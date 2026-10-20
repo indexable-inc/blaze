@@ -23,7 +23,8 @@ impl Salted {
     }
 
     pub fn key(&self, key: &[u8; KEY]) -> [u8; KEY] {
-        self.0.key(key)
+        // PROBE, not to be merged: a deliberate slowdown, to see the comparison fail.
+        self.0.key(&self.0.key(key))
     }
 }
 
