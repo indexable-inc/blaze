@@ -8,6 +8,10 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Added
 
+- The SSE and AVX compares compile (#87): `llvm.x86.sse.cmp.ps` and `.ss`, `sse2.cmp.pd` and
+  `.sd` and AVX's 256-bit ones give a lane of all ones where the immediate's predicate holds, as
+  rustc's do. glam's `Vec4::cmpeq` and `is_finite_mask`, which bevy calls, were left to rustc;
+  `harness/breakers` checks each predicate, NaN lanes included, against rustc's program.
 - `RA_JIT_UNITS=1` compiles a whole program's functions many to an LLVM module, as rustc
   compiles a crate's codegen units (#176): the functions are found from their IR before any
   is compiled, cut into units of about 20,000 instructions in the order they were found in,
@@ -195,7 +199,7 @@ All notable changes to ra-jit are written here. The format follows
 - A borrow checker, the crate `hir-ty-borrowck` in the rust-analyzer subtree, written to give
   rustc's verdict: Polonius alpha by default as nightly rustc does, NLL with
   `RA_JIT_BORROWCK=nll`. It gives rustc's errors on
-  1536 of 1581 of rustc's own borrow-check tests that it can run, and none on any of the 246
+  1539 of 1581 of rustc's own borrow-check tests that it can run, and none on any of the 246
   rustc accepts, scored by `harness/borrowck_ui.py`, and finds nothing in ripgrep, fd, bat,
   hyperfine, just, axum, nushell, delta, eza, tokei, starship and cargo. Its errors, and rustc's
   `unused_mut` warning, are rust-analyzer diagnostics and `ra-jit borrowck` prints them ([docs/borrowck.md](docs/borrowck.md)).
@@ -493,6 +497,12 @@ All notable changes to ra-jit are written here. The format follows
   only one), and `use<'_>` that one too. Type lowering in rust-analyzer gives the
   `impl Trait` a lifetime parameter for each, as rustc does (corpus `elided_captures`).
   1536 of 1581 of rustc's tests now (was 1535).
+- The borrow checker proves `for<'a>` bounds for placeholders, as rustc does, and those an
+  impl's where clauses need on the way: `&'static str: DeserializeOwned`, which needs
+  `&'static str: for<'de> Deserialize<'de>` where only `'de: 'static` is implemented, gives
+  rustc's "higher-ranked lifetime error", as does a forwarding impl that needs
+  `T: for<'a> Bar<&'a isize>` of a `T` that is only `Bar<&'b isize>`. They were missed
+  (corpus `higher_ranked`). 1539 of 1581 of rustc's tests now (was 1536).
 - A returned `impl Trait` hiding a type parameter is checked when the function's lifetimes
   are late-bound or elided: `fn f<T>(d: T, p: &mut ()) -> impl Sized + '_ { (d, p) }` gives
   rustc's E0311, and with `p: &'b mut ()` its E0309. The borrow checker relates the hidden

@@ -111,6 +111,10 @@ pub(super) enum UniversalKind {
     /// rustc's `UniversalRegions` calls external. The closure's own, the late-bound lifetimes
     /// of its signature and the borrow of its environment, are `AnonParam`.
     Creator,
+    /// A lifetime of a `for<'a>` the trait solver proves something for, as rustc's
+    /// placeholders: any lifetime at all, so it outlives only itself and is outlived by
+    /// `'static`.
+    Placeholder,
 }
 
 /// The position among a closure's creator's regions of the anonymous lifetime 0 of the impl
@@ -612,6 +616,8 @@ pub(super) fn build<'db>(
         const_positions: 0,
         aggregate_temps: aggregate_temps(body),
         synthesized: synthesized(ctx),
+        placeholders: FxHashMap::default(),
+        forall_universe: None,
     };
     builder.universal_regions();
     builder.env_aliases();
@@ -676,6 +682,11 @@ struct Builder<'c, 'a, 'db> {
     /// The expressions lowering makes that the source does not write, as the `let x = x;` of
     /// each parameter of an `async fn`: rustc's desugarings, `Boring` to blame.
     synthesized: FxHashSet<hir_def::hir::ExprId>,
+    /// The universal region of each placeholder the trait solver's answers name.
+    placeholders: FxHashMap<Region<'db>, Region<'db>>,
+    /// The universe of the placeholders a `for<'a>` predicate being proven is instantiated
+    /// with, which a type outlives only by outliving `'static`.
+    forall_universe: Option<rustc_type_ir::UniverseIndex>,
 }
 
 fn synthesized(ctx: &Ctx<'_, '_>) -> FxHashSet<hir_def::hir::ExprId> {
@@ -757,6 +768,15 @@ impl<'db> Builder<'_, '_, 'db> {
         let rv = rv_of(region).expect("a fresh region is a variable");
         self.regions.universal_index.insert(rv, self.regions.universals.len());
         self.regions.universals.push((rv, kind));
+        region
+    }
+
+    fn placeholder(&mut self, placeholder: Region<'db>) -> Region<'db> {
+        if let Some(&it) = self.placeholders.get(&placeholder) {
+            return it;
+        }
+        let region = self.new_universal(UniversalKind::Placeholder);
+        self.placeholders.insert(placeholder, region);
         region
     }
 
@@ -4740,26 +4760,46 @@ impl<'db> Builder<'_, '_, 'db> {
                     // region outlives only by outliving `'static`.
                     let forall =
                         rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&trait_ref);
+                    let interner = self.interner();
+                    let instantiate = |with: &mut dyn FnMut(_) -> Region<'db>| {
+                        rustc_type_ir::fold_regions(interner, trait_ref, |region, depth| {
+                            match region.kind() {
+                                RegionKind::ReBound(
+                                    rustc_type_ir::BoundVarIndexKind::Bound(binder),
+                                    bound,
+                                ) if binder == depth => with(bound),
+                                _ => region,
+                            }
+                        })
+                    };
+                    let placeholders = forall.then(|| {
+                        let universe = self.ctx.infcx.create_next_universe();
+                        let placeholders = instantiate(&mut |bound| {
+                            Region::new_placeholder(
+                                interner,
+                                hir_ty::next_solver::PlaceholderRegion::new(universe, bound),
+                            )
+                        });
+                        (universe, placeholders)
+                    });
                     let trait_ref = match forall {
-                        true => {
-                            let interner = self.interner();
-                            rustc_type_ir::fold_regions(interner, trait_ref, |region, depth| {
-                                match region.kind() {
-                                    RegionKind::ReBound(
-                                        rustc_type_ir::BoundVarIndexKind::Bound(binder),
-                                        _,
-                                    ) if binder == depth => Region::new_static(interner),
-                                    _ => region,
-                                }
-                            })
-                        }
+                        true => instantiate(&mut |_| Region::new_static(interner)),
                         false => trait_ref,
                     };
                     self.trait_args_outlive(trait_ref, at);
                     self.object_assoc_bounds(trait_ref, at);
+                    // Proven for placeholders, what the trait's impls need of them is an error
+                    // where it is more than they can be, `for<'a> Foo<&'a isize>` needing
+                    // `'a: 'b`.
+                    if let Some((universe, placeholders)) = placeholders {
+                        self.forall_universe = Some(universe);
+                        self.prove(placeholders, at);
+                        self.forall_universe = None;
+                    }
                     // Of a call written as one: `map[i] = v` calls `IndexMut::index_mut`, which
                     // is E0594 where only `Index` is implemented.
                     if self.prove(trait_ref, at)
+                        && !forall
                         && !forall
                         && at.category == Category::Predicate
                         && let MirSpan::ExprId(expr) = at.span
@@ -5042,8 +5082,7 @@ impl<'db> Builder<'_, '_, 'db> {
             },
             obligation_ctxt::ObligationCtxt,
         };
-        if !rustc_type_ir::TypeVisitableExt::has_free_regions(&trait_ref)
-            || rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&trait_ref)
+        if rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&trait_ref)
             || rustc_type_ir::TypeVisitableExt::references_error(&trait_ref)
             || trait_ref.args.iter().any(|arg| {
                 rustc_type_ir::inherent::GenericArg::as_type(&arg).is_some_and(names_closure)
@@ -5051,6 +5090,9 @@ impl<'db> Builder<'_, '_, 'db> {
         {
             return false;
         }
+        // Without regions of its own it can still need what a `for<'a>` in an impl's where
+        // clauses says of the placeholders it is proven for: `&'static str: DeserializeOwned`.
+        let regionless = !rustc_type_ir::TypeVisitableExt::has_free_regions(&trait_ref);
         let interner = self.interner();
         let (constraints_before, obligations_before) = {
             let mut inner = self.ctx.infcx.inner.borrow_mut();
@@ -5072,7 +5114,7 @@ impl<'db> Builder<'_, '_, 'db> {
         ));
         let errors = ocx.evaluate_obligations_error_on_ambiguity();
         if !errors.is_empty() {
-            return errors.iter().any(|it| it.is_true_error());
+            return !regionless && errors.iter().any(|it| it.is_true_error());
         }
         let (constraints, obligations) = {
             let mut inner = self.ctx.infcx.inner.borrow_mut();
@@ -5088,27 +5130,78 @@ impl<'db> Builder<'_, '_, 'db> {
                     .collect();
             (constraints, obligations)
         };
+        if regionless && constraints.is_empty() {
+            return false;
+        }
+        if crate::debugging(self.ctx.db, self.ctx.owner) {
+            eprintln!("prove {trait_ref:?}: {constraints:?} {obligations:?}");
+        }
         let rv = |this: &mut Self, region: Region<'db>| match region.kind() {
             RegionKind::ReVar(vid) => Some(vid.as_usize()),
             RegionKind::ReStatic => Some(this.regions.static_rv),
             RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) => {
                 this.signature_region(region, rustc_type_ir::INNERMOST).and_then(rv_of)
             }
+            RegionKind::RePlaceholder(_) => rv_of(this.placeholder(region)),
             _ => None,
         };
-        for constraint in constraints {
-            // `a <= b`: `b` outlives `a`.
-            let (shorter, longer) = match constraint {
-                Constraint::VarSubVar(a, b) => (Some(a.as_usize()), Some(b.as_usize())),
-                Constraint::RegSubVar(a, b) => (rv(self, a), Some(b.as_usize())),
-                Constraint::VarSubReg(a, b) => (Some(a.as_usize()), rv(self, b)),
-                Constraint::RegSubReg(a, b) => (rv(self, a), rv(self, b)),
+        let var = |vid: rustc_type_ir::RegionVid| Region::new_var(interner, vid);
+        let pairs: Vec<(Region<'db>, Region<'db>)> = constraints
+            .into_iter()
+            .map(|constraint| match constraint {
+                Constraint::VarSubVar(a, b) => (var(a), var(b)),
+                Constraint::RegSubVar(a, b) => (a, var(b)),
+                Constraint::VarSubReg(a, b) => (var(a), b),
+                Constraint::RegSubReg(a, b) => (a, b),
+            })
+            .collect();
+        // A placeholder equated with an error region stands for a lifetime rust-analyzer
+        // elided in a signature, whose trait objects it gives `'static` rather than that
+        // lifetime (`fn(&mut dyn Write)` for `for<'b> FnMut(&'b mut dyn Write)`), so nothing
+        // else said of it holds.
+        let unknown: FxHashSet<Region<'db>> = pairs
+            .iter()
+            .flat_map(|&(a, b)| [(a, b), (b, a)])
+            .filter(|(it, other)| it.is_placeholder() && other.is_error())
+            .map(|(it, _)| it)
+            .collect();
+        // `a <= b`: `b` outlives `a`.
+        for (shorter, longer) in pairs {
+            if unknown.contains(&shorter) || unknown.contains(&longer) {
+                continue;
+            }
+            // A region of a universe that cannot name the placeholder outlives it only by
+            // outliving every region, as rustc's `add_incompatible_universe`.
+            let longer = match shorter.is_placeholder()
+                && longer != shorter
+                && self.ctx.infcx.universe_of_region(longer)
+                    < self.ctx.infcx.universe_of_region(shorter)
+            {
+                true => Region::new_static(interner),
+                false => longer,
             };
-            if let (Some(shorter), Some(longer)) = (shorter, longer) {
+            if let (Some(shorter), Some(longer)) = (rv(self, shorter), rv(self, longer)) {
                 self.outlives(longer, shorter, at);
             }
         }
+        let forall = self.forall_universe;
+        let ctx = self.ctx;
+        let infcx = &ctx.infcx;
+        let ours = |region: Region<'db>| {
+            region.is_placeholder() && Some(infcx.universe_of_region(region)) == forall
+        };
         for (ty, region) in obligations {
+            let ty = rustc_type_ir::fold_regions(interner, ty, |it, _| match ours(it) {
+                true => Region::new_static(interner),
+                false => it,
+            });
+            let region = match ours(region) {
+                true => Region::new_static(interner),
+                false => region,
+            };
+            if region.is_placeholder() || rustc_type_ir::TypeVisitableExt::has_placeholders(&ty) {
+                continue;
+            }
             let Some(region) = rv(self, region) else { continue };
             let ty = rustc_type_ir::fold_regions(interner, ty, |it, _| match it.kind() {
                 RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) | RegionKind::ReStatic => {

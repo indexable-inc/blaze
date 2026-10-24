@@ -32,6 +32,7 @@ cases![
     promoted_index_of_casts,
     simd_lanes,
     simd_packs,
+    simd_compare,
     sha_ni,
     const_bytes_match,
     link_name_macro,

@@ -751,7 +751,8 @@ def platform_doc(name, result, stored):
         cold_runs = result.get("cold_runs", 1)
         lines += ["", f"#### Cold, {BACKEND_NAMES[backend]}, {name}", "",
                   "From an empty target directory, crates already downloaded, " + ("one run." if cold_runs == 1 else
-                  f"median of {cold_runs} runs, each from nothing.") + " `cargo ra-jit build` is cargo's own build (the daemon is "
+                  f"median of {cold_runs} runs, each from nothing.") + " The empty store fetches the standard library as a "
+                  "release's first build does. `cargo ra-jit build` is cargo's own build (the daemon is "
                   "not loaded yet); the daemon then loads the workspace and builds it once, and edits are fast from then on. "
                   "Warm store: the same in another checkout of the same commit, with the store the first one filled.", "",
                   "| Project | `cargo build` | `cargo ra-jit build` | Daemon ready, empty store | Daemon ready, warm store | "

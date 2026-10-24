@@ -28,55 +28,55 @@
 <line x1="16" y1="193" x2="744" y2="193" class="r"/>
 <rect x="188.6" y="143" width="192.1" height="12" rx="2" class="p0"/>
 <rect x="188.6" y="158" width="265.9" height="12" rx="2" class="p1"/>
-<rect x="188.6" y="173" width="217.3" height="12" rx="2" class="p2"/>
+<rect x="188.6" y="173" width="204" height="12" rx="2" class="p2"/>
 <rect x="188.6" y="201" width="173.9" height="12" rx="2" class="p0"/>
 <path d="M318.1 207H435.1M318.1 203v8M435.1 203v8" class="o w0"/>
 <rect x="188.6" y="216" width="260" height="12" rx="2" class="p1"/>
 <path d="M404.2 222H464.5M404.2 218v8M464.5 218v8" class="o w1"/>
-<rect x="188.6" y="231" width="214.5" height="12" rx="2" class="p2"/>
-<path d="M369.2 237H440.8M369.2 233v8M440.8 233v8" class="o w2"/>
+<rect x="188.6" y="231" width="202.8" height="12" rx="2" class="p2"/>
+<path d="M350 237H415.1M350 233v8M415.1 233v8" class="o w2"/>
 <rect x="188.6" y="259" width="149.7" height="12" rx="2" class="p0"/>
 <path d="M332.9 265H367.9M332.9 261v8M367.9 261v8" class="o w0"/>
 <rect x="188.6" y="274" width="257.5" height="12" rx="2" class="p1"/>
 <path d="M439 280H485.7M439 276v8M485.7 276v8" class="o w1"/>
-<rect x="188.6" y="289" width="204.8" height="12" rx="2" class="p2"/>
-<path d="M375.8 295H417M375.8 291v8M417 291v8" class="o w2"/>
+<rect x="188.6" y="289" width="186.9" height="12" rx="2" class="p2"/>
+<path d="M371 295H413.5M371 291v8M413.5 291v8" class="o w2"/>
 <rect x="189.6" y="318.5" width="9" height="9" rx="2" class="o w0"/>
 <rect x="188.6" y="332" width="291" height="12" rx="2" class="p1"/>
 <path d="M460.3 338H492.4M460.3 334v8M492.4 334v8" class="o w1"/>
-<rect x="188.6" y="347" width="240" height="12" rx="2" class="p2"/>
-<path d="M378.2 353H447.4M378.2 349v8M447.4 349v8" class="o w2"/>
+<rect x="188.6" y="347" width="218.6" height="12" rx="2" class="p2"/>
+<path d="M370.5 353H425.1M370.5 349v8M425.1 349v8" class="o w2"/>
 <rect x="189.6" y="376.5" width="9" height="9" rx="2" class="o w0"/>
 <rect x="188.6" y="390" width="216.9" height="12" rx="2" class="p1"/>
 <path d="M368.5 396H437.4M368.5 392v8M437.4 392v8" class="o w1"/>
-<rect x="188.6" y="405" width="203.3" height="12" rx="2" class="p2"/>
-<path d="M338.9 411H403.3M338.9 407v8M403.3 407v8" class="o w2"/>
+<rect x="188.6" y="405" width="175.8" height="12" rx="2" class="p2"/>
+<path d="M331.7 411H387.5M331.7 407v8M387.5 407v8" class="o w2"/>
 <rect x="189.6" y="434.5" width="9" height="9" rx="2" class="o w0"/>
 <rect x="188.6" y="448" width="257.8" height="12" rx="2" class="p1"/>
 <path d="M428.8 454H485.1M428.8 450v8M485.1 450v8" class="o w1"/>
-<rect x="188.6" y="463" width="234.5" height="12" rx="2" class="p2"/>
-<path d="M400.3 469H437.3M400.3 465v8M437.3 465v8" class="o w2"/>
+<rect x="188.6" y="463" width="216" height="12" rx="2" class="p2"/>
+<path d="M376.5 469H426.7M376.5 465v8M426.7 465v8" class="o w2"/>
 <rect x="189.6" y="492.5" width="9" height="9" rx="2" class="o w0"/>
 <rect x="188.6" y="506" width="229.7" height="12" rx="2" class="p1"/>
 <path d="M416.9 512H477M416.9 508v8M477 508v8" class="o w1"/>
-<rect x="188.6" y="521" width="178.5" height="12" rx="2" class="p2"/>
-<path d="M366.3 527H437M366.3 523v8M437 523v8" class="o w2"/>
+<rect x="188.6" y="521" width="177" height="12" rx="2" class="p2"/>
+<path d="M363.3 527H436.7M363.3 523v8M436.7 523v8" class="o w2"/>
 <rect x="188.6" y="549" width="191.9" height="12" rx="2" class="p0"/>
 <path d="M303.9 555H424.3M303.9 551v8M424.3 551v8" class="o w0"/>
 <rect x="188.6" y="564" width="294.6" height="12" rx="2" class="p1"/>
 <path d="M445.8 570H524.7M445.8 566v8M524.7 566v8" class="o w1"/>
-<rect x="188.6" y="579" width="237.7" height="12" rx="2" class="p2"/>
-<path d="M326.9 585H478.8M326.9 581v8M478.8 581v8" class="o w2"/>
+<rect x="188.6" y="579" width="228" height="12" rx="2" class="p2"/>
+<path d="M316.9 585H453.6M316.9 581v8M453.6 581v8" class="o w2"/>
 <rect x="189.6" y="608.5" width="9" height="9" rx="2" class="o w0"/>
 <rect x="188.6" y="622" width="323.2" height="12" rx="2" class="p1"/>
 <path d="M467.5 628H560M467.5 624v8M560 624v8" class="o w1"/>
-<rect x="188.6" y="637" width="269.2" height="12" rx="2" class="p2"/>
-<path d="M401 643H487.9M401 639v8M487.9 639v8" class="o w2"/>
+<rect x="188.6" y="637" width="274.3" height="12" rx="2" class="p2"/>
+<path d="M380.3 643H484.4M380.3 639v8M484.4 639v8" class="o w2"/>
 <rect x="189.6" y="666.5" width="9" height="9" rx="2" class="o w0"/>
 <rect x="188.6" y="680" width="270.9" height="12" rx="2" class="p1"/>
 <path d="M454 686H564.7M454 682v8M564.7 682v8" class="o w1"/>
-<rect x="188.6" y="695" width="131.4" height="12" rx="2" class="p2"/>
-<path d="M285 701H504.9M285 697v8M504.9 697v8" class="o w2"/>
+<rect x="188.6" y="695" width="101.5" height="12" rx="2" class="p2"/>
+<path d="M287.5 701H419M287.5 697v8M419 697v8" class="o w2"/>
 <rect x="188.6" y="723" width="253.1" height="12" rx="2" class="p0"/>
 <path d="M369.9 729H484.9M369.9 725v8M484.9 725v8" class="o w0"/>
 <rect x="188.6" y="738" width="257.1" height="12" rx="2" class="p1"/>
@@ -97,43 +97,43 @@
 <text x="118.8" y="176" font-size="11" text-anchor="end" class="d">geometric mean</text>
 <text x="386.7" y="153" font-size="12" class="v b">10× faster</text>
 <text x="460.4" y="168" font-size="12" class="v b">24× faster</text>
-<text x="411.9" y="183" font-size="12" class="v b">14× faster</text>
+<text x="398.6" y="183" font-size="12" class="v b">12× faster</text>
 <text x="118.8" y="226.5" font-size="13" text-anchor="end">ripgrep 15.1.0</text>
 <text x="441.1" y="211" font-size="12" class="v">8.1× faster</text>
 <text x="470.5" y="226" font-size="12" class="v">23× faster</text>
-<text x="446.8" y="241" font-size="12" class="v">13× faster</text>
+<text x="421.1" y="241" font-size="12" class="v">11× faster</text>
 <text x="118.8" y="284.5" font-size="13" text-anchor="end">fd 10.3.0</text>
 <text x="373.9" y="269" font-size="12" class="v">6.0× faster</text>
 <text x="491.7" y="284" font-size="12" class="v">22× faster</text>
-<text x="423" y="299" font-size="12" class="v">12× faster</text>
+<text x="419.5" y="299" font-size="12" class="v">9.4× faster</text>
 <text x="118.8" y="342.5" font-size="13" text-anchor="end">bat 0.26.0</text>
 <text x="204.6" y="327" font-size="11.5" class="d">not measured yet</text>
 <text x="498.4" y="342" font-size="12" class="v">33× faster</text>
-<text x="453.4" y="357" font-size="12" class="v">18× faster</text>
+<text x="431.1" y="357" font-size="12" class="v">14× faster</text>
 <text x="118.8" y="400.5" font-size="13" text-anchor="end">hyperfine 1.19.0</text>
 <text x="204.6" y="385" font-size="11.5" class="d">not measured yet</text>
 <text x="443.4" y="400" font-size="12" class="v">14× faster</text>
-<text x="409.3" y="415" font-size="12" class="v">11× faster</text>
+<text x="393.5" y="415" font-size="12" class="v">8.2× faster</text>
 <text x="118.8" y="458.5" font-size="13" text-anchor="end">just 1.43.0</text>
 <text x="204.6" y="443" font-size="11.5" class="d">not measured yet</text>
 <text x="491.1" y="458" font-size="12" class="v">22× faster</text>
-<text x="443.3" y="473" font-size="12" class="v">17× faster</text>
+<text x="432.7" y="473" font-size="12" class="v">13× faster</text>
 <text x="118.8" y="516.5" font-size="13" text-anchor="end">axum 0.8.6</text>
 <text x="204.6" y="501" font-size="11.5" class="d">not measured yet</text>
 <text x="483" y="516" font-size="12" class="v">16× faster</text>
-<text x="443" y="531" font-size="12" class="v">8.5× faster</text>
+<text x="442.7" y="531" font-size="12" class="v">8.4× faster</text>
 <text x="118.8" y="574.5" font-size="13" text-anchor="end">nushell 0.108.0</text>
 <text x="430.3" y="559" font-size="12" class="v">10× faster</text>
 <text x="530.7" y="574" font-size="12" class="v">34× faster</text>
-<text x="484.8" y="589" font-size="12" class="v">17× faster</text>
+<text x="459.6" y="589" font-size="12" class="v">15× faster</text>
 <text x="118.8" y="632.5" font-size="13" text-anchor="end">helix 25.07.1</text>
 <text x="204.6" y="617" font-size="11.5" class="d">not measured yet</text>
 <text x="566" y="632" font-size="12" class="v">48× faster</text>
-<text x="493.9" y="647" font-size="12" class="v">25× faster</text>
+<text x="490.4" y="647" font-size="12" class="v">27× faster</text>
 <text x="118.8" y="690.5" font-size="13" text-anchor="end">bevy 0.20.0</text>
 <text x="204.6" y="675" font-size="11.5" class="d">not measured yet</text>
 <text x="570.7" y="690" font-size="12" class="v">26× faster</text>
-<text x="510.9" y="705" font-size="12" class="v">4.8× faster</text>
+<text x="425" y="705" font-size="12" class="v">3.4× faster</text>
 <text x="118.8" y="748.5" font-size="13" text-anchor="end">bun 1.4.3</text>
 <text x="490.9" y="733" font-size="12" class="v">21× faster</text>
 <text x="504.4" y="748" font-size="12" class="v">22× faster</text>
@@ -142,6 +142,6 @@
 <text x="180.6" y="810" font-size="12" text-anchor="end" class="d">← ra-jit slower</text>
 <text x="196.6" y="810" font-size="12" class="d">ra-jit faster →</text>
 <text x="16" y="834" font-size="11.5" class="d">Each colour is a machine of its own: compare bars of one colour, not across colours. macOS arm64: MacBook Pro, 2026-10-21.</text>
-<text x="16" y="851" font-size="11.5" class="d">Linux aarch64: AWS c8g.16xlarge, 2026-10-23. Linux x86-64: AWS c8a.metal-24xl, 2026-10-23. bun, measured on its own: macOS</text>
+<text x="16" y="851" font-size="11.5" class="d">Linux aarch64: AWS c8g.16xlarge, 2026-10-23. Linux x86-64: AWS c8a.metal-24xl, 2026-10-24. bun, measured on its own: macOS</text>
 <text x="16" y="868" font-size="11.5" class="d">arm64: Apple M5 Max, 2026-10-23; Linux aarch64: AWS c8g.24xlarge, 2026-10-23; Linux x86-64: AWS c8a.24xlarge, 2026-10-23.</text>
 </svg>

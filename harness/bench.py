@@ -16,7 +16,9 @@ that module's `prepare` makes beside the clone, and is measured only when named.
 backend, with a store, a daemon and a home of its own, and plain cargo building the same source
 into a target directory of its own outside the checkout (under `--reference`, which lets the two be on different disks, or `WORK/reference`):
   cold       `cargo ra-jit build` from nothing, then the wait until the daemon has the
-             workspace loaded and its first build linked
+             workspace loaded and its first build linked; the standard library's unit is
+             fetched into the empty store from what `ra-jit std` made once, as a release's
+             first build fetches it (`std_made_s` is how long making it took)
   no-op      `cargo ra-jit build` with nothing changed
   body       one function's body is edited
   signature  a function gets another parameter, and every caller the argument
@@ -277,6 +279,29 @@ def ra_jit_of(backend):
     if backend == "llvm":
         return os.environ.get("RA_JIT_LLVM_BIN") or os.path.join(ROOT, "target-llvm/release/ra-jit")
     return cargo_ra_jit.RA_JIT
+
+
+SHIPPED = {}
+
+
+def shipped_std(ra_jit, backend, work):
+    """The remote a release of `ra_jit` would fetch the standard library's unit from, made once
+    by `ra-jit std` as the release workflow makes it: a cold build fetches it into its empty
+    store, as a user's first build does, rather than making it. The seconds making it took are
+    the second value, outside every phase."""
+    if (ra_jit, backend) not in SHIPPED:
+        remote = os.path.join(work, f"std-{backend}")
+        shutil.rmtree(remote, ignore_errors=True)
+        env = dict(cargo_ra_jit.base_env(os.path.join(work, f"home-std-{backend}")), **BACKENDS[backend])
+        sysroot = subprocess.run(["rustc", "--print", "sysroot"], capture_output=True, text=True, env=env,
+                                 check=True).stdout.strip()
+        start = time.monotonic()
+        made = subprocess.run([ra_jit, "std", remote, sysroot], capture_output=True, text=True, env=env)
+        if made.returncode != 0:
+            raise Failed(f"{backend}: `ra-jit std` failed:\n{made.stderr[-3000:]}")
+        SHIPPED[ra_jit, backend] = (remote, round(time.monotonic() - start, 3))
+        print(f"  standard library for {backend}, as a release ships it: {SHIPPED[ra_jit, backend][1]:.1f}s", flush=True)
+    return SHIPPED[ra_jit, backend]
 
 
 def seconds(text):
@@ -632,8 +657,11 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         return took, warm, mine, used
 
     # Each cold run starts from nothing: no target directories, an empty store and a daemon of
-    # its own. The builds take turns, never at once: they would share the cores (a daemon that
-    # is ready is idle). The last one's daemon is the one the edits are measured with.
+    # its own, with the standard library's unit to fetch as a release has it. The builds take
+    # turns, never at once: they would share the cores (a daemon that is ready is idle). The
+    # last one's daemon is the one the edits are measured with.
+    std_from, std_s = shipped_std(ra_jit, backend, work)
+    ours.env["RA_JIT_STD_FROM"] = std_from
     colds, builds = [], [0]
     for turn in range(cold_runs):
         ours.cargo("stop")
@@ -668,7 +696,8 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
                         build_samples_s=[round(c["build_s"], 3) for c in colds],
                         setups=setup_times(setups, [c["setups"] for c in colds]),
                         compiled=compiled(said), steps_s=cold_steps(said), threads_s=thread_steps(said), started_over=rounds(said),
-                        memory=memory_phase([(c["used"], c["cargo_used"]) for c in colds], ready_mb), disk_mb=cold_disk))
+                        memory=memory_phase([(c["used"], c["cargo_used"]) for c in colds], ready_mb), disk_mb=cold_disk,
+                        std_made_s=std_s))
 
     samples = [both() for _ in range(max(runs, 3))]
     said = daemon.said()

@@ -113,6 +113,30 @@ fn user(mut s: S) {
     }
 
     #[test]
+    fn higher_ranked_bound_holds_for_any_lifetime() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, fn
+trait Deserialize<'de> {}
+trait DeserializeOwned: for<'de> Deserialize<'de> {}
+impl<T> DeserializeOwned for T where T: for<'de> Deserialize<'de> {}
+impl<'de: 'a, 'a> Deserialize<'de> for &'a str {}
+impl<'de> Deserialize<'de> for u32 {}
+fn owned<T: DeserializeOwned>() {}
+trait Write {}
+fn handler(_: &u32, _: &mut dyn Write) {}
+fn run(_: impl FnMut(&u32, &mut dyn Write)) {}
+fn main() {
+    owned::<u32>();
+    owned::<&'static str>();
+  //^^^^^^^^^^^^^^^^^^^^^^^ error: higher-ranked lifetime error
+    run(handler);
+}
+"#,
+        );
+    }
+
+    #[test]
     fn unit_expression_initializes_its_place() {
         check_diagnostics(
             r#"

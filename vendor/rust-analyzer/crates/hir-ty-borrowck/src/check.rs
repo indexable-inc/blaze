@@ -1520,6 +1520,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         }
         let universals = &self.regions.universals;
         let in_closure = self.ctx.closure_local.is_some() || self.ctx.inline_const;
+        let mut higher_ranked = FxHashSet::default();
         for (longer, &(longer_rv, kind)) in universals.iter().enumerate() {
             if matches!(kind, UniversalKind::Static | UniversalKind::FnBody) {
                 continue;
@@ -1537,7 +1538,9 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                     .filter(|&it| !self.regions.knows(longer, it))
                     .collect(),
             };
-            if failing.is_empty() || in_closure && self.propagate(longer, &failing) {
+            let placeholder = kind == UniversalKind::Placeholder;
+            if failing.is_empty() || in_closure && !placeholder && self.propagate(longer, &failing)
+            {
                 continue;
             }
             let shorter = failing[0];
@@ -1552,7 +1555,9 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             // to its creator by how it gets there.
             let escapes = in_closure
                 && matches!(shorter_kind, UniversalKind::Creator | UniversalKind::Static);
-            let (code, message) = if escapes
+            let (code, message) = if placeholder {
+                ("", "higher-ranked lifetime error".to_owned())
+            } else if escapes
                 && blamed.category == Category::Return
                 && self.regions.closure_env == Some(longer)
                 && self.ctx.closure_kind == Some(rustc_type_ir::ClosureKind::FnMut)
@@ -1587,6 +1592,23 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 Category::Return => self.tail(blamed.span),
                 _ => blamed.span,
             };
+            // A predicate proven twice, each time for placeholders of its own, is one error: of
+            // a function's where clauses, at its path and at its call, it is the call's.
+            let span = match span {
+                MirSpan::ExprId(callee) if placeholder => self
+                    .ctx
+                    .store
+                    .exprs()
+                    .find_map(|(call, it)| {
+                        matches!(it, hir_def::hir::Expr::Call { callee: c, .. } if *c == callee)
+                            .then_some(MirSpan::ExprId(call))
+                    })
+                    .unwrap_or(span),
+                _ => span,
+            };
+            if placeholder && !higher_ranked.insert(span) {
+                continue;
+            }
             if blamed.category == Category::Signature {
                 self.errors.push(Some(BorrowckDiagnostic {
                     code,
