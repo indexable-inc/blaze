@@ -6,7 +6,8 @@
 //! and the dep-info where rustc would have, with the files `include!` and its kin read and
 //! the variables `env!` and `option_env!` read, and cargo runs the script as it would rustc's.
 //! A script that read a variable cargo sets for rustc alone is left to rustc. A proc macro the
-//! script links is expanded with the library rustc compiled of it, by rust-analyzer's server.
+//! script links is expanded with the library compiled of it: rustc's by rust-analyzer's
+//! server, ra-jit's (`own_macro.rs`) by the server that reads its list of macros.
 
 use std::{
     collections::BTreeMap,
@@ -42,8 +43,20 @@ struct Described {
     env: BTreeMap<String, String>,
     /// The name each library is linked under and where it is in the description.
     deps: Vec<(String, usize)>,
-    /// The library rustc compiled of a proc macro, which rust-analyzer's server expands with.
+    /// The library compiled of a proc macro, which a proc-macro server expands with.
     proc_macro: Option<PathBuf>,
+    /// Whether the crate is a proc macro the build compiles.
+    compiled_macro: bool,
+}
+
+/// What a build makes of the first crate of its description.
+pub(crate) struct Made<'a> {
+    /// The crate's name in the description, which ra-jit is asked to build.
+    pub(crate) name: &'a str,
+    /// Whether the crate is a proc macro, linked as a shared library with its list of macros.
+    pub(crate) proc_macro: bool,
+    pub(crate) exe: PathBuf,
+    pub(crate) dep_info: PathBuf,
 }
 
 /// The arguments of one run of rustc, as cargo gave them for a crate.
@@ -119,6 +132,20 @@ pub(crate) fn compile(
     exe: &Path,
     dir: &Path,
 ) -> Result<(), String> {
+    let made =
+        Made { name: SCRIPT, proc_macro: false, exe: exe.to_owned(), dep_info: exe.with_extension("d") };
+    compile_as(rustc, args, cwd, source, &made, dir)
+}
+
+/// [`compile`] of the crate cargo asked rustc for, made as `made` says.
+pub(crate) fn compile_as(
+    rustc: &OsStr,
+    args: &[String],
+    cwd: &Path,
+    source: &Path,
+    made: &Made<'_>,
+    dir: &Path,
+) -> Result<(), String> {
     let asked = Asked { args, cwd };
     let rustc = crate::answers::toolchain_rustc_of(rustc).ok_or("its toolchain is not known")?;
     let sysroot = rustc.parent().and_then(Path::parent).ok_or("its toolchain is not known")?;
@@ -129,41 +156,41 @@ pub(crate) fn compile(
     let mut crates = Vec::new();
     let env: BTreeMap<String, String> =
         std::env::vars().filter(|(name, _)| read_by_crates(name)).collect();
-    let script = Described {
-        name: SCRIPT.to_owned(),
+    let first = Described {
+        name: made.name.to_owned(),
         root: source.to_owned(),
         edition: asked.edition(),
         cfg: asked.cfg(),
         env,
         deps: Vec::new(),
         proc_macro: None,
+        compiled_macro: made.proc_macro,
     };
-    crates.push(script);
+    crates.push(first);
     let mut linked = BTreeMap::new();
     let deps = asked.externs();
     let deps =
         deps.iter().map(|(name, path)| Ok((name.clone(), add(&mut crates, &mut linked, path)?)));
     crates[0].deps = deps.collect::<Result<_, String>>()?;
-    let said = build(sysroot, &crates, dir, exe, super::daemon::store(), true)?;
+    let said = build(sysroot, &crates, dir, made, super::daemon::store(), true)?;
     if let Some(line) =
         said.lines().find(|it| it.contains(" functions in it ra-jit could not compile"))
         && !line.ends_with(", 0 functions in it ra-jit could not compile")
     {
         return Err(format!("it calls functions ra-jit could not compile ({line})"));
     }
-    let read = std::fs::read_to_string(exe.with_extension("d")).map_err(|it| it.to_string())?;
+    let read = std::fs::read_to_string(&made.dep_info).map_err(|it| it.to_string())?;
     read_otherwise(&crate::dep_info::DepInfo::parse(&read), |name| std::env::var(name).ok())
 }
 
-/// Builds the first of `crates` over the standard library of `sysroot` into `exe` with its
-/// dep-info beside it, describing them in `dir`, with `store` as the store: what the build
-/// said, or why it did not build. With `shipped` it fetches the standard library as builds do
-/// (`shipped.rs`).
+/// Builds the first of `crates` over the standard library of `sysroot` as `made` says,
+/// describing them in `dir`, with `store` as the store: what the build said, or why it did
+/// not build. With `shipped` it fetches the standard library as builds do (`shipped.rs`).
 fn build(
     sysroot: &Path,
     crates: &[Described],
     dir: &Path,
-    exe: &Path,
+    made: &Made<'_>,
     store: Option<PathBuf>,
     shipped: bool,
 ) -> Result<String, String> {
@@ -175,10 +202,12 @@ fn build(
         "crates": crates.iter().enumerate().map(|(at, it)| described(it, at == 0)).collect::<Vec<_>>(),
     });
     std::fs::write(&project, described.to_string()).map_err(|it| it.to_string())?;
-    let dep_info = exe.with_extension("d");
     let mut ra_jit = Command::new(std::env::current_exe().map_err(|it| it.to_string())?);
-    ra_jit.arg(&project).args(["--crate", SCRIPT]).arg("--out").arg(dir.join("script.o"));
-    ra_jit.arg("--exe").arg(exe).arg("--dep-info").arg(&dep_info);
+    ra_jit.arg(&project).args(["--crate", made.name]).arg("--out").arg(dir.join("built.o"));
+    ra_jit.arg("--exe").arg(&made.exe).arg("--dep-info").arg(&made.dep_info);
+    if made.proc_macro {
+        ra_jit.args(["--crate", "proc_macro", "--shared"]);
+    }
     // What cargo set for the script's rustc is not the build's: the build ra-jit runs is its
     // own, which asks cargo nothing through a wrapper and is no doctest.
     for (name, _) in std::env::vars_os() {
@@ -188,7 +217,7 @@ fn build(
             ra_jit.env_remove(&name);
         }
     }
-    for kept in ["RA_JIT_HOME", "RA_JIT_BACKEND", "RA_JIT_STD_FROM"] {
+    for kept in ["RA_JIT_HOME", "RA_JIT_BACKEND", "RA_JIT_STD_FROM", super::own_macro::SERVER] {
         if let Some(value) = std::env::var_os(kept) {
             ra_jit.env(kept, value);
         }
@@ -225,9 +254,11 @@ pub(crate) fn build_nothing(sysroot: &Path, dir: &Path, store: &Path) -> Result<
         env: BTreeMap::new(),
         deps: Vec::new(),
         proc_macro: None,
+        compiled_macro: false,
     };
     let exe = dir.join("build-script-build");
-    build(sysroot, &[script], dir, &exe, Some(store.to_owned()), false)
+    let made = Made { name: SCRIPT, proc_macro: false, dep_info: exe.with_extension("d"), exe };
+    build(sysroot, &[script], dir, &made, Some(store.to_owned()), false)
 }
 
 /// Why rustc is to compile the script when it read a variable as another than rustc would,
@@ -250,6 +281,11 @@ fn add(
     linked: &mut BTreeMap<PathBuf, usize>,
     path: &Path,
 ) -> Result<usize, String> {
+    // A library is named by its metadata to a crate rustc pipelines and by itself to the others.
+    let path = &match path.extension().is_some_and(|it| it == "rmeta") {
+        true => path.with_extension("rlib"),
+        false => path.to_owned(),
+    };
     if let Some(&at) = linked.get(path) {
         return Ok(at);
     }
@@ -277,8 +313,9 @@ fn add(
         env: record.crate_env.clone(),
         deps: Vec::new(),
         proc_macro: library.is_none().then(|| path.to_owned()),
+        compiled_macro: false,
     });
-    // A proc macro's libraries are described too, though rustc's library of it is what
+    // A proc macro's libraries are described too, though the library of it is what
     // expands: what the store keeps of the script is keyed by them.
     let mut deps = Vec::new();
     for (name, path) in asked.externs() {
@@ -297,7 +334,7 @@ fn described(krate: &Described, member: bool) -> Value {
         "cfg": krate.cfg,
         "env": krate.env,
         "is_workspace_member": member,
-        "is_proc_macro": krate.proc_macro.is_some(),
+        "is_proc_macro": krate.proc_macro.is_some() || krate.compiled_macro,
         "proc_macro_dylib_path": krate.proc_macro,
     })
 }

@@ -20,7 +20,7 @@ use super::{
     ancestor::Cargo,
     cli,
     daemon::{self, NotBuilt},
-    own_script, say, script,
+    own_macro, own_script, say, script,
     state::{State, place},
     switch::Enabled,
     units::{Copied, Record, stamp_now},
@@ -98,7 +98,7 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
     };
     compiler.args(&args);
     if only_asks {
-        std::process::exit(compiler.status()?.code().unwrap_or(1));
+        std::process::exit(for_load(compiler, &rustc, &args)?);
     }
     if outside {
         std::process::exit(self::outside(compiler, &rustc, &args)?);
@@ -188,6 +188,46 @@ fn outside(mut compiler: Command, rustc: &OsString, args: &[OsString]) -> anyhow
         if record.is_rlib() || record.runs_in_build() {
             record.write_described(&unit.records)?;
         }
+    }
+    Ok(status.code().unwrap_or(1))
+}
+
+/// Builds a crate for rust-analyzer's `cargo check --compile-time-deps` as `compiler`, rustc,
+/// does without ra-jit, but a proc macro when it is ra-jit's ([`own_macro::wanted`]): the
+/// libraries rustc compiles are then described for the proc macros that link them. The code
+/// to end with.
+fn for_load(mut compiler: Command, rustc: &OsString, args: &[OsString]) -> anyhow::Result<i32> {
+    if !own_macro::wanted() {
+        return Ok(compiler.status()?.code().unwrap_or(1));
+    }
+    let unit = Unit::of(args);
+    let record = unit.as_ref().map(|it| it.as_record(stamp_now(), Vec::new(), None));
+    if let Some((unit, record)) = unit.as_ref().zip(record.as_ref()).filter(|(_, it)| it.is_proc_macro())
+    {
+        let built = own_macro::made(record).ok_or("cargo names no place for it".to_owned());
+        let dir = unit.records.join(&unit.id).join(record.stamp.to_string());
+        let built = built.and_then(|made| {
+            own_script::compile_as(rustc, &unit.args, &unit.cwd, &unit.source, &made, &dir)
+        });
+        match built {
+            Ok(()) => {
+                record.write_described(&unit.records)?;
+                return Ok(0);
+            }
+            Err(why) => {
+                let then = format!("rustc compiles the proc macro `{}`", unit.crate_name);
+                say::fallback(&why, &then);
+            }
+        }
+    }
+    let text: Vec<String> = args.iter().filter_map(|it| it.to_str().map(str::to_owned)).collect();
+    own_macro::rustc_first(rustc, &text, &std::env::current_dir()?)?;
+    let status = compiler.status()?;
+    if let Some((unit, record)) = unit.as_ref().zip(record.as_ref())
+        && status.success()
+        && (record.is_rlib() || record.runs_in_build())
+    {
+        record.write_described(&unit.records)?;
     }
     Ok(status.code().unwrap_or(1))
 }

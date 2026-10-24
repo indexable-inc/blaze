@@ -7,6 +7,7 @@ pub(crate) mod wrapper;
 mod ancestor;
 mod cli;
 mod client;
+pub(crate) mod own_macro;
 pub(crate) mod own_script;
 mod package;
 pub(crate) mod plan;

@@ -6643,9 +6643,14 @@ fn cargo_config(args: &Args) -> CargoConfig {
         // The build scripts are run with cargo told it is a nightly, for
         // `--compile-time-deps`. Cargo then also takes an `[unstable]` table of the user's
         // configuration at its word, and `checksum-freshness` hands rustc a `-Z` flag the
-        // stable rustc refuses, so that no build script runs.
+        // stable rustc refuses, so that no build script runs. The wrapper is told when the
+        // target directory is ra-jit's own, which cargo's builds do not read: the proc macros
+        // built there can be ra-jit's (`cargo/own_macro.rs`).
         extra_env: [("CARGO_UNSTABLE_CHECKSUM_FRESHNESS".to_owned(), Some("false".to_owned()))]
             .into_iter()
+            .chain(args.own_target.then(|| {
+                (cargo::own_macro::OWN_TARGET.to_owned(), Some("1".to_owned()))
+            }))
             .collect(),
         ..Default::default()
     }
@@ -7094,6 +7099,11 @@ fn process_wide() {
     hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
     project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     ra_jit_expand::install();
+    let server = std::env::var_os(cargo::own_macro::SERVER).map(PathBuf::from);
+    let server = server.and_then(|it| std::env::current_dir().ok().map(|cwd| cwd.join(it)));
+    if let Some(Ok(server)) = server.as_deref().and_then(Path::to_str).map(AbsPathBuf::try_from) {
+        load_cargo::serve_listed_with(server);
+    }
 }
 
 /// Loads the workspace `args` names and builds what they ask for, then serves it when they

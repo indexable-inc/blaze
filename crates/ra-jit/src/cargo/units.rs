@@ -196,9 +196,13 @@ impl Record {
         self.crate_name.starts_with("build_script_")
     }
 
+    pub(crate) fn is_proc_macro(&self) -> bool {
+        self.crate_types().contains(&"proc-macro")
+    }
+
     /// Whether the crate runs during the build: a build script or a proc macro.
     pub(crate) fn runs_in_build(&self) -> bool {
-        self.is_build_script() || self.crate_types().contains(&"proc-macro")
+        self.is_build_script() || self.is_proc_macro()
     }
 
     /// The files of this unit that another unit or the user is given.
@@ -212,7 +216,7 @@ impl Record {
         if self.is_rlib() {
             outputs.push(out_dir.join(format!("lib{name}{extra}.rlib")));
         }
-        if self.crate_types().contains(&"proc-macro") {
+        if self.is_proc_macro() {
             let (prefix, suffix) = (std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX);
             outputs.push(out_dir.join(format!("{prefix}{name}{extra}{suffix}")));
         }
