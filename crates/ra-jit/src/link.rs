@@ -163,11 +163,11 @@ fn native(db: &RootDatabase, program: &[Crate], target: &Target) -> Native {
     let mut seen = FxHashSet::default();
     let mut order = Vec::new();
     let unlinked = crate::unlinked_panic_runtime(db, program);
+    let programs: FxHashSet<base_db::Crate> = program.iter().map(|&it| it.into()).collect();
     for &krate in program {
-        depth_first(db, krate.into(), unlinked, &mut seen, &mut order);
+        depth_first(db, krate.into(), unlinked, &programs, &mut seen, &mut order);
     }
     let mut native = Native::default();
-    let programs: FxHashSet<base_db::Crate> = program.iter().map(|&it| it.into()).collect();
     for &krate in order.iter().rev() {
         let attributes = hir_def::nameres::crate_def_map(db, krate)
             .modules(db)
@@ -251,21 +251,26 @@ fn lib_of(spec: &str) -> Option<NativeLib> {
     })
 }
 
-/// Puts `krate` in `order` after every crate it links: what a proc macro, `test` or the
-/// panic runtime named `unlinked` links is not linked.
+/// Puts `krate` in `order` after every crate it links: what the panic runtime named
+/// `unlinked` links is not linked, nor what a proc macro or `test` links unless it is one of
+/// the `programs`. A proc macro's library has the macro crate for its program and links libc
+/// through it: with libc not named, glibc gives each of its symbols the oldest version, a
+/// `realpath` that takes no null buffer.
 fn depth_first(
     db: &RootDatabase,
     krate: base_db::Crate,
     unlinked: &str,
+    programs: &FxHashSet<base_db::Crate>,
     seen: &mut FxHashSet<base_db::Crate>,
     order: &mut Vec<base_db::Crate>,
 ) {
     let data = krate.data(db);
-    let left_out = data.target_kind.is_proc_macro()
-        || matches!(
-            data.origin,
-            CrateOrigin::Lang(LangCrateOrigin::ProcMacro | LangCrateOrigin::Test)
-        )
+    let left_out = (!programs.contains(&krate)
+        && (data.target_kind.is_proc_macro()
+            || matches!(
+                data.origin,
+                CrateOrigin::Lang(LangCrateOrigin::ProcMacro | LangCrateOrigin::Test)
+            )))
         || Crate::from(krate)
             .display_name(db)
             .is_some_and(|name| name.crate_name().as_str() == unlinked);
@@ -273,7 +278,7 @@ fn depth_first(
         return;
     }
     for dep in &data.dependencies {
-        depth_first(db, dep.crate_id, unlinked, seen, order);
+        depth_first(db, dep.crate_id, unlinked, programs, seen, order);
     }
     order.push(krate);
 }

@@ -269,6 +269,15 @@ def built_macros(target):
     return sorted(map(name, ours)), sorted(map(name, set(libraries) - ours))
 
 
+def without_libc(target):
+    """ra-jit's proc-macro libraries in `target` that do not name libc: glibc binds each libc
+    symbol of such a library to its oldest version, a `realpath` that fails without a buffer."""
+    libraries = glob.glob(os.path.join(target, "**", "deps", "lib*.so"), recursive=True)
+    read = {lib: open(lib, "rb").read() for lib in libraries}
+    return sorted(os.path.basename(lib) for lib, data in read.items()
+                  if LIST in data and b"libc.so" not in data)
+
+
 def wired(work, root, meta, server):
     """The package built whole by ra-jit and run, its proc macros built by the load's cargo in
     ra-jit's own target directory (`--own-target`): by rustc, and then by ra-jit with the
@@ -296,6 +305,9 @@ def wired(work, root, meta, server):
             raise SystemExit(f"FAIL: the load ({how}) built the proc macros {ours} by ra-jit and "
                              f"{theirs} by rustc, not each of {wanted} by "
                              f"{'ra-jit' if named else 'rustc'}:\n{ran.stderr[-8000:]}")
+        bare = without_libc(os.path.join(root, "target", "rust-analyzer"))
+        if sys.platform == "linux" and bare:
+            raise SystemExit(f"FAIL: ra-jit linked the proc macros {bare} without libc")
         lines.append(f"the package whole, its proc macros by {'ra-jit' if named else 'rustc'}: "
                      f"built and linked in {took:.1f} s, prints what cargo's does")
     return lines
@@ -339,9 +351,13 @@ def app(name, work, server):
                      f"{said.stdout.strip()[:80]!r}")
         lines += [f"  left: {it[:300]}" for it in re.findall(r"^  left to rustc: (.*)$", ran.stderr, re.M)
                   if "no rustc symbol" not in it and "calling convention Custom" not in it]
+        lines += [f"  {it[:300]}" for it in re.findall(
+            r"^((?:resolve|frozen|proc macros|standard library|stats|phases|cold|warm):.*)$",
+            ran.stderr, re.M)]
         if named:
             lines += [f"  {it}" for it in fallbacks(own, theirs)]
         print("\n".join(lines[start:]), flush=True)
+    shutil.rmtree(root, ignore_errors=True)
     return lines
 
 
