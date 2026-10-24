@@ -35,6 +35,11 @@ back them is under [docs/upstream/](../upstream/), each with a `SOURCE.md`. Sear
   by ra-jit: how the harness builds it, what broke and was fixed, what is filed, and its edit
   and runtime numbers against cargo; why the whole program ran 5.9x slower than release and
   the added function took 19.8 s, and the macOS whole-program link. 2026-10-21, 2026-10-23.
+- [codegen-units.md](codegen-units.md): whole-program builds compiled many functions to an
+  LLVM module (`RA_JIT_UNITS=1`, #176): how the functions are found and cut, what units kept of
+  their imports, the build and run times on ripgrep, helix, nushell and bun against compiles
+  of one function and cargo's release build, and why LLVM takes four times rustc's time for
+  code of the same size. 2026-10-24.
 - [../architecture-split.md](../architecture-split.md): what of ra-jit belongs in the
   rust-analyzer subtree and what in `crates/`; ra-jit's changes to rust-analyzer by purpose,
   upstream's churn on the files they touch, rustc's crate split, and a migration plan.

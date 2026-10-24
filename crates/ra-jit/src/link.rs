@@ -18,21 +18,44 @@ use rustc_hash::FxHashSet;
 pub(crate) mod split;
 
 /// Links `objects` into the executable `exe`, with the native libraries of the crates `program`
-/// links. How long `cc` took.
+/// links. A shared library instead when `exports` names what it exports: the rest of it is
+/// its own, and the link leaves out what that does not reach, as rustc's of a `cdylib` does.
+/// How long `cc` took.
 pub(crate) fn executable(
     db: &RootDatabase,
     program: &[Crate],
     objects: &[&Path],
     sysroot: Option<&Path>,
     exe: &Path,
+    exports: Option<&[String]>,
 ) -> anyhow::Result<Duration> {
-    Line::of(db, program, sysroot)?.link(objects, exe)
+    let mut line = Line::of(db, program, sysroot, exports.is_some())?;
+    let Some(exports) = exports else { return line.link(objects, exe) };
+    let mut listed = exe.as_os_str().to_owned();
+    listed.push(".exports");
+    let listed = PathBuf::from(listed);
+    let (text, arg) = if line.apple {
+        let text: String = exports.iter().map(|it| format!("_{it}\n")).collect();
+        (text, format!("-Wl,-exported_symbols_list,{}", listed.display()))
+    } else {
+        let text: String = exports.iter().map(|it| format!("  {it};\n")).collect();
+        (
+            format!("{{\n global:\n{text} local: *;\n}};\n"),
+            format!("-Wl,--version-script={}", listed.display()),
+        )
+    };
+    std::fs::write(&listed, text).with_context(|| format!("writing {}", listed.display()))?;
+    line.after.push(arg);
+    let took = line.link(objects, exe);
+    _ = std::fs::remove_file(&listed);
+    took
 }
 
 /// The arguments `cc` links the program of some crates with, around its objects.
 pub(crate) struct Line {
     before: Vec<String>,
     after: Vec<String>,
+    apple: bool,
 }
 
 impl Line {
@@ -40,9 +63,10 @@ impl Line {
         db: &RootDatabase,
         program: &[Crate],
         sysroot: Option<&Path>,
+        shared: bool,
     ) -> anyhow::Result<Line> {
         let Some(&first) = program.first() else { bail!("nothing to link") };
-        let target = Target::of(db, first.into());
+        let target = Target { shared, ..Target::of(db, first.into()) };
         let mut before = Vec::new();
         if !target.apple
             && let Some(gcc_ld) = sysroot.and_then(lld_dir)
@@ -57,7 +81,7 @@ impl Line {
         }
         after.extend(native.args);
         after.extend(target.trailing());
-        Ok(Line { before, after })
+        Ok(Line { before, after, apple: target.apple })
     }
 
     /// Links `objects` into the executable `exe`. How long `cc` took.
@@ -258,6 +282,8 @@ fn depth_first(
 struct Target {
     apple: bool,
     arch: String,
+    /// A shared library is linked, not an executable.
+    shared: bool,
 }
 
 impl Target {
@@ -266,7 +292,8 @@ impl Target {
         let value = |key: &str| {
             cfg.get_cfg_values(key).next().map(|it| it.as_str().to_owned()).unwrap_or_default()
         };
-        Target { apple: value("target_vendor") == "apple", arch: value("target_arch") }
+        let (apple, arch) = (value("target_vendor") == "apple", value("target_arch"));
+        Target { apple, arch, shared: false }
     }
 
     fn leading(&self) -> Vec<String> {
@@ -332,17 +359,28 @@ impl Target {
     /// The rest of rustc's arguments: what is not reached is left out, and nothing is linked
     /// that the crates did not ask for.
     fn trailing(&self) -> Vec<String> {
-        let args: &[&str] = if self.apple {
-            &["-Wl,-dead_strip", "-nodefaultlibs"]
-        } else {
-            &[
+        let args: &[&str] = match (self.apple, self.shared) {
+            (true, false) => &["-Wl,-dead_strip", "-nodefaultlibs"],
+            (true, true) => &["-dynamiclib", "-Wl,-dead_strip", "-nodefaultlibs"],
+            (false, false) => &[
                 "-Wl,--eh-frame-hdr",
                 "-Wl,-z,noexecstack",
                 "-Wl,--gc-sections",
                 "-pie",
                 "-Wl,-z,relro,-z,now",
                 "-nodefaultlibs",
-            ]
+            ],
+            // A call in the library goes to its own definition, which the code generator
+            // took for one in the same object: nothing loaded before it may stand in.
+            (false, true) => &[
+                "-Wl,--eh-frame-hdr",
+                "-Wl,-z,noexecstack",
+                "-Wl,--gc-sections",
+                "-shared",
+                "-Wl,-Bsymbolic",
+                "-Wl,-z,relro,-z,now",
+                "-nodefaultlibs",
+            ],
         };
         args.iter().map(|it| (*it).to_owned()).collect()
     }
@@ -375,7 +413,7 @@ mod tests {
             Some(("libz.so.1".to_owned(), NativeLibKind::Dylib, true, false))
         );
         assert_eq!(lib("bogus=x"), None);
-        let linux = Target { apple: false, arch: "x86_64".to_owned() };
+        let linux = Target { apple: false, arch: "x86_64".to_owned(), shared: false };
         assert_eq!(linux.search("native=/a/out").as_deref(), Some("-L/a/out"));
         assert_eq!(linux.search("/b").as_deref(), Some("-L/b"));
         assert_eq!(linux.search("dependency=/c"), None);

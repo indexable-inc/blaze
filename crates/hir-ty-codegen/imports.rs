@@ -54,10 +54,13 @@ const INLINE: usize = 300;
 const EVOLUTION: f32 = 0.7;
 const DEPTH: u32 = 8;
 /// The most instructions a compile imports in all.
-const BUDGET: usize = 40_000;
+pub(super) const BUDGET: usize = 40_000;
 /// The most instructions of Cranelift IR a body has that an export is built for, at each
 /// instruction of the most LLVM imports: what is larger is not built, as none would be.
-const CLIF_PER_IMPORTED: usize = 4;
+/// Cranelift's IR of small calls of `std` is many times LLVM's: SipHash's `d_rounds` is 1792
+/// of it and some 50 of LLVM's, so at 4 it was never imported and `words` ran 1.27x (x86) and
+/// 1.38x (aarch64) where at 16 it runs 1.14x and 1.23x; 64 imports no more.
+const CLIF_PER_IMPORTED: usize = 16;
 
 /// A function as the compiles that call it import it.
 pub(super) struct Export {
@@ -93,6 +96,25 @@ pub(super) fn enabled() -> bool {
 /// The exports of what `recorder` calls that its compile imports, and of what those call in
 /// turn, the first first: what a call asks for is in the compile's names from then on.
 pub(super) fn chosen(recorder: &mut Recorder<'_>) -> Vec<Import> {
+    tallied(chosen_for(recorder, &|_| false, BUDGET))
+}
+
+/// `chosen`, counted as imported.
+pub(super) fn tallied(chosen: Vec<Import>) -> Vec<Import> {
+    let tally = Tally::global();
+    tally.imported.fetch_add(chosen.len(), Ordering::Relaxed);
+    let spent = chosen.iter().map(|it| it.export.size).sum();
+    tally.imported_size.fetch_add(spent, Ordering::Relaxed);
+    chosen
+}
+
+/// [`chosen`], for a compile of the functions of a unit ([`super::units`]), which has the
+/// room of all of them and imports none of them: `defined` says which instances it has.
+pub(super) fn chosen_for(
+    recorder: &mut Recorder<'_>,
+    defined: &dyn Fn(&Instance) -> bool,
+    budget: usize,
+) -> Vec<Import> {
     let db = recorder.db;
     let mut chosen = Vec::new();
     let mut taken: FxHashSet<u32> = FxHashSet::default();
@@ -107,7 +129,7 @@ pub(super) fn chosen(recorder: &mut Recorder<'_>) -> Vec<Import> {
         }
         let request = &recorder.requests.funcs[id as usize];
         let FuncTarget::Instance(instance, env) = &request.target else { continue };
-        if !super::tier::shared(db, instance) {
+        if !super::tier::shared(db, instance) || defined(instance) {
             continue;
         }
         let Some(export) = export(db, instance, env) else { continue };
@@ -119,7 +141,7 @@ pub(super) fn chosen(recorder: &mut Recorder<'_>) -> Vec<Import> {
         };
         if export.signature != request.sig
             || export.size as f32 > room as f32 * share
-            || spent + export.size > BUDGET
+            || spent + export.size > budget
         {
             continue;
         }
@@ -133,9 +155,6 @@ pub(super) fn chosen(recorder: &mut Recorder<'_>) -> Vec<Import> {
         let datas = datas.iter().map(|it| it.as_u32()).collect();
         chosen.push(Import { export, id, funcs, datas });
     }
-    let tally = Tally::global();
-    tally.imported.fetch_add(chosen.len(), Ordering::Relaxed);
-    tally.imported_size.fetch_add(spent, Ordering::Relaxed);
     chosen
 }
 

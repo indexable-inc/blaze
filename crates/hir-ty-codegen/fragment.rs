@@ -56,7 +56,7 @@ pub(super) struct FuncRequest {
 
 /// A data object that compiled code or other data points to. The ids inside a blob index the
 /// requests of the same [`Requests`].
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) enum DataRequest {
     Blob {
         blob: ConstBlob,
@@ -353,6 +353,17 @@ pub(super) struct Wants {
 }
 
 impl Wants {
+    pub(super) fn new(isa: &'static dyn TargetIsa) -> Wants {
+        Wants {
+            isa,
+            requests: Requests::default(),
+            funcs: FxHashMap::default(),
+            shared: FxHashMap::default(),
+            pointees: Vec::new(),
+            seen: Vec::new(),
+        }
+    }
+
     pub(super) fn into_requests(self) -> Requests {
         self.requests
     }
@@ -423,7 +434,82 @@ impl Wants {
         (&self.requests.funcs[mark.funcs..], &self.requests.datas[mark.datas..])
     }
 
-    fn func(&mut self, target: FuncTarget, sig: &Signature) -> FuncId {
+    /// Which of the requests `code` refers to, directly or through the data it refers to,
+    /// with `code` renumbered to them. `None`, and `code` as it was, when it refers to all.
+    #[cfg(feature = "llvm")]
+    fn kept(&self, code: &mut Code) -> Option<Kept> {
+        let requests = &self.requests;
+        let mut funcs = vec![false; requests.funcs.len()];
+        let mut datas = vec![false; requests.datas.len()];
+        let mut reached = Vec::new();
+        for reloc in &code.relocs {
+            match reloc.name {
+                ModuleRelocTarget::User { namespace: 0, index } => funcs[index as usize] = true,
+                ModuleRelocTarget::User { namespace: 1, index } => reached.push(index as usize),
+                _ => {}
+            }
+        }
+        while let Some(at) = reached.pop() {
+            if std::mem::replace(&mut datas[at], true) {
+                continue;
+            }
+            if let DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } =
+                &requests.datas[at]
+            {
+                reached.extend(blob.relocs.iter().map(|it| it.1.as_u32() as usize));
+                for &(_, func) in &blob.fn_relocs {
+                    funcs[func.as_u32() as usize] = true;
+                }
+            }
+        }
+        if funcs.iter().chain(&datas).all(|&it| it) {
+            return None;
+        }
+        let numbered = |kept: &[bool]| {
+            let mut next = 0;
+            let numbers = kept.iter().map(|&it| {
+                let number = next;
+                next += u32::from(it);
+                it.then_some(number)
+            });
+            numbers.collect::<Vec<Option<u32>>>()
+        };
+        let kept = Kept { funcs: numbered(&funcs), datas: numbered(&datas) };
+        for reloc in &mut code.relocs {
+            if let ModuleRelocTarget::User { namespace, index } = &mut reloc.name {
+                *index = match *namespace {
+                    0 => kept.funcs[*index as usize].unwrap(),
+                    1 => kept.datas[*index as usize].unwrap(),
+                    _ => *index,
+                };
+            }
+        }
+        Some(kept)
+    }
+
+    /// Of what the functions of a unit ask for, what `code`, one function's, refers to, in
+    /// its own numbers, which `code` is renumbered to.
+    #[cfg(feature = "llvm")]
+    pub(super) fn referenced(&self, code: &mut Code) -> Requests {
+        let Some(kept) = self.kept(code) else {
+            let Requests { funcs, datas } = &self.requests;
+            return Requests { funcs: funcs.clone(), datas: datas.clone() };
+        };
+        let funcs = iter::zip(&self.requests.funcs, &kept.funcs);
+        let funcs = funcs.filter(|it| it.1.is_some()).map(|it| it.0.clone()).collect();
+        let datas = iter::zip(&self.requests.datas, &kept.datas).filter(|it| it.1.is_some());
+        let datas = datas.map(|(request, _)| {
+            let mut request = request.clone();
+            if let DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } = &mut request
+            {
+                kept.renumber(blob);
+            }
+            request
+        });
+        Requests { funcs, datas: datas.collect() }
+    }
+
+    pub(super) fn func(&mut self, target: FuncTarget, sig: &Signature) -> FuncId {
         let request = FuncRequest { target, sig: sig.clone() };
         if let Some(&id) = self.funcs.get(&request) {
             return id;
@@ -556,14 +642,7 @@ impl<'db> Recorder<'db> {
             isa,
             target,
             checked,
-            wants: Wants {
-                isa,
-                requests: Requests::default(),
-                funcs: FxHashMap::default(),
-                shared: FxHashMap::default(),
-                pointees: Vec::new(),
-                seen: Vec::new(),
-            },
+            wants: Wants::new(isa),
             vtables: FxHashMap::default(),
             statics: FxHashMap::default(),
             layouts: std::env::var_os("RA_JIT_LAYOUTS").map(|_| Default::default()),
@@ -690,28 +769,7 @@ impl<'db> Recorder<'db> {
     /// is in this function's names, with the bodies it shows LLVM moved among this one's.
     fn moved(&mut self, body: &Inlinable) -> ir::Function {
         let (funcs, datas) = self.moved_requests(&body.requests);
-        let rename = |func: &ir::Function| {
-            let mut func = func.clone();
-            let names: Vec<_> = func
-                .params
-                .user_named_funcs()
-                .iter()
-                .map(|(name, it)| (name, it.clone()))
-                .collect();
-            for (name, was) in names {
-                let index = match was.namespace {
-                    0 => funcs[was.index as usize].as_u32(),
-                    1 => datas[was.index as usize].as_u32(),
-                    // A callee that was put in this one, which nothing calls any more.
-                    _ => continue,
-                };
-                func.params.reset_user_func_name(
-                    name,
-                    ir::UserExternalName { namespace: was.namespace, index },
-                );
-            }
-            func
-        };
+        let rename = |func: &ir::Function| renamed(func, &funcs, &datas);
         for seen in &body.seen {
             let id = funcs[seen.id.as_u32() as usize];
             if !self.seen.iter().any(|it| it.id == id) {
@@ -728,67 +786,16 @@ impl<'db> Recorder<'db> {
     /// of calls LLVM then takes out: each would be compiled, and whatever that calls.
     #[cfg(feature = "llvm")]
     pub(super) fn keep_referenced(&mut self, code: &mut Code) {
-        let requests = &self.wants.requests;
-        let mut funcs = vec![false; requests.funcs.len()];
-        let mut datas = vec![false; requests.datas.len()];
-        let mut reached = Vec::new();
-        for reloc in &code.relocs {
-            match reloc.name {
-                ModuleRelocTarget::User { namespace: 0, index } => funcs[index as usize] = true,
-                ModuleRelocTarget::User { namespace: 1, index } => reached.push(index as usize),
-                _ => {}
-            }
-        }
-        while let Some(at) = reached.pop() {
-            if std::mem::replace(&mut datas[at], true) {
-                continue;
-            }
-            if let DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } =
-                &requests.datas[at]
-            {
-                reached.extend(blob.relocs.iter().map(|it| it.1.as_u32() as usize));
-                for &(_, func) in &blob.fn_relocs {
-                    funcs[func.as_u32() as usize] = true;
-                }
-            }
-        }
-        if funcs.iter().chain(&datas).all(|&it| it) {
-            return;
-        }
-        let numbered = |kept: &[bool]| {
-            let mut next = 0;
-            let numbers = kept.iter().map(|&it| {
-                let number = next;
-                next += u32::from(it);
-                it.then_some(number)
-            });
-            numbers.collect::<Vec<Option<u32>>>()
-        };
-        let (func_numbers, data_numbers) = (numbered(&funcs), numbered(&datas));
-        let func = |id: FuncId| FuncId::from_u32(func_numbers[id.as_u32() as usize].unwrap());
-        let data = |id: DataId| DataId::from_u32(data_numbers[id.as_u32() as usize].unwrap());
-        let renumbered = |blob: &mut ConstBlob| {
-            blob.relocs.iter_mut().for_each(|it| it.1 = data(it.1));
-            blob.fn_relocs.iter_mut().for_each(|it| it.1 = func(it.1));
-        };
+        let Some(kept) = self.wants.kept(code) else { return };
         let Requests { funcs: all_funcs, datas: all_datas } =
             std::mem::take(&mut self.wants.requests);
         let kept_funcs: Vec<FuncRequest> =
-            iter::zip(all_funcs, &funcs).filter(|it| *it.1).map(|it| it.0).collect();
+            iter::zip(all_funcs, &kept.funcs).filter(|it| it.1.is_some()).map(|it| it.0).collect();
         let mut kept_datas: Vec<DataRequest> =
-            iter::zip(all_datas, &datas).filter(|it| *it.1).map(|it| it.0).collect();
+            iter::zip(all_datas, &kept.datas).filter(|it| it.1.is_some()).map(|it| it.0).collect();
         for request in &mut kept_datas {
             if let DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } = request {
-                renumbered(blob);
-            }
-        }
-        for reloc in &mut code.relocs {
-            if let ModuleRelocTarget::User { namespace, index } = &mut reloc.name {
-                *index = match *namespace {
-                    0 => func(FuncId::from_u32(*index)).as_u32(),
-                    1 => data(DataId::from_u32(*index)).as_u32(),
-                    _ => *index,
-                };
+                kept.renumber(blob);
             }
         }
         let wants = &mut self.wants;
@@ -800,16 +807,14 @@ impl<'db> Recorder<'db> {
         wants.shared = std::mem::take(&mut wants.shared)
             .into_iter()
             .filter_map(|(mut blob, id)| {
-                data_numbers[id.as_u32() as usize]?;
-                renumbered(&mut blob);
-                Some((blob, data(id)))
+                kept.data(id)?;
+                kept.renumber(&mut blob);
+                Some((blob, kept.data(id)?))
             })
             .collect();
-        let kept = |id: &mut DataId| {
-            data_numbers[id.as_u32() as usize].map(|it| *id = DataId::from_u32(it)).is_some()
-        };
-        self.statics.retain(|_, id| kept(id));
-        self.vtables.retain(|_, id| kept(id));
+        let still = |id: &mut DataId| kept.data(*id).map(|it| *id = it).is_some();
+        self.statics.retain(|_, id| still(id));
+        self.vtables.retain(|_, id| still(id));
         wants.requests = Requests { funcs: kept_funcs, datas: kept_datas };
     }
 
@@ -911,6 +916,49 @@ impl<'db> Recorder<'db> {
             tls,
         })
     }
+}
+
+/// The number each request kept has among those kept ([`Wants::kept`]).
+#[cfg(feature = "llvm")]
+struct Kept {
+    funcs: Vec<Option<u32>>,
+    datas: Vec<Option<u32>>,
+}
+
+#[cfg(feature = "llvm")]
+impl Kept {
+    fn func(&self, id: FuncId) -> Option<FuncId> {
+        self.funcs[id.as_u32() as usize].map(FuncId::from_u32)
+    }
+
+    fn data(&self, id: DataId) -> Option<DataId> {
+        self.datas[id.as_u32() as usize].map(DataId::from_u32)
+    }
+
+    /// What a blob kept points to, in the numbers of what is kept.
+    fn renumber(&self, blob: &mut ConstBlob) {
+        blob.relocs.iter_mut().for_each(|it| it.1 = self.data(it.1).unwrap());
+        blob.fn_relocs.iter_mut().for_each(|it| it.1 = self.func(it.1).unwrap());
+    }
+}
+
+/// `func` in the names of the requests its own became, as [`Recorder::moved_requests`]
+/// gives them.
+pub(super) fn renamed(func: &ir::Function, funcs: &[FuncId], datas: &[DataId]) -> ir::Function {
+    let mut func = func.clone();
+    let names: Vec<_> =
+        func.params.user_named_funcs().iter().map(|(name, it)| (name, it.clone())).collect();
+    for (name, was) in names {
+        let index = match was.namespace {
+            0 => funcs[was.index as usize].as_u32(),
+            1 => datas[was.index as usize].as_u32(),
+            // A callee that was put in this one, which nothing calls any more.
+            _ => continue,
+        };
+        func.params
+            .reset_user_func_name(name, ir::UserExternalName { namespace: was.namespace, index });
+    }
+    func
 }
 
 impl From<cranelift_module::ModuleError> for CodegenError {

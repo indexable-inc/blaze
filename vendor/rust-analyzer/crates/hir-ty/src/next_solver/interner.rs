@@ -1073,7 +1073,10 @@ impl<'db> Interner for DbInterner<'db> {
     }
 
     fn with_cached_task<T>(self, task: impl FnOnce() -> T) -> (T, Self::DepNodeIndex) {
-        // Every goal the solver computes runs in here, a nested goal inside its parent's.
+        // Every goal the solver computes runs in here, a nested goal inside its parent's. A
+        // goal can take minutes of solving that asks the database nothing, so a cancelled one
+        // is noticed here rather than at the next query.
+        salsa::Database::unwind_if_revision_cancelled(self.db);
         (super::ensure_sufficient_stack(task), DepNodeIndex)
     }
 

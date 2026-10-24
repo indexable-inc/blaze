@@ -291,7 +291,9 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
 - `unused_mut` ("variable does not need to be mutable"), a warning: a binding declared `mut`
   that no assignment or mutable borrow needs the `mut` of, as rustc's `used_mut`. A closure
   needs the `mut` of a captured variable when its body mutates it, and a name that starts
-  with `_` is left alone, as rustc does.
+  with `_` is left alone, as rustc does. A body whose types have an error gets none, as
+  rustc lints no body its type check failed. A source that denies it fails the build with it
+  ([no-rustc.md](no-rustc.md), step D), unless `RA_JIT_BORROWCK_REFUSE=0`.
 
 ## How it is tested
 

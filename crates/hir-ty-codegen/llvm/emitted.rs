@@ -1,9 +1,12 @@
-//! The object file LLVM wrote for one function, read back as a [`Code`].
+//! The object file LLVM wrote for a function, or for the functions of a unit, read back as a
+//! [`Code`] for each.
 //!
-//! The code is the function's section. Constants LLVM put in sections of their own (jump
+//! The code of a function is its section. Constants LLVM put in sections of their own (jump
 //! tables, float literals) are laid out after it in the same bytes, and what the code says
 //! about where they are is filled in here, so that the rest of ra-jit sees one piece of code
-//! that refers to nothing but what the function asked for.
+//! that refers to nothing but what the function asked for. What the functions of a unit call
+//! of each other they call by the names of requests, as they call anything else; constants
+//! more than one of them uses are a data object of their own.
 
 use cranelift_codegen::{
     binemit::Reloc,
@@ -18,9 +21,9 @@ use object::{
     Architecture, BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationFlags,
     RelocationTarget, SectionIndex, SectionKind, SymbolSection, elf, macho, pe,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::{OWN, Symbol, Unhandled};
+use super::{Symbol, Unhandled};
 use crate::{
     ConstBlob,
     debuginfo::{LineRow, SlotPlaces, VariablePlace},
@@ -28,8 +31,16 @@ use crate::{
     unwind::{FrameRows, FrameRule, FunctionUnwind, seh},
 };
 
-pub(super) struct Emitted<'data> {
-    file: object::File<'data>,
+pub(super) struct Emitted<'data, 'file> {
+    file: &'file object::File<'data>,
+    /// The section of the function.
+    text: SectionIndex,
+    /// The sections of every function of the object that is read.
+    texts: &'file FxHashSet<SectionIndex>,
+    /// Sections the code of more than one of them refers to.
+    shared: &'file FxHashSet<SectionIndex>,
+    /// The name of the function, which is that of the file its lines are of.
+    name: &'file str,
     /// What became of each section the code leads to.
     placed: FxHashMap<SectionIndex, Placement>,
     /// The sections that are part of the code, in the order they are in `bytes`.
@@ -51,27 +62,85 @@ enum Placement {
     Blob(DataId),
 }
 
-impl<'data> Emitted<'data> {
-    pub(super) fn code(
-        object: &'data [u8],
+/// The code of each of `functions`, by its name in the object and its signature. What is wrong
+/// with the code of one is that function's; what is wrong with the object is every one's.
+pub(super) fn read(
+    object: &[u8],
+    functions: &[(&str, Signature)],
+    recorder: &mut Wants,
+) -> Result<Vec<Result<Code, Unhandled>>, Unhandled> {
+    let file = object::File::parse(object)?;
+    let mut found: Vec<Option<(SectionIndex, u64)>> = vec![None; functions.len()];
+    for symbol in file.symbols() {
+        let (Ok(name), SymbolSection::Section(section)) = (symbol.name(), symbol.section()) else {
+            continue;
+        };
+        if let Some(at) = functions.iter().position(|it| it.0 == plain(&file, name)) {
+            found[at] = Some((section, symbol.address()));
+        }
+    }
+    let texts: FxHashSet<SectionIndex> = found.iter().flatten().map(|it| it.0).collect();
+    let mut referrers: FxHashMap<SectionIndex, usize> = FxHashMap::default();
+    if texts.len() > 1 {
+        for &text in &texts {
+            let mut targets = FxHashSet::default();
+            for (_, relocation) in file.section_by_index(text)?.relocations() {
+                if let Destination::Section(target) = Emitted::destination(&file, &relocation)?
+                    && !texts.contains(&target)
+                {
+                    targets.insert(target);
+                }
+            }
+            for target in targets {
+                *referrers.entry(target).or_default() += 1;
+            }
+        }
+    }
+    let shared = referrers.into_iter().filter(|it| it.1 > 1).map(|it| it.0).collect();
+    let mut codes = Vec::with_capacity(functions.len());
+    for (at, (_, signature)) in functions.iter().enumerate() {
+        let code = match found[at] {
+            None => Err(Unhandled::Shape("an object without the function")),
+            Some((_, address)) if address != 0 => {
+                Err(Unhandled::Shape("code ahead of the function"))
+            }
+            Some((text, _)) if found.iter().flatten().filter(|it| it.0 == text).count() > 1 => {
+                Err(Unhandled::Shape("functions that share a section"))
+            }
+            Some((text, _)) => {
+                let name = functions[at].0;
+                Emitted::code(&file, text, &texts, &shared, name, signature.clone(), recorder)
+            }
+        };
+        codes.push(code);
+    }
+    Ok(codes)
+}
+
+/// Where a relocation leads: to a request or a library function by its name, or into a
+/// section of the object. A function of the unit is called by the name of its request, which
+/// only such a function has as a definition.
+enum Destination<'name> {
+    Named(&'name str),
+    Section(SectionIndex),
+}
+
+impl<'data, 'file> Emitted<'data, 'file> {
+    fn code(
+        file: &'file object::File<'data>,
+        text: SectionIndex,
+        texts: &'file FxHashSet<SectionIndex>,
+        shared: &'file FxHashSet<SectionIndex>,
+        name: &'file str,
         signature: Signature,
         recorder: &mut Wants,
     ) -> Result<Code, Unhandled> {
-        let file = object::File::parse(object)?;
-        let own = file
-            .symbols()
-            .find(|symbol| {
-                symbol.is_definition() && symbol.name().is_ok_and(|name| plain(&file, name) == OWN)
-            })
-            .ok_or(Unhandled::Shape("an object without the function"))?;
-        let SymbolSection::Section(text) = own.section() else {
-            return Err(Unhandled::Shape("an object without the function"));
-        };
-        if own.address() != 0 {
-            return Err(Unhandled::Shape("code ahead of the function"));
-        }
         let mut emitted = Emitted {
             file,
+            text,
+            texts,
+            shared,
+            name,
             placed: FxHashMap::default(),
             inline: Vec::new(),
             bytes: Vec::new(),
@@ -118,17 +187,42 @@ impl<'data> Emitted<'data> {
         let unit = dwarf.unit(dwarf.units().next().ok()??).ok()?;
         let mut places = SlotPlaces::default();
         let mut entries = unit.entries();
+        // How deep the function's subprogram is, while what is read is in it, and how deep
+        // another function LLVM built into it is, whose variables are of the other's slots.
+        let (mut within, mut inlined): (Option<isize>, Option<isize>) = (None, None);
         while let Some(entry) = entries.next_dfs().ok()? {
+            if within.is_some_and(|depth| entry.depth() <= depth) {
+                within = None;
+            }
+            if inlined.is_some_and(|depth| entry.depth() <= depth) {
+                inlined = None;
+            }
             match entry.tag() {
+                gimli::DW_TAG_inlined_subroutine if inlined.is_none() => {
+                    inlined = Some(entry.depth());
+                }
                 gimli::DW_TAG_subprogram => {
+                    let low = entry.attr_value(gimli::DW_AT_low_pc);
+                    let low = low.and_then(|it| dwarf.attr_address(&unit, it).ok().flatten());
+                    if low.and_then(|it| self.local(it)) != Some(0) {
+                        continue;
+                    }
+                    within = Some(entry.depth());
                     if let Some(base) = entry.attr_value(gimli::DW_AT_frame_base)
                         && let Some(base) = base.exprloc_value()
                     {
                         places.frame_base = base.0.slice().to_vec();
                     }
                 }
-                gimli::DW_TAG_variable => {
-                    let name = entry.attr_value(gimli::DW_AT_name)?;
+                gimli::DW_TAG_variable if within.is_some() && inlined.is_none() => {
+                    // The function's code apart from another's that it is built into has its
+                    // variables by what they are in that other: the code is the same.
+                    let name = match entry.attr_value(gimli::DW_AT_abstract_origin) {
+                        Some(gimli::AttributeValue::UnitRef(at)) => {
+                            unit.entry(at).ok()?.attr_value(gimli::DW_AT_name)?
+                        }
+                        _ => entry.attr_value(gimli::DW_AT_name)?,
+                    };
                     let name = dwarf.attr_string(&unit, name).ok()?;
                     let slot = name.to_string().ok()?.parse().ok()?;
                     let mut ranges = Vec::new();
@@ -141,7 +235,12 @@ impl<'data> Emitted<'data> {
                             let mut list = dwarf.attr_locations(&unit, list).ok()??;
                             while let Some(place) = list.next().ok()? {
                                 let range = place.range;
-                                ranges.push((range.begin as u32, range.end as u32, place.data));
+                                let (Some(begin), Some(end)) =
+                                    (self.local(range.begin), self.local(range.end))
+                                else {
+                                    continue;
+                                };
+                                ranges.push((begin, end, place.data));
                             }
                         }
                     }
@@ -195,8 +294,8 @@ impl<'data> Emitted<'data> {
     }
 
     /// The bytes of the section `name` with what its relocations say filled in, as far as
-    /// that is known before linking: the function starts its section, and every other
-    /// section is on its own.
+    /// that is known before linking: each function starts its section, which is at
+    /// [`Self::base`], and every other section is on its own.
     fn relocated(&self, name: &str) -> Option<Vec<u8>> {
         let Some(section) = self.file.section_by_name(name) else { return Some(Vec::new()) };
         let mut bytes = section.data().ok()?.to_vec();
@@ -204,8 +303,12 @@ impl<'data> Emitted<'data> {
             if relocation.kind() != object::RelocationKind::Absolute {
                 return None;
             }
-            let symbol = Self::symbol(&self.file, &relocation).ok()?;
-            let value = symbol.address().wrapping_add_signed(relocation.addend());
+            let symbol = Self::symbol(self.file, &relocation).ok()?;
+            let base = match symbol.section() {
+                SymbolSection::Section(at) if self.texts.contains(&at) => Self::base(at),
+                _ => 0,
+            };
+            let value = (base + symbol.address()).wrapping_add_signed(relocation.addend());
             let size = usize::from(relocation.size() / 8);
             let at = bytes.get_mut(offset as usize..)?.get_mut(..size)?;
             at.copy_from_slice(value.to_le_bytes().get(..size)?);
@@ -213,27 +316,52 @@ impl<'data> Emitted<'data> {
         Some(bytes)
     }
 
+    /// Where a section of code is taken to be by [`Self::relocated`]: each 4 GiB on from the
+    /// one before, so that an address in the debug sections tells which function it is in.
+    fn base(section: SectionIndex) -> u64 {
+        (section.0 as u64 + 1) << 32
+    }
+
+    /// How far into the function an address [`Self::relocated`] filled in is, if it is in the
+    /// function's section.
+    fn local(&self, address: u64) -> Option<u32> {
+        u32::try_from(address.checked_sub(Self::base(self.text))?).ok()
+    }
+
     /// Which source location the code is of from each offset on, from the line table: the
     /// lines of it are the source locations `lower` marked the instructions with.
     fn lines(&self) -> Result<Vec<LineRow>, Unhandled> {
-        let Some(section) = self.file.section_by_name(".debug_line") else {
+        const MALFORMED: Unhandled = Unhandled::Shape("a line table that does not parse");
+        if self.file.section_by_name(".debug_line").is_none() {
             return Ok(Vec::new());
+        }
+        let bytes = self.relocated(".debug_line").ok_or(MALFORMED)?;
+        let table = gimli::DebugLine::new(&bytes, LittleEndian);
+        let program =
+            table.program(gimli::DebugLineOffset(0), 8, None, None).map_err(|_| MALFORMED)?;
+        let (program, sequences) = program.sequences().map_err(|_| MALFORMED)?;
+        // The rows of code of another function of the object that LLVM built into this one
+        // are of that one's statements: the code is taken to be of the call.
+        let header = program.header();
+        let ours = |file: &gimli::FileEntry<EndianSlice<'_, LittleEndian>>| {
+            matches!(file.path_name(), gimli::AttributeValue::String(name)
+                if name.slice() == self.name.as_bytes())
         };
-        let malformed = |_| Unhandled::Shape("a line table that does not parse");
-        let table = gimli::DebugLine::new(section.data()?, LittleEndian);
-        let program = table.program(gimli::DebugLineOffset(0), 8, None, None).map_err(malformed)?;
-        let (program, sequences) = program.sequences().map_err(malformed)?;
-        // The function is at the start of the one section of code, which is where a
-        // sequence that is yet to be relocated says it starts.
-        let [sequence] = sequences.as_slice() else {
-            return Err(Unhandled::Shape("a line table of more than one run of code"));
-        };
-        let mut rows = program.resume_from(sequence);
+        let named = header.file_names().iter().any(ours);
+        // Each run of code is of one section: the function's are those that start in it.
         let mut ranges = Vec::new();
-        while let Some((_, row)) = rows.next_row().map_err(malformed)? {
-            let line = row.line().map_or(0, |line| line.get());
-            if !row.end_sequence() && line != 0 && row.address() < u64::from(self.code) {
-                ranges.push((row.address() as u32, ir::SourceLoc::new(line as u32)));
+        for sequence in sequences.iter().filter(|it| self.local(it.start).is_some()) {
+            let mut rows = program.resume_from(sequence);
+            while let Some((header, row)) = rows.next_row().map_err(|_| MALFORMED)? {
+                let line = row.line().map_or(0, |line| line.get());
+                if let Some(at) = self.local(row.address())
+                    && !row.end_sequence()
+                    && line != 0
+                    && at < self.code
+                    && (!named || row.file(header).is_some_and(ours))
+                {
+                    ranges.push((at, ir::SourceLoc::new(line as u32)));
+                }
             }
         }
         Ok(LineRow::of_ranges(ranges))
@@ -260,9 +388,18 @@ impl<'data> Emitted<'data> {
             if self.placed.contains_key(&index) {
                 continue;
             }
+            if index != first && self.texts.contains(&index) {
+                return Err(Unhandled::Shape("code that refers into another function"));
+            }
             let section = self.file.section_by_index(index)?;
-            if section.relocations().any(|(_, relocation)| Self::is_address(&relocation)) {
-                let blob = self.blob(&section)?;
+            let addresses =
+                section.relocations().any(|(_, relocation)| Self::is_address(&relocation));
+            // What more than one function uses is had once, as a data object.
+            if addresses || self.shared.contains(&index) {
+                let blob = match addresses {
+                    true => self.blob(&section)?,
+                    false => self.blob_elf(&section)?,
+                };
                 let id = recorder
                     .define_const(blob)
                     .map_err(|_| Unhandled::Shape("constants that cannot be defined"))?;
@@ -287,9 +424,7 @@ impl<'data> Emitted<'data> {
             self.placed.insert(index, Placement::Inline(start));
             self.inline.push(index);
             for (_, relocation) in section.relocations() {
-                if let SymbolSection::Section(target) =
-                    Self::symbol(&self.file, &relocation)?.section()
-                {
+                if let Destination::Section(target) = Self::destination(self.file, &relocation)? {
                     pending.push(target);
                 }
             }
@@ -316,9 +451,10 @@ impl<'data> Emitted<'data> {
             align: section.align().max(1),
         };
         for (offset, relocation) in section.relocations() {
-            let symbol = Self::symbol(&self.file, &relocation)?;
-            let named = symbol.is_undefined().then(|| symbol.name().ok()).flatten();
-            let target = named.and_then(Symbol::parse);
+            let target = match Self::destination(self.file, &relocation)? {
+                Destination::Named(name) => Symbol::parse(name),
+                Destination::Section(_) => None,
+            };
             let absolute = Self::is_address(&relocation);
             // COFF keeps what is added to the address where the address goes.
             let held = match blob.bytes.get_mut(offset as usize..).and_then(<[u8]>::first_chunk_mut)
@@ -350,14 +486,32 @@ impl<'data> Emitted<'data> {
         )
     }
 
-    fn symbol<'file>(
-        file: &'file object::File<'data>,
+    fn symbol<'f>(
+        file: &'f object::File<'data>,
         relocation: &object::Relocation,
-    ) -> Result<object::Symbol<'data, 'file>, Unhandled> {
+    ) -> Result<object::Symbol<'data, 'f>, Unhandled> {
         let RelocationTarget::Symbol(symbol) = relocation.target() else {
             return Err(Unhandled::Shape("a relocation against no symbol"));
         };
         Ok(file.symbol_by_index(symbol)?)
+    }
+
+    /// See [`Destination`].
+    fn destination(
+        file: &'_ object::File<'data>,
+        relocation: &object::Relocation,
+    ) -> Result<Destination<'data>, Unhandled> {
+        let symbol = Self::symbol(file, relocation)?;
+        let SymbolSection::Section(section) = symbol.section() else {
+            return Ok(Destination::Named(plain(file, symbol.name()?)));
+        };
+        if symbol.is_global()
+            && let name = plain(file, symbol.name()?)
+            && Symbol::parse(name).is_some()
+        {
+            return Ok(Destination::Named(name));
+        }
+        Ok(Destination::Section(section))
     }
 
     /// Fills in what points from one part of the code into another, and turns the rest into
@@ -369,10 +523,11 @@ impl<'data> Emitted<'data> {
             for (offset, relocation) in section.relocations() {
                 let at = base + offset;
                 let (field, addend) = Self::field(&mut self.bytes, at, &relocation)?;
-                let symbol = Self::symbol(&self.file, &relocation)?;
-                let within = match symbol.section() {
-                    SymbolSection::Section(target) => Some(self.placed[&target]),
-                    _ => None,
+                let symbol = Self::symbol(self.file, &relocation)?;
+                let destination = Self::destination(self.file, &relocation)?;
+                let within = match destination {
+                    Destination::Section(target) => Some(self.placed[&target]),
+                    Destination::Named(_) => None,
                 };
                 if let Some(Placement::Inline(target)) = within {
                     // Both ends are in `bytes`, whose pieces do not move against each other.
@@ -391,11 +546,14 @@ impl<'data> Emitted<'data> {
                     Field::TlsGd => Reloc::ElfX86_64TlsGd,
                     Field::SectionOffset => Reloc::X86SecRel,
                 };
-                let (name, addend) = match within {
-                    Some(Placement::Blob(id)) => {
+                let (name, addend) = match (within, destination) {
+                    (Some(Placement::Blob(id)), _) => {
                         (ModuleRelocTarget::user(1, id.as_u32()), addend + symbol.address() as i64)
                     }
-                    _ => (Self::target(symbol.name()?, recorder)?, addend),
+                    (_, Destination::Named(name)) => (Self::target(name, recorder)?, addend),
+                    (_, Destination::Section(_)) => {
+                        return Err(Unhandled::Shape("code that holds an address of itself"));
+                    }
                 };
                 self.relocs.push(ModuleReloc { offset: at as u32, kind, name, addend });
             }
@@ -463,12 +621,14 @@ impl<'data> Emitted<'data> {
         self.placed.insert(text, Placement::Inline(0));
         self.inline.push(text);
         for (_, relocation) in section.relocations() {
-            let SymbolSection::Section(index) = Self::symbol(&self.file, &relocation)?.section()
-            else {
+            let Destination::Section(index) = Self::destination(self.file, &relocation)? else {
                 continue;
             };
             if self.placed.contains_key(&index) {
                 continue;
+            }
+            if self.texts.contains(&index) {
+                return Err(Unhandled::Shape("code that refers into another function"));
             }
             let section = self.file.section_by_index(index)?;
             let blob = match self.file.format() {
@@ -522,14 +682,16 @@ impl<'data> Emitted<'data> {
             else {
                 return Err(HELD);
             };
-            let symbol = Self::symbol(&self.file, &relocation)?;
-            let named = symbol.is_undefined().then(|| symbol.name().ok()).flatten();
+            let named = match Self::destination(self.file, &relocation)? {
+                Destination::Named(name) => Some(name),
+                Destination::Section(_) => None,
+            };
             // The addend is where the address will be.
             let at = offset as usize;
             let field = blob.bytes.get_mut(at..at + 8).ok_or(HELD)?;
             let addend = i64::from_le_bytes((&*field).try_into().map_err(|_| HELD)?);
             field.fill(0);
-            match (named.and_then(|name| Symbol::parse(plain(&self.file, name))), addend) {
+            match (named.and_then(Symbol::parse), addend) {
                 (Some(Symbol::Data(index)), addend) => {
                     blob.relocs.push((at as u32, DataId::from_u32(index), addend));
                 }
@@ -583,9 +745,9 @@ impl<'data> Emitted<'data> {
                 },
                 _ => return Err(Unhandled::Shape("an object of a format that is not read")),
             };
-            let symbol = Self::symbol(&self.file, &relocation)?;
-            let (name, addend) = match symbol.section() {
-                SymbolSection::Section(target) => match self.placed[&target] {
+            let symbol = Self::symbol(self.file, &relocation)?;
+            let (name, addend) = match Self::destination(self.file, &relocation)? {
+                Destination::Section(target) => match self.placed[&target] {
                     Placement::Blob(id) => {
                         let within =
                             symbol.address() - self.file.section_by_index(target)?.address();
@@ -598,10 +760,7 @@ impl<'data> Emitted<'data> {
                         return Err(Unhandled::Shape("code that holds an address of itself"));
                     }
                 },
-                _ => (
-                    Self::target(plain(&self.file, symbol.name()?), recorder)?,
-                    relocation.addend(),
-                ),
+                Destination::Named(name) => (Self::target(name, recorder)?, relocation.addend()),
             };
             self.relocs.push(ModuleReloc { offset: offset as u32, kind, name, addend });
         }
@@ -640,13 +799,30 @@ impl<'data> Emitted<'data> {
         let eh_frame = EhFrame::new(section.data()?, LittleEndian);
         let bases = BaseAddresses::default().set_eh_frame(0).set_text(0);
         let malformed = |_| Unhandled::Shape("an unwind table that does not parse");
+        // Of an object of more than one function, the entries of this one: those whose
+        // start, eight bytes in, is relocated against its section.
+        let ours: Option<FxHashSet<u64>> = (self.texts.len() > 1).then(|| {
+            let starts = section.relocations().filter(|(_, relocation)| {
+                Self::symbol(self.file, relocation)
+                    .is_ok_and(|it| it.section() == SymbolSection::Section(self.text))
+            });
+            starts.map(|(offset, _)| offset.wrapping_sub(8)).collect()
+        });
         let mut entries = eh_frame.entries(&bases);
         let mut rows = None;
+        let mut table = None;
         while let Some(entry) = entries.next().map_err(malformed)? {
             let CieOrFde::Fde(partial) = entry else { continue };
             let fde = partial
                 .parse(|_, bases, offset| eh_frame.cie_from_offset(bases, offset))
                 .map_err(malformed)?;
+            if let Some(ours) = &ours {
+                let at = fde.offset() as u64;
+                if !ours.contains(&at) {
+                    continue;
+                }
+                table = Some(self.table_of(&section, at..at + fde.entry_len() as u64 + 4)?);
+            }
             if rows.is_some() {
                 return Err(Unhandled::Shape("more than one unwind table entry"));
             }
@@ -669,7 +845,33 @@ impl<'data> Emitted<'data> {
             });
         }
         let Some(rows) = rows else { return Ok(None) };
-        Ok(Some(FunctionUnwind::from_rows(rows, self.landing_pads()?)))
+        let pads = match table {
+            Some(table) => table,
+            None => self.landing_pads()?,
+        };
+        Ok(Some(FunctionUnwind::from_rows(rows, pads)))
+    }
+
+    /// The table of landing pads the entry of `.eh_frame` at `entry` names, as it is.
+    fn table_of(
+        &self,
+        eh_frame: &object::Section<'data, '_>,
+        entry: std::ops::Range<u64>,
+    ) -> Result<Option<Vec<u8>>, Unhandled> {
+        for (offset, relocation) in eh_frame.relocations() {
+            if !entry.contains(&offset) {
+                continue;
+            }
+            let SymbolSection::Section(index) = Self::symbol(self.file, &relocation)?.section()
+            else {
+                continue;
+            };
+            let table = self.file.section_by_index(index)?;
+            if table.name()?.starts_with(".gcc_except_table") {
+                return Self::pads_of(&table).map(Some);
+            }
+        }
+        Ok(None)
     }
 
     /// The function's entry of `.pdata` as the `UNWIND_INFO` of `.xdata` it names, which is
@@ -696,7 +898,7 @@ impl<'data> Emitted<'data> {
         };
         let (_, relocation) =
             pdata.relocations().find(|(offset, _)| *offset == 8).ok_or(MALFORMED)?;
-        let symbol = Self::symbol(&self.file, &relocation)?;
+        let symbol = Self::symbol(self.file, &relocation)?;
         let SymbolSection::Section(xdata) = symbol.section() else { return Err(MALFORMED) };
         let xdata = self.file.section_by_index(xdata)?;
         // The field holds what the linker adds the address of the symbol to.
@@ -755,13 +957,14 @@ impl<'data> Emitted<'data> {
             BinaryFormat::MachO => "__gcc_except_tab",
             _ => ".gcc_except_table",
         };
-        match self.file.section_by_name(name) {
-            Some(table) if table.relocations().next().is_some() => {
-                Err(Unhandled::Shape("landing pads that name a type"))
-            }
-            Some(table) => Ok(Some(table.data()?.to_vec())),
-            None => Ok(None),
+        self.file.section_by_name(name).map(|table| Self::pads_of(&table)).transpose()
+    }
+
+    fn pads_of(table: &object::Section<'data, '_>) -> Result<Vec<u8>, Unhandled> {
+        if table.relocations().next().is_some() {
+            return Err(Unhandled::Shape("landing pads that name a type"));
         }
+        Ok(table.data()?.to_vec())
     }
 
     /// The function's entry of `__compact_unwind` as the rules it stands for, and its entry

@@ -566,7 +566,37 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 );
                 Ok(Some(current))
             }
-            Expr::InlineAsm(asm) if asm.comment_only => Ok(Some(current)),
+            // A register only written to has no value the block could leave in it, so such an
+            // operand is lowered as assembly would be.
+            Expr::InlineAsm(asm)
+                if asm.comment_only
+                    && !asm
+                        .operands
+                        .iter()
+                        .any(|(_, it)| matches!(it, AsmOperand::Out { expr: Some(_), .. })) =>
+            {
+                // The block emits nothing, so a register it reads and writes keeps the value it
+                // was given: the borrow checker sees the write to the variable as a mutation.
+                for (_, operand) in &asm.operands {
+                    let (input, output) = match *operand {
+                        AsmOperand::InOut { expr, .. } => (expr, expr),
+                        AsmOperand::SplitInOut { in_expr, out_expr: Some(out_expr), .. } => {
+                            (in_expr, out_expr)
+                        }
+                        _ => continue,
+                    };
+                    let Some((value, next)) = self.lower_expr_to_some_operand(input, current)?
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((place, next)) = self.lower_expr_as_place(next, output, true)? else {
+                        return Ok(None);
+                    };
+                    current = next;
+                    self.push_assignment(current, place, value.into(), expr_id.into());
+                }
+                Ok(Some(current))
+            }
             Expr::InlineAsm(asm) => {
                 let Some(template) = &asm.template else {
                     not_supported!("inline assembly whose template is not known");
@@ -924,6 +954,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 let end_of_else = if let Some(else_branch) = else_branch {
                     self.lower_branch_to_place(*else_branch, place, else_block)?
                 } else {
+                    self.push_assign_unit(else_block, place, expr_id.into());
                     Some(else_block)
                 };
                 let end_of_else = if early {
@@ -1226,23 +1257,23 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 Ok(None)
             }
             &Expr::Break { expr, label } => {
-                if let Some(expr) = expr {
-                    let loop_data = match label {
-                        Some(l) => self
-                            .labeled_loop_blocks
-                            .get(&l)
-                            .ok_or(MirLowerError::UnresolvedLabel)?,
-                        None => self
-                            .current_loop_blocks
-                            .as_ref()
-                            .ok_or(MirLowerError::BreakWithoutLoop)?,
-                    };
-                    let Some(c) =
-                        self.lower_expr_to_place(expr, loop_data.place.as_ref(), current)?
-                    else {
-                        return Ok(None);
-                    };
-                    current = c;
+                let loop_data = match label {
+                    Some(l) => {
+                        self.labeled_loop_blocks.get(&l).ok_or(MirLowerError::UnresolvedLabel)?
+                    }
+                    None => {
+                        self.current_loop_blocks.as_ref().ok_or(MirLowerError::BreakWithoutLoop)?
+                    }
+                };
+                let loop_place = loop_data.place.as_ref();
+                match expr {
+                    Some(expr) => {
+                        let Some(c) = self.lower_expr_to_place(expr, loop_place, current)? else {
+                            return Ok(None);
+                        };
+                        current = c;
+                    }
+                    None => self.push_assign_unit(current, loop_place, expr_id.into()),
                 }
                 let (end, drop_scope) = match label {
                     Some(l) => {
@@ -1272,6 +1303,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     } else {
                         return Ok(None);
                     }
+                } else {
+                    self.push_assign_unit(current, return_slot().into(), expr_id.into());
                 }
                 let returned = match self.returned {
                     Some(it) => it,
@@ -1669,6 +1702,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         rhs_op,
                     );
                     self.push_assignment(current, lhs_place, r_value, expr_id.into());
+                    self.push_assign_unit(current, place, expr_id.into());
                     return Ok(Some(current));
                 }
                 // Each side of `&&` and `||` drops its temporaries when it is done, unless it
@@ -1783,6 +1817,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     self.resolver.update_to_inner_scope(self.db, self.store_owner, expr_id);
                 current = self.pattern_match_assignment(current, value, target)?;
                 self.resolver.reset_to_guard(resolver_guard);
+                self.push_assign_unit(current, place, expr_id.into());
                 Ok(Some(current))
             }
             Expr::Closure {
@@ -2984,6 +3019,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         resume
     }
 
+    /// rustc's `push_assign_unit`: what an expression of type `()` that computes nothing gives
+    /// its place, as an assignment, a block without a tail or a `break` without a value. Zero
+    /// sized, but assigned, so that the borrow checker sees the place initialized and a second
+    /// write to it as one that needs its `mut`.
+    fn push_assign_unit(&mut self, block: BasicBlockId, place: Place<'db>, span: MirSpan) {
+        let unit = Ty::new_unit(self.interner());
+        let r = Rvalue::Aggregate(AggregateKind::Tuple(unit.store()), Box::default());
+        self.push_assignment(block, place, r, span);
+    }
+
     /// A function item, or a tuple struct's or variant's constructor, written as a value: zero
     /// sized, but assigned as rustc does, so that the borrow checker sees it initialized.
     fn push_fn_item(&mut self, block: BasicBlockId, place: Place<'db>, expr: ExprId) {
@@ -3484,6 +3529,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             if !edition.at_least_2024() {
                 self.outlive_block(declared);
             }
+        } else if self.expr_ty_without_adjust(block).is_unit() {
+            self.push_assign_unit(current, place, span);
         }
         current = scope.pop_and_drop(self, current, span);
         Ok(Some(current))

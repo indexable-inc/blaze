@@ -868,7 +868,7 @@ pub fn prepare(db: &dyn HirDatabase, asked: &Asked) -> std::result::Result<Prepa
     let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &asked.node.0 {
         Kind::Root(func) => super::root_code(db, *func, true),
         Kind::Instance(instance, env) => {
-            super::instance_code(db, instance.clone(), env.clone(), true)
+            super::instance_code(db, instance.clone(), env.clone(), super::Detach::Tier)
         }
     }));
     let inlining = INLINING.with(|it| std::mem::replace(&mut *it.borrow_mut(), held));

@@ -1361,6 +1361,16 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                     }
                 }
                 MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
+                // `self` is a binding no pattern binds.
+                MirSpan::BindingId(binding)
+                    if body
+                        .self_param
+                        .is_some_and(|it| it.formal == binding || it.user_written == binding) =>
+                {
+                    return source_map
+                        .self_param_syntax()
+                        .map(|it| it.map(|it| it.syntax_node_ptr()));
+                }
                 MirSpan::BindingId(binding) => {
                     let pat = *source_map.patterns_for_binding(binding).first()?;
                     source_map.pat_syntax(pat).ok()?
@@ -1394,7 +1404,11 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
             // at what the user wrote, which has no `mut` to remove.
             if diagnostic.code == "unused_mut" {
                 let pat = node.value.to_node(&node.file_id.parse_or_expand(self.db));
-                if !ast::IdentPat::cast(pat).is_some_and(|it| it.mut_token().is_some()) {
+                let written = match ast::SelfParam::cast(pat.clone()) {
+                    Some(it) => it.mut_token().is_some(),
+                    None => ast::IdentPat::cast(pat).is_some_and(|it| it.mut_token().is_some()),
+                };
+                if !written {
                     continue;
                 }
             }

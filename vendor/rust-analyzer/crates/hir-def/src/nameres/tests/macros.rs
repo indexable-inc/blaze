@@ -1090,8 +1090,10 @@ pub fn derive_macro_2(_item: TokenStream) -> TokenStream {
             - AnotherTrait : macro#
             - DummyTrait : macro#
             - TokenStream : type value
-            - attribute_macro : macro#
-            - function_like_macro : macro!
+            - attribute_macro : value macro#
+            - derive_macro : value
+            - derive_macro_2 : value
+            - function_like_macro : value macro!
         "#]],
     );
 }

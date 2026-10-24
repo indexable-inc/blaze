@@ -2036,6 +2036,11 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     /// of. As rustc's `gather_used_muts`, a variable moved into a temporary that needs its
     /// `mut` needs it too, and one never assigned is left to other lints.
     fn unused_mut(&mut self) -> Vec<BorrowckDiagnostic> {
+        // rustc lints no body its type check found an error in, and a type rust-analyzer could
+        // not find may be such an error, as an array length whose evaluation fails.
+        if self.ctx.infer.has_errors {
+            return Vec::new();
+        }
         let body = self.body;
         let temporaries: FxHashSet<LocalId> = self
             .used_mut

@@ -61,6 +61,7 @@ HARNESSES = [
     ("core", ["asmedits.py"], {"RA_JIT_ASSEMBLER": "cc"}, on("linux", "macos", backend="cranelift"), 1),
     ("core", ["includes.py"], {}, EVERYWHERE, 1),
     ("core", ["latelisted.py"], {}, on("linux", "macos"), 1),
+    ("core", ["aheadready.py"], {}, on("linux", "macos"), 1),
     ("core", ["pickedahead.py"], {}, on("linux", "macos"), 1),
     ("core", ["rustsrc.py"], {}, EVERYWHERE, 1),
     # Each scenario runs rustc and rustdoc no more often than norustc/baseline.json says.

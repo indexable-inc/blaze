@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """allrajit.py: programs with nothing rustc built in them (docs/no-rustc.md, steps F and G).
 
-Four programs, a hello, one that uses collections, `catch_unwind`, threads, channels,
-formatting, a file and an uncaught panic, one with a `#[global_allocator]` of its own, and
-one built with `panic = "abort"`, are built by ra-jit with every crate its own, the standard
-library included, and linked by ra-jit (`--exe`): the native libraries are the ones the
-crates' `#[link]`s ask for, and nothing it could not compile may be left in the executable.
+Five programs, a hello, one that uses collections, `catch_unwind`, threads, channels,
+formatting, a file and an uncaught panic, one with a `#[global_allocator]` of its own, one
+built with `panic = "abort"`, and one with a static of proc-macro clients as J2 writes it,
+are built by ra-jit with every crate its own, the standard library included, and linked by
+ra-jit (`--exe`): the native libraries are the ones the crates' `#[link]`s ask for, and
+nothing it could not compile may be left in the executable. A shared library is linked too
+(`--exe` with `--shared`), loaded with `dlopen` and called as cargo's `cdylib` of it is, and
+a proc-macro crate's, whose list of macros ra-jit writes into it is read off the library.
 Each is built three ways:
 
   - whole: the program and the standard library in one build, one object;
@@ -22,7 +25,7 @@ thread ids aside.
     python3 allrajit.py            # every way
     python3 allrajit.py unit stored
 """
-import os, re, shutil, subprocess, sys, time
+import json, os, re, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -135,9 +138,81 @@ ABORT = r"""fn main() {
     if std::env::args().count() > 1 { panic!("aborting {}", 3); }
 }
 """
+# What docs/no-rustc.md's J2 writes into a proc-macro crate: a static of each macro's client,
+# which reaches `proc_macro`'s own statics (its symbol interner's thread-local) through the
+# bridge it runs. The standard library's unit leaves `proc_macro` out, so the program has it.
+MACROS = r"""#![feature(proc_macro_internals)]
+#![allow(internal_features)]
+extern crate proc_macro;
+
+use proc_macro::TokenStream;
+use proc_macro::bridge::client::Client;
+
+fn derive_it(input: TokenStream) -> TokenStream { input }
+
+fn attr_it(_attr: TokenStream, item: TokenStream) -> TokenStream { item }
+
+#[unsafe(no_mangle)]
+pub static ALLRAJIT_MACROS: [Client; 2] = [Client::expand1(derive_it), Client::expand2(attr_it)];
+
+fn main() {
+    let words = std::hint::black_box(&ALLRAJIT_MACROS) as *const _ as *const usize;
+    let (first, second) = unsafe { (*words, *words.add(1)) };
+    println!("clients {} {}", first != 0 && second != 0, first != second);
+}
+"""
 # (program, its source, the runs to compare: the arguments of each, its panic strategy)
 PROGRAMS = [("hello", HELLO, [["a", "b"]], "unwind"), ("rich", RICH, [[], ["fail"]], "unwind"),
-            ("counting", ALLOC, [[]], "unwind"), ("abort", ABORT, [[], ["fail"]], "abort")]
+            ("counting", ALLOC, [[]], "unwind"), ("abort", ABORT, [[], ["fail"]], "abort"),
+            ("macros", MACROS, [[]], "unwind")]
+# A shared library, as J2 links a proc macro's (`--exe` with `--shared`): its function
+# allocates, formats, keeps a thread-local and catches a panic, which the allocator shim, the
+# library's TLS and the unwinder have to be right for, loaded into a process ra-jit did not link.
+LIBRARY = r"""use std::cell::RefCell;
+use std::collections::BTreeMap;
+
+thread_local! {
+    static SEEN: RefCell<BTreeMap<u64, String>> = RefCell::new(BTreeMap::new());
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn allrajit_count(n: u64) -> u64 {
+    let text: String = (0..n).map(|i| format!("{i},")).collect();
+    SEEN.with(|seen| seen.borrow_mut().insert(n, text.clone()));
+    std::panic::set_hook(Box::new(|_| {}));
+    let caught = std::panic::catch_unwind(|| if n == 3 { panic!("three") } else { n });
+    let seen = SEEN.with(|seen| seen.borrow().len() as u64);
+    seen * 1000 + text.len() as u64 * 10 + caught.is_err() as u64
+}
+"""
+CALLS = [1, 3, 10, 3]
+# A proc-macro crate linked as J2 links one: the library has the list of its macros ra-jit
+# writes into the crate (crates/ra-jit/src/macro_list.rs) where rustc's metadata has it.
+PROC_MACROS = r"""extern crate proc_macro;
+use proc_macro::TokenStream;
+
+#[proc_macro_derive(Hello, attributes(hello, greet))]
+pub fn hello(_input: TokenStream) -> TokenStream {
+    "impl Hello for () {}".parse().unwrap()
+}
+
+#[proc_macro_attribute]
+pub fn same(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    item
+}
+
+#[proc_macro]
+pub fn answer(_input: TokenStream) -> TokenStream {
+    "42".parse().unwrap()
+}
+"""
+# Kind (derive, attribute, function-like), name and helper attributes, by name.
+MACRO_LIST = [[0, "Hello", ["hello", "greet"]], [2, "answer", []], [1, "same", []]]
+# cargo's build of these needs the unstable features they name.
+UNSTABLE = {"macros"}
+# Crates of the standard library a program links that the library's unit leaves out. What
+# they depend on (`rustc-literal-escaper` of `proc_macro`) makes the unit another one.
+LINKS = {"macros": ["proc_macro"]}
 
 
 def run(cmd, cwd, what, env=None):
@@ -170,6 +245,59 @@ def package(work, name, source, panic):
     return root
 
 
+def library_package(work):
+    root = os.path.join(work, "shared")
+    os.makedirs(os.path.join(root, "src"))
+    with open(os.path.join(root, "Cargo.toml"), "w") as f:
+        f.write('[package]\nname = "shared"\nversion = "0.1.0"\nedition = "2021"\n'
+                '[lib]\ncrate-type = ["cdylib"]\n[workspace]\n')
+    with open(os.path.join(root, "src/lib.rs"), "w") as f:
+        f.write(LIBRARY)
+    subprocess.run(["cargo", "generate-lockfile", "-q"], cwd=root, check=True)
+    return root
+
+
+def proc_macro_package(work):
+    root = os.path.join(work, "macros-crate")
+    os.makedirs(os.path.join(root, "src"))
+    with open(os.path.join(root, "Cargo.toml"), "w") as f:
+        f.write('[package]\nname = "allmacros"\nversion = "0.1.0"\nedition = "2021"\n'
+                '[lib]\nproc-macro = true\n[workspace]\n')
+    with open(os.path.join(root, "src/lib.rs"), "w") as f:
+        f.write(PROC_MACROS)
+    subprocess.run(["cargo", "generate-lockfile", "-q"], cwd=root, check=True)
+    return root
+
+
+def macro_list(library):
+    """The list of macros the library exports, each with whether its client is there, read by a
+    process of its own."""
+    code = ("import ctypes, json, sys\n"
+            "class Slice(ctypes.Structure):\n"
+            "    _fields_ = [('ptr', ctypes.c_void_p), ('len', ctypes.c_size_t)]\n"
+            "class Macro(ctypes.Structure):\n"
+            "    _fields_ = [('kind', ctypes.c_uint32), ('name', Slice), ('helpers', Slice),\n"
+            "                ('client', ctypes.c_void_p)]\n"
+            "text = lambda it: ctypes.string_at(it.ptr, it.len).decode()\n"
+            "listed = Slice.in_dll(ctypes.CDLL(sys.argv[1]), 'RA_JIT_PROC_MACROS')\n"
+            "macros = (Macro * listed.len).from_address(listed.ptr)\n"
+            "helpers = lambda it: [text(h) for h in (Slice * it.len).from_address(it.ptr or 1)]\n"
+            "print(json.dumps([[m.kind, text(m.name), helpers(m.helpers), bool(m.client)]\n"
+            "                  for m in macros]))\n")
+    ran = subprocess.run([sys.executable, "-c", code, library], capture_output=True, text=True)
+    return ran.returncode, ran.stdout, ran.stderr
+
+
+def calls(library):
+    """What the library's `allrajit_count` gives for each of CALLS, loaded by a process of its own."""
+    code = ("import ctypes, sys\n"
+            "f = ctypes.CDLL(sys.argv[1]).allrajit_count\n"
+            "f.argtypes, f.restype = [ctypes.c_uint64], ctypes.c_uint64\n"
+            f"print([f(n) for n in {CALLS!r}])\n")
+    ran = subprocess.run([sys.executable, "-c", code, library], capture_output=True, text=True)
+    return ran.returncode, ran.stdout, ran.stderr
+
+
 def ra_jit(root, crates, out, *extra, env=None):
     args = sum((["--crate", c] for c in crates), [])
     return run([RA_JIT, root, *args, "--out", out, *extra], root, f"ra-jit {' '.join(crates[:1])}", env)
@@ -200,9 +328,16 @@ def main():
         for name, _, runs, _ in PROGRAMS:
             root = roots[name]
             target = os.path.join(root, "target")
-            run(["cargo", "build", "-q", "--target-dir", target], root, f"cargo build of {name}")
+            run(["cargo", "build", "-q", "--target-dir", target], root, f"cargo build of {name}",
+                {"RUSTC_BOOTSTRAP": "1"} if name in UNSTABLE else None)
             binary = os.path.join(root, "target/debug", name)
             expected[name] = [outcome(binary, args, root) for args in runs]
+        library, macros = library_package(work), proc_macro_package(work)
+        run(["cargo", "build", "-q", "--target-dir", os.path.join(library, "target")], library,
+            "cargo build of the shared library")
+        expected_calls = calls(os.path.join(library, "target/debug/libshared.so"))
+        if expected_calls[0] != 0:
+            raise SystemExit(f"FAIL: cargo's shared library did not load: {expected_calls}")
         lines = []
         units = {}
         if "unit" in ways:
@@ -220,7 +355,8 @@ def main():
             # The first program again once the store has the library, and the second on
             # another store.
             programs = PROGRAMS + PROGRAMS[:1] + PROGRAMS[1:2] if way == "stored" else PROGRAMS
-            # The panic strategies whose library some store or the remote has.
+            # The units, by panic strategy and what else of the library is linked, that some
+            # store or the remote has.
             compiled = set()
             for at, (name, _, runs, panic) in enumerate(programs):
                 root = roots[name]
@@ -228,20 +364,22 @@ def main():
                 binary = os.path.join(work, f"{name}-{way}")
                 exe = ["--exe", binary]
                 how = ""
+                own = [name, *LINKS.get(name, [])]
                 if way == "whole":
-                    ran, took = ra_jit(root, [name, *std_of(panic)], obj, *exe)
+                    ran, took = ra_jit(root, [*own, *std_of(panic)], obj, *exe)
                 elif way == "unit":
-                    ran, took = ra_jit(root, [name], obj, "--prebuilt", units[panic], *exe)
+                    ran, took = ra_jit(root, own, obj, "--prebuilt", units[panic], *exe)
                 else:
                     store = stores[at == len(programs) - 1]
-                    ran, took = ra_jit(root, [name], obj, *exe, env=store)
+                    ran, took = ra_jit(root, own, obj, *exe, env=store)
                     said = re.findall(r"^standard library: (.*)$", ran.stderr, re.M)
                     stored = bool(said) and said[0].startswith("from the store")
-                    if not said or stored != (panic in compiled):
+                    unit = (panic, *LINKS.get(name, []))
+                    if not said or stored != (unit in compiled):
                         raise SystemExit(f"FAIL: {name} ({way}, build {at + 1}) "
-                                         f"{'should have taken' if panic in compiled else 'took'} the "
+                                         f"{'should have taken' if unit in compiled else 'took'} the "
                                          f"standard library from the store: {said}\n{ran.stderr}")
-                    compiled.add(panic)
+                    compiled.add(unit)
                     how = (", the standard library from the remote" if store is stores[1]
                            else ", the standard library from the store" if stored
                            else ", the standard library compiled, stored and pushed")
@@ -253,8 +391,46 @@ def main():
                                          f"cargo:  {want}\nra-jit: {got}")
                 lines.append(f"{name} ({way}): built and linked in {took:.2f} s{how}, the link "
                              f"{link_took}, {len(runs)} runs as cargo's")
+            obj, shared = (os.path.join(work, f"shared-{way}{ext}") for ext in (".o", ".so"))
+            exe = ["--exe", shared, "--shared"]
+            if way == "whole":
+                ran, took = ra_jit(library, ["shared", *std_of("unwind")], obj, *exe)
+            elif way == "unit":
+                ran, took = ra_jit(library, ["shared"], obj, "--prebuilt", units["unwind"], *exe)
+            else:
+                ran, took = ra_jit(library, ["shared"], obj, *exe, env=stores[0])
+                said = re.findall(r"^standard library: (.*)$", ran.stderr, re.M)
+                if not said or not said[0].startswith("from the store"):
+                    raise SystemExit(f"FAIL: the shared library (stored) should have taken the "
+                                     f"standard library from the store: {said}\n{ran.stderr}")
+            link_took = linked(ran, f"the shared library ({way})")
+            got = calls(shared)
+            if got != expected_calls:
+                raise SystemExit(f"FAIL: the shared library ({way}) differs from cargo's:\n"
+                                 f"cargo:  {expected_calls}\nra-jit: {got}")
+            lines.append(f"the shared library ({way}): built and linked in {took:.2f} s, the link "
+                         f"{link_took}, {len(CALLS)} calls as cargo's library answers them")
+            obj, shared = (os.path.join(work, f"allmacros-{way}{ext}") for ext in (".o", ".so"))
+            exe = ["--exe", shared, "--shared"]
+            if way == "whole":
+                ran, took = ra_jit(macros, ["allmacros", "proc_macro", *std_of("unwind")], obj, *exe)
+            elif way == "unit":
+                ran, took = ra_jit(macros, ["allmacros", "proc_macro"], obj,
+                                   "--prebuilt", units["unwind"], *exe)
+            else:
+                ran, took = ra_jit(macros, ["allmacros", "proc_macro"], obj, *exe, env=stores[0])
+            link_took = linked(ran, f"the proc-macro crate ({way})")
+            code, out, err = macro_list(shared)
+            want = [[*it, True] for it in MACRO_LIST]
+            if code != 0 or json.loads(out) != want:
+                raise SystemExit(f"FAIL: the proc-macro crate's library ({way}) lists other than "
+                                 f"its macros:\nwanted: {want}\ngot:    {code} {out}{err}")
+            lines.append(f"the proc-macro crate ({way}): built and linked in {took:.2f} s, the "
+                         f"link {link_took}, its {len(MACRO_LIST)} macros listed")
         print("\n".join(lines))
-        print(f"PASS: {len(PROGRAMS)} programs with nothing of rustc's, {' and '.join(ways)}")
+        print(f"PASS: {len(PROGRAMS)} programs, a shared library and a proc-macro crate's with "
+              f"nothing of rustc's, "
+              f"{' and '.join(ways)}")
         passed = True
     finally:
         if passed:

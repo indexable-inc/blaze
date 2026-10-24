@@ -397,6 +397,7 @@ impl Compiler {
                 entries: &entries,
                 on_demand: &on_demand,
                 start: None,
+                shared: false,
                 whole: false,
                 kept: &[],
                 offered: &[],
