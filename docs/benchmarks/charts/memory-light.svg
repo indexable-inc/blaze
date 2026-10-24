@@ -28,34 +28,34 @@
 <line x1="510.8" y1="135" x2="510.8" y2="773" class="g"/>
 <line x1="16" y1="193" x2="744" y2="193" class="r"/>
 <rect x="154.3" y="143" width="279.1" height="12" rx="2" class="p0"/>
-<rect x="205" y="158" width="228.4" height="12" rx="2" class="p1"/>
+<rect x="281.2" y="158" width="152.2" height="12" rx="2" class="p1"/>
 <rect x="252.6" y="173" width="180.7" height="12" rx="2" class="p2"/>
 <rect x="154.1" y="201" width="279.2" height="12" rx="2" class="p0"/>
-<rect x="202.6" y="216" width="230.7" height="12" rx="2" class="p1"/>
+<rect x="290" y="216" width="143.4" height="12" rx="2" class="p1"/>
 <rect x="258.9" y="231" width="174.5" height="12" rx="2" class="p2"/>
 <rect x="153.6" y="259" width="279.7" height="12" rx="2" class="p0"/>
-<rect x="221.9" y="274" width="211.4" height="12" rx="2" class="p1"/>
+<rect x="316" y="274" width="117.4" height="12" rx="2" class="p1"/>
 <rect x="291.1" y="289" width="142.2" height="12" rx="2" class="p2"/>
 <rect x="434.4" y="318.5" width="9" height="9" rx="2" class="o w0"/>
-<rect x="233.3" y="332" width="200.1" height="12" rx="2" class="p1"/>
+<rect x="313.9" y="332" width="119.4" height="12" rx="2" class="p1"/>
 <rect x="290.3" y="347" width="143.1" height="12" rx="2" class="p2"/>
 <rect x="434.4" y="376.5" width="9" height="9" rx="2" class="o w0"/>
-<rect x="176.4" y="390" width="256.9" height="12" rx="2" class="p1"/>
+<rect x="256.8" y="390" width="176.5" height="12" rx="2" class="p1"/>
 <rect x="241.1" y="405" width="192.2" height="12" rx="2" class="p2"/>
 <rect x="434.4" y="434.5" width="9" height="9" rx="2" class="o w0"/>
-<rect x="181.6" y="448" width="251.7" height="12" rx="2" class="p1"/>
+<rect x="259.7" y="448" width="173.6" height="12" rx="2" class="p1"/>
 <rect x="239.2" y="463" width="194.2" height="12" rx="2" class="p2"/>
 <rect x="434.4" y="492.5" width="9" height="9" rx="2" class="o w0"/>
-<rect x="174.6" y="506" width="258.7" height="12" rx="2" class="p1"/>
+<rect x="257.3" y="506" width="176.1" height="12" rx="2" class="p1"/>
 <rect x="229.3" y="521" width="204" height="12" rx="2" class="p2"/>
 <rect x="157.3" y="549" width="276.1" height="12" rx="2" class="p0"/>
-<rect x="246" y="564" width="187.4" height="12" rx="2" class="p1"/>
+<rect x="303.2" y="564" width="130.1" height="12" rx="2" class="p1"/>
 <rect x="275.2" y="579" width="158.1" height="12" rx="2" class="p2"/>
 <rect x="434.4" y="608.5" width="9" height="9" rx="2" class="o w0"/>
-<rect x="202" y="622" width="231.4" height="12" rx="2" class="p1"/>
+<rect x="286.8" y="622" width="146.6" height="12" rx="2" class="p1"/>
 <rect x="232.1" y="637" width="201.2" height="12" rx="2" class="p2"/>
 <rect x="434.4" y="666.5" width="9" height="9" rx="2" class="o w0"/>
-<rect x="208.6" y="680" width="224.8" height="12" rx="2" class="p1"/>
+<rect x="324.9" y="680" width="108.4" height="12" rx="2" class="p1"/>
 <rect x="259.9" y="695" width="173.5" height="12" rx="2" class="p2"/>
 <rect x="152" y="723" width="281.3" height="12" rx="2" class="p0"/>
 <rect x="202.9" y="738" width="230.4" height="12" rx="2" class="p1"/>
@@ -74,43 +74,43 @@
 <text x="118.8" y="162" font-size="13" text-anchor="end" class="b">All projects</text>
 <text x="118.8" y="176" font-size="11" text-anchor="end" class="d">geometric mean</text>
 <text x="439.4" y="153" font-size="12" class="v b">12× more</text>
-<text x="439.4" y="168" font-size="12" class="v b">7.7× more</text>
+<text x="439.4" y="168" font-size="12" class="v b">3.9× more</text>
 <text x="439.4" y="183" font-size="12" class="v b">5.0× more</text>
 <text x="118.8" y="226.5" font-size="13" text-anchor="end">ripgrep 15.1.0</text>
 <text x="439.4" y="211" font-size="12" class="v">12× more · 2.9 GB vs cargo's 235 MB</text>
-<text x="439.4" y="226" font-size="12" class="v">7.9× more · 3.7 GB vs cargo's 463 MB</text>
+<text x="439.4" y="226" font-size="12" class="v">3.6× more · 1.7 GB vs cargo's 464 MB</text>
 <text x="439.4" y="241" font-size="12" class="v">4.8× more · 2.2 GB vs cargo's 458 MB</text>
 <text x="118.8" y="284.5" font-size="13" text-anchor="end">fd 10.3.0</text>
 <text x="439.4" y="269" font-size="12" class="v">12× more · 2.6 GB vs cargo's 212 MB</text>
-<text x="439.4" y="284" font-size="12" class="v">6.6× more · 3.4 GB vs cargo's 519 MB</text>
+<text x="439.4" y="284" font-size="12" class="v">2.9× more · 1.5 GB vs cargo's 520 MB</text>
 <text x="439.4" y="299" font-size="12" class="v">3.6× more · 1.9 GB vs cargo's 533 MB</text>
 <text x="118.8" y="342.5" font-size="13" text-anchor="end">bat 0.26.0</text>
 <text x="449.4" y="327" font-size="11.5" class="d">not measured yet</text>
-<text x="439.4" y="342" font-size="12" class="v">6.0× more · 4.0 GB vs cargo's 672 MB</text>
+<text x="439.4" y="342" font-size="12" class="v">2.9× more · 2.0 GB vs cargo's 672 MB</text>
 <text x="439.4" y="357" font-size="12" class="v">3.6× more · 2.4 GB vs cargo's 676 MB</text>
 <text x="118.8" y="400.5" font-size="13" text-anchor="end">hyperfine 1.19.0</text>
 <text x="449.4" y="385" font-size="11.5" class="d">not measured yet</text>
-<text x="439.4" y="400" font-size="12" class="v">10× more · 3.6 GB vs cargo's 360 MB</text>
+<text x="439.4" y="400" font-size="12" class="v">4.9× more · 1.8 GB vs cargo's 361 MB</text>
 <text x="439.4" y="415" font-size="12" class="v">5.6× more · 1.9 GB vs cargo's 346 MB</text>
 <text x="118.8" y="458.5" font-size="13" text-anchor="end">just 1.43.0</text>
 <text x="449.4" y="443" font-size="11.5" class="d">not measured yet</text>
-<text x="439.4" y="458" font-size="12" class="v">9.5× more · 4.1 GB vs cargo's 434 MB</text>
+<text x="439.4" y="458" font-size="12" class="v">4.7× more · 2.1 GB vs cargo's 434 MB</text>
 <text x="439.4" y="473" font-size="12" class="v">5.7× more · 2.6 GB vs cargo's 461 MB</text>
 <text x="118.8" y="516.5" font-size="13" text-anchor="end">axum 0.8.6</text>
 <text x="449.4" y="501" font-size="11.5" class="d">not measured yet</text>
-<text x="439.4" y="516" font-size="12" class="v">10× more · 4.0 GB vs cargo's 399 MB</text>
+<text x="439.4" y="516" font-size="12" class="v">4.8× more · 1.9 GB vs cargo's 399 MB</text>
 <text x="439.4" y="531" font-size="12" class="v">6.2× more · 2.4 GB vs cargo's 391 MB</text>
 <text x="118.8" y="574.5" font-size="13" text-anchor="end">nushell 0.108.0</text>
 <text x="439.4" y="559" font-size="12" class="v">12× more · 12.5 GB vs cargo's 1.1 GB</text>
-<text x="439.4" y="574" font-size="12" class="v">5.3× more · 12.7 GB vs cargo's 2.4 GB</text>
+<text x="439.4" y="574" font-size="12" class="v">3.2× more · 7.6 GB vs cargo's 2.4 GB</text>
 <text x="439.4" y="589" font-size="12" class="v">4.1× more · 10.9 GB vs cargo's 2.7 GB</text>
 <text x="118.8" y="632.5" font-size="13" text-anchor="end">helix 25.07.1</text>
 <text x="449.4" y="617" font-size="11.5" class="d">not measured yet</text>
-<text x="439.4" y="632" font-size="12" class="v">7.9× more · 14.2 GB vs cargo's 1.8 GB</text>
+<text x="439.4" y="632" font-size="12" class="v">3.7× more · 6.6 GB vs cargo's 1.8 GB</text>
 <text x="439.4" y="647" font-size="12" class="v">6.1× more · 12.3 GB vs cargo's 2.0 GB</text>
 <text x="118.8" y="690.5" font-size="13" text-anchor="end">bevy 0.20.0</text>
 <text x="449.4" y="675" font-size="11.5" class="d">not measured yet</text>
-<text x="439.4" y="690" font-size="12" class="v">7.5× more · 50.4 GB vs cargo's 6.7 GB</text>
+<text x="439.4" y="690" font-size="12" class="v">2.6× more · 17.8 GB vs cargo's 6.7 GB</text>
 <text x="439.4" y="705" font-size="12" class="v">4.7× more · 39.7 GB vs cargo's 8.4 GB</text>
 <text x="118.8" y="748.5" font-size="13" text-anchor="end">bun 1.4.3</text>
 <text x="439.4" y="733" font-size="12" class="v">12× more · 26.1 GB vs cargo's 2.1 GB</text>
@@ -120,6 +120,6 @@
 <text x="425.4" y="810" font-size="12" text-anchor="end" class="d">← ra-jit uses more</text>
 <text x="441.4" y="810" font-size="12" class="d">ra-jit uses less →</text>
 <text x="16" y="834" font-size="11.5" class="d">Each colour is a machine of its own: compare bars of one colour, not across colours. macOS arm64: MacBook Pro, 2026-10-21.</text>
-<text x="16" y="851" font-size="11.5" class="d">Linux aarch64: AWS c8g.16xlarge, 2026-10-22. Linux x86-64: AWS c8a.metal-24xl, 2026-10-23. bun, measured on its own: macOS</text>
+<text x="16" y="851" font-size="11.5" class="d">Linux aarch64: AWS c8g.16xlarge, 2026-10-23. Linux x86-64: AWS c8a.metal-24xl, 2026-10-23. bun, measured on its own: macOS</text>
 <text x="16" y="868" font-size="11.5" class="d">arm64: Apple M5 Max, 2026-10-23; Linux aarch64: AWS c8g.24xlarge, 2026-10-23; Linux x86-64: AWS c8a.24xlarge, 2026-10-23.</text>
 </svg>

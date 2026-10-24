@@ -196,8 +196,10 @@ def compare(name, title, subtitle, rows, everything, words, same, hints, notes, 
     marks_.append(f'<line x1="{n(one)}" y1="{top - 8}" x2="{n(one)}" y2="{bottom}" class="r"/>')
     labels.append(f'<text x="{n(one)}" y="{top - 13}" font-size="11.5" text-anchor="middle" class="d">{esc(same)}</text>')
     left, right = f"← {hints[0]}", f"{hints[1]} →"
-    lx = max(one - 8, x0 + text_width(left, 12))
-    rx = min(one + 8, WIDTH - PAD - text_width(right, 12))
+    # Under the row labels is empty, so the left hint may reach into it: with nothing worse than
+    # 1× the line is near the plot's left edge, and the two hints must not overlap there.
+    lx = max(one - 8, PAD + text_width(left, 12))
+    rx = max(min(one + 8, WIDTH - PAD - text_width(right, 12)), lx + 16)
     labels.append(f'<text x="{n(lx)}" y="{bottom + 37}" font-size="12" text-anchor="end" class="d">{esc(left)}</text>')
     labels.append(f'<text x="{n(rx)}" y="{bottom + 37}" font-size="12" class="d">{esc(right)}</text>')
     y = bottom + 44
