@@ -253,6 +253,15 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
   output to its declared return type with lifetime elision applied (the lifetime of the
   one `&Self` in `self: Box<&Self>` or `Pin<&mut Self>` too), as rustc proves the
   `Future<Output = ..>` bound of the `impl Future` it returns.
+- `async` closures (`async || ..`): the future a call returns is the one rustc normalizes
+  `CallRefFuture<'_>` to, made of the closure's signature, its captures and the borrow of
+  the closure, so what the closure captured by reference is held by the future for as long
+  as the closure holds it, and one that moves its captures in lends them for the borrow of
+  the closure: `outlives::<'a>(c())` with a closure that borrows a local `x` is E0597 on
+  `x` in edition 2018, and on `c` for an `async move` closure. As for a closure, its
+  captures are related to what makes it and what its body needs of them is proven there,
+  and it outlives as its captures do. A capture that escapes is E0515 ("cannot return
+  value referencing local variable"), not a closure's E0373, as rustc says it.
 - Items, as rustc's `wfcheck` (the crate `hir-ty-wfcheck`, next to the checker): a struct's,
   enum's or union's fields must be well-formed given its where clauses and what rustc infers
   from the fields (every `T: 'a`, never `T: 'static`), so `&'static T` or `Bar<T>` with
@@ -349,6 +358,15 @@ E0311 and E0597 not reported, then a long tail. The causes, grouped:
   bound (`borrowck/alias-liveness/higher-ranked-outlives-for-capture.rs`), where the nightly
   blames the return (E0515). ra-jit gives E0515 for both, so
   `impl-trait/precise-capturing/migration-note.rs` has 12 of its 13 errors right.
+- **Which of two equally short paths an error is blamed on**: rustc's constraint graph
+  walks a region's newest constraint first, and relates a closure to where it goes before
+  what making it needs; ra-jit walks the oldest first. Walking as rustc does needs ra-jit's
+  constraints made in rustc's order throughout: done alone it wins
+  `cast/ptr-to-trait-obj-different-regions-misc.rs` and
+  `async-await/async-closures/without-precise-captures-we-are-powerless.rs` (whose two
+  E0621 are at the closure, not at the call rustc names) and loses
+  `borrowck/alias-liveness/rpit-hide-lifetime-for-swap.rs` and
+  `async-await/issues/issue-63388-1.rs`.
 - **Captures of an empty `match`**: rustc's capture analysis has a closure that matches
   on `x` with no arms read `x`; rust-analyzer's captures nothing there, so the E0381 of an
   uninitialized `x` is missed.
