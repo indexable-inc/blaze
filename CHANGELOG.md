@@ -195,7 +195,7 @@ All notable changes to ra-jit are written here. The format follows
 - A borrow checker, the crate `hir-ty-borrowck` in the rust-analyzer subtree, written to give
   rustc's verdict: Polonius alpha by default as nightly rustc does, NLL with
   `RA_JIT_BORROWCK=nll`. It gives rustc's errors on
-  1541 of 1581 of rustc's own borrow-check tests that it can run, and none on any of the 246
+  1542 of 1581 of rustc's own borrow-check tests that it can run, and none on any of the 246
   rustc accepts, scored by `harness/borrowck_ui.py`, and finds nothing in ripgrep, fd, bat,
   hyperfine, just, axum, nushell, delta, eza, tokei, starship and cargo. Its errors, and rustc's
   `unused_mut` warning, are rust-analyzer diagnostics and `ra-jit borrowck` prints them ([docs/borrowck.md](docs/borrowck.md)).
@@ -494,6 +494,12 @@ All notable changes to ra-jit are written here. The format follows
   which no item's body holds. `const N: usize = { let s: String; s.len() }` is rustc's E0381,
   and a move out of a reference in an array length its E0507; both were missed. 1541 of 1581
   of rustc's tests now (was 1539).
+- The borrow checker types the call of an `async` closure as rustc does: `c()` returns the
+  future made of the closure's captures and the borrow of `c`, so what the closure captured
+  by reference stays borrowed while the future lives. `outlives::<'a>(c())` of a closure that
+  borrows a local is rustc's E0597 in edition 2018 (on `c` for an `async move` closure), and
+  `Box::new((async || x)())` returned is its E0515; both were missed. 1542 of 1581 of
+  rustc's tests now (was 1541).
 - A returned `impl Trait` hiding a type parameter is checked when the function's lifetimes
   are late-bound or elided: `fn f<T>(d: T, p: &mut ()) -> impl Sized + '_ { (d, p) }` gives
   rustc's E0311, and with `p: &'b mut ()` its E0309. The borrow checker relates the hidden
