@@ -339,7 +339,9 @@ fn staged(
     let on = std::env::var_os(STAGED).is_some_and(|it| it != "0");
     let crates = match Staged::of(asked) {
         Ok(Ok(crates)) => crates,
-        Ok(Err(why)) => return Ok(Err(NotStaged::Cargos(on.then_some(why), None))),
+        Ok(Err(state::Unstaged { why, ahead })) => {
+            return Ok(Err(NotStaged::Cargos(on.then_some(why), ahead)));
+        }
         // Cargo's build of all of it loses only the daemon's head start.
         Err(_) if !on => return Ok(Err(NotStaged::Cargos(None, None))),
         Err(why) => return Err(why),

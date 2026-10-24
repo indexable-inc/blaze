@@ -7023,8 +7023,9 @@ fn spare(dir: &Path) -> anyhow::Result<()> {
         unsafe { std::env::set_var(name, value) };
     }
     std::env::set_current_dir(&told.cwd)?;
-    if !told.ahead {
-        std::thread::spawn(end_with_input);
+    match told.ahead {
+        true => eprintln!("spare: loading beside cargo's build"),
+        false => drop(std::thread::spawn(end_with_input)),
     }
     run_holding(Args::parse(told.args.into_iter())?, None, held, told.ahead)
 }

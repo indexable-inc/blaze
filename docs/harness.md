@@ -107,6 +107,7 @@ with reasons. The daemon's log says `backend: llvm -O2 fast emit` when LLVM is i
 | `worktrees.py` | Several checkouts of one workspace built by one daemon, edited independently |
 | `includes.py` | Edits to a file only `include!` names |
 | `latelisted.py` | What a file named by `include!` through a build script's variable declares is listed in its crate though the daemon listed the crate beside cargo's build before it read the file, as bun's generated bindings are: an edit that adds a function then patches a few functions, not every one the file declares |
+| `pickedahead.py` | A first build that picks its target (`--example`) has a worker load the workspace while cargo builds it, as a build of the whole package does; the next build is the daemon's, and an edit of the example prints what cargo's program does |
 | `rustsrc.py` | A toolchain without `rust-src` is turned down, saying how to install it |
 | `splices.py` | Edits that are hard on the splice: thread-locals, statics, vtables, function pointers, closures, panics, foreign calls. Counts how each step was linked |
 | `farsplices.py` | Splices into a binary whose code is further from its end than an AArch64 branch reaches |

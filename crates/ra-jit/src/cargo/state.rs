@@ -356,9 +356,10 @@ impl Staged {
     /// `Err` is why rustc builds every crate of the build `asked` for. The crates that
     /// run during the build are rustc's, and so are the ones those depend on: a build
     /// script, a proc macro, and what either is declared to need under any feature.
-    pub(crate) fn of(asked: &Invocation) -> anyhow::Result<Result<Staged, String>> {
-        if asked.subcommand == Subcommand::Test || asked.flags.selects_targets {
-            return Ok(Err("the build picks its targets".to_owned()));
+    pub(crate) fn of(asked: &Invocation) -> anyhow::Result<Result<Staged, Unstaged>> {
+        let picks = "the build picks its targets".to_owned();
+        if asked.subcommand == Subcommand::Test {
+            return Ok(Err(Unstaged { why: picks, ahead: None }));
         }
         let metadata = metadata(asked)?;
         let members: Vec<&Package> = metadata.workspace_packages();
@@ -379,6 +380,7 @@ impl Staged {
             }
         }
         let mut roots = Vec::new();
+        let mut shared = None;
         for (at, member) in members.iter().enumerate() {
             if reached.contains(&at) {
                 continue;
@@ -398,34 +400,68 @@ impl Staged {
                     [CrateType::Lib | CrateType::RLib | CrateType::Bin]
                 );
                 if !alone {
-                    return Ok(Err(format!(
-                        "`{}` is linked into more than a program of the workspace",
-                        target.name
-                    )));
+                    shared.get_or_insert_with(|| {
+                        format!("`{}` is linked into more than a program of the workspace", target.name)
+                    });
                 }
                 roots.push(target.src_path.clone().into_std_path_buf());
             }
         }
-        if roots.is_empty() {
-            return Ok(Err("every crate of the workspace runs during the build".to_owned()));
+        let picks_targets = asked.flags.selects_targets;
+        if let Some(why) = shared.filter(|_| !picks_targets) {
+            return Ok(Err(Unstaged { why, ahead: None }));
+        }
+        if roots.is_empty() && !picks_targets {
+            let why = "every crate of the workspace runs during the build".to_owned();
+            return Ok(Err(Unstaged { why, ahead: None }));
         }
         // Before cargo builds what would then be built again.
         if let Some(why) = other_toolchain() {
-            return Ok(Err(why));
+            return Ok(Err(Unstaged { why, ahead: None }));
         }
         let root = metadata.workspace_root.clone().into_std_path_buf();
-        let ahead = project(asked, &std::env::current_dir()?, &metadata).ok().map(|project| {
-            let config = WorkerConfig {
-                repository: repository(&root),
-                project: project.strip_prefix(&root).unwrap_or(Path::new("")).to_owned(),
-                cfg_test: false,
-                selection: asked.selection(),
-                env: worker_env(),
+        let project = project(asked, &std::env::current_dir()?, &metadata).ok();
+        let ahead = |crates: Vec<PathBuf>| {
+            project.as_ref().map(|project| {
+                let config = WorkerConfig {
+                    repository: repository(&root),
+                    project: project.strip_prefix(&root).unwrap_or(Path::new("")).to_owned(),
+                    cfg_test: false,
+                    selection: asked.selection(),
+                    env: worker_env(),
+                };
+                daemon::Ahead { config, crates, root: root.clone() }
+            })
+        };
+        // Rustc builds all of a build that picks its targets, and the daemon loads it
+        // meanwhile all the same: after cargo, loading bevy for its example took 25 s.
+        if picks_targets {
+            let flags = &asked.flags;
+            let picked = |it: &&Target| {
+                let named = |kind, name: &Option<String>| {
+                    it.kind.contains(&kind) && name.as_deref() == Some(it.name.as_str())
+                };
+                named(TargetKind::Example, &flags.example) || named(TargetKind::Bin, &flags.bin)
             };
-            daemon::Ahead { config, crates: roots.clone(), root }
-        });
+            let mut crates = roots;
+            for target in members.iter().flat_map(|it| &it.targets).filter(picked) {
+                let root = target.src_path.clone().into_std_path_buf();
+                if !crates.contains(&root) {
+                    crates.push(root);
+                }
+            }
+            return Ok(Err(Unstaged { why: picks, ahead: ahead(crates) }));
+        }
+        let ahead = ahead(roots.clone());
         Ok(Ok(Staged { roots, ahead }))
     }
+}
+
+/// Why rustc builds every crate of a first build, with what the daemon is told of it so
+/// that it loads it while cargo builds, when it is told.
+pub(crate) struct Unstaged {
+    pub(crate) why: String,
+    pub(crate) ahead: Option<daemon::Ahead>,
 }
 
 /// What the checker of `cargo ra-jit check` with the flags of `asked` loads: the workspace
