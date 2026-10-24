@@ -534,13 +534,23 @@ impl SymbolTable {
         // What was read ahead of files that are not of the link is not asked for again.
         lock(&READ_AHEAD).clear();
         let read_in = start.elapsed();
+        let (mut private_seen, mut names_read) = (FxHashSet::default(), 0);
         for (file, names) in files.iter().zip(read) {
-            let first = symbols.len();
-            for name in names? {
-                table.add_name(name, &mut symbols);
+            let names = names?;
+            names_read += names.len();
+            let sources = crate_sources(file, root);
+            // Counted before `add_name`, which takes a name once however many objects have it.
+            let mut mentions: FxHashMap<u64, usize> = FxHashMap::default();
+            if let Some((name, _)) = &sources {
+                for (_, id) in names.iter().flat_map(|it| &it.ids).filter(|it| it.0 == *name) {
+                    *mentions.entry(*id).or_default() += 1;
+                }
             }
-            if let Some((name, sources)) = crate_sources(file, root) {
-                owners.push((name, table.real(&sources[0]), first..symbols.len()));
+            for name in names {
+                table.add_name(name, &mut symbols, &mut private_seen);
+            }
+            if let Some((name, sources)) = sources {
+                owners.push((name, table.real(&sources[0]), mentions));
                 let sources = sources.into_iter().map(Source::new).collect();
                 table.built_from.push((file.clone(), sources));
             }
@@ -550,27 +560,26 @@ impl SymbolTable {
         // on it: the id that is left once the others have theirs is its own. A crate may be
         // several files, when it is linked from its objects.
         let mut unplaced: FxHashMap<PathBuf, FxHashMap<u64, usize>> = FxHashMap::default();
-        for (name, source, range) in owners {
+        for (name, source, mentions) in owners {
             table.linked.insert((name.clone(), source.clone()));
             if table.crates.get(&name) != Some(&None) {
                 continue;
             }
-            let mentions = unplaced.entry(source).or_default();
-            for symbol in &symbols[range] {
-                for (_, id) in crate_ids(&symbol.with_ids).filter(|it| it.0 == name) {
-                    *mentions.entry(id).or_default() += 1;
-                }
+            let into = unplaced.entry(source).or_default();
+            for (id, count) in mentions {
+                *into.entry(id).or_default() += count;
             }
         }
         let added_in = start.elapsed() - read_in;
+        let kept = table.names.len() + private_seen.len();
         table.place(unplaced);
         table.index(symbols);
         if std::env::var_os("RA_JIT_STATS").is_some() {
             let indexed_in = start.elapsed() - read_in - added_in;
             let ahead = READ_BEFORE.load(std::sync::atomic::Ordering::Relaxed);
             eprintln!(
-                "symbols: read {read_in:.1?} ({ahead} of {} files ahead), added {added_in:.1?}, \
-                 indexed {indexed_in:.1?}",
+                "symbols: read {read_in:.1?} ({ahead} of {} files ahead), added {added_in:.1?} \
+                 ({kept} of {names_read} names), indexed {indexed_in:.1?}",
                 files.len()
             );
         }
@@ -587,9 +596,9 @@ impl SymbolTable {
     #[allow(dead_code)] // `ra-jit-wasm` builds this file too, and has no files to read.
     pub(crate) fn of_names<'a>(names: impl IntoIterator<Item = &'a str>) -> SymbolTable {
         let mut table = SymbolTable::default();
-        let mut symbols = Vec::new();
+        let (mut symbols, mut private_seen) = (Vec::new(), FxHashSet::default());
         for name in names {
-            table.add_name(Read::new(Named::new(name, false)), &mut symbols);
+            table.add_name(Read::new(Named::new(name, false)), &mut symbols, &mut private_seen);
         }
         table.index(symbols);
         table
@@ -691,9 +700,20 @@ impl SymbolTable {
         self.names.contains(&Self::hashed(symbol))
     }
 
-    fn add_name(&mut self, read: Read, symbols: &mut Vec<Symbol>) {
+    /// Takes a name in once: another object that links to it, or another copy of a private
+    /// function, files it as the first did.
+    fn add_name(
+        &mut self,
+        read: Read,
+        symbols: &mut Vec<Symbol>,
+        private_seen: &mut FxHashSet<u64>,
+    ) {
         let Read { named: Named { name, private, demangled }, hashed, instance, .. } = read;
-        if !private && self.names.insert(hashed) && instance != name.len() {
+        let first = if private { private_seen.insert(hashed) } else { self.names.insert(hashed) };
+        if !first {
+            return;
+        }
+        if !private && instance != name.len() {
             self.copies.entry(name[..instance].to_owned()).or_default().push(name.clone());
         }
         let Some((with_ids, path)) = demangled else { return };

@@ -6629,6 +6629,21 @@ fn beside_cargo() -> usize {
     (cores() / 4).max(1)
 }
 
+/// Puts the calling thread, and the threads it starts, below cargo's: what works beside
+/// cargo's build takes the cores it leaves idle, as it does at its end, and no others.
+fn below_cargo() {
+    // SAFETY: each sets only the calling thread's priority (Linux's nice value is a thread's,
+    // not its process's), which the threads it starts then take.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+    }
+    #[cfg(target_vendor = "apple")]
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+    }
+}
+
 /// How cargo is asked about the workspace of `args`.
 fn cargo_config(args: &Args) -> CargoConfig {
     // The library is read as the toolchain that built the program has it: one the directory
@@ -7086,8 +7101,16 @@ fn follow_cargo(
                 lints_capped,
                 ..args.clone()
             };
-            resolve_crates(db, &of_ready, beside_cargo())?;
-            lower_until(db, &of_ready, listed, beside_cargo(), false, &more)?;
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        below_cargo();
+                        resolve_crates(db, &of_ready, beside_cargo())?;
+                        lower_until(db, &of_ready, listed, beside_cargo(), false, &more)
+                    })
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })?;
         }
         while !more() {
             let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).0;
