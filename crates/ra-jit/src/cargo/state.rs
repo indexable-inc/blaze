@@ -401,7 +401,10 @@ impl Staged {
                 );
                 if !alone {
                     shared.get_or_insert_with(|| {
-                        format!("`{}` is linked into more than a program of the workspace", target.name)
+                        format!(
+                            "`{}` is linked into more than a program of the workspace",
+                            target.name
+                        )
                     });
                 }
                 roots.push(target.src_path.clone().into_std_path_buf());
