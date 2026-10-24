@@ -72,18 +72,6 @@ pub(super) fn plain_handlers(func: &ir::Function) -> bool {
     })
 }
 
-/// A function of a unit LLVM compiles in one module ([`emit_unit`]).
-pub(super) struct Member<'a> {
-    pub(super) func: &'a ir::Function,
-    /// The slots of its locals with a name.
-    pub(super) named: &'a [ir::StackSlot],
-    /// What its parameters point to, as [`Wants::pointees`].
-    pub(super) pointees: &'a [(u32, super::fragment::Pointee)],
-    /// The request the others call it by, which is its name in the module: a call of it from
-    /// another is a call of a function of the module, which LLVM may build in.
-    pub(super) request: u32,
-}
-
 /// `named` are the slots of the locals with a name. `weights`, from what code of the function
 /// counted while it ran, become its `!prof`. `imports` are the bodies of what it calls that
 /// LLVM may build in ([`super::imports`]).
@@ -96,95 +84,29 @@ pub(super) fn emit(
     imports: &[Import],
 ) -> Result<Code, Unhandled> {
     let pointees = std::mem::take(&mut recorder.pointees);
-    let alone = Alone { func, named, pointees: &pointees, weights };
-    let emitted = compiled(recorder, Members::Alone(alone), optimization, imports);
+    let emitted = compiled(recorder, func, named, &pointees, weights, optimization, imports);
     recorder.pointees = pointees;
-    emitted?.members.pop().ok_or(Unhandled::Shape("an object without the function"))?
+    emitted
 }
 
-/// What the module of a unit gave ([`emit_unit`]).
-pub(super) struct Unit {
-    /// The code of each member, or what is wrong with it, which is that function's alone.
-    pub(super) members: Vec<Result<Code, Unhandled>>,
-    /// The code of each import LLVM left a call of, by the request it is of.
-    pub(super) kept: Vec<(u32, Result<Code, Unhandled>)>,
-}
-
-/// The functions of a unit, compiled in one module with what each imports ([`super::units`]).
-/// What is wrong with the module is every member's.
-///
-/// An import of a unit is `linkonce_odr` where a compile alone has it `available_externally`:
-/// a body LLVM did not build into every call of it is kept, and is the code of the function
-/// it is of, which the calls left call. So what a unit's code calls is known before LLVM
-/// runs: what its functions call that is not imported, and the same of what is
-/// ([`super::units`]).
-pub(super) fn emit_unit(
-    recorder: &mut Wants,
-    members: &[Member<'_>],
-    optimization: Optimization,
-    imports: &[Import],
-) -> Result<Unit, Unhandled> {
-    compiled(recorder, Members::Unit(members), optimization, imports)
-}
-
-/// The function of a module of one, which is named [`OWN`] and has nothing else call it.
-struct Alone<'a> {
-    func: &'a ir::Function,
-    named: &'a [ir::StackSlot],
-    pointees: &'a [(u32, super::fragment::Pointee)],
-    weights: Option<&'a super::tier::Weights>,
-}
-
-enum Members<'a> {
-    Alone(Alone<'a>),
-    Unit(&'a [Member<'a>]),
-}
-
+/// The function compiled in a module of its own, named [`OWN`] there, with nothing else
+/// calling it.
 fn compiled(
     recorder: &mut Wants,
-    members: Members<'_>,
+    func: &ir::Function,
+    named: &[ir::StackSlot],
+    pointees: &[(u32, super::fragment::Pointee)],
+    weights: Option<&super::tier::Weights>,
     optimization: Optimization,
     imports: &[Import],
-) -> Result<Unit, Unhandled> {
+) -> Result<Code, Unhandled> {
     let tally = Tally::global();
-    let alone = match &members {
-        Members::Alone(alone) => Some(alone),
-        Members::Unit(_) => None,
-    };
-    let weights = alone.and_then(|it| it.weights);
-    let (requested, defined): (Vec<String>, Vec<Defined<'_>>) = match &members {
-        Members::Alone(it) => {
-            let defined = Defined {
-                name: "",
-                func: it.func,
-                pointees: it.pointees,
-                named: it.named,
-                weights,
-                marked: true,
-            };
-            (vec![String::new()], vec![defined])
-        }
-        Members::Unit(members) => members
-            .iter()
-            .map(|it| {
-                let defined = Defined {
-                    name: "",
-                    func: it.func,
-                    pointees: it.pointees,
-                    named: it.named,
-                    weights: None,
-                    marked: true,
-                };
-                (Symbol::Func(it.request).to_string(), defined)
-            })
-            .unzip(),
-    };
     // LLVM's optimizing register allocator takes more than linear time, as Cranelift's does:
     // one function of dx kept it busy for minutes. Such a function is compiled without
     // optimization, and counted.
-    let large = defined.iter().filter(|it| it.func.dfg.num_insts() > super::LARGE).count();
-    let optimization = if large > 0 && optimization != Optimization::NONE {
-        tally.large.fetch_add(large, std::sync::atomic::Ordering::Relaxed);
+    let optimization = if func.dfg.num_insts() > super::LARGE && optimization != Optimization::NONE
+    {
+        tally.large.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Optimization::NONE
     } else {
         optimization
@@ -192,21 +114,11 @@ fn compiled(
     let seen = std::mem::take(&mut recorder.seen);
     // Without a line table to keep (see `lower::Marks`), and where a parameter is the only
     // way to its memory.
-    let wrapped = alone.is_some()
-        && optimization.pipeline().is_some()
-        && alone.is_some_and(|it| it.pointees.iter().any(|(_, it)| it.unique))
+    let wrapped = optimization.pipeline().is_some()
+        && pointees.iter().any(|(_, it)| it.unique)
         && super::Target::selected().is_ok_and(|it| it.object_format == super::ObjectFormat::MachO);
-    let names: Vec<&str> = requested
-        .iter()
-        .map(|name| match alone {
-            Some(_) if wrapped => INNER,
-            Some(_) => OWN,
-            None => name.as_str(),
-        })
-        .collect();
-    let defined: Vec<Defined<'_>> = std::iter::zip(&names, defined)
-        .map(|(&name, defined)| Defined { name, ..defined })
-        .collect();
+    let name = if wrapped { INNER } else { OWN };
+    let defined = Defined { name, func, pointees, named, weights, marked: true };
     Machine::with(optimization, |context, machine| {
         let module = context.create_module("ra-jit");
         module.set_triple(&machine.get_triple());
@@ -223,35 +135,10 @@ fn compiled(
             machine.get_target_data().get_pointer_byte_size(None) as usize,
         );
         let debug = lower::Debug::of(&module)?;
-        let (shown, failed) = tally.time(Phase::Lower, || {
-            // What is wrong with the function of each member, which is then only declared.
-            let mut failed: Vec<Option<Unhandled>> = defined.iter().map(|_| None).collect();
-            let mut functions = Vec::with_capacity(defined.len());
-            for (at, defined) in defined.iter().enumerate() {
-                match Lowering::add(context, &module, defined) {
-                    Ok(function) => functions.push(Some(function)),
-                    Err(e) if alone.is_some() => return Err(e),
-                    Err(e) => {
-                        failed[at] = Some(e);
-                        functions.push(None);
-                    }
-                }
-            }
-            // Each function of a unit is a section of its own, which `emitted` reads as the
-            // code of that function.
-            if alone.is_none() {
-                for (function, name) in std::iter::zip(&functions, &names) {
-                    if let Some(function) = function {
-                        function.as_global_value().set_comdat(module.get_or_insert_comdat(name));
-                    }
-                }
-            }
-            // Before the functions' bodies: their calls of what is imported are of the bodies.
-            let linkage = match alone {
-                Some(_) => Linkage::AvailableExternally,
-                None => Linkage::LinkOnceODR,
-            };
-            link(context, &module, imports, linkage)?;
+        let shown = tally.time(Phase::Lower, || {
+            let function = Lowering::add(context, &module, &defined)?;
+            // Before the function's body: its calls of what is imported are of the bodies.
+            link(context, &module, imports, Linkage::AvailableExternally)?;
             let names: Vec<String> = seen.iter().map(|it| shown_name(it.id.as_u32())).collect();
             let shown: Vec<Defined<'_>> = std::iter::zip(&seen, &names)
                 .map(|(it, name)| Defined {
@@ -286,39 +173,28 @@ fn compiled(
                     unshow(&module, &FxHashMap::from_iter([(it.id.as_u32(), function)]));
                 }
             }
-            for (at, (defined, function)) in std::iter::zip(&defined, &functions).enumerate() {
-                let Some(function) = *function else { continue };
-                let lowered = Lowering::define(
-                    context,
-                    &module,
-                    function,
-                    defined,
-                    &constants,
-                    &statics,
-                    resume,
-                    memcmp,
-                    &by_id,
-                    debug.as_ref(),
-                );
-                match lowered {
-                    Ok(()) => {}
-                    Err(e) if alone.is_some() => return Err(e),
-                    Err(e) => {
-                        failed[at] = Some(e);
-                        declared_only(&module, function);
-                    }
-                }
-            }
+            Lowering::define(
+                context,
+                &module,
+                function,
+                &defined,
+                &constants,
+                &statics,
+                resume,
+                memcmp,
+                &by_id,
+                debug.as_ref(),
+            )?;
             if let Some(debug) = &debug {
                 debug.finish();
             }
-            if !imports.is_empty() || alone.is_none() {
+            if !imports.is_empty() {
                 agree_calls(context, &module)?;
             }
-            if wrapped && let Some(Some(function)) = functions.first() {
-                wrap(context, &module, *function, weights)?;
+            if wrapped {
+                wrap(context, &module, function, weights)?;
             }
-            Ok::<_, Unhandled>((by_id, failed))
+            Ok::<_, Unhandled>(by_id)
         })?;
         // `RA_JIT_DUMP_LLVM=after` prints the IR as the passes left it, anything else as it
         // goes in.
@@ -347,27 +223,13 @@ fn compiled(
                     .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))?;
             }
         }
-        // What a compile alone imports is only there to be built in: a body LLVM did not
-        // build in is the callee's own code, called. The passes above drop them; a function
-        // too large for them gets none. What a unit imports and still calls is kept.
-        let mut kept = Vec::new();
+        // What a compile imports is only there to be built in: a body LLVM did not build in
+        // is the callee's own code, called. The passes above drop them; a function too large
+        // for them gets none.
         if !imports.is_empty() {
-            let pass = if alone.is_some() { "elim-avail-extern" } else { "globaldce" };
             module
-                .run_passes(pass, machine, PassBuilderOptions::create())
+                .run_passes("elim-avail-extern", machine, PassBuilderOptions::create())
                 .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))?;
-        }
-        if alone.is_none() {
-            for import in imports {
-                let name = Symbol::Func(import.id).to_string();
-                let Some(body) = module.get_function(&name) else { continue };
-                if body.count_basic_blocks() == 0 {
-                    continue;
-                }
-                body.set_linkage(Linkage::External);
-                body.as_global_value().set_comdat(module.get_or_insert_comdat(&name));
-                kept.push((name, import));
-            }
         }
         unshow(&module, &shown);
         retold_bytes(context, &module, &readonly);
@@ -380,40 +242,11 @@ fn compiled(
         let object = tally
             .time(Phase::Emit, || machine.write_to_memory_buffer(&module, FileType::Object))
             .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))?;
-        let mut read: Vec<(&str, ir::Signature)> = std::iter::zip(&names, &defined)
-            .map(|(&name, defined)| {
-                (if wrapped { OWN } else { name }, defined.func.signature.clone())
-            })
-            .collect();
-        read.extend(
-            kept.iter().map(|(name, import)| (name.as_str(), import.export.signature.clone())),
-        );
+        let read = [(OWN, func.signature.clone())];
         let mut codes =
             tally.time(Phase::Read, || emitted::read(object.as_slice(), &read, recorder))?;
-        let kept_codes = codes.split_off(defined.len());
-        let kept = std::iter::zip(kept.iter().map(|(_, import)| import.id), kept_codes);
-        Ok(Unit {
-            members: std::iter::zip(codes, failed)
-                .map(|(code, failed)| match failed {
-                    Some(failed) => Err(failed),
-                    None => code,
-                })
-                .collect(),
-            kept: kept.collect(),
-        })
+        codes.pop().ok_or(Unhandled::Shape("an object without the function"))?
     })
-}
-
-/// Leaves `function`, whose body could not be lowered, a declaration of the same name and
-/// type, which the other functions of the module call.
-fn declared_only<'ctx>(module: &Module<'ctx>, function: FunctionValue<'ctx>) {
-    let name = function.get_name().to_owned();
-    function.as_global_value().set_name("ra-jit.unlowered");
-    let declaration =
-        module.add_function(&name.to_string_lossy(), function.get_type(), Some(Linkage::External));
-    function.replace_all_uses_with(declaration);
-    // SAFETY: nothing refers to the function any more.
-    unsafe { function.delete() };
 }
 
 /// The function being compiled, when it is [`wrap`]ped.
@@ -522,10 +355,9 @@ pub(super) fn export(
 /// Puts the body each of `imports` has in `module`, of `linkage` under the name of the request
 /// it is of, with what it refers to under the names of the compile's requests.
 ///
-/// LLVM's linker goes over all of the module it links into, so each linked into a unit's
-/// module, which every one makes larger, took time of the square of their number: lowering
-/// ripgrep's units took 23.7 s summed over the cores, where its functions alone took 12.3 s.
-/// They are linked to each other two at a time instead, and into `module` at once.
+/// LLVM's linker goes over all of the module it links into, so each linked into the module,
+/// which every one makes larger, takes time of the square of their number. They are linked to
+/// each other two at a time instead, and into `module` at once.
 fn link<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
@@ -1321,152 +1153,6 @@ define void @"ra-jit.own"(ptr %to, i64 %from) {
             assert_eq!(body.get_linkage(), Linkage::AvailableExternally);
             assert!(body.count_basic_blocks() > 0);
         }
-    }
-
-    /// Two functions compiled as one module come back each as its own code: the call of one
-    /// by the other names the callee's request, and the constant both load is one object.
-    #[test]
-    fn a_unit_reads_back_each_function_with_its_calls_and_constants() {
-        use cranelift_codegen::ir::{AbiParam, InstBuilder, UserFuncName, types::F64};
-        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-        use cranelift_module::{FuncId, ModuleRelocTarget};
-
-        use super::super::fragment::FuncTarget;
-
-        let isa = super::super::target().unwrap();
-        let mut wants = Wants::new(&**isa);
-        let mut sig = ir::Signature::new(isa.default_call_conv());
-        sig.params.push(AbiParam::new(F64));
-        sig.returns.push(AbiParam::new(F64));
-        let callee = wants.func(FuncTarget::Symbol("callee".into()), &sig);
-        let caller = wants.func(FuncTarget::Symbol("caller".into()), &sig);
-        let mut context = FunctionBuilderContext::new();
-        let mut body = |call: Option<FuncId>| {
-            let mut func = ir::Function::with_name_signature(UserFuncName::default(), sig.clone());
-            let callee = call.map(|it| wants.declare_func_in_func(it, &mut func));
-            let mut builder = FunctionBuilder::new(&mut func, &mut context);
-            let block = builder.create_block();
-            builder.append_block_params_for_function_params(block);
-            builder.switch_to_block(block);
-            builder.seal_block(block);
-            let mut value = builder.block_params(block)[0];
-            if let Some(callee) = callee {
-                let call = builder.ins().call(callee, &[value]);
-                value = builder.inst_results(call)[0];
-            }
-            // Not an immediate of AArch64's `fmov`, so loaded from memory there too.
-            let tenth = builder.ins().f64const(0.1);
-            let value = builder.ins().fmul(value, tenth);
-            builder.ins().return_(&[value]);
-            builder.finalize(isa.frontend_config());
-            func
-        };
-        let (calls, called) = (body(Some(callee)), body(None));
-        let members = [
-            Member { func: &calls, named: &[], pointees: &[], request: caller.as_u32() },
-            Member { func: &called, named: &[], pointees: &[], request: callee.as_u32() },
-        ];
-        let unit = emit_unit(&mut wants, &members, Optimization::NONE, &[]).unwrap();
-        let mut codes: Vec<Code> = unit.members.into_iter().map(Result::unwrap).collect();
-        let named = |code: &Code, wanted| -> Vec<u32> {
-            let names = code.relocs.iter().map(|it| &it.name);
-            names
-                .filter_map(|it| match *it {
-                    ModuleRelocTarget::User { namespace, index } if namespace == wanted => {
-                        Some(index)
-                    }
-                    _ => None,
-                })
-                .collect()
-        };
-        assert_eq!(named(&codes[0], 0), [callee.as_u32()]);
-        assert_eq!(named(&codes[1], 0), Vec::<u32>::new());
-        let constant = named(&codes[0], 1);
-        assert_eq!(constant.len(), 1);
-        assert_eq!(named(&codes[1], 1), constant);
-
-        let requests = wants.referenced(&mut codes[0]);
-        let targets: Vec<_> = requests.funcs.iter().map(|it| &it.target).collect();
-        assert!(matches!(&targets[..], [FuncTarget::Symbol(it)] if it == "callee"));
-        assert_eq!(requests.datas.len(), 1);
-        let requests = wants.referenced(&mut codes[1]);
-        assert!(requests.funcs.is_empty());
-        assert_eq!(requests.datas.len(), 1);
-    }
-
-    /// What a unit imports and LLVM leaves a call of is kept, and read out as code of its
-    /// own; what LLVM built into every call is not.
-    #[test]
-    fn a_unit_keeps_an_import_it_still_calls() {
-        use cranelift_codegen::ir::{AbiParam, InstBuilder, UserFuncName, types::F64};
-        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-        use cranelift_module::FuncId;
-
-        use super::super::fragment::FuncTarget;
-
-        const NOT_BUILT_IN: &str = r#"
-define double @"ra-jit.own"(double %x) #0 {
-  %y = fmul double %x, 3.0
-  ret double %y
-}
-attributes #0 = { noinline }
-"#;
-        const BUILT_IN: &str = r#"
-define double @"ra-jit.own"(double %x) #0 {
-  %y = fadd double %x, 2.0
-  ret double %y
-}
-attributes #0 = { alwaysinline }
-"#;
-        let isa = super::super::target().unwrap();
-        let mut wants = Wants::new(&**isa);
-        let mut sig = ir::Signature::new(isa.default_call_conv());
-        sig.params.push(AbiParam::new(F64));
-        sig.returns.push(AbiParam::new(F64));
-        let kept = wants.func(FuncTarget::Symbol("kept".into()), &sig);
-        let built_in = wants.func(FuncTarget::Symbol("built in".into()), &sig);
-        let caller = wants.func(FuncTarget::Symbol("caller".into()), &sig);
-        let mut func = ir::Function::with_name_signature(UserFuncName::default(), sig.clone());
-        let calls = [kept, built_in].map(|it| wants.declare_func_in_func(it, &mut func));
-        let mut context = FunctionBuilderContext::new();
-        let mut builder = FunctionBuilder::new(&mut func, &mut context);
-        let block = builder.create_block();
-        builder.append_block_params_for_function_params(block);
-        builder.switch_to_block(block);
-        builder.seal_block(block);
-        let mut value = builder.block_params(block)[0];
-        for callee in calls {
-            let call = builder.ins().call(callee, &[value]);
-            value = builder.inst_results(call)[0];
-        }
-        builder.ins().return_(&[value]);
-        builder.finalize(isa.frontend_config());
-
-        let llvm = Context::create();
-        let import = |text, id: FuncId| Import {
-            export: std::sync::Arc::new(super::super::imports::Export {
-                bitcode: parsed(&llvm, text).write_bitcode_to_memory().as_slice().to_vec(),
-                requests: Default::default(),
-                signature: sig.clone(),
-                size: 2,
-                hint: Hint::None,
-            }),
-            id: id.as_u32(),
-            funcs: vec![id.as_u32()],
-            datas: Vec::new(),
-        };
-        let imports = [import(NOT_BUILT_IN, kept), import(BUILT_IN, built_in)];
-        let members = [Member { func: &func, named: &[], pointees: &[], request: caller.as_u32() }];
-        let optimization =
-            Optimization { passes: Passes::Aggressive, selection: Selection::Optimized };
-        let unit = emit_unit(&mut wants, &members, optimization, &imports).unwrap();
-        let mut code = unit.members.into_iter().next().unwrap().unwrap();
-        let requests = wants.referenced(&mut code);
-        let targets: Vec<_> = requests.funcs.iter().map(|it| &it.target).collect();
-        assert!(matches!(&targets[..], [FuncTarget::Symbol(it)] if it == "kept"));
-        let kept: Vec<u32> = unit.kept.iter().map(|it| it.0).collect();
-        assert_eq!(kept, [imports[0].id]);
-        assert!(unit.kept[0].1.as_ref().is_ok_and(|it| !it.bytes.is_empty()));
     }
 
     #[test]

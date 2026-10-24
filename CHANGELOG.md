@@ -12,19 +12,10 @@ All notable changes to ra-jit are written here. The format follows
   `.sd` and AVX's 256-bit ones give a lane of all ones where the immediate's predicate holds, as
   rustc's do. glam's `Vec4::cmpeq` and `is_finite_mask`, which bevy calls, were left to rustc;
   `harness/breakers` checks each predicate, NaN lanes included, against rustc's program.
-- `RA_JIT_UNITS=1` compiles a whole program's functions many to an LLVM module, as rustc
-  compiles a crate's codegen units (#176): the functions are found from their IR before any
-  is compiled, cut into units of about 20,000 instructions in the order they were found in,
-  and compiled on every core, each unit with the union of its functions' imports linked in.
-  An import LLVM leaves a call of is kept as the code of its function, so the functions are
-  found in one round, and each function's code is read out of the unit's object and put in
-  the program's as a compile of it alone is. It is not the default: on 16 cores helix builds
-  in 71.1 s against 69.7 s and runs 1.28x of cargo's release build against 1.21x, and LLVM
-  takes four times rustc's time for code of the same size either way
-  ([codegen-units.md](docs/research/codegen-units.md)). Imports are linked into a compile's
-  module once, after being linked to each other two at a time, which took the lowering of a
-  module of many functions from 23.7 s to 8.1 s summed over ripgrep's cores.
-
+- A compile links its imports to each other two at a time and into its module once: linked in
+  one at a time they took time of the square of their number, as LLVM's linker goes over the
+  whole module it links into (ripgrep's lowering of many functions to a module went from
+  23.7 s to 8.1 s summed over the cores).
 - An edit that needs a build in full no longer links in full when the daemon has no base of
   its own (it gave it up, or hasn't built it yet) (#159): on Linux the program is built onto
   the executable rustc linked and spliced into it whole, and the edits after it are patches of

@@ -17,7 +17,8 @@
 //!
 //! Each compile is still a module of its own, so two that call one function each link it in
 //! and optimize it: helix and nushell build in about twice the time of cargo's release build,
-//! and would with nothing imported. Codegen units that share their imports are #176.
+//! and would with nothing imported. Codegen units that shared their imports were tried and
+//! removed (`docs/research/codegen-units.md`).
 
 use std::{
     collections::VecDeque,
@@ -96,25 +97,6 @@ pub(super) fn enabled() -> bool {
 /// The exports of what `recorder` calls that its compile imports, and of what those call in
 /// turn, the first first: what a call asks for is in the compile's names from then on.
 pub(super) fn chosen(recorder: &mut Recorder<'_>) -> Vec<Import> {
-    tallied(chosen_for(recorder, &|_| false, BUDGET))
-}
-
-/// `chosen`, counted as imported.
-pub(super) fn tallied(chosen: Vec<Import>) -> Vec<Import> {
-    let tally = Tally::global();
-    tally.imported.fetch_add(chosen.len(), Ordering::Relaxed);
-    let spent = chosen.iter().map(|it| it.export.size).sum();
-    tally.imported_size.fetch_add(spent, Ordering::Relaxed);
-    chosen
-}
-
-/// [`chosen`], for a compile of the functions of a unit ([`super::units`]), which has the
-/// room of all of them and imports none of them: `defined` says which instances it has.
-pub(super) fn chosen_for(
-    recorder: &mut Recorder<'_>,
-    defined: &dyn Fn(&Instance) -> bool,
-    budget: usize,
-) -> Vec<Import> {
     let db = recorder.db;
     let mut chosen = Vec::new();
     let mut taken: FxHashSet<u32> = FxHashSet::default();
@@ -129,7 +111,7 @@ pub(super) fn chosen_for(
         }
         let request = &recorder.requests.funcs[id as usize];
         let FuncTarget::Instance(instance, env) = &request.target else { continue };
-        if !super::tier::shared(db, instance) || defined(instance) {
+        if !super::tier::shared(db, instance) {
             continue;
         }
         let Some(export) = export(db, instance, env) else { continue };
@@ -141,7 +123,7 @@ pub(super) fn chosen_for(
         };
         if export.signature != request.sig
             || export.size as f32 > room as f32 * share
-            || spent + export.size > budget
+            || spent + export.size > BUDGET
         {
             continue;
         }
@@ -155,6 +137,9 @@ pub(super) fn chosen_for(
         let datas = datas.iter().map(|it| it.as_u32()).collect();
         chosen.push(Import { export, id, funcs, datas });
     }
+    let tally = Tally::global();
+    tally.imported.fetch_add(chosen.len(), Ordering::Relaxed);
+    tally.imported_size.fetch_add(spent, Ordering::Relaxed);
     chosen
 }
 

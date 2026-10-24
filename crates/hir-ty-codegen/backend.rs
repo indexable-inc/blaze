@@ -317,13 +317,6 @@ impl fmt::Display for Backend {
 pub(super) struct Tally {
     cranelift: Produced,
     pub(super) llvm: Produced,
-    /// The units LLVM compiled ([`super::units`]), the functions of them and the imports
-    /// they kept as the code of the functions those are of, and why a function of one was
-    /// compiled alone instead, and how often.
-    units: AtomicUsize,
-    unit_members: AtomicUsize,
-    pub(super) unit_kept: AtomicUsize,
-    alone: Mutex<BTreeMap<String, usize>>,
     /// Time LLVM spent on functions it then gave up on.
     wasted: AtomicU64,
     /// Why LLVM left a function to Cranelift, and how often.
@@ -432,18 +425,6 @@ impl Tally {
     }
 
     #[cfg(feature = "llvm")]
-    pub(super) fn unit(&self, members: usize) {
-        self.units.fetch_add(1, Ordering::Relaxed);
-        self.unit_members.fetch_add(members, Ordering::Relaxed);
-    }
-
-    #[cfg(feature = "llvm")]
-    pub(super) fn alone(&self, reason: &str, functions: usize) {
-        let mut alone = self.alone.lock().unwrap_or_else(|e| e.into_inner());
-        *alone.entry(reason.to_owned()).or_default() += functions;
-    }
-
-    #[cfg(feature = "llvm")]
     pub(super) fn time<T>(&self, phase: Phase, work: impl FnOnce() -> T) -> T {
         let start = Instant::now();
         let out = work();
@@ -529,23 +510,6 @@ impl Tally {
             eprintln!(
                 "backend: llvm built exports of {exports}; {imported} imported, {size} instructions"
             );
-        }
-        let (units, members) =
-            (self.units.swap(0, Ordering::Relaxed), self.unit_members.swap(0, Ordering::Relaxed));
-        let kept = self.unit_kept.swap(0, Ordering::Relaxed);
-        if units != 0 {
-            eprintln!(
-                "backend: llvm compiled {members} functions in {units} units, which kept {kept} \
-                 imports"
-            );
-        }
-        let alone = std::mem::take(&mut *self.alone.lock().unwrap_or_else(|e| e.into_inner()));
-        if !alone.is_empty() {
-            let count: usize = alone.values().sum();
-            eprintln!("backend: {count} functions of units compiled alone:");
-            for (reason, count) in alone {
-                eprintln!("  {count}\t{reason}");
-            }
         }
         if let Some(cranelift) = cranelift {
             eprintln!("backend: cranelift compiled {cranelift}");
