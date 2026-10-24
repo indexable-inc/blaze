@@ -1202,6 +1202,37 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
             source_map,
             TypeOwnerId::from_anon_const(def, self.db),
         );
+        self.collect_anon_const_borrowck(source_map, def);
+    }
+
+    fn collect_anon_const_borrowck(
+        &mut self,
+        source_map: &ExpressionStoreSourceMap,
+        def: AnonConstId<'db>,
+    ) {
+        use hir_ide::mir::MirSpan;
+        let result = hir_ty_borrowck::borrowck_anon_const(self.db, def);
+        for diagnostic in &result.diagnostics {
+            let source = match diagnostic.span {
+                MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => source_map.expr_syntax(expr),
+                MirSpan::PatId(pat) => source_map.pat_syntax(pat),
+                MirSpan::BindingId(binding) => match source_map.patterns_for_binding(binding) {
+                    [pat, ..] => source_map.pat_syntax(*pat),
+                    [] => continue,
+                },
+                _ => source_map.expr_syntax(def.loc(self.db).expr),
+            };
+            let Ok(source) = source else { continue };
+            self.acc.push(
+                BorrowckError {
+                    node: source.map(|it| it.syntax_node_ptr()),
+                    at_end: matches!(diagnostic.span, MirSpan::ExprEnd(_)),
+                    code: diagnostic.code,
+                    message: diagnostic.message.clone(),
+                }
+                .into(),
+            );
+        }
     }
 
     fn collect_enum(&mut self, def: EnumId) {
@@ -1361,6 +1392,16 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                     }
                 }
                 MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
+                // `self` is a binding no pattern binds.
+                MirSpan::BindingId(binding)
+                    if body
+                        .self_param
+                        .is_some_and(|it| it.formal == binding || it.user_written == binding) =>
+                {
+                    return source_map
+                        .self_param_syntax()
+                        .map(|it| it.map(|it| it.syntax_node_ptr()));
+                }
                 MirSpan::BindingId(binding) => {
                     let pat = *source_map.patterns_for_binding(binding).first()?;
                     source_map.pat_syntax(pat).ok()?
@@ -1394,7 +1435,11 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
             // at what the user wrote, which has no `mut` to remove.
             if diagnostic.code == "unused_mut" {
                 let pat = node.value.to_node(&node.file_id.parse_or_expand(self.db));
-                if !ast::IdentPat::cast(pat).is_some_and(|it| it.mut_token().is_some()) {
+                let written = match ast::SelfParam::cast(pat.clone()) {
+                    Some(it) => it.mut_token().is_some(),
+                    None => ast::IdentPat::cast(pat).is_some_and(|it| it.mut_token().is_some()),
+                };
+                if !written {
                     continue;
                 }
             }

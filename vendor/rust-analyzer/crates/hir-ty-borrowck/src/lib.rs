@@ -122,6 +122,37 @@ pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckRe
     {
         return result;
     }
+    check_owner(db, owner, Some(def))
+}
+
+/// The errors rustc's borrow checker reports in a constant of a signature, as an array length
+/// or a const generic argument or default, which rustc checks as a body of its own.
+#[salsa::tracked(returns(ref))]
+pub fn borrowck_anon_const<'db>(
+    db: &'db dyn HirDatabase,
+    konst: hir_ty::db::AnonConstId<'db>,
+) -> BorrowckResult {
+    if mode() == Mode::Off || konst.is_inline_const(db) {
+        return BorrowckResult::default();
+    }
+    let owner = InferBodyId::AnonConstId(konst);
+    let infer = InferenceResult::of(db, owner);
+    if infer.has_type_mismatches() || infer.is_erroneous() {
+        return BorrowckResult::default();
+    }
+    check_owner(db, owner, None)
+}
+
+/// The errors in `owner`'s body and the closures, coroutines and `const { .. }` blocks in it;
+/// `def` is the item when it is one, not a constant of a signature.
+fn check_owner<'db>(
+    db: &'db dyn HirDatabase,
+    owner: InferBodyId<'db>,
+    def: Option<DefWithBodyId>,
+) -> BorrowckResult {
+    let mode = mode();
+    let mut result = BorrowckResult::default();
+    let infer = InferenceResult::of(db, owner);
     let body = match db.mir_body(owner) {
         Ok(body) => body,
         Err(error) => {
@@ -198,11 +229,13 @@ pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckRe
 /// rustc's E0493, from checking a const context before borrow checking it: a `const` or
 /// `static` item or a `const fn` drops a value of a type with drop glue, and rustc does not
 /// borrow check it. What is moved out of, in part too, is taken not to be dropped.
-fn drops_in_const(ctx: &Ctx<'_, '_>, def: DefWithBodyId, body: &MirBody<'_>) -> bool {
+fn drops_in_const(ctx: &Ctx<'_, '_>, def: Option<DefWithBodyId>, body: &MirBody<'_>) -> bool {
     use hir_ty::mir::{OperandKind, TerminatorKind};
     let const_context = match def {
-        DefWithBodyId::ConstId(_) | DefWithBodyId::StaticId(_) => true,
-        DefWithBodyId::FunctionId(it) => {
+        // A constant of a signature.
+        None => true,
+        Some(DefWithBodyId::ConstId(_) | DefWithBodyId::StaticId(_)) => true,
+        Some(DefWithBodyId::FunctionId(it)) => {
             hir_def::signatures::FunctionSignature::of(ctx.db, it).is_const()
         }
         _ => false,

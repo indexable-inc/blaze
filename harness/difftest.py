@@ -165,6 +165,10 @@ class Fixture:
         """Builds with cargo and captures the linker line so ra-jit objects can be spliced in."""
         os.utime(self.touch)
         env, target = dict(os.environ), []
+        # In the workspace's own target directory: cargo names a package's artifacts by its
+        # path in its workspace, so programs of one name built at once in the caller's would
+        # take each other's place (fuzz/edits.py's, all of them `fz`).
+        env.pop("CARGO_TARGET_DIR", None)
         if self.alone:
             env.update(RUSTC_WORKSPACE_WRAPPER=RA_JIT, RA_JIT_WRAPS_RUSTC="1",
                        CARGO_TARGET_DIR=os.path.join(self.ws, "target-alone"))

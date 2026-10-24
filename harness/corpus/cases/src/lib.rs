@@ -8219,6 +8219,96 @@ pub mod elided_captures {
     }
 }
 
+/// What `for<'a>` bounds prove for any lifetime, which the borrow checker proves for
+/// placeholders: an owned type deserialized from a borrow, a forwarding impl through
+/// `&mut F`, a closure for any lifetime, a collection borrowed for any lifetime and a function
+/// taking `&mut dyn Write` as a callback.
+pub mod higher_ranked {
+    pub trait Deserialize<'de>: Sized {
+        fn parse(text: &'de str) -> Self;
+    }
+
+    pub trait DeserializeOwned: for<'de> Deserialize<'de> {}
+    impl<T> DeserializeOwned for T where T: for<'de> Deserialize<'de> {}
+
+    impl<'de> Deserialize<'de> for String {
+        fn parse(text: &'de str) -> Self {
+            text.to_owned()
+        }
+    }
+
+    impl<'de> Deserialize<'de> for &'de str {
+        fn parse(text: &'de str) -> Self {
+            text
+        }
+    }
+
+    fn owned<T: DeserializeOwned>(text: &str) -> T {
+        T::parse(text)
+    }
+
+    fn borrowed<'de, T: Deserialize<'de>>(text: &'de str) -> T {
+        T::parse(text)
+    }
+
+    pub trait Bar<X> {
+        fn bar(&mut self, x: X) -> usize;
+    }
+
+    impl<X, F: Bar<X>> Bar<X> for &mut F {
+        fn bar(&mut self, x: X) -> usize {
+            (**self).bar(x)
+        }
+    }
+
+    struct Count(usize);
+
+    impl<'b> Bar<&'b str> for Count {
+        fn bar(&mut self, x: &'b str) -> usize {
+            self.0 += x.len();
+            self.0
+        }
+    }
+
+    fn needs<T: for<'b> Bar<&'b str>>(t: &mut T, word: &str) -> usize {
+        t.bar(word)
+    }
+
+    fn apply<F: for<'a> Fn(&'a str) -> &'a str>(f: F, text: &str) -> usize {
+        f(text).len()
+    }
+
+    fn total<C>(items: &C) -> u32
+    where
+        for<'a> &'a C: IntoIterator<Item = &'a u32>,
+    {
+        items.into_iter().sum()
+    }
+
+    fn report(text: &str, out: &mut dyn std::fmt::Write) {
+        let _ = out.write_str(text.trim());
+    }
+
+    fn with_handler(mut handle: impl FnMut(&str, &mut dyn std::fmt::Write)) -> String {
+        let mut out = String::new();
+        handle(" handled ", &mut out);
+        out
+    }
+
+    pub fn run() -> (String, usize, usize, usize, u32, String) {
+        let text = String::from(" abc ");
+        let copy: String = owned(&text);
+        let view: &str = borrowed(&text);
+        let mut count = Count(0);
+        let first = needs(&mut &mut count, view);
+        let second = needs(&mut count, &copy);
+        let trimmed = apply(|it| it.trim(), &text);
+        let sum = total(&vec![1, 2, 3]);
+        let handled = with_handler(report);
+        (copy, first, second, trimmed, sum, handled)
+    }
+}
+
 pub mod async_closure_futures {
     use std::future::Future;
     use std::pin::pin;

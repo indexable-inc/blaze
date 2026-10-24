@@ -3,6 +3,7 @@
 
 usage: lints_ui.py <rust checkout> [--bin ra-jit] [--work dir] [--jobs N] [--filter substr]
                    [--json out.json] [--toolchain nightly-YYYY-MM-DD] [--list wrong|out]
+                   [--deny LINT]
 
 A lint a crate denies, with `#![deny(..)]`, `#[forbid(..)]` or `deny(warnings)`, fails rustc's
 build, so ra-jit may only build what it is denied in if it fails the build too, and may only
@@ -19,6 +20,11 @@ Each lint is scored on its own, by the (lint, line) of every error: one ra-jit r
 rustc does not is wrong, one rustc reports that ra-jit does not is missed. A lint whose
 errors ra-jit may fail a build with must have none wrong. What ra-jit finds in a macro's
 expansion is not counted: it fails no build.
+
+`--deny LINT` scores one lint over every `tests/ui` file, not only those that set a level: rustc
+warns of most lints by default, so any test is one for them. Each file is read with
+`#![deny(LINT)]` put before its first line, which a level the file sets itself overrides, as it
+would in a crate; a file that begins with a `#!` line that is no attribute is out of scope.
 """
 import argparse, collections, concurrent.futures, hashlib, json, os, re, subprocess, sys, tempfile, time
 
@@ -32,17 +38,37 @@ LINT_FLAG = re.compile(r"^(-[AWDF]|--cap-lints|--force-warn)")
 LINT = re.compile(r"^(?!borrowck$)[a-z][a-z0-9_]*$")
 
 
-def collect(root):
+# rustc names the crate after the file, so the prefix must keep it an identifier.
+DENIED = "lints_ui_denied_"
+
+
+def collect(root, every=False):
     ui = os.path.join(root, "tests", "ui")
     found = []
     for dirpath, dirnames, filenames in os.walk(ui):
         dirnames[:] = [d for d in dirnames if d != "auxiliary"]
         for name in filenames:
-            if name.endswith(".rs"):
+            if name.endswith(".rs") and not name.startswith(DENIED):
                 path = os.path.join(dirpath, name)
-                if LEVEL.search(open(path, errors="replace").read()):
+                if every or LEVEL.search(open(path, errors="replace").read()):
                     found.append(path)
     return sorted(found)
+
+
+def denied_copy(unit, lint, made):
+    """Points the unit at a copy of its file that denies `lint`, beside it so that what the file
+    names by a relative path is found; or says why it cannot."""
+    text = open(unit.path, errors="replace").read()
+    if text.startswith("#!") and not text.startswith("#!["):
+        return "a `#!` line first"
+    copy = os.path.join(os.path.dirname(unit.path), DENIED + os.path.basename(unit.path))
+    if copy not in made:
+        # On the first line, so that every line keeps its number.
+        with open(copy, "w") as f:
+            f.write(f"#![deny({lint})] " + text)
+        made.add(copy)
+    unit.path = copy
+    return None
 
 
 def rustc_errors(toolchain, unit, cache, work):
@@ -50,8 +76,11 @@ def rustc_errors(toolchain, unit, cache, work):
     text = open(unit.path, errors="replace").read()
     args = [unit.path, "--edition", unit.edition, "--error-format=json", "--emit=metadata", "--crate-type", "lib",
             "-Zui-testing"]
+    # `-Zunpretty` prints the source and stops before any lint, so rustc checks it without.
+    dropped = ("--crate-type", "--edition", "--error-format", "--emit", "-Zpolonius", "-Z polonius", "-Zunpretty",
+               "-Z unpretty")
     for flag in unit.flags:
-        if not flag.startswith(("--crate-type", "--edition", "--error-format", "--emit", "-Zpolonius", "-Z polonius")):
+        if not flag.startswith(dropped):
             args += flag.split(" ", 1)
     key = hashlib.sha1(json.dumps([toolchain, args, text]).encode()).hexdigest()
     if key not in cache:
@@ -104,20 +133,35 @@ def main():
     ap.add_argument("--json")
     ap.add_argument("--toolchain", default=DEFAULT_TOOLCHAIN)
     ap.add_argument("--list", choices=["wrong", "missed", "out"], action="append", default=[])
+    ap.add_argument("--deny")
     args = ap.parse_args()
+    # rustc runs in the directory of each file, so the paths it is given are absolute.
+    args.rust = os.path.abspath(args.rust)
     os.makedirs(args.work, exist_ok=True)
     cache_path = os.path.join(args.work, "rustc-cache.json")
     cache = json.load(open(cache_path)) if os.path.exists(cache_path) else {}
 
-    files = collect(args.rust)
+    files = collect(args.rust, every=bool(args.deny))
     if args.filter:
         files = [f for f in files if args.filter in f]
     units = [u for f in files for u in classify(args.rust, f)]
+    made = set()
     for unit in units:
         if unit.out and unit.out.startswith("compile flag -") and LINT_FLAG.match(unit.out.split()[-1]):
             unit.out = "a lint level on the command line"
         elif not unit.out and any(LINT_FLAG.match(f) for f in unit.flags):
             unit.out = "a lint level on the command line"
+        elif not unit.out and args.deny:
+            unit.out = denied_copy(unit, args.deny, made)
+    try:
+        score(args, units, files, cache, cache_path)
+    finally:
+        for copy in made:
+            os.remove(copy)
+
+
+def score(args, units, files, cache, cache_path):
+    scored = (lambda code: code == args.deny) if args.deny else (lambda code: True)
     started = time.time()
     todo = [u for u in units if not u.out]
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
@@ -127,7 +171,7 @@ def main():
             elif any(not (code and LINT.match(code)) for code, _, _ in errs):
                 unit.out = "rustc reports an error that is no lint"
             else:
-                unit.want = {(code, line) for code, line, _ in errs}
+                unit.want = {(code, line) for code, line, _ in errs if scored(code)}
     json.dump(cache, open(cache_path, "w"))
     print(f"rustc: {len(todo)} runs in {time.time() - started:.0f}s", file=sys.stderr)
 
@@ -145,7 +189,8 @@ def main():
         # A lint in what a macro expands to fails no build of ra-jit's (`broken_in`), so it is
         # not ra-jit's verdict to score.
         have = {(d["code"], d["line"]) for d in got.get("diagnostics", [])
-                if d["severity"] == "Error" and LINT.match(d["code"]) and not d.get("expanded")}
+                if d["severity"] == "Error" and LINT.match(d["code"]) and scored(d["code"])
+                and not d.get("expanded")}
         messages = {(d["code"], d["line"]): d["message"] for d in got.get("diagnostics", [])}
         for it in have & unit.want:
             per[it[0]]["right"] += 1

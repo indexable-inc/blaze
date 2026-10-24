@@ -526,8 +526,16 @@ impl DefMap {
                             shadow,
                             None,
                         );
+                        // That resolves from the other crate's root. What a crate of procedural
+                        // macros has besides its macros is its own, its proc-macro functions too.
+                        let resolved_def = match defp_map.data.proc_macro {
+                            true => resolution.resolved_def.filter_visibility(|vis| {
+                                vis.is_visible_from_def_map(db, self, original_module)
+                            }),
+                            false => resolution.resolved_def,
+                        };
                         return ResolvePathResult::new(
-                            resolution.resolved_def,
+                            resolved_def,
                             ReachedFixedPoint::Yes,
                             resolution.segment_index.map(|s| s + i),
                             ResolvePathResultPrefixInfo {

@@ -1674,10 +1674,14 @@ impl Enc<'_> {
             rustc_coherence_is_core,
             no_core,
             no_std,
+            proc_macro,
             edition,
             recursion_limit,
         } = &**data;
-        if !fn_proc_macro_mapping.is_empty() || !fn_proc_macro_mapping_back.is_empty() {
+        if *proc_macro
+            || !fn_proc_macro_mapping.is_empty()
+            || !fn_proc_macro_mapping_back.is_empty()
+        {
             return Err("a crate of procedural macros".to_owned());
         }
         self.edition(*edition);

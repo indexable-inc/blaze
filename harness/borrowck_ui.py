@@ -166,7 +166,10 @@ def classify(root, path):
                 else:
                     unit.edition = year.group(0)
             elif name == "compile-flags":
-                unit.flags += flags_of(value)
+                try:
+                    unit.flags += flags_of(value)
+                except ValueError:
+                    unit.out = unit.out or "compile flags that do not split"
             elif name in ("aux-build", "aux-crate", "proc-macro", "aux-bin", "aux-codegen-backend"):
                 unit.out = unit.out or "needs an auxiliary crate"
         mode = polonius_of(unit.flags)

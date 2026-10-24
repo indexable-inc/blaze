@@ -256,7 +256,7 @@ jobs:
           git sparse-checkout set tests/ui
           git fetch -q --depth 1 --filter=blob:none origin a30aa9064df6a504b6a323c6884a2f4cfbfff666
           git checkout -q FETCH_HEAD
-      - run: python3 harness/borrowck_ui.py "$RUNNER_TEMP/rust" --bin target/release/ra-jit --jobs 4 --mode both --min-pass 1533
+      - run: python3 harness/borrowck_ui.py "$RUNNER_TEMP/rust" --bin target/release/ra-jit --jobs 4 --mode both --min-pass 1538
       # Crates rustc accepts: an error is a false one, and a file the checker panics on (which
       # fails `ra-jit borrowck`) would have none of its errors reported.
       - name: the corpus and mixfutures

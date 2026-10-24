@@ -183,6 +183,17 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
   enough". A trait object cast to one of its supertraits' (`dyn Foo<'static>` to
   `dyn Bar<'static, 'a>` with `trait Foo<'a>: Bar<'a, 'a>`) has the supertrait as the
   source's arguments instantiate it equal to the target's.
+- Higher-ranked bounds, as rustc's placeholders: a `for<'a>` predicate is proven for a
+  placeholder `'a`, and so is one an impl's where clauses need on the way
+  (`T: DeserializeOwned` through `T: for<'de> Deserialize<'de>`). A placeholder is a universal
+  region that outlives only itself, so one the impls make outlive something else is rustc's
+  "higher-ranked lifetime error": `&'static str` is `Deserialize<'de>` only for
+  `'de: 'static`, and a forwarding impl that needs `T: for<'a> Bar<&'a isize>` of a `T` that
+  is only `Bar<&'b isize>` needs `'a: 'b`. A region that must outlive a placeholder outlives
+  `'static`, as a region of a lower universe does in rustc. rust-analyzer gives a trait object
+  behind an elided reference in a signature `'static`, not the reference's lifetime, so a
+  placeholder the solver equates with an elided lifetime is left out
+  (`fn(&mut dyn Write)` for `impl FnMut(&mut dyn Write)` holds).
 - Errors on universal regions: "lifetime may not live long enough", E0521, E0309, E0310,
   E0311, with rustc's object lifetime defaults (`&'a dyn Trait` is `dyn Trait + 'a`, a
   closure's parameter `|x: &dyn Trait|` too, a trait
@@ -247,6 +258,10 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
   the function evaluates it (`const { InvariantRef::<'a>::NEW }` compared with a borrow of a
   local needs the local to outlive `'a`). What its value borrows becomes part of the value,
   as for a `const` item, but no call in it is promoted.
+- Constants of a signature: an array length or a const generic's default written as a
+  block, `[u8; { .. }]` or `struct X<const N: usize = { .. }>`, has a body no item owns,
+  checked as rustc checks an anonymous constant, by itself, with its errors in the item
+  (`const N: usize = { let x; x }` is E0381).
 - `async` blocks and `async fn` bodies: checked as rustc checks a coroutine, as a closure
   of the body that makes it, for moves, initialization and loans across `.await`. Every
   region of the future's type is its creator's, and an `async fn` relates the future's
@@ -300,7 +315,9 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
 - `unused_mut` ("variable does not need to be mutable"), a warning: a binding declared `mut`
   that no assignment or mutable borrow needs the `mut` of, as rustc's `used_mut`. A closure
   needs the `mut` of a captured variable when its body mutates it, and a name that starts
-  with `_` is left alone, as rustc does.
+  with `_` is left alone, as rustc does. A body whose types have an error gets none, as
+  rustc lints no body its type check failed. A source that denies it fails the build with it
+  ([no-rustc.md](no-rustc.md), step D), unless `RA_JIT_BORROWCK_REFUSE=0`.
 
 ## How it is tested
 
@@ -322,8 +339,8 @@ With no borrow checker, the 246 units rustc accepts would pass. Now:
 
 | Mode | In scope | Pass | rustc accepts, ra-jit too | rustc rejects, same errors |
 |---|---|---|---|---|
-| Polonius | 1581 | 1536 (97.2%) | 246 of 246 | 1290 of 1335 |
-| NLL | 1579 | 1532 (97.0%) | 227 of 227 | 1305 of 1352 |
+| Polonius | 1581 | 1541 (97.5%) | 246 of 246 | 1295 of 1335 |
+| NLL | 1579 | 1537 (97.3%) | 227 of 227 | 1310 of 1352 |
 
 460 units are out of scope; 344 of them need a nightly feature. CI runs the scoring on Linux
 and fails below a floor a few units under the count there, on any error in a unit rustc
@@ -338,14 +355,17 @@ files, errors and files it panicked on; a panic makes it fail.
 ## What is left
 
 Every failing unit is one where rustc gives an error ra-jit does not, or gives it on another
-line or with another code. By what is wrong, most first: 5 each of E0507, E0310 and
-higher-ranked errors not reported, 4 "lifetime may not live long enough" not reported, 3 on
-another line or with another code, 1 with only an error rustc does not give, 3 each of E0309,
-E0311 and E0597 not reported, then a long tail. The causes, grouped:
+line or with another code. By what is wrong, most first: 15 with an error on another line or
+with another code, then, of the errors not reported, 5 "lifetime may not live long enough",
+3 each of E0507, E0309, E0310, E0311 and higher-ranked errors, 2 each of E0716 and E0597,
+then one each of five more. The causes, grouped:
 
-- **Higher-ranked regions and placeholders** (`for<'a>` bounds, closures with higher-ranked
-  signatures): rustc checks them with placeholders in universes; ra-jit does not yet, and
-  leaves out what a `for<'a>` lifetime is related to, apart from `for<'a> T: 'a`.
+- **Higher-ranked regions and placeholders**: trait bounds are proven for placeholders, but a
+  function pointer or closure related to a `for<'a> fn` type is not (rustc's higher-ranked
+  subtyping, with a projection normalized for the placeholder in
+  `nll/closure-malformed-projection-input-issue-102800.rs`), a type a placeholder must outlive
+  is left out, and auto traits of a coroutine's witness (`T: Send` of an `async` block holding
+  a `for<'a>` future) are not proven with them.
 - **Well-formedness of items** (most of what is left of E0309 and E0310): items whose
   signature or impl header has an associated type (what normalizing it implies) are not
   checked yet, nor what an impl's or function's where clauses need of a projection in them.

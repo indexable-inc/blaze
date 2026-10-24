@@ -168,7 +168,8 @@ These are the places ra-jit still runs rustc or relies on what it wrote, as of m
   is no longer left to rustdoc for its features.
 - Under plain cargo after `ra-jit enable`, rustc builds every crate of the workspace except the
   programs the daemon has loaded, and writes the dep-info of those.
-- `cargo ra-jit check` is `cargo check`.
+- `cargo ra-jit check` was `cargo check`. Since 2026-10-23 it is the daemon's verdict, and
+  `cargo check` only where `only_cargo` sends the command to cargo (below).
 - Under Cranelift, every `asm!` block was assembled by running rustc (`hir-ty-codegen/asm.rs`).
   Since C, a build of ra-jit with LLVM assembles it in process and one without has clang or
   the host's `cc` assemble it; where there is neither, the build fails and says to install
@@ -199,7 +200,7 @@ Paths are under `crates/`; line numbers are of 41e7906192.
 |---|---|---|
 | `ra-jit/src/cargo/mod.rs:305` `by_daemon`, `:300` `ToCargo`, `:395` `by_cargo` | sends the whole build to cargo | the source has an error (until D's first part: now it fails the build with ra-jit's error); rustc's copy of a refused function is stale; a build script's or proc macro's source changed; a manifest changed; the daemon did not build a program |
 | `ra-jit/src/cargo/cli.rs:297` `only_cargo` | sends the command to cargo untouched | `--message-format`, `-Z`, `--exclude`, several targets, an unknown triple |
-| `ra-jit/src/cargo/mod.rs:139` `plain_cargo` | runs cargo with nothing of ra-jit's but its answers to cargo's questions (since B) | `cargo ra-jit check` and subcommands ra-jit does not claim |
+| `ra-jit/src/cargo/mod.rs:139` `plain_cargo` | runs cargo with nothing of ra-jit's but its answers to cargo's questions (since B) | subcommands ra-jit does not claim, and a check `only_cargo` sends to cargo (until 2026-10-23, every `cargo ra-jit check`) |
 
 **What rustc compiled, linked into ra-jit's programs** (steps E, F, G)
 
@@ -231,7 +232,7 @@ Paths are under `crates/`; line numbers are of 41e7906192.
 | `ra-jit/src/cargo/run.rs:136` | `cargo test --doc` with ra-jit as `RUSTDOC` | `cargo ra-jit test` of a library with doctests |
 | `ra-jit/src/doctest.rs` `compile` | rustc compiles or checks an example ra-jit does not build | `compile_fail`, an example rust-analyzer finds an error in or that links a second copy of the library, a build or link of ra-jit's that failed; except what is unchanged since the last run (L's first part). Since L's second part, no probe |
 | `ra-jit/src/doctest.rs:301` `leave_to_rustdoc` | hands the library to rustdoc | `-q`, a library ra-jit cannot load; until A, every package whose features `cargo build --unit-graph` rejected (below) |
-| `ra-jit/src/cargo/mod.rs:139` | `cargo ra-jit check` is `cargo check` | every check |
+| `ra-jit/src/cargo/mod.rs:48` | `cargo ra-jit check` is `cargo check` | a check with `--message-format`, unstable cargo flags, `--exclude`, several targets or an unknown triple; until 2026-10-23, every check |
 | `ra-jit/src/test_harness.rs` `module` returning `None` | leaves the test program's harness to rustc, and a test added to cargo | a bench, an `ignore` written as a token tree (H) |
 | `ra-jit/src/main.rs:5084`, `:5127` `RA_JIT_WRAPS_RUSTC` | ra-jit standing in for rustc for a whole build | the harness's "alone" builds |
 | `harness/apps.py:113` | the harness's "alone" mode: cargo with ra-jit as `RUSTC_WRAPPER`, linking the sysroot's rlibs | the harness only |
@@ -529,7 +530,7 @@ enable`. What stays with cargo for now: what the frontend turns down as unsuppor
 link that failed). An error in a file written before the worker loaded the workspace is ra-jit's
 too since 2026-10-23: the worker leaves it beside its socket and every build of the checkout
 fails with it until a source is written. The lints followed: a lint the source denies fails the
-build for the seven lints `harness/lints_ui.py` finds rust-analyzer reports only where rustc does
+build for the eight lints `harness/lints_ui.py` finds rust-analyzer reports only where rustc does
 (on rustc's UI tests that deny or forbid a lint, 2026-10-23: non_snake_case 31 right, 0 wrong,
 9 missed; non_camel_case_types 22, 0, 2; unused_must_use 14, 0, 30; non_upper_case_globals 9,
 0, 4; deprecated_safe_2024 3, 0, 0; elided_lifetimes_in_paths 1, 0, 0; unsafe_op_in_unsafe_fn
@@ -541,7 +542,19 @@ units with the brace lints): elided_lifetimes_in_paths 25, 0, 6; unsafe_op_in_un
 rustc's of an old commit, its `unused_must_use` looked into `if` and `match` arms and took
 `Result<(), Never>` for one to use, and it took a deprecated-safe call (`std::env::set_var`
 before 2024) in an `unsafe fn` for the lint, which rustc reports there only where
-`unsafe_op_in_unsafe_fn` is not allowed. None of the seven is denied by default, so the level
+`unsafe_op_in_unsafe_fn` is not allowed. The eighth, since 2026-10-24, is `unused_mut`, which
+the borrow checker gives and `RA_JIT_BORROWCK_REFUSE=0` turns off with its errors. Few UI tests
+deny it, so `lints_ui.py --deny unused_mut` scores it on every UI test, each read with
+`#![deny(unused_mut)]` first: 51 right, 0 wrong, 5 missed against the nightly of 2026-10-09
+(6,446 units in scope), 49, 0, 5 against 1.99.0, and 71, 0, 3 on its 25 units in
+`harness/lints_probes` (closures, `mut self`, patterns, `ref mut`, later assignment, autoref,
+compound and field assignment, `Box`, `FnMut`, macros, `async`, shadowing, `asm!`). Seven had
+been wrong first: an assignment, a block without a tail or a `break` without a value gave its
+place no `()`, so `let mut z: () = x = 1; z = x = 2;` took the second write for the first (and
+`let z: () = x = 1; let w = z;` was E0381), a comment-only `asm!` was lowered to nothing, so
+its `inout` registers were not mutated, and a body whose array length fails to evaluate was
+linted, which rustc's is not. The misses are in macro expansions and that body's length.
+None of the eight is denied by default, so the level
 is the source's, which only `--cap-lints` and `--force-warn` undo; with either among the flags
 no lint fails a build. A lint in what a macro expands to does not, and `lints_ui.py` does not
 count one (rustc reports it in the macro's definition). The other lints are not ra-jit's
@@ -787,7 +800,7 @@ rust-analyzer: the toolchain's server (`rust-analyzer-proc-macro-srv` in the sys
 rustc metadata and will not, so a library ra-jit compiles needs a server of its own. The
 server's side of the bridge (`proc_macro::bridge::server`) is unstable and ra-jit is built
 on stable, so ra-jit cannot link it into itself; it can compile it, as it compiles any crate,
-from the toolchain's `library/proc_macro` and the vendored `proc-macro-srv`. A server and a
+from the toolchain's `library/proc_macro` and the release's `proc-macro-srv` (below). A server and a
 library both compiled by ra-jit from the one `proc_macro` source agree on the bridge by
 construction (its `Buffer`, `Closure` and `Client` are `repr(C)` with `extern "C"` functions,
 but each toolchain encodes the messages its own way). The stages, each lowering a count:
@@ -802,20 +815,73 @@ but each toolchain encodes the messages its own way). The stages, each lowering 
 - J1. ra-jit's proc-macro server: `proc-macro-srv` and `proc-macro-srv-cli` built by ra-jit
   with nothing of rustc's (G) over the toolchain's `proc_macro`, kept in the store by
   toolchain and shipped with the standard library (above), started by `load_config` in place of
-  the toolchain's. It opens a library with `dlopen` and finds its macros by a symbol, as
-  rust-analyzer did before it read metadata: rustc's `__rustc_proc_macro_decls_*__`, or
-  ra-jit's. It serves rustc's libraries too, which is how it is checked: the harness expands
-  every macro call of the bench apps with both servers and holds the outputs equal.
+  the toolchain's. It opens a library with `dlopen` and reads its macros from a static ra-jit
+  wrote (J2).
 - J2. Proc-macro crates compiled by ra-jit into a library for J1's server: the crate and its
   libraries from source as code that can be loaded (position-independent, the standard
-  library's unit built so too), the list of macros written as rustc's harness writes it (a
-  static of `proc_macro::bridge::client::ProcMacro::{custom_derive, attr, bang}` of each
-  `#[proc_macro*]` function) under ra-jit's symbol, linked with `cc -shared`. Used where every
-  crate that expands with the macro is ra-jit's: a build script's macros (J0's then need no
-  rustc library of their own when nothing else of rustc's names them) and the daemon's builds.
-  Count: the proc macros of scripts, and with K every proc macro and the libraries only they
-  link (syn, quote, proc-macro2, ...), which is most of what rustc compiles in a cold build of
-  a crate with derives.
+  library's unit built so too), the list of macros written into the crate's root as
+  `test_harness.rs` writes a test program's `main`: a `#[no_mangle]` static of each
+  `#[proc_macro*]` function's kind, name, helper attributes and
+  `proc_macro::bridge::client::Client::{expand1, expand2}`, linked with `cc -shared`. Used where
+  every crate that expands with the macro is ra-jit's: a build script's macros (J0's then need
+  no rustc library of their own when nothing else of rustc's names them) and the daemon's
+  builds. Count: the proc macros of scripts, and with K every proc macro and the libraries only
+  they link (syn, quote, proc-macro2, ...), which is most of what rustc compiles in a cold build
+  of a crate with derives.
+
+What 1.99.0 changes in that plan (read 2026-10-24 in its `library/proc_macro` and in
+rust-lang/rust at b940084d7, the commit `rustc 1.99.0 -vV` names):
+
+- A library rustc compiled cannot be served by any server but one that reads rustc's metadata.
+  1.99.0's `proc_macro::bridge::client::Client` is the `run` function and nothing else, and
+  there is no `ProcMacro` enum any more: the `__rustc_proc_macro_decls_<id>__` static is the
+  macros' clients alone, and their names, kinds and helper attributes are only in the
+  metadata, where `rustc_metadata::locator::get_proc_macros` pairs them up. rust-analyzer's
+  old loader (`libloading` and the symbol, upstream until 2025) worked because the static then
+  held them. Decoding rustc's metadata would mirror its private, per-release encoding, which
+  ra-jit does not do. So J1's server serves only libraries ra-jit compiled, whose list ra-jit
+  writes, and J1 and J2 land together. They are checked against the toolchain: every macro
+  call of the bench apps and of rust-analyzer's `proc-macro-test` is expanded by the
+  toolchain's server with rustc's library and by J1's with ra-jit's, and the outputs are held
+  equal.
+- The vendored `proc-macro-srv` follows rustc's development branch (it uses
+  `bridge::IdentKind`, which 1.99.0 does not have), so it does not compile against 1.99.0's
+  `proc_macro`. The server that does is the one the release ships, rust-lang/rust's
+  `src/tools/rust-analyzer` at the release's commit, whose loader is
+  `rustc_metadata`'s too. J1's source is that server pinned to the release, as
+  `vendor/rustc_abi` is rustc's crate from the 1.99.0 tag, with its loader replaced by the one
+  that reads ra-jit's static. Its protocol is the toolchain server's: rust-analyzer already
+  talks to that release's server today.
+- Building the server needs serde's derives expanded (`proc-macro-api`'s messages), so the
+  first server is built with what expands them today (rustc's `serde_derive` and the
+  toolchain's server), once per release when `ra-jit std` ships it; once J2 compiles
+  `serde_derive`, each server is built with the one before it.
+
+Where J stands (2026-10-24):
+
+- The static J2 writes compiles. `harness/allrajit.py`'s `macros` program holds
+  `[Client::expand1(..), Client::expand2(..)]` in a `#[no_mangle]` static and is built with
+  nothing of rustc's whole, over the standard library's unit and from the store: const
+  evaluation reifies each client's closure into its `extern "C"` function as rustc does
+  (`bridge::selfless_reify`), and the bridge it reaches, `proc_macro`'s symbol interner and its
+  thread-local included, is compiled with the program. `proc_macro` (and `test`) are not in
+  the unit, so they are the program's when it links them; the unit of a program that links
+  `proc_macro` has `rustc-literal-escaper` too, and is shared by every such program.
+- ra-jit links a shared library (`--exe` with `--shared`): the object carries the allocator
+  shim, the link is `-shared -Wl,-Bsymbolic`, and only the crate's `#[no_mangle]` and
+  `#[export_name]` items are exported, as rustc's `cdylib` is, so the rest is left out where
+  they do not reach it. `allrajit.py` loads one with `dlopen` and calls it as cargo's library
+  answers, whole, over the unit and stored.
+- A proc-macro crate linked with `--shared` has the list of its macros: ra-jit adds a module
+  to its root as it does a test harness (`crates/ra-jit/src/macro_list.rs`), with an exported
+  `static RA_JIT_PROC_MACROS: &[Macro]` of each macro's kind (0 derive, 1 attribute, 2
+  function-like, as ra-jit-expand numbers them), name, helper attributes and `Client`, a
+  `#[repr(C)]` record. `allrajit.py` reads it off the library. rust-analyzer had taken a
+  proc-macro function out of its crate's value namespace, so `crate::derive_fn` did not
+  resolve; it is a function in its crate now, and a path from another crate sees only the
+  macros.
+- Next: the release's server with a loader that reads the list and calls each `Client` over
+  the bridge, checked against the toolchain's server as above.
 
 **K. The cold build is ra-jit's.** ([#91](https://github.com/indexable-inc/ra-jit/issues/91)) `cargo ra-jit build` with nothing built plans the units
 (plan.rs), and the daemon compiles them all, taking what the store and the remote have, links

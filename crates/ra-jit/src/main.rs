@@ -16,6 +16,7 @@ mod frozen;
 mod inputs;
 mod link;
 mod live;
+mod macro_list;
 mod memory;
 mod mirdump;
 mod outline;
@@ -137,6 +138,9 @@ struct Args {
     /// The executable to link `out` into, with the standard library's object and the native
     /// libraries the crates ask for, in a build with nothing of rustc's ([`link::executable`]).
     exe: Option<PathBuf>,
+    /// `exe` is a shared library of the crate asked for, as a proc macro's is
+    /// (docs/no-rustc.md, step J2), not an executable.
+    shared: bool,
     /// Where to write, after `exe` is linked, the dep-info rustc would have of the crate asked
     /// for: the files of its modules, as cargo reads them to know when to build it again.
     dep_info: Option<PathBuf>,
@@ -233,6 +237,7 @@ impl Args {
         let mut isolate = None;
         let mut prebuilt = None;
         let mut exe = None;
+        let mut shared = false;
         let mut dep_info = None;
         let mut cfg_test = false;
         let mut dev_deps = false;
@@ -275,6 +280,7 @@ impl Args {
                 "--isolate" => isolate = Some(PathBuf::from(value()?)),
                 "--prebuilt" => prebuilt = Some(PathBuf::from(value()?)),
                 "--exe" => exe = Some(PathBuf::from(value()?)),
+                "--shared" => shared = true,
                 "--dep-info" => dep_info = Some(PathBuf::from(value()?)),
                 "--watch" => watch = true,
                 "--socket" => socket = Some(PathBuf::from(value()?)),
@@ -300,6 +306,9 @@ impl Args {
                 _ => bail!("unexpected argument {arg}"),
             }
         }
+        if shared && exe.is_none() {
+            bail!("--shared says what --exe links, and there is no --exe");
+        }
         Ok(Args {
             project: project.context("missing project path")?,
             krate: krate.context("missing --crate")?,
@@ -319,6 +328,7 @@ impl Args {
             isolate,
             prebuilt,
             exe,
+            shared,
             dep_info,
             library: false,
             cfg_test,
@@ -1333,8 +1343,10 @@ impl SymbolResolver for Resolver<'_> {
         if self.prebuilt(krate) {
             return true;
         }
+        // What the prebuilt unit leaves out ([`library_unit`]), `proc_macro` and `test`, is
+        // compiled with the program that links it.
         if krate.data(self.db).origin.is_lang() {
-            return !self.table.is_empty() || self.prebuilt.is_some();
+            return !self.table.is_empty();
         }
         if self.own_crate_id(krate).is_none() {
             return true;
@@ -3081,19 +3093,33 @@ fn harness_alone(args: &Args) -> Option<String> {
 /// The text of the root file of the crate of each program of tests of `programs` with ra-jit's
 /// test harness as the tests are now at its end, or without it where ra-jit writes none, for
 /// those that differ from the text they have. Only the crates among `of` when it is given.
+/// A proc-macro crate linked as a shared library has the list of its macros there instead
+/// ([`macro_list`]).
 fn harnesses<'a>(
     db: &RootDatabase,
     programs: impl IntoIterator<Item = &'a Args>,
     of: Option<&FxHashSet<Crate>>,
 ) -> Vec<(vfs::FileId, String)> {
     let mut texts: Vec<(vfs::FileId, String)> = Vec::new();
-    for args in programs.into_iter().filter(|it| of_tests(it)) {
+    for args in programs.into_iter().filter(|it| of_tests(it) || it.shared) {
         for krate in crates_named(db, &args.krate, args).unwrap_or_default().into_iter().take(1) {
             let file = krate.root_file(db);
             if of.is_some_and(|it| !it.contains(&krate)) || texts.iter().any(|it| it.0 == file) {
                 continue;
             }
             let text = db.file_text(file).text(db).clone();
+            if !of_tests(args) {
+                let data = ide_db::base_db::Crate::from(krate).data(db);
+                if !data.target_kind.is_proc_macro() {
+                    continue;
+                }
+                let module = hir::attach_db(db, || macro_list::module(db, krate));
+                let wanted = format!("{}{module}", test_harness::without(&text));
+                if *text != *wanted {
+                    texts.push((file, wanted));
+                }
+                continue;
+            }
             let module = hir::attach_db(db, || {
                 let functions = krate.modules(db).into_iter().flat_map(|it| it.declarations(db));
                 let functions = functions.filter_map(|it| match it {
@@ -3671,8 +3697,15 @@ fn std_unit(
     for named in args.crates() {
         program.extend(crates_named(db, named, args)?);
     }
-    let base = |it: &Crate| ide_db::base_db::Crate::from(*it);
-    if program.iter().any(|it| base(it).data(db).origin.is_lang()) {
+    // `proc_macro` and `test` are the program's when it links them: the unit leaves them out.
+    let of_library = |it: &Crate| {
+        use ide_db::base_db::LangCrateOrigin::{ProcMacro, Test};
+        match &ide_db::base_db::Crate::from(*it).data(db).origin {
+            CrateOrigin::Lang(ProcMacro | Test) => false,
+            origin => origin.is_lang(),
+        }
+    };
+    if program.iter().any(of_library) {
         return Ok(None);
     }
     let members = library_unit(db, &program);
@@ -3744,6 +3777,7 @@ fn std_unit(
         out: object.clone(),
         report: None,
         exe: None,
+        shared: false,
         library: true,
         debug,
         ..args.clone()
@@ -3789,6 +3823,7 @@ fn std_unit(
 fn link_executable(
     db: &RootDatabase,
     table: &SymbolTable,
+    listed: &Listed,
     args: &Args,
     sysroot: Option<&Path>,
     exe: &Path,
@@ -3802,7 +3837,22 @@ fn link_executable(
     }
     let objects: Vec<&Path> =
         std::iter::once(args.out.as_path()).chain(args.prebuilt.as_deref()).collect();
-    let took = link::executable(db, &program, &objects, sysroot, exe)?;
+    // A shared library exports what the crate asked for names with `#[no_mangle]` or
+    // `#[export_name]`.
+    let exports = args.shared.then(|| -> anyhow::Result<Vec<String>> {
+        let mut exports = Vec::new();
+        for krate in crates_named(db, &args.krate, args)? {
+            let of = listed.of(db, krate);
+            let functions = of.functions.iter().filter_map(|&it| exported_symbol(db, it));
+            let statics = of.statics.iter().filter_map(|&it| exported_static(db, it));
+            exports.extend(functions.chain(statics.map(|it| it.as_str().to_owned())));
+        }
+        exports.sort_unstable();
+        exports.dedup();
+        Ok(exports)
+    });
+    let exports = exports.transpose()?;
+    let took = link::executable(db, &program, &objects, sysroot, exe, exports.as_deref())?;
     let stand_ins = link::stand_ins(exe)?;
     eprintln!(
         "linked {} in {took:.1?}, {} functions in it ra-jit could not compile",
@@ -3982,6 +4032,7 @@ fn build(
         entries: &entries,
         on_demand: &on_demand,
         start: main.filter(|it| own(it).is_some() || in_harness(db, *it)),
+        shared: args.shared,
         whole: local.iter().all(|&krate| resolver.own_crate_id(krate.into()).is_some()),
         kept: &kept,
         offered: &offered,
@@ -4104,6 +4155,7 @@ fn build(
                     entries: &[func],
                     on_demand: &[],
                     start: None,
+                    shared: false,
                     whole: false,
                     kept: &[],
                     offered: &[],
@@ -5120,6 +5172,9 @@ const DENIED: &[&str] = &[
     "unsafe_op_in_unsafe_fn",
 ];
 
+/// The lints of [`DENIED`]'s kind that the borrow checker gives, off with its errors.
+const DENIED_BORROWCK: &[&str] = &["unused_mut"];
+
 /// The errors written in the edited files, as rust-analyzer finds them, as rustc writes them
 /// with paths from `root`. Nothing may reach them, so the build never looks at them.
 fn broken_in(
@@ -5158,7 +5213,11 @@ fn broken_in(
                                 it.severity == ide_db::Severity::Error
                                     && (SURE.contains(&code)
                                         || refuse_borrowck && BORROWCK.contains(&code)
-                                        || lints && !expanded && DENIED.contains(&code))
+                                        || lints
+                                            && !expanded
+                                            && (DENIED.contains(&code)
+                                                || refuse_borrowck
+                                                    && DENIED_BORROWCK.contains(&code)))
                             })
                             .map(|it| (it.range, it.code.as_str(), it.message))
                             .collect::<Vec<_>>()
@@ -5373,6 +5432,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             isolate: None,
             prebuilt: args.prebuilt.clone(),
             exe: args.exe.clone(),
+            shared: args.shared,
             dep_info: None,
             library: args.library,
             cfg_test: args.cfg_test,
@@ -7365,7 +7425,8 @@ fn run_holding(
             if let Some(exe) = &args.exe {
                 let workspace = checkouts.loaded.workspaces().first();
                 let sysroot = workspace.and_then(|it| it.sysroot.root());
-                link_executable(&db, &table, &args, sysroot.map(|it| it.as_ref()), exe)?;
+                let sysroot = sysroot.map(|it| it.as_ref());
+                link_executable(&db, &table, &listed, &args, sysroot, exe)?;
                 if let Some(path) = &args.dep_info {
                     write_dep_info(&db, &args, tree.vfs(), exe, path)?;
                 }

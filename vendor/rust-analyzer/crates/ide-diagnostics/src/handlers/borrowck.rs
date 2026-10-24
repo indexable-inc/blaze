@@ -113,6 +113,87 @@ fn user(mut s: S) {
     }
 
     #[test]
+    fn constant_of_a_signature_is_borrow_checked() {
+        check_diagnostics(
+            r#"
+//- minicore: sized
+pub struct X<const N: usize = {
+    let n: usize;
+    n
+  //^ error: used binding `n` isn't initialized
+}>;
+pub fn f() -> [u8; { let n = 1; n }] {
+    [0]
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn higher_ranked_bound_holds_for_any_lifetime() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, fn
+trait Deserialize<'de> {}
+trait DeserializeOwned: for<'de> Deserialize<'de> {}
+impl<T> DeserializeOwned for T where T: for<'de> Deserialize<'de> {}
+impl<'de: 'a, 'a> Deserialize<'de> for &'a str {}
+impl<'de> Deserialize<'de> for u32 {}
+fn owned<T: DeserializeOwned>() {}
+trait Write {}
+fn handler(_: &u32, _: &mut dyn Write) {}
+fn run(_: impl FnMut(&u32, &mut dyn Write)) {}
+fn main() {
+    owned::<u32>();
+    owned::<&'static str>();
+  //^^^^^^^^^^^^^^^^^^^^^^^ error: higher-ranked lifetime error
+    run(handler);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_expression_initializes_its_place() {
+        check_diagnostics(
+            r#"
+//- minicore: copy
+#![deny(unused_mut)]
+fn f() -> () {
+    let mut x: i32;
+    let z: () = x = 10;
+    let w = z;
+    let mut q: () = x = 11;
+    q = x += 1;
+    let mut b: () = { x += 1; };
+    b = ();
+    let mut l: () = loop { break; };
+    l = ();
+    let mut i: () = if x > 0 { x = 1 };
+    i = ();
+    let _ = (q, b, l, i, x);
+    w
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unused_mut_self() {
+        check_diagnostics(
+            r#"
+#![deny(unused_mut)]
+struct S(u8);
+impl S {
+    fn read(mut self) -> u8 { self.0 }
+          //^^^^^^^^ error: variable does not need to be mutable
+    fn write(mut self) -> u8 { self.0 = 1; self.0 }
+}
+"#,
+        );
+    }
+
+    #[test]
     fn async_closure_call_holds_its_captures_2018() {
         check_diagnostics(
             r#"

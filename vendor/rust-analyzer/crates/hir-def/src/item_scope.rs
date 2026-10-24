@@ -469,14 +469,6 @@ impl ItemScope {
         self.declarations.push(def)
     }
 
-    pub(crate) fn remove_from_value_ns(&mut self, name: &Name, def: ModuleDefId) {
-        // predicate needed since a different item with the same name may be registered instead,
-        // leading to `shift_remove` removing the wrong item.
-        if self.values.get(name).is_some_and(|entry| entry.def == def) {
-            let _ = self.values.shift_remove(name);
-        }
-    }
-
     pub(crate) fn get_legacy_macro(&self, name: &Name) -> Option<&[MacroId]> {
         self.legacy_macros.get(name).map(|it| &**it)
     }

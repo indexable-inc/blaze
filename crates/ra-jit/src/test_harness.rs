@@ -18,16 +18,22 @@ pub(crate) const MODULE: &str = "__ra_jit_test_harness";
 /// What the module starts with, after the text of the root file.
 const MARK: &str = "\n// ra-jit's test harness, which is not in the file on disk.\n";
 
+/// Where the module, or a proc-macro crate's [`crate::macro_list`] written the same way,
+/// starts in `text`.
+fn written_at(text: &str) -> Option<usize> {
+    [MARK, crate::macro_list::MARK].iter().filter_map(|it| text.find(it)).min()
+}
+
 /// The text of the root file without the module.
 pub(crate) fn without(text: &str) -> &str {
-    text.find(MARK).map_or(text, |at| &text[..at])
+    written_at(text).map_or(text, |at| &text[..at])
 }
 
 /// `text` read anew from a file, with the module `was` had at its end. The module stays in
 /// the crate from one revision to the next, where it is written again for the tests that
 /// are there now: one that is gone a moment is another module when it is back.
 pub(crate) fn kept(was: &str, text: String) -> String {
-    match was.find(MARK) {
+    match written_at(was) {
         Some(at) => text + &was[at..],
         None => text,
     }

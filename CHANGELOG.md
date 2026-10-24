@@ -8,6 +8,19 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Added
 
+- `RA_JIT_UNITS=1` compiles a whole program's functions many to an LLVM module, as rustc
+  compiles a crate's codegen units (#176): the functions are found from their IR before any
+  is compiled, cut into units of about 20,000 instructions in the order they were found in,
+  and compiled on every core, each unit with the union of its functions' imports linked in.
+  An import LLVM leaves a call of is kept as the code of its function, so the functions are
+  found in one round, and each function's code is read out of the unit's object and put in
+  the program's as a compile of it alone is. It is not the default: on 16 cores helix builds
+  in 71.1 s against 69.7 s and runs 1.28x of cargo's release build against 1.21x, and LLVM
+  takes four times rustc's time for code of the same size either way
+  ([codegen-units.md](docs/research/codegen-units.md)). Imports are linked into a compile's
+  module once, after being linked to each other two at a time, which took the lowering of a
+  module of many functions from 23.7 s to 8.1 s summed over ripgrep's cores.
+
 - An edit that needs a build in full no longer links in full when the daemon has no base of
   its own (it gave it up, or hasn't built it yet) (#159): on Linux the program is built onto
   the executable rustc linked and spliced into it whole, and the edits after it are patches of
@@ -182,7 +195,7 @@ All notable changes to ra-jit are written here. The format follows
 - A borrow checker, the crate `hir-ty-borrowck` in the rust-analyzer subtree, written to give
   rustc's verdict: Polonius alpha by default as nightly rustc does, NLL with
   `RA_JIT_BORROWCK=nll`. It gives rustc's errors on
-  1536 of 1581 of rustc's own borrow-check tests that it can run, and none on any of the 246
+  1541 of 1581 of rustc's own borrow-check tests that it can run, and none on any of the 246
   rustc accepts, scored by `harness/borrowck_ui.py`, and finds nothing in ripgrep, fd, bat,
   hyperfine, just, axum, nushell, delta, eza, tokei, starship and cargo. Its errors, and rustc's
   `unused_mut` warning, are rust-analyzer diagnostics and `ra-jit borrowck` prints them ([docs/borrowck.md](docs/borrowck.md)).
@@ -214,6 +227,10 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Changed
 
+- `unused_mut` a source denies fails the build, with the seven deny lints before it (#84).
+  `harness/lints_ui.py --deny unused_mut` scores it on every rustc UI test: 51 right, 0 wrong,
+  5 missed against the nightly, 49, 0, 5 against 1.99.0. `RA_JIT_BORROWCK_REFUSE=0` turns it
+  off with the borrow checker's errors. `fn f(mut self)` gets it too, where none was given.
 - Each debug type is described once, by itself, and the types made of each other are kept
   together as one group that every set of debug types reaching them shares
   ([#29](https://github.com/indexable-inc/ra-jit/issues/29)); the DWARF is the same. On Linux
@@ -422,6 +439,11 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Fixed
 
+- An expression of type `()` that computes nothing (an assignment, a block without a tail, a
+  `break` or `return` without a value, an `if` without an `else`) gives its place the `()`, as
+  rustc's MIR does: `let z: () = x = 1; let w = z;` was E0381, a build failed on code rustc
+  accepts. A comment-only `asm!` writes its `inout` registers back, so the variable is
+  mutated.
 - A daemon's link that fails on names nothing defines, used only by code rustc's own link
   takes out, is run again as rustc's line has it, with `--gc-sections` (or `-dead_strip`,
   `/OPT:REF`). The daemon leaves those out so a patch can call what the executable's code no
@@ -461,6 +483,17 @@ All notable changes to ra-jit are written here. The format follows
   only one), and `use<'_>` that one too. Type lowering in rust-analyzer gives the
   `impl Trait` a lifetime parameter for each, as rustc does (corpus `elided_captures`).
   1536 of 1581 of rustc's tests now (was 1535).
+- The borrow checker proves `for<'a>` bounds for placeholders, as rustc does, and those an
+  impl's where clauses need on the way: `&'static str: DeserializeOwned`, which needs
+  `&'static str: for<'de> Deserialize<'de>` where only `'de: 'static` is implemented, gives
+  rustc's "higher-ranked lifetime error", as does a forwarding impl that needs
+  `T: for<'a> Bar<&'a isize>` of a `T` that is only `Bar<&'b isize>`. They were missed
+  (corpus `higher_ranked`). 1539 of 1581 of rustc's tests now (was 1536).
+- The borrow checker checks the constants of a signature: an array length or a const
+  generic's default written as a block, `[u8; { .. }]` or `struct X<const N: usize = { .. }>`,
+  which no item's body holds. `const N: usize = { let s: String; s.len() }` is rustc's E0381,
+  and a move out of a reference in an array length its E0507; both were missed. 1541 of 1581
+  of rustc's tests now (was 1539).
 - A returned `impl Trait` hiding a type parameter is checked when the function's lifetimes
   are late-bound or elided: `fn f<T>(d: T, p: &mut ()) -> impl Sized + '_ { (d, p) }` gives
   rustc's E0311, and with `p: &'b mut ()` its E0309. The borrow checker relates the hidden

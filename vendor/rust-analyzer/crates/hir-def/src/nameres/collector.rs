@@ -327,6 +327,7 @@ impl<'db> DefCollector<'db> {
                 () => (),
             }
         }
+        crate_data.proc_macro = self.is_proc_macro;
 
         for (name, dep) in &self.deps {
             // Add all
@@ -2152,18 +2153,15 @@ impl ModCollector<'_, '_> {
                         && self.module_id == self.def_collector.def_map.root
                         && let Some(proc_macro) = attrs.parse_proc_macro_decl(&it.name)
                     {
+                        // A proc macro is implemented as a function, which is a macro to other
+                        // crates. In its own it is a function still, which can be called and
+                        // which rustc's list of the crate's macros names from the root;
+                        // `censor_non_proc_macros` keeps it to the crate.
                         self.def_collector.export_proc_macro(
                             proc_macro,
                             InFile::new(self.file_id(), ast_id),
                             fn_id,
                         );
-
-                        // A proc macro is implemented as a function, but it's treated as a macro, not a function.
-                        // You cannot call it like a function, for example, except in its defining crate.
-                        // So we keep the function definition, but remove it from the scope, leaving only the macro.
-                        self.def_collector.def_map.modules.building()[module_id]
-                            .scope_mut()
-                            .remove_from_value_ns(&it.name, fn_id.into());
                     }
                 }
                 ModItemKind::Struct(ast_id, it) => {

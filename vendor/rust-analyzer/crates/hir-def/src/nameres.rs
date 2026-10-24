@@ -230,6 +230,8 @@ struct DefMapCrateData {
     rustc_coherence_is_core: bool,
     no_core: bool,
     no_std: bool,
+    /// A crate of procedural macros, which gives other crates its macros and nothing else.
+    proc_macro: bool,
 
     edition: Edition,
     recursion_limit: Option<u32>,
@@ -246,6 +248,7 @@ impl DefMapCrateData {
             rustc_coherence_is_core: false,
             no_core: false,
             no_std: false,
+            proc_macro: false,
             edition,
             recursion_limit: None,
         }
@@ -261,6 +264,7 @@ impl DefMapCrateData {
             rustc_coherence_is_core: _,
             no_core: _,
             no_std: _,
+            proc_macro: _,
             edition: _,
             recursion_limit: _,
         } = self;
