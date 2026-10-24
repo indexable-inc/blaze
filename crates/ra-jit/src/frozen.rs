@@ -12,6 +12,8 @@
 //! `check` resolves and finds as well and fails the build on any difference, `verify` writes
 //! what was read and fails on any difference, `off` neither reads nor writes.
 
+use std::sync::{Mutex, atomic::Ordering::Relaxed};
+
 use ide_db::base_db::Crate;
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
@@ -228,26 +230,48 @@ pub(crate) fn store(db: &ide_db::RootDatabase, served: &Served) -> anyhow::Resul
         anyhow::bail!("what was frozen differs:\n{}", differences.join("\n"));
     }
     let Some(store) = served.mode.and(ra_jit_store::Store::global()) else { return Ok(()) };
-    let mut stored = 0;
-    let mut refused: FxHashMap<String, usize> = FxHashMap::default();
+    let start = std::time::Instant::now();
+    let mut writes = Vec::new();
     for (index, part) in Part::ALL.into_iter().enumerate() {
         for (&krate, key) in &served.keys {
             let key = part.key(key);
-            if served.served[index].contains(&krate) || store.has(&key) {
-                continue;
-            }
-            match part.encode(db, krate) {
-                Ok(bytes) => {
-                    if stored == 0 {
-                        store.settled();
-                    }
-                    store.insert(&key, &bytes);
-                    stored += 1;
-                }
-                Err(why) => *refused.entry(format!("{} with {why}", part.name())).or_default() += 1,
+            if !served.served[index].contains(&krate) && !store.has(&key) {
+                writes.push((part, krate, key));
             }
         }
     }
+    // On every core: on one, bevy's 1167 took 6.2 s of the wait for its first build.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let (settle, stored) = (std::sync::Once::new(), std::sync::atomic::AtomicUsize::new(0));
+    let refused: Mutex<FxHashMap<String, usize>> = Mutex::default();
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(writes.len());
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let (db, writes, next) = (db.clone(), &writes, &next);
+            let (settle, stored, refused) = (&settle, &stored, &refused);
+            scope.spawn(move || {
+                while let Some(&(part, krate, key)) = writes.get(next.fetch_add(1, Relaxed)) {
+                    match part.encode(&db, krate) {
+                        Ok(bytes) => {
+                            settle.call_once(|| store.settled());
+                            store.insert(&key, &bytes);
+                            stored.fetch_add(1, Relaxed);
+                        }
+                        Err(why) => {
+                            let why = format!("{} with {why}", part.name());
+                            *refused
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .entry(why)
+                                .or_default() += 1;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let (stored, refused) =
+        (stored.into_inner(), refused.into_inner().unwrap_or_else(|e| e.into_inner()));
     if stored > 0 {
         store.flush();
     }
@@ -257,9 +281,10 @@ pub(crate) fn store(db: &ide_db::RootDatabase, served: &Served) -> anyhow::Resul
         .map(|(part, crates)| format!("{} of {}", part.name(), crates.len()))
         .collect();
     let mut said = format!(
-        "frozen, of {} crates: {} from the store, {stored} written",
+        "frozen, of {} crates: {} from the store, {stored} written in {:.1?}",
         served.keys.len(),
-        from.join(", ")
+        from.join(", "),
+        start.elapsed()
     );
     if served.unreadable > 0 {
         said += &format!(", {} naming a file not loaded", served.unreadable);

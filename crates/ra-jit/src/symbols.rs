@@ -56,6 +56,19 @@ struct NestedSymbol {
     around: Vec<u64>,
 }
 
+/// A symbol as [`SymbolTable::index`] files it: a private one by its path hashed, another by
+/// its path and, nested in a closure, by the path without those with the closures' numbers.
+enum Filed {
+    Private(u64),
+    Public {
+        name: String,
+        place: Option<u64>,
+        around: Vec<u64>,
+        path: String,
+        nested: Option<(String, Vec<u32>)>,
+    },
+}
+
 struct Placed {
     name: String,
     /// The place of the item among those of its name in what it is written in, which rustc
@@ -133,9 +146,45 @@ impl Named {
     }
 }
 
+/// A symbol of a library as the table takes it in, with what is worked out of its name alone
+/// done where the library is read, on every core: the table takes the symbols in on one,
+/// and for bevy's 862,764 that took 5.8 s once cargo was done.
+struct Read {
+    named: Named,
+    hashed: u64,
+    /// The length of the name without the crate that instantiated it.
+    instance: usize,
+    /// The crates its path names, with their ids.
+    ids: Vec<(String, u64)>,
+    /// The function of an instance, and the crate that compiled this copy of it.
+    maker: Option<(String, u64)>,
+    place: Option<u64>,
+    around: Vec<u64>,
+}
+
+impl Read {
+    fn new(named: Named) -> Read {
+        let name = &named.name;
+        let instance = without_instantiating_crate(name).len();
+        let (mut ids, mut maker, mut place, mut around) = (Vec::new(), None, None, Vec::new());
+        if let Some((with_ids, path)) = &named.demangled {
+            ids = crate_ids(with_ids).map(|(krate, id)| (krate.to_owned(), id)).collect();
+            if instance != name.len()
+                && let Some(made_by) = V0::instantiating_crate(name)
+                && let Some(function) = function_name(path)
+            {
+                maker = Some((function, made_by));
+            }
+            place = V0::place(name);
+            around = V0::places_around(name).unwrap_or_default();
+        }
+        Read { hashed: hashed(name), instance, ids, maker, place, around, named }
+    }
+}
+
 /// What was read of a library before the table was asked for: with its length and when it
 /// was written, which a library written again since has others of.
-type ReadAhead = FxHashMap<PathBuf, ((u64, SystemTime), Vec<Named>)>;
+type ReadAhead = FxHashMap<PathBuf, ((u64, SystemTime), Vec<Read>)>;
 
 static READ_AHEAD: std::sync::LazyLock<Mutex<ReadAhead>> = std::sync::LazyLock::new(Mutex::default);
 
@@ -176,7 +225,7 @@ fn stamp_of(file: &Path) -> Option<(u64, SystemTime)> {
 }
 
 /// The symbols of `file` as they were read ahead, unless it was written again since.
-fn read_before(file: &Path) -> Option<Vec<Named>> {
+fn read_before(file: &Path) -> Option<Vec<Read>> {
     let (stamp, names) = lock(&READ_AHEAD).remove(file)?;
     let names = (stamp_of(file)? == stamp).then_some(names)?;
     READ_BEFORE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -187,7 +236,7 @@ fn read_before(file: &Path) -> Option<Vec<Named>> {
 static READ_BEFORE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The symbols of each of `files`, which are objects or archives of them, read on every core.
-fn names_of(files: &[PathBuf]) -> Vec<anyhow::Result<Vec<Named>>> {
+fn names_of(files: &[PathBuf]) -> Vec<anyhow::Result<Vec<Read>>> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let read = || {
         let mut read = Vec::new();
@@ -206,7 +255,7 @@ fn names_of(files: &[PathBuf]) -> Vec<anyhow::Result<Vec<Named>>> {
     read.into_iter().map(|it| it.1).collect()
 }
 
-fn names_of_file(file: &Path) -> anyhow::Result<Vec<Named>> {
+fn names_of_file(file: &Path) -> anyhow::Result<Vec<Read>> {
     let data = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
     let mut names = Vec::new();
     match ArchiveFile::parse(&*data) {
@@ -220,7 +269,7 @@ fn names_of_file(file: &Path) -> anyhow::Result<Vec<Named>> {
     Ok(names)
 }
 
-fn names_of_object(data: &[u8], names: &mut Vec<Named>) {
+fn names_of_object(data: &[u8], names: &mut Vec<Read>) {
     // rlibs also hold `lib.rmeta`, which isn't an object file.
     let Ok(object) = object::File::parse(data) else { return };
     for symbol in object.symbols() {
@@ -248,7 +297,7 @@ fn names_of_object(data: &[u8], names: &mut Vec<Named>) {
             object::BinaryFormat::MachO => name.strip_prefix('_').unwrap_or(name),
             _ => name,
         };
-        names.push(Named::new(name, private));
+        names.push(Read::new(Named::new(name, private)));
     }
 }
 
@@ -540,7 +589,7 @@ impl SymbolTable {
         let mut table = SymbolTable::default();
         let mut symbols = Vec::new();
         for name in names {
-            table.add_name(Named::new(name, false), &mut symbols);
+            table.add_name(Read::new(Named::new(name, false)), &mut symbols);
         }
         table.index(symbols);
         table
@@ -548,32 +597,77 @@ impl SymbolTable {
 
     /// Files the symbols under their paths, once every crate named in one is known.
     fn index(&mut self, symbols: Vec<Symbol>) {
-        let table = self;
-        for Symbol { private, name, place, around, with_ids, path } in symbols {
-            let shared = |krate: &str| table.crates.get(krate) == Some(&None);
+        // What each symbol is filed under is worked out on every core, in parts kept in order;
+        // filing them is one thread's.
+        let crates = &self.crates;
+        let file = |Symbol { private, name, place, around, with_ids, path }: Symbol| {
+            let shared = |krate: &str| crates.get(krate) == Some(&None);
             let path = if crate_ids(&with_ids).any(|(krate, _)| shared(krate)) {
                 without_ids(&with_ids, |krate| !shared(krate))
             } else {
                 path
             };
             if private {
-                table.private.insert(Self::hashed(&path));
-                continue;
+                return Filed::Private(Self::hashed(&path));
             }
             // A closure is not an item nested in itself.
             let unnamed = path.rsplit("::").next().is_some_and(|last| last.starts_with('{'));
-            if path.contains("::{") && !unnamed {
+            let nested = (path.contains("::{") && !unnamed).then(|| {
                 let named: Vec<_> = path.split("::").filter(|it| !it.starts_with('{')).collect();
                 let closures = path
                     .split("::")
                     .filter_map(|it| it.strip_prefix("{closure#")?.strip_suffix('}')?.parse().ok())
                     .collect();
-                let symbols = table.nested.entry(named.join("::")).or_default();
-                if symbols.iter().all(|it| it.name != name) {
-                    let around = around.clone();
-                    symbols.push(NestedSymbol { name: name.clone(), closures, place, around });
+                (named.join("::"), closures)
+            });
+            Filed::Public { name, place, around, path, nested }
+        };
+        let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+        let each = symbols.len().div_ceil(threads).max(1);
+        let mut parts = Vec::new();
+        let mut rest = symbols;
+        while rest.len() > each {
+            parts.push(rest.split_off(rest.len() - each));
+        }
+        parts.push(rest);
+        parts.reverse();
+        // `ra-jit-wasm` files its names on the thread it has.
+        let filed: Vec<Vec<Filed>> = if let [_] = &parts[..] {
+            parts.into_iter().map(|part| part.into_iter().map(file).collect()).collect()
+        } else {
+            std::thread::scope(|scope| {
+                let file = &file;
+                let filing: Vec<_> = parts
+                    .into_iter()
+                    .map(|part| scope.spawn(move || part.into_iter().map(file).collect()))
+                    .collect();
+                filing.into_iter().map(|it| it.join().expect("filing symbols panicked")).collect()
+            })
+        };
+        let table = self;
+        table.by_path.reserve(filed.iter().map(Vec::len).sum());
+        for filed in filed.into_iter().flatten() {
+            let (name, place, around, path) = match filed {
+                Filed::Private(hashed) => {
+                    table.private.insert(hashed);
+                    continue;
                 }
-            }
+                Filed::Public { name, place, around, path, nested } => {
+                    if let Some((named, closures)) = nested {
+                        let symbols = table.nested.entry(named).or_default();
+                        if symbols.iter().all(|it| it.name != name) {
+                            let around = around.clone();
+                            symbols.push(NestedSymbol {
+                                name: name.clone(),
+                                closures,
+                                place,
+                                around,
+                            });
+                        }
+                    }
+                    (name, place, around, path)
+                }
+            };
             let known = table.by_path.entry(path).or_default();
             let same = |it: &Placed| {
                 without_instantiating_crate(&it.name) == without_instantiating_crate(&name)
@@ -597,30 +691,25 @@ impl SymbolTable {
         self.names.contains(&Self::hashed(symbol))
     }
 
-    fn add_name(&mut self, named: Named, symbols: &mut Vec<Symbol>) {
-        let Named { name, private, demangled } = named;
-        let instance = without_instantiating_crate(&name);
-        if !private && self.names.insert(Self::hashed(&name)) && instance.len() != name.len() {
-            self.copies.entry(instance.to_owned()).or_default().push(name.clone());
+    fn add_name(&mut self, read: Read, symbols: &mut Vec<Symbol>) {
+        let Read { named: Named { name, private, demangled }, hashed, instance, .. } = read;
+        if !private && self.names.insert(hashed) && instance != name.len() {
+            self.copies.entry(name[..instance].to_owned()).or_default().push(name.clone());
         }
         let Some((with_ids, path)) = demangled else { return };
-        for (krate, id) in crate_ids(&with_ids) {
-            match self.crates.get_mut(krate) {
+        for (krate, id) in read.ids {
+            match self.crates.get_mut(&krate) {
                 Some(known) if *known != Some(id) => *known = None,
                 Some(_) => {}
                 None => {
-                    self.crates.insert(krate.to_owned(), Some(id));
+                    self.crates.insert(krate, Some(id));
                 }
             }
         }
-        if instance.len() != name.len()
-            && let Some(maker) = V0::instantiating_crate(&name)
-            && let Some(function) = function_name(&path)
-        {
+        if let Some((function, maker)) = read.maker {
             self.makers.entry(function).or_default().insert(maker);
         }
-        let place = V0::place(&name);
-        let around = V0::places_around(&name).unwrap_or_default();
+        let (place, around) = (read.place, read.around);
         symbols.push(Symbol { private, name, place, around, with_ids, path });
     }
 
@@ -1269,7 +1358,7 @@ mod tests {
         }
         let mut names = Vec::new();
         names_of_object(&object.write().unwrap(), &mut names);
-        let names: Vec<&str> = names.iter().map(|it| it.name.as_str()).collect();
+        let names: Vec<&str> = names.iter().map(|it| it.named.name.as_str()).collect();
         assert_eq!(names, [name]);
     }
 
