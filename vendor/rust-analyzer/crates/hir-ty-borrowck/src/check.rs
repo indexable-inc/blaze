@@ -1337,7 +1337,13 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         }
         let projection = loan.projection.clone();
         let place = PlaceRef { local: loan.local, projection: &projection };
-        let capture = self.capture_temps.get(&loan.assigned).copied();
+        // rustc's `closure_span` knows the captures of a closure or a coroutine, not of an
+        // `async` closure, whose escaping borrow is a returned one.
+        let capture = self
+            .capture_temps
+            .get(&loan.assigned)
+            .copied()
+            .filter(|_| !captured_by_async_closure(self.body, loan.assigned));
         // A loan whose region outlives a universal one must be valid for it, and the error
         // says why: it is returned, or it goes to where a closure escapes to.
         let universal = self
@@ -3079,6 +3085,23 @@ fn capture_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, MirSpan> {
         }
     }
     temps
+}
+
+/// Whether the temporary `local` is moved into an `async` closure that `body` makes.
+fn captured_by_async_closure(body: &MirBody<'_>, local: LocalId) -> bool {
+    body.basic_blocks.iter().flat_map(|(_, block)| block.statements.iter()).any(|statement| {
+        matches!(
+            &statement.kind,
+            StatementKind::Assign(
+                _,
+                Rvalue::Aggregate(hir_ty::mir::AggregateKind::Closure(ty), operands),
+            ) if matches!(ty.as_ref().kind(), TyKind::CoroutineClosure(..))
+                && operands.iter().any(|it| matches!(
+                    &it.kind,
+                    OperandKind::Move(place) if place.local == local
+                ))
+        )
+    })
 }
 
 /// Where the temporary `local` is made: the statement or call that assigns it.

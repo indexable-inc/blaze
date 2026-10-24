@@ -8218,3 +8218,50 @@ pub mod elided_captures {
         (evens, first, len(), sum, v)
     }
 }
+
+pub mod async_closure_futures {
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = pin!(future);
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                return value;
+            }
+        }
+    }
+
+    // The closure borrows `*text` for `'a`, and its future that, not the closure.
+    pub fn length<'a>(text: &'a String) -> impl Future<Output = usize> + 'a {
+        let c = async || text.len();
+        c()
+    }
+
+    pub fn run() -> (usize, usize, Vec<usize>, usize) {
+        let text = String::from("hello");
+        let first = block_on(length(&text));
+
+        let mut words = vec![String::from("a"), String::from("bc")];
+        let lens = async || words.iter().map(|it| it.len()).sum::<usize>();
+        let pending = lens();
+        let total = block_on(pending);
+        words.push(String::from("def"));
+        let mut all = Vec::new();
+        for word in &words {
+            let c = async || word.len();
+            all.push(block_on(c()));
+        }
+
+        let mut count = 0;
+        let mut bump = async || {
+            count += 1;
+            count
+        };
+        let a = block_on(bump());
+        let b = block_on(bump());
+        (first, total, all, a + b + count)
+    }
+}

@@ -111,4 +111,39 @@ fn user(mut s: S) {
 "#,
         );
     }
+
+    #[test]
+    fn async_closure_call_holds_its_captures_2018() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, async_fn
+//- /main.rs edition:2018
+fn outlives<'a>(_: impl Sized + 'a) {}
+fn simple<'a>(x: &'a i32) {
+    let c = async || { let _y = *x; };
+                               //^ error: `x` does not live long enough
+    outlives::<'a>(c());
+}
+fn local(x: &i32) {
+    let c = async || { let _y = *x; };
+    let _future = c();
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn async_closure_call_holds_its_captures_2021() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, async_fn
+//- /main.rs edition:2021
+fn outlives<'a>(_: impl Sized + 'a) {}
+fn simple<'a>(x: &'a i32) {
+    let c = async || { let _y = *x; };
+    outlives::<'a>(c());
+}
+"#,
+        );
+    }
 }

@@ -4113,6 +4113,11 @@ impl<'db> Builder<'_, '_, 'db> {
                         args.as_closure().tupled_upvars_ty(),
                         lifetimes(args.as_closure().parent_args().as_slice()),
                     )),
+                    TyKind::CoroutineClosure(def, args) => Some((
+                        def.0.loc(self.ctx.db).expr,
+                        args.as_coroutine_closure().tupled_upvars_ty(),
+                        lifetimes(args.as_coroutine_closure().parent_args().as_slice()),
+                    )),
                     TyKind::Coroutine(def, args) => {
                         let expr = def.0.loc(self.ctx.db).expr;
                         if let TyKind::Coroutine(_, typed) = written.kind() {
@@ -4506,6 +4511,16 @@ impl<'db> Builder<'_, '_, 'db> {
                     category: self.category_of_assignment(destination.local, projection),
                     span,
                 };
+                // An `async` closure's call returns `CallRefFuture<'_>`, the future its
+                // signature, captures and the borrow of it make, which holds what the closure
+                // captured by reference for as long as the closure did: rustc normalizes it so.
+                if let TyKind::FnDef(def, _) = func_ty.kind()
+                    && let CallableDefId::FunctionId(function) = def.0
+                    && let Some(receiver) = args.first().and_then(|it| self.operand_ty(it))
+                    && let Some(future) = self.async_call_future(function, receiver, dest)
+                {
+                    self.relate(future, dest, Variance::Covariant, at);
+                }
                 self.relate(output, dest, Variance::Covariant, at);
             }
             TerminatorKind::DropAndReplace { place, value, .. } => {
@@ -4519,6 +4534,52 @@ impl<'db> Builder<'_, '_, 'db> {
             }
             _ => (),
         }
+    }
+
+    /// The future `AsyncFn::async_call`, `AsyncFnMut::async_call_mut` or
+    /// `AsyncFnOnce::async_call_once` of the `async` closure `receiver` returns, as rustc's
+    /// `CoroutineClosureSignature::to_coroutine_given_kind_and_upvars`: by reference, its
+    /// captures borrowed from the closure for as long as that reference.
+    fn async_call_future(
+        &mut self,
+        function: hir_def::FunctionId,
+        receiver: Ty<'db>,
+        dest: Ty<'db>,
+    ) -> Option<Ty<'db>> {
+        let lang = self.interner().lang_items();
+        let (closure, kind, env_region) = match receiver.kind() {
+            TyKind::Ref(region, closure, mutability)
+                if Some(function) == lang.AsyncFn_async_call && mutability.is_not()
+                    || Some(function) == lang.AsyncFnMut_async_call_mut && mutability.is_mut() =>
+            {
+                let kind = match mutability.is_mut() {
+                    true => rustc_type_ir::ClosureKind::FnMut,
+                    false => rustc_type_ir::ClosureKind::Fn,
+                };
+                (closure, kind, region)
+            }
+            _ if Some(function) == lang.AsyncFnOnce_async_call_once => {
+                (receiver, rustc_type_ir::ClosureKind::FnOnce, Region::new_static(self.interner()))
+            }
+            _ => return None,
+        };
+        let TyKind::CoroutineClosure(_, args) = closure.kind() else { return None };
+        let TyKind::Coroutine(coroutine, _) = dest.kind() else { return None };
+        let parts = args.as_coroutine_closure();
+        let sig = self.ctx.infcx.instantiate_binder_with_fresh_vars(
+            hir_ty::Span::Dummy,
+            hir_ty::next_solver::infer::BoundRegionConversionTime::FnCall,
+            parts.coroutine_closure_sig(),
+        );
+        Some(sig.to_coroutine_given_kind_and_upvars(
+            self.interner(),
+            parts.parent_args(),
+            coroutine,
+            kind,
+            env_region,
+            parts.tupled_upvars_ty(),
+            parts.coroutine_captures_by_ref_ty(),
+        ))
     }
 
     /// Whether `function` is of an impl for a `dyn Trait + 'static`.
@@ -5494,6 +5555,9 @@ pub(super) fn outlives_components<'db>(
         }
         TyKind::Coroutine(_, args) => {
             outlives_components(args.as_coroutine().tupled_upvars_ty(), regions, params)
+        }
+        TyKind::CoroutineClosure(_, args) => {
+            outlives_components(args.as_coroutine_closure().tupled_upvars_ty(), regions, params)
         }
         TyKind::Tuple(tys) => {
             for it in tys.iter() {
