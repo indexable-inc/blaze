@@ -3,8 +3,9 @@
 work (PGO). The release workflow, the flake's `daemon` and `cargo install` from a checkout all
 build it with this.
 
-  build_release.py --target T [--profdata FILE] [--features F] [--out DIR]
-                                                  # the build, into target/T/dist; DIR gets every binary of ra-jit
+  build_release.py --target T [--profdata FILE] [--features F] [--out DIR [--server]]
+                                                  # the build, into target/T/dist; DIR gets every binary of ra-jit,
+                                                  # and with --server blaze's proc-macro server
   build_release.py --target T --train DIR         # a new profile for T, into DIR (the pgo workflow)
   build_release.py --pin DIR                      # pgo/profiles.json names the profiles in DIR
   build_release.py --target T --show              # the command the build runs, for any other driver
@@ -37,6 +38,14 @@ by itself. The `cc` crate passes `-Cprofile-generate`/`-Cprofile-use` on to the 
 on macOS Apple clang's profile format is not rustc's LLVM's and the instrumented ra-jit
 crashes at start (rust-lang/rust#163640), so the C code (mimalloc, ring) is built without
 them. macOS and Linux; stdlib only.
+
+With `--server` the ra-jit just built builds blaze's proc-macro server (`vendor/proc-macro-srv`,
+docs/no-rustc.md step J1) into DIR as `blaze-proc-macro-srv`, the server that expands with the
+proc-macro libraries ra-jit links, found beside ra-jit (`RA_JIT_PROC_MACRO_SERVER=1`). It is
+built whole by ra-jit (`--exe`), over the standard library ra-jit compiles, so it speaks the
+bridge of the libraries that ra-jit compiles; its own serde derives are expanded by the
+toolchain's server with rustc's libraries, as blaze's own executable may be built with rustc.
+Linux only, where ra-jit links proc-macro libraries so far.
 """
 
 import argparse
@@ -63,6 +72,10 @@ RELEASE = "https://github.com/indexable-inc/blaze/releases/download/pgo-profiles
 # A training run that reached the workers counts tens of billions; one that lost them a few
 # million (the client's own short runs).
 MIN_COUNT = 1_000_000_000
+# blaze's proc-macro server: its workspace, the crate of its executable, and the name it ships as.
+SERVER = ROOT / "vendor" / "proc-macro-srv"
+SERVER_CRATE = "rust_analyzer_proc_macro_srv"
+SERVER_BIN = "blaze-proc-macro-srv"
 # What LLVM says of a function whose control flow changed since the profile was trained.
 STALE = re.compile(r"function control flow change detected \(hash mismatch\)")
 # The hash rustc gives the crate ra-jit, in each of its symbols. Cargo derives it from the
@@ -244,6 +257,24 @@ def pin(dirs):
     PINS.write_text(json.dumps(table, indent=2) + "\n")
 
 
+def proc_macro_server(ra_jit, out):
+    """blaze's proc-macro server, built and linked by `ra-jit` into `out`, from a store of its
+    own; the path of the executable."""
+    exe = out / SERVER_BIN
+    with tempfile.TemporaryDirectory(prefix="blaze-server-") as work:
+        env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, RA_JIT_CACHE=str(Path(work) / "store"),
+                   RA_JIT_STD_FROM="off", RUST_BACKTRACE="0")
+        start = time.monotonic()
+        # `proc_macro` is not in the standard library's unit: the program that links it has it.
+        run([str(ra_jit), str(SERVER), "--crate", SERVER_CRATE, "--crate", "proc_macro",
+             "--out", str(Path(work) / "server.o"), "--exe", str(exe)], cwd=SERVER, env=env)
+    said = subprocess.run([str(exe), "--version"], capture_output=True, text=True, check=True,
+                          env=dict(os.environ, RUST_ANALYZER_INTERNALS_DO_NOT_USE="this is unstable"))
+    print(f"build_release: {said.stdout.strip()} as {exe}, built by ra-jit in {time.monotonic() - start:.1f} s",
+          flush=True)
+    return exe
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--target")
@@ -252,6 +283,7 @@ def main():
     parser.add_argument("--pin", nargs="+", metavar="DIR", help="pin the profiles trained into DIR")
     parser.add_argument("--out", type=Path, metavar="DIR", help="copy the binaries into DIR")
     parser.add_argument("--features", help="cargo features of ra-jit (`llvm`); a release has none")
+    parser.add_argument("--server", action="store_true", help="build blaze's proc-macro server into --out with that ra-jit")
     parser.add_argument("--strict", action="store_true", help="fail when the profile is of other crates (a release)")
     parser.add_argument("--show", action="store_true", help="print the build's environment and command")
     args = parser.parse_args()
@@ -259,6 +291,8 @@ def main():
         return pin(args.pin)
     if not args.target:
         parser.error("--target is required")
+    if args.server and not args.out:
+        parser.error("--server builds into --out")
     if args.train:
         return train(args.target, args.train)
     if args.show:
@@ -282,6 +316,8 @@ def main():
         args.out.mkdir(parents=True, exist_ok=True)
         for binary in binaries:
             shutil.copy2(binary, args.out / binary.name)
+        if args.server:
+            proc_macro_server(args.out / "ra-jit", args.out)
     shown = args.out or binaries[0].parent
     print(f"build_release: {', '.join(b.name for b in binaries)} in {shown}, with the profile trained at "
           f"{chosen['commit'][:10]}; {stale} functions changed since and are not optimized by it", flush=True)

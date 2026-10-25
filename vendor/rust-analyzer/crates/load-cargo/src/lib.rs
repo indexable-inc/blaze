@@ -174,9 +174,6 @@ impl Loaded {
         self.workspaces.extend(workspaces);
         let known: FxHashSet<vfs::FileId> = vfs.iter().map(|(file, _)| file).collect();
         let ws = self.workspaces.first().ok_or_else(|| anyhow::anyhow!("no workspace to load"))?;
-        if self.proc_macro_server.is_none() {
-            self.proc_macro_server = spawn_proc_macro_server(ws, extra_env, load_config);
-        }
         let (sender, receiver) = unbounded();
         let mut loader = Box::new(vfs_notify::NotifyHandle::spawn(sender));
 
@@ -212,6 +209,15 @@ impl Loaded {
                 .collect(),
             None => FxHashSet::default(),
         };
+        // The toolchain's server is started for the libraries the other does not serve only,
+        // so a load whose proc macros are all listed starts none of the toolchain's.
+        let unlisted = proc_macros.values().any(|it| match it {
+            Ok((_, path)) => !listed.contains(path),
+            Err(_) => false,
+        });
+        if self.proc_macro_server.is_none() && unlisted {
+            self.proc_macro_server = spawn_proc_macro_server(ws, extra_env, load_config);
+        }
         if let Some(server) = listed::server().filter(|_| !listed.is_empty())
             && self.listed_server.is_none()
         {

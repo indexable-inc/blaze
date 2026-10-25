@@ -33,7 +33,9 @@ Change a function and run `cargo blaze run` again: the `Finished` line now says 
 The installer downloads the build for your machine from the
 [releases](https://github.com/indexable-inc/blaze/releases), checks it against the checksums
 published with it, and puts `cargo-blaze` and the programs it runs in `~/.cargo/bin`. It asks
-nothing. Run it again to upgrade. To install a given release, end the line with
+nothing. On Linux the build has `blaze-proc-macro-srv` too, blaze's own proc-macro server,
+which a build from crates.io (below) does not have. Run it again to upgrade. To install a given
+release, end the line with
 `| sh -s -- --version 0.2.0`; `--help` says what else it takes. Until the first release under the
 name blaze, it installs the newest nightly build.
 

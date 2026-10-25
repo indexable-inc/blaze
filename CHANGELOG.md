@@ -97,6 +97,10 @@ All notable changes to ra-jit are written here. The format follows
   and rustc's libraries left for what ra-jit did not link (#90). `macroserver.py all` builds
   fd, bat, hyperfine, just, nushell and helix both ways: 3,465 calls the same, 12 of
   `pest_consume_macros` not compared, as ra-jit cannot compile it yet (#327).
+- The Linux release has blaze's proc-macro server, `blaze-proc-macro-srv`, beside `ra-jit`,
+  built whole by the release's ra-jit (`build_release.py --server`);
+  `RA_JIT_PROC_MACRO_SERVER=1` uses it, and says so when it is not there. A load whose proc
+  macros are all ra-jit's starts no toolchain server.
 - The SSE and AVX compares compile (#87): `llvm.x86.sse.cmp.ps` and `.ss`, `sse2.cmp.pd` and
   `.sd` and AVX's 256-bit ones give a lane of all ones where the immediate's predicate holds, as
   rustc's do. glam's `Vec4::cmpeq` and `is_finite_mask`, which bevy calls, were left to rustc;

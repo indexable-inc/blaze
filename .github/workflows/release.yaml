@@ -58,7 +58,8 @@ jobs:
       NAME: blaze-v${{ needs.notes.outputs.version }}-${{ matrix.target }}
     steps:
       - uses: actions/checkout@v7
-      - run: rustup toolchain install 1.99.0 --profile minimal && rustup default 1.99.0
+      # rust-src: blaze's proc-macro server and the standard library are compiled from it.
+      - run: rustup toolchain install 1.99.0 --profile minimal --component rust-src && rustup default 1.99.0
       # `cargo blaze --version` names the commit, as the flake's build does.
       - run: echo "RA_JIT_GIT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
       # A release's builds fetch the standard library from the release's assets (the step
@@ -69,8 +70,10 @@ jobs:
       # that one links libLLVM dynamically, which a machine that downloads the binary lacks.
       # The recipe the flake's build runs too, with the profile pgo/profiles.json pins; a
       # release refuses a profile trained on other crates (Cargo.lock or the toolchain moved
-      # since the pgo workflow last ran).
-      - run: python3 .github/scripts/build_release.py --target ${{ matrix.target }} --out shipped --strict
+      # since the pgo workflow last ran). On Linux the ra-jit it built then builds blaze's
+      # proc-macro server (`--server`), which the archive has beside it: the server that
+      # expands with the proc-macro libraries ra-jit links, so no user's machine builds it.
+      - run: python3 .github/scripts/build_release.py --target ${{ matrix.target }} --out shipped --strict ${{ runner.os == 'Linux' && '--server' || '' }}
         env:
           MACOSX_DEPLOYMENT_TARGET: "13.0"
       - name: Archive
@@ -83,6 +86,9 @@ jobs:
           "$NAME/blaze" --version | grep -F "blaze ${{ needs.notes.outputs.version }} "
           "$NAME/cargo-blaze" blaze --version | grep -F "blaze ${{ needs.notes.outputs.version }} "
           "$NAME/cargo-ra-jit" ra-jit --version | grep -F "blaze ${{ needs.notes.outputs.version }} "
+          if [ "$RUNNER_OS" = Linux ]; then
+            RUST_ANALYZER_INTERNALS_DO_NOT_USE=1 "$NAME/blaze-proc-macro-srv" --version | grep -F "rust-analyzer-proc-macro-srv "
+          fi
           tar czf "$NAME.tar.gz" "$NAME"
           shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
       - uses: actions/upload-artifact@v7
@@ -98,7 +104,6 @@ jobs:
       - name: Standard library
         continue-on-error: true
         run: |
-          rustup component add rust-src --toolchain 1.99.0
           shipped/ra-jit std "$RUNNER_TEMP/std" "$(rustc +1.99.0 --print sysroot)"
           mkdir std-assets
           cd "$RUNNER_TEMP/std"

@@ -8,7 +8,11 @@
 //! rustc compiles there that links such a library has rustc compile the proc macro first,
 //! over ra-jit's library, as rustc loads only its own.
 
-use std::{ffi::OsStr, path::Path};
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
 use anyhow::Context as _;
 use paths::AbsPathBuf;
@@ -20,15 +24,45 @@ use super::{
 };
 
 /// The variable that names the proc-macro server that reads the list of macros of a library
-/// ra-jit linked.
+/// ra-jit linked: a path, or `1` for the one a release ships beside ra-jit ([`SHIPPED`]).
 pub(crate) const SERVER: &str = "RA_JIT_PROC_MACRO_SERVER";
+
+/// The server's executable a release has beside ra-jit's (`.github/scripts/build_release.py`).
+pub(crate) const SHIPPED: &str = "blaze-proc-macro-srv";
 
 /// The variable ra-jit sets for the cargo of a load into its own target directory.
 pub(crate) const OWN_TARGET: &str = "RA_JIT_OWN_TARGET";
 
-/// Whether a proc macro cargo asks the wrapper for is ra-jit's to compile.
+/// Whether a proc macro cargo asks the wrapper for is ra-jit's to compile. The load names the
+/// server it found ([`server`]) to its cargo, so the wrapper reads only that it is named.
 pub(crate) fn wanted() -> bool {
     std::env::var_os(SERVER).is_some() && std::env::var_os(OWN_TARGET).is_some()
+}
+
+/// The server that expands with the libraries ra-jit links, as [`SERVER`] says, relative to
+/// the current directory: `None` when it names none, or `1` and no server is beside ra-jit.
+/// A load names it to its cargo, or takes the variable away, so the wrapper links a proc
+/// macro only for a server there is.
+pub(crate) fn server() -> Option<&'static Path> {
+    static FOUND: OnceLock<Option<PathBuf>> = OnceLock::new();
+    FOUND.get_or_init(find).as_deref()
+}
+
+fn find() -> Option<PathBuf> {
+    let named = std::env::var_os(SERVER)?;
+    if named == "1" {
+        let exe = std::env::current_exe().ok()?;
+        let shipped = exe.parent()?.join(format!("{SHIPPED}{}", std::env::consts::EXE_SUFFIX));
+        if !shipped.is_file() {
+            say::fallback(
+                &format!("no proc-macro server is beside {}", exe.display()),
+                "rustc compiles the proc macros and the toolchain's server expands them",
+            );
+            return None;
+        }
+        return Some(shipped);
+    }
+    std::path::absolute(named).ok()
 }
 
 /// What ra-jit makes of the proc macro `record` is of: its library, where rustc would have
