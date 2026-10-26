@@ -114,8 +114,15 @@ impl Release {
             }
         }
         let ((version, date, channel), rustc, manifest) = (release?, rustc?, manifest?);
-        (!components.is_empty())
-            .then_some(Release { version, channel, date, rustc, host, manifest, components })
+        (!components.is_empty()).then_some(Release {
+            version,
+            channel,
+            date,
+            rustc,
+            host,
+            manifest,
+            components,
+        })
     }
 
     /// What the download comes to, in megabytes as people count them.
