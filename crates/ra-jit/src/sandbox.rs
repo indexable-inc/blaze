@@ -517,6 +517,11 @@ mod linux {
         }
         let staged = opened(staging)?;
         tmpfs(staging)?;
+        // The other empty directories go in place before the overlays too: a workspace or a
+        // `TMPDIR` under `/dev/shm` is mounted again inside its empty one.
+        for dir in ["/var/tmp", "/dev/shm"].map(Path::new).iter().filter(|it| it.is_dir()) {
+            tmpfs(dir)?;
+        }
         let by_fd = |fd: &std::os::fd::OwnedFd, rest: &str| {
             PathBuf::from(format!("/proc/self/fd/{}{rest}", std::os::fd::AsRawFd::as_raw_fd(fd)))
         };
@@ -527,8 +532,12 @@ mod linux {
             overlay(dir, &by_fd(lower, ""), &upper, &work)?;
         }
         drop((lowers, staged));
-        for dir in ["/var/tmp", "/dev/shm"].map(Path::new).iter().filter(|it| it.is_dir()) {
-            tmpfs(dir)?;
+        // A `TMPDIR` in one of the empty directories is there, empty as they are.
+        let tmp = spec.env.iter().find(|(name, _)| name == "TMPDIR").map(|(_, it)| Path::new(it));
+        if let Some(tmp) =
+            tmp.filter(|it| ["/tmp", "/var/tmp", "/dev/shm"].iter().any(|dir| it.starts_with(dir)))
+        {
+            std::fs::create_dir_all(tmp).map_err(|error| format!("{}: {error}", tmp.display()))?;
         }
         loopback_up()?;
         if unsafe { libc::unshare(libc::CLONE_NEWPID) } < 0 {

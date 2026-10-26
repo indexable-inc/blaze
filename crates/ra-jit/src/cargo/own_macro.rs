@@ -149,9 +149,10 @@ pub(crate) fn command(mut args: impl Iterator<Item = std::ffi::OsString>) -> any
 fn library_of(sysroot: &Path, library: &Path) -> Result<Option<PathBuf>, String> {
     let (prefix, suffix) = (std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX);
     let file = library.file_name().and_then(OsStr::to_str).ok_or("a library unnamed")?;
-    let unit = file.strip_prefix(prefix).and_then(|it| it.strip_suffix(suffix));
-    let unit = unit.ok_or("not a library")?;
+    let stem = file.strip_prefix(prefix).and_then(|it| it.strip_suffix(suffix));
+    let stem = stem.ok_or("not a library")?;
     let dir = library.parent().ok_or("a library without a directory")?;
+    let unit = &super::layout::unit_of_file(stem, dir);
     // One ra-jit's own target directory was seeded with is recorded in cargo's.
     let parts: Vec<_> = dir.components().collect();
     let cargos = parts.iter().rposition(|it| it.as_os_str() == "rust-analyzer").map(|at| {
@@ -341,10 +342,8 @@ pub(crate) fn rustc_first(rustc: &OsStr, args: &[String], cwd: &Path) -> anyhow:
     let (prefix, suffix) = (std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX);
     for (_, path) in externs.filter_map(|it| it.split_once('=')) {
         let library = cwd.join(path);
-        let Some(unit) = library.file_name().and_then(|it| it.to_str()) else { continue };
-        let Some(unit) = unit.strip_prefix(prefix).and_then(|it| it.strip_suffix(suffix)) else {
-            continue;
-        };
+        let Some(unit) = Record::id_of_file(&library, prefix, suffix) else { continue };
+        let unit = &unit;
         let Some(listed) = library.to_str().and_then(|it| AbsPathBuf::try_from(it).ok()) else {
             continue;
         };

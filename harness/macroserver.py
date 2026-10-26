@@ -269,9 +269,16 @@ def linked(ran, what):
                          f"{ran.stderr[-8000:]}")
 
 
+def unit_libraries(target):
+    """The dynamic libraries rustc wrote for cargo's units in `target`: in `deps` in cargo's
+    first layout of the build directory, in `build/<package>/<hash>/out` in its second."""
+    return [*glob.glob(os.path.join(target, "**", "deps", "lib*.so"), recursive=True),
+            *glob.glob(os.path.join(target, "**", "build", "*", "*", "out", "lib*.so"), recursive=True)]
+
+
 def built_macros(target):
     """The proc-macro libraries the load's cargo built in `target`, ra-jit's ones apart."""
-    libraries = glob.glob(os.path.join(target, "**", "deps", "lib*.so"), recursive=True)
+    libraries = unit_libraries(target)
     ours = {lib for lib in libraries if LIST in open(lib, "rb").read()}
     name = lambda lib: os.path.basename(lib)[3:].rsplit("-", 1)[0]
     return sorted(map(name, ours)), sorted(map(name, set(libraries) - ours))
@@ -280,7 +287,7 @@ def built_macros(target):
 def without_libc(target):
     """ra-jit's proc-macro libraries in `target` that do not name libc: glibc binds each libc
     symbol of such a library to its oldest version, a `realpath` that fails without a buffer."""
-    libraries = glob.glob(os.path.join(target, "**", "deps", "lib*.so"), recursive=True)
+    libraries = unit_libraries(target)
     read = {lib: open(lib, "rb").read() for lib in libraries}
     return sorted(os.path.basename(lib) for lib, data in read.items()
                   if LIST in data and b"libc.so" not in data)
@@ -369,7 +376,7 @@ def app(name, work, server):
         if build == "ours":
             # A proc macro rustc compiled again, for a crate of rustc's that links it, left
             # ra-jit's library beside its record.
-            for lib in [*glob.glob(os.path.join(own, "**", "deps", "lib*.so"), recursive=True),
+            for lib in [*unit_libraries(own),
                         *glob.glob(os.path.join(own, "**", ".ra-jit-units", "*", "lib*.so"),
                                    recursive=True)]:
                 if LIST in open(lib, "rb").read():

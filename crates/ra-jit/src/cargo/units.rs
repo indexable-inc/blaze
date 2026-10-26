@@ -19,9 +19,6 @@ const RECORDS: &str = ".ra-jit-units";
 /// The file of a unit's directory that describes a library outside the workspace.
 const DESCRIBED: &str = "crate.json";
 
-/// The directories of a profile that cargo has rustc write to.
-const PLACES: [&str; 3] = ["deps", "examples", "build"];
-
 /// A stamp dir of a unit that no state names is deleted once it is this old: a build under
 /// way may be about to name it.
 const UNUSED_FOR: Duration = Duration::from_secs(3600);
@@ -63,21 +60,32 @@ pub(crate) struct Copied {
 
 impl Record {
     /// Where the records of the units cargo writes to `out_dir` are: in the directory of the
-    /// profile, which `deps`, `examples` and `build` are in. A file cargo links from one of
-    /// those to the profile's directory is found the same way.
+    /// profile, which `deps`, `examples` and `build` are in, in either of cargo's layouts
+    /// ([`super::layout`]). A file cargo links from one of those to the profile's directory
+    /// is found the same way.
     pub(crate) fn dir_for(out_dir: &Path) -> PathBuf {
-        let profile = out_dir
-            .ancestors()
-            .find(|it| it.file_name().is_some_and(|name| PLACES.iter().any(|it| name == *it)))
-            .and_then(Path::parent)
-            .unwrap_or(out_dir);
-        profile.join(RECORDS)
+        super::layout::profile_of(out_dir).unwrap_or(out_dir).join(RECORDS)
+    }
+
+    /// The name of the unit of crate `crate_name` that rustc writes to `out_dir` with
+    /// `-C extra-filename=extra`, which its record is kept by: `<crate>-<hash>` in both of
+    /// cargo's layouts.
+    pub(crate) fn id_of(crate_name: &str, extra: &str, out_dir: &Path) -> String {
+        super::layout::unit_name(crate_name, extra, out_dir)
+    }
+
+    /// The name of the unit that wrote `file`, named `<prefix><stem><suffix>`, as
+    /// [`Record::id_of`] gives it.
+    pub(crate) fn id_of_file(file: &Path, prefix: &str, suffix: &str) -> Option<String> {
+        let name = file.file_name()?.to_str()?;
+        let stem = name.strip_prefix(prefix)?.strip_suffix(suffix)?;
+        Some(super::layout::unit_of_file(stem, file.parent()?))
     }
 
     /// The copy the record of the unit that wrote `library` (`lib<crate><extra>.rlib`, as
     /// its unit is named) has of it, which is what the daemon reads in its place.
     pub(crate) fn kept_copy(library: &Path) -> Option<PathBuf> {
-        let unit = library.file_stem()?.to_str()?.strip_prefix("lib")?;
+        let unit = Record::id_of_file(library, "lib", ".rlib")?;
         let record = Record::dir_for(library.parent()?).join(unit).join("record.json");
         let record: Record = serde_json::from_str(&std::fs::read_to_string(record).ok()?).ok()?;
         record.copy_of(library).map(Path::to_owned)
@@ -260,12 +268,15 @@ impl Record {
         stamps.filter_map(|it| std::fs::metadata(it).and_then(|it| it.modified()).ok()).min()
     }
 
-    /// The unit's directories in cargo's fingerprint directory.
+    /// The unit's directories in cargo's fingerprint directory: in the second layout the one
+    /// in the unit's own directory.
     fn fingerprints(&self) -> Vec<PathBuf> {
         let extra = self.extra_filename();
-        let Some(profile) = self.out_dir().and_then(|it| it.parent().map(Path::to_path_buf)) else {
-            return Vec::new();
-        };
+        let Some(out_dir) = self.out_dir() else { return Vec::new() };
+        if let Some(unit) = super::layout::unit_dir(&out_dir) {
+            return vec![unit.dir.join("fingerprint")];
+        }
+        let Some(profile) = out_dir.parent() else { return Vec::new() };
         let Ok(units) = std::fs::read_dir(profile.join(".fingerprint")) else { return Vec::new() };
         let units = units
             .flatten()
@@ -417,7 +428,13 @@ mod tests {
     #[test]
     fn records_are_in_the_profile() {
         let records = Path::new("/t/debug/.ra-jit-units");
-        for dir in ["/t/debug/deps", "/t/debug/examples", "/t/debug/build/a-1", "/t/debug"] {
+        for dir in [
+            "/t/debug/deps",
+            "/t/debug/examples",
+            "/t/debug/build/a-1",
+            "/t/debug",
+            "/t/debug/build/a/0123456789abcdef/out",
+        ] {
             assert_eq!(Record::dir_for(Path::new(dir)), records, "{dir}");
         }
     }

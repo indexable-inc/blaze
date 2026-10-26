@@ -8,6 +8,7 @@ mod affected;
 mod ancestor;
 mod cli;
 mod client;
+pub(crate) mod layout;
 mod messages;
 pub(crate) mod metadata;
 pub(crate) mod own_macro;

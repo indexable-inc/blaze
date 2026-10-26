@@ -1,8 +1,8 @@
 //! A run of a build script as cargo 1.99 runs it: the dirty work of `build_work` in
 //! `src/compiler/custom_build.rs` of rust-lang/cargo at 5f94df478. The script runs in its
 //! package's directory with no input and both outputs kept, after `OUT_DIR` and the directory
-//! around it are made; cargo's files beside `OUT_DIR` are written once it succeeds, which is
-//! where cargo and blaze read a run back from.
+//! around it are made; cargo's files of the run ([`run_dir`]) are written once it succeeds,
+//! which is where cargo and blaze read a run back from.
 
 use std::{
     fs,
@@ -61,9 +61,34 @@ pub struct Failed {
     pub log_messages: Vec<(Severity, String)>,
 }
 
-/// The directory cargo keeps a run's files in: the one around `OUT_DIR`.
-pub fn run_dir(unit: &Unit) -> &Path {
-    unit.out_dir.parent().unwrap_or(&unit.out_dir)
+/// The directory cargo keeps a run's files in: the one around `OUT_DIR` in cargo's first
+/// layout of its build directory (`build/<package>-<hash>/out`), and `run` beside `OUT_DIR`
+/// in its second (`build/<package>/<hash>/out`, nightly cargo's default since 2026:
+/// `BuildDirLayout::build_script_execution` of rust-lang/cargo at cad07cf8e).
+pub fn run_dir(unit: &Unit) -> PathBuf {
+    let around = unit.out_dir.parent().unwrap_or(&unit.out_dir);
+    match is_second_layout(&unit.out_dir) {
+        true => around.join("run"),
+        false => around.to_owned(),
+    }
+}
+
+/// The file of a run's directory that holds what the script printed: `output` in cargo's
+/// first layout, `stdout` in its second.
+pub fn printed(unit: &Unit) -> PathBuf {
+    let name = if is_second_layout(&unit.out_dir) { "stdout" } else { "output" };
+    run_dir(unit).join(name)
+}
+
+/// Whether `out_dir` is in a unit's directory of cargo's second layout,
+/// `build/<package>/<hash>/out`, where the hash is sixteen hexadecimal digits.
+pub fn is_second_layout(out_dir: &Path) -> bool {
+    let unit = out_dir.parent();
+    let hash = unit.and_then(Path::file_name).and_then(|it| it.to_str());
+    let build = unit.and_then(Path::parent).and_then(Path::parent).and_then(Path::file_name);
+    out_dir.file_name().is_some_and(|it| it == "out")
+        && hash.is_some_and(|it| it.len() == 16 && it.bytes().all(|it| it.is_ascii_hexdigit()))
+        && build.is_some_and(|it| it == "build")
 }
 
 /// Runs `command`, made from `unit`'s [`Invocation`] (directly or in a sandbox).
@@ -72,7 +97,7 @@ pub fn run(unit: &Unit, mut command: Command) -> Result<Ran, Error> {
         Error(format!("failed to create script output directory for build command: {err}"))
     })?;
     let failed = |err: std::io::Error| Error(format!("{}: {err}", run_dir(unit).display()));
-    let began = invocation_time(run_dir(unit)).map_err(failed)?;
+    let began = invocation_time(&run_dir(unit)).map_err(failed)?;
     command.stdin(Stdio::null());
     // A script this process just wrote stays busy while a child another thread forked holds
     // it open, until that child execs.
@@ -124,8 +149,8 @@ impl Ran {
     }
 
     /// What cargo makes of the run: what the script printed, once it succeeded and logged no
-    /// error, with cargo's files written beside `OUT_DIR` (`output`, `stderr`, `root-output`);
-    /// or why the build fails.
+    /// error, with cargo's files written in [`run_dir`] (`output` or `stdout`, `stderr`,
+    /// `root-output`); or why the build fails.
     pub fn finish(&self, unit: &Unit, cx: &Context<'_>) -> Result<Output, Failed> {
         let logged = self.logged();
         let failed = |error: String, log_messages| Failed { error: Error(error), log_messages };
@@ -159,7 +184,7 @@ impl Ran {
     /// cargo's files of a run that succeeded, which a later build reads the run back from.
     fn write(&self, unit: &Unit) -> std::io::Result<()> {
         let dir = run_dir(unit);
-        let output = dir.join("output");
+        let output = printed(unit);
         fs::write(&output, &self.stdout)?;
         let times = fs::FileTimes::new().set_accessed(self.began).set_modified(self.began);
         fs::File::options().write(true).open(&output)?.set_times(times)?;

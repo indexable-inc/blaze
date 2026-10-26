@@ -126,11 +126,15 @@ def printed(program, args=(), cwd=None, env=None):
 
 
 def cargo_built(target):
-    """Whether cargo built anything into `target`: it leaves `.fingerprint` in each profile.
-    The build scripts and proc macros blaze loads the workspace with are in its own
-    `target/rust-analyzer`."""
+    """Whether cargo built anything into `target`: it leaves `.fingerprint` in each profile in
+    its first layout of the build directory, and `fingerprint` in each unit's directory,
+    `build/<package>/<hash>`, in its second. The build scripts and proc macros blaze loads the
+    workspace with are in its own `target/rust-analyzer`."""
     own = os.path.join(target, "rust-analyzer")
-    return any(".fingerprint" in dirs for at, dirs, _ in os.walk(target)
+    unit = lambda at: (re.fullmatch(r"[0-9a-f]{16}", os.path.basename(at))
+                       and os.path.basename(os.path.dirname(os.path.dirname(at))) == "build")
+    return any(".fingerprint" in dirs or ("fingerprint" in dirs and unit(at))
+               for at, dirs, _ in os.walk(target)
                if at != own and not at.startswith(own + os.sep))
 
 

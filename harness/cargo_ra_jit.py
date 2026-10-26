@@ -333,8 +333,9 @@ def program_output(ran):
 def test_results(ran):
     """The outcome of each test and of each test executable, and the exit status."""
     # A doc test in a generated file is named by its path, in a directory cargo names
-    # with a hash of how it was built.
-    names = re.sub(r"-[0-9a-f]{16}/", "-HASH/", ran.stdout.replace("target-ref", "target"))
+    # with a hash of how it was built (`build/<package>-<hash>/out` in cargo's first layout,
+    # `build/<package>/<hash>/out` in its second).
+    names = re.sub(r"([-/])[0-9a-f]{16}/", r"\1HASH/", ran.stdout.replace("target-ref", "target"))
     # A test's result is not always on the line of its name: what a program started by
     # another test prints lands between the two. So the names are read from the lines and
     # the failures from the list at the end, and the totals say the rest.

@@ -36,7 +36,9 @@ OPEN = {
 }
 
 COLOR = re.compile(r"\x1b\[[0-9;]*m")
-RUNNING = re.compile(r"^\s+Running .*[/\\]deps[/\\](\w+?)-[0-9a-f]{16}")
+# A test binary is `deps/<name>-<hash>` in cargo's first layout of the build directory and
+# `build/<package>/<hash>/out/<name>-<hash>` in its second (nightly cargo's default).
+RUNNING = re.compile(r"^\s+Running .*[/\\](?:deps|out)[/\\](\w+?)-[0-9a-f]{16}\b")
 DOCTESTS = re.compile(r"^\s+Doc-tests (\w+)")
 RESULT = re.compile(r"^test (\S+)(?: - .*)? \.\.\. (ok|FAILED|ignored)")
 

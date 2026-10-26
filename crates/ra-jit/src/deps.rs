@@ -11,6 +11,13 @@
 //! list and cargo then builds the crates of the workspace only. Cargo checks the fingerprint
 //! of each unit it is given as it would one of its own, so a unit the build has no use for
 //! costs its transfer and nothing else.
+//!
+//! Cargo has two layouts of a profile's directory (`cargo::layout`). The first keeps a unit
+//! in `deps`, `build/<unit>` and `.fingerprint/<unit>`, and the list names it `serde-<hash>`;
+//! the second keeps it whole in `build/<package>/<hash>`, and the list names it
+//! `serde/<hash>`, its directory below `build`. The hash is the same in both, but neither
+//! cargo reads what the other wrote, so a pull takes the units of the layout the directory
+//! is in, and of both into a directory that is in neither yet.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -23,8 +30,12 @@ use rustc_hash::FxHashMap;
 
 use crate::remote::{Digest, Fetched, Remote, Room, Tally, project_name, runtime};
 
-/// The directories of a profile that hold units, the one cargo trusts last.
+/// The directories of a profile that hold units in cargo's first layout, the one cargo
+/// trusts last.
 const PLACES: [&str; 3] = ["deps", "build", ".fingerprint"];
+
+/// The directory of a unit in cargo's second layout that cargo trusts last.
+const FINGERPRINT: &str = "fingerprint";
 
 /// What an entry of an archive takes of it besides what the file holds.
 const HEADER: u64 = 512;
@@ -88,12 +99,52 @@ fn is_hex(text: &str, len: usize) -> bool {
     text.len() == len && text.bytes().all(|it| it.is_ascii_hexdigit())
 }
 
-/// The hash at the end of the name of a unit, `serde-33c9cbd578789acd`. A name that has one
-/// is safe as the name of a file.
-fn hash_of(unit: &str) -> Option<&str> {
-    let (krate, hash) = unit.rsplit_once('-')?;
+/// The package and the hash of the name of a unit, `serde-33c9cbd578789acd` in cargo's first
+/// layout and `serde/33c9cbd578789acd` in its second. A name that has them is safe as the
+/// path of a file below the profile's directory.
+fn parts_of(unit: &str) -> Option<(&str, &str)> {
+    let (package, hash) = unit.rsplit_once(['-', '/'])?;
     let plain = |it: u8| it.is_ascii_alphanumeric() || it == b'-' || it == b'_';
-    (!krate.is_empty() && krate.bytes().all(plain) && is_hex(hash, 16)).then_some(hash)
+    (!package.is_empty() && package.bytes().all(plain) && is_hex(hash, 16))
+        .then_some((package, hash))
+}
+
+/// The hash at the end of the name of a unit.
+fn hash_of(unit: &str) -> Option<&str> {
+    parts_of(unit).map(|(_, hash)| hash)
+}
+
+/// The package of a unit, by its name.
+fn package_of(unit: &str) -> Option<&str> {
+    parts_of(unit).map(|(package, _)| package)
+}
+
+/// Whether the unit is named as cargo's second layout keeps it, `serde/<hash>`.
+fn is_second(unit: &str) -> bool {
+    parts_of(unit).is_some() && unit.contains('/')
+}
+
+/// Where a unit's fingerprint is, which cargo reads its outputs by.
+fn fingerprint_of(dir: &Path, unit: &str) -> PathBuf {
+    match is_second(unit) {
+        true => dir.join("build").join(unit).join(FINGERPRINT),
+        false => dir.join(".fingerprint").join(unit),
+    }
+}
+
+/// The layouts `dir` takes units of: the one it is in, or both while it is in neither.
+fn takes(dir: &Path) -> (bool, bool) {
+    let first = dir.join(".fingerprint").is_dir() || dir.join("deps").is_dir();
+    let second = std::fs::read_dir(dir.join("build"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|package| std::fs::read_dir(package.path()).into_iter().flatten().flatten())
+        .any(|unit| unit.path().join(FINGERPRINT).is_dir());
+    match (first, second) {
+        (false, false) => (true, true),
+        either => either,
+    }
 }
 
 /// The packages of the lockfile that are read from a path: the workspace's, and the ones a
@@ -113,20 +164,34 @@ fn local_packages(lock: &str) -> BTreeSet<String> {
     local
 }
 
-/// The units in `dir` that are not of a local package, by name.
+/// The units in `dir` that are not of a local package, by name, in both of cargo's layouts.
 fn units(dir: &Path, local: &BTreeSet<String>) -> anyhow::Result<BTreeSet<String>> {
     let mut units = BTreeSet::new();
+    let of_registry = |unit: &str| package_of(unit).is_some_and(|it| !local.contains(it));
     let fingerprints = dir.join(".fingerprint");
-    if !fingerprints.exists() {
-        return Ok(units);
+    if fingerprints.exists() {
+        for entry in std::fs::read_dir(fingerprints)? {
+            if let Ok(unit) = entry?.file_name().into_string()
+                && !is_second(&unit)
+                && of_registry(&unit)
+            {
+                units.insert(unit);
+            }
+        }
     }
-    for entry in std::fs::read_dir(fingerprints)? {
-        if let Ok(unit) = entry?.file_name().into_string()
-            && hash_of(&unit).is_some()
-            && let Some((package, _)) = unit.rsplit_once('-')
-            && !local.contains(package)
-        {
-            units.insert(unit);
+    let Ok(packages) = std::fs::read_dir(dir.join("build")) else { return Ok(units) };
+    for package in packages {
+        let package = package?;
+        let Ok(name) = package.file_name().into_string() else { continue };
+        let Ok(hashes) = std::fs::read_dir(package.path()) else { continue };
+        for hash in hashes {
+            let hash = hash?;
+            let Ok(unit) = hash.file_name().into_string().map(|it| format!("{name}/{it}")) else {
+                continue;
+            };
+            if is_second(&unit) && of_registry(&unit) && hash.path().join(FINGERPRINT).is_dir() {
+                units.insert(unit);
+            }
         }
     }
     Ok(units)
@@ -151,6 +216,21 @@ fn archive(dir: &Path, unit: &str, outputs: &[String]) -> anyhow::Result<Vec<u8>
     let packed = zstd::Encoder::new(Vec::new(), 3)?;
     let mut tar = tar::Builder::new(packed);
     tar.follow_symlinks(false);
+    if is_second(unit) {
+        let at = dir.join("build").join(unit);
+        let mut entries: Vec<std::ffi::OsString> = std::fs::read_dir(&at)?
+            .map(|it| Ok(it?.file_name()))
+            .collect::<std::io::Result<_>>()?;
+        entries.sort_by_key(|it| (it == FINGERPRINT, it.clone()));
+        for name in entries {
+            let (from, to) = (at.join(&name), Path::new("build").join(unit).join(&name));
+            match from.symlink_metadata()?.is_dir() {
+                true => tar.append_dir_all(to, from)?,
+                false => tar.append_path_with_name(from, to)?,
+            }
+        }
+        return Ok(tar.into_inner()?.finish()?);
+    }
     for output in outputs {
         tar.append_path_with_name(dir.join("deps").join(output), format!("deps/{output}"))?;
     }
@@ -219,9 +299,13 @@ fn unpack(dir: &Path, unit: &str, archive: impl std::io::Read, room: &Room) -> a
         let (Some(Some(place)), Some(Some(name))) = (parts.next(), parts.next()) else {
             bail!("{unit} holds {}", path.display());
         };
-        let of_unit = match place {
-            "deps" => hash_of(name.split('.').next().unwrap_or(name)) == hash_of(unit),
-            "build" | ".fingerprint" => name == unit,
+        let of_unit = match (place, is_second(unit)) {
+            ("build", true) => {
+                parts.next().flatten().map(|hash| format!("{name}/{hash}")) == Some(unit.to_owned())
+            }
+            (_, true) => false,
+            ("deps", false) => hash_of(name.split('.').next().unwrap_or(name)) == hash_of(unit),
+            ("build" | ".fingerprint", false) => name == unit,
             _ => false,
         };
         // Nor a link, which is to wherever it says. A file with holes is a file.
@@ -250,10 +334,13 @@ async fn pull(
     let room = Arc::new(Room::of(unpacked_max));
     tokio::fs::create_dir_all(dir).await?;
     let listed = Listed::fetch(remote, project).await?;
-    let missing =
-        listed.0.iter().filter(|(unit, _)| !dir.join(".fingerprint").join(unit).exists()).filter(
-            |(unit, _)| unit.rsplit_once('-').is_some_and(|(package, _)| !local.contains(package)),
-        );
+    let (first, second) = takes(dir);
+    let missing = listed
+        .0
+        .iter()
+        .filter(|(unit, _)| if is_second(unit) { second } else { first })
+        .filter(|(unit, _)| !fingerprint_of(dir, unit).exists())
+        .filter(|(unit, _)| package_of(unit).is_some_and(|package| !local.contains(package)));
     let fetch = |(unit, hash): (&String, &Digest)| {
         let (unit, hash, room) = (unit.clone(), *hash, room.clone());
         async move {
@@ -369,6 +456,37 @@ mod tests {
         pulled(&dir, &remote, Some(1 << 20)).unwrap();
         assert_eq!(std::fs::read(dir.join(rlib())).unwrap(), b"rlib");
         assert_eq!(held(&dir), 4, "the archive is not left behind");
+        _ = std::fs::remove_dir_all(&top);
+    }
+
+    #[test]
+    fn a_unit_of_the_second_layout_is_packed_and_unpacked_where_it_belongs() {
+        let unit = "serde/33c9cbd578789acd";
+        let (remote, top) = unsigned("second", 1 << 20);
+        let from = top.join("from/debug");
+        let out = from.join("build").join(unit).join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::create_dir_all(from.join("build").join(unit).join(FINGERPRINT)).unwrap();
+        std::fs::write(out.join("libserde-33c9cbd578789acd.rlib"), b"rlib").unwrap();
+        // A package of the workspace is not sent.
+        std::fs::create_dir_all(from.join("build/app/0123456789abcdef/fingerprint")).unwrap();
+        let local = BTreeSet::from(["app".to_owned()]);
+        assert_eq!(units(&from, &local).unwrap(), BTreeSet::from([unit.to_owned()]));
+        let packed = archive(&from, unit, &[]).unwrap();
+        let hash = Digest::of(&packed);
+        put(&top, &format!("units/{hash}"), &packed);
+        put(&top, "deps/default", format!("{unit} {hash}\n").as_bytes());
+        // A directory of the first layout takes none of it; an empty one, and one of the
+        // second layout, do.
+        let first = top.join("first/debug");
+        std::fs::create_dir_all(first.join(".fingerprint")).unwrap();
+        pulled(&first, &remote, Some(1 << 20)).unwrap();
+        assert!(!first.join("build").exists());
+        let to = top.join("to/debug");
+        pulled(&to, &remote, Some(1 << 20)).unwrap();
+        let rlib = to.join("build").join(unit).join("out/libserde-33c9cbd578789acd.rlib");
+        assert_eq!(std::fs::read(rlib).unwrap(), b"rlib");
+        assert!(fingerprint_of(&to, unit).is_dir());
         _ = std::fs::remove_dir_all(&top);
     }
 
@@ -503,7 +621,11 @@ mod tests {
             for (unit, archive) in &Listed::parse(&text).0 {
                 // Both become names of files.
                 assert!(hash_of(unit).is_some(), "{unit}");
-                assert!(!unit.contains(['/', '\\', '\0']) && !unit.starts_with('.'), "{unit}");
+                // A name of cargo's second layout is a package's directory and a unit's in it.
+                for part in unit.split('/') {
+                    assert!(!part.contains(['\\', '\0']) && !part.starts_with('.'), "{unit}");
+                }
+                assert!(unit.matches('/').count() <= 1, "{unit}");
                 assert_eq!(archive.to_string().len(), 64);
                 listed += 1;
             }

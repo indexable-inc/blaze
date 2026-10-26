@@ -1020,9 +1020,11 @@ impl Program {
 /// locks from putting its programs in place until they have started. A directory cargo
 /// keeps no lock in, on NFS, has none to hold.
 fn build_locks<'a>(executables: impl Iterator<Item = &'a Path>) -> Vec<std::fs::File> {
-    // `debug/app`, `debug/examples/app` and `debug/deps/app-…` are all of `debug`.
+    // `debug/app`, `debug/examples/app`, `debug/deps/app-…` and, in cargo's second layout,
+    // `debug/build/app/<hash>/out/app-…` are all of `debug`.
     let lock_of = |executable: &Path| {
-        let above = executable.ancestors().skip(1).take(2);
+        let profile = super::layout::unit_dir(executable).and_then(|it| it.profile());
+        let above = profile.into_iter().chain(executable.ancestors().skip(1).take(2));
         above.map(|dir| dir.join(".cargo-lock")).find(|it| it.is_file())
     };
     let mut locks: Vec<PathBuf> = executables.filter_map(lock_of).collect();
@@ -1288,15 +1290,24 @@ pub(super) fn sysroot_libraries() -> Option<PathBuf> {
 
 /// Where cargo has the dynamic linker look when it runs `executable`: the dependencies of
 /// the profile, the profile's own directory, the toolchain's libraries, and then wherever
-/// it looked already. A test of a proc macro is linked with the toolchain's `libstd`.
+/// it looked already. A test of a proc macro is linked with the toolchain's `libstd`. The
+/// dependencies are `deps` in cargo's first layout and, in its second, the directory of each
+/// unit that is a `dylib` ([`super::layout::dylib_dirs`]).
 pub(super) fn library_path(executable: &Path, sysroot: Option<&Path>) -> Option<(String, String)> {
     let inside = |it: &&Path| it.file_name().is_some_and(|it| it == "deps" || it == "examples");
     let dir = executable.parent()?;
-    let profile = if inside(&dir) { dir.parent()? } else { dir };
+    let profile = match super::layout::unit_dir(dir) {
+        Some(unit) => unit.profile()?,
+        None if inside(&dir) => dir.parent()?,
+        None => dir,
+    };
     let already = std::env::var_os(LIBRARY_PATH);
     let already = already.iter().flat_map(std::env::split_paths);
-    let dirs =
-        [profile.join("deps"), profile.to_owned()].into_iter().chain(sysroot.map(Path::to_owned));
+    let deps = match profile.join("deps").is_dir() || !profile.join("build").is_dir() {
+        true => vec![profile.join("deps")],
+        false => super::layout::dylib_dirs(profile),
+    };
+    let dirs = deps.into_iter().chain([profile.to_owned()]).chain(sysroot.map(Path::to_owned));
     let joined = std::env::join_paths(dirs.chain(already)).ok()?;
     Some((LIBRARY_PATH.to_owned(), joined.into_string().ok()?))
 }
@@ -1540,6 +1551,17 @@ mod tests {
         assert_eq!(dirs("/t/debug/deps/unit-0123"), expected);
         assert_eq!(dirs("/t/debug/app"), expected);
         assert_eq!(dirs("/t/debug/examples/one"), expected);
+        // cargo's second layout, with no `deps`: a test in its unit's directory.
+        let second = std::env::temp_dir().join(format!("ra-jit-state-{}", std::process::id()));
+        let unit = second.join("debug/build/app/0123456789abcdef/out");
+        std::fs::create_dir_all(&unit).unwrap();
+        let test = unit.join("app-0123456789abcdef");
+        let dirs = |executable: &Path| {
+            let (_, value) = library_path(executable, Some(sysroot)).unwrap();
+            std::env::split_paths(&value).take(2).collect::<Vec<PathBuf>>()
+        };
+        assert_eq!(dirs(&test), [second.join("debug"), sysroot.to_owned()]);
+        let _ = std::fs::remove_dir_all(&second);
     }
 
     #[test]

@@ -79,6 +79,7 @@ echo "said on stderr" >&2"#,
     assert!(output.log_messages.is_empty(), "stdin is closed, so nothing was read");
 
     let dir = run_dir(&unit);
+    assert_eq!(printed(&unit), dir.join("output"));
     assert_eq!(fs::read(dir.join("output")).unwrap(), ran.stdout);
     assert_eq!(fs::read_to_string(dir.join("stderr")).unwrap(), "said on stderr\n");
     assert_eq!(fs::read(dir.join("root-output")).unwrap(), path_bytes(&unit.out_dir).unwrap());
@@ -137,4 +138,20 @@ fn output_cargo_refuses() {
     let failed = ran(&unit, env).finish(&unit, &Context::of(&unit, &[])).unwrap_err();
     assert!(failed.error.0.starts_with("invalid output in build script of `foo v0.5.0`"));
     assert!(run_dir(&unit).join("output").exists(), "cargo keeps what it could not read");
+}
+
+#[test]
+fn a_run_in_cargos_second_layout() {
+    let (mut unit, env) = package("second", "echo cargo:rustc-cfg=foo\necho said on stderr >&2");
+    let target = unit.script.ancestors().nth(4).unwrap().to_owned();
+    unit.out_dir = target.join("debug/build/foo/0123456789abcdef/out");
+    let ran = ran(&unit, env);
+    ran.finish(&unit, &Context::of(&unit, &[])).unwrap();
+    let dir = target.join("debug/build/foo/0123456789abcdef/run");
+    assert_eq!((run_dir(&unit), printed(&unit)), (dir.clone(), dir.join("stdout")));
+    assert_eq!(fs::read(dir.join("stdout")).unwrap(), ran.stdout);
+    assert_eq!(fs::read_to_string(dir.join("stderr")).unwrap(), "said on stderr\n");
+    assert_eq!(fs::read(dir.join("root-output")).unwrap(), path_bytes(&unit.out_dir).unwrap());
+    assert!(dir.join("invoked.timestamp").exists() && !dir.join("output").exists());
+    assert!(!is_second_layout(&target.join("debug/build/foo-1/out")));
 }

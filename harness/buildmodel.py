@@ -164,7 +164,12 @@ class Case:
             command = [*self.runner, artifact, *self.spec.get("args", [])]
         # A program linked to a `dylib` finds it where cargo left it, as `cargo run` has it.
         mine, other = ("target-ref", "target") if "/target-ref/" in artifact else ("target", "target-ref")
-        libraries = [d for t in (mine, other) for d in glob.glob(os.path.join(self.ws, t, "**", "deps"), recursive=True)]
+        # `deps` in cargo's first layout of the build directory, the `out` of each unit that
+        # built one in its second.
+        libraries = [d for t in (mine, other) for d in [
+            *glob.glob(os.path.join(self.ws, t, "**", "deps"), recursive=True),
+            *sorted({os.path.dirname(lib) for lib in glob.glob(
+                os.path.join(self.ws, t, "**", "build", "*", "*", "out", "lib*.so"), recursive=True)})]]
         libraries += glob.glob(os.path.join(self.sysroot(env), "lib", "rustlib", "*", "lib"))
         env = {**env, "LD_LIBRARY_PATH": ":".join(libraries)}
         try:
@@ -308,7 +313,12 @@ class Case:
         if link is None:
             # cargo has built exactly this before and links nothing: without what it linked
             # then, it does again.
-            for linked in glob.glob(os.path.join(self.ws, "target", "**", "deps", self.artifact_name() + "-*"), recursive=True):
+            # In `deps` in cargo's first layout; in the `out` of its unit in the second, where
+            # only a test has the hash in its name.
+            name = self.artifact_name()
+            for linked in [*glob.glob(os.path.join(self.ws, "target", "**", "deps", name + "-*"), recursive=True),
+                           *glob.glob(os.path.join(self.ws, "target", "**", "build", "*", "*", "out", name), recursive=True),
+                           *glob.glob(os.path.join(self.ws, "target", "**", "build", "*", "*", "out", name + "-*"), recursive=True)]:
                 if "." not in os.path.basename(linked):
                     os.remove(linked)
             link = self.link_line(env)

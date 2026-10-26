@@ -339,13 +339,26 @@ impl Asked {
     }
 
     /// Where rustc's programs of the examples stay from run to run: beside what cargo built
-    /// them against, in `<target>/<profile>/ra-jit-doctest`.
+    /// them against, in `<target>/<profile>/ra-jit-doctest`. Cargo names the libraries'
+    /// directory, `deps` in its first layout and one unit's `build/<package>/<hash>/out` in
+    /// its second ([`crate::cargo::layout`]).
     fn memo(&self) -> Option<PathBuf> {
-        let deps = self.rustc_args.windows(2).find_map(|it| match it[0] == "-L" {
-            true => it[1].strip_prefix("dependency="),
+        // In cargo's second layout of the build directory a library of no dependencies is
+        // documented with no `-L dependency=`: the directory of the library itself then.
+        let dependency = self.rustc_args.windows(2).find_map(|it| match it[0] == "-L" {
+            true => it[1].strip_prefix("dependency=").map(Path::new),
             false => None,
-        })?;
-        Some(self.cwd.join(deps).parent()?.join("ra-jit-doctest"))
+        });
+        let library = || {
+            let externs = self.rustc_args.windows(2).filter(|it| it[0] == "--extern");
+            externs.filter_map(|it| Path::new(it[1].split_once('=')?.1).parent()).next()
+        };
+        let deps = self.cwd.join(dependency.or_else(library)?);
+        let profile = match crate::cargo::layout::unit_dir(&deps) {
+            Some(unit) => unit.profile()?.to_owned(),
+            None => deps.parent()?.to_owned(),
+        };
+        Some(profile.join("ra-jit-doctest"))
     }
 
     /// What tells a program rustc compiles apart from another: everything it is given, and

@@ -8,7 +8,7 @@ has to find every unit of the registry fresh, compile the local crates, and the 
 to print the same. An archive that is not what its name says is refused.
 
 Needs the crates in cargo's local registry cache: it builds offline."""
-import os, shutil, subprocess, sys, tempfile
+import os, re, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -78,13 +78,13 @@ def main():
     out = ra_jit(first, "push", remote, ASKED_FOR_NOTHING)
     check("the units are pushed", out.returncode == 0 and out.something, out.stdout.strip() + out.stderr.strip())
     listed = [line for _, name in PROFILES for line in open(f"{remote}/deps/{name}").read().split("\n")]
-    check("none of a crate at a path", not any(line.rsplit("-", 1)[0] in LOCAL for line in listed))
+    check("none of a crate at a path", not any(re.split(r"[-/](?=[0-9a-f]{16}$)", line)[0] in LOCAL for line in listed))
     out = ra_jit(first, "push", remote)
     check("a second push sends nothing", out.nothing, out.stdout.strip())
 
     out = ra_jit(second, "pull", remote, ASKED_FOR_NOTHING)
     check("a pull from lists nobody signed is refused unless asked for",
-          out.returncode != 0 and "RA_JIT_REMOTE_UNSIGNED=1" in out.stderr and not os.path.exists(f"{second}/target/debug/.fingerprint"),
+          out.returncode != 0 and "RA_JIT_REMOTE_UNSIGNED=1" in out.stderr and not any(os.path.exists(f"{second}/target/debug/{it}") for it in (".fingerprint", "build")),
           out.stderr.strip()[-80:])
     out = ra_jit(second, "pull", remote)
     check("the units are pulled", out.returncode == 0, out.stdout.strip() + out.stderr.strip())

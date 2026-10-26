@@ -33,6 +33,7 @@ TOOLCHAIN = PIN
 # Set in cargo's environment: the wrapper's cue, and the program it puts in place of scripts.
 WRAP = "BLAZE_SCRIPTS_WRAP"
 LEFT_OUT = {"bun"}
+UNIT_HASH = re.compile(r"[0-9a-f]{16}")
 
 
 def wrap(argv):
@@ -64,6 +65,39 @@ def wrap(argv):
             with open(os.path.join(out_dir, "harness-real"), "w") as f:
                 f.write(script + ".real")
     sys.exit(status)
+
+
+def unit_dirs(profile):
+    """The directory of each unit cargo built for `profile`, which holds the files of a build
+    script's run around its `OUT_DIR`: `build/<package>-<hash>` in cargo's first layout of the
+    build directory, `build/<package>/<hash>` in its second (nightly cargo's default)."""
+    build = os.path.join(profile, "build")
+    found = []
+    for name in sorted(os.listdir(build)) if os.path.isdir(build) else []:
+        first = os.path.join(build, name)
+        found.append(first)
+        found += [os.path.join(first, h) for h in sorted(os.listdir(first))
+                  if UNIT_HASH.fullmatch(h) and os.path.isdir(os.path.join(first, h, "out"))]
+    return found
+
+
+def printed(run_dir):
+    """The file cargo kept what a build script printed in: `output` in the first layout,
+    `run/stdout` in the second."""
+    second = os.path.join(run_dir, "run", "stdout")
+    return second if os.path.isfile(second) else os.path.join(run_dir, "output")
+
+
+def host_deps(profile):
+    """Where cargo has a build script load the host's dynamic libraries from: `deps` in the
+    first layout, the `out` of each unit that built a `dylib` in the second."""
+    deps = os.path.join(profile, "deps")
+    if os.path.isdir(deps) or not os.path.isdir(os.path.join(profile, "build")):
+        return [deps]
+    suffix = {"darwin": ".dylib", "win32": ".dll"}.get(sys.platform, ".so")
+    return [out for d in unit_dirs(profile) if os.path.isdir(out := os.path.join(d, "out"))
+            and any(f.endswith(suffix) and not f.endswith(f"-{os.path.basename(d)}{suffix}")
+                    for f in os.listdir(out))]
 
 
 def sh(argv, cwd, env, check=True):
@@ -296,12 +330,11 @@ def project(name, spec, work, t, blaze, jobs, clean):
     target_cfgs = sh([t["rustc"], "--print", "cfg", *rustflags], ws, None).splitlines()
 
     recordings = []
-    build_dir = os.path.join(host_root, "build")
-    for run_dir in sorted(os.listdir(build_dir)) if os.path.isdir(build_dir) else []:
-        path = os.path.join(build_dir, run_dir, "harness-ran.json")
+    for run_dir in unit_dirs(host_root):
+        path = os.path.join(run_dir, "harness-ran.json")
         if os.path.isfile(path):
             with open(path) as f:
-                recordings.append((os.path.join(build_dir, run_dir), json.load(f)))
+                recordings.append((run_dir, json.load(f)))
 
     # Which run of the unit graph each recording is.
     run_of = {}
@@ -405,7 +438,7 @@ def project(name, spec, work, t, blaze, jobs, clean):
             "dylib_search": {
                 # `cargo check` writes nothing to the artifact directory, and has none.
                 "host_root": None,
-                "host_deps": [os.path.join(host_root, "deps")],
+                "host_deps": host_deps(host_root),
                 "sysroot_libdir": t["libdir"],
                 "plugin_search": plugin_search,
             },
@@ -427,7 +460,7 @@ def project(name, spec, work, t, blaze, jobs, clean):
         path = os.path.join(blaze_dir, run_hash(i) + "-parse.json")
         with open(path, "w") as f:
             json.dump(unit_json(i, rec["env"]["OUT_DIR"], [], []), f)
-        output = os.path.join(run_dir, "output")
+        output = printed(run_dir)
         if not os.path.isfile(output):
             return None
         return call("parse", path, cargo_env_file, output)
@@ -505,7 +538,7 @@ def project(name, spec, work, t, blaze, jobs, clean):
         elif cargo_ok:
             # What the run comes to, not its bytes: cc prints the variables it looked up as
             # often as its threads happened to look.
-            with open(os.path.join(run_dir, "output"), errors="replace") as f:
+            with open(printed(run_dir), errors="replace") as f:
                 cargo_stdout = f.read()
             blaze_stdout = ran["stdout"].replace(out_dir, cargo_out)
             row["stdout_equal"] = cargo_stdout == blaze_stdout

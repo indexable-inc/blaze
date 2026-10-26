@@ -353,7 +353,7 @@ impl Unit {
             id: String::new(),
             crate_name,
             source: cwd.join(&args[source]),
-            records: Record::dir_for(&cwd.join(out_dir)),
+            records: Record::dir_for(&cwd.join(&out_dir)),
             args,
             cwd,
             linked: false,
@@ -369,8 +369,8 @@ impl Unit {
         }
         unit.script = record.is_build_script();
         unit.linked = record.is_linked() && !record.runs_in_build();
-        unit.id =
-            format!("{}{}", unit.crate_name, record.codegen("extra-filename").unwrap_or_default());
+        let extra = record.codegen("extra-filename").unwrap_or_default();
+        unit.id = Record::id_of(&unit.crate_name, extra, &unit.cwd.join(&out_dir));
         Some(unit)
     }
 
@@ -565,8 +565,7 @@ impl Unit {
     /// value is the metadata of a crate that has one.
     fn standing_in(&self, named: &str) -> Option<String> {
         let (name, path) = named.split_once('=')?;
-        let stem = Path::new(path).file_name()?.to_str()?.strip_suffix(".rmeta")?;
-        let id = stem.strip_prefix("lib")?;
+        let id = Record::id_of_file(&self.cwd.join(path), "lib", ".rmeta")?;
         self.records
             .join(id)
             .join(STANDS_IN)
@@ -578,8 +577,7 @@ impl Unit {
     /// the value is the library that stands in for one.
     fn checked_against(&self, named: &str) -> Option<String> {
         let (name, path) = named.split_once('=')?;
-        let stem = Path::new(path).file_name()?.to_str()?.strip_suffix(".rlib")?;
-        let id = stem.strip_prefix("lib")?;
+        let id = Record::id_of_file(&self.cwd.join(path), "lib", ".rlib")?;
         self.records
             .join(id)
             .join(STANDS_IN)
