@@ -1,5 +1,5 @@
 //! The workspace as `cargo metadata --format-version 1` prints it, read by blaze-manifest as
-//! cargo 1.99.0 reads it and resolved by blaze-resolve, with no cargo run (docs/resolve.md).
+//! the pinned cargo reads it and resolved by blaze-resolve, with no cargo run (docs/resolve.md).
 
 use std::path::Path;
 
@@ -202,7 +202,7 @@ mod tests {
     }
 
     /// Each workspace of blaze-manifest's fixtures that cargo reads is, as `cargo_metadata`
-    /// gives it to the rest of blaze, what cargo 1.99.0 printed for it.
+    /// gives it to the rest of blaze, what the pinned cargo printed for it.
     #[test]
     fn fixtures_are_what_cargo_metadata_gives() {
         let dir =
