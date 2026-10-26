@@ -178,12 +178,12 @@ pub(crate) fn note_failed() {
 /// What `rustc` says it is after `rustc `, as `1.101.0-nightly (12433c307 2026-10-24)`: the
 /// whole line, since every nightly of a release has the same number.
 fn version_of(rustc: &OsStr) -> Option<String> {
-    let said = rustc_says(rustc, "--version")?;
+    let said = rustc_says(rustc, &["--version"])?;
     said.lines().next()?.trim().strip_prefix("rustc ").map(str::to_owned)
 }
 
 fn sysroot_of(rustc: &OsStr) -> PathBuf {
-    PathBuf::from(rustc_says(rustc, "--print=sysroot").unwrap_or_default())
+    PathBuf::from(rustc_says(rustc, &["--print=sysroot"]).unwrap_or_default())
 }
 
 /// What chose the project's toolchain, as rustup tells the programs its proxies start.

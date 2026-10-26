@@ -51,6 +51,36 @@ pub(crate) fn executable(
     took
 }
 
+/// The command that links `objects` into the executable `exe` as [`executable`] does, for a
+/// shell: the daemon's line, which its edits are spliced after.
+pub(crate) fn command(
+    db: &RootDatabase,
+    program: &[Crate],
+    objects: &[&Path],
+    sysroot: Option<&Path>,
+    exe: &Path,
+) -> anyhow::Result<String> {
+    let line = Line::of(db, program, sysroot, false)?;
+    let mut args = vec!["cc".to_owned()];
+    args.extend(line.before.iter().cloned());
+    for &object in objects {
+        let path = object.display().to_string();
+        // An object the build has yet to write is none.
+        if object.exists() && split::is_archive(&leading_bytes(object)?) {
+            args.extend([
+                "-Wl,--whole-archive".to_owned(),
+                path,
+                "-Wl,--no-whole-archive".to_owned(),
+            ]);
+        } else {
+            args.push(path);
+        }
+    }
+    args.extend(line.after.iter().cloned());
+    args.extend(["-o".to_owned(), exe.display().to_string()]);
+    shlex::try_join(args.iter().map(String::as_str)).context("a link argument has a NUL in it")
+}
+
 /// The arguments `cc` links the program of some crates with, around its objects.
 pub(crate) struct Line {
     before: Vec<String>,

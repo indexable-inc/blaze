@@ -10,13 +10,13 @@ use base_db::{Crate, FileId};
 use hir_def::{CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
-    TypeSuperVisitable, TypeVisitable, TypeVisitor,
+    AliasTy, AliasTyKind, TypeSuperVisitable, TypeVisitable, TypeVisitor,
     inherent::{BoundExistentialPredicates as _, IntoKind, ParamEnv as _, SliceLike as _},
 };
 use salsa::plumbing::FromId as _;
 
 use hir_ty::{
-    InferBodyId,
+    ImplTraitId, InferBodyId,
     db::{HirDatabase, InternedClosureId, InternedCoroutineId},
     method_resolution::loaded_crates,
     next_solver::{DbInterner, Ty, TyKind},
@@ -31,6 +31,16 @@ struct Mentions<'db> {
     crates: FxHashSet<Crate>,
     /// The bodies it has the code of or mentions a type of.
     bodies: Vec<DefWithBodyId>,
+    /// Of those, the ones it mentions a coroutine of, whose layout is of the whole body.
+    coroutines: Vec<DefWithBodyId>,
+    /// Whether an `impl Trait` is looked through to the type its body gives it, and a
+    /// projection left as it is written, rather than either told apart as `opaque`.
+    reveal: bool,
+    /// How many `impl Trait`s the type being looked at is inside of.
+    revealing: u32,
+    /// The bodies that give the `impl Trait`s it mentions their types, and those of the
+    /// closures in those types: its name says none of what they wrote.
+    hidden: Vec<DefWithBodyId>,
     /// It mentions something whose crate we can't tell.
     opaque: bool,
     /// The types looked into so far. The type of a future holds those of the futures it
@@ -40,10 +50,18 @@ struct Mentions<'db> {
 
 impl<'db> Mentions<'db> {
     fn of(db: &'db dyn HirDatabase, instance: &Instance) -> Mentions<'db> {
+        Mentions::looking(db, instance, false)
+    }
+
+    fn looking(db: &'db dyn HirDatabase, instance: &Instance, reveal: bool) -> Mentions<'db> {
         let mut mentions = Mentions {
             db,
             crates: FxHashSet::default(),
             bodies: Vec::new(),
+            coroutines: Vec::new(),
+            reveal,
+            revealing: 0,
+            hidden: Vec::new(),
             opaque: false,
             seen: FxHashSet::default(),
         };
@@ -130,6 +148,31 @@ pub fn body_files(db: &dyn HirDatabase, instance: &Instance) -> Option<Box<[File
     Some(files.into())
 }
 
+/// The bodies the code of an instance depends on beyond its name: the one it is written in,
+/// when it has one; those it mentions a coroutine of, whose layout is of the whole body; and
+/// those that give the `impl Trait`s it mentions their types, with the closures and coroutines
+/// in those. A closure or function its name mentions is in it whole, with what the closure
+/// captures. `None` when that can't be told.
+pub(super) fn bodies_of(
+    db: &dyn HirDatabase,
+    instance: &Instance,
+) -> Option<(Option<DefWithBodyId>, Vec<DefWithBodyId>)> {
+    let mut mentions = Mentions::looking(db, instance, true);
+    if mentions.opaque {
+        return None;
+    }
+    mentions.coroutines.append(&mut mentions.hidden);
+    let written = match instance.def {
+        InstanceDef::Fn(_)
+        | InstanceDef::VtableShim(_)
+        | InstanceDef::Closure(_)
+        | InstanceDef::Coroutine(_)
+        | InstanceDef::CoroutineByMove(_) => mentions.bodies.first().copied(),
+        _ => None,
+    };
+    Some((written, mentions.coroutines))
+}
+
 /// The file a body is written in, which for one a macro makes is where the macro is called.
 pub fn body_file(db: &dyn HirDatabase, body: DefWithBodyId) -> FileId {
     let file = match body {
@@ -163,14 +206,48 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Mentions<'db> {
                 };
                 self.crates.insert(krate);
             }
-            TyKind::Closure(id, _) => self.owner(id.0.loc(self.db).owner),
-            TyKind::CoroutineClosure(id, _) => self.owner(id.0.loc(self.db).owner),
-            TyKind::Coroutine(id, _) => self.owner(id.0.loc(self.db).owner),
+            TyKind::Closure(id, _) => {
+                let known = self.bodies.len();
+                self.owner(id.0.loc(self.db).owner);
+                if self.revealing > 0 {
+                    self.hidden.extend(self.bodies.get(known).copied());
+                }
+            }
+            TyKind::CoroutineClosure(id, _) => {
+                self.owner(id.0.loc(self.db).owner);
+                self.coroutines.extend(self.bodies.last().copied());
+            }
+            TyKind::Coroutine(id, _) => {
+                self.owner(id.0.loc(self.db).owner);
+                self.coroutines.extend(self.bodies.last().copied());
+            }
             TyKind::Dynamic(bounds, _) => {
                 if let Some(principal) = bounds.principal() {
                     self.crates.insert(principal.skip_binder().def_id.0.krate(self.db));
                 }
             }
+            TyKind::Alias(AliasTy { kind: AliasTyKind::Opaque { def_id }, args, .. })
+                if self.reveal =>
+            {
+                let ImplTraitId::ReturnTypeImplTrait(of, _) = def_id.0.loc(self.db) else {
+                    self.opaque = true;
+                    return;
+                };
+                self.hidden.push(of.into());
+                let interner = DbInterner::new_no_crate(self.db);
+                let hidden = rustc_type_ir::Interner::type_of(interner, def_id.into())
+                    .instantiate(interner, args)
+                    .skip_norm_wip();
+                if matches!(hidden.kind(), TyKind::Error(_)) {
+                    self.opaque = true;
+                    return;
+                }
+                self.revealing += 1;
+                self.visit_ty(hidden);
+                self.revealing -= 1;
+            }
+            // What no `impl` gave a type is the type its name spells.
+            TyKind::Alias(AliasTy { kind: AliasTyKind::Projection { .. }, .. }) if self.reveal => {}
             TyKind::Alias(..) | TyKind::Foreign(..) => self.opaque = true,
             _ => {}
         }

@@ -10,11 +10,16 @@ use std::{
     sync::Arc,
 };
 
-use base_db::{Crate, FileId};
+use base_db::{Crate, EditionedFileId, FileId};
 use cranelift_module::{Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use hir_def::{FunctionId, HasModule, Lookup, StaticId, signatures::FunctionSignature};
+use hir_def::{
+    DefWithBodyId, FunctionId, HasModule, Lookup, StaticId, signatures::FunctionSignature,
+};
+use hir_expand::{FileRange, HirFileId};
+use hir_ty::mir::location::line_and_column;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use span::ErasedFileAstId;
 
 type FxIndexMap<K, V> = indexmap::IndexMap<K, V, FxBuildHasher>;
 
@@ -22,8 +27,9 @@ use hir_ty::{db::HirDatabase, traits::StoredParamEnvAndCrate};
 
 use super::{
     CodegenError, ContentId, Instance, InstanceDef, ObjectCodegen, OwnStatics, Phases, Rejections,
-    Result, Roots, SymbolResolver, TheirStatics, Walked, async_blocks, compiled_instance,
-    compiled_root, compiled_static, declaration_location,
+    Result, Roots, SymbolResolver, TheirStatics, Walked, async_blocks,
+    cached::WrittenItem,
+    compiled_instance, compiled_root, compiled_static, declaration_location,
     fragment::{CompiledFunction, DataRequest, FuncTarget, Requests, TextPart},
     home::{body_file, body_files, mentioned_crates, written_in},
     instance_serial, is_thread_local, left_to_rustc, root_serial, row_location, source_location,
@@ -43,7 +49,9 @@ pub(super) fn stable_mark(
     debug: bool,
 ) -> Option<u128> {
     let mut hasher = rustc_stable_hash::StableSipHasher128::new();
-    compiled.code.hash(&mut hasher);
+    // Left out with the variables below: a full build and a later compile of the same code
+    // can give different named locals a slot of their own.
+    compiled.code.hash_with(&mut hasher, false);
     for request in &compiled.requests.funcs {
         request.sig.hash(&mut hasher);
         match &request.target {
@@ -93,6 +101,92 @@ pub(super) fn stable_mark(
     }
     let super::type_id::Fingerprint(low, high) = hasher.finish();
     Some(u128::from(low) | u128::from(high) << 64)
+}
+
+/// The items of the checkout the code of an instance comes from, as they are written now:
+/// the one its code is written in, with where it begins when `lines` (its mark has the lines
+/// of its code then), and those of what it tells the place of, with where each begins; those
+/// of the bodies it mentions a coroutine of, by their text alone (see
+/// [`super::home::bodies_of`]). `None` when one is of no file of the checkout or a macro
+/// wrote it. While nothing but bodies changes, code whose items read the same is the code it
+/// was, or code nothing calls by its name any more.
+pub(super) fn written_items(
+    db: &dyn HirDatabase,
+    names: &StableNames<'_, '_>,
+    instance: &Instance,
+    compiled: &CompiledFunction,
+    lines: bool,
+) -> Option<Vec<WrittenItem>> {
+    let (written, mentioned) = super::home::bodies_of(db, instance)?;
+    let mut placed = Vec::new();
+    for request in &compiled.requests.datas {
+        match request {
+            DataRequest::Location(Some((owner, _))) => placed.push(*owner),
+            DataRequest::Declaration(func) => placed.push((*func).into()),
+            _ => {}
+        }
+    }
+    let item = |body: DefWithBodyId, places: bool| {
+        let (file, id, hash, at) = (*body_print(db, body))?;
+        let file = names.file_path(file.file_id(db))?;
+        Some(WrittenItem { file, id, hash, at: places.then_some(at) })
+    };
+    let placed = placed.into_iter().map(|it| item(it, true));
+    let written = written.into_iter().map(|it| item(it, lines));
+    let mentioned = mentioned.into_iter().map(|it| item(it, false));
+    let mut items: Vec<WrittenItem> =
+        placed.chain(written).chain(mentioned).collect::<Option<_>>()?;
+    items.sort_unstable();
+    items.dedup();
+    Some(items)
+}
+
+/// [`item_print`] of the item a body is of, with its file and its id there.
+#[salsa::tracked(returns(ref))]
+fn body_print(
+    db: &dyn HirDatabase,
+    body: DefWithBodyId,
+) -> Option<(EditionedFileId, u32, u64, (u32, u32))> {
+    let (file, id) = match body {
+        DefWithBodyId::FunctionId(it) => (it.lookup(db).id.file_id, it.lookup(db).id.value.erase()),
+        DefWithBodyId::ConstId(it) => (it.lookup(db).id.file_id, it.lookup(db).id.value.erase()),
+        DefWithBodyId::StaticId(it) => (it.lookup(db).id.file_id, it.lookup(db).id.value.erase()),
+        DefWithBodyId::VariantId(it) => (it.lookup(db).id.file_id, it.lookup(db).id.value.erase()),
+    };
+    let file = file.file_id()?;
+    let (hash, at) = item_print(db, file, id)?;
+    Some((file, id.into_raw(), hash, at))
+}
+
+/// A hash of the text of the item `id` of `file`, and the line and column it begins on.
+fn item_print(
+    db: &dyn HirDatabase,
+    file: EditionedFileId,
+    id: ErasedFileAstId,
+) -> Option<(u64, (u32, u32))> {
+    let range = HirFileId::from(file).ast_id_map(db).try_get_erased(id)?.text_range();
+    let text = db.file_text(file.file_id(db));
+    let written = text.text(db).get(usize::from(range.start())..usize::from(range.end()))?;
+    let mut hasher = rustc_stable_hash::StableSipHasher128::new();
+    written.hash(&mut hasher);
+    let super::type_id::Fingerprint(hash, _) = hasher.finish();
+    let (_, line, column) = line_and_column(db, FileRange { file_id: file, range })?;
+    Some((hash, (line, column)))
+}
+
+/// Whether each of `items` that is of a file in `edited`, by its name, reads as it did.
+fn items_unchanged(
+    db: &dyn HirDatabase,
+    items: &[WrittenItem],
+    edited: &FxHashMap<String, EditionedFileId>,
+) -> bool {
+    items.iter().all(|item| {
+        let Some(&file) = edited.get(&item.file) else { return true };
+        let Some((hash, at)) = item_print(db, file, ErasedFileAstId::from_raw(item.id)) else {
+            return false;
+        };
+        hash == item.hash && item.at.is_none_or(|was| was == at)
+    })
 }
 
 /// What a compiled function or static was when the base took it in.
@@ -704,6 +798,8 @@ pub(super) struct Base {
     /// The roots of `compiled` put in the object from the store, by their index there, with
     /// their [`stable_mark`]: what tells an edit of them, which `marks` does not.
     stored_marks: FxHashMap<u32, u128>,
+    /// The items the code of those comes from, as the build that kept each saw them.
+    stored_items: FxHashMap<u32, Box<[WrittenItem]>>,
     /// The ids the crates of the checkout were named by in the build, which a look names what
     /// the build had from the store by. Empty when it had nothing of the checkout from there.
     ids: FxHashMap<Crate, ContentId>,
@@ -755,6 +851,8 @@ struct Hydrated {
     /// The files its code comes from, by the names [`StableNames::file_path`] gives them, or
     /// `None` when any file can be one.
     files: Option<Box<[Box<str>]>>,
+    /// The items its code comes from, as the build that kept it saw them.
+    items: Option<Box<[WrittenItem]>>,
     /// What calls it in the base, which its instance is found through.
     callers: Vec<Caller>,
     /// Its instance, when code the build compiled called it. Else it is found again at each
@@ -951,6 +1049,9 @@ pub struct StaleSteps {
     /// How many roots and instances an edit could have changed, and so were asked about.
     pub roots_asked: usize,
     pub instances_asked: usize,
+    /// How many of those from the store were told unchanged by their items, not compiled.
+    pub roots_unchanged: usize,
+    pub instances_unchanged: usize,
     /// The longest any one of them took to answer.
     pub slowest: std::time::Duration,
 }
@@ -1074,6 +1175,7 @@ impl FromStore {
                 mark: tracked.mark,
                 krate: krate.copied(),
                 files: tracked.files.map(|it| it.into_iter().map(Box::from).collect()),
+                items: tracked.items.map(Box::from),
                 callers: Vec::new(),
                 known: cg.found_instances.get(id).cloned(),
             });
@@ -1145,8 +1247,13 @@ impl Base {
             let name = cg.stored_roots.get(&root)?.as_ref()?;
             cg.entries.as_ref()?.get(name).filter(|_| cg.mixed.is_none())
         };
-        let stored_marks: FxHashMap<u32, u128> = (0..compiled.len())
-            .filter_map(|i| Some((i as u32, stored_entry(compiled[i].0)?.tracked.as_ref()?.mark)))
+        let stored_tracked: FxHashMap<u32, super::cached::Tracked> = (0..compiled.len())
+            .filter_map(|i| Some((i as u32, stored_entry(compiled[i].0)?.tracked.clone()?)))
+            .collect();
+        let stored_marks: FxHashMap<u32, u128> =
+            stored_tracked.iter().map(|(&i, it)| (i, it.mark)).collect();
+        let stored_items: FxHashMap<u32, Box<[WrittenItem]>> = (stored_tracked.into_iter())
+            .filter_map(|(i, it)| Some((i, Box::from(it.items?))))
             .collect();
         let stored = |i: usize| stored_marks.contains_key(&(i as u32));
         let root_mark = |db: &dyn HirDatabase, root| Mark::of_root(db, root, debug);
@@ -1335,6 +1442,7 @@ impl Base {
             hydrated: from_store.hydrated,
             hydrated_homes: from_store.homes,
             stored_marks,
+            stored_items,
             ids: from_store.ids,
             owned: cg.own_statics.crates.clone(),
             reached_from_store: from_store.reached,
@@ -1378,6 +1486,7 @@ impl Base {
             hydrated: Vec::new(),
             hydrated_homes: HydratedHomes::default(),
             stored_marks: FxHashMap::default(),
+            stored_items: FxHashMap::default(),
             ids: FxHashMap::default(),
             owned: FxHashSet::default(),
             reached_from_store: FxHashSet::default(),
@@ -1834,6 +1943,26 @@ impl Base {
         Box::new(part_of(asked, part, parts))
     }
 
+    /// The files edited since the last look, by the names a look names them by, when nothing
+    /// changed but bodies that nothing else sees into: code from the store whose items read
+    /// as they did when it was compiled is then the code it was, and is not compiled to tell.
+    fn bodies_edited(
+        &self,
+        db: &dyn HirDatabase,
+        names: &StableNames<'_, '_>,
+    ) -> Option<FxHashMap<String, EditionedFileId>> {
+        let touched = &self.touched;
+        if touched.any || !touched.crates.is_empty() || touched.bodies.is_empty() {
+            return None;
+        }
+        (touched.bodies.iter())
+            .map(|&file| {
+                let edition = base_db::relevant_crates(db, file).first()?.data(db).edition;
+                Some((names.file_path(file)?, EditionedFileId::new(db, file, edition)))
+            })
+            .collect()
+    }
+
     /// Looks at one part in `parts` of the code the base has from the store for what an edit
     /// changed, comparing what it compiles to now with the mark the store had of it.
     fn stale_hydrated(
@@ -1851,10 +1980,19 @@ impl Base {
         let edited: Option<Vec<String>> =
             self.touched.bodies.iter().map(|&file| names.file_path(file)).collect();
         let edited_paths: FxHashSet<&str> = edited.iter().flatten().map(String::as_str).collect();
+        let bodies_edited = self.bodies_edited(db, names);
         let mut homes = super::home::Homes::default();
         let mut found = FoundHydrated::default();
         for i in self.hydrated_to_ask(check_all, edited.as_deref(), part, parts) {
             let was = &self.hydrated[i];
+            let unchanged = !self.touched.hydrated.contains(&(i as u32))
+                && bodies_edited.as_ref().is_some_and(|edited| {
+                    was.items.as_deref().is_some_and(|items| items_unchanged(db, items, edited))
+                });
+            if unchanged && !check_all {
+                stale.steps.instances_unchanged += 1;
+                continue;
+            }
             let in_edited = || {
                 edited.is_none()
                     || was
@@ -1882,6 +2020,15 @@ impl Base {
             match (same, instance) {
                 (Some(Some(true)), _) => {}
                 _ if !touched => eprintln!("check-all: MISSED `{}` from the store", was.name),
+                (None, _)
+                    if unchanged
+                        && self.dropped(db, names, &mut homes, &mut found, i, &mut Vec::new()) => {}
+                _ if unchanged => {
+                    eprintln!(
+                        "check-all: MISSED `{}` from the store, its items unchanged",
+                        was.name
+                    )
+                }
                 (Some(Some(false)), Some((instance, env))) => {
                     stale.hydrated.push((i as u32, instance, env))
                 }
@@ -2048,6 +2195,7 @@ impl Base {
                 return stale.declined("an instance that did not compile is another now");
             }
         }
+        let bodies_edited = names.as_ref().and_then(|names| self.bodies_edited(db, names));
         for i in self.roots_to_ask(check_all, part, parts) {
             let root = self.compiled[i].0;
             let touched = self.touched.reaches(self.crates[i])
@@ -2055,6 +2203,15 @@ impl Base {
                 || self.touched.roots.contains(&root)
                 || self.touched.edited() && self.cached_roots.binary_search(&(i as u32)).is_ok();
             if !touched && !check_all {
+                continue;
+            }
+            let unchanged = !self.touched.roots.contains(&root)
+                && bodies_edited.as_ref().is_some_and(|edited| {
+                    let items = self.stored_items.get(&(i as u32));
+                    items.is_some_and(|items| items_unchanged(db, items, edited))
+                });
+            if unchanged && !check_all {
+                stale.steps.roots_unchanged += 1;
                 continue;
             }
             let asked = stdx::time::Instant::now();
@@ -2069,7 +2226,7 @@ impl Base {
             stale.steps.slowest = stale.steps.slowest.max(asked.elapsed());
             match same {
                 Some(Some(true)) => {}
-                _ if !touched => {
+                _ if !touched || unchanged => {
                     eprintln!("check-all: MISSED root {root:?} of {:?}", self.crates[i]);
                     continue;
                 }

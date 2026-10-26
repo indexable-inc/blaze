@@ -116,6 +116,7 @@ fn whole(
         if let Err(why) = built {
             return Err(format!("could not build `{}`: {}", program.name, why.why()));
         }
+        let _unwritten = crate::splice::unwritten(&plan.binary);
         let stand_ins = crate::link::stand_ins(&plan.binary).map_err(|it| format!("{it:#}"))?;
         if !stand_ins.is_empty() {
             let mut reached: Vec<String> = stand_ins
@@ -331,7 +332,8 @@ fn ran(asked: &Invocation, cwd: &Path, programs: &[Program]) -> anyhow::Result<i
     Ok(run::exit_code(status))
 }
 
-/// The programs `asked` builds, as cargo's unit graph has them: each executable root.
+/// The programs `asked` builds, each executable root of the build, as blaze plans it with its
+/// own resolution, or as cargo's unit graph has them where blaze cannot.
 fn planned(asked: &Invocation, cwd: &Path, metadata: &Metadata) -> anyhow::Result<Vec<Program>> {
     let manifest = asked.flags.manifest_path.as_ref().map(|it| cwd.join(it));
     let dir = manifest.as_deref().and_then(Path::parent).unwrap_or(cwd);
@@ -343,7 +345,28 @@ fn planned(asked: &Invocation, cwd: &Path, metadata: &Metadata) -> anyhow::Resul
         targets.extend(["--example".to_owned(), example.clone()]);
     }
     let selection = asked.selection();
-    let planned = Plan::programs(dir, manifest.as_deref(), &selection, &targets)?;
+    let named = blaze_metadata::Targets {
+        bin: asked.flags.bin.as_deref(),
+        example: asked.flags.example.as_deref(),
+    };
+    let own = super::metadata::programs(&selection, dir, manifest.as_deref(), named);
+    let planned = match own {
+        Some(Ok(planned)) => planned
+            .into_iter()
+            .map(|it| crate::plan::Program {
+                package: it.package,
+                name: it.name,
+                root: it.root,
+                example: it.example,
+                platform: selection.target.clone(),
+            })
+            .collect(),
+        Some(Err(why)) => {
+            eprintln!("blaze could not plan the build itself, so cargo does: {why:#}");
+            Plan::programs(dir, manifest.as_deref(), &selection, &targets)?
+        }
+        None => Plan::programs(dir, manifest.as_deref(), &selection, &targets)?,
+    };
     // cargo's directory of a profile: `dev`'s is `debug`.
     let profile = match selection.profile.as_str() {
         "dev" => "debug",
@@ -355,7 +378,7 @@ fn planned(asked: &Invocation, cwd: &Path, metadata: &Metadata) -> anyhow::Resul
         let Some(package) = metadata.packages.iter().find(|it| it.id.repr == program.package)
         else {
             anyhow::bail!(
-                "cargo's unit graph names {}, which `cargo metadata` does not",
+                "the plan of the build names {}, which the workspace does not",
                 program.package
             );
         };

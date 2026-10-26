@@ -100,6 +100,62 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
     })
 }
 
+/// The programs a build of `selection` links of `targets`, asked for in `cwd` (of the package
+/// of `manifest`, when there is one), planned with blaze's own resolution for the triple
+/// `target` or the host's: what cargo's unit graph has. `None` when `RA_JIT_OWN_RESOLVE=0`
+/// leaves the plan to cargo.
+pub(crate) fn programs(
+    selection: &crate::plan::Selection,
+    cwd: &Path,
+    manifest: Option<&Path>,
+    targets: blaze_metadata::Targets<'_>,
+) -> Option<anyhow::Result<Vec<blaze_metadata::Program>>> {
+    if std::env::var_os("RA_JIT_OWN_RESOLVE").is_some_and(|it| it == "0") {
+        return None;
+    }
+    let planned = || {
+        let rustc = super::state::rustc_path();
+        let asked = |args: &[&str]| {
+            let said = super::state::rustc_says(&rustc, args).filter(|it| !it.is_empty());
+            said.with_context(|| format!("`rustc {}` says nothing", args.join(" ")))
+        };
+        let triple = match &selection.target {
+            Some(triple) => triple.clone(),
+            None => {
+                let told = asked(&["-vV"])?;
+                let host = told.lines().find_map(|it| it.strip_prefix("host: "));
+                host.context("rustc names no host")?.to_owned()
+            }
+        };
+        let printed = asked(&["--print", "cfg", "--target", &triple])?;
+        let cfg = printed.lines().filter(|it| !it.is_empty()).map(|it| {
+            use std::str::FromStr;
+            cargo_platform::Cfg::from_str(it).with_context(|| format!("the cfg {it}"))
+        });
+        let cfg = cfg.collect::<anyhow::Result<Vec<_>>>()?;
+        let asked = blaze_metadata::Asked {
+            cwd,
+            env: std::env::vars().collect(),
+            manifest_path: manifest,
+            config: &selection.config,
+            features: &selection.features,
+            all_features: selection.all_features,
+            no_default_features: selection.no_default_features,
+            build: Some(blaze_metadata::Build {
+                packages: &selection.packages,
+                workspace: selection.workspace,
+                excludes: &selection.excludes,
+                dev_units: selection.dev_deps,
+            }),
+            platform: Some(blaze_metadata::TargetPlatform { triple: &triple, cfg: &cfg }),
+            offline: false,
+            store: None,
+        };
+        Ok(blaze_metadata::programs(&asked, targets)?.1)
+    };
+    Some(planned())
+}
+
 /// A `cfg` as rust-analyzer has it, as cargo's platforms read it.
 fn platform_cfg(atom: &cfg::CfgAtom) -> Option<cargo_platform::Cfg> {
     use std::str::FromStr;

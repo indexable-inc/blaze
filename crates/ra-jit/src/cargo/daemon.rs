@@ -354,19 +354,18 @@ impl Checkout {
             |path: &PathBuf| path.strip_prefix(&self.root).unwrap_or(path).display().to_string();
         // Each with a comma after it: the program is of these crates and no others.
         let crates: String = plan.crates.iter().map(|it| named(it) + ",").collect();
-        // A program built whole is linked by blaze into `binary`: no executable of rustc's
-        // is patched.
-        let (patch, splice, exe) = match plan.whole {
-            true => (String::new(), String::new(), plan.binary.display().to_string()),
-            false => {
-                (plan.patch.display().to_string(), plan.binary.display().to_string(), String::new())
-            }
+        // A program built whole is linked by blaze into `binary`, with a line of the
+        // worker's own, and its edits are spliced into that.
+        let (splice, exe) = match plan.whole {
+            true => (String::new(), plan.binary.display().to_string()),
+            false => (plan.binary.display().to_string(), String::new()),
         };
         let mut line = format!(
-            "sync\t{}\t{}\t{}\t{patch}\t{}\t{splice}\t{exe}",
+            "sync\t{}\t{}\t{}\t{}\t{}\t{splice}\t{exe}",
             self.project().display(),
             crates,
             plan.object.display(),
+            plan.patch.display(),
             plan.link_cmd,
         );
         for file in &plan.symbol_files {
@@ -461,8 +460,12 @@ impl Worker {
             ("--splice", &first.binary),
             ("--socket", &socket),
         ];
-        let whole: [(&str, &Path); 3] =
-            [("--out", &first.object), ("--exe", &first.binary), ("--socket", &socket)];
+        let whole: [(&str, &Path); 4] = [
+            ("--out", &first.object),
+            ("--patch", &first.patch),
+            ("--exe", &first.binary),
+            ("--socket", &socket),
+        ];
         let named: &[(&str, &Path)] = if first.whole { &whole } else { &rustcs };
         for &(flag, path) in named {
             args.push(flag.into());

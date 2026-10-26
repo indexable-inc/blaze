@@ -54,6 +54,24 @@ pub(super) struct Tracked {
     /// The files its code comes from, as [`super::stable::StableNames::file_path`] names
     /// them; `None` when any file can be one.
     pub(super) files: Option<Vec<String>>,
+    /// The items of those files its code comes from, as they were written then; `None` when
+    /// one of them can't be told. An edit of nothing but bodies that leaves each of them as
+    /// it was leaves the code as it was.
+    pub(super) items: Option<Vec<WrittenItem>>,
+}
+
+/// An item of the checkout as code compiled from it saw it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub(super) struct WrittenItem {
+    /// As [`super::stable::StableNames::file_path`] names it.
+    pub(super) file: String,
+    /// Its id in the file, which an edit of bodies alone leaves it.
+    pub(super) id: u32,
+    /// Of its text.
+    pub(super) hash: u64,
+    /// The line and column it begins on, for one whose place the code tells, or the one it is
+    /// written in when its mark has its lines; `None` for the others.
+    pub(super) at: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -405,7 +423,7 @@ impl Entry {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"ra-jit entry 10");
+        field(b"ra-jit entry 11");
         field(program.map_or(&[][..], |it| it));
         // Code of one producer is not what another would have given.
         field(super::Backend::from_env().ok()?.to_string().as_bytes());
@@ -1015,6 +1033,12 @@ mod tests {
                 mark: 7 << 100 | 3,
                 home: Some([5; 32]),
                 files: Some(vec!["src/lib.rs".to_owned()]),
+                items: Some(vec![WrittenItem {
+                    file: "src/lib.rs".to_owned(),
+                    id: 9,
+                    hash: 11,
+                    at: Some((3, 1)),
+                }]),
             }),
         }
     }

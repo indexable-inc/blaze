@@ -1077,13 +1077,26 @@ build`, no rustc base. See [the cold start](#the-cold-start-without-rustc).
   again. No spare worker is started for it: the build asks at once, and a spare loads its
   library first (ripgrep's cold build 7.3 s with one, 4.5 s without). The objects of a whole
   build keep each function in a section of its own, as a build of no daemon's does, so that
-  the link leaves out what the program does not reach; a daemon's links that edits are
-  spliced into keep everything, and the store keys the standard library by which it is.
+  the link leaves out what the program does not reach; the store keys the standard library
+  by which it is.
   ripgrep on dev-aws-14 (shared): an edit to a body 2.3 s, cargo's 0.47 s. The edit compiles
   2 functions, and the rest of the 2 s is the full object written again and the link.
-- Next: edits spliced into the executable as patches, as the daemon's edits of cargo's builds
-  are; the shipped standard library for the dev and release program units; biome's 9
-  functions; then the flip.
+- Done (2026-10-25): the edits are patches spliced into the executable the worker linked, as
+  the daemon's edits of cargo's builds are. The worker is given `--patch` and links with G's
+  line (`link::command`), over the standard library's unit of its own, which a build that
+  patches its library into the program's object leaves out (`patches_its_library`). On
+  dev-aws-14 (`harness/coldbuild.py bench`): an edit to a body of ripgrep 0.19 s (cargo's
+  0.46 s), of axum's example 0.25 s (0.35 s), of fd 0.22 s (0.44 s); of a signature, fd
+  0.37 s (0.46 s), ripgrep 0.25 s (0.58 s), nushell 0.99 s (5.16 s). A whole build takes no
+  crate over from rustc on an edit (`Program::widen`): every crate is the worker's already,
+  and taking one over wrote the whole object again (ripgrep's signature edit 2.9 s before).
+- Next: the cold builds, which are slower than cargo's but axum's (dev-aws-14, quiet,
+  2026-10-26: ripgrep 4.8 s against 4.0 s, fd 22.1 s against 16.8 s, bat 12.6 s against
+  7.0 s, hyperfine 7.0 s against 3.8 s, just 11.0 s against 5.5 s, axum 6.1 s against 6.1 s,
+  nushell 49.3 s against 23.8 s): fd's load waits 16.7 s on jemalloc's build script, which
+  cargo builds beside the crates; biome expands its proc macros in 149 s and reaches 17
+  functions the frontend turns down. Then the shipped standard library for the dev and
+  release program units, and the flip.
 
 **L. Doctests by the daemon.** ([#92](https://github.com/indexable-inc/ra-jit/issues/92)) [#28](https://github.com/indexable-inc/ra-jit/issues/28): the
 examples are compiled by the daemon that has the workspace loaded, linked with G's line; no probe

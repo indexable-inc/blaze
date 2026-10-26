@@ -4097,6 +4097,12 @@ impl Drop for Probing {
     }
 }
 
+/// Whether the edits of the build are patches of an object that has the standard library in
+/// it. A whole build's (`--exe`) are patched over the library it links as a unit of its own.
+fn patches_its_library(args: &Args) -> bool {
+    args.patch.is_some() && args.exe.is_none()
+}
+
 /// The standard library of a build with nothing of rustc's, compiled before the program into
 /// an object of its own beside `--out` (docs/no-rustc.md, step F): the store's when it has the
 /// one of these crates, cfgs and target, otherwise built here and kept there. `None` when the
@@ -4108,7 +4114,7 @@ fn std_unit(
     listed: &Listed,
 ) -> anyhow::Result<Option<PathBuf>> {
     use sha2::{Digest, Sha256};
-    if !table.is_empty() || args.prebuilt.is_some() || args.patch.is_some() {
+    if !table.is_empty() || args.prebuilt.is_some() || patches_its_library(args) {
         return Ok(None);
     }
     let mut program = Vec::new();
@@ -4289,6 +4295,24 @@ fn link_executable(
         eprintln!("  {said}");
     }
     Ok(())
+}
+
+/// What a whole build's daemon links the program at `--exe` with and splices its edits into:
+/// G's line. `None` when it is not one, or has it already.
+fn own_link_line(db: &RootDatabase, args: &Args) -> anyhow::Result<Option<(String, PathBuf)>> {
+    let Some(exe) = args.exe.as_ref().filter(|_| args.patch.is_some() && args.link_cmd.is_none())
+    else {
+        return Ok(None);
+    };
+    let mut program = Vec::new();
+    for named in args.crates() {
+        program.extend(crates_named(db, named, args)?);
+    }
+    let objects: Vec<&Path> =
+        std::iter::once(args.out.as_path()).chain(args.prebuilt.as_deref()).collect();
+    let sysroot = SYSROOT.get().and_then(Option::as_deref);
+    let cmd = link::command(db, &program, &objects, sysroot, exe)?;
+    Ok(Some((cmd, exe.clone())))
 }
 
 /// Writes to `path` the dep-info rustc writes of the crate `args` asks for, linked as `exe`:
@@ -7782,7 +7806,7 @@ fn run_holding(
     }
     // A build with nothing of rustc's starts from the standard library, which a release ships.
     let nothing_of_rustc = library.is_none() && args.symbol_files.is_empty();
-    let shipped = (nothing_of_rustc && args.prebuilt.is_none() && args.patch.is_none())
+    let shipped = (nothing_of_rustc && args.prebuilt.is_none() && !patches_its_library(&args))
         .then(|| shipped::fetch_ahead(emits.triple()))
         .flatten();
     let built = follow_cargo(&mut db, &mut vfs, &mut checkouts, &args, &listed)?;
@@ -7968,6 +7992,9 @@ fn run_holding(
                 args.prebuilt = Some(unit);
                 known.not_counted();
             }
+            if let Some((cmd, exe)) = own_link_line(&db, &args)? {
+                (args.link_cmd, args.splice) = (Some(cmd), Some(exe));
+            }
             let mut cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
             // An `include!` in a body is first seen when the body is compiled.
             if WatchedFile::include_sources(&mut files, &mut tree, &mut db) != Loaded::Nothing {
@@ -7998,8 +8025,11 @@ fn run_holding(
                 packs_whole(&args),
             )?;
             if let Some(exe) = &args.exe {
-                let sysroot = SYSROOT.get().and_then(Option::as_deref);
-                link_executable(&db, &table, &listed, &args, sysroot, exe)?;
+                // A daemon's link line linked it already.
+                if args.splice.is_none() {
+                    let sysroot = SYSROOT.get().and_then(Option::as_deref);
+                    link_executable(&db, &table, &listed, &args, sysroot, exe)?;
+                }
                 if let Some(path) = &args.dep_info {
                     write_dep_info(&db, &args, tree.vfs(), exe, path)?;
                 }
@@ -9430,6 +9460,10 @@ impl Program {
     /// not use) has nothing in it an edit changes. The result is why one can't be taken over,
     /// when one can't.
     fn widen(&mut self, db: &RootDatabase) -> Option<String> {
+        // Every crate of a whole build is the daemon's: rustc has no copy of any.
+        if self.args.exe.is_some() {
+            return None;
+        }
         let built: Vec<ide_db::base_db::Crate> = self
             .args
             .crates()
@@ -9530,8 +9564,16 @@ impl Program {
         let unnamed = if named_anew { None } else { self.widen(db) };
         self.read_copies_again(db)?;
         let Program { args, table, known, unbuilt, wrote, whole, tests, tests_now, .. } = self;
+        if let Some((cmd, exe)) = own_link_line(db, args)? {
+            (args.link_cmd, args.splice) = (Some(cmd), Some(exe));
+        }
         let Outputs { out, patch, link_cmd, splice } =
             wanted.cloned().unwrap_or_else(|| Outputs::of(args));
+        // A whole build's link line is the worker's own, which no client names.
+        let (link_cmd, splice) = match &args.exe {
+            Some(_) => (link_cmd.or(args.link_cmd.clone()), splice.or(args.splice.clone())),
+            None => (link_cmd, splice),
+        };
         let args = &Args { out, patch, link_cmd, splice, ..args.clone() };
         // A patch is for the object with all of the program, which this build may be the
         // first to be asked for at this place.
@@ -9708,7 +9750,8 @@ impl Program {
                 return self.sync(db, listed, paths, edit, wanted, link_it, defer);
             }
             failed = failed.or(unlinked.map(|it| Refused::Cargos(it.to_string())));
-            if let Some(exe) = args.exe.as_deref().filter(|_| failed.is_none() && link_it) {
+            let unspliced = || failed.is_none() && link_it && full && args.splice.is_none();
+            if let Some(exe) = args.exe.as_deref().filter(|_| unspliced()) {
                 let sysroot = SYSROOT.get().and_then(Option::as_deref);
                 let linked = link_executable(db, table, listed, args, sysroot, exe);
                 failed = linked.err().map(|it| Refused::Cargos(format!("{it:#}")));
@@ -9765,11 +9808,14 @@ impl Program {
                 steps.iter().map(|(name, took)| format!("{name}={}", took.as_micros())).collect();
             eprintln!("timeline-us: {}", steps.join(" "));
             eprintln!(
-                "asked: {} roots, {} instances, slowest {:.1?}; longest on a thread: roots {:.1?}, \
-                 instances {:.1?}, statics {:.1?}, left {:.1?}",
+                "asked: {} roots, {} instances, slowest {:.1?}; unchanged by their items: {} roots, \
+                 {} instances; longest on a thread: roots {:.1?}, instances {:.1?}, statics \
+                 {:.1?}, left {:.1?}",
                 warm.looked.roots_asked,
                 warm.looked.instances_asked,
                 warm.looked.slowest,
+                warm.looked.roots_unchanged,
+                warm.looked.instances_unchanged,
                 warm.looked.roots,
                 warm.looked.instances,
                 warm.looked.statics,

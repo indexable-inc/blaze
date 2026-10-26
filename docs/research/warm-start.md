@@ -332,3 +332,56 @@ by the second the samples fall in (**read**):
 So the next costs are the debugger's types read whole for every entry while the roots are
 looked for, which only stitching needs; the debug info of all 155,843 functions written again
 when nothing changed; and the link of an executable the target directory already has.
+
+## The first edit after a restart: code from the store told unchanged by its items (2026-10-25)
+
+Each store entry now names the items of the checkout its code comes from, as they were written
+when it was compiled: the body it is written in, the bodies whose places it tells (a panic's
+location, a `#[track_caller]` declaration) with the line and column each begins on, and the
+bodies it mentions a coroutine of, and the bodies that give an `impl Trait` in it its type
+with the closures in that type, by a hash of the text of each. After an edit of nothing but
+bodies, code from the store whose items in the edited files read as they did is taken as it
+was, not compiled again to compare its mark. A closure or function an instance is generic over
+is not one of its items: its stable name prints it whole, what a closure captures with it, so
+the same name is the same code and a changed one leaves the old code uncalled. Before is main
+(`24cb49d6`), after is the branch merged with it; "old" is main before #360 compiled everything
+at the start (`2be2c76`). dev-aws-7, warmstart.py, quiet host, main and the branch interleaved,
+three nushell pairs in both orders (**read**):
+
+| | old | main | after |
+|---|---|---|---|
+| ripgrep first edit after the restart | 0.09, 0.10 s | 0.30 to 0.32 s | 0.22, 0.23 s |
+| ripgrep: functions asked, "check" | 382 (warm), 25 ms | 382, 210 ms | 17, 114 ms |
+| nushell first edit after the restart | 0.37, 0.36 s | 0.57 to 0.68 s | 0.53 to 0.70 s |
+| nushell: functions asked, "check" | 156 (warm), 216 ms | 156, 439 to 528 ms | 18, 443 to 530 ms |
+| ripgrep / nushell `restart` build | 4.78 / 25.7 s | 4.63 to 4.75 / 20.4 to 21.4 s | 4.72 to 4.94 / 21.4 to 22.2 s |
+
+The nushell restarts differ by which ran first of a pair: main first, main took 21.38 and 21.21 s
+and the branch 21.44 and 21.61 s, its compile of the roots 9.7 s where main's took 10.2 s.
+
+- What ripgrep still asks is what changed: the 17 functions below the edit whose panic
+  locations moved a line, each patched. They cost what they do because nothing they reach is
+  compiled yet: `perf record -g` of the edit (frame pointers) puts 27 % of the daemon's time in
+  `inlinable`/`small_body`, the MIR of every callee a recompiled function might inline, each
+  on a cold body of another crate (its file parsed, 14 %; inferred, 23 %), and most of the
+  rest in the instance's own inference, layouts and macro expansions. The revert after it
+  ("back", 0.10 s) finds them warm (**read**).
+- nushell asked 105 before the `impl Trait`s were looked through: 87 drop glues of types with
+  one in them, whose type a body says and no name does, had no items and were compiled to
+  tell (**read**, `RJ_DBG` run). Now it asks 18, but the edit takes as long: the check is the
+  edited function itself and the 17 below it, compiled cold, 483 to 509 ms each where main's
+  156 asks, warming what they share on 64 threads, left the edited one 295 to 320 ms. The
+  revert after it takes 0.26 s (**read**).
+- Compiling the store's code of the checkout at the end of the restart instead, as main did
+  before #360, was tried: ripgrep's check fell to 26 ms, but the restart took 1.1 s longer and
+  the edit then wrote the 8,155 functions it compiled, 0.18 to 0.20 s in all (**read**). The
+  rest of the gap is work that only a warm database or a persisted answer saves: which
+  callees are small enough to inline, kept by the callee's content, would take the largest
+  share (**unverified**).
+- A stored mark hashed where the named locals of the code are kept for a debugger, and a full
+  build and a later compile of the same code differ there: std's `map_fold` over the
+  fixture's closures, whose two zero-sized parameters `f` and `g` have a slot each in the
+  full build and none in the later compile, the machine code byte for byte the same. Every
+  edit after a restart found such code changed and compiled it again; the mark now leaves
+  the slots out with the variables (**read**, storetracked.py under `RA_JIT_CHECK_ALL`). Why
+  the two compiles give them slots differently is not known (**unverified**).

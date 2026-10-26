@@ -14,7 +14,9 @@ host and with the lock file it ships:
   --filter-platform HOST` run with another; the whole JSON is compared, key order included.
 - `build`: the example with `--build`, the graph of a plain `cargo build` in the workspace's
   root, against `cargo build --unit-graph`: the packages it builds, each one's features (over
-  all its units) and the packages each one's units depend on.
+  all its units) and the packages each one's units depend on; and with `--programs`, the
+  binaries it links (the unit graph's roots that are executables), as blaze's whole build
+  takes them.
 
 A case is equal, different, blaze-failed or cargo-failed; the first difference or error of
 each that is not equal is printed, and `--out` writes them all as JSON.
@@ -59,6 +61,15 @@ def unit_graph(graph):
             if dep["pkg_id"] != u["pkg_id"] and dep["mode"] != "run-custom-build":
                 node["deps"].add(dep["pkg_id"])
     return out
+
+
+def unit_programs(graph):
+    """The executables a unit graph links: its roots that build a binary or an example."""
+    units = graph["units"]
+    roots = (units[at] for at in graph["roots"])
+    return {(u["pkg_id"], u["target"]["name"]) for u in roots
+            if u["mode"] == "build" and u["target"]["crate_types"] == ["bin"]
+            and set(u["target"]["kind"]) & {"bin", "example"}}
 
 
 def of_resolve(metadata):
@@ -151,8 +162,18 @@ def one(case, blaze, homes, platform):
             if mode == "metadata":
                 diff = rg.first_difference(json.loads(ours_text), json.loads(cargo.stdout))
             else:
-                diff = graph_difference(of_resolve(json.loads(ours_text)),
-                                        unit_graph(json.loads(cargo.stdout)))
+                theirs = json.loads(cargo.stdout)
+                diff = graph_difference(of_resolve(json.loads(ours_text)), unit_graph(theirs))
+                listed = run([blaze, *flags, "--build", "--programs"], homes["blaze"])
+                put_back()
+                if not diff and listed.returncode:
+                    diff = "programs: " + (listed.stderr.strip().splitlines() or ["no output"])[-1][:300]
+                elif not diff:
+                    ours_programs = {(it["package"], it["name"]) for it in json.loads(listed.stdout)}
+                    programs = unit_programs(theirs)
+                    if ours_programs != programs:
+                        diff = (f"programs only cargo's {sorted(programs - ours_programs)[:3]}, "
+                                f"only blaze's {sorted(ours_programs - programs)[:3]}")
             results.append({**out, "class": "different" if diff else "equal", "why": diff})
     finally:
         os.replace(shipped, lock)

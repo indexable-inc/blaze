@@ -100,8 +100,96 @@ pub fn workspace_root(
     Ok(ws.root_manifest().to_owned())
 }
 
+/// A program a `cargo build` links: a binary or an example of a member it builds.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Program {
+    /// The id of its package, as `cargo metadata` spells it.
+    pub package: String,
+    pub name: String,
+    /// The root file of its crate.
+    pub root: PathBuf,
+    pub example: bool,
+}
+
+/// The program a build names with `--bin` or `--example`, or none for every binary.
+#[derive(Clone, Copy, Default)]
+pub struct Targets<'a> {
+    pub bin: Option<&'a str>,
+    pub example: Option<&'a str>,
+}
+
 /// The JSON `cargo metadata --format-version 1` prints for `asked`.
 pub fn metadata(asked: &Asked<'_>) -> Result<String> {
+    Ok(made(asked)?.0)
+}
+
+/// The metadata of `asked`'s build, and the programs it links of `targets`, as cargo's unit
+/// graph has them: of each member the build selects, the binaries whose `required-features`
+/// it is built with, or the one target named.
+pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<Program>)> {
+    anyhow::ensure!(asked.build.is_some(), "the programs are of a build");
+    let (json, roots) = made(asked)?;
+    let metadata: serde_json::Value = serde_json::from_str(&json)?;
+    let nodes = metadata["resolve"]["nodes"].as_array().into_iter().flatten();
+    let features: FxHashMap<&str, Vec<&str>> = nodes
+        .filter_map(|node| {
+            let on = node["features"].as_array()?.iter().filter_map(|it| it.as_str());
+            Some((node["id"].as_str()?, on.collect()))
+        })
+        .collect();
+    let packages = metadata["packages"].as_array().into_iter().flatten();
+    let mut programs = Vec::new();
+    for package in packages {
+        let Some(id) = package["id"].as_str().filter(|id| roots.iter().any(|it| it == id)) else {
+            continue;
+        };
+        let on = features.get(id).map(Vec::as_slice).unwrap_or_default();
+        for target in package["targets"].as_array().into_iter().flatten() {
+            let of = |key: &str, it: &str| {
+                target[key].as_array().is_some_and(|all| all.iter().any(|kind| kind == it))
+            };
+            let only_bin = target["crate_types"].as_array().is_some_and(|it| it == &["bin"]);
+            let (bin, example) = (of("kind", "bin") && only_bin, of("kind", "example") && only_bin);
+            let name = target["name"].as_str().unwrap_or_default();
+            let named = match targets {
+                Targets { bin: Some(asked), .. } => bin && name == asked,
+                Targets { example: Some(asked), .. } => example && name == asked,
+                Targets { bin: None, example: None } => bin,
+            };
+            if !named {
+                continue;
+            }
+            let required = target["required-features"].as_array().into_iter().flatten();
+            // A feature of a dependency (`dep/feature`) is taken to be on.
+            let missing: Vec<&str> = required
+                .filter_map(|it| it.as_str())
+                .filter(|it| !it.contains('/') && !on.contains(it))
+                .collect();
+            let asked_for = targets.bin.is_some() || targets.example.is_some();
+            if !missing.is_empty() && asked_for {
+                let listed: Vec<String> = missing.iter().map(|it| format!("`{it}`")).collect();
+                bail!(
+                    "target `{name}` in package `{}` requires the features: {}\nConsider enabling them by passing, e.g., `--features=\"{}\"`",
+                    package["name"].as_str().unwrap_or_default(),
+                    listed.join(", "),
+                    missing.join(" ")
+                );
+            }
+            if missing.is_empty() {
+                programs.push(Program {
+                    package: id.to_owned(),
+                    name: name.to_owned(),
+                    root: PathBuf::from(target["src_path"].as_str().unwrap_or_default()),
+                    example,
+                });
+            }
+        }
+    }
+    Ok((json, programs))
+}
+
+/// The metadata of `asked`, and the ids of the members its build selects.
+fn made(asked: &Asked<'_>) -> Result<(String, Vec<String>)> {
     let mut config = Config::load(asked.cwd, asked.env.clone(), &[])?;
     config.start("metadata", asked.config)?;
     let offline = asked.offline || config.net_config()?.offline.unwrap_or(false);
@@ -209,6 +297,7 @@ pub fn metadata(asked: &Asked<'_>) -> Result<String> {
         None => vec![CompileKind::Host],
     };
     let packages = Packages { reads: &reads, platform: asked.platform.as_ref() };
+    let mut roots = Vec::new();
     let resolve = match &asked.build {
         None => resolve_graph(&targeted, member_ids, current, &packages, &kinds)?,
         Some(build) => {
@@ -216,8 +305,7 @@ pub fn metadata(asked: &Asked<'_>) -> Result<String> {
             let opts = FeatureOpts::new(behavior, has_dev_units, ForceAllTargets::No);
             let features =
                 FeatureResolver::resolve(&packages, &targeted, &member_features, &kinds, opts)?;
-            let roots: Vec<PackageId> =
-                member_features.iter().map(|(it, _)| it.package_id()).collect();
+            roots = member_features.iter().map(|(it, _)| it.package_id()).collect();
             let activated = |platform: &Platform| packages.activates(platform);
             graph::of_build(
                 &targeted,
@@ -244,7 +332,8 @@ pub fn metadata(asked: &Asked<'_>) -> Result<String> {
     let mut slots: Vec<Option<SerializedPackage<'_>>> = serialized.into_iter().map(Some).collect();
     let packages: Vec<SerializedPackage<'_>> =
         listed.iter().filter_map(|(_, at)| slots[*at].take()).collect();
-    Ok(serde_json::to_string(&export(&ws, packages, Some(resolve)))?)
+    let json = serde_json::to_string(&export(&ws, packages, Some(resolve)))?;
+    Ok((json, roots.iter().map(|it| it.to_spec().to_string()).collect()))
 }
 
 /// What the resolve graph and the feature resolver read of the packages.

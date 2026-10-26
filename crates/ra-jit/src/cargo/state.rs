@@ -1104,7 +1104,11 @@ pub(crate) fn place(from: &Path, to: &Path) -> std::io::Result<()> {
     if cfg!(target_os = "macos") || std::fs::hard_link(from, &new).is_err() {
         std::fs::copy(from, &new)?;
     }
-    std::fs::rename(&new, to)
+    std::fs::rename(&new, to)?;
+    // A rename onto another name of the same file, as `to` is after the first build, leaves
+    // both names.
+    let _ = std::fs::remove_file(&new);
+    Ok(())
 }
 
 /// Gives `command` the environment cargo built in, so that a cargo it runs, or is, has the
@@ -1151,9 +1155,9 @@ pub(super) fn rustc_named() -> Option<OsString> {
     std::env::var_os("RUSTC")
 }
 
-/// What `rustc` prints for `flag` (`--version`, `--print=sysroot`), when it starts.
-pub(super) fn rustc_says(rustc: &OsStr, flag: &str) -> Option<String> {
-    let output = crate::answers::answer(Command::new(rustc).arg(flag), &[]).ok()?;
+/// What `rustc` prints when given `args` (`--version`, `--print=sysroot`), when it starts.
+pub(super) fn rustc_says(rustc: &OsStr, args: &[&str]) -> Option<String> {
+    let output = crate::answers::answer(Command::new(rustc).args(args), &[]).ok()?;
     Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
@@ -1220,7 +1224,7 @@ fn project(asked: &Invocation, cwd: &Path, metadata: &Metadata) -> Result<PathBu
 /// nightly's, and nothing checks that the other rustc agrees with them.
 fn other_toolchain() -> Option<String> {
     let rustc = rustc_path();
-    let said = |flag: &str| rustc_says(&rustc, flag);
+    let said = |flag: &str| rustc_says(&rustc, &[flag]);
     let version = said("--version")?;
     let version = version.lines().next().unwrap_or_default().trim();
     let version = version.strip_prefix("rustc ").unwrap_or(version);

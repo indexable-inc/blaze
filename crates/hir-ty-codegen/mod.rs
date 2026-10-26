@@ -1617,6 +1617,8 @@ impl Rejections {
             left: longest(|it| it.left),
             roots_asked: self.stale.iter().map(|it| it.steps.roots_asked).sum(),
             instances_asked: self.stale.iter().map(|it| it.steps.instances_asked).sum(),
+            roots_unchanged: self.stale.iter().map(|it| it.steps.roots_unchanged).sum(),
+            instances_unchanged: self.stale.iter().map(|it| it.steps.instances_unchanged).sum(),
             slowest: longest(|it| it.slowest),
         }
     }

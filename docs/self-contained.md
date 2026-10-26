@@ -156,6 +156,14 @@ leaves to cargo (#321); bun, swc and agave cargo 1.99.0 does not resolve there. 
 whole build builds (5.9 and 6.5 s in two runs, cargo's 6.2 and 6.1 s, on a shared host): its example no longer reaches `mime_guess`, whose
 build script its build never ran. Left: the unit graph (#335), choosing versions (#321).
 
+2026-10-25, the programs of a whole build: `cargo blaze build` with `RA_JIT_WHOLE_BUILD=1`
+takes the programs it links from blaze-metadata's `programs` (the binaries of the build's
+members whose `required-features` it has, or the `--bin` or `--example` named), for the
+target's cfg as blaze answers `rustc --print cfg` itself, instead of `cargo build
+--unit-graph`. Where it cannot, it says why and asks cargo; `RA_JIT_OWN_RESOLVE=0` asks cargo
+always. `harness/own_metadata.py` compares them with the unit graph's executable roots in its
+`build` check: 321 of 321 equal over the corpus (dev-aws-14).
+
 ## Build scripts
 
 blaze compiles build scripts (step I) and keeps their runs in the store; cargo still runs

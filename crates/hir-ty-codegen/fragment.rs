@@ -180,8 +180,19 @@ pub(super) struct Variable {
 /// Of everything `eq` compares.
 impl Hash for Code {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let Code { signature, bytes, align, relocs, elf_types, unwind, lines, slots } = self;
-        (signature, bytes, align, elf_types, lines, slots).hash(state);
+        self.hash_with(state, true);
+    }
+}
+
+impl Code {
+    /// Its [`Hash`], leaving out where the named locals are unless `slots`.
+    pub(super) fn hash_with<H: Hasher>(&self, state: &mut H, slots: bool) {
+        let Code { signature, bytes, align, relocs, elf_types, unwind, lines, slots: places } =
+            self;
+        (signature, bytes, align, elf_types, lines).hash(state);
+        if slots {
+            places.hash(state);
+        }
         // Cranelift's unwind rules have no `Hash`: what they print is all of them.
         format!("{unwind:?}").hash(state);
         relocs.len().hash(state);
