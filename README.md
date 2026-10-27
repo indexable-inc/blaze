@@ -121,6 +121,11 @@ How to build blaze from a checkout, run its tests and send a change:
 [docs/contributing.md](docs/contributing.md). To report a security problem:
 [SECURITY.md](SECURITY.md).
 
+## Sponsors
+
+Companies that save engineer time with blaze can sponsor it: [SPONSORS.md](SPONSORS.md) has the
+tiers and terms. No sponsors yet, be the first.
+
 ## Credits
 
 blaze stands on the shoulders of giants. Thank you to the people who built:
