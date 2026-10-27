@@ -73,3 +73,14 @@ I. misc — associated-types/unconstrained-lifetime-in-projection (E0716),
   t, l (app false errors, priority), c, d, g, ab, ehi (H+I on new branch bk-h-1027).
 - Next for parent: when PRs merge, rerun UI suite + apps sweep on main in VM `borrowck`, update docs/borrowck.md
   numbers table, write /tmp/blaze-lanes/borrowck.result.md. Then step 4 (r-a diagnostics) if time.
+
+## Run 4 (restart 02:37 PDT) — runs get killed ~every 15 min; subagents now WIP-commit + write handoff early
+- Merged: #469 (E), #470 (F), #465. Queued auto: #474 (C partial: 3 units, +3 both modes), #475 (D partial: hrtb-implied-2, +1; tango check failed, not inspected: gh rate limit).
+- Removed VMs bk-f (done), bk-c (FAILED). bk-l STOPPED.
+- WIP uncommitted at restart: c (on top of #474), d (on top of #475), ehi (H/I, branch bk-h... WIP commit "fndef variances"), g, l, t. ab: nothing.
+- Respawned subagents t, l, c, d, g, ab, ehi with "commit WIP every step" rule.
+- 02:40 spawned 7 subagents (t, l, c->bk-c2-1027, d->bk-d2-1027, g, ab, ehi->bk-h-1027). Shared resume rules
+  /tmp/blaze-lanes/borrowck-resume.md; each writes /tmp/blaze-lanes/borrowck-<g>.md as it goes.
+  On next restart: read those files, respawn only unfinished groups with the same prompts (resume rules + group task).
+- Parent still to do: after PRs merge, rerun UI both modes + apps sweep (harness/borrowck_apps.py) on main in VM
+  `borrowck`, update docs/borrowck.md numbers, write /tmp/blaze-lanes/borrowck.result.md.
