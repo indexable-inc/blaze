@@ -100,3 +100,7 @@ re-spawned ctdeps agent (background, 03:55) to fix driver/harness and land; VM n
   VM nc-unitgraph2 unit ug-r8 (/root/ug/r8.log): nix/unit_graph.py (-> /root/ug/r8-units.tar),
   build, rustcsites, trace (/root/ug/out/after8), resolve.py units toolchain. Then commit units,
   fill placeholders, force-push (lease on 64d9cb4893's predecessor at origin), land.py again.
+- 04:30 #516 rebased on #485, fixed (plan::Asked keeps cfg), r8 trace on combined tree:
+  fixture 2/2, ripgrep 2/3 cargo execs (left: check --compile-time-deps + typed). units 13/14,
+  toolchain 35/35. Pushed + re-queued with land.py. nix/units regenerated in VM.
+  Next: ctdeps agent lands its PR (must rebase on #516); then parent re-traces main (VM nocargo).
