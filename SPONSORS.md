@@ -20,9 +20,10 @@ Every tier is billed monthly, or yearly at 10 times the monthly price.
 | Backer | $5 to $25 | Your name in this file. |
 | Bronze | $250 | A small logo in the README. |
 | Gold | $1,000 | A medium logo, and a weighted vote on the public roadmap: issues labelled `sponsor-priority`. |
-| Platinum | $5,000 | A large logo at the top of the sponsor section, a priority look at your issues, your codebase added to blaze's [benchmark](docs/benchmarks.md) set, and a monthly call with up to 4 hours of help a month. |
+| Platinum | $5,000 | A large logo at the top of the sponsor section, a priority look at your issues, your codebase added to blaze's [benchmark](docs/benchmarks.md) set, and a monthly call. |
 
-Enterprise or custom work: talk to us at [andrew@ix.dev](mailto:andrew@ix.dev).
+No tier includes an SLA or guaranteed support hours. Enterprise or custom work, an SLA or any
+support commitment needs its own written agreement: email [andrew@ix.dev](mailto:andrew@ix.dev).
 
 **Founding sponsors.** What the first sponsors pay counts as credit toward paid ix infrastructure
 when it exists.
@@ -40,9 +41,10 @@ A short note each month says what it paid for.
 - blaze stays MIT or Apache-2.0. Sponsorship never changes the licence.
 - Priority means we look at your issue first. It is not a promise to build it.
 - We set the roadmap. A vote weighs in; it does not decide.
-- No SLA below Platinum.
+- No tier includes an SLA, a response time or support hours. Those need a separate written
+  agreement.
 - Sponsors get no rights to the code and no exclusivity.
-- Custom work happens only under a separate contract.
+- Custom work happens only under a separate written agreement.
 - Billed in advance and not refundable. A logo comes down when payment stops.
 - We may decline any sponsor.
 - Sponsorship is paid to Indexable Inc. It is a business purchase, not a charitable donation.
