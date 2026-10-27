@@ -109,6 +109,24 @@ re-spawned ctdeps agent (background, 03:55) to fix driver/harness and land; VM n
   After it lands: re-trace main in VM nocargo, update docs/no-rustc.md self-contained text, result.md.
 
 
+## Restart 5 (2026-10-27 06:13 PDT, watchdog)
+ctdeps agent dead (last commit 05:50). Parent now drives ctdeps itself in its worktree (no
+background agents). h9 harness (unit ct-h9, nc-ctdeps, /root/ct/h9.log) was still running.
+Left for ctdeps: h9 result, cargo test -p ra-jit -p project-model, rustcsites, after-counts,
+docs placeholders COUNTS_TABLE/CTDEPS_RESULTS, git rm --cached HANDOFF.md, squash, land.
+- 06:40 ctdeps squashed + rebased on main b6a385c8de (conflicts with bscache #585 keyed builds in
+  own_script.rs resolved: build_described -> built(); links_proc_macro passed to build()). Backup
+  branch nocargo-ctdeps-prerebase. Commit 2: said() uses answers::own_answer_of only (rustcsites
+  flagged answers::answer, which can spawn rustc).
+- h9 (old base): ctdeps 10/14 equal, nushell+biome blaze-failed (#327 syn-1 proc macro codegen,
+  pre-existing), zed+bun both-failed (cmake/ld/path pkgs missing).
+- r3 trace (VM nocargo, rebased tree): ALL 8 runs = 1 cargo (typed cargo blaze only), 0 toolchain
+  rustc/rustdoc (the rustc execs are ra-jit-rustc stand-ins = ra-jit). ripgrep test: 320 of 329
+  integration tests fail NotFound (`../rg`) since #569 (release lane: matches pinned nightly cargo's
+  second layout, where cargo fails the same). Not this lane's.
+- Running: nocargo unit nc-r4 (build, cargo test -p ra-jit -p project-model, rustcsites, r4 trace,
+  /root/nc/r4.log); nc-ctdeps unit ct-h10 (rebased build, srv, full harness, /root/ct/h10.log).
+
 ## Operator note 2026-10-27 11:33Z (Andrew: build scripts and proc macros are cached, and hermetic)
 DECISION: compiling a build script, running it, and building a proc macro are each ordinary store entries,
 keyed by what they are built from (sources, deps, cfgs, env the script declares or is recorded reading, target,
