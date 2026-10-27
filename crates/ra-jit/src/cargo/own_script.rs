@@ -222,6 +222,7 @@ fn compile_in(
     if !key.is_some_and(|key| super::own_macro::restored(&key, made)) {
         // A script that reaches a function ra-jit could not compile is not built
         // ([`crate::refused_error`]).
+        let _slot = slot()?;
         build(&described, dir, made, super::daemon::store(), true)?;
         if let Some(key) = key {
             let inputs = crates.iter().filter_map(|it| it.inputs.as_ref());
@@ -230,6 +231,64 @@ fn compile_in(
     }
     let read = std::fs::read_to_string(&made.dep_info).map_err(|it| it.to_string())?;
     read_otherwise(&crate::dep_info::DepInfo::parse(&read), rustc_had)
+}
+
+/// The variable that says how many builds of build scripts and proc macros run at once on the
+/// machine (#203).
+pub(crate) const AT_ONCE: &str = "RA_JIT_SCRIPT_BUILDS";
+
+/// Set for a build that holds a slot: what it builds in turn (the standard library's unit it
+/// makes, a proc macro's library) runs in the same slot, as a build waiting for a slot its
+/// own build holds would never get one.
+const IN_SLOT: &str = "RA_JIT_IN_SCRIPT_SLOT";
+
+/// The memory one build of a script or proc macro is given when [`AT_ONCE`] does not say:
+/// each is a process with the standard library's maps loaded, 0.4-0.5 GB resident for
+/// hyperfine's on arm64, using every core itself.
+const BUDGET: u64 = 2 << 30;
+
+/// How many builds `said` ([`AT_ONCE`]) says, or one per [`BUDGET`] of the machine's
+/// `memory`, at least one and at most one per core; one per core where the system does not
+/// say how much memory there is.
+fn at_once(said: Option<&str>, memory: Option<u64>, cores: usize) -> Result<usize, String> {
+    match said {
+        None => Ok(memory.map_or(cores, |it| (it / BUDGET).clamp(1, cores as u64) as usize)),
+        Some(text) => text
+            .parse::<usize>()
+            .ok()
+            .filter(|it| *it > 0)
+            .ok_or_else(|| format!("{AT_ONCE}=`{text}` is not a number of builds above 0")),
+    }
+}
+
+/// One of the [`at_once`] slots of the machine, held until it is dropped: a file of ra-jit's
+/// home locked, which the kernel lets go of when the process ends however it ends. `None`
+/// when a build above this one holds the slot. Cargo runs a wrapper per job, and each build
+/// uses every core itself.
+fn slot() -> Result<Option<std::fs::File>, String> {
+    if std::env::var_os(IN_SLOT).is_some() {
+        return Ok(None);
+    }
+    let said = std::env::var(AT_ONCE).ok();
+    let cores = std::thread::available_parallelism().map_or(1, |it| it.get());
+    let slots = at_once(said.as_deref(), crate::memory::of_the_machine(), cores)?;
+    let dir = super::daemon::home().map_err(|it| it.to_string())?.join("script-builds");
+    std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
+    let open = |at: usize| {
+        let path = dir.join(at.to_string());
+        let mut file = std::fs::OpenOptions::new();
+        let file = file.create(true).truncate(false).write(true).open(&path);
+        file.map_err(|it| format!("{}: {it}", path.display()))
+    };
+    for at in 0..slots {
+        let file = open(at)?;
+        if file.try_lock().is_ok() {
+            return Ok(Some(file));
+        }
+    }
+    let file = open(std::process::id() as usize % slots)?;
+    file.lock().map_err(|it| format!("waiting for a slot of {AT_ONCE}: {it}"))?;
+    Ok(Some(file))
 }
 
 /// The `rust-project.json` of `crates` over the standard library of `sysroot`.
@@ -278,6 +337,7 @@ fn build(
     if let Some(store) = store {
         ra_jit.env("RA_JIT_CACHE", store);
     }
+    ra_jit.env(IN_SLOT, "1");
     if !shipped {
         ra_jit.env("RA_JIT_STD_FROM", "off");
     }
@@ -417,6 +477,18 @@ mod tests {
         assert_eq!(read_otherwise(&info, rustc_has(Some("1"))), Ok(()));
         assert!(read_otherwise(&info, rustc_has(Some("2"))).is_err());
         assert!(read_otherwise(&info, rustc_has(None)).is_err());
+    }
+
+    #[test]
+    fn script_builds_at_once_by_memory_or_as_told() {
+        let gib = 1 << 30;
+        assert_eq!(at_once(None, Some(16 * gib), 16), Ok((16 * gib / BUDGET) as usize));
+        assert_eq!(at_once(None, Some(gib), 16), Ok(1));
+        assert_eq!(at_once(None, Some(1024 * gib), 16), Ok(16));
+        assert_eq!(at_once(None, None, 8), Ok(8));
+        assert_eq!(at_once(Some("3"), Some(16 * gib), 16), Ok(3));
+        assert!(at_once(Some("0"), None, 16).is_err());
+        assert!(at_once(Some("many"), None, 16).is_err());
     }
 
     #[test]
