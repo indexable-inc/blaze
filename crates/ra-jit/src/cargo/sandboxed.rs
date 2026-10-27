@@ -154,6 +154,9 @@ pub(crate) struct WorkspaceOptOut {
     /// `build-script-link-dirs`: directories of the system a build script in the sandbox may
     /// name in `rustc-link-search` besides those it always may (`directives.rs`).
     pub(crate) build_script_link_dirs: BTreeSet<String>,
+    /// `wasi-build-scripts`: the packages, by name (`"*"`, all), whose build scripts run under
+    /// WASI, an experiment (`wasi_script.rs`).
+    pub(crate) wasi_build_scripts: BTreeSet<String>,
 }
 
 impl WorkspaceOptOut {
@@ -185,11 +188,12 @@ pub(crate) fn workspace_opt_out(root: &Path) -> anyhow::Result<WorkspaceOptOut> 
             "unsandboxed-proc-macros" => &mut out.proc_macros,
             "build-script-env" => &mut out.build_script_env,
             "build-script-link-dirs" => &mut out.build_script_link_dirs,
+            "wasi-build-scripts" => &mut out.wasi_build_scripts,
             other => {
                 return Err(wrong(&format!(
                     "`{other}` is not known (`unsandboxed-build-scripts`, \
-                     `unsandboxed-proc-macros`, `build-script-env` and \
-                     `build-script-link-dirs` are)"
+                     `unsandboxed-proc-macros`, `build-script-env`, \
+                     `build-script-link-dirs` and `wasi-build-scripts` are)"
                 )));
             }
         };

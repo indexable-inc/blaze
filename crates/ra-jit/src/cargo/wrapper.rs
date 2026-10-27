@@ -24,6 +24,7 @@ use super::{
     state::{State, place},
     switch::Enabled,
     units::{Copied, Record, stamp_now},
+    wasi_script,
 };
 use crate::{
     dep_info,
@@ -111,6 +112,9 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
     };
     let plain = unit.linked && std::env::var_os(DRIVEN).is_none();
     let dir = unit.records.join(&unit.id);
+    if unit.script {
+        unit.for_wasi(&rustc, &dir)?;
+    }
     if unit.script && std::env::var_os(own_script::BY_RUSTC).is_none() {
         match unit.by_ra_jit(&rustc, &dir) {
             Ok(()) => std::process::exit(0),
@@ -179,6 +183,9 @@ fn rustc_of(rustc: &OsStr) -> Command {
 /// described for the scripts that link them. The code to end with.
 fn outside(mut compiler: Command, rustc: &OsString, args: &[OsString]) -> anyhow::Result<i32> {
     let unit = Unit::of(args);
+    if let Some(unit) = unit.as_ref().filter(|it| it.script) {
+        unit.for_wasi(rustc, &unit.records.join(&unit.id))?;
+    }
     if let Some(unit) = unit.as_ref().filter(|it| it.script)
         && std::env::var_os(own_script::BY_RUSTC).is_none()
     {
@@ -477,6 +484,20 @@ impl Unit {
         let exe = record.outputs().into_iter().next().ok_or("rustc names no executable")?;
         own_script::compile(rustc, &self.args, &self.cwd, &self.source, &exe, &copies)?;
         self.record(stamp, &copies, None, &self.source).map_err(|it| format!("{it:#}"))
+    }
+
+    /// Builds the build script for wasm32-wasip1 beside where rustc links it, when its package
+    /// runs its script under WASI ([`wasi_script::mode`]), whoever builds the executable.
+    fn for_wasi(&self, rustc: &OsString, dir: &Path) -> anyhow::Result<()> {
+        let package = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
+        let record = self.as_record(0, Vec::new(), None);
+        let out_dir = record.out_dir();
+        let Some(mode) = wasi_script::mode(&package, &self.cwd, out_dir.as_deref())? else {
+            return Ok(());
+        };
+        let exe = record.outputs().into_iter().next().context("rustc names no executable")?;
+        let dir = dir.join("wasi");
+        wasi_script::compile(mode, &package, rustc, &self.args, &self.cwd, &self.source, &exe, &dir)
     }
 
     /// Gives cargo what rustc would have written of the library `record` is of, which the

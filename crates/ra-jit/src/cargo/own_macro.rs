@@ -188,6 +188,7 @@ fn library_of(sysroot: &Path, library: &Path) -> Result<Option<PathBuf>, String>
     let made = Made {
         name: &record.crate_name,
         proc_macro: true,
+        wasi: false,
         exe: dir.join(file),
         dep_info: dir.join(format!("{}{extra}.d", record.crate_name)),
     };
@@ -206,6 +207,7 @@ pub(crate) fn made(record: &Record) -> Option<Made<'_>> {
     Some(Made {
         name,
         proc_macro: true,
+        wasi: false,
         exe: out_dir.join(format!("{prefix}{name}{extra}{suffix}")),
         dep_info: out_dir.join(format!("{name}{extra}.d")),
     })

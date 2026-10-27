@@ -63,6 +63,9 @@ pub(crate) struct Made<'a> {
     pub(crate) name: &'a str,
     /// Whether the crate is a proc macro, linked as a shared library with its list of macros.
     pub(crate) proc_macro: bool,
+    /// Whether it is built for wasm32-wasip1 with blaze's `std::process`, to run under WASI
+    /// (`wasi_script.rs`), not for the host.
+    pub(crate) wasi: bool,
     pub(crate) exe: PathBuf,
     pub(crate) dep_info: PathBuf,
 }
@@ -143,8 +146,30 @@ pub(crate) fn compile(
     let made = Made {
         name: SCRIPT,
         proc_macro: false,
+        wasi: false,
         exe: exe.to_owned(),
         dep_info: exe.with_extension("d"),
+    };
+    compile_as(rustc, args, cwd, source, &made, dir)
+}
+
+/// [`compile`] for wasm32-wasip1 into `module`, with blaze's `std::process`, to run under
+/// WASI (`wasi_script.rs`). The libraries it links are described from their records as for
+/// [`compile`]: what their own build scripts printed was printed for the host.
+pub(crate) fn compile_wasi(
+    rustc: &OsStr,
+    args: &[String],
+    cwd: &Path,
+    source: &Path,
+    module: &Path,
+    dir: &Path,
+) -> Result<(), String> {
+    let made = Made {
+        name: SCRIPT,
+        proc_macro: false,
+        wasi: true,
+        exe: module.to_owned(),
+        dep_info: module.with_extension("wasm.d"),
     };
     compile_as(rustc, args, cwd, source, &made, dir)
 }
@@ -269,6 +294,9 @@ fn built(
     let mut first = keyed::Key::new(BUILDS);
     first.field(described.as_bytes()).field(keyed::toolchain(sysroot).as_bytes());
     first.field(&[u8::from(made.proc_macro)]);
+    if made.wasi {
+        first.field(crate::RUN_TOOL_TARGET.as_bytes());
+    }
     let first = first.done();
     let store = store();
     let found = store.and_then(|it| keyed::find(it, &first, &keyed::digest));
@@ -435,6 +463,9 @@ fn build(
     if made.proc_macro {
         ra_jit.args(["--crate", "proc_macro", "--shared"]);
     }
+    if made.wasi {
+        ra_jit.args(["--target", crate::RUN_TOOL_TARGET, "--run-tool"]);
+    }
     // What cargo set for the script's rustc is not the build's: the build ra-jit runs is its
     // own, which asks cargo nothing through a wrapper and is no doctest.
     for (name, _) in std::env::vars_os() {
@@ -452,7 +483,8 @@ fn build(
     if let Some(store) = store {
         ra_jit.env("RA_JIT_CACHE", store);
     }
-    if !shipped {
+    // No release ships the standard library with blaze's `std::process`.
+    if !shipped || made.wasi {
         ra_jit.env("RA_JIT_STD_FROM", "off");
     }
     ra_jit.current_dir(dir).stdin(Stdio::null()).stdout(Stdio::null());
@@ -488,7 +520,8 @@ pub(crate) fn build_nothing(sysroot: &Path, dir: &Path, store: &Path) -> Result<
         inputs: None,
     };
     let exe = dir.join("build-script-build");
-    let made = Made { name: SCRIPT, proc_macro: false, dep_info: exe.with_extension("d"), exe };
+    let made =
+        Made { name: SCRIPT, proc_macro: false, wasi: false, dep_info: exe.with_extension("d"), exe };
     let described = description(sysroot, &[script]);
     build(&described, dir, &made, Some(store.to_owned()), false, None)
 }

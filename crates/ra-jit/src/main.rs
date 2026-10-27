@@ -157,6 +157,9 @@ struct Args {
     /// The build is of the standard library alone ([`std_unit`]): a crate it names is the
     /// library's, not another of that name the program has too.
     library: bool,
+    /// The program is a build script for wasm32-wasip1 whose commands run on the host: its
+    /// standard library has blaze's `std::process` ([`run_tool_std`]).
+    run_tool: bool,
     /// Build the workspace's crates as `cargo test` does, with `cfg(test)`.
     cfg_test: bool,
     /// Run build scripts and build proc macros in a directory of ra-jit's own under the
@@ -251,6 +254,7 @@ impl Args {
         let mut prebuilt = None;
         let mut exe = None;
         let mut shared = false;
+        let mut run_tool = false;
         let mut dep_info = None;
         let mut inputs = None;
         let mut cfg_test = false;
@@ -296,6 +300,7 @@ impl Args {
                 "--prebuilt" => prebuilt = Some(PathBuf::from(value()?)),
                 "--exe" => exe = Some(PathBuf::from(value()?)),
                 "--shared" => shared = true,
+                "--run-tool" => run_tool = true,
                 "--dep-info" => dep_info = Some(PathBuf::from(value()?)),
                 "--inputs" => inputs = Some(PathBuf::from(value()?)),
                 "--watch" => watch = true,
@@ -327,6 +332,9 @@ impl Args {
         if shared && exe.is_none() {
             bail!("--shared says what --exe links, and there is no --exe");
         }
+        if run_tool && target.as_deref() != Some(RUN_TOOL_TARGET) {
+            bail!("--run-tool is for build scripts compiled for --target {RUN_TOOL_TARGET}");
+        }
         Ok(Args {
             project: project.context("missing project path")?,
             krate: krate.context("missing --crate")?,
@@ -350,6 +358,7 @@ impl Args {
             dep_info,
             inputs,
             library: false,
+            run_tool,
             cfg_test,
             own_target,
             scripts_from,
@@ -3863,6 +3872,46 @@ fn write_harnesses(db: &mut RootDatabase, texts: Vec<(vfs::FileId, String)>) -> 
     texts.into_iter().map(|it| it.0).collect()
 }
 
+/// The target of a build script whose commands run on the host (`--run-tool`).
+pub(crate) const RUN_TOOL_TARGET: &str = "wasm32-wasip1";
+
+/// Gives the standard library of a build with `--run-tool` blaze's `std::process` for
+/// wasm32-wasip1 build scripts ([`blaze_wasi::STD_PROCESS`]) in place of the toolchain's
+/// unsupported one. Refused when the toolchain's file is not the one blaze's was written
+/// against: blaze's uses that module's private interface to the rest of std.
+fn run_tool_std(db: &mut RootDatabase) -> anyhow::Result<()> {
+    use ide_db::base_db::{LangCrateOrigin, salsa::Durability};
+    use sha2::{Digest, Sha256};
+    let std = ide_db::base_db::all_crates(db)
+        .iter()
+        .copied()
+        .find(|it| matches!(it.data(db).origin, CrateOrigin::Lang(LangCrateOrigin::Std)))
+        .context("--run-tool: the workspace has no standard library")?;
+    let root = Crate::from(std).root_file(db);
+    let source_root = db.file_source_root(root).source_root_id(db);
+    let source_root = db.source_root(source_root).source_root(db);
+    let at = source_root
+        .path_for_file(&root)
+        .and_then(|it| it.parent())
+        .and_then(|it| it.join(blaze_wasi::STD_PROCESS_AT))
+        .context("--run-tool: std's root has no directory")?;
+    let file = source_root
+        .file_for_path(&at)
+        .with_context(|| format!("--run-tool: the standard library has no {at}"))?;
+    let digest = Sha256::digest(db.file_text(file).text(db).as_bytes());
+    let digest: String = digest.iter().map(|it| format!("{it:02x}")).collect();
+    anyhow::ensure!(
+        digest == blaze_wasi::STD_PROCESS_FOR,
+        "--run-tool: blaze's std::process for build scripts (crates/blaze-wasi/std/process.rs) \
+         was written against another {at} (sha256 {}) than this toolchain's (sha256 {digest}): \
+         it is to be written again for this toolchain",
+        blaze_wasi::STD_PROCESS_FOR
+    );
+    db.set_file_text_with_durability(file, blaze_wasi::STD_PROCESS, Durability::HIGH);
+    frozen::overlaid(std, blaze_wasi::STD_PROCESS);
+    Ok(())
+}
+
 /// Whether the root of `krate` says `#![no_main]`.
 fn has_no_main(db: &RootDatabase, krate: Crate) -> bool {
     let root = ide_db::base_db::EditionedFileId::new(db, krate.root_file(db), krate.edition(db));
@@ -4544,6 +4593,11 @@ fn std_unit(
     };
     field(b"ra-jit standard library 4");
     field(format!("{:?} {debug:?}", args.selection.target).as_bytes());
+    // A file of one of its crates whose text is blaze's, not the toolchain's.
+    if args.run_tool {
+        field(blaze_wasi::STD_PROCESS_AT.as_bytes());
+        field(blaze_wasi::STD_PROCESS.as_bytes());
+    }
     // An object of one section is linked whole, with what the program never reaches.
     if !hir_ty_codegen::sections_of_their_own() {
         field(b"one section");
@@ -6613,6 +6667,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             dep_info: None,
             inputs: None,
             library: args.library,
+            run_tool: args.run_tool,
             cfg_test: args.cfg_test,
             own_target: args.own_target,
             scripts_from: None,
@@ -8621,6 +8676,9 @@ fn run_holding(
     }
     eprintln!("load workspace: {:.1?}", start.elapsed());
     memory::checkpoint("load");
+    if args.run_tool {
+        run_tool_std(&mut db)?;
+    }
 
     if args.out.is_dir() {
         let texts = harnesses(&db, [&args], None);

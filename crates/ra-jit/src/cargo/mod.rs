@@ -27,6 +27,7 @@ mod state;
 pub(crate) mod switch;
 pub(crate) mod toolchain;
 mod units;
+pub(crate) mod wasi_script;
 pub(crate) mod whole;
 
 use std::{collections::BTreeMap, path::Path, time::Instant};

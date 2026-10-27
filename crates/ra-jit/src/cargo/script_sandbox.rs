@@ -94,6 +94,7 @@ pub(crate) struct Ran {
 }
 
 /// Where a script runs.
+#[derive(Clone)]
 pub(crate) enum Plan {
     /// Outside, why, and the environment it runs with ([`with_own_rustc`]).
     Outside(String, Vec<(String, String)>),
@@ -184,7 +185,7 @@ fn workspace_of(script: &Script<'_>) -> anyhow::Result<Option<PathBuf>> {
 }
 
 /// The target directory `out_dir` is in: what is above its `build` directory's profile.
-fn target_of(out_dir: &Path) -> Option<&Path> {
+pub(crate) fn target_of(out_dir: &Path) -> Option<&Path> {
     let build = out_dir.ancestors().find(|it| it.file_name().is_some_and(|it| it == "build"))?;
     build.parent()?.parent()
 }
@@ -268,6 +269,24 @@ pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
         view: None,
     };
     Ok(Plan::Sandboxed { spec, root_manifest: root.map(|it| it.join("Cargo.toml")), link_dirs })
+}
+
+/// `plan`, a script's, for a program the script runs under WASI (`wasi_script.rs`): the same
+/// sandbox, with `env`, in `cwd`, its spec and record in `scratch`.
+pub(crate) fn for_tool(plan: &Plan, env: Vec<(String, String)>, cwd: &Path, scratch: &Path) -> Plan {
+    match plan {
+        Plan::Outside(why, _) => Plan::Outside(why.clone(), env),
+        Plan::Sandboxed { spec, root_manifest, link_dirs } => Plan::Sandboxed {
+            spec: Spec {
+                cwd: cwd.to_owned(),
+                env,
+                record: Some(scratch.join("ra-jit-record")),
+                ..spec.clone()
+            },
+            root_manifest: root_manifest.clone(),
+            link_dirs: link_dirs.clone(),
+        },
+    }
 }
 
 /// Whether the variable `name` of cargo's environment is given to a build script in the

@@ -37,6 +37,15 @@ pub(crate) struct Served {
     mode: Option<Mode>,
 }
 
+/// The crates whose source is not all the toolchain's, registry's or checkout's: a file of
+/// each has a text of blaze's (`--run-tool`'s std), which its key has.
+static OVERLAID: Mutex<Vec<(Crate, &'static str)>> = Mutex::new(Vec::new());
+
+/// Says that a file of `krate` has `text` in place of the one where its source is.
+pub(crate) fn overlaid(krate: Crate, text: &'static str) {
+    crate::lock(&OVERLAID).push((krate, text));
+}
+
 fn mode() -> Option<Mode> {
     match std::env::var("RA_JIT_FROZEN").as_deref() {
         Ok("off" | "0") => None,
@@ -104,6 +113,10 @@ fn key_of(
         krate.cfg_options(db).into_iter().map(|it| it.to_string()).collect();
     cfgs.sort_unstable();
     field(cfgs.join("\n").as_bytes());
+    for (_, text) in crate::lock(&OVERLAID).iter().filter(|it| it.0 == krate) {
+        field(b"overlaid");
+        field(text.as_bytes());
+    }
     // A build script writes below the target directory of the checkout that ran it, so what it
     // wrote stands for where: two checkouts share the crate when its script wrote the same.
     let env = krate.env(db);
