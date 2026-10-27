@@ -471,7 +471,7 @@ fn f(mut n: N) -> N {
     fn elision_counts_no_lifetime_of_self() {
         check_diagnostics(
             r#"
-//- minicore: sized, deref, copy, clone
+//- minicore: sized, deref, copy, clone, derive
 use core::ops::Deref;
 struct Store(u32);
 struct Body(Store);
@@ -509,7 +509,7 @@ fn caller_err(id: Id<'static>) -> &'static u32 {
     fn implied_bounds_of_a_trait_objects_arguments() {
         check_diagnostics(
             r#"
-//- minicore: sized, fn
+//- minicore: sized, fn, dispatch_from_dyn
 struct G<'db>(&'db u32);
 fn need<'a, 'db: 'a>(_: &'a G<'db>) {}
 fn f<'a, 'db>(g: &dyn Fn() -> &'a G<'db>) { need(g()) }

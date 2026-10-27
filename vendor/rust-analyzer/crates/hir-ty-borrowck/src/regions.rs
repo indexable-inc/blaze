@@ -70,6 +70,10 @@ struct Annotation {
 pub(super) enum Category {
     Return,
     TypeAnnotation,
+    /// A path's written generic arguments, `foo::<&'a T>`, rustc's
+    /// `TypeAnnotation(AnnotationSource::GenericArg)`: unlikely to be what relates the regions
+    /// an error is about, so blamed after the other interesting constraints.
+    GenericArg,
     Cast,
     CallArgument,
     Assignment,
@@ -149,6 +153,8 @@ pub(super) struct TypeTest<'db> {
     pub(super) span: MirSpan,
     /// From a `for<'a> T: 'a` bound, which rustc reports without a code.
     pub(super) forall: bool,
+    /// Needed by the signature, which rustc reports at it.
+    pub(super) signature: bool,
 }
 
 pub(super) struct Regions<'db> {
@@ -170,6 +176,9 @@ pub(super) struct Regions<'db> {
     /// Whether universal regions are checked against each other: not in a closure whose
     /// signature could not be split into its own regions and its creator's.
     pub(super) check_universals: bool,
+    /// The universal regions of the placeholders of relating two types' `for<'a>`, whose
+    /// errors are rustc's `UniverseInfo::RelateTys`: E0308, one type more general than the other.
+    pub(super) related_placeholders: FxHashSet<usize>,
     /// The body is a method of a trait impl, whose signature the trait fixes: rustc's
     /// `is_bound_region_in_impl_item`, which keeps E0621 from suggesting a change to it.
     pub(super) is_impl_item: bool,
@@ -652,6 +661,7 @@ pub(super) fn build<'db>(
             outlives: Vec::new(),
             type_tests: Vec::new(),
             check_universals: ctx.closure_local.is_none(),
+            related_placeholders: FxHashSet::default(),
             is_impl_item: false,
             unsuggested: FxHashSet::default(),
             closure_env: None,
@@ -677,13 +687,14 @@ pub(super) fn build<'db>(
         aggregate_temps: aggregate_temps(body),
         synthesized: synthesized(ctx),
         placeholders: FxHashMap::default(),
-        forall_universe: None,
+        relate_universes: FxHashSet::default(),
         elided: Default::default(),
     };
     builder.universal_regions();
     builder.env_aliases();
     builder.location = None;
     builder.signature_projections();
+    builder.signature_higher_ranked();
     builder.annotations();
     for &block in &cfg.order {
         let data = &body.basic_blocks[block];
@@ -745,9 +756,8 @@ struct Builder<'c, 'a, 'db> {
     synthesized: FxHashSet<hir_def::hir::ExprId>,
     /// The universal region of each placeholder the trait solver's answers name.
     placeholders: FxHashMap<Region<'db>, Region<'db>>,
-    /// The universe of the placeholders a `for<'a>` predicate being proven is instantiated
-    /// with, which a type outlives only by outliving `'static`.
-    forall_universe: Option<rustc_type_ir::UniverseIndex>,
+    /// The universes made to relate two types' `for<'a>`.
+    relate_universes: FxHashSet<rustc_type_ir::UniverseIndex>,
     /// The region variables given the error regions rust-analyzer leaves for elided lifetimes,
     /// each a late-bound lifetime of its own in rustc: the fn pointer two fn items or closures
     /// coerce to, `if r { up } else { down }`, is `for<'a> fn(&'a T)` there.
@@ -850,6 +860,9 @@ impl<'db> Builder<'_, '_, 'db> {
             return it;
         }
         let region = self.new_universal(UniversalKind::Placeholder);
+        if self.relate_universes.contains(&self.ctx.infcx.universe_of_region(placeholder)) {
+            self.regions.related_placeholders.insert(self.regions.universals.len() - 1);
+        }
         self.placeholders.insert(placeholder, region);
         region
     }
@@ -1317,6 +1330,18 @@ impl<'db> Builder<'_, '_, 'db> {
                     (None, false) => self.static_region(),
                 })
             });
+            // rustc's MIR has the return slot's type normalized: a projection whose impl
+            // gives it a lifetime of its own is that lifetime an existential region, live
+            // where the slot is.
+            let ty = match ty.kind() {
+                TyKind::Alias(alias)
+                    if matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. })
+                        && self.normalize(ty).is_none() =>
+                {
+                    normalize_with_fresh(self.ctx, ty).unwrap_or(ty)
+                }
+                _ => ty,
+            };
             local_tys[return_local.into_raw().into_u32() as usize] = Some(ty);
             // rustc proves an `impl Trait`'s bounds of the type it hides where the body
             // defines it: `impl Iterator<Item = Box<dyn Foo>>` hiding `Iter<'a, T>` needs the
@@ -2350,16 +2375,18 @@ impl<'db> Builder<'_, '_, 'db> {
             .collect();
     }
 
-    /// What normalizing the signature needs, as rustc normalizes the type of each parameter
-    /// and the return type: the where clauses of the impl that a projection there is of,
-    /// `<&'a () as Visitor<'d>>::Value` with only `impl<'a, 'd: 'a> Visitor<'d> for &'a ()`
-    /// that `'d: 'a`.
-    fn signature_projections(&mut self) {
+    /// What proving a signature type's higher-ranked where clauses needs, as rustc's
+    /// `add_implied_bounds` applies the region constraints of proving the well-formedness of
+    /// each parameter's type: `Foo<&'lt u8>` with `for<'x> T::Ty<'x>: Sized` normalizes
+    /// `<&'lt u8 as Trait>::Ty<'x>` for a placeholder `'x`, whose `Self: 'x` is `'lt: 'static`
+    /// (`implied-bounds/normalization-placeholder-leak.rs`). The others are what the type
+    /// implies, assumed rather than proven.
+    fn signature_higher_ranked(&mut self) {
         if self.ctx.closure_local.is_some() || self.ctx.inline_const {
             return;
         }
         let interner = self.interner();
-        let mut trait_refs = Vec::new();
+        let mut clauses = Vec::new();
         for &local in self
             .body
             .param_locals
@@ -2368,14 +2395,93 @@ impl<'db> Builder<'_, '_, 'db> {
         {
             let ty = self.regions.local_tys[local.into_raw().into_u32() as usize];
             for arg in ty.walk() {
-                if let Some(it) = rustc_type_ir::inherent::GenericArg::as_type(&arg)
-                    && let TyKind::Alias(alias) = it.kind()
-                    && let rustc_type_ir::AliasTyKind::Projection { .. } = alias.kind
+                let Some(it) = rustc_type_ir::inherent::GenericArg::as_type(&arg) else {
+                    continue;
+                };
+                let TyKind::Adt(def, args) = it.kind() else { continue };
+                for clause in GenericPredicates::query_all(self.ctx.db, def.def_id().into())
+                    .iter_instantiated(interner, args.as_slice())
                 {
-                    let trait_ref = alias.trait_ref(interner);
-                    if !trait_refs.contains(&trait_ref) {
-                        trait_refs.push(trait_ref);
+                    let clause = clause.skip_norm_wip();
+                    if matches!(clause.kind().skip_binder(), ClauseKind::Trait(_))
+                        && !clause.kind().bound_vars().is_empty()
+                        && !clauses.contains(&clause)
+                    {
+                        clauses.push(clause);
                     }
+                }
+            }
+        }
+        self.clauses(clauses, At { category: Category::Signature, span: MirSpan::Unknown }, true);
+    }
+
+    /// What normalizing the signature needs, as rustc normalizes the type of each parameter
+    /// and the return type: the where clauses of the impl that a projection there is of,
+    /// `<&'a () as Visitor<'d>>::Value` with only `impl<'a, 'd: 'a> Visitor<'d> for &'a ()`
+    /// that `'d: 'a`. And what computing its implied bounds needs, as rustc's
+    /// `compute_implied_outlives_bounds_inner` normalizes what the well-formedness of each
+    /// type asks, the where clauses of a struct or enum it names: `Foo<(&'a str,)>` of
+    /// `struct Foo<T: Trait> where T::Assoc: Clone` with only `impl<X: 'static> Trait for (X,)`
+    /// needs `'a: 'static`. Their trait bounds themselves it does not prove.
+    fn signature_projections(&mut self) {
+        if self.ctx.closure_local.is_some() || self.ctx.inline_const {
+            return;
+        }
+        let interner = self.interner();
+        let mut trait_refs = Vec::new();
+        let mut tys: Vec<Ty<'db>> = self
+            .body
+            .param_locals
+            .iter()
+            .chain((!self.returns_opaque).then_some(&super::return_slot()))
+            .map(|local| self.regions.local_tys[local.into_raw().into_u32() as usize])
+            .collect();
+        use rustc_type_ir::inherent::GenericArg as _;
+        let mut seen = FxHashSet::default();
+        while let Some(ty) = tys.pop() {
+            // A where clause can name a bigger type than its ADT, with no end.
+            if seen.len() > 256 || !seen.insert(ty) {
+                continue;
+            }
+            for arg in ty.walk() {
+                let Some(it) = rustc_type_ir::inherent::GenericArg::as_type(&arg) else {
+                    continue;
+                };
+                match it.kind() {
+                    TyKind::Alias(alias)
+                        if matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. }) =>
+                    {
+                        let trait_ref = alias.trait_ref(interner);
+                        if !trait_refs.contains(&trait_ref) {
+                            trait_refs.push(trait_ref);
+                        }
+                    }
+                    TyKind::Adt(def, args) => {
+                        let clauses =
+                            GenericPredicates::query_all(self.ctx.db, def.def_id().into())
+                                .iter_instantiated(interner, args.as_slice())
+                                .map(|it| it.skip_norm_wip());
+                        for clause in clauses {
+                            match clause.kind().skip_binder() {
+                                ClauseKind::Trait(predicate) => tys.extend(
+                                    predicate.trait_ref.args.iter().filter_map(|arg| arg.as_type()),
+                                ),
+                                ClauseKind::Projection(predicate) => {
+                                    tys.extend(
+                                        predicate
+                                            .projection_term
+                                            .args
+                                            .iter()
+                                            .filter_map(|arg| arg.as_type()),
+                                    );
+                                    tys.extend(predicate.term.as_type());
+                                }
+                                ClauseKind::TypeOutlives(OutlivesPredicate(ty, _)) => tys.push(ty),
+                                _ => (),
+                            }
+                        }
+                    }
+                    _ => (),
                 }
             }
         }
@@ -3140,6 +3246,7 @@ impl<'db> Builder<'_, '_, 'db> {
                     lower: sub,
                     span: requirement.span,
                     forall: false,
+                    signature: false,
                 });
                 continue;
             }
@@ -3158,20 +3265,93 @@ impl<'db> Builder<'_, '_, 'db> {
     }
 
     fn relate_regions(&mut self, a: Region<'db>, b: Region<'db>, variance: Variance, at: At) {
-        let static_rv = self.regions.static_rv;
-        let rv = |region: Region<'db>| match region.kind() {
-            RegionKind::ReStatic => Some(static_rv),
-            _ => rv_of(region),
-        };
-        let (Some(a), Some(b)) = (rv(a), rv(b)) else { return };
         match variance {
-            Variance::Covariant => self.outlives(a, b, at),
-            Variance::Contravariant => self.outlives(b, a, at),
+            Variance::Covariant => self.region_outlives(a, b, at),
+            Variance::Contravariant => self.region_outlives(b, a, at),
             Variance::Invariant => {
-                self.outlives(a, b, at);
-                self.outlives(b, a, at);
+                self.region_outlives(a, b, at);
+                self.region_outlives(b, a, at);
             }
             Variance::Bivariant => (),
+        }
+    }
+
+    /// That `longer` outlives `shorter`. A region of a universe that cannot name the
+    /// placeholder `shorter` outlives it only by outliving `'static`, as rustc's
+    /// `add_incompatible_universe`.
+    fn region_outlives(&mut self, longer: Region<'db>, shorter: Region<'db>, at: At) {
+        let shorter = match shorter.is_placeholder()
+            && longer != shorter
+            && !matches!(longer.kind(), RegionKind::ReBound(..) | RegionKind::ReError(_))
+            && self.ctx.infcx.universe_of_region(longer)
+                < self.ctx.infcx.universe_of_region(shorter)
+        {
+            true => Region::new_static(self.interner()),
+            false => shorter,
+        };
+        let static_rv = self.regions.static_rv;
+        let mut rv = |this: &mut Self, region: Region<'db>| match region.kind() {
+            RegionKind::ReStatic => Some(static_rv),
+            RegionKind::RePlaceholder(_) => rv_of(this.placeholder(region)),
+            _ => rv_of(region),
+        };
+        let (Some(longer), Some(shorter)) = (rv(self, longer), rv(self, shorter)) else { return };
+        self.outlives(longer, shorter, at);
+    }
+
+    /// The inputs and output of a signature's `for<'a>` instantiated, as rustc's
+    /// `TypeRelating::binders`: for placeholders of a new universe on the side that must be
+    /// the more general, for variables of that universe, which can name them, on the other.
+    fn instantiate_sig(
+        &mut self,
+        sig: rustc_type_ir::Binder<
+            hir_ty::next_solver::DbInterner<'db>,
+            rustc_type_ir::FnSigTys<hir_ty::next_solver::DbInterner<'db>>,
+        >,
+        universe: rustc_type_ir::UniverseIndex,
+        placeholders: bool,
+    ) -> hir_ty::next_solver::Tys<'db> {
+        let interner = self.interner();
+        let infcx = &self.ctx.infcx;
+        let mut existentials: Vec<(rustc_type_ir::BoundVar, Region<'db>)> = Vec::new();
+        rustc_type_ir::fold_regions(
+            interner,
+            sig.skip_binder().inputs_and_output,
+            |region, depth| match region.kind() {
+                RegionKind::ReBound(rustc_type_ir::BoundVarIndexKind::Bound(binder), bound)
+                    if binder == depth =>
+                {
+                    if placeholders {
+                        return Region::new_placeholder(
+                            interner,
+                            hir_ty::next_solver::PlaceholderRegion::new(universe, bound),
+                        );
+                    }
+                    if let Some(&(_, it)) = existentials.iter().find(|it| it.0 == bound.var) {
+                        return it;
+                    }
+                    let it = infcx.next_region_var_in_universe(universe, hir_ty::Span::Dummy);
+                    existentials.push((bound.var, it));
+                    it
+                }
+                _ => region,
+            },
+        )
+    }
+
+    /// Two signatures' inputs and output, related as the types of `fn` pointers are.
+    fn relate_sig_tys(
+        &mut self,
+        xs: hir_ty::next_solver::Tys<'db>,
+        ys: hir_ty::next_solver::Tys<'db>,
+        variance: Variance,
+        at: At,
+    ) {
+        let count = xs.len().min(ys.len());
+        for (index, (x, y)) in xs.iter().zip(ys.iter()).enumerate() {
+            let inner =
+                if index + 1 == count { variance } else { variance.xform(Variance::Contravariant) };
+            self.relate(x, y, inner, at);
         }
     }
 
@@ -3211,17 +3391,33 @@ impl<'db> Builder<'_, '_, 'db> {
             (TyKind::Array(x, _), TyKind::Array(y, _)) | (TyKind::Slice(x), TyKind::Slice(y)) => {
                 self.relate(x, y, variance, at)
             }
+            // Higher-ranked subtyping, as rustc's `TypeRelating::binders`: `a <: b` holds
+            // when `b`'s `for<'a>` instantiated with placeholders is a supertype of `a`'s
+            // instantiated with variables; invariant, both ways, each still invariant. A region
+            // that cannot name a placeholder outlives it by outliving `'static`, so a closure
+            // parameter `x: fn(&u32)` of a type `fn(&'1 u32)` needs `'1: 'static`.
             (TyKind::FnPtr(sa, _), TyKind::FnPtr(sb, _)) => {
-                let (xs, ys) =
-                    (sa.skip_binder().inputs_and_output, sb.skip_binder().inputs_and_output);
-                let count = xs.len().min(ys.len());
-                for (index, (x, y)) in xs.iter().zip(ys.iter()).enumerate() {
-                    let inner = if index + 1 == count {
-                        variance
-                    } else {
-                        variance.xform(Variance::Contravariant)
-                    };
-                    self.relate(x, y, inner, at);
+                if sa.bound_vars().is_empty() && sb.bound_vars().is_empty() {
+                    let (xs, ys) =
+                        (sa.skip_binder().inputs_and_output, sb.skip_binder().inputs_and_output);
+                    self.relate_sig_tys(xs, ys, variance, at);
+                    return;
+                }
+                let mut pass = |this: &mut Self, general_is_b: bool| {
+                    let universe = this.ctx.infcx.create_next_universe();
+                    this.relate_universes.insert(universe);
+                    let xs = this.instantiate_sig(sa, universe, !general_is_b);
+                    let ys = this.instantiate_sig(sb, universe, general_is_b);
+                    this.relate_sig_tys(xs, ys, variance, at);
+                };
+                match variance {
+                    Variance::Covariant => pass(self, true),
+                    Variance::Contravariant => pass(self, false),
+                    Variance::Invariant => {
+                        pass(self, true);
+                        pass(self, false);
+                    }
+                    Variance::Bivariant => (),
                 }
             }
             (TyKind::Dynamic(pa, ra), TyKind::Dynamic(pb, rb)) => {
@@ -3331,9 +3527,25 @@ impl<'db> Builder<'_, '_, 'db> {
             }
             (TyKind::Closure(_, aa), TyKind::Closure(_, ab))
             | (TyKind::Coroutine(_, aa), TyKind::Coroutine(_, ab))
-            | (TyKind::CoroutineClosure(_, aa), TyKind::CoroutineClosure(_, ab))
-            | (TyKind::FnDef(_, aa), TyKind::FnDef(_, ab)) => {
+            | (TyKind::CoroutineClosure(_, aa), TyKind::CoroutineClosure(_, ab)) => {
                 self.relate_args(aa, ab, None, Variance::Invariant, at)
+            }
+            // rustc relates a function item's arguments with the item's variances
+            // (`relate_item_args`), which its signature gives: `foo<'a>() -> PhantomData<&'a ()>`
+            // is covariant in `'a`, and a constructor `fn(T) -> S<T>` is invariant in `T`.
+            (TyKind::FnDef(def, aa), TyKind::FnDef(_, ab)) => {
+                let variances = match def.0 {
+                    hir_def::CallableDefId::FunctionId(it) => {
+                        self.ctx.db.variances_of(GenericDefId::FunctionId(it))
+                    }
+                    hir_def::CallableDefId::StructId(it) => {
+                        hir_ty::ctor_variances(self.ctx.db, it.into())
+                    }
+                    hir_def::CallableDefId::EnumVariantId(it) => {
+                        hir_ty::ctor_variances(self.ctx.db, it.into())
+                    }
+                };
+                self.relate_args(aa, ab, Some(variances.as_slice()), variance, at)
             }
             _ => (),
         }
@@ -3381,6 +3593,7 @@ impl<'db> Builder<'_, '_, 'db> {
                 lower: rv,
                 span: at.span,
                 forall: false,
+                signature: at.category == Category::Signature,
             });
         }
         if depth > 4 {
@@ -3469,7 +3682,13 @@ impl<'db> Builder<'_, '_, 'db> {
             }
             return;
         }
-        self.regions.type_tests.push(TypeTest { ty, lower: rv, span: at.span, forall: false });
+        self.regions.type_tests.push(TypeTest {
+            ty,
+            lower: rv,
+            span: at.span,
+            forall: false,
+            signature: at.category == Category::Signature,
+        });
     }
 
     fn place_ty(&self, local: LocalId, projection: &[PlaceElem]) -> PlaceTy<'db> {
@@ -3545,7 +3764,18 @@ impl<'db> Builder<'_, '_, 'db> {
 
     /// The type of a callee whose path spells out generic arguments, `f::<&'a T>`, with the
     /// lifetimes written there: rustc's user type annotation on the path.
+    ///
+    /// As rustc, the callee's type has regions of its own, equal to the written ones by a
+    /// `GenericArg` constraint at the path, so an error blames a use of the callee over it.
     fn written_callee(&mut self, func: &Operand, call: MirSpan) -> Option<Ty<'db>> {
+        let written = self.written_callee_ty(func, call)?;
+        let ty = self.renumber(written);
+        let span = self.callee_expr(func, call).map_or(call, MirSpan::ExprId);
+        self.relate(ty, written, Variance::Invariant, At { category: Category::GenericArg, span });
+        Some(ty)
+    }
+
+    fn written_callee_ty(&mut self, func: &Operand, call: MirSpan) -> Option<Ty<'db>> {
         let ty = match &func.kind {
             OperandKind::Constant { ty, .. } => ty.as_ref(),
             OperandKind::Allocation { allocation } => allocation.as_ref().ty,
@@ -3627,6 +3857,14 @@ impl<'db> Builder<'_, '_, 'db> {
 
     fn statement(&mut self, kind: &StatementKind, span: MirSpan) {
         kind.for_each_operand(&mut |operand| self.copy_bound(operand, span));
+        if let StatementKind::InlineAsm(asm) = kind {
+            for operand in asm.operands.iter() {
+                if let hir_ty::mir::AsmOperand::Sym(operand) = operand {
+                    self.asm_sym(operand, span);
+                }
+            }
+            return;
+        }
         let StatementKind::Assign(place, rvalue) = kind else { return };
         let projection = place.projection.as_slice();
         let dest = self.place_ty(place.local, projection).ty;
@@ -3674,12 +3912,18 @@ impl<'db> Builder<'_, '_, 'db> {
         span: MirSpan,
     ) {
         let projection = place.projection.as_slice();
+        // rustc's user type annotation on a cast is the type written, its `_`s inference
+        // variables: `ptr as _` relates no lifetime, though `_` is inferred `'static` from
+        // where the value goes.
         if let MirSpan::ExprId(expr) = span
-            && let hir_def::hir::Expr::Cast { .. } = self.ctx.store[expr]
+            && let hir_def::hir::Expr::Cast { type_ref, .. } = self.ctx.store[expr]
             && matches!(rvalue, Rvalue::Use(_) | Rvalue::Cast(..))
-            && let Some(written) = self.ctx.infer.type_of_expr.get(expr)
+            && let Some(inferred) = self.ctx.infer.type_of_expr.get(expr)
         {
-            let written = self.written(written.as_ref());
+            let inferred = inferred.as_ref();
+            let lowered = self.lower_annotation(type_ref, span);
+            let ty = self.zip_annotation(lowered, inferred, &mut FxHashMap::default(), 0);
+            let written = self.written(ty.unwrap_or(inferred));
             let at = At { category: Category::TypeAnnotation, span };
             self.relate(dest, written, Variance::Invariant, at);
         }
@@ -3859,6 +4103,24 @@ impl<'db> Builder<'_, '_, 'db> {
             let written = self.written(written);
             let at = At { category: Category::TypeAnnotation, span };
             self.relate(self_ty, written, Variance::Invariant, at);
+        }
+    }
+
+    /// A function an inline `asm!` names by `sym`, with the generic arguments its path spells
+    /// out: rustc type checks the path as a value, with its user type annotation, so its where
+    /// clauses hold of the lifetimes written there (`sym dep::<'a, T>` needs `T: 'a`).
+    fn asm_sym(&mut self, operand: &Operand, span: MirSpan) {
+        let ty = match &operand.kind {
+            OperandKind::Constant { ty, .. } => ty.as_ref(),
+            OperandKind::Allocation { allocation } => allocation.as_ref().ty,
+            _ => return,
+        };
+        let ty = self.written(ty);
+        if let TyKind::FnDef(def, args) = ty.kind() {
+            self.callee_predicates(def.0, args, span);
+            for ty in args.types() {
+                self.well_formed(ty, At { category: Category::Boring, span }, 0);
+            }
         }
     }
 
@@ -4168,8 +4430,26 @@ impl<'db> Builder<'_, '_, 'db> {
                                 .callable_item_signature(def.0)
                                 .instantiate(self.interner(), args)
                                 .skip_norm_wip();
+                            // To a `for<'a> fn`, the item's signature keeps its own `for<'a>`,
+                            // related to the target's as higher-ranked types are.
+                            if let TyKind::FnPtr(to, _) = target.kind()
+                                && !to.bound_vars().is_empty()
+                            {
+                                let interner = self.interner();
+                                let sig =
+                                    rustc_type_ir::fold_regions(interner, sig, |r, _| {
+                                        match r.kind() {
+                                            RegionKind::ReError(_) => self.fresh_elided(),
+                                            _ => r,
+                                        }
+                                    });
+                                let source = Ty::new_fn_ptr(interner, sig);
+                                self.relate(source, target, Variance::Covariant, at);
+                                return Some(target);
+                            }
                             // rustc instantiates the item's late-bound lifetimes and proves
-                            // its signature well-formed with them: `&'a &'b ()` that `'b: 'a`.
+                            // its signature well-formed with them: `&'a &'b ()` that `'b: 'a`,
+                            // when the target has none of its own.
                             let sig = self.ctx.infcx.instantiate_binder_with_fresh_vars(
                                 hir_ty::Span::Dummy,
                                 hir_ty::next_solver::infer::BoundRegionConversionTime::FnCall,
@@ -4404,6 +4684,24 @@ impl<'db> Builder<'_, '_, 'db> {
                         })
                         .collect::<Vec<_>>()
                 };
+                // rustc's `prove_aggregate_predicates`: a closure's where clauses are its
+                // creator's, which hold where it is made, with its parent args: so
+                // `for<'a> &'a S: 'a` is proven for a placeholder `'a`, needing `S: 'static`.
+                let parent_args = match ty.kind() {
+                    TyKind::Closure(_, args) => Some(args.as_closure().parent_args()),
+                    TyKind::Coroutine(_, args) => Some(args.as_coroutine().parent_args()),
+                    _ => None,
+                };
+                if let Some(parent_args) = parent_args {
+                    let def = self.ctx.owner.generic_def(self.ctx.db);
+                    let at = At { category: Category::Boring, span };
+                    self.predicates(
+                        def,
+                        GenericArgs::new_from_iter(parent_args.iter().copied().collect::<Vec<_>>()),
+                        at,
+                        true,
+                    );
+                }
                 let made = match ty.kind() {
                     TyKind::Closure(def, args) => Some((
                         def.0.loc(self.ctx.db).expr,
@@ -4635,8 +4933,23 @@ impl<'db> Builder<'_, '_, 'db> {
                 if let (Some(local), Some(location)) = (local, self.location) {
                     self.regions.callee_reads.push((local, location));
                 }
-                let Some(func_ty) = local
-                    .map(|it| peel(self.regions.local_tys[it.into_raw().into_u32() as usize]))
+                // rustc's MIR copies the variable into a temporary it calls, `_6 = copy _4;
+                // move _6(..)`, whose type has regions of its own the variable's flow into.
+                let local_callee = local.map(|it| {
+                    let ty = peel(self.regions.local_tys[it.into_raw().into_u32() as usize]);
+                    let copy = self.renumber(ty);
+                    let callee = match span {
+                        MirSpan::ExprId(call) => match self.ctx.store[call] {
+                            hir_def::hir::Expr::Call { callee, .. } => MirSpan::ExprId(callee),
+                            _ => span,
+                        },
+                        _ => span,
+                    };
+                    let at = At { category: Category::Boring, span: callee };
+                    self.relate(ty, copy, Variance::Covariant, at);
+                    copy
+                });
+                let Some(func_ty) = local_callee
                     .or_else(|| self.written_callee(func, span))
                     .or_else(|| self.constant_ty(func, span))
                     .or_else(|| self.operand_ty(func))
@@ -5055,10 +5368,22 @@ impl<'db> Builder<'_, '_, 'db> {
                         self.outlives(longer, shorter, at);
                     }
                 }
-                ClauseKind::TypeOutlives(OutlivesPredicate(ty, region))
-                    if type_outlives
-                        && !rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&ty) =>
-                {
+                ClauseKind::TypeOutlives(OutlivesPredicate(ty, region)) if type_outlives => {
+                    // A region of the type bound by the clause's `for<'a>` is a placeholder,
+                    // taken as `'static` as a placeholder in a type is where it is proven:
+                    // `for<'a> &'a S: 'a` needs `S: 'static`.
+                    let interner = self.interner();
+                    let ty =
+                        rustc_type_ir::fold_regions(interner, ty, |it, depth| match it.kind() {
+                            RegionKind::ReBound(
+                                rustc_type_ir::BoundVarIndexKind::Bound(binder),
+                                _,
+                            ) if binder == depth => Region::new_static(interner),
+                            _ => it,
+                        });
+                    if rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&ty) {
+                        continue;
+                    }
                     let original = region;
                     let region = match region.kind() {
                         RegionKind::ReStatic => self.static_region(),
@@ -5117,13 +5442,12 @@ impl<'db> Builder<'_, '_, 'db> {
                     };
                     let placeholders = forall.then(|| {
                         let universe = self.ctx.infcx.create_next_universe();
-                        let placeholders = instantiate(&mut |bound| {
+                        instantiate(&mut |bound| {
                             Region::new_placeholder(
                                 interner,
                                 hir_ty::next_solver::PlaceholderRegion::new(universe, bound),
                             )
-                        });
-                        (universe, placeholders)
+                        })
                     });
                     let trait_ref = match forall {
                         true => instantiate(&mut |_| Region::new_static(interner)),
@@ -5134,15 +5458,12 @@ impl<'db> Builder<'_, '_, 'db> {
                     // Proven for placeholders, what the trait's impls need of them is an error
                     // where it is more than they can be, `for<'a> Foo<&'a isize>` needing
                     // `'a: 'b`.
-                    if let Some((universe, placeholders)) = placeholders {
-                        self.forall_universe = Some(universe);
+                    if let Some(placeholders) = placeholders {
                         self.prove(placeholders, at);
-                        self.forall_universe = None;
                     }
                     // Of a call written as one: `map[i] = v` calls `IndexMut::index_mut`, which
                     // is E0594 where only `Index` is implemented.
                     if self.prove(trait_ref, at)
-                        && !forall
                         && !forall
                         && at.category == Category::Predicate
                         && let MirSpan::ExprId(expr) = at.span
@@ -5473,7 +5794,9 @@ impl<'db> Builder<'_, '_, 'db> {
                     .collect();
             (constraints, obligations)
         };
-        if regionless && constraints.is_empty() {
+        // Its impl's where clauses can still need a type to outlive a region:
+        // `ServiceChain<P, S>: Service` that `P::Error: 'static`.
+        if regionless && constraints.is_empty() && obligations.is_empty() {
             return false;
         }
         if crate::debugging(self.ctx.db, self.ctx.owner) {
@@ -5534,24 +5857,23 @@ impl<'db> Builder<'_, '_, 'db> {
                 self.outlives(longer, shorter, at);
             }
         }
-        let forall = self.forall_universe;
-        let ctx = self.ctx;
-        let infcx = &ctx.infcx;
-        let ours = |region: Region<'db>| {
-            region.is_placeholder() && Some(infcx.universe_of_region(region)) == forall
-        };
+        // A type outlives a placeholder, of the predicate being proven or of a `for<'a>` in
+        // the where clauses of an impl or of the environment that proves it, only by outliving
+        // `'static`: the body's regions are of a universe that cannot name it, as rustc's
+        // `add_incompatible_universe`. So `for<'a> F: FnMut(<&'1 mut I as Lend>::Item<'a>)`,
+        // whose normalization needs `&'1 mut I: 'a`, needs `'1: 'static` (rustc's "due to a
+        // current limitation of the type system"), and a type parameter that must outlive it
+        // is rustc's codeless "does not live long enough".
         for (ty, region) in obligations {
-            let ty = rustc_type_ir::fold_regions(interner, ty, |it, _| match ours(it) {
+            let placeholder = region.is_placeholder();
+            let ty = rustc_type_ir::fold_regions(interner, ty, |it, _| match it.is_placeholder() {
                 true => Region::new_static(interner),
                 false => it,
             });
-            let region = match ours(region) {
+            let region = match placeholder {
                 true => Region::new_static(interner),
                 false => region,
             };
-            if region.is_placeholder() || rustc_type_ir::TypeVisitableExt::has_placeholders(&ty) {
-                continue;
-            }
             let Some(region) = rv(self, region) else { continue };
             let ty = rustc_type_ir::fold_regions(interner, ty, |it, _| match it.kind() {
                 RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) | RegionKind::ReStatic => {
@@ -5561,11 +5883,17 @@ impl<'db> Builder<'_, '_, 'db> {
                 }
                 _ => it,
             });
+            let tests = self.regions.type_tests.len();
             self.type_outlives(
                 ty,
                 Region::new_var(interner, rustc_type_ir::RegionVid::from_usize(region)),
                 at,
             );
+            if placeholder {
+                for test in &mut self.regions.type_tests[tests..] {
+                    test.forall = true;
+                }
+            }
         }
         false
     }
@@ -6163,6 +6491,7 @@ pub(super) fn blame_with(path: &[Outlives], opaque: bool) -> Option<Outlives> {
         | Category::CallArgument
         | Category::Assignment
         | Category::Usage => 2,
+        Category::GenericArg => 3,
         Category::Predicate => 4,
         Category::Boring | Category::Signature | Category::Opaque => 5,
         Category::Internal => 7,
@@ -6179,6 +6508,18 @@ pub(super) fn blame_with(path: &[Outlives], opaque: bool) -> Option<Outlives> {
 /// regions: the solver gives the result regions of its own, related to those it came from only
 /// by constraints it records.
 pub(super) fn normalize<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> Option<Ty<'db>> {
+    normalize_impl(ctx, ty, false)
+}
+
+/// `ty` normalized as `normalize` does, a region the result has of its own (an impl's
+/// lifetime that nothing constrains, `impl<'a, T: 'a> Tr for T { type A = <T as Mk<'a>>::R }`)
+/// left a region variable of its own, as rustc's normalization in borrowck gives it an
+/// existential region.
+fn normalize_with_fresh<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> Option<Ty<'db>> {
+    normalize_impl(ctx, ty, true)
+}
+
+fn normalize_impl<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>, allow_fresh: bool) -> Option<Ty<'db>> {
     use hir_ty::next_solver::{
         infer::{region_constraints::Constraint, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
@@ -6224,5 +6565,5 @@ pub(super) fn normalize<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> Option<Ty<'db>>
             _ => region,
         }
     });
-    (!unmapped).then_some(normalized)
+    (allow_fresh || !unmapped).then_some(normalized)
 }

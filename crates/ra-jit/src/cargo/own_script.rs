@@ -220,13 +220,9 @@ fn compile_in(
     // A proc macro's library is kept in the store, by its description.
     let key = made.proc_macro.then(|| super::own_macro::library_key(&described));
     if !key.is_some_and(|key| super::own_macro::restored(&key, made)) {
-        let said = build(&described, dir, made, super::daemon::store(), true)?;
-        if let Some(line) =
-            said.lines().find(|it| it.contains(" functions in it ra-jit could not compile"))
-            && !line.ends_with(", 0 functions in it ra-jit could not compile")
-        {
-            return Err(format!("it calls functions ra-jit could not compile ({line})"));
-        }
+        // A script that reaches a function ra-jit could not compile is not built
+        // ([`crate::refused_error`]).
+        build(&described, dir, made, super::daemon::store(), true)?;
         if let Some(key) = key {
             let inputs = crates.iter().filter_map(|it| it.inputs.as_ref());
             super::own_macro::keep(&key, made, inputs.map(|(info, cwd)| (&**info, &**cwd)));
@@ -290,7 +286,10 @@ fn build(
     let said = String::from_utf8_lossy(&built.stderr).into_owned();
     std::fs::write(dir.join("ra-jit.log"), &said).map_err(|it| it.to_string())?;
     if !built.status.success() {
+        // The error, of as many lines as it has, or else the last line.
+        let error = said.rfind("\nError: ").map(|at| said[at + 1..].trim_end());
         let last = said.lines().rev().find(|it| !it.trim().is_empty()).unwrap_or("");
+        let last = error.unwrap_or(last);
         return Err(format!("ra-jit did not build it ({}): {last}", built.status));
     }
     Ok(said)

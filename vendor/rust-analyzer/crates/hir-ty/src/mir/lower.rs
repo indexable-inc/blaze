@@ -604,13 +604,13 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 Ok(Some(current))
             }
             // A register only written to has no value the block could leave in it, so such an
-            // operand is lowered as assembly would be.
+            // operand is lowered as assembly would be, and so is a `sym`, whose function's
+            // where clauses the borrow checker proves.
             Expr::InlineAsm(asm)
                 if asm.comment_only
-                    && !asm
-                        .operands
-                        .iter()
-                        .any(|(_, it)| matches!(it, AsmOperand::Out { expr: Some(_), .. })) =>
+                    && !asm.operands.iter().any(|(_, it)| {
+                        matches!(it, AsmOperand::Out { expr: Some(_), .. } | AsmOperand::Sym(_))
+                    }) =>
             {
                 // The block emits nothing, so a register it reads and writes keeps the value it
                 // was given: the borrow checker sees the write to the variable as a mutation.
@@ -647,7 +647,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 };
                 let mut labels = Vec::new();
                 let mut operands = Vec::with_capacity(asm.operands.len());
-                for (_, operand) in &asm.operands {
+                for (index, (_, operand)) in asm.operands.iter().enumerate() {
                     let written = !matches!(operand, AsmOperand::In { .. });
                     let (reg, input, output) = match operand {
                         AsmOperand::In { reg, expr } => (reg, Some(*expr), None),
@@ -703,16 +703,13 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                                 Some(ValueNs::StaticId(id)) => {
                                     Operand { kind: OperandKind::Static(id), span: None }
                                 }
-                                // FIXME: one with parameters, whose arguments inference
-                                // does not record for a `sym`.
-                                Some(ValueNs::FunctionId(func))
-                                    if generics(self.db, func.into()).len(true) == 0 =>
+                                // The function item with the generic arguments the path
+                                // spells out, as inference typed it.
+                                Some(ValueNs::FunctionId(_))
+                                    if let Some(ty) =
+                                        self.infer.asm_sym_tys.get(&(expr_id, index as u32)) =>
                                 {
-                                    Operand::const_zst(Ty::new_fn_def(
-                                        self.interner(),
-                                        CallableDefId::FunctionId(func).into(),
-                                        GenericArgs::empty(),
-                                    ))
+                                    Operand::const_zst(ty.as_ref())
                                 }
                                 _ => not_supported!(
                                     "inline assembly with a `sym` that is not a static or a                                      function without parameters"

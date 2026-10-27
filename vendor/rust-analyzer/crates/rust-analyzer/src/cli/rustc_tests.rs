@@ -77,9 +77,7 @@ impl Tester {
         let mut sysroot = Sysroot::discover(tmp_file.parent().unwrap(), &cargo_config.extra_env);
         let loaded_sysroot =
             sysroot.load_workspace(&RustSourceWorkspaceConfig::default_cargo(), false, &|_| ());
-        if let Some(loaded_sysroot) = loaded_sysroot {
-            sysroot.set_workspace(loaded_sysroot);
-        }
+        sysroot.set_loaded(loaded_sysroot);
 
         let query_config = QueryConfig::Rustc(&sysroot, tmp_file.parent().unwrap().as_ref());
         let toolchain_version = version::get(query_config, &cargo_config.extra_env).ok().flatten();

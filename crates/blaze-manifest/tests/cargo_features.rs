@@ -19,7 +19,9 @@ fn tree(name: &str, files: &[(&str, &str)]) -> PathBuf {
         std::fs::write(path, text).unwrap();
     }
     std::fs::create_dir_all(root.join("cargo-home")).unwrap();
-    root.canonicalize().unwrap()
+    // As cargo is given it: not the `\\?\` form `canonicalize` gives on Windows, which a
+    // path read back from a `file:` URL is not.
+    dunce::canonicalize(root).unwrap()
 }
 
 fn context(root: &Path) -> Context {

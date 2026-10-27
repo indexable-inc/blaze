@@ -263,7 +263,7 @@ cargo, as [cargo.md](cargo.md) lists.
 | `panic = "abort"` | supported | unverified |
 | `lto = true`, `lto = "thin"` | refused: rustc recompiles the whole program at link time and leaves no library to link ra-jit's functions against | cargo |
 | `lto = "off"` | supported | unverified |
-| crate types `bin`, `lib`, `rlib`, `dylib`, `cdylib`, `staticlib` | supported | programs only; a `cdylib` or `staticlib` that is not linked into an executable has nothing to splice into |
+| crate types `bin`, `lib`, `rlib`, `dylib`, `cdylib`, `staticlib` | supported | programs only; a build that would write a `cdylib` or `staticlib` stops with an error, since blaze does not link one yet ([#262](https://github.com/indexable-inc/blaze/issues/262)) |
 | proc macros (attribute, derive, function-like) | supported: rustc's build of the macro is loaded and its expansion is compiled by ra-jit | served; an edit to the proc-macro crate itself is cargo's |
 | build scripts (`rerun-if-changed`, `rerun-if-env-changed`, `rustc-cfg`, `rustc-env`, `rustc-link-lib`, `OUT_DIR`, `links`) | supported | served; a change to a script or its inputs is cargo's, then the daemon reloads |
 | unit tests, integration tests, examples, benches | supported | served; adding or removing a `#[test]` is cargo's |

@@ -711,6 +711,7 @@ dependencies = [
  "anyhow",
  "cargo-platform",
  "cargo-util-schemas",
+ "dunce",
  "glob",
  "pathdiff",
  "rustc-hash 2.1.2",

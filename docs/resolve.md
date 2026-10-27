@@ -164,6 +164,19 @@ the sharing pass decides whether the debuginfo of a host unit is lowered. Packag
 checked against the packages of `Cargo.lock`, as cargo checks them against the workspace's
 resolve.
 
+The `sysroot` part is the standard library's workspace in the toolchain
+(`lib/rustlib/src/rust/library`), read in its directory (whose `.cargo/config.toml` replaces
+crates.io with `library/vendor`) as rust-analyzer's `Sysroot::load_workspace` asks for it:
+`--features sysroot/backtrace`, cargo told it is a nightly, `--no-deps` and full, with no
+`--filter-platform` and with each target of `harness/answers.py`. cargo reads the full metadata
+against a copy of the lock file (`CARGO_RESOLVER_LOCKFILE_PATH`); blaze-metadata's
+`metadata_locked` never writes it and refuses a lock file the manifests no longer agree with, as
+`--locked` does. ra-jit answers rust-analyzer with these (`ra-jit/src/cargo/metadata.rs`
+`library`, through `OwnMetadata.library`), so loading a workspace runs no cargo for the sysroot.
+
+On VM nc-sysroot (Linux arm64), 2026-10-27, with the pinned nightly: 26 of 26 equal (no platform and
+the 12 targets, each `--no-deps` and full; 15 packages without dependencies, 30 to 50 with).
+
 ## Decisions
 
 **cargo's schema crate, pinned.** `cargo-util-schemas = "=0.14.3"` is the version cargo 1.99.0

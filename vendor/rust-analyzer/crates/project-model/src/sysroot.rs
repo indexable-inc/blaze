@@ -7,7 +7,7 @@
 use core::fmt;
 use std::{env, fs, ops::Not, path::Path, process::Command};
 
-use anyhow::{Result, format_err};
+use anyhow::{Context as _, Result, format_err};
 use base_db::Env;
 use itertools::Itertools;
 use paths::{AbsPath, AbsPathBuf, Utf8PathBuf};
@@ -246,19 +246,30 @@ impl Sysroot {
         }
     }
 
+    /// The library's workspace read; an error only when the embedder reads it in place of
+    /// cargo (`CargoMetadataConfig::own_metadata`) and could not, which is not hidden by
+    /// stitching the library together instead.
     pub fn load_workspace(
         &self,
         sysroot_source_config: &RustSourceWorkspaceConfig,
         no_deps: bool,
         progress: &dyn Fn(String),
-    ) -> Option<RustLibSrcWorkspace> {
+    ) -> Result<Option<RustLibSrcWorkspace>> {
         assert!(matches!(self.workspace, RustLibSrcWorkspace::Empty), "workspace already loaded");
         let Self { root: _, rust_lib_src_root: Some(src_root), workspace: _, error: _ } = self
         else {
-            return None;
+            return Ok(None);
         };
         if let RustSourceWorkspaceConfig::CargoMetadata(cargo_config) = sysroot_source_config {
             let library_manifest = ManifestPath::try_from(src_root.join("Cargo.toml")).unwrap();
+            if let Some(own) = &cargo_config.own_metadata {
+                return self
+                    .load_library_own(own, &library_manifest, cargo_config, no_deps)
+                    .map(Some)
+                    .with_context(|| {
+                        format!("blaze could not read the standard library's workspace {library_manifest}")
+                    });
+            }
             if fs::metadata(&library_manifest).is_ok() {
                 match self.load_library_via_cargo(
                     &library_manifest,
@@ -267,7 +278,7 @@ impl Sysroot {
                     no_deps,
                     progress,
                 ) {
-                    Ok(loaded) => return Some(loaded),
+                    Ok(loaded) => return Ok(Some(loaded)),
                     Err(e) => {
                         tracing::error!("`cargo metadata` failed on `{library_manifest}` : {e}")
                     }
@@ -320,12 +331,25 @@ impl Sysroot {
                     }
                 }
             }
-            return Some(RustLibSrcWorkspace::Stitched(stitched));
+            return Ok(Some(RustLibSrcWorkspace::Stitched(stitched)));
         } else if let RustSourceWorkspaceConfig::Json(project_json) = sysroot_source_config {
-            return Some(RustLibSrcWorkspace::Json(project_json.clone()));
+            return Ok(Some(RustLibSrcWorkspace::Json(project_json.clone())));
         }
 
-        None
+        Ok(None)
+    }
+
+    /// Takes what [`Sysroot::load_workspace`] read: a library that could not be read is this
+    /// sysroot's error, and it has no library.
+    pub fn set_loaded(&mut self, loaded: Result<Option<RustLibSrcWorkspace>>) {
+        match loaded {
+            Ok(Some(workspace)) => self.set_workspace(workspace),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("{e:#}");
+                self.error = Some(format!("{e:#}"));
+            }
+        }
     }
 
     pub fn set_workspace(&mut self, workspace: RustLibSrcWorkspace) {
@@ -356,6 +380,29 @@ impl Sysroot {
         }
     }
 
+    /// The library's workspace as the embedder reads it, in place of `cargo metadata`.
+    fn load_library_own(
+        &self,
+        own: &crate::OwnMetadata,
+        library_manifest: &ManifestPath,
+        cargo_config: &CargoMetadataConfig,
+        no_deps: bool,
+    ) -> Result<RustLibSrcWorkspace> {
+        let target = match cargo_config.targets.as_slice() {
+            [] => None,
+            [target] => Some(target.as_str()),
+            more => anyhow::bail!("the library is read for one target, not {}", more.join(", ")),
+        };
+        let metadata = (own.library)(
+            library_manifest,
+            &cargo_config.features,
+            target,
+            no_deps,
+            &cargo_config.extra_env,
+        )?;
+        Ok(Self::library_workspace(metadata, library_manifest, None))
+    }
+
     fn load_library_via_cargo(
         &self,
         library_manifest: &ManifestPath,
@@ -374,10 +421,19 @@ impl Sysroot {
 
         // Make sure we never attempt to write to the sysroot
         let locked = true;
-        let (mut res, err) =
+        let (res, err) =
             FetchMetadata::new(library_manifest, current_dir, &cargo_config, self, no_deps)
                 .exec(locked, progress)?;
+        Ok(Self::library_workspace(res, library_manifest, err))
+    }
 
+    /// The library's workspace of its `cargo metadata`, with the error of a full read whose
+    /// `--no-deps` read it is.
+    fn library_workspace(
+        mut res: cargo_metadata::Metadata,
+        library_manifest: &ManifestPath,
+        err: Option<anyhow::Error>,
+    ) -> RustLibSrcWorkspace {
         // Patch out `rustc-std-workspace-*` crates to point to the real crates.
         // This is done prior to `CrateGraph` construction to prevent de-duplication logic from failing.
         let patches = {
@@ -429,10 +485,10 @@ impl Sysroot {
 
         let cargo_workspace =
             CargoWorkspace::new(res, library_manifest.clone(), Default::default(), true);
-        Ok(RustLibSrcWorkspace::Workspace {
+        RustLibSrcWorkspace::Workspace {
             ws: cargo_workspace,
             metadata_err: err.map(|e| format!("{e:#}")),
-        })
+        }
     }
 }
 

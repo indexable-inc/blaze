@@ -64,12 +64,15 @@ def unit_graph(graph):
 
 
 def unit_programs(graph):
-    """The executables a unit graph links: its roots that build a binary or an example."""
+    """What a unit graph links: its roots that build a binary or an example, or a library's
+    `cdylib` or `staticlib`."""
     units = graph["units"]
     roots = (units[at] for at in graph["roots"])
+    linked = {"cdylib", "staticlib"}
     return {(u["pkg_id"], u["target"]["name"]) for u in roots
-            if u["mode"] == "build" and u["target"]["crate_types"] == ["bin"]
-            and set(u["target"]["kind"]) & {"bin", "example"}}
+            if u["mode"] == "build"
+            and ((u["target"]["crate_types"] == ["bin"] and set(u["target"]["kind"]) & {"bin", "example"})
+                 or (set(u["target"]["crate_types"]) & linked and not set(u["target"]["kind"]) & {"example", "bench", "test"}))}
 
 
 def of_resolve(metadata):

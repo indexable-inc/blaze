@@ -334,7 +334,15 @@ fn sandbox(
 ) -> Result<i32, String> {
     let flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWNET | libc::CLONE_NEWIPC;
     if unsafe { libc::unshare(flags) } < 0 {
-        return Err(os("a user namespace (unshare)"));
+        let refused = std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        let mut why = os("a user namespace (unshare)");
+        // A container's seccomp profile (Docker's default) refuses it with EPERM: say so, and
+        // the ways on, where the process is told it is in one.
+        let container = std::env::var("container").ok();
+        if refused && let Some(known) = super::container(Path::new("/"), container.as_deref()) {
+            why.push_str(&super::container_hint(&known));
+        }
+        return Err(why);
     }
     let write =
         |file: &str, text: String| std::fs::write(file, text).map_err(|it| format!("{file}: {it}"));

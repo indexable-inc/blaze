@@ -1,6 +1,10 @@
 //! The `resolve` of `cargo metadata`, against cargo 1.99.0's for the same workspace
 //! (`metadata/metadata.sh` writes it).
 
+// The fixtures are cargo's output for a workspace at `/ws` on Linux: `path+file:///ws` ids,
+// which a Windows path is not, and `/ws` is no absolute path there.
+#![cfg(unix)]
+
 #[path = "resolver/helpers.rs"]
 mod helpers;
 

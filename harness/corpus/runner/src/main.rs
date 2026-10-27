@@ -1,3 +1,4 @@
+#![cfg_attr(feature = "nightly", feature(portable_simd))]
 use cases::*;
 
 macro_rules! case {
@@ -614,6 +615,22 @@ fn main() {
     println!("simd_x86 {}", cases::simd_x86::run());
     #[cfg(target_arch = "aarch64")]
     println!("simd_aarch64 {}", cases::simd_aarch64::run());
+    #[cfg(all(target_arch = "aarch64", feature = "nightly"))]
+    println!("neon_intrinsics {}", cases::neon_intrinsics::run());
+    #[cfg(feature = "nightly")]
+    {
+        use std::simd::Simd;
+        use cases::small_vectors::*;
+        println!(
+            "small_vectors {:?} {:?} {:?} {:?} {:?} {:?}",
+            bytes(Simd::from_array([1, 255, 128, 7]), Simd::from_array([2, 3, 128, 250])),
+            halves(Simd::from_array([i16::MIN, 1234]), Simd::from_array([255, 9])),
+            pair(Simd::from_array([200, 13]), Simd::from_array([-1, 2, -3, 4])),
+            single(Simd::from_array([-5]), Simd::from_array([i16::MAX]), Simd::from_array([0xf0])),
+            single_byte(Simd::from_array([i8::MIN])),
+            called(bytes),
+        );
+    }
     // Threads.
     #[cfg(not(target_family = "wasm"))]
     println!("boxed_fn_once {:?}", cases::boxed_fn_once::run());

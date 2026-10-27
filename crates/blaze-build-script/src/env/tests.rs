@@ -277,6 +277,9 @@ fn dynamic_libraries_on_linux() {
 }
 
 /// On macOS dyld's defaults follow, since setting the variable takes them away.
+// `$HOME/lib` is joined as cargo joins it, with the separator of the machine it runs on, which
+// is the host: a macOS host is never a Windows machine's.
+#[cfg(unix)]
 #[test]
 fn dynamic_libraries_on_macos() {
     let mut unit = bar();

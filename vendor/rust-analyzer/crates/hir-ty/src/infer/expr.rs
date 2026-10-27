@@ -833,7 +833,7 @@ impl<'db> InferenceContext<'db> {
                 };
 
                 let mut diverge = asm.options.contains(AsmOptions::NORETURN);
-                asm.operands.iter().for_each(|(_, operand)| match *operand {
+                asm.operands.iter().enumerate().for_each(|(index, (_, operand))| match *operand {
                     AsmOperand::In { expr, .. } => check_expr_asm_operand(self, expr, true),
                     AsmOperand::Out { expr: Some(expr), .. } | AsmOperand::InOut { expr, .. } => {
                         check_expr_asm_operand(self, expr, false)
@@ -864,7 +864,15 @@ impl<'db> InferenceContext<'db> {
                         self.infer_expr(expr, &Expectation::None, ExprIsRead::No);
                     }
                     // FIXME: `sym` should report for things that are not functions or statics.
-                    AsmOperand::Sym(_) => (),
+                    AsmOperand::Sym(ref path) => {
+                        // rustc type checks a `sym` as a path to a value, with the generic
+                        // arguments it spells out.
+                        if let Some((ValueNs::FunctionId(_), ty)) =
+                            self.infer_path(path, tgt_expr.into())
+                        {
+                            self.result.asm_sym_tys.insert((tgt_expr, index as u32), ty.store());
+                        }
+                    }
                 });
                 if diverge || asm.kind == InlineAsmKind::NakedAsm {
                     self.types.types.never

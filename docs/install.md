@@ -24,6 +24,12 @@ Change a function and run `blaze run` again: the `Finished` line now says `[ra-j
   not supported; the installer says so.
 - **A C compiler for linking**: `gcc` (or `cc`) on Linux, Apple's command line tools on macOS
   (`xcode-select --install`). The installer says so when it is missing.
+- **In a container, user namespaces.** Build scripts and proc macros run in a sandbox made of
+  Linux namespaces ([cargo.md](cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox)), and
+  Docker's default seccomp profile refuses them: run the container with
+  `--security-opt seccomp=unconfined` (`options: --security-opt seccomp=unconfined` for a
+  GitHub Actions `container:` job), or set `BLAZE_SANDBOX=off` to run them outside a sandbox,
+  as cargo does. The error says so when it can tell it runs in a container.
 - **Memory to spare.** blaze's background process holds a few GB for a small project and tens of
   GB for the largest ([numbers](benchmarks.md#how-much-memory-and-disk-it-takes)).
 

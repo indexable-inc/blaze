@@ -13,8 +13,11 @@ const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const CKSUM: &str = "8e1b9346248cf3391ead604c4407258d327c28e37209f6d56127598165165dda";
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
+/// A path package's source: an absolute directory, which `/ws` is not on Windows. What a lock
+/// file says of one is its name and version, not where it is.
 fn path_source(name: &str, version: &str) -> SourceId {
-    SourceId::for_path(&PathBuf::from(format!("/ws/{name}-{version}"))).unwrap()
+    let root = if cfg!(windows) { "C:/ws" } else { "/ws" };
+    SourceId::for_path(&PathBuf::from(format!("{root}/{name}-{version}"))).unwrap()
 }
 
 /// Each entry without a source stands for a path package of its own directory.

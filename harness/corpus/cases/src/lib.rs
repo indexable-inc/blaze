@@ -9,6 +9,18 @@
     feature(deref_patterns, c_variadic_int128, portable_simd, core_intrinsics)
 )]
 #![cfg_attr(feature = "nightly", allow(incomplete_features, internal_features))]
+// The `core::arch::aarch64` functions `neon_intrinsics` calls that are not stable yet.
+#![cfg_attr(
+    all(feature = "nightly", target_arch = "aarch64"),
+    feature(
+        stdarch_neon_ftts,
+        stdarch_neon_i8mm,
+        stdarch_neon_fcma,
+        stdarch_arm_barrier,
+        stdarch_arm_hints,
+        stdarch_aarch64_rand
+    )
+)]
 
 pub mod stabilized;
 
@@ -5227,6 +5239,455 @@ pub mod simd_aarch64 {
             out += " neon";
         }
         out
+    }
+}
+
+/// `core::arch::aarch64` functions whose LLVM intrinsics are instructions of their own:
+/// reductions and pairs of floats, saturating and rounding shifts, estimates, conversions by
+/// each rounding, dot products, complex arithmetic, table lookups of several registers,
+/// interleaved loads and stores, SHA-1 and SHA-3, barriers and hints, with lanes at their
+/// edges (NaN, both zeros, infinities, the least and most integers, indices past the
+/// tables). An extension the processor may lack is called only where it has it, and the
+/// output says which ran.
+#[cfg(all(target_arch = "aarch64", feature = "nightly"))]
+pub mod neon_intrinsics {
+    use core::arch::aarch64::*;
+    use core::mem::transmute;
+
+    const SINGLES: [f32; 4] = [f32::NAN, -0.0, 2.5, -1.5e-40];
+    const SINGLES2: [f32; 4] = [0.0, 0.0, f32::NEG_INFINITY, 3.0e38];
+    const DOUBLES: [f64; 2] = [-0.0, f64::NAN];
+    const DOUBLES2: [f64; 2] = [0.0, -2.5];
+
+    fn f32s(v: float32x4_t) -> [u32; 4] {
+        unsafe { transmute(v) }
+    }
+    fn f64s(v: float64x2_t) -> [u64; 2] {
+        unsafe { transmute(v) }
+    }
+
+    pub fn reductions(a: float32x4_t, b: float64x2_t) -> [u64; 11] {
+        unsafe {
+            let low = vget_low_f32(a);
+            [
+                vmaxnmv_f32(low).to_bits() as u64,
+                vmaxv_f32(low).to_bits() as u64,
+                vminv_f32(vget_high_f32(a)).to_bits() as u64,
+                vmaxvq_f32(a).to_bits() as u64,
+                vminnmvq_f32(a).to_bits() as u64,
+                vaddv_f32(vget_high_f32(a)).to_bits() as u64,
+                vaddvq_f32(vsetq_lane_f32::<0>(1.0, a)).to_bits() as u64,
+                vmaxvq_f64(b).to_bits(),
+                vminnmvq_f64(b).to_bits(),
+                vaddvq_f64(vsetq_lane_f64::<1>(1.25, b)).to_bits(),
+                vminvq_f64(b).to_bits(),
+            ]
+        }
+    }
+
+    pub fn floats(a: float32x4_t, b: float32x4_t, c: float64x2_t, d: float64x2_t) -> Vec<u64> {
+        unsafe {
+            let mut out = Vec::new();
+            for v in [
+                vabdq_f32(a, b),
+                vminnmq_f32(a, b),
+                vminq_f32(a, b),
+                vpmaxq_f32(a, b),
+                vpmaxnmq_f32(a, b),
+                vcombine_f32(vpadd_f32(vget_low_f32(a), vget_high_f32(b)), vpmin_f32(vget_low_f32(b), vget_low_f32(a))),
+                vmulxq_f32(a, b),
+                vrecpsq_f32(a, b),
+                vrecpeq_f32(a),
+                vrecpeq_f32(b),
+                vreinterpretq_f32_u32(vcageq_f32(a, b)),
+            ] {
+                out.extend(f32s(v).map(u64::from));
+            }
+            for v in [
+                vmaxq_f64(c, d),
+                vpminnmq_f64(c, d),
+                vrsqrteq_f64(d),
+                vcombine_f64(vabd_f64(vget_low_f64(c), vget_low_f64(d)), vmax_f64(vget_high_f64(c), vget_high_f64(d))),
+                vcombine_f64(vmaxnm_f64(vget_high_f64(c), vget_low_f64(d)), vminnm_f64(vget_high_f64(c), vget_low_f64(d))),
+                vreinterpretq_f64_u64(vcombine_u64(vcage_f64(vget_low_f64(c), vget_low_f64(d)), vcage_f64(vget_high_f64(d), vget_high_f64(c)))),
+            ] {
+                out.extend(f64s(v));
+            }
+            let (x, y) = (vgetq_lane_f32::<2>(a), vgetq_lane_f32::<3>(b));
+            out.extend([
+                vmulxs_f32(x, y).to_bits() as u64,
+                vmulxs_f32(0.0, f32::INFINITY).to_bits() as u64,
+                vrsqrtss_f32(x, y).to_bits() as u64,
+                vrecpxs_f32(y).to_bits() as u64,
+                vrecpes_f32(x).to_bits() as u64,
+                vcagts_f32(x, y) as u64,
+            ]);
+            out
+        }
+    }
+
+    pub fn conversions(a: float32x4_t, c: float64x2_t) -> Vec<i64> {
+        unsafe {
+            let mut out: Vec<i64> = Vec::new();
+            out.extend(transmute::<_, [i32; 4]>(vcvtaq_s32_f32(a)).map(i64::from));
+            out.extend(transmute::<_, [u32; 4]>(vcvtmq_u32_f32(a)).map(i64::from));
+            out.extend(transmute::<_, [i32; 4]>(vcvtq_s32_f32(a)).map(i64::from));
+            out.extend(transmute::<_, [i64; 2]>(vcvtnq_s64_f64(c)));
+            out.extend(transmute::<_, [u64; 2]>(vcvtq_u64_f64(c)).map(|it| it as i64));
+            out.push(vcvtps_s32_f32(vgetq_lane_f32::<2>(a)) as i64);
+            out.push(vcvtpd_u64_f64(vgetq_lane_f64::<1>(c)) as i64);
+            out.push(transmute::<_, i64>(vcvta_s64_f64(vget_high_f64(c))));
+            out.push(transmute::<_, i64>(vcvt_u64_f64(vget_low_f64(c))));
+            out.push(transmute::<_, i64>(vcvtx_f32_f64(c)));
+            out
+        }
+    }
+
+    pub fn rounding(a: float32x4_t, c: float64x2_t) -> Vec<u64> {
+        unsafe {
+            let mut out = Vec::new();
+            for v in [vrndnq_f32(a), vrndiq_f32(a), vrndq_f32(a), vrndaq_f32(a), vrndxq_f32(a)] {
+                out.extend(f32s(v).map(u64::from));
+            }
+            out.extend(f64s(vrndnq_f64(c)));
+            out.extend(f64s(vrndiq_f64(c)));
+            out.push(transmute(vrndn_f64(vget_high_f64(c))));
+            out.push(transmute(vrnda_f64(vget_high_f64(c))));
+            out.push(transmute(vrndi_f64(vget_low_f64(c))));
+            out.push(vrndns_f32(vgetq_lane_f32::<2>(a)).to_bits() as u64);
+            out
+        }
+    }
+
+    #[target_feature(enable = "frintts")]
+    unsafe fn bounded_rounding(a: float32x4_t, c: float64x2_t) -> Vec<u64> {
+        unsafe {
+            let mut out = Vec::new();
+            out.extend(f32s(vrnd32xq_f32(a)).map(u64::from));
+            out.extend(f32s(vrnd64zq_f32(a)).map(u64::from));
+            out.extend(f64s(vrnd64xq_f64(c)));
+            out.extend(f64s(vrnd32zq_f64(c)));
+            out.push(transmute(vrnd32z_f64(vget_high_f64(c))));
+            out.push(transmute(vrnd64x_f64(vget_low_f64(c))));
+            out
+        }
+    }
+
+    pub fn integers(a: int8x16_t, b: int8x16_t) -> Vec<i64> {
+        unsafe {
+            let (s, t) = (vreinterpretq_s16_s8(a), vreinterpretq_s16_s8(b));
+            let (w, x) = (vreinterpretq_s32_s8(a), vreinterpretq_s32_s8(b));
+            let (u, v) = (vreinterpretq_u8_s8(a), vreinterpretq_u8_s8(b));
+            let small = vandq_s8(b, vdupq_n_s8(0x8f_u8 as i8));
+            let mut out: Vec<i64> = Vec::new();
+            for r in [
+                vabdq_s8(a, b),
+                vreinterpretq_s8_u16(vhaddq_u16(vreinterpretq_u16_s8(a), vreinterpretq_u16_s8(b))),
+                vreinterpretq_s8_s32(vhsubq_s32(w, x)),
+                vreinterpretq_s8_u8(vrhaddq_u8(u, v)),
+                vreinterpretq_s8_s16(vqrdmulhq_s16(s, t)),
+                vshlq_s8(a, small),
+                vreinterpretq_s8_u16(vshlq_u16(vreinterpretq_u16_s8(a), vreinterpretq_s16_s8(small))),
+                vreinterpretq_s8_s32(vrshlq_s32(w, vreinterpretq_s32_s8(small))),
+                vreinterpretq_s8_u64(vrshlq_u64(vreinterpretq_u64_s8(a), vreinterpretq_s64_s8(small))),
+                vqshlq_s8(a, small),
+                vreinterpretq_s8_u32(vqshlq_u32(vreinterpretq_u32_s8(a), vreinterpretq_s32_s8(small))),
+                vreinterpretq_s8_s16(vqrshlq_s16(s, vreinterpretq_s16_s8(small))),
+                vreinterpretq_s8_u8(vqrshlq_u8(u, small)),
+                vreinterpretq_s8_p8(vmulq_p8(vreinterpretq_p8_s8(a), vreinterpretq_p8_s8(b))),
+                vclsq_s8(a),
+                vqabsq_s8(a),
+                vreinterpretq_s8_s16(vqnegq_s16(s)),
+                vreinterpretq_s8_u32(vrecpeq_u32(vreinterpretq_u32_s8(a))),
+                vreinterpretq_s8_u32(vrsqrteq_u32(vreinterpretq_u32_s8(b))),
+                vuqaddq_s8(a, v),
+                vreinterpretq_s8_u8(vsqaddq_u8(u, b)),
+            ] {
+                out.extend(transmute::<_, [i8; 16]>(r).map(i64::from));
+            }
+            let (p, q) = (vgetq_lane_s32::<1>(w), vgetq_lane_s32::<2>(x));
+            let (m, n) = (vgetq_lane_s64::<0>(vreinterpretq_s64_s8(a)), vgetq_lane_s64::<1>(vreinterpretq_s64_s8(b)));
+            out.extend(transmute::<_, [i32; 2]>(vcls_s32(vget_low_s32(w))).map(i64::from));
+            out.extend([
+                vqrshls_s32(p, q & 0x3f) as i64,
+                vqshld_s64(m, n & 0x7f),
+                vrshld_s64(m, n % 70),
+                vqaddd_s64(m, n),
+                vqaddd_s64(i64::MAX, 1),
+                vqadds_s32(p, q) as i64,
+                vqadds_s32(i32::MIN, -1) as i64,
+                vqsubs_u32(p as u32, q as u32) as i64,
+                vqaddd_u64(m as u64, n as u64) as i64,
+                vqabss_s32(i32::MIN) as i64,
+                transmute::<_, i64>(vqabs_s64(vcreate_s64(i64::MIN as u64))),
+                vabsd_s64(i64::MIN),
+                vabsd_s64(n),
+                vuqadds_s32(p, q as u32) as i64,
+            ]);
+            out
+        }
+    }
+
+    pub fn narrowing(a: int8x16_t, b: int8x16_t) -> Vec<i64> {
+        unsafe {
+            let (s, t) = (vreinterpretq_s16_s8(a), vreinterpretq_s16_s8(b));
+            let wide = vreinterpretq_s64_s8(a);
+            let mut out: Vec<i64> = Vec::new();
+            out.extend(transmute::<_, [i8; 8]>(vqmovn_s16(s)).map(i64::from));
+            out.extend(transmute::<_, [u16; 4]>(vqmovn_u32(vreinterpretq_u32_s8(b))).map(i64::from));
+            out.extend(transmute::<_, [u32; 2]>(vqmovun_s64(wide)).map(i64::from));
+            out.extend(transmute::<_, [i8; 8]>(vraddhn_s16(s, t)).map(i64::from));
+            out.extend(transmute::<_, [u32; 2]>(vrsubhn_u64(vreinterpretq_u64_s8(a), vreinterpretq_u64_s8(b))).map(i64::from));
+            out.extend(transmute::<_, [u16; 8]>(vmull_p8(vget_low_p8(vreinterpretq_p8_s8(a)), vget_high_p8(vreinterpretq_p8_s8(b)))).map(i64::from));
+            out.extend([
+                vqmovnd_s64(vgetq_lane_s64::<1>(wide)) as i64,
+                vqmovnd_u64(vgetq_lane_u64::<0>(vreinterpretq_u64_s8(b))) as i64,
+                vqdmulls_s32(i32::MIN, i32::MIN),
+                vqdmulls_s32(vgetq_lane_s32::<0>(vreinterpretq_s32_s8(a)), -7),
+            ]);
+            out
+        }
+    }
+
+    pub fn tables(a: uint8x16_t, b: uint8x16_t) -> Vec<u8> {
+        unsafe {
+            let index: [u8; 16] = [0, 17, 31, 32, 47, 48, 63, 64, 255, 15, 16, 33, 50, 2, 100, 62];
+            let i = vld1q_u8(index.as_ptr());
+            let (c, d) = (veorq_u8(a, b), vaddq_u8(a, b));
+            let mut out = Vec::new();
+            for r in [
+                vqtbl2q_u8(uint8x16x2_t(a, b), i),
+                vcombine_u8(vqtbl3_u8(uint8x16x3_t(a, b, c), vget_low_u8(i)), vqtbx2_u8(vget_high_u8(b), uint8x16x2_t(c, d), vget_high_u8(i))),
+                vreinterpretq_u8_s8(vqtbl4q_s8(transmute(uint8x16x4_t(a, b, c, d)), i)),
+                vqtbx3q_u8(d, uint8x16x3_t(b, c, a), i),
+                vcombine_u8(vreinterpret_u8_s8(vqtbx4_s8(vreinterpret_s8_u8(vget_low_u8(a)), transmute(uint8x16x4_t(d, c, b, a)), vget_low_u8(i))), vget_low_u8(d)),
+            ] {
+                out.extend(transmute::<_, [u8; 16]>(r));
+            }
+            out
+        }
+    }
+
+    pub fn memory(bytes: &[u8; 64]) -> Vec<u64> {
+        unsafe {
+            let mut out: Vec<u64> = Vec::new();
+            let pair = vld2q_u8(bytes.as_ptr());
+            out.extend(transmute::<_, [u64; 4]>(pair));
+            let longs = vld2_s64(bytes.as_ptr().add(3) as *const i64);
+            out.extend(transmute::<_, [u64; 2]>(longs));
+            out.extend(transmute::<_, [u64; 2]>(vld2_dup_u16(bytes.as_ptr().add(5) as *const u16)));
+            out.extend(transmute::<_, [u64; 6]>(vld3q_dup_f32(bytes.as_ptr().add(9) as *const f32)));
+            out.extend(transmute::<_, [u64; 4]>(vld4_dup_u8(bytes.as_ptr().add(60))));
+            out.extend(transmute::<_, [u64; 4]>(vld2q_f64(bytes.as_ptr().add(16) as *const f64)));
+            let mut stored = [0u8; 80];
+            vst1q_u8_x2(stored.as_mut_ptr().add(1), pair);
+            vst1_f64_x3(stored.as_mut_ptr().add(33) as *mut f64, transmute([1.5f64, -0.0, f64::NAN]));
+            vst1q_u32_x4(stored.as_mut_ptr().add(13) as *mut u32, transmute(*bytes));
+            out.extend(stored.chunks(8).map(|it| u64::from_le_bytes(it.try_into().unwrap())));
+            out
+        }
+    }
+
+    #[target_feature(enable = "rdm")]
+    unsafe fn rounding_doubling(a: int16x8_t, b: int16x8_t, c: int32x4_t) -> ([i16; 8], [i32; 4]) {
+        unsafe {
+            let d = vreinterpretq_s32_s16(b);
+            (transmute(vqrdmlahq_s16(a, b, vdupq_n_s16(i16::MIN))), transmute(vqrdmlshq_s32(c, d, d)))
+        }
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dots(a: int8x16_t, b: int8x16_t) -> ([i32; 4], [u32; 2]) {
+        unsafe {
+            let sums = vdupq_n_s32(i32::MAX - 3);
+            let (u, v) = (vreinterpretq_u8_s8(a), vreinterpretq_u8_s8(b));
+            (transmute(vdotq_s32(sums, a, b)), transmute(vdot_u32(vdup_n_u32(7), vget_low_u8(u), vget_high_u8(v))))
+        }
+    }
+
+    #[target_feature(enable = "i8mm")]
+    unsafe fn matrices(a: int8x16_t, b: int8x16_t) -> [[i32; 4]; 4] {
+        unsafe {
+            let sums = transmute([1i32, -1, i32::MIN, 3]);
+            let (u, v) = (vreinterpretq_u8_s8(a), vreinterpretq_u8_s8(b));
+            [
+                transmute(vmmlaq_s32(sums, a, b)),
+                transmute(vmmlaq_u32(vreinterpretq_u32_s32(sums), u, v)),
+                transmute(vusmmlaq_s32(sums, u, b)),
+                transmute(vusdotq_s32(sums, u, b)),
+            ]
+        }
+    }
+
+    #[target_feature(enable = "fcma")]
+    unsafe fn complex(a: float32x4_t, b: float32x4_t, c: float64x2_t, d: float64x2_t) -> Vec<u64> {
+        let mut out = Vec::new();
+        for v in [vcmlaq_f32(a, b, a), vcmlaq_rot180_f32(b, a, b), vcaddq_rot90_f32(a, b)] {
+            out.extend(f32s(v).map(u64::from));
+        }
+        let low = vcombine_f32(vcmla_rot270_f32(vget_low_f32(b), vget_high_f32(a), vget_low_f32(b)), vcadd_rot270_f32(vget_high_f32(a), vget_low_f32(b)));
+        out.extend(f32s(low).map(u64::from));
+        out.extend(f64s(vcmlaq_rot90_f64(c, d, c)));
+        out
+    }
+
+    #[target_feature(enable = "aes")]
+    unsafe fn polynomial(a: u64, b: u64) -> u128 {
+        vmull_p64(a, b)
+    }
+
+    #[target_feature(enable = "sha3")]
+    unsafe fn sha3(a: uint8x16_t, b: uint8x16_t, c: uint8x16_t) -> [u64; 6] {
+        unsafe {
+            let (x, y, z) = (vreinterpretq_s32_u8(a), vreinterpretq_s32_u8(b), vreinterpretq_s32_u8(c));
+            let words: [[u64; 2]; 3] = [
+                transmute(veor3q_u8(a, b, c)),
+                transmute(vbcaxq_s32(x, y, z)),
+                transmute(vrax1q_u64(vreinterpretq_u64_u8(a), vreinterpretq_u64_u8(c))),
+            ];
+            transmute(words)
+        }
+    }
+
+    #[target_feature(enable = "sha2")]
+    unsafe fn sha1(a: uint32x4_t, b: uint32x4_t) -> [[u32; 4]; 4] {
+        unsafe {
+            let e = vgetq_lane_u32::<3>(b);
+            [
+                transmute(vsha1cq_u32(a, e, b)),
+                transmute(vsha1mq_u32(b, e, a)),
+                transmute(vsha1pq_u32(a, e ^ 0x5a5a, b)),
+                [vsha1h_u32(e), vsha1h_u32(0x8000_0001), 0, 0],
+            ]
+        }
+    }
+
+    #[target_feature(enable = "jsconv")]
+    unsafe fn javascript() -> [i32; 6] {
+        [1e10, -3.75, f64::NAN, -0.0, 4294967296.0 + 5.0, f64::INFINITY].map(|it| __jcvt(it))
+    }
+
+    /// Barriers and hints do nothing that shows: they are compiled and run.
+    pub fn barriers() -> u32 {
+        unsafe {
+            __dmb(SY);
+            __dmb(ISHLD);
+            __dsb(ISH);
+            __dsb(OSHST);
+            __isb(SY);
+            __yield();
+        }
+        7
+    }
+
+    #[target_feature(enable = "rand")]
+    unsafe fn random() -> (i32, i32) {
+        unsafe {
+            let mut value = 0;
+            let status = __rndr(&mut value);
+            let mut again = 0;
+            (status, __rndrrs(&mut again).min(0))
+        }
+    }
+
+    pub fn run() -> String {
+        unsafe {
+            let a = vld1q_f32(SINGLES.as_ptr());
+            let b = vld1q_f32(SINGLES2.as_ptr());
+            let c = vld1q_f64(DOUBLES.as_ptr());
+            let d = vld1q_f64(DOUBLES2.as_ptr());
+            let first: [i8; 16] = [i8::MIN, -1, 0, 1, i8::MAX, 100, -100, 3, -128, 127, 64, -65, 7, 0, -2, 33];
+            let second: [i8; 16] = [i8::MIN, 1, -1, 0, i8::MAX, -100, 100, -7, 9, -1, 63, 65, 8, -128, 2, 31];
+            let (x, y) = (vld1q_s8(first.as_ptr()), vld1q_s8(second.as_ptr()));
+            let (u, v) = (vreinterpretq_u8_s8(x), vreinterpretq_u8_s8(y));
+            let mut bytes = [0u8; 64];
+            for (i, it) in bytes.iter_mut().enumerate() {
+                *it = (i as u8).wrapping_mul(37) ^ 0x5c;
+            }
+            let mut out = format!(
+                "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {}",
+                reductions(a, c),
+                reductions(b, d),
+                floats(a, b, c, d),
+                conversions(vld1q_f32([1.5f32, -2.5, 3.0e9, -0.5].as_ptr()), vld1q_f64([-2.5f64, 1.8e19].as_ptr())),
+                conversions(a, c),
+                rounding(vld1q_f32([0.5f32, -1.5, 2.5, -0.0].as_ptr()), vld1q_f64([2.5f64, -3.5].as_ptr())),
+                integers(x, y),
+                (narrowing(x, y), tables(u, v), memory(&bytes)),
+                barriers(),
+            );
+            let detected = |feature: &str| match feature {
+                "frintts" => std::arch::is_aarch64_feature_detected!("frintts"),
+                "rdm" => std::arch::is_aarch64_feature_detected!("rdm"),
+                "dotprod" => std::arch::is_aarch64_feature_detected!("dotprod"),
+                "i8mm" => std::arch::is_aarch64_feature_detected!("i8mm"),
+                "fcma" => std::arch::is_aarch64_feature_detected!("fcma"),
+                "aes" => std::arch::is_aarch64_feature_detected!("aes"),
+                "sha3" => std::arch::is_aarch64_feature_detected!("sha3"),
+                "sha2" => std::arch::is_aarch64_feature_detected!("sha2"),
+                "jsconv" => std::arch::is_aarch64_feature_detected!("jsconv"),
+                _ => std::arch::is_aarch64_feature_detected!("rand"),
+            };
+            if detected("frintts") {
+                out += &format!(" frintts {:?}", bounded_rounding(a, vld1q_f64([2.5e9f64, -9.3e18].as_ptr())));
+            }
+            if detected("rdm") {
+                out += &format!(" rdm {:?}", rounding_doubling(vreinterpretq_s16_s8(x), vreinterpretq_s16_s8(y), vreinterpretq_s32_s8(x)));
+            }
+            if detected("dotprod") {
+                out += &format!(" dotprod {:?}", dots(x, y));
+            }
+            if detected("i8mm") {
+                out += &format!(" i8mm {:?}", matrices(x, y));
+            }
+            if detected("fcma") {
+                out += &format!(" fcma {:?}", complex(b, vld1q_f32([1.0f32, -2.0, 0.5, 3.0].as_ptr()), d, vld1q_f64([1.5f64, -0.25].as_ptr())));
+            }
+            if detected("aes") {
+                out += &format!(" aes {:?}", (polynomial(u64::MAX, 0x8000_0000_0000_0001), polynomial(0x1b, 0x87)));
+            }
+            if detected("sha3") {
+                out += &format!(" sha3 {:?}", sha3(u, v, veorq_u8(u, vdupq_n_u8(0x3c))));
+            }
+            if detected("sha2") {
+                out += &format!(" sha2 {:?}", sha1(vreinterpretq_u32_s8(x), vreinterpretq_u32_s8(y)));
+            }
+            if detected("jsconv") {
+                out += &format!(" jsconv {:?}", javascript());
+            }
+            if detected("rand") {
+                out += &format!(" rand {:?}", random());
+            }
+            out
+        }
+    }
+}
+
+/// Portable vectors of fewer than 64 bits by value, which AArch64's LLVM passes in a vector
+/// register with their lanes widened (`<4 x u8>` as `<4 x u16>`), or after their one lane: the
+/// runner, which rustc builds, calls these and hands them back.
+#[cfg(feature = "nightly")]
+pub mod small_vectors {
+    use std::simd::Simd;
+
+    pub fn bytes(a: Simd<u8, 4>, b: Simd<u8, 4>) -> Simd<u8, 4> {
+        a + b + Simd::splat(1)
+    }
+    pub fn halves(a: Simd<i16, 2>, b: Simd<u8, 2>) -> Simd<i16, 2> {
+        a * Simd::splat(3) - Simd::from_array([b[0] as i16, b[1] as i16])
+    }
+    pub fn pair(a: Simd<u8, 2>, b: Simd<i8, 4>) -> Simd<u8, 2> {
+        Simd::from_array([a[1] ^ b[3] as u8, a[0].wrapping_add(b[0] as u8)])
+    }
+    pub fn single(a: Simd<i8, 1>, b: Simd<i16, 1>, c: Simd<u8, 1>) -> Simd<i16, 1> {
+        Simd::from_array([b[0].wrapping_mul(a[0] as i16) ^ c[0] as i16])
+    }
+    pub fn single_byte(a: Simd<i8, 1>) -> Simd<i8, 1> {
+        Simd::from_array([a[0].wrapping_neg()])
+    }
+    /// Through a function pointer, which no inlining sees through.
+    pub fn called(f: fn(Simd<u8, 4>, Simd<u8, 4>) -> Simd<u8, 4>) -> [u8; 4] {
+        f(Simd::from_array([250, 1, 2, 3]), Simd::from_array([10, 20, 30, 40])).to_array()
     }
 }
 

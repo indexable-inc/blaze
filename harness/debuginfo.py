@@ -410,10 +410,6 @@ BEHIND = "behind rustc"
 
 # What is known to be wrong, and why.
 OPEN = set()
-# Under LLVM gdb shows a slice's length and not its elements, `&[i32](size=2)` where rustc's build
-# shows `&[i32](size=2) = {2, 3}`; not looked into yet. Windows asks cdb, which has no such check.
-if LLVM and sys.platform == "linux":
-    OPEN |= {"types: the debugger shows them"}
 
 
 class Tally:
@@ -1140,13 +1136,33 @@ def callers(tally):
 
 
 def printed_by(debugger, binary, cwd, place, names):
-    """What a debugger prints for each of the names when stopped at a place, addresses aside."""
+    """What a debugger prints for each of the names when stopped at a place, addresses aside.
+
+    gdb prints `<optimized out>` for a value it has no location for, but not always: for an
+    enum, whose variant it works out from the value, it fails to read memory at address 0, and
+    the pretty-printer of a `&str` fails with "value has been optimized out" and leaves the
+    value blank. rustc's optimized builds get the same. Where gdb printed no value and said
+    the value is optimized out, or `info address` says the symbol is, the name is optimized out."""
+    def mark(name):
+        """A line that starts what is said of the name, on both of gdb's streams."""
+        return (f"echo @@{name}@@\\n", f"python gdb.write('@@{name}@@\\n', gdb.STDERR)")
     commands = ["set pagination off", "set startup-with-shell off", f"break {place}", "run",
-                *[x for name in names for x in (f"echo <{name}>\\n", f"print {name}")], "kill"]
+                *[x for name in names for x in (*mark(name), f"print {name}", f"info address {name}")], *mark(""), "kill"]
     ran = subprocess.run([debugger, "-q", "-batch", *[x for c in commands for x in ("-ex", c)], binary],
                          capture_output=True, text=True, errors="replace", cwd=cwd, timeout=300)
-    found = {name: re.search(rf"<{re.escape(name)}>\n\$\d+ = (.*)", ran.stdout) for name in names}
-    return {name: re.sub(r"0x[0-9a-f]+", "0x..", it.group(1)) if it else None for name, it in found.items()}
+
+    def said(stream, name):
+        found = re.search(rf"^@@{re.escape(name)}@@\n(.*?)^@@", stream, re.S | re.M)
+        return found.group(1) if found else ""
+    printed = {}
+    for name in names:
+        out = said(ran.stdout, name)
+        value = re.search(r"^\$\d+ = (.*)", out, re.M)
+        value = value.group(1) if value else None
+        if not value and ("value has been optimized out" in said(ran.stderr, name) or f'Symbol "{name}" is optimized out.' in out):
+            value = OPTIMIZED_OUT
+        printed[name] = re.sub(r"0x[0-9a-f]+", "0x..", value) if value is not None else None
+    return printed
 
 
 def kept_by_rustc(ws, asked):

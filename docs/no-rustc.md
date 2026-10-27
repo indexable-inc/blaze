@@ -154,7 +154,11 @@ project's own pin does not change which Rust blaze builds with
 ([#269](https://github.com/indexable-inc/blaze/issues/269)). blaze's manifest reader, registry
 and resolver (`crates/blaze-manifest`, `blaze-registry`, `blaze-resolve`) replace `cargo
 metadata`, `cargo build --unit-graph` and cargo's fetching, held equal to cargo's by
-`harness/resolve.py`; with them K needs no cargo to plan a build.
+`harness/resolve.py`; with them K needs no cargo to plan a build. Since 2026-10-27 the standard library's
+workspace is read by them too (`OwnMetadata.library`, `harness/resolve.py sysroot`): the cargo
+processes of a cold `cargo blaze build` and `test` from a clean `target/` (strace, Linux arm64,
+the typed `cargo blaze` included) went from 14 to 8 and 12 to 8 on `harness/norustc/fixture`, 26
+to 8 and 43 to 15 on ripgrep, none of them for the sysroot.
 
 ## While the paths remain
 
@@ -249,7 +253,7 @@ Paths are under `crates/`; line numbers are of 41e7906192.
 
 | Where | What it does | When |
 |---|---|---|
-| `ra-jit/src/main.rs:2261` `ProjectWorkspace::load` | `cargo metadata`, plus rustc's `-vV`, `--print sysroot`, `--print cfg`, `--print target-spec-json` through `cargo rustc --print` (`vendor/rust-analyzer/crates/project-model/src/toolchain_info/`) | every load: the daemon's workers and spares, and each doctest process; since B, ra-jit answers them (`answers/own.rs`) |
+| `ra-jit/src/main.rs:2261` `ProjectWorkspace::load` | `cargo metadata`, plus rustc's `-vV`, `--print sysroot`, `--print cfg`, `--print target-spec-json` through `cargo rustc --print` (`vendor/rust-analyzer/crates/project-model/src/toolchain_info/`) | every load: the daemon's workers and spares, and each doctest process; since B, ra-jit answers them (`answers/own.rs`); the `cargo metadata` of the sysroot's `library/` (rust-analyzer's `Sysroot::load_workspace`, two per load and per unit load of a build script or proc macro) is blaze-metadata's since 2026-10-27 (`cargo/metadata.rs` `library`) |
 | `ra-jit/src/main.rs:2272` | asks rustc for the target triple | every load |
 | `ra-jit/src/plan.rs:475` | `cargo build --unit-graph`, which asks rustc about the target | every load, and every doctest run per library |
 | `ra-jit/src/main.rs:2314`, `ra-jit/src/inputs.rs:282` `run_build_scripts` | rust-analyzer's `cargo check --compile-time-deps`: into ra-jit's own target directory (every load of `cargo ra-jit` and the daemon) nothing is rustc's since 2026-10-27 (J, below): ra-jit links the scripts and proc macros and only describes their libraries; into cargo's (a load without `--own-target`) rustc compiles them all; the scripts run | a load that is neither beside nor after a cargo build of the workspace (a worker after one reads what cargo said, `cargo/state.rs` `kept_said`), whose target directory does not have them yet; after an edit to a proc macro or build script |
@@ -688,8 +692,17 @@ builds, links and runs with nothing rustc built, and 19 of its commands (searche
 ra-jit cannot compile (1,786 of the library's: 534 for f16 and f128, most of the rest
 `core::arch`'s SIMD; the 222 intrinsics declared with no body are not functions to compile,
 every call to one being the compiler's own code) is, where something calls it, a hidden stand-in
-that says so when it runs; a program that calls one compiles its own copy and is told at its
-build. The unit is what the program takes of the library and everything that depends on, but
+that says so when it runs. A program that reaches one is not built: a function of its own
+crates ra-jit refused (its `main`, or one only code of the object calls, its own copy of an
+`#[inline]` function of the library's among them) stops the build before the link, and a stand-in
+the link keeps, the library unit's included, fails it after; either way the error names each
+function and why it was refused (`` `p` reaches 1 function ra-jit could not compile, and a build
+with nothing of rustc's has nothing else to compile it, so it is not built:``), and no
+executable is left. A function the library exports by name that nothing in it calls has no
+stand-in, as one exported under the name could take the place of a definition the program
+links from elsewhere (libgcc's soft float is named as the library's is): the unit keeps a list
+of those it refused beside it and in the store, and a link that fails on one of their names
+is the same error, naming the function and why. The unit is what the program takes of the library and everything that depends on, but
 `test`, `proc_macro` and the panic runtime the program does not link, which rust-analyzer's
 graph has every crate depend on: 21 crates, `rand` and `foldhash` among them, which std's own
 workspace adds to its graph and which nothing compiled uses. The library's build names only the
@@ -703,7 +716,7 @@ over ripgrep: 2.5 s against 0.25 s), and the native libraries the crates linked 
 `#[link(name, kind, modifiers, cfg)]`, read from their `extern` blocks, a crate's before those
 of the crates it depends on; no list of libraries is fixed. What the link leaves out it proves
 unreachable, so a stand-in left in the executable is a function the program can reach that
-ra-jit could not compile: ra-jit says how many after the link, and `allrajit.py` fails on any.
+ra-jit could not compile: ra-jit says how many after the link and fails on any.
 None is left in hello, the four `allrajit.py` programs or ripgrep. The rest of what rustc
 does around the link: the allocator shim calls the `#[global_allocator]`'s methods (through the
 four functions the attribute's expansion exports) or else std's defaults; the panic runtime is

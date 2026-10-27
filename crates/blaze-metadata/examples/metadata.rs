@@ -2,19 +2,22 @@
 //! which compares it with cargo's.
 //!
 //! usage: metadata [--manifest-path P] [--filter-platform TRIPLE --cfg-file F] [--features F]
-//!                 [--all-features] [--no-default-features] [--offline]
+//!                 [--all-features] [--no-default-features] [--offline] [--no-deps | --locked]
 //!                 [--build [-p NAME]... [--workspace] [--exclude NAME]... [--dev-units]
 //!                  [--programs [--bin NAME | --example NAME]]]
 //!
 //! `--cfg-file` is what `rustc --print cfg --target TRIPLE` prints. With `--build`, the graph is
 //! that of `cargo build` with the same flags; with `--programs` too, what it prints is the
-//! programs that build links instead, a JSON list.
+//! programs that build links instead, a JSON list. `--no-deps` is `cargo metadata --no-deps`;
+//! `--locked` never writes the lock file, as the standard library's workspace is read.
 
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
-use blaze_metadata::{Asked, Build, TargetPlatform, Targets, metadata, programs};
+use blaze_metadata::{
+    Asked, Build, TargetPlatform, Targets, metadata, metadata_locked, metadata_no_deps, programs,
+};
 use blaze_resolve::Cfg;
 
 fn main() -> Result<()> {
@@ -26,6 +29,7 @@ fn main() -> Result<()> {
     let (mut build, mut workspace, mut dev_units) = (false, false, false);
     let (mut packages, mut excludes) = (Vec::new(), Vec::new());
     let (mut listed, mut bin, mut example) = (false, None, None);
+    let (mut no_deps, mut locked) = (false, false);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || args.next().with_context(|| format!("{arg} takes a value"));
@@ -39,6 +43,8 @@ fn main() -> Result<()> {
             "--all-features" => all_features = true,
             "--no-default-features" => no_default_features = true,
             "--offline" => offline = true,
+            "--no-deps" => no_deps = true,
+            "--locked" => locked = true,
             "--build" => build = true,
             "--workspace" => workspace = true,
             "--dev-units" => dev_units = true,
@@ -79,8 +85,13 @@ fn main() -> Result<()> {
         store: None,
     };
     if listed {
-        let targets = Targets { bin: bin.as_deref(), example: example.as_deref() };
+        let targets =
+            Targets { bin: bin.as_deref(), example: example.as_deref(), lib: false, test: None };
         println!("{}", serde_json::to_string(&programs(&asked, targets)?.1)?);
+    } else if no_deps {
+        println!("{}", metadata_no_deps(&asked)?);
+    } else if locked {
+        println!("{}", metadata_locked(&asked)?);
     } else {
         println!("{}", metadata(&asked)?);
     }

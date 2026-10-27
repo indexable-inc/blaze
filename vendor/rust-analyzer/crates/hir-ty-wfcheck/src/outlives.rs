@@ -297,6 +297,93 @@ pub(crate) fn projection_needs<'db>(
     ty: Ty<'db>,
     out: &mut Vec<Needs<'db>>,
 ) {
+    let interner = DbInterner::new_no_crate(db);
+    let mut aliases = Vec::new();
+    walk(ty, &mut aliases);
+    let predicates = aliases
+        .into_iter()
+        .filter_map(|it| match it.kind() {
+            TyKind::Alias(alias)
+                if matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. })
+                    && !it.has_escaping_bound_vars()
+                    && !it.references_error() =>
+            {
+                Some(trait_predicate(interner, alias))
+            }
+            _ => None,
+        })
+        .collect();
+    prove_needs(db, def, predicates, out);
+}
+
+/// What proving the trait bounds the well-formedness of `ty` asks needs of what outlives what,
+/// given the where clauses of `def`: of each associated type in it, that its trait is
+/// implemented, and of each struct or enum, its where clauses. `ServiceChainBuilder<
+/// ServiceChain<P, S>, NS>` of `struct ServiceChainBuilder<P: Service, ..>` with only
+/// `impl<P: Service, S: Service> Service for ServiceChain<P, S> where P::Error: 'static`
+/// needs `P::Error: 'static`.
+pub(crate) fn trait_needs<'db>(
+    db: &'db dyn HirDatabase,
+    def: hir_def::GenericDefId,
+    ty: Ty<'db>,
+    out: &mut Vec<Needs<'db>>,
+) {
+    use rustc_type_ir::inherent::Clause as _;
+    let interner = DbInterner::new_no_crate(db);
+    let mut tys = Vec::new();
+    walk(ty, &mut tys);
+    let mut predicates = Vec::new();
+    for it in tys {
+        if it.has_escaping_bound_vars() || it.references_error() {
+            continue;
+        }
+        match it.kind() {
+            TyKind::Alias(alias)
+                if matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. }) =>
+            {
+                predicates.push(trait_predicate(interner, alias));
+            }
+            TyKind::Adt(adt, args) => {
+                predicates.extend(
+                    GenericPredicates::query_all(db, adt.def_id().into())
+                        .iter_instantiated(interner, args.as_slice())
+                        .map(|it| it.skip_norm_wip())
+                        .filter(|it| {
+                            matches!(
+                                it.kind().skip_binder(),
+                                ClauseKind::Trait(_) | ClauseKind::Projection(_)
+                            ) && !it.references_error()
+                        })
+                        .map(|it| it.as_predicate()),
+                );
+            }
+            _ => (),
+        }
+    }
+    prove_needs(db, def, predicates, out);
+}
+
+fn trait_predicate<'db>(
+    interner: DbInterner<'db>,
+    alias: AliasTy<'db>,
+) -> hir_ty::next_solver::Predicate<'db> {
+    use rustc_type_ir::Upcast as _;
+    rustc_type_ir::TraitPredicate {
+        trait_ref: alias.trait_ref(interner),
+        polarity: rustc_type_ir::PredicatePolarity::Positive,
+    }
+    .upcast(interner)
+}
+
+/// What proving `predicates` with the trait solver needs of what outlives what, given the
+/// where clauses of `def`: the where clauses of the impls that prove them. Nothing when one
+/// is not proven.
+fn prove_needs<'db>(
+    db: &'db dyn HirDatabase,
+    def: hir_def::GenericDefId,
+    predicates: Vec<hir_ty::next_solver::Predicate<'db>>,
+    out: &mut Vec<Needs<'db>>,
+) {
     use hir_def::HasModule as _;
     use hir_ty::next_solver::{
         TypingMode,
@@ -307,27 +394,14 @@ pub(crate) fn projection_needs<'db>(
         },
         obligation_ctxt::ObligationCtxt,
     };
-    let mut aliases = Vec::new();
-    walk(ty, &mut aliases);
-    aliases.retain(|it| {
-        matches!(it.kind(), TyKind::Alias(alias)
-            if matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. }))
-            && !it.has_escaping_bound_vars()
-            && !it.references_error()
-    });
-    if aliases.is_empty() {
+    if predicates.is_empty() {
         return;
     }
     let interner = DbInterner::new_with(db, def.module(db).krate(db)).with_regions();
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
     let env = db.trait_environment(def);
-    for alias in aliases {
-        let TyKind::Alias(alias) = alias.kind() else { continue };
+    for predicate in predicates {
         let mut ocx = ObligationCtxt::new(&infcx);
-        let predicate = rustc_type_ir::TraitPredicate {
-            trait_ref: alias.trait_ref(interner),
-            polarity: rustc_type_ir::PredicatePolarity::Positive,
-        };
         ocx.register_obligation(Obligation::new(
             interner,
             ObligationCause::dummy(),
@@ -348,14 +422,19 @@ pub(crate) fn projection_needs<'db>(
     let mut equal: FxHashMap<rustc_type_ir::RegionVid, Region<'db>> = FxHashMap::default();
     for constraint in &constraints {
         if let Constraint::VarSubReg(var, region) | Constraint::RegSubVar(region, var) = *constraint
-            && matches!(region.kind(), RegionKind::ReEarlyParam(_) | RegionKind::ReStatic)
+            && matches!(
+                region.kind(),
+                RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) | RegionKind::ReStatic
+            )
         {
             equal.entry(var).or_insert(region);
         }
     }
     let resolve = |region: Region<'db>| match region.kind() {
         RegionKind::ReVar(var) => equal.get(&var).copied(),
-        RegionKind::ReEarlyParam(_) | RegionKind::ReStatic => Some(region),
+        RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) | RegionKind::ReStatic => {
+            Some(region)
+        }
         _ => None,
     };
     for (ty, region) in obligations {
@@ -618,6 +697,80 @@ impl<'db> Known<'db> {
             }
         }
         false
+    }
+
+    /// The associated types in `ty` not known to outlive `region`, as rustc's
+    /// `alias_bound`s: one does when the where clauses say so, when the trait declares it
+    /// does (`type Error: 'static`), or when each of its arguments does.
+    pub(crate) fn failing_aliases(
+        &self,
+        db: &'db dyn HirDatabase,
+        ty: Ty<'db>,
+        region: Region<'db>,
+    ) -> Vec<Ty<'db>> {
+        let mut failing = Vec::new();
+        if !matches!(
+            region.kind(),
+            RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) | RegionKind::ReStatic
+        ) {
+            return failing;
+        }
+        for component in components(ty) {
+            if let Component::Alias(alias) = component
+                && !failing.contains(&alias)
+                && !self.alias_outlives(db, alias, region, 0)
+            {
+                failing.push(alias);
+            }
+        }
+        failing
+    }
+
+    fn alias_outlives(
+        &self,
+        db: &'db dyn HirDatabase,
+        ty: Ty<'db>,
+        region: Region<'db>,
+        depth: usize,
+    ) -> bool {
+        let TyKind::Alias(alias) = ty.kind() else { return true };
+        if depth > 8
+            || !matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. })
+            || ty.has_non_region_infer()
+            || ty.references_error()
+            || self
+                .types
+                .iter()
+                .any(|&(known, bound)| known == ty && self.region_outlives(bound, region))
+        {
+            return true;
+        }
+        let interner = DbInterner::new_no_crate(db);
+        let declared = rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id())
+            .iter_instantiated(interner, alias.args.as_slice())
+            .any(|clause| match clause.kind().skip_binder() {
+                ClauseKind::TypeOutlives(OutlivesPredicate(bounded, bound)) => {
+                    bounded == ty
+                        && !bound.has_escaping_bound_vars()
+                        && self.region_outlives(bound, region)
+                }
+                _ => false,
+            });
+        if declared {
+            return true;
+        }
+        alias.args.iter().all(|arg| match arg.kind() {
+            GenericArgKind::Lifetime(longer) => self.region_outlives(longer, region),
+            GenericArgKind::Type(arg) => components(arg).into_iter().all(|it| match it {
+                Component::Region(longer) => self.region_outlives(longer, region),
+                Component::Param(param) => self
+                    .types
+                    .iter()
+                    .any(|&(known, bound)| known == param && self.region_outlives(bound, region)),
+                Component::Alias(inner) => self.alias_outlives(db, inner, region, depth + 1),
+            }),
+            GenericArgKind::Const(_) => true,
+        })
     }
 
     /// The type parameters in `ty` not known to outlive `region`. Associated types count as

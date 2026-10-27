@@ -3,6 +3,10 @@
 //! The `patched` workspace's fixtures are cargo 1.99.0's (`workspace_resolve/patched.sh`
 //! writes them).
 
+// The fixtures are cargo's output for a workspace at `/ws` on Linux: `path+file:///ws` ids,
+// which a Windows path is not, and `/ws` is no absolute path there.
+#![cfg(unix)]
+
 use std::collections::BTreeMap;
 use std::path::Path;
 

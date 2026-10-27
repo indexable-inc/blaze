@@ -124,14 +124,22 @@ jobs:
         env:
           RUSTC_WRAPPER: sccache
       - run: sccache --show-stats
+      # blaze's proc-macro server beside ra-jit, as a release has it: a load into ra-jit's own
+      # target directory has ra-jit link every proc macro for that server, and fails without
+      # one ("ra-jit did not build the proc macro", docs/no-rustc.md, J). Linux only, as the
+      # release builds it: ra-jit does not build the server on macOS yet (train run 40483813878).
+      - name: blaze's proc-macro server
+        if: runner.os == 'Linux'
+        run: nix develop --command python3 .github/scripts/build_release.py --server-beside target/release/ra-jit
       # The binaries run each other from next to themselves (`ra-jit enable` links `cargo fmt`
-      # and `cargo clippy` to the cargo-blaze beside it, and fails without one). A tar keeps
-      # them executable.
+      # and `cargo clippy` to the cargo-blaze beside it, and fails without one; a load finds
+      # blaze-proc-macro-srv beside ra-jit). A tar keeps them executable.
       - name: Pack
         working-directory: target/release
         run: |
           exe=$([ "$RUNNER_OS" = Windows ] && echo .exe || true)
-          tar -cf ra-jit.tar ra-jit$exe cargo-ra-jit$exe cargo-blaze$exe blaze$exe ra-jit-rustc$exe ra-jit-rustc-first$exe
+          server=$([ -f blaze-proc-macro-srv ] && echo blaze-proc-macro-srv || true)
+          tar -cf ra-jit.tar ra-jit$exe cargo-ra-jit$exe cargo-blaze$exe blaze$exe ra-jit-rustc$exe ra-jit-rustc-first$exe $server
       - uses: actions/upload-artifact@v7
         with:
           name: ra-jit-${{ inputs.platform }}

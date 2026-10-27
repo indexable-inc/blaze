@@ -2,6 +2,10 @@
 //! from the directory its `fixture.json` names, against what cargo 1.99 printed for it
 //! (`expected.json`, written by `harness/resolve.py --fixtures`).
 
+// `expected.json` is what cargo printed on Linux: `/` in its paths and `file:///` ids of
+// them. On Windows cargo prints `\` and `file:///C:/` there, which these were not recorded with.
+#![cfg(unix)]
+
 use std::path::{Path, PathBuf};
 
 use blaze_manifest::diagnostic::ManifestDiagnostic;

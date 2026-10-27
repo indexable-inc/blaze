@@ -1097,18 +1097,29 @@ def poisoned(top, remote, a, crates, target, workspace, address, bucket, expecte
         m.cargo(target)
         return m
 
-    # 1. The pack A sent, changed in place: its name no longer fits.
-    pack = "packs/" + listed[0][0] + ".pack"
-    data = bucket.get(pack)
-    records = records_of(data)
-    changed = pack_of([(key, value[:-1] + bytes([value[-1] ^ 0x55]) if value else value) for key, value in records])
-    bucket.put(pack, changed)
+    # 1. Every pack A sent, changed in place: no name fits. A pack that compresses to a quarter
+    #    less is sent as `.pack.zst` and listed with what was sent (six fields). Which packs
+    #    those are, and the order the manifest lists them in, change from build to build, and
+    #    one pack can be enough for B to compile almost nothing: so all of them are changed.
+    def change(fields):
+        compressed = len(fields) == 6
+        name = "packs/" + fields[0] + ".pack" + (".zst" if compressed else "")
+        data = bucket.get(name)
+        records = records_of(unpacked(data) if compressed else data)
+        changed = pack_of([(key, value[:-1] + bytes([value[-1] ^ 0x55]) if value else value) for key, value in records])
+        bucket.put(name, packed(changed) if compressed else changed)
+        return name, data, records, changed
+
+    sent = [change(fields) for fields in listed]
+    _, _, records, changed = sent[0]
     b = machine("changed")
     log, _ = b.build(crates, env={"RA_JIT_REMOTE": address})
     check("code changed under A's name: rejected, B compiles its own and prints the same",
-          "rejected " + pack in log and compiled(log) > 0 and b.run() == expected and listed[0][0] + ".pack" not in b.packs(),
-          f"{compiled(log)} compiled")
-    bucket.put(pack, data)
+          all("rejected " + name in log for name, *_ in sent) and compiled(log) > 0 and b.run() == expected
+          and not any(fields[0] + ".pack" in b.packs() for fields in listed),
+          f"{len(sent)} packs, {compiled(log)} compiled")
+    for name, data, *_ in sent:
+        bucket.put(name, data)
 
     # 2. The same with the manifest rewritten to name the changed pack by its own hash: every
     #    hash fits. Only a signature tells this list from A's.

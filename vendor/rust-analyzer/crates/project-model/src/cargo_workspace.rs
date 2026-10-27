@@ -172,17 +172,34 @@ type Metadata = dyn Fn(
     + Send
     + Sync;
 
+/// `cargo metadata` of the standard library's workspace at the manifest given (a toolchain's
+/// `library/Cargo.toml`), as `Sysroot::load_workspace` asks cargo for it: with the features
+/// given, for the target with the triple given (none: every platform's), `--no-deps` or not,
+/// cargo run with the variables given.
+type Library = dyn Fn(
+        &ManifestPath,
+        &CargoFeatures,
+        Option<&str>,
+        bool,
+        &FxHashMap<String, Option<String>>,
+    ) -> anyhow::Result<cargo_metadata::Metadata>
+    + Send
+    + Sync;
+
 /// What reads a workspace in place of `cargo locate-project` and `cargo metadata`.
 #[derive(Clone)]
 pub struct OwnMetadata {
     pub root: std::sync::Arc<Root>,
     pub metadata: std::sync::Arc<Metadata>,
+    /// The standard library's workspace, which cargo is never asked for when this is set.
+    pub library: std::sync::Arc<Library>,
 }
 
 impl PartialEq for OwnMetadata {
     fn eq(&self, other: &OwnMetadata) -> bool {
         std::sync::Arc::ptr_eq(&self.root, &other.root)
             && std::sync::Arc::ptr_eq(&self.metadata, &other.metadata)
+            && std::sync::Arc::ptr_eq(&self.library, &other.library)
     }
 }
 
@@ -351,6 +368,8 @@ pub struct CargoMetadataConfig {
     /// The toolchain version, if known.
     /// Used to conditionally enable unstable cargo features.
     pub toolchain_version: Option<semver::Version>,
+    /// What reads the standard library's workspace in place of cargo (`kind` "sysroot").
+    pub own_metadata: Option<OwnMetadata>,
 }
 
 // Deserialize helper for the cargo metadata

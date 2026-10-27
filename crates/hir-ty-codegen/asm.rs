@@ -49,6 +49,22 @@ pub(super) fn isb() -> String {
     format!(".globl {SYMBOL}\n{SYMBOL}:\nisb\nret\n")
 }
 
+/// A function of the one AArch64 instruction whose word is `word`.
+pub(super) fn instruction_word(word: u32) -> String {
+    format!(".globl {SYMBOL}\n{SYMBOL}:\n.inst {word:#010x}\nret\n")
+}
+
+/// Writes a random number of AArch64's `RNDR` (or `RNDRRS`, `reseeded`) where its argument
+/// points, and after it a byte that is 1 when there was none. The registers are named by
+/// number, which needs no extension of the assembler.
+pub(super) fn random(reseeded: bool) -> String {
+    let register = if reseeded { "s3_3_c2_c4_1" } else { "s3_3_c2_c4_0" };
+    format!(
+        ".globl {SYMBOL}\n{SYMBOL}:\nmrs x9, {register}\ncset w10, eq\nstr x9, [x0]\n\
+         strb w10, [x0, #8]\nret\n"
+    )
+}
+
 /// AArch64's CRC-32 of its second argument into the checksum of its first, as `instruction`
 /// (`crc32b` to `crc32cx`) says: the `x` ones read 64 bits.
 pub(super) fn crc32(instruction: &str) -> String {
@@ -157,6 +173,8 @@ fn aarch64_extension(feature: &str) -> Option<&'static str> {
         "sve2-bitperm" => "sve2-bitperm",
         "tme" => "tme",
         "mops" => "mops",
+        "faminmax" => "faminmax",
+        "fp8" => "fp8",
         _ => return None,
     })
 }
@@ -208,6 +226,41 @@ pub(super) fn neon_instruction(extension: &str, instruction: &str) -> String {
         ".arch_extension {extension}\n.globl {SYMBOL}\n{SYMBOL}:\nldr q0, [x0]\nldr q1, [x1]\n\
          ldr q2, [x2]\n{instruction}\nstr q0, [x2]\nret\n"
     )
+}
+
+/// A function of AArch64 instructions on SIMD registers, an intrinsic of LLVM's as
+/// `neon::lower` has it. The first argument is where the results go and each other points at
+/// a value: `args[i]` says how many bytes of argument `i + 1` are read into `v{i+1}`, or that
+/// it is a pointer, read into `x{i+1}`. `text` runs after the reads, with `directives` (the
+/// extensions it needs) before it, and leaves the results in `v0` up: `results` says their
+/// sizes, and each is written after the one before it.
+pub(super) fn neon_function(
+    directives: &str,
+    args: &[Option<u32>],
+    text: &str,
+    results: &[(u32, u32)],
+) -> String {
+    let mut out = format!("{directives}.globl {SYMBOL}\n{SYMBOL}:\n");
+    let register = |bytes: u32| match bytes {
+        1 => 'b',
+        2 => 'h',
+        4 => 's',
+        8 => 'd',
+        _ => 'q',
+    };
+    for (i, arg) in args.iter().enumerate() {
+        let k = i + 1;
+        match arg {
+            Some(bytes) => _ = writeln!(out, "ldr {}{k}, [x{k}]", register(*bytes)),
+            None => _ = writeln!(out, "ldr x{k}, [x{k}]"),
+        }
+    }
+    _ = writeln!(out, "{text}");
+    for (k, (offset, bytes)) in results.iter().enumerate() {
+        _ = writeln!(out, "str {}{k}, [x0, #{offset}]", register(*bytes));
+    }
+    out.push_str("ret\n");
+    out
 }
 
 /// `sha1rnds4` does four rounds of SHA-1 on the vectors at its first two arguments. Which

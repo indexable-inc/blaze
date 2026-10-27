@@ -102,7 +102,7 @@ pub fn workspace_root(
 }
 
 /// A program a `cargo build` or `cargo test` links: a binary or an example of a member it
-/// builds, or a test of one.
+/// builds, a `cdylib` or `staticlib` of its library, or a test of one.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Program {
     /// The id of its package, as `cargo metadata` spells it.
@@ -125,14 +125,29 @@ pub enum Kind {
     Bin,
     Example,
     Test,
+    /// The `cdylib` of a library, which `cargo build` links as a shared library (#262).
+    Cdylib,
+    /// The `staticlib` of a library, an archive `cargo build` writes.
+    Staticlib,
 }
 
-/// The programs a build names with `--bin` or `--example`, or none for every binary; of
-/// `cargo test` (`test`), also the targets `--lib` and `--test` name.
+impl Kind {
+    /// Whether it is a library's linked output, a `cdylib` or a `staticlib`, and not an
+    /// executable.
+    pub fn linked_library(self) -> bool {
+        matches!(self, Kind::Cdylib | Kind::Staticlib)
+    }
+}
+
+/// The programs a build names with `--bin`, `--example` or `--lib`, or none for every binary
+/// and the `cdylib` and `staticlib` of each library; of `cargo test` (`test`), also the targets
+/// `--lib` and `--test` name.
 #[derive(Clone, Copy, Default)]
 pub struct Targets<'a> {
     pub bin: Option<&'a str>,
     pub example: Option<&'a str>,
+    /// `--lib` of a build: the library's `cdylib` and `staticlib`.
+    pub lib: bool,
     pub test: Option<Tests<'a>>,
 }
 
@@ -154,9 +169,14 @@ impl Targets<'_> {
     fn picks(&self, kind: Kind, name: &str, tested: bool) -> Option<bool> {
         let Some(tests) = self.test else {
             let named = match self {
-                Targets { bin: Some(asked), .. } => kind == Kind::Bin && name == *asked,
-                Targets { example: Some(asked), .. } => kind == Kind::Example && name == *asked,
-                _ => kind == Kind::Bin,
+                Targets { bin: None, example: None, lib: false, .. } => {
+                    kind == Kind::Bin || kind.linked_library()
+                }
+                _ => {
+                    (kind == Kind::Bin && self.bin == Some(name))
+                        || (kind == Kind::Example && self.example == Some(name))
+                        || (kind.linked_library() && self.lib)
+                }
             };
             return named.then_some(false);
         };
@@ -172,6 +192,7 @@ impl Targets<'_> {
             Kind::Bin => self.bin == Some(name),
             Kind::Example => self.example == Some(name),
             Kind::Test => tests.test == Some(name),
+            Kind::Cdylib | Kind::Staticlib => false,
         };
         named.then_some(kind != Kind::Example || tested)
     }
@@ -180,6 +201,28 @@ impl Targets<'_> {
 /// The JSON `cargo metadata --format-version 1` prints for `asked`.
 pub fn metadata(asked: &Asked<'_>) -> Result<String> {
     Ok(made(asked)?.json)
+}
+
+/// The JSON `cargo metadata --format-version 1 --no-deps` prints for `asked`: the members
+/// alone, nothing resolved or fetched.
+pub fn metadata_no_deps(asked: &Asked<'_>) -> Result<String> {
+    let mut config = Config::load(asked.cwd, asked.env.clone(), &[])?;
+    config.start("metadata", asked.config)?;
+    let ctx = Context::new(config);
+    let ws = Workspace::new(&root_manifest(asked.manifest_path, &ctx)?, &ctx)?;
+    Ok(serde_json::to_string(&blaze_manifest::metadata::export_no_deps(&ws))?)
+}
+
+/// [`metadata`] of a workspace whose lock file is never written, as `cargo metadata
+/// --locked` reads one: a lock file the manifests no longer agree with is cargo's
+/// `--locked` error. The standard library's workspace in a toolchain is read so.
+pub fn metadata_locked(asked: &Asked<'_>) -> Result<String> {
+    let relock =
+        Relock { command: "metadata", locked: Some("--locked"), respect_source_config: true };
+    let made = resolving_with(asked, None, Some(relock), |resolved, serialized, ids, _| {
+        described(asked, &resolved, serialized, ids)
+    })?;
+    Ok(made.json)
 }
 
 /// The metadata of `asked`'s build, and the programs it links of `targets`, as cargo's unit
@@ -220,6 +263,16 @@ pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<
                 _ if of("kind", "custom-build") => continue,
                 _ => Kind::Lib,
             };
+            // A build links a library's `cdylib` and `staticlib`, each a program of its own;
+            // its `rlib` is linked into the others.
+            let kinds: Vec<Kind> = match (kind, targets.test) {
+                (Kind::Lib, None) => [("cdylib", Kind::Cdylib), ("staticlib", Kind::Staticlib)]
+                    .into_iter()
+                    .filter(|(it, _)| of("crate_types", it))
+                    .map(|(_, kind)| kind)
+                    .collect(),
+                _ => vec![kind],
+            };
             let name = target["name"].as_str().unwrap_or_default();
             let tested = target["test"].as_bool().unwrap_or(false);
             let root = PathBuf::from(target["src_path"].as_str().unwrap_or_default());
@@ -232,21 +285,23 @@ pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<
             if kind == Kind::Bin && missing.is_empty() {
                 bins.push((name, root.clone()));
             }
-            let Some(test) = targets.picks(kind, name, tested) else { continue };
-            if !missing.is_empty() && targets.named() {
-                let listed: Vec<String> = missing.iter().map(|it| format!("`{it}`")).collect();
-                bail!(
-                    "target `{name}` in package `{}` requires the features: {}\nConsider enabling them by passing, e.g., `--features=\"{}\"`",
-                    package["name"].as_str().unwrap_or_default(),
-                    listed.join(", "),
-                    missing.join(" ")
-                );
-            }
-            if missing.is_empty() {
-                integration |= kind == Kind::Test;
-                let harness = test && !unharnessed.contains(&root);
-                let (package, name) = (id.to_owned(), name.to_owned());
-                programs.push(Program { package, name, root, kind, test, harness });
+            for kind in kinds {
+                let Some(test) = targets.picks(kind, name, tested) else { continue };
+                if !missing.is_empty() && targets.named() {
+                    let listed: Vec<String> = missing.iter().map(|it| format!("`{it}`")).collect();
+                    bail!(
+                        "target `{name}` in package `{}` requires the features: {}\nConsider enabling them by passing, e.g., `--features=\"{}\"`",
+                        package["name"].as_str().unwrap_or_default(),
+                        listed.join(", "),
+                        missing.join(" ")
+                    );
+                }
+                if missing.is_empty() {
+                    integration |= kind == Kind::Test;
+                    let harness = test && !unharnessed.contains(&root);
+                    let (package, name, root) = (id.to_owned(), name.to_owned(), root.clone());
+                    programs.push(Program { package, name, root, kind, test, harness });
+                }
             }
         }
         for (name, root) in bins.into_iter().filter(|_| integration) {

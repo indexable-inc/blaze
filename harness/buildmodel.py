@@ -203,7 +203,12 @@ class Case:
             raise Wrong("cargo failed with what ra-jit needs of it: " + run.stderr[-600:])
         printed = run.stdout + run.stderr
         if whole:
-            printed = "\n".join(l for l in printed.splitlines() if re.search(rf"[/\\]{re.escape(self.artifact_name())}-", l))
+            # The program is `deps/<name>-<hash>` in cargo's first layout of the build directory
+            # and `build/<name>/<hash>/out/<name>` in its second, where the build script's
+            # line also has the package's directory in it.
+            name = re.escape(self.artifact_name())
+            program = rf"[/\\]{name}-|[/\\]out[/\\]{name}(\.exe)?[\"'\s]"
+            printed = "\n".join(l for l in printed.splitlines() if re.search(program, l))
         try:
             # rustc's `symbols.o` asks for what the libraries need of one another, which a linker
             # that reads archives in order finds no other way: `-C save-temps` keeps the file.

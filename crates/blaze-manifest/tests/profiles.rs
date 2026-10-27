@@ -3,6 +3,9 @@
 //! `case.json` after its `PROFILE_RUNS`): the profile blaze-manifest computes for every unit,
 //! the warnings about profiles and the error when cargo refused the profiles, against cargo's.
 
+// `expected.json` is what cargo printed on Linux: its unit graph names Linux paths, put in a
+// JSON text as they are, which a Windows path's `\` is not.
+#![cfg(unix)]
 #![allow(dead_code, reason = "the example's module, of which the test uses `main`")]
 
 #[path = "../examples/profiles/walk.rs"]

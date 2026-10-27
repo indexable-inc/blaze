@@ -55,6 +55,12 @@ pub enum Site {
     Bound(GenericDefId, u32),
     /// An `impl Trait` a function returns, by its index among those of its return type.
     Opaque(FunctionId, u32),
+    /// The type of a function's parameter, by its index, `self` included.
+    Param(FunctionId, u32),
+    /// The type a function returns.
+    Output(FunctionId),
+    /// The type an impl is for.
+    SelfTy(ImplId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
@@ -186,6 +192,16 @@ impl<'db> Check<'_, 'db> {
         let Some(header) = self.header(impl_) else { return };
         let known = self.known(impl_.into(), &header);
         let mut needs = self.where_needs(impl_.into());
+        // The header is well-formed: the trait bounds that asks hold.
+        for (index, &ty) in header.iter().enumerate() {
+            let site = match index {
+                0 => Site::SelfTy(impl_),
+                _ => Site::ImplTrait(impl_),
+            };
+            let mut found = Vec::new();
+            outlives::trait_needs(db, impl_.into(), ty, &mut found);
+            needs.extend(found.into_iter().map(|it| (it, site)));
+        }
 
         // The trait's outlives bounds hold of the impl's arguments.
         if let Some(trait_ref) = db.impl_trait(impl_) {
@@ -292,7 +308,16 @@ impl<'db> Check<'_, 'db> {
         if !output.has_aliases() {
             assumed.push(output);
             let known = self.known(function.into(), &assumed);
-            let needs = self.where_needs(function.into());
+            let mut needs = self.where_needs(function.into());
+            // Its signature is well-formed: the trait bounds that asks hold.
+            let sites = (0..inputs.len() as u32)
+                .map(|it| Site::Param(function, it))
+                .chain([Site::Output(function)]);
+            for (&ty, site) in inputs.iter().chain([&output]).zip(sites) {
+                let mut found = Vec::new();
+                outlives::trait_needs(db, function.into(), ty, &mut found);
+                needs.extend(found.into_iter().map(|it| (it, site)));
+            }
             self.resolve(&known, needs);
         } else if !FunctionSignature::of(db, function).is_async() {
             let known = self.known(function.into(), &assumed);
@@ -534,27 +559,55 @@ impl<'db> Check<'_, 'db> {
     fn resolve(&mut self, known: &Known<'db>, needs: Vec<(Needs<'db>, Site)>) {
         let region_fails = needs.iter().any(|&(need, _)| match need {
             Needs::Region(longer, shorter) => !known.region_outlives(longer, shorter),
-            Needs::Type(ty, region) => outlives::components(ty).into_iter().any(|it| {
-                matches!(it, outlives::Component::Region(longer)
-                    if !known.region_outlives(longer, region))
-            }),
+            Needs::Type(..) => false,
         });
         if region_fails {
             return;
         }
+        // A type that outlives a region only if a lifetime in it does, which it is not known
+        // to: rustc's `ConcreteFailure` of a `RelateParamBound`, E0477, which also keeps the
+        // errors of type parameters from being reported.
+        let mut concrete = Vec::new();
+        for &(need, site) in &needs {
+            let Needs::Type(ty, region) = need else { continue };
+            let fails = outlives::components(ty).into_iter().any(|it| {
+                matches!(it, outlives::Component::Region(longer)
+                    if !known.region_outlives(longer, region))
+            });
+            let message = "the type does not fulfill the required lifetime".to_owned();
+            let diagnostic = WfDiagnostic { code: "E0477", message, site };
+            if fails && !concrete.contains(&diagnostic) {
+                concrete.push(diagnostic);
+            }
+        }
+        if !concrete.is_empty() {
+            for diagnostic in concrete {
+                if !self.found.contains(&diagnostic) {
+                    self.found.push(diagnostic);
+                }
+            }
+            return;
+        }
         for (need, site) in needs {
             let Needs::Type(ty, region) = need else { continue };
+            let code = match region.kind() {
+                RegionKind::ReStatic => "E0310",
+                RegionKind::ReLateParam(late)
+                    if !matches!(late.bound_region.kind, BoundRegionKind::Named(_)) =>
+                {
+                    "E0311"
+                }
+                _ => "E0309",
+            };
+            for _ in known.failing_aliases(self.db, ty, region) {
+                let message = "the associated type may not live long enough".to_owned();
+                let diagnostic = WfDiagnostic { code, message, site };
+                if !self.found.contains(&diagnostic) {
+                    self.found.push(diagnostic);
+                }
+            }
             for param in known.failing_params(ty, region) {
                 let TyKind::Param(param) = param.kind() else { continue };
-                let code = match region.kind() {
-                    RegionKind::ReStatic => "E0310",
-                    RegionKind::ReLateParam(late)
-                        if !matches!(late.bound_region.kind, BoundRegionKind::Named(_)) =>
-                    {
-                        "E0311"
-                    }
-                    _ => "E0309",
-                };
                 let params = GenericParams::of(self.db, param.id.parent());
                 let name = params[param.id.local_id()].name().map_or("_", |it| it.as_str());
                 let message = format!("the parameter type `{name}` may not live long enough");

@@ -609,8 +609,15 @@ pub(crate) fn reached_only(cmd: &str) -> Option<String> {
         let reached = reached_file(response);
         reached.is_file().then_some((response.display().to_string(), reached))
     })?;
-    let response = format!("@{response}");
-    cmd.contains(&response).then(|| cmd.replacen(&response, &format!("@{}", reached.display()), 1))
+    // The response file as the line has it: quoted for a shell after `cc` (where a Windows
+    // path's `\` is escaped), in double quotes as it is after `link.exe`.
+    let quotings: [fn(&str) -> Option<String>; 2] =
+        [|it| Some(shlex::try_quote(it).ok()?.into_owned()), |it| Some(format!("\"{it}\""))];
+    quotings.iter().find_map(|quote| {
+        let response = quote(&format!("@{response}"))?;
+        let reached = quote(&format!("@{}", reached.display()))?;
+        cmd.contains(&response).then(|| cmd.replacen(&response, &reached, 1))
+    })
 }
 
 /// The file the link of the Apple executable at `binary` reads the room after its load

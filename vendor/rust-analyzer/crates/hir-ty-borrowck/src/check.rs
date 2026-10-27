@@ -47,6 +47,7 @@ pub(super) fn check<'db>(
     let flow = InitFlow::compute(body, &cfg, &moves);
     let dominators = Dominators::new(&cfg);
     let capture_temps = capture_temps(body);
+    let index_spans = index_spans(body);
     let mut regions = regions::build(ctx, body, &cfg, requirements);
     let count = ctx.infcx.num_region_vars();
     let live = liveness::region_liveness(ctx, body, &cfg, &moves, &regions, count);
@@ -140,6 +141,7 @@ pub(super) fn check<'db>(
         move_errors: Vec::new(),
         scrutinees: None,
         capture_temps,
+        index_spans,
         assigned_local: super::return_slot(),
         regions: &regions,
         region_count: count,
@@ -675,6 +677,8 @@ struct Checker<'a, 'b, 'db> {
     scrutinees: Option<FxHashMap<BindingId, Option<ExprId>>>,
     /// The temporaries that hold a borrow a closure captures, with the span of the closure.
     capture_temps: FxHashMap<LocalId, MirSpan>,
+    /// The index expression each index temporary is evaluated for.
+    index_spans: FxHashMap<LocalId, MirSpan>,
     /// The local the statement being checked assigns, if it assigns one.
     assigned_local: LocalId,
     /// The temporaries that point to a `static mut`.
@@ -1216,6 +1220,51 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         allowed: Allowed,
         depth: Depth,
     ) {
+        self.bounds_check_reads(location, place, span);
+        self.access_place_only(location, place, span, access, allowed, depth);
+    }
+
+    /// What rustc's bounds check of each index of a slice in `place` reads, at the index
+    /// expression, before `place` is accessed (`len_of_slice_or_array`): a slice behind a
+    /// `Copy` local has its length read from the local (`PtrMetadata(copy _1)`), another
+    /// slice's is a shallow read of the slice (`&raw const (fake) *_1`, `ArrayLength`), so
+    /// `&mut list[i]` uses `*list`, which a mutable borrow of it still live forbids (E0503).
+    /// An array's length is its constant; its `FakeRead(ForIndex)` checks only that the array
+    /// is initialized.
+    fn bounds_check_reads(&mut self, location: Location, place: PlaceRef<'_>, span: MirSpan) {
+        for (at, elem) in place.projection.iter().enumerate() {
+            let ProjectionElem::Index(index) = elem else { continue };
+            let base = place.base(at);
+            let span = self.index_spans.get(index).copied().unwrap_or(span);
+            let ty = self.ctx.place_ty(self.body, base.local, base.projection).ty;
+            let (read, depth) = match ty.kind() {
+                TyKind::Slice(_) => match base.projection {
+                    [ProjectionElem::Deref]
+                        if self
+                            .ctx
+                            .place_ty(self.body, base.local, &[])
+                            .ty
+                            .is_trivially_pure_clone_copy() =>
+                    {
+                        (PlaceRef { local: base.local, projection: &[] }, Depth::Deep)
+                    }
+                    _ => (base, Depth::ShallowArtificial),
+                },
+                _ => continue,
+            };
+            self.access_place_only(location, read, span, Access::Read, Allowed::No, depth);
+        }
+    }
+
+    fn access_place_only(
+        &mut self,
+        location: Location,
+        place: PlaceRef<'_>,
+        span: MirSpan,
+        access: Access,
+        allowed: Allowed,
+        depth: Depth,
+    ) {
         let key = (place.key(), span);
         if self.access_reported.contains(&key) {
             return;
@@ -1679,39 +1728,42 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             // to its creator by how it gets there.
             let escapes = in_closure
                 && matches!(shorter_kind, UniversalKind::Creator | UniversalKind::Static);
-            let (code, message) = if placeholder {
-                ("", "higher-ranked lifetime error".to_owned())
-            } else if escapes
-                && blamed.category == Category::Return
-                && self.regions.closure_env == Some(longer)
-                && self.ctx.closure_kind == Some(rustc_type_ir::ClosureKind::FnMut)
-                && !self.async_closure()
-            {
-                ("", "captured variable cannot escape `FnMut` closure body".to_owned())
-            } else if escapes
-                && matches!(blamed.category, Category::Assignment | Category::CallArgument)
-                && (self.closure_variable_names(longer_rv)
-                    || self.closure_variable_names(shorter_rv))
-            {
-                ("E0521", "borrowed data escapes outside of closure".to_owned())
-            } else if !self.regions.is_impl_item
-                && !in_closure
-                && (named_anon(kind, shorter_kind) || named_anon(shorter_kind, kind))
-                && !self.regions.unsuggested.contains(&if kind == UniversalKind::AnonParam {
-                    longer
+            let (code, message) =
+                if placeholder && self.regions.related_placeholders.contains(&longer) {
+                    ("E0308", "mismatched types".to_owned())
+                } else if placeholder {
+                    ("", "higher-ranked lifetime error".to_owned())
+                } else if escapes
+                    && blamed.category == Category::Return
+                    && self.regions.closure_env == Some(longer)
+                    && self.ctx.closure_kind == Some(rustc_type_ir::ClosureKind::FnMut)
+                    && !self.async_closure()
+                {
+                    ("", "captured variable cannot escape `FnMut` closure body".to_owned())
+                } else if escapes
+                    && matches!(blamed.category, Category::Assignment | Category::CallArgument)
+                    && (self.closure_variable_names(longer_rv)
+                        || self.closure_variable_names(shorter_rv))
+                {
+                    ("E0521", "borrowed data escapes outside of closure".to_owned())
+                } else if !self.regions.is_impl_item
+                    && !in_closure
+                    && (named_anon(kind, shorter_kind) || named_anon(shorter_kind, kind))
+                    && !self.regions.unsuggested.contains(&if kind == UniversalKind::AnonParam {
+                        longer
+                    } else {
+                        shorter
+                    })
+                {
+                    ("E0621", "explicit lifetime required in the type of a parameter".to_owned())
+                } else if blamed.category == Category::CallArgument
+                    && shorter_kind == UniversalKind::Static
+                    && self.parameter_names(longer_rv)
+                {
+                    ("E0521", format!("borrowed data escapes outside of {}", self.owner_descr()))
                 } else {
-                    shorter
-                })
-            {
-                ("E0621", "explicit lifetime required in the type of a parameter".to_owned())
-            } else if blamed.category == Category::CallArgument
-                && shorter_kind == UniversalKind::Static
-                && self.parameter_names(longer_rv)
-            {
-                ("E0521", format!("borrowed data escapes outside of {}", self.owner_descr()))
-            } else {
-                ("", "lifetime may not live long enough".to_owned())
-            };
+                    ("", "lifetime may not live long enough".to_owned())
+                };
             let span = match blamed.category {
                 Category::Return => self.tail(blamed.span),
                 _ => blamed.span,
@@ -1799,7 +1851,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                         code,
                         span: test.span,
                         message,
-                        at_signature: false,
+                        at_signature: test.signature,
                     }));
                 }
                 break;
@@ -3220,6 +3272,18 @@ fn index_borrows<'db>(
         }
     }
     out
+}
+
+/// The span of the index expression each index temporary is evaluated for, where lowering
+/// starts its storage.
+fn index_spans(body: &MirBody<'_>) -> FxHashMap<LocalId, MirSpan> {
+    let statements = body.basic_blocks.iter().flat_map(|(_, block)| &block.statements);
+    statements
+        .filter_map(|statement| match statement.kind {
+            StatementKind::StorageLive(local) => Some((local, statement.span)),
+            _ => None,
+        })
+        .collect()
 }
 
 fn capture_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, MirSpan> {

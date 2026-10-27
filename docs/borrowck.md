@@ -69,9 +69,22 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
   Indexing (E0510) too: in `x[1][{ x = y; 2 }]` with `x: &[&[i32]]`, the slice `x[1]`
   indexes was bounds-checked before the second index, so what it is behind may not change
   there.
+  A slice's bounds check reads its length where it is indexed, before the place is used:
+  `&mut list[i]` with `list: &mut [T]` shallow-reads `*list` (rustc's `&raw const (fake)
+  *list`), E0503 while `list.iter_mut()` is still live; a slice behind a `Copy` reference
+  reads the reference. An array's length is its constant, read for nothing but its
+  initialization.
 - Unaligned references (E0793): a `&` or `&mut` of a field a `#[repr(packed)]` struct may
   leave less aligned than its type needs, as rustc's `check_packed_ref` (not `&raw`, nor
   behind a pointer; a field of a type parameter or of a `dyn` tail may be unaligned).
+- Builtin derives are checked as rustc expands them (`rustc_builtin_macros/src/deriving`;
+  `ra-jit borrowck` expands them, as `ra-jit check` and builds do). The methods derived for
+  a `#[repr(packed)]` struct copy each field out of it, `{ self.x }` at the field, rather
+  than borrow it, so one that is not `Copy` is E0507 where the field is written; `Debug`
+  takes the last field by one more reference, so an unsized one still becomes a
+  `&dyn Debug`, and every derive but `Copy` and `Default` bounds the struct's type
+  parameters by `Copy` too (`needs_copy_as_bound_if_packed`). A derived impl has the
+  struct's lifetime parameters, so its self type elides none (E0726).
 - Conflicting borrows: shared, mutable, two-phase (`vec.push(vec.len())`), shallow borrows of
   match scrutinees, and fake reads (E0499, E0500, E0501, E0502, E0503, E0506, E0524). The drop
   of the old value before an assignment is the assignment's write, so assigning to a borrowed
@@ -97,7 +110,10 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
   and unsizing to `dyn Trait` proves the value's type implements `Trait`, with what its impl
   needs of the regions and what the trait says its types outlive (`T` as `dyn Any + 'a` needs
   `T: 'static`); a field's `dyn Any + 'a` implies nothing of `'a`, as rustc's inferred
-  outlives leave out what mentions `Self`. An associated type in a signature is related as what it normalizes
+  outlives leave out what mentions `Self`. A returned associated type whose impl gives it a
+  lifetime nothing constrains (`impl<'a, T: 'a> Tr for T { type A = <T as Mk<'a>>::R }`) is
+  that lifetime a region of its own, live where the return slot is, as rustc normalizes the
+  return slot's type. An associated type in a signature is related as what it normalizes
   to, so `for x in &mut v` keeps `v` borrowed in the `IterMut<'a, T>` that
   `<&'a mut Vec<T> as IntoIterator>::IntoIter` is; two associated types are too (a GAT's
   `Self::Item<'w, 's>` and `Self::Item<'w, 'static>` are both `&'w T`), with what a where
@@ -125,7 +141,11 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
 - The signature's associated types are normalized as rustc's universal regions normalize
   them: what the impl of one needs of the regions must hold, reported at the signature
   (`-> <&'a () as Visitor<'d>>::Value` with `impl<'a, 'd: 'a> Visitor<'d> for &'a ()` and
-  `'a: 'd` makes `'a` and `'d` one, which the signature does not say).
+  `'a: 'd` makes `'a` and `'d` one, which the signature does not say). So are those of the
+  where clauses of a struct or enum the signature names, as rustc's
+  `compute_implied_outlives_bounds_inner` normalizes what each type's well-formedness asks:
+  `foo: Foo<(&'a str,)>` of `struct Foo<T: Trait> where T::Assoc: Clone` with only
+  `impl<X: 'static> Trait for (X,)` needs `'a: 'static`.
 - Well-formedness in bodies: a called function's signature as written, before its associated
   types are normalized, and its generic arguments are well-formed at the call (`&'a &'b ()`
   that `'b: 'a`); so is a function item's signature where it becomes a function pointer, with
@@ -174,7 +194,8 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
   `let z: &'a &u32 = &&y` needs `y` to outlive `'a`), struct and variant patterns that spell out generic
   arguments (`let Foo::<'static> { .. } = foo`) and constant patterns (`<() as Foo<'a>>::C`,
   whose type is a subtype of what it matches, as rustc ascribes it, so it matches a
-  `&'static u32` only if `'a: 'static`), casts, turbofishes (a method's own, `x.f::<&'a T>()`, too) and struct
+  `&'static u32` only if `'a: 'static`), casts (the type written, its `_`s holes: `ptr as _`
+  relates no lifetime, though inference makes it `'static` from where the value goes), turbofishes (a method's own, `x.f::<&'a T>()`, too) and struct
   literal and variant paths, in closures too; `Self { .. }` and `Self(..)` in an impl have the
   impl's self type, with its anonymous lifetimes (`impl Foo<'_>`) as the impl's own. A function item called through a variable
   (`let f = foo::<&'static u32>; f(&x)`, or through a reference, `let f = &foo::<..>`) has the
@@ -189,7 +210,13 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
   associated item through a type (`Foo::f`, `<()>::f`, `T::f`, not `Default::default`) has its
   generic arguments and its impl's self type and trait arguments well-formed, as rustc's user
   type annotation on it. A function item, closure or safe function pointer cast to a
-  function pointer is a subtype of it by signature. A where clause `for<'a> T: 'a` is
+  function pointer is a subtype of it by signature. Two function item types are related with
+  the item's variances, as rustc's `variances_of` infers them from its signature (`fn foo<'a>()
+  -> PhantomData<&'a ()>` is covariant in `'a`; a constructor `fn(T) -> S<T>` is invariant in
+  `T`, not as `S`); a variable holding one is copied into a temporary of its own type to be
+  called, as rustc's MIR does, and the type a path's written arguments give a callee
+  (`f::<&'a T>`) is related to the callee's own at the path, blamed after the other
+  interesting constraints (rustc's `AnnotationSource::GenericArg`). A where clause `for<'a> T: 'a` is
   `T: 'static`, and a type parameter that fails it is rustc's codeless "does not live long
   enough". A trait object cast to one of its supertraits' (`dyn Foo<'static>` to
   `dyn Bar<'static, 'a>` with `trait Foo<'a>: Bar<'a, 'a>`) has the supertrait as the
@@ -201,7 +228,26 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
   "higher-ranked lifetime error": `&'static str` is `Deserialize<'de>` only for
   `'de: 'static`, and a forwarding impl that needs `T: for<'a> Bar<&'a isize>` of a `T` that
   is only `Bar<&'b isize>` needs `'a: 'b`. A region that must outlive a placeholder outlives
-  `'static`, as a region of a lower universe does in rustc. rust-analyzer gives a trait object
+  `'static`, as a region of a lower universe does in rustc, and so does a type, whether the
+  placeholder is the predicate's own or one of a `for<'a>` in the where clauses that prove it:
+  `Eat<&'1 mut I, F>: Iterator` needs `for<'a> F: FnMut(<&'1 mut I as LendingIterator>::Item<'a>)`,
+  whose normalization needs `&'1 mut I: 'a`, so `'1: 'static` (rustc's "due to a current
+  limitation of the type system"), and a type parameter that must outlive one is rustc's
+  codeless "does not live long enough". A closure or coroutine is made where its creator's where
+  clauses hold, so they are proven again at its creation with its parent's arguments (rustc's
+  `prove_aggregate_predicates`): `for<'a> &'a S: 'a` needs `S: 'static` there, and a closure
+  of `negotiate<S>` is "`S` does not live long enough". What a parameter's type implies is
+  assumed, but its higher-ranked where clauses are proven, as rustc applies what proving the
+  type's well-formedness needs: `Foo<&'lt u8>` with `for<'x> T::Ty<'x>: Sized` normalizes
+  `<&'lt u8 as Trait>::Ty<'x>`, whose `Self: 'x` is `'lt: 'static`. Function pointer types
+  are related as rustc's higher-ranked subtyping (`TypeRelating::binders`): the more general
+  side's `for<'a>` is instantiated with placeholders of a new universe, the other's with
+  variables of it, both ways when invariant; a region of a lower universe made to outlive such
+  a placeholder outlives `'static`, and a placeholder made to outlive anything is rustc's E0308
+  "one type is more general than the other". So a closure parameter `x: fn(&u32)` whose
+  expected type is `fn(&'1 u32)` needs `'1: 'static`. A function item cast to a `for<'a> fn`
+  keeps its own `for<'a>`, as rustc's reify, rather than its late-bound lifetimes as variables.
+  rust-analyzer gives a trait object
   behind an elided reference in a signature `'static`, not the reference's lifetime, so a
   placeholder the solver equates with an elided lifetime is left out
   (`fn(&mut dyn Write)` for `impl FnMut(&mut dyn Write)` holds).
@@ -241,7 +287,9 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
   rustc picks the captured lifetime a
   region becomes and checks the body with that choice; ra-jit only tests that one exists, so
   it reports E0700 where rustc does and leaves the errors that choice causes unreported.
-- Closures: captures, E0373, `FnMut` escapes, E0596 and E0594 through captures. A closure's
+- Closures: captures, E0373, `FnMut` escapes, E0596 and E0594 through captures. A capture's
+  borrow is reported at the first use of the place in the closure (rustc's `path_expr_id`,
+  which `compute_min_captures` keeps from the capture recorded first). A closure's
   body has two kinds of universal region, as rustc's: its own (the late-bound lifetimes of
   its signature, `for<'a> FnOnce(&'a T)`, and the borrow of its environment) and its
   creator's (every other region of its type, and the enclosing item's lifetime parameters,
@@ -292,7 +340,17 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
   `trait Foo: 'static` (E0310); a generic associated type is checked with its own where
   clauses, not the trait's. The where clauses of an ADT, impl, trait or function must be
   well-formed given its bounds and what its signature's and impl header's types imply
-  (`fn foo<'a, L: X<&'a Nested<K>>>()` needs `K: 'a`). As rustc, an item that also needs a lifetime to outlive one
+  (`fn foo<'a, L: X<&'a Nested<K>>>()` needs `K: 'a`). A function's signature and an impl's
+  header are well-formed too: the trait bounds of each struct or enum they name, and the trait
+  of each associated type, hold, so what the impls that prove them need of what outlives what
+  must hold: `-> ServiceChainBuilder<ServiceChain<P, S>, NS>` with `struct
+  ServiceChainBuilder<P: Service, ..>` and only `impl<P: Service, ..> Service for
+  ServiceChain<P, S> where P::Error: 'static` needs `P::Error: 'static` (E0310, of an
+  associated type, which outlives a region where a where clause or its trait's bound says so,
+  or where its arguments do), and `impl<X> TestTrait for [Foo<(X,)>; 1]` with `struct Foo<T:
+  Trait>` and `impl<X: 'static> Trait for (X,)` needs `X: 'static`. A type that outlives a
+  region only if a lifetime in it does is E0477 ("does not fulfill the required lifetime"):
+  `foo: Foo<(&str,)>` there. As rustc, an item that also needs a lifetime to outlive one
   it does not (E0491) gets only that error, which ra-jit does not report yet. The type a
   returned `impl Trait` hides must be well-formed and outlive what its bounds say, given what
   the function knows (rustc's `check_opaque_meets_bounds`): `-> impl Sized + 'static` hiding
@@ -308,7 +366,9 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
   `async fn foo() -> &'static impl T` needs `Self: 'static` (E0310).
 - Function items and locals, as rustc's type check: a function item used as a value, not
   only called (`let f: fn(&'a str) -> _ = extend;`, or passed to a call), needs its where
-  clauses and its type arguments well-formed; a variable's or temporary's type is `Sized`,
+  clauses and its type arguments well-formed, and so does a function an inline `asm!` names
+  by `sym`, with the lifetimes its path writes (`sym dep::<'a, T>` with `fn dep<'a, T: 'a>`
+  needs `T: 'a`, E0309); a variable's or temporary's type is `Sized`,
   which a where clause `<&'static T as A>::X: Sized` proves only for `'static`.
 - E0621 ("explicit lifetime required") where rustc gives it: for an anonymous lifetime a
   parameter's written type has, not in a trait impl's method, nor for one of `self`, of the
@@ -372,15 +432,15 @@ with another code, then, of the errors not reported, 5 "lifetime may not live lo
 3 each of E0507, E0309, E0310, E0311 and higher-ranked errors, 2 each of E0716 and E0597,
 then one each of five more. The causes, grouped:
 
-- **Higher-ranked regions and placeholders**: trait bounds are proven for placeholders, but a
-  function pointer or closure related to a `for<'a> fn` type is not (rustc's higher-ranked
-  subtyping, with a projection normalized for the placeholder in
-  `nll/closure-malformed-projection-input-issue-102800.rs`), a type a placeholder must outlive
-  is left out, and auto traits of a coroutine's witness (`T: Send` of an `async` block holding
-  a `for<'a>` future) are not proven with them.
+- **Higher-ranked regions and placeholders**: function pointer types are related with
+  placeholders, but a projection in them is not normalized for the placeholder
+  (`nll/closure-malformed-projection-input-issue-102800.rs`), and auto traits of a coroutine's
+  witness (`T: Send` of an `async` block holding a `for<'a>` future) are not proven with them.
 - **Well-formedness of items** (most of what is left of E0309 and E0310): items whose
   signature or impl header has an associated type (what normalizing it implies) are not
-  checked yet, nor what an impl's or function's where clauses need of a projection in them.
+  checked yet (`fn as_ref2<'a>(&'a self) -> Self::Output<'a>` normalized to `FooRef<'a, U>`
+  needs `U: 'a`), nor a `for<'a>` bound's projection under its binder (a supertrait
+  `for<'a> GatTrait<Gat<'a> = T>` needs the GAT's `Self: 'a` for every `'a`, E0311).
 - **Member constraints of `impl Trait`**: the choice rustc makes is not applied, and a
   projection bound that names a lifetime (`impl Iterator<Item = Box<dyn Foo>>`) leaves them
   out.
@@ -476,6 +536,10 @@ changes to rust-analyzer were needed, each made as rustc does it:
   parameter whose lifetimes are not counted from its written type (`dyn Trait`, `impl Trait`,
   a function pointer, an associated type) adds none, and gives elision no lifetime unless
   `&self` does.
+- Type inference types an inline `asm!`'s `sym` of a function as a path to a value, as
+  rustc's `check_expr_asm` does (`InferenceResult::asm_sym_tys`), so MIR lowering names the
+  function item with the generic arguments the path spells out, and lowers an `asm!` with a
+  `sym` even when its template is only a comment, as it lowered no generic `sym` before.
 - Type inference takes an inline `asm!` output as a place written, as rustc's
   `check_expr_asm_operand` does, so `out(reg) v[0]` indexes with `IndexMut` and needs `v`
   mutable (E0596).

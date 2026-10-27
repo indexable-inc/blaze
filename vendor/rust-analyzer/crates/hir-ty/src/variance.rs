@@ -22,6 +22,7 @@ use rustc_type_ir::{Variance, inherent::IntoKind};
 use stdx::never;
 
 use crate::{
+    CallableDefId,
     db::HirDatabase,
     generics::{Generics, generics},
     next_solver::{
@@ -68,6 +69,45 @@ fn variances_of_query(db: &dyn HirDatabase, def: GenericDefId) -> StoredVariance
         Context { generics, variances: vec![Variance::Bivariant; count].into_boxed_slice(), db }
             .solve();
 
+    VariancesOf::new_from_slice(&variances).store()
+}
+
+/// The variances of a tuple struct's or tuple variant's constructor function item, as rustc's
+/// `variances_of` gives them for a `DefKind::Ctor`: inferred from the constructor's signature
+/// `fn(fields..) -> Adt<..>`, not from the ADT's. A parameter its fields use appears both as an
+/// argument and in the result, so it is invariant (`SomeStruct::<&'static u32>` can't be called
+/// with a shorter borrow); one only another variant uses keeps the ADT's variance.
+pub fn ctor_variances(db: &dyn HirDatabase, ctor: VariantId) -> VariancesOf<'_> {
+    ctor_variances_query(db, ctor).as_ref()
+}
+
+#[salsa::tracked(returns(ref))]
+fn ctor_variances_query(db: &dyn HirDatabase, ctor: VariantId) -> StoredVariancesOf {
+    let adt: GenericDefId = match ctor {
+        VariantId::StructId(s) => AdtId::StructId(s).into(),
+        VariantId::EnumVariantId(v) => AdtId::EnumId(v.loc(db).parent).into(),
+        VariantId::UnionId(_) => return VariancesOf::empty().store(),
+    };
+    let generics = generics(db, adt);
+    let count = generics.len(true);
+    if count == 0 {
+        return VariancesOf::empty().store();
+    }
+    let mut cx =
+        Context { generics, variances: vec![Variance::Bivariant; count].into_boxed_slice(), db };
+    let callable = match ctor {
+        VariantId::StructId(s) => CallableDefId::StructId(s),
+        VariantId::EnumVariantId(v) => CallableDefId::EnumVariantId(v),
+        VariantId::UnionId(_) => unreachable!(),
+    };
+    let sig = db.callable_item_signature(callable).instantiate_identity().skip_binder();
+    cx.add_constraints_from_sig(sig.inputs_and_output.iter(), Variance::Covariant);
+    let mut variances = cx.variances;
+    for (idx, param) in cx.generics.iter_id(false).enumerate() {
+        if let GenericParamId::ConstParamId(_) = param {
+            variances[idx] = Variance::Invariant;
+        }
+    }
     VariancesOf::new_from_slice(&variances).store()
 }
 

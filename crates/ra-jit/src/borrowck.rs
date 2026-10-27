@@ -22,6 +22,10 @@ use project_model::{CargoConfig, RustLibSource};
 use vfs::{AbsPathBuf, VfsPath};
 
 pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    // rustc borrow-checks what a builtin derive expands to (a packed struct's derived `Debug`
+    // copies each field out, and moving one that isn't `Copy` is E0507), and so does
+    // `ra-jit check`: the derived methods need their bodies here as there.
+    hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut edition = "2015".to_owned();
     let mut project = None;
     while let Some(arg) = args.next() {

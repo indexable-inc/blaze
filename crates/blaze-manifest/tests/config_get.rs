@@ -3,6 +3,10 @@
 //! `harness/resolve.py --fixtures` with the runs of the case's `case.json` after its
 //! `CONFIG_RUNS`).
 
+// `expected.json` is what cargo printed on Linux: `/` in the paths of the files it read and
+// POSIX shell quoting. On Windows cargo prints `\` there, which these were not recorded with.
+#![cfg(unix)]
+
 use std::path::{Path, PathBuf};
 
 use blaze_manifest::config::get::main as config_main;
@@ -41,7 +45,13 @@ fn check(fixture: &Path, scratch: &Path) -> Vec<String> {
         }
     };
     let root_text = root.display().to_string();
-    let mut env = vec![("CARGO_HOME".to_owned(), home.display().to_string())];
+    // Stop the walk up for `.cargo/config.toml` at the scratch dir, as cargo's own tests do, so
+    // config files above it (an ix VM's `/.cargo/config.toml`) don't reach what cargo recorded.
+    let test_root = scratch.canonicalize().unwrap();
+    let mut env = vec![
+        ("CARGO_HOME".to_owned(), home.display().to_string()),
+        ("__CARGO_TEST_ROOT".to_owned(), test_root.display().to_string()),
+    ];
     for (k, v) in case["env"].as_object().into_iter().flatten() {
         env.push((k.clone(), v.as_str().unwrap().replace("$ROOT", &root_text)));
     }

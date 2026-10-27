@@ -1561,6 +1561,21 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                         _ => None,
                     }
                 }
+                Site::Param(function, index) => {
+                    let (signature, source_map) = FunctionSignature::with_source_map(db, function);
+                    signature
+                        .params
+                        .get(index as usize)
+                        .and_then(|&ty| source_map.type_syntax(ty).ok())
+                }
+                Site::Output(function) => {
+                    let (signature, source_map) = FunctionSignature::with_source_map(db, function);
+                    signature.ret_type.and_then(|ty| source_map.type_syntax(ty).ok())
+                }
+                Site::SelfTy(impl_) => {
+                    let (signature, source_map) = ImplSignature::with_source_map(db, impl_);
+                    source_map.type_syntax(signature.self_ty).ok()
+                }
                 Site::Opaque(function, index) => {
                     use hir_def::{
                         expr_store::StoreVisitor,

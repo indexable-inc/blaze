@@ -818,6 +818,11 @@ pub struct InferenceResult<'db> {
     /// type are written as: the lifetimes elided in a parameter's are the closure's own.
     pub closures_without_expectation: FxHashSet<ExprId>,
 
+    /// The type of each `sym` operand of an inline `asm!` that names a function, by the
+    /// `asm!` and the operand's index: rustc type checks the path as a value, so a function's
+    /// generic arguments (`sym dep::<'a, T>`) are those it spells out.
+    pub asm_sym_tys: FxHashMap<(ExprId, u32), StoredTy>,
+
     pub closures_data: FxHashMap<ExprId, ClosureData>,
 
     defined_anon_consts: ThinVec<AnonConstId<'db>>,
@@ -1156,6 +1161,7 @@ impl<'db> InferenceResult<'db> {
             expr_adjustments: Default::default(),
             coercion_casts: Default::default(),
             closures_without_expectation: Default::default(),
+            asm_sym_tys: Default::default(),
             closures_data: Default::default(),
             defined_anon_consts: Default::default(),
         }
@@ -1511,6 +1517,7 @@ impl<'db> InferenceContext<'db> {
             skipped_ref_pats,
             coercion_casts,
             closures_without_expectation,
+            asm_sym_tys,
             closures_data,
             nodes_with_type_mismatches,
             defined_anon_consts: _,
@@ -1540,6 +1547,7 @@ impl<'db> InferenceContext<'db> {
         merge_hash_set(skipped_ref_pats, &other.skipped_ref_pats);
         merge_hash_set(coercion_casts, &other.coercion_casts);
         merge_hash_set(closures_without_expectation, &other.closures_without_expectation);
+        merge_hash_maps(asm_sym_tys, &other.asm_sym_tys);
         merge_hash_maps(closures_data, &other.closures_data);
         if let Some(other_nodes_with_type_mismatches) = &other.nodes_with_type_mismatches {
             merge_hash_set(
@@ -1681,6 +1689,7 @@ impl<'db> InferenceContext<'db> {
             tuple_field_access_types,
             coercion_casts: _,
             closures_without_expectation: _,
+            asm_sym_tys,
             diagnostics: result_diagnostics,
             nodes_with_type_mismatches,
             defined_anon_consts: result_defined_anon_consts,
@@ -1709,6 +1718,10 @@ impl<'db> InferenceContext<'db> {
             resolver.resolve_completely(ty);
         }
         type_of_type_placeholder.shrink_to_fit();
+        for ty in asm_sym_tys.values_mut() {
+            resolver.resolve_completely(ty);
+        }
+        asm_sym_tys.shrink_to_fit();
         type_of_opaque.shrink_to_fit();
 
         if let Some(nodes_with_type_mismatches) = nodes_with_type_mismatches {

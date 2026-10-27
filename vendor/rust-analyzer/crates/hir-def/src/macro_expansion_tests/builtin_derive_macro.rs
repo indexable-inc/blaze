@@ -73,7 +73,7 @@ struct Foo<A, B, 'a, 'b>;
 #[derive(Copy)]
 struct Foo<A, B, 'a, 'b>;
 
-impl <A: $crate::marker::Copy, B: $crate::marker::Copy, > $crate::marker::Copy for Foo<A, B, > where {}"#]],
+impl <'a, 'b, A: $crate::marker::Copy, B: $crate::marker::Copy, > $crate::marker::Copy for Foo<'a, 'b, A, B, > where {}"#]],
     );
 }
 
@@ -634,6 +634,7 @@ impl <> $crate::fmt::Debug for HideAndShow< > where {
                 $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "always_show", &always_show_self);
                 $crate::fmt::DebugStruct::finish(&mut ra_expand_builder)
             }
+            ,
         }
     }
 }
@@ -735,8 +736,8 @@ pub trait Trait<T: ?Sized> {}
 pub struct Foo<'a, T: ?Sized + Trait<U>, #[pointee] U: ?Sized, const N: u32>(T)
 where
     U: Trait<U> + ToString;
-impl <T, U, const N: u32, __S> $crate::ops::DispatchFromDyn<Foo<'a, T, __S, N>> for Foo<T, U, N, > where U: Trait<U> +ToString, T: Trait<__S>, __S: ?Sized, __S: Trait<__S> +ToString, U: ::core::marker::Unsize<__S>, T:?Sized+Trait<U>, U:?Sized, {}
-impl <T, U, const N: u32, __S> $crate::ops::CoerceUnsized<Foo<'a, T, __S, N>> for Foo<T, U, N, > where U: Trait<U> +ToString, T: Trait<__S>, __S: ?Sized, __S: Trait<__S> +ToString, U: ::core::marker::Unsize<__S>, T:?Sized+Trait<U>, U:?Sized, {}"#]],
+impl <'a, T, U, const N: u32, __S> $crate::ops::DispatchFromDyn<Foo<'a, T, __S, N>> for Foo<'a, T, U, N, > where U: Trait<U> +ToString, T: Trait<__S>, __S: ?Sized, __S: Trait<__S> +ToString, U: ::core::marker::Unsize<__S>, T:?Sized+Trait<U>, U:?Sized, {}
+impl <'a, T, U, const N: u32, __S> $crate::ops::CoerceUnsized<Foo<'a, T, __S, N>> for Foo<'a, T, U, N, > where U: Trait<U> +ToString, T: Trait<__S>, __S: ?Sized, __S: Trait<__S> +ToString, U: ::core::marker::Unsize<__S>, T:?Sized+Trait<U>, U:?Sized, {}"#]],
     );
 }
 
@@ -829,7 +830,7 @@ where
     left: &'a mut T,
     right: &'b mut T,
 }
-impl <T, const N: usize, > $crate::marker::Reborrow for Foo<T, N, > where T:'a+'b, {}"#]],
+impl <'a, 'b, T, const N: usize, > $crate::marker::Reborrow for Foo<'a, 'b, T, N, > where T:'a+'b, {}"#]],
     );
 }
 
@@ -863,7 +864,7 @@ mod shared {
 struct Foo<'a, 'b, T, const N: usize>(&'a mut T, &'b mut T)
 where
     T: 'a + 'b;
-impl <T, const N: usize, > $crate::marker::CoerceShared<shared::Shared<'a, 'b, (T, u8), N>> for Foo<T, N, > where T:'a+'b, {}"#]],
+impl <'a, 'b, T, const N: usize, > $crate::marker::CoerceShared<shared::Shared<'a, 'b, (T, u8), N>> for Foo<'a, 'b, T, N, > where T:'a+'b, {}"#]],
     );
 }
 

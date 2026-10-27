@@ -255,9 +255,7 @@ fn smoke_test_real_sysroot_cargo() {
     std::fs::create_dir_all(&cwd).unwrap();
     let loaded_sysroot =
         sysroot.load_workspace(&RustSourceWorkspaceConfig::default_cargo(), false, &|_| ());
-    if let Some(loaded_sysroot) = loaded_sysroot {
-        sysroot.set_workspace(loaded_sysroot);
-    }
+    sysroot.set_loaded(loaded_sysroot);
     assert!(
         matches!(sysroot.workspace(), RustLibSrcWorkspace::Workspace { .. }),
         "got {}",

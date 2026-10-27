@@ -2450,7 +2450,9 @@ fn crates_called(db: &RootDatabase, krate: &str, args: &Args) -> Vec<Crate> {
     let mut found: Vec<Crate> = named_crates(db)
         .iter()
         .filter(|it| match (is_file, &it.root) {
-            (true, Some(root)) if plain && !root.ends_with(krate) => false,
+            // By its parts: on Windows the root's are apart by `\` and the asked `examples/a.rs`'s
+            // may be by `/`.
+            (true, Some(root)) if plain && !Path::new(&**root).ends_with(krate) => false,
             // Named from the checkout, or in full.
             (true, Some(root)) => {
                 let root = Path::new(&**root);
@@ -3166,6 +3168,9 @@ fn workspace_at(
     // Without the standard library's source every call into it is unresolved, and each
     // function making one would be refused for a reason that says nothing of the toolchain.
     if workspace.sysroot.is_rust_lib_src_empty() {
+        if let Some(error) = workspace.sysroot.error() {
+            anyhow::bail!("{}", error.trim_end());
+        }
         let toolchain =
             workspace.sysroot.root().map_or("the toolchain".to_owned(), |it| it.to_string());
         anyhow::bail!(
@@ -4316,6 +4321,17 @@ fn lower(db: &RootDatabase, bodies: Vec<DefWithBodyId>) -> Vec<DefWithBodyId> {
 struct Build {
     compiled: usize,
     skipped: Vec<(String, CodegenError)>,
+    /// Of [`Build::skipped`], by where each is in it, those the program reaches: with nothing
+    /// of rustc's nothing else compiles them, and the build stops before its link
+    /// ([`Build::refused_reached`]).
+    reached: Vec<usize>,
+    /// The build has nothing of rustc's, which would compile what ra-jit refuses.
+    nothing_of_rustc: bool,
+    /// Of [`Build::skipped`], in a library's build with nothing of rustc's, those exported by
+    /// name, each `(symbol, "name: why")`: a program can declare one in an `extern` block
+    /// and call it, which the unit has no stand-in for when nothing in it calls the function,
+    /// and the link then fails on the name ([`RefusedExports`]).
+    refused_exports: Vec<(String, String)>,
     instances: usize,
     codegen: Duration,
     emit: Duration,
@@ -4403,7 +4419,7 @@ fn std_unit(
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
     };
-    field(b"ra-jit standard library 3");
+    field(b"ra-jit standard library 4");
     field(format!("{:?} {debug:?}", args.selection.target).as_bytes());
     // An object of one section is linked whole, with what the program never reaches.
     if !hir_ty_codegen::sections_of_their_own() {
@@ -4427,13 +4443,22 @@ fn std_unit(
         field(it.as_bytes());
     }
     let key: [u8; 32] = hasher.finalize().into();
+    // What it refused that a program can call by name is kept beside it ([`refused_exports_of`]).
+    let refused_key: [u8; 32] =
+        Sha256::new().chain_update(key).chain_update(b"refused").finalize().into();
     let object = args.out.with_extension("std.o");
     let archive = args.out.with_extension("std.a");
+    let refused = refused_exports_of(&object);
     let store = ra_jit_store::Store::global();
     let stored = || -> anyhow::Result<Option<PathBuf>> {
-        let Some(bytes) = store.and_then(|it| it.get(&key)) else { return Ok(None) };
+        let Some(store) = store else { return Ok(None) };
+        let Some((bytes, listed)) = store.get(&key).zip(store.get(&refused_key)) else {
+            return Ok(None);
+        };
         let path = if link::split::is_archive(&bytes) { &archive } else { &object };
         std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+        std::fs::write(&refused, listed)
+            .with_context(|| format!("writing {}", refused.display()))?;
         eprintln!("standard library: from the store, {} crates", members.len());
         Ok(Some(path.clone()))
     };
@@ -4469,6 +4494,8 @@ fn std_unit(
         })?;
     eprint!("standard library: {} crates, ", members.len());
     report(&built);
+    let listed = refused_exports_text(&built.refused_exports);
+    std::fs::write(&refused, &listed).with_context(|| format!("writing {}", refused.display()))?;
     let mut path = object;
     let mut bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     if object::FileKind::parse(&*bytes).is_ok_and(|it| it == object::FileKind::Elf64) {
@@ -4492,6 +4519,8 @@ fn std_unit(
     }
     if let Some(store) = store {
         store.settled();
+        // The list first: a unit from the store comes with it.
+        store.insert(&refused_key, listed.as_bytes());
         store.insert(&key, &bytes);
         store.flush();
     }
@@ -4536,15 +4565,22 @@ fn link_executable(
         Ok(exports)
     });
     let exports = exports.transpose()?;
-    let took = link::executable(db, &program, &objects, sysroot, exe, exports.as_deref())?;
+    let took = link::executable(db, &program, &objects, sysroot, exe, exports.as_deref())
+        .map_err(|it| refused_linked(it, args))?;
     let stand_ins = link::stand_ins(exe)?;
     eprintln!(
         "linked {} in {took:.1?}, {} functions in it ra-jit could not compile",
         exe.display(),
         stand_ins.len()
     );
-    for said in stand_ins.iter().take(8) {
-        eprintln!("  {said}");
+    // What the link kept of the stand-ins is what the program can reach, the standard
+    // library's unit's among them, each saying why its unit refused it.
+    if !stand_ins.is_empty() {
+        let said = stand_ins.iter().map(|it| {
+            let it = it.trim().trim_start_matches(hir_ty_codegen::STAND_IN_SAYS);
+            cargo::whole::without_hashes(it)
+        });
+        bail!("{}", refused_error(&args.krate, stand_ins.len(), said));
     }
     Ok(())
 }
@@ -4848,13 +4884,38 @@ fn build(
     if let (Some(path), Some(patch)) = (&args.patch, unit.patch.take()) {
         unwritten.push((path.clone(), patch));
     }
+    // What a program with nothing of rustc's reaches of what was refused: its start, and what
+    // only code of the object calls, which is compiled only once it is called. An entry the
+    // program does not start from is there whether or not anything calls it, and its stand-in
+    // says, once linked, whether the program can reach it ([`link_executable`]).
+    let reaches = |func: FunctionId| {
+        table.is_empty()
+            && !args.library
+            && main.is_some()
+            && (main == Some(func) || !entries.contains(&func))
+    };
+    let reached = unit.skipped.iter().enumerate().filter(|(_, (func, _))| reaches(*func));
+    let reached = reached.map(|(at, _)| at).collect();
+    // The standard library's unit names the functions it refused that a program can call by
+    // name ([`RefusedExports`]).
+    let refused_exports = if table.is_empty() && args.library {
+        let exported = unit.skipped.iter().filter_map(|(func, e)| {
+            let symbol = exported_symbol(hir_db, *func)?;
+            let why = e.to_string().replace('\n', " ");
+            Some((symbol, format!("{}: {why}", cargo::whole::without_hashes(&name(*func)))))
+        });
+        exported.collect()
+    } else {
+        Vec::new()
+    };
+    let skipped =
+        unit.skipped.into_iter().map(|(func, e)| (name(func), explained(func, e))).collect();
     let mut build = Build {
         compiled: unit.compiled.len(),
-        skipped: unit
-            .skipped
-            .into_iter()
-            .map(|(func, e)| (name(func), explained(func, e)))
-            .collect(),
+        skipped,
+        reached,
+        nothing_of_rustc: table.is_empty(),
+        refused_exports,
         instances: unit.instances,
         codegen,
         emit: start.elapsed(),
@@ -4896,7 +4957,100 @@ fn build(
     Ok(Some(build))
 }
 
+/// How many of the functions ra-jit could not compile an error names.
+const REFUSED_SHOWN: usize = 16;
+/// What the first line of [`refused_error`] says, which the daemon's client finds it by.
+pub(crate) const REFUSED_SAYS: &str = "ra-jit could not compile";
+
+/// Why a program with nothing of rustc's is not built: the functions it reaches that ra-jit
+/// could not compile, `reached` of them, each `name: why`, the first [`REFUSED_SHOWN`] named.
+/// Nothing else compiles them (AGENTS.md, no fallback), and a link without them would fail on
+/// what they leave undefined or keep a stand-in that aborts.
+fn refused_error(program: &str, reached: usize, said: impl Iterator<Item = String>) -> String {
+    let mut text = format!(
+        "`{program}` reaches {reached} function{} {REFUSED_SAYS}, and a build with nothing of \
+         rustc's has nothing else to compile {}, so it is not built:",
+        if reached == 1 { "" } else { "s" },
+        if reached == 1 { "it" } else { "them" },
+    );
+    for line in said.take(REFUSED_SHOWN) {
+        text += &format!("\n  {line}");
+    }
+    if reached > REFUSED_SHOWN {
+        text += &format!("\n  and {} more", reached - REFUSED_SHOWN);
+    }
+    text
+}
+
+/// Where the standard library's unit at `unit` lists the functions it refused that are
+/// exported by name ([`Build::refused_exports`]), a line each, `symbol\tname: why`. A program
+/// that declares one in an `extern` block and calls it, when nothing in the library calls it,
+/// finds no stand-in for it in the unit: one exported under the name could take the place of
+/// a definition the program links from elsewhere (libgcc's soft float is named as the
+/// library's is), so the unit has none, and the link fails on the name ([`refused_linked`]).
+fn refused_exports_of(unit: &Path) -> PathBuf {
+    unit.with_extension("refused")
+}
+
+/// The lines of [`refused_exports_of`].
+fn refused_exports_text(exports: &[(String, String)]) -> String {
+    exports.iter().map(|(symbol, why)| format!("{symbol}\t{why}\n")).collect()
+}
+
+/// Of the names a link that failed says nothing defines, `said`, those the standard library's
+/// unit at `unit` refused ([`refused_exports_of`]), each `name: why`, in the order the linker
+/// names them. Every linker names a symbol as a word of its own, Apple's with the `_` before
+/// it, and the names are looked up a word at a time, whatever else the linker says around them.
+pub(crate) fn refused_undefined(said: &str, unit: &Path) -> Vec<String> {
+    if !LinkFailed::UNDEFINED.iter().any(|it| said.contains(it)) {
+        return Vec::new();
+    }
+    let Ok(listed) = std::fs::read_to_string(refused_exports_of(unit)) else { return Vec::new() };
+    let refused: FxHashMap<&str, &str> =
+        listed.lines().filter_map(|it| it.split_once('\t')).collect();
+    let mut named = FxHashSet::default();
+    let words =
+        said.split(|it: char| !(it.is_ascii_alphanumeric() || matches!(it, '_' | '$' | '.')));
+    let found = words.filter_map(|word| {
+        let (symbol, why) = refused
+            .get_key_value(word)
+            .or_else(|| refused.get_key_value(word.strip_prefix('_')?))?;
+        named.insert(*symbol).then(|| (*why).to_owned())
+    });
+    found.collect()
+}
+
+/// Why the program of `args` is not linked, when its link failed, `failed`, on names the
+/// standard library's unit refused ([`refused_undefined`]): the error of a program that
+/// reaches a function ra-jit refused ([`refused_error`]).
+fn refused_linked(failed: anyhow::Error, args: &Args) -> anyhow::Error {
+    let Some(unit) = &args.prebuilt else { return failed };
+    let said = match failed.downcast_ref::<LinkFailed>() {
+        Some(it) => it.said.clone(),
+        None => format!("{failed:#}"),
+    };
+    let refused = refused_undefined(&said, unit);
+    if refused.is_empty() {
+        return failed;
+    }
+    anyhow::anyhow!("{}", refused_error(&args.krate, refused.len(), refused.into_iter()))
+}
+
 impl Build {
+    /// Why the program of `args` is not linked, when it reaches a function this build refused
+    /// ([`Build::reached`]).
+    fn refused_reached(&self, args: &Args) -> Option<String> {
+        if self.reached.is_empty() {
+            return None;
+        }
+        let said = self.reached.iter().map(|&at| {
+            let (name, error) = &self.skipped[at];
+            let error = error.to_string().replace('\n', " ");
+            format!("{}: {error}", cargo::whole::without_hashes(name))
+        });
+        Some(refused_error(&args.krate, self.reached.len(), said))
+    }
+
     fn write_report(&self, path: &Path, compiled: &[String]) -> anyhow::Result<()> {
         use std::fmt::Write;
         let mut out = String::new();
@@ -4972,8 +5126,10 @@ fn report(build: &Build) {
         }
     }
     if build.skipped.len() <= 8 {
+        // With nothing of rustc's, nothing compiles what ra-jit refuses.
+        let left = if build.nothing_of_rustc { "refused" } else { "left to rustc" };
         for (name, error) in &build.skipped {
-            eprintln!("  left to rustc: {name}: {error}");
+            eprintln!("  {left}: {name}: {error}");
         }
         return;
     }
@@ -8392,6 +8548,9 @@ fn run_holding(
             if let Some(said) = ra_jit_expand::report() {
                 eprintln!("{said}");
             }
+            if let Some(why) = cold.refused_reached(&args) {
+                bail!("{why}");
+            }
             memory::report(&mut db, "build")?;
             report_stats(&known.stats);
             link(
@@ -8405,12 +8564,15 @@ fn run_holding(
                 false,
                 packs_whole(&args),
                 args.exe.is_some(),
-            )?;
+            )
+            .map_err(|it| refused_linked(it, &args))?;
             if let Some(exe) = &args.exe {
                 // A daemon's link line linked it already.
                 if args.splice.is_none() {
                     let sysroot = SYSROOT.get().and_then(Option::as_deref);
-                    link_executable(&db, &table, &listed, &args, sysroot, exe)?;
+                    // An executable that reaches a stand-in is not the program.
+                    link_executable(&db, &table, &listed, &args, sysroot, exe)
+                        .inspect_err(|_| _ = std::fs::remove_file(exe))?;
                 }
                 if let Some(path) = &args.dep_info {
                     write_dep_info(&db, &args, tree.vfs(), exe, path)?;
@@ -10120,7 +10282,8 @@ impl Program {
             .or_else(|| {
                 let unset = warm.unset.as_deref()?;
                 Some(Refused::Error(errors::Said::one(errors::of_none(unset))))
-            });
+            })
+            .or_else(|| warm.refused_reached(args).map(Refused::Cargos));
         let refused = start.elapsed();
         failed = failed.or_else(|| stale_copies(db, table, args).map(Refused::Cargos));
         let copies = start.elapsed();

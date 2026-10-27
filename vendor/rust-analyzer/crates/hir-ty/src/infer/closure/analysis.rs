@@ -44,7 +44,7 @@ use hir_def::{
 use macros::{TypeFoldable, TypeVisitable};
 use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use rustc_type_ir::{
     BoundVar, ClosureKind,
     inherent::{AdtDef as _, GenericArgs as _, IntoKind as _, Ty as _},
@@ -741,7 +741,7 @@ impl<'db> InferenceContext<'db> {
 
         let mut closure_data = self.result.closures_data.remove(&closure_def_id).unwrap();
         let root_var_min_capture_list = &mut closure_data.min_captures;
-        let mut dedup_sources_scratch = FxHashMap::default();
+        let mut dedup_sources_scratch = FxHashSet::default();
 
         for (mut place, capture_info) in capture_information.into_iter() {
             let var_hir_id = match place.base {
@@ -811,8 +811,8 @@ impl<'db> InferenceContext<'db> {
                         PlaceAncestryRelation::SamePlace => {
                             ancestor_found = true;
                             let backup_path_sources = determine_capture_sources(
-                                &mut updated_capture_info,
                                 &mut possible_ancestor.info,
+                                &mut updated_capture_info,
                                 &mut dedup_sources_scratch,
                             );
                             determine_capture_info(
@@ -837,8 +837,8 @@ impl<'db> InferenceContext<'db> {
                             );
 
                             let backup_path_sources = determine_capture_sources(
-                                &mut updated_capture_info,
                                 &mut possible_ancestor.info,
+                                &mut updated_capture_info,
                                 &mut dedup_sources_scratch,
                             );
                             determine_capture_info(
@@ -1425,22 +1425,23 @@ fn determine_capture_info(capture_info_a: &mut CaptureInfo, capture_info_b: &mut
     }
 }
 
+/// The sources of two captures of one place merged, `kept`'s first: as rustc's
+/// `compute_min_captures` keeps the `path_expr_id` of the capture recorded first (the ancestor's
+/// when a descendant is folded into it), the first source is the use a capture's borrow is
+/// reported at.
 fn determine_capture_sources(
-    capture_info_a: &mut CaptureInfo,
-    capture_info_b: &mut CaptureInfo,
-    dedup_sources_scratch: &mut FxHashMap<ExprOrPatIdPacked, CaptureSourceStack>,
+    kept: &mut CaptureInfo,
+    other: &mut CaptureInfo,
+    dedup_sources_scratch: &mut FxHashSet<ExprOrPatIdPacked>,
 ) -> SmallVec<[CaptureSourceStack; 2]> {
     dedup_sources_scratch.clear();
-    dedup_sources_scratch.extend(
-        mem::take(&mut capture_info_a.sources).into_iter().map(|it| (it.final_source(), it)),
+    let mut result = mem::take(&mut kept.sources);
+    result.retain(|it| dedup_sources_scratch.insert(it.final_source()));
+    result.extend(
+        mem::take(&mut other.sources)
+            .into_iter()
+            .filter(|it| dedup_sources_scratch.insert(it.final_source())),
     );
-    dedup_sources_scratch.extend(
-        mem::take(&mut capture_info_b.sources).into_iter().map(|it| (it.final_source(), it)),
-    );
-
-    let mut result = mem::take(&mut capture_info_a.sources);
-    result.clear();
-    result.extend(dedup_sources_scratch.values().cloned());
     result
 }
 

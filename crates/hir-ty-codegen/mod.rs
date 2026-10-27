@@ -112,6 +112,7 @@ pub use home::body_file;
 mod imports;
 #[cfg(feature = "llvm")]
 mod llvm;
+mod neon;
 mod patch;
 mod places;
 #[cfg(feature = "llvm")]
@@ -227,11 +228,13 @@ pub fn moved(path: &str, from: &str, to: &str) -> Option<String> {
 }
 
 /// `path` as rustc spells it in a location or in debug info. For a file of the installed
-/// standard library rustc joins `lib/rustlib/src/rust` to the sysroot as one piece, so on
-/// Windows it reads `<sysroot>\lib/rustlib/src/rust\library\..` where the file system
+/// standard library rustc joins `lib/rustlib/src/rust` to the sysroot as one piece, and then
+/// the path the library was built from, whose crate's directory the build named as
+/// `library/core`: on Windows it reads `<sysroot>\lib/rustlib/src/rust\library/core\src\..`
+/// (nightly-2026-10-25, harness/breakers.py `library_panic_location`) where the file system
 /// names it with backslashes throughout. Elsewhere the two are already the same.
 fn as_rustc_spells(path: &str) -> String {
-    path.replacen(r"\lib\rustlib\src\rust\", r"\lib/rustlib/src/rust\", 1)
+    path.replacen(r"\lib\rustlib\src\rust\library\", r"\lib/rustlib/src/rust\library/", 1)
 }
 
 /// The sources of the standard library: rustc names them where they are on this machine, and
@@ -504,6 +507,14 @@ enum PassMode {
         skipped: u8,
     },
     Indirect,
+    /// A vector of AArch64's shorter than 64 bits, whose lanes LLVM widens to make a 64-bit
+    /// vector of the same count (`<4 x i8>` as `<4 x i16>`): in the low 64 bits of a vector
+    /// register, each lane of `lane` at the bottom of `stride` bytes, the bits above it
+    /// undefined.
+    Spread {
+        lane: Type,
+        stride: u8,
+    },
     /// The C ABI's by-value aggregate in memory: the caller copies `size` bytes into its
     /// outgoing arguments, which Cranelift does given a pointer. Cranelift has such a copy
     /// at the next multiple of eight bytes, so one that is aligned to sixteen has eight
@@ -2980,12 +2991,8 @@ fn instance_code(
             });
         }
         InstanceDef::CallOnceShim => {
-            let args = instance.args.as_ref();
             return compile_as(db, env, None, false, instance.checked, shim, |fx| {
-                match args.len() {
-                    1 => fx.call_once_shim(ty()),
-                    _ => fx.call_once_by_pointer(args),
-                }
+                fx.call_once_shim(ty())
             });
         }
         InstanceDef::VtableShim(func) => {
@@ -3508,6 +3515,21 @@ fn fn_trait_methods(lang_items: &LangItems) -> [[Option<FunctionId>; 3]; 2] {
             lang_items.AsyncFnOnce_async_call_once,
         ],
     ]
+}
+
+/// The `Fn`-trait method (`call`, `call_mut` or `call_once`) that `func` is the impl of,
+/// when it is one written for a type.
+fn implemented_fn_method(
+    db: &dyn HirDatabase,
+    lang_items: &LangItems,
+    func: FunctionId,
+) -> Option<FunctionId> {
+    let ItemContainerId::ImplId(impl_) = func.lookup(db).container else { return None };
+    let trait_ref = db.impl_trait(impl_)?;
+    let name = &FunctionSignature::of(db, func).name;
+    let method = trait_ref.skip_binder().def_id.0.trait_items(db).method_by_name(name)?;
+    let [fn_methods, _] = fn_trait_methods(lang_items);
+    fn_methods.contains(&Some(method)).then_some(method)
 }
 
 /// The instance that is the `poll` of the future `ty`, when that is one of an `async` block.
@@ -8011,18 +8033,36 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if !matches!(target.arch, Arch::X86_64 | Arch::Aarch64) || size > 16 {
             return Ok(PassMode::Indirect);
         }
-        if count.as_u64() == 1 {
+        let lanes = count.as_u64();
+        if target.arch == Arch::Aarch64 && size < 8 {
+            // AArch64's LLVM makes a vector of fewer than 64 bits one of 64 (`v1i64` and
+            // `v1f64`, NEON's `*x1_t` of 64-bit lanes, are in a D register already, as the
+            // 64-bit vectors below are). One lane, or floats, it widens with more lanes
+            // after them (`<1 x i8>` as `<8 x i8>`, `<2 x half>` as `<4 x half>`): their
+            // bytes are the low ones of the register, as an `f32` is in its S register. The
+            // lanes of a vector of integers it promotes to as many lanes of 64 bits in all
+            // (`<4 x i8>` as `<4 x i16>`, `<2 x i8>` as `<2 x i32>`).
+            let float = matches!(element.primitive(), Primitive::Float(_));
+            return Ok(match lanes {
+                1 if size == 4 => PassMode::Cast(types::F32),
+                1 => PassMode::Cast(types::F64),
+                _ if !lanes.is_power_of_two() => {
+                    unsupported!("a SIMD vector of {lanes} lanes by value in the Rust ABI")
+                }
+                _ if float => PassMode::Cast(types::F64),
+                _ => PassMode::Spread {
+                    lane: Type::int((size / lanes * 8) as u16).expect("a lane of 8 or 16 bits"),
+                    stride: (8 / lanes) as u8,
+                },
+            });
+        }
+        if lanes == 1 {
             let lane = self.scalar(element)?.ty;
             match target.arch {
                 // x86-64's LLVM makes a vector of one lane its scalar, in that scalar's
                 // register under either convention: an integer's or pointer's in a general
                 // register, a float's in an XMM register, as the lane alone would be.
                 Arch::X86_64 if lane != types::I128 => return Ok(PassMode::Cast(lane)),
-                // AArch64's LLVM has `v1i64` and `v1f64` (NEON's `*x1_t` of 64-bit lanes) in
-                // a D register, as the 64-bit vectors below are, and widens a narrower lane
-                // to a 64-bit vector whose first lane it is: of a 32-bit lane that is the low
-                // 32 bits of the register, as an `f32` is in its S register.
-                Arch::Aarch64 if size == 4 => return Ok(PassMode::Cast(types::F32)),
                 Arch::Aarch64 if size == 8 => (),
                 _ => unsupported!("a SIMD vector of one {lane:?} lane by value in the Rust ABI"),
             }
@@ -8039,7 +8079,6 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             (Arch::X86_64, _) => PassMode::Cast(types::I64X2),
             // AArch64 has a 64-bit vector in the low half of a vector register, as an `f64`.
             (Arch::Aarch64, 8) => PassMode::Cast(types::F64),
-            // AArch64 widens the lanes of a shorter one, which is not a copy of its bytes.
             _ => unsupported!("a SIMD vector of {size} bytes by value in the Rust ABI"),
         })
     }
@@ -8213,6 +8252,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 PassMode::Cast(ty) => self.count_regs(&[ty]),
                 PassMode::CastPair(a, b) => self.count_regs(&[a, b]),
                 PassMode::Uniform { .. } => unreachable!("x86-64 has no uniform aggregate"),
+                PassMode::Spread { .. } => unreachable!("only the Rust ABI spreads lanes"),
                 PassMode::SpilledPair { .. } => unreachable!("only the stack spills a pair"),
                 PassMode::SkippingPair { .. } => unreachable!("only AAPCS64 skips registers"),
             };
@@ -8661,6 +8701,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 params.extend((0..count).map(|_| AbiParam::new(unit)));
             }
             PassMode::Indirect => params.push(AbiParam::new(ptr())),
+            PassMode::Spread { .. } => params.push(AbiParam::new(types::F64)),
             PassMode::OnStack { size, padded } => {
                 params.extend(padded.then(|| copied(8)));
                 params.push(copied(size));
@@ -8730,6 +8771,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 values.push(self.builder.ins().load(b.ty, MEM, addr, offset.bytes() as i32));
             }
             PassMode::Cast(ty) => values.push(self.load_cast(ty, addr, layout.size)),
+            PassMode::Spread { lane, stride } => {
+                let spread = self.scratch();
+                for i in 0..(layout.size.bytes() / u64::from(lane.bytes())) as i32 {
+                    let value = self.builder.ins().load(lane, MEM, addr, i * lane.bytes() as i32);
+                    self.builder.ins().store(MEM, value, spread, i * i32::from(stride));
+                }
+                values.push(self.builder.ins().load(types::F64, MEM, spread, 0));
+            }
             PassMode::CastPair(a, b) => {
                 values.push(self.builder.ins().load(a, MEM, addr, 0));
                 let rest = self.builder.ins().iadd_imm(addr, 8);
@@ -8809,6 +8858,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             PassMode::Cast(_) => {
                 let value = next();
                 self.store_cast(value, addr, layout.size);
+            }
+            PassMode::Spread { lane, stride } => {
+                let spread = self.scratch();
+                let value = next();
+                self.builder.ins().store(MEM, value, spread, 0);
+                for i in 0..(layout.size.bytes() / u64::from(lane.bytes())) as i32 {
+                    let value = self.builder.ins().load(lane, MEM, spread, i * i32::from(stride));
+                    self.builder.ins().store(MEM, value, addr, i * lane.bytes() as i32);
+                }
             }
             PassMode::CastPair(..) => {
                 let (a, b) = (next(), next());
@@ -12730,15 +12788,25 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if fn_methods.contains(&Some(func)) && !written {
             return self.vtable_fn_method(self_ty, once);
         }
-        // A type with an impl of the trait, as `Box<dyn Fn()>` has: `call_once` takes it by
-        // value, and the slot is called with a pointer to it.
-        if once {
-            let (callee, callee_args, sig, mode) = self.call_once_impl(trait_ref.args)?;
-            if matches!(mode, PassMode::Indirect) {
-                return self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &sig);
+        // A type with an impl of the trait, as `Box<dyn Fn()>` and `&mut dyn FnMut()` have:
+        // the slot is called with the arguments one by one and, for `call_once`, a pointer to
+        // the receiver, where the method takes them as a tuple and the receiver by value.
+        if fn_methods.contains(&Some(func)) {
+            let Some(callee_args) = self.vtable_method_args(func, trait_ref) else {
+                unsupported!("generic `Fn`-trait method in a vtable");
+            };
+            let (callee, callee_args) = db.lookup_impl_method(self.env, func, callee_args);
+            let either::Either::Left(callee) = callee else {
+                unsupported!("builtin `Fn`-trait method in the vtable of {self_ty:?}");
+            };
+            if !FunctionSignature::of(db, callee).has_body() {
+                let method = FunctionSignature::of(db, callee).name.as_str();
+                unsupported!("no impl of `{method}` found for the vtable of {self_ty:?}");
             }
-            let sig = Self::by_pointer(&sig, mode);
-            return self.cg.callee(InstanceDef::CallOnceShim, trait_ref.args, self.env, &sig);
+            let body = self.body_types(InstanceDef::Fn(callee), callee_args)?;
+            let (_, abi) = self.spread_shim_abi(body)?;
+            let sig = self.signature(&abi.args, abi.ret);
+            return self.cg.callee(InstanceDef::VtableShim(callee), callee_args, self.env, &sig);
         }
         if Some(func) == lang_items.FuturePoll
             && let Some((def, parent_args)) = coroutine_instance(db, self_ty)
@@ -13085,43 +13153,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(())
     }
 
-    /// The `FnOnce::call_once` written for a type, given the type and the tuple of what it
-    /// is called with, and how the function takes the type.
-    fn call_once_impl(
-        &mut self,
-        args: GenericArgs<'db>,
-    ) -> Result<(FunctionId, GenericArgs<'db>, Signature, PassMode)> {
-        let Some(func) = self.interner.lang_items().FnOnce_call_once else {
-            unsupported!("no `FnOnce::call_once`");
-        };
-        let (callee, callee_args) = self.cg.db.lookup_impl_method(self.env, func, args);
-        let either::Either::Left(callee) = callee else {
-            unsupported!("builtin derive method in a vtable");
-        };
-        if !FunctionSignature::of(self.cg.db, callee).has_body() {
-            unsupported!("no impl of `call_once` found for {:?}", args.type_at(0));
-        }
-        let body = self.body_types(InstanceDef::Fn(callee), callee_args)?;
-        let sig = self.body_signature(body)?;
-        let Some(receiver) = body.params.first() else {
-            unsupported!("`call_once` without a receiver");
-        };
-        let layout = self.layout(receiver.as_ref())?;
-        let mode = self.pass_mode(&layout, false)?;
-        Ok((callee, callee_args, sig, mode))
-    }
-
-    /// The body of a `CallOnceShim` for a type with an impl of `FnOnce`: calls it with the
-    /// value the shim is handed a pointer to.
-    fn call_once_by_pointer(&mut self, args: GenericArgs<'db>) -> Result<()> {
-        let (callee, callee_args, sig, mode) = self.call_once_impl(args)?;
-        let layout = self.layout(args.type_at(0))?;
-        self.call_by_pointer(callee, callee_args, &sig, mode, &layout)
-    }
-
     /// The body of a `VtableShim`: calls the method with the value the shim is handed a
     /// pointer to.
     fn vtable_shim(&mut self, func: FunctionId, args: GenericArgs<'db>) -> Result<()> {
+        if let Some(method) = implemented_fn_method(self.cg.db, self.interner.lang_items(), func) {
+            return self.spread_shim(func, args, method);
+        }
         let body = self.body_types(InstanceDef::Fn(func), args)?;
         let sig = self.body_signature(body)?;
         let Some(receiver) = body.params.first() else {
@@ -13130,6 +13167,92 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let layout = self.layout(receiver.as_ref())?;
         let mode = self.pass_mode(&layout, false)?;
         self.call_by_pointer(func, args, &sig, mode, &layout)
+    }
+
+    /// What the vtable slot for an `Fn`-trait method written for a type, whose body is
+    /// `body`, is called with: the data pointer of the object, then the arguments one by one,
+    /// as every call through an `Fn`-trait vtable passes them. The method takes them as the
+    /// tuple this also gives.
+    fn spread_shim_abi(&self, body: &BodyTypes) -> Result<(Ty<'db>, FnAbi)> {
+        let [_, tuple] = &body.params[..] else {
+            unsupported!("an `Fn`-trait method that takes other than a receiver and a tuple");
+        };
+        let tuple = tuple.as_ref();
+        let TyKind::Tuple(fields) = tuple.kind() else {
+            unsupported!("an `Fn`-trait method that takes {tuple:?}, not a tuple");
+        };
+        let thin = Ty::new_imm_ptr(self.interner, Ty::new_unit(self.interner));
+        let inputs = std::iter::once(thin).chain(fields.iter());
+        Ok((tuple, self.fn_abi(ExternAbi::Rust, body.returned.as_ref(), inputs)?))
+    }
+
+    /// The body of a `VtableShim` for `func`, the `Fn`-trait method `method` written for a
+    /// type: puts the arguments it is handed one by one back in the tuple `func` takes, and
+    /// hands `func` the receiver, which for `call_once` it has a pointer to.
+    fn spread_shim(
+        &mut self,
+        func: FunctionId,
+        args: GenericArgs<'db>,
+        method: FunctionId,
+    ) -> Result<()> {
+        if track_caller(self.cg.db, func) {
+            unsupported!("an `Fn`-trait method in a vtable that tracks its caller");
+        }
+        let body = self.body_types(InstanceDef::Fn(func), args)?;
+        let receiver_ty = body.params[0].as_ref();
+        let dst_ty = body.returned.as_ref();
+        let (tuple_ty, FnAbi { ret, args: modes }) = self.spread_shim_abi(body)?;
+        self.builder.func.signature = self.signature(&modes, ret);
+        let entry = self.builder.create_block();
+        self.builder.append_block_params_for_function_params(entry);
+        self.builder.switch_to_block(entry);
+        let mut incoming = self.builder.block_params(entry).to_vec().into_iter();
+        let dst_layout = self.layout(dst_ty)?;
+        let dst = match ret {
+            PassMode::Indirect => incoming.next().expect("sret param"),
+            _ => self.stack_slot(&dst_layout),
+        };
+        let thin = Ty::new_imm_ptr(self.interner, Ty::new_unit(self.interner));
+        let tuple_layout = self.layout(tuple_ty)?;
+        let tuple = self.stack_slot(&tuple_layout);
+        let inputs = std::iter::once(thin).chain(tuple_ty.tuple_fields().iter());
+        let mut data = None;
+        for (i, (ty, mode)) in inputs.zip(modes).enumerate() {
+            let layout = self.layout(ty)?;
+            let addr = match mode {
+                PassMode::OnStack { padded: true, .. } => {
+                    incoming.nth(1).expect("a parameter in memory after its padding")
+                }
+                PassMode::Indirect | PassMode::OnStack { .. } => {
+                    incoming.next().expect("indirect param")
+                }
+                _ => self.stack_slot(&layout),
+            };
+            self.receive(mode, &mut incoming, addr, &layout);
+            match i.checked_sub(1) {
+                None => data = Some(addr),
+                Some(field) => {
+                    let offset = tuple_layout.fields.offset(field).bytes() as i64;
+                    let at = self.builder.ins().iadd_imm(tuple, offset);
+                    self.copy(at, addr, layout.size);
+                }
+            }
+        }
+        let data = data.expect("the data pointer of the object");
+        // `call` and `call_mut` borrow the object, which is what the data pointer is.
+        // `call_once` takes it by value, and the data pointer is where it is.
+        let receiver = match Some(method) == self.interner.lang_items().FnOnce_call_once {
+            true => self.builder.ins().load(ptr(), MEM, data, 0),
+            false => data,
+        };
+        let values = [(receiver, receiver_ty), (tuple, tuple_ty)];
+        self.emit_call(Callee::Instance(InstanceDef::Fn(func), args), &values, dst, dst_ty)?;
+        let mut results = Vec::new();
+        if !matches!(ret, PassMode::Indirect) {
+            self.pass(ret, dst, &dst_layout, &mut results);
+        }
+        self.builder.ins().return_(&results);
+        Ok(())
     }
 
     /// The body of a shim that is handed a pointer to the receiver of `callee`, which takes
@@ -14457,6 +14580,33 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
                 self.builder.ins().store(MEM, acc, dst, 0);
             }
+            // Each float lane to an integral float, as rustc's LLVM `trunc`, `round` (ties
+            // away from zero) and `rint` (in the current mode, which is to even) select on
+            // AArch64, of lanes of any float's width.
+            ("simd_trunc" | "simd_round" | "simd_round_ties_even", [arg])
+                if self.cg.target.arch == Arch::Aarch64 =>
+            {
+                let ty = self.operand_ty(arg)?;
+                let layout = self.layout(ty)?;
+                let lanes = match layout.backend_repr {
+                    BackendRepr::SimdVector { element, count } => match element.primitive() {
+                        Primitive::Float(float) => {
+                            neon::Lanes::floats(float.size().bits() as u32, count.as_u64() as u32)
+                        }
+                        _ => unsupported!("`{name}` of integers"),
+                    },
+                    _ => unsupported!("vector operation on {ty:?}"),
+                };
+                let instruction = match name {
+                    "simd_trunc" => "frintz",
+                    "simd_round" => "frinta",
+                    _ => "frintx",
+                };
+                let Some(lowered) = neon::rounding(instruction, lanes) else {
+                    unsupported!("`{name}` of {ty:?}");
+                };
+                self.neon_assembly(name, &lowered, args, dst, dst_ty)?;
+            }
             (
                 "simd_ctpop" | "simd_ctlz" | "simd_cttz" | "simd_bswap" | "simd_bitreverse"
                 | "simd_neg" | "simd_fabs" | "simd_fsqrt" | "simd_floor" | "simd_ceil",
@@ -15248,6 +15398,58 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(true)
     }
 
+    /// Calls the instructions `neon::lower` made of the intrinsic `name` on its
+    /// operands and writes what they leave where `dst` is, once each operand and the result
+    /// is of the size the name says.
+    fn neon_assembly(
+        &mut self,
+        name: &str,
+        lowered: &neon::Lowered,
+        args: &[Operand],
+        dst: Value,
+        dst_ty: Ty<'db>,
+    ) -> Result<()> {
+        if args.len() != lowered.args.len() {
+            unsupported!("`{name}` with {} arguments", args.len());
+        }
+        let mut values = vec![dst];
+        for (arg, expected) in args.iter().zip(&lowered.args) {
+            let ty = self.operand_ty(arg)?;
+            let pointer = matches!(ty.kind(), TyKind::RawPtr(..));
+            let fits = match expected {
+                None => pointer,
+                Some(bytes) => !pointer && self.layout(ty)?.size.bytes() == u64::from(*bytes),
+            };
+            if !fits {
+                unsupported!("`{name}` of {ty:?}, which is not what its name says");
+            }
+            values.push(self.operand(arg)?.0);
+        }
+        // One result, or a tuple of vectors (`int8x16x2_t`) whose fields are the registers.
+        let layout = self.layout(dst_ty)?;
+        let size: u64 = lowered.results.iter().map(|&it| u64::from(it)).sum();
+        let results: Vec<(u32, u32)> = match lowered.results.as_slice() {
+            [] if layout.is_zst() => Vec::new(),
+            &[bytes] if layout.size.bytes() == u64::from(bytes) => vec![(0, bytes)],
+            many if layout.size.bytes() == size
+                && layout.fields.count() == many.len()
+                && (0..many.len())
+                    .all(|i| layout.fields.offset(i).bytes() == i as u64 * u64::from(many[0])) =>
+            {
+                many.iter().enumerate().map(|(i, &bytes)| (i as u32 * bytes, bytes)).collect()
+            }
+            _ => unsupported!("`{name}` returning {dst_ty:?}, which is not what its name says"),
+        };
+        let directives = asm::extensions(Arch::Aarch64, lowered.features.iter().copied());
+        let text = asm::neon_function(&directives, &lowered.args, &lowered.text, &results);
+        let mut sig = self.cg.make_signature();
+        sig.params.extend(values.iter().map(|_| AbiParam::new(ptr())));
+        let callee = self.cg.assembly(text, &sig);
+        let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+        self.builder.ins().call(callee, &values);
+        Ok(())
+    }
+
     /// A function `core::arch` declares as `llvm.{name}`: something LLVM implements, with no
     /// body anywhere.
     fn llvm_intrinsic(
@@ -15587,6 +15789,40 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     self.builder.ins().store(MEM, value, dst, at);
                 }
             }
+            // A barrier of the kind its option names, or the hint its number names, as the
+            // instruction's word: `dsb` of option 0 and 4 are the barriers `ssbb` and
+            // `pssbb`, which an assembler may take only by those names.
+            ("aarch64.dmb" | "aarch64.dsb" | "aarch64.hint", [option]) => {
+                let Some(option) = self.immediate(option)? else {
+                    unsupported!("`llvm.{name}` of an option that is not a constant");
+                };
+                let (word, most, at) = match name {
+                    "aarch64.dmb" => (0xd503_30bf_u32, 15, 8),
+                    "aarch64.dsb" => (0xd503_309f, 15, 8),
+                    _ => (0xd503_201f, 127, 5),
+                };
+                if option > most {
+                    unsupported!("`llvm.{name}` of option {option}");
+                }
+                let word = word | (option as u32) << at;
+                let sig = self.cg.make_signature();
+                let callee = self.cg.assembly(asm::instruction_word(word), &sig);
+                let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+                self.builder.ins().call(callee, &[]);
+            }
+            // A random number, and whether there was none (`rndrrs` reseeds first): the
+            // register reads as 0 with the Z flag set then. The result is `(u64, bool)`.
+            ("aarch64.rndr" | "aarch64.rndrrs", []) => {
+                let layout = self.layout(dst_ty)?;
+                if layout.size.bytes() != 16 || layout.fields.offset(1).bytes() != 8 {
+                    unsupported!("`llvm.{name}` returning {dst_ty:?}");
+                }
+                let mut sig = self.cg.make_signature();
+                sig.params.push(AbiParam::new(ptr()));
+                let callee = self.cg.assembly(asm::random(name == "aarch64.rndrrs"), &sig);
+                let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+                self.builder.ins().call(callee, &[dst]);
+            }
             ("x86.sse2.pause", []) | ("aarch64.isb", [_]) => {
                 let text = if name == "aarch64.isb" { asm::isb() } else { asm::pause() };
                 let sig = self.cg.make_signature();
@@ -15706,6 +15942,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             ("x86.avx.vzeroupper", []) => {}
             // A hint to the cache, which the program behaves the same without.
             ("prefetch.p0", [_address, _write, _locality, _cache]) => {}
+            _ if self.cg.target.arch == Arch::Aarch64
+                && let Some(lowered) = neon::lower(name) =>
+            {
+                self.neon_assembly(&format!("llvm.{name}"), &lowered, args, dst, dst_ty)?
+            }
             _ => unsupported!("LLVM intrinsic `{name}`"),
         }
         Ok(())

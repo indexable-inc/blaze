@@ -26,8 +26,10 @@ def main():
             continue
         for line in text.splitlines():
             line = line.strip()
-            if line.startswith("left to rustc: "):
-                line = line[len("left to rustc: "):]
+            # "refused: " in a build with nothing of rustc's, "left to rustc: " in one with it.
+            prefix = next((it for it in ("left to rustc: ", "refused: ") if line.startswith(it)), None)
+            if prefix:
+                line = line[len(prefix):]
             elif not path.endswith(".skipped"):
                 continue
             m = re.match(r"(.*?): (unsupported: .*|.*)$", line)

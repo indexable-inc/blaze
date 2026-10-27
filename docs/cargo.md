@@ -122,9 +122,12 @@ build, which says which and why; nothing is handed to cargo or rustc:
 
 What blaze does not build yet fails the same way, saying what: the targets `--bins`,
 `--examples`, `--tests`, `--benches` and `--all-targets` pick, several `--target`s,
-`--target-dir`, `--message-format`, `-Z`, and `--build-plan` and `--unit-graph`. A build of
-libraries alone (`--lib`, or a workspace with no program) is the daemon's check of them:
-blaze writes no library for cargo, and says what it finds.
+`--target-dir`, `--message-format`, `-Z`, and `--build-plan` and `--unit-graph`, and a
+library whose crate types include `cdylib` or `staticlib` when the build would write that file
+(a plain `build`, or `--lib`): blaze does not link one yet, and says which
+([#262](https://github.com/indexable-inc/blaze/issues/262)). A build of other libraries alone
+(`--lib`, or a workspace with no program) is the daemon's check of them: blaze writes no
+`rlib` for cargo, and says what it finds.
 
 The build is the daemon's: its worker loads the workspace, builds and links the programs, and
 answers once they are linked. The next build asks the same worker, which compiles the
@@ -328,6 +331,19 @@ does. Where no sandbox can be made, the script fails with why and the same way o
 run does, and a proc-macro server does not start and the load says why: nothing ever runs
 outside instead, nor goes to cargo or rustc. Windows has no sandbox yet, so there a build with
 build scripts or proc macros needs `RA_JIT_SANDBOX=off`.
+
+In a container the sandbox's user namespace may be refused: Docker's default seccomp profile
+refuses `unshare(CLONE_NEWUSER)` to a process without `CAP_SYS_ADMIN`, so in a plain `docker
+run` every build script and proc macro fails with
+`a user namespace (unshare): Operation not permitted`
+([#420](https://github.com/indexable-inc/blaze/issues/420)). Where the process can tell it is
+in a container (`/.dockerenv`, `/run/.containerenv`, the `container` variable, or
+`/proc/1/cgroup` naming docker, kubepods, containerd, libpod or lxc), the error says so and
+names the ways on: run the container with `--security-opt seccomp=unconfined` (or a seccomp
+profile that allows user namespaces; on Kubernetes `securityContext.seccompProfile.type:
+Unconfined`), which keeps the sandbox, or set `BLAZE_SANDBOX=off`, which runs build scripts,
+proc macros and tests outside it, as cargo does. blaze does not make a weaker sandbox there on
+its own.
 
 What a script read is recorded, and decides one thing only. Cargo runs a script again when a
 file of its `rerun-if-changed` changed, when a variable of `rerun-if-env-changed` did, and,

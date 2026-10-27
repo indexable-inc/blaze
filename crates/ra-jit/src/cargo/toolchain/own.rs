@@ -663,13 +663,18 @@ mod tests {
         Release::read(pins.leak(), "test-host").unwrap()
     }
 
+    /// The programs of the package as the host's are named: `bin/rustc.exe` on Windows.
+    fn exe(name: &str) -> &'static str {
+        format!("bin/{name}{}", std::env::consts::EXE_SUFFIX).leak()
+    }
+
     fn rustc() -> Vec<u8> {
         package(
             "rustc-9.9.9-test-host",
             "rustc",
             &[
-                ("bin/rustc", "#!/bin/sh\n"),
-                ("bin/cargo", "#!/bin/sh\n"),
+                (exe("rustc"), "#!/bin/sh\n"),
+                (exe("cargo"), "#!/bin/sh\n"),
                 ("lib/librustc_driver-0.so", ""),
                 ("share/doc/rust/README.md", "read me\n"),
             ],
@@ -709,7 +714,11 @@ mod tests {
         assert_eq!(read("lib/rustlib/components"), "rustc-test-host\nrust-src\n");
         assert_eq!(
             read("lib/rustlib/manifest-rustc-test-host"),
-            "file:bin/rustc\nfile:bin/cargo\nfile:lib/librustc_driver-0.so\nfile:share/doc/rust/README.md\n"
+            format!(
+                "file:{}\nfile:{}\nfile:lib/librustc_driver-0.so\nfile:share/doc/rust/README.md\n",
+                exe("rustc"),
+                exe("cargo")
+            )
         );
         assert_eq!(
             read("lib/rustlib/manifest-rust-src"),

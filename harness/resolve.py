@@ -2,7 +2,8 @@
 """resolve.py: what blaze-manifest reads of a workspace against what cargo reads of it, over a
 corpus. cargo is the oracle; blaze never runs it outside this harness.
 
-usage: resolve.py [PART...] [--work DIR] [--jobs N] [--blaze BIN] [--out FILE] [--limit N]
+usage: resolve.py [PART...] [--work DIR] [--jobs N] [--blaze BIN] [--blaze-metadata BIN] [--out FILE]
+                  [--limit N]
        resolve.py DIR...                 compare the workspaces at DIR... only
        resolve.py --fixtures             write the expected JSON of the fixtures with cargo
        resolve.py --top-crates N         list the N most downloaded crates.io crates, newest
@@ -21,6 +22,9 @@ The parts of the corpus (harness/resolve/corpus.json) are
               case's runs, on the trees of crates/blaze-manifest/tests/profile-fixtures and
               the bench and workspace repositories: the profiles, the warnings about profiles
               and cargo's error when it refuses the profiles
+  sysroot     `cargo metadata` of the toolchain's library/ (`--no-deps` and full, no platform and
+              each target of harness/answers.py), asked as rust-analyzer's Sysroot asks it, against
+              blaze-metadata's `metadata` example (`--no-deps`, `--locked`)
 and every part runs when none is named. Each is fetched under `--work` (default
 $TMPDIR/blaze-resolve) with a CARGO_HOME of its own there, then `cargo metadata --no-deps
 --format-version 1` and the `metadata` example of blaze-manifest are run on it from its root.
@@ -50,7 +54,7 @@ PROFILE_FIXTURES = os.path.join(ROOT, "crates", "blaze-manifest", "tests", "prof
 PIN = open(os.path.join(HERE, "toolchain")).read().strip()
 CARGO = os.environ.get("CARGO_ORACLE", f"cargo +{PIN}").split()
 USER_AGENT = "blaze resolve.py (https://github.com/indexable-inc/blaze)"
-PARTS = ["bench", "crates", "workspaces", "config", "profiles"]
+PARTS = ["bench", "crates", "workspaces", "config", "profiles", "sysroot"]
 # The `config get` arguments every config case runs, before those of its case.json.
 CONFIG_RUNS = [[], ["--show-origin"], ["--merged", "no"], ["--merged", "no", "--show-origin"], ["--format", "json"], ["--format", "json-value"], ["--format", "json", "--show-origin"]]
 # The commands every profiles case runs, before those of its case.json; `--target` names a
@@ -313,6 +317,73 @@ def compare_profiles(case, blaze, cargo_home, host):
     return result
 
 
+def sysroot_library():
+    rustc = ["rustc", CARGO[1]] if len(CARGO) > 1 and CARGO[1].startswith("+") else ["rustc"]
+    sysroot = subprocess.run(rustc + ["--print", "sysroot"], capture_output=True, text=True, check=True).stdout.strip()
+    return rustc, os.path.join(sysroot, "lib", "rustlib", "src", "rust", "library")
+
+
+def sysroot_cases():
+    """A case for each way rust-analyzer asks for the library: no platform and each target ra-jit
+    has the answers of, `--no-deps` and full."""
+    sys.path.insert(0, HERE)
+    from answers import TARGETS
+    return [dict(name=f"{'no-deps' if no_deps else 'full'}/{target or 'any'}", part="sysroot", dir=None, fetch=lambda: None, no_deps=no_deps, target=target)
+            for target in [None, *TARGETS] for no_deps in (True, False)]
+
+
+def build_metadata_example():
+    command = CARGO + ["build", "--release", "-p", "blaze-metadata", "--example", "metadata", "--message-format", "json"]
+    proc = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=True)
+    for line in proc.stdout.splitlines():
+        message = json.loads(line)
+        if message.get("reason") == "compiler-artifact" and message.get("executable") and message["target"]["name"] == "metadata":
+            return message["executable"]
+    raise SystemExit("cargo built no metadata example of blaze-metadata")
+
+
+def compare_sysroot(case, blaze, cargo_home):
+    """cargo's and blaze's metadata of the toolchain's library, asked as rust-analyzer asks."""
+    rustc, library = sysroot_library()
+    result = dict(name=case["name"], part="sysroot")
+    manifest = os.path.join(library, "Cargo.toml")
+    env = {k: v for k, v in clean_env(cargo_home).items() if k != "CARGO_ORACLE"}
+    env["__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS"] = "nightly"
+    args = ["metadata", "--format-version", "1"] + (["--no-deps"] if case["no_deps"] else [])
+    args += ["--features", "sysroot/backtrace", "--manifest-path", manifest]
+    platform = ["--filter-platform", case["target"]] if case["target"] else []
+    work = tempfile.mkdtemp(prefix="blaze-sysroot-")
+    try:
+        cargo_env = dict(env)
+        cargo_args = args + platform
+        if not case["no_deps"]:
+            # rust-analyzer's copy of the lock file, so that the toolchain's is never written.
+            copy = os.path.join(work, "Cargo.lock")
+            shutil.copyfile(os.path.join(library, "Cargo.lock"), copy)
+            cargo_env["CARGO_RESOLVER_LOCKFILE_PATH"] = copy
+            cargo_args += ["-Zunstable-options"]
+        c_code, c_out, c_err = run(CARGO + cargo_args, library, cargo_env)
+        blaze_args = args[3:] + platform + (["--no-deps"] if case["no_deps"] else ["--locked"])
+        if case["target"]:
+            cfg = os.path.join(work, "cfg")
+            with open(cfg, "w") as f:
+                f.write(subprocess.run(rustc + ["--print", "cfg", "--target", case["target"]], capture_output=True, text=True, check=True).stdout)
+            blaze_args += ["--cfg-file", cfg]
+        b_code, b_out, b_err = run([blaze, *blaze_args], library, env)
+    finally:
+        shutil.rmtree(work)
+    if c_code or b_code:
+        cls = "both-failed" if c_code and b_code else "cargo-failed" if c_code else "blaze-failed"
+        result.update(cls=cls, cargo=first_line(c_err) if c_code else "", blaze=b_err.strip()[-600:] if b_code else "")
+        return result
+    c_json, b_json = normalize(c_out, library, cargo_home), normalize(b_out, library, cargo_home)
+    if c_json == b_json:
+        result.update(cls="equal", packages=len(json.loads(c_json)["packages"]))
+    else:
+        result.update(cls="different", difference=first_difference(json.loads(b_json), json.loads(c_json)) or "formatting")
+    return result
+
+
 def fetch_git(repo, rev, dest):
     with FETCH_LOCKS[dest]:
         fetch_git_unlocked(repo, rev, dest)
@@ -353,6 +424,8 @@ def fetch_crate_unlocked(name, version, dest):
 def cases_of(part, corpus, work, limit):
     """The workspaces of a part, fetched: (name, directory) each."""
     cases = []
+    if part == "sysroot":
+        return sysroot_cases()
     if part in ("config", "profiles"):
         fixtures = CONFIG_FIXTURES if part == "config" else PROFILE_FIXTURES
         for name in sorted(os.listdir(fixtures)):
@@ -474,6 +547,9 @@ def main():
     limit = int(option(argv, "--limit", "1000000"))
     blaze = option(argv, "--blaze")
     built = dict(metadata=blaze, config=os.path.join(os.path.dirname(blaze), "config"), profiles=os.path.join(os.path.dirname(blaze), "profiles")) if blaze else build_blaze()
+    blaze_metadata = option(argv, "--blaze-metadata")
+    if "sysroot" in (argv or PARTS):
+        built["sysroot"] = blaze_metadata or build_metadata_example()
     host = rustc_host()
     cargo_home = os.path.join(work, "cargo-home")
     os.makedirs(cargo_home, exist_ok=True)
@@ -492,6 +568,8 @@ def main():
             return dict(name=case["name"], part=case["part"], cls="fetch-failed", error=str(e)[:300])
         if case["part"] == "config":
             return compare_config(case, built["config"], cargo_home)
+        if case["part"] == "sysroot":
+            return compare_sysroot(case, built["sysroot"], cargo_home)
         if case["part"] == "profiles":
             return compare_profiles(case, built["profiles"], cargo_home, host)
         return compare(case, built["metadata"], cargo_home)

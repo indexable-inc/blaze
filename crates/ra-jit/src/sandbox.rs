@@ -449,6 +449,41 @@ fn probe() -> Result<(), String> {
     }
 }
 
+/// What a container this process is in is known by, below `root` (`/` but in tests), with
+/// `container` the variable of that name: `/.dockerenv` (Docker), `/run/.containerenv` (Podman),
+/// the variable (systemd-nspawn, Podman, LXC), or `/proc/1/cgroup` naming a runtime (cgroup v1
+/// Docker, Kubernetes, containerd). `None` outside one, as far as it can be told.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn container(root: &Path, container: Option<&str>) -> Option<String> {
+    for file in [".dockerenv", "run/.containerenv"] {
+        if root.join(file).exists() {
+            return Some(format!("/{file}"));
+        }
+    }
+    if let Some(name) = container.filter(|it| !it.is_empty()) {
+        return Some(format!("`container={name}`"));
+    }
+    let cgroup = std::fs::read_to_string(root.join("proc/1/cgroup")).unwrap_or_default();
+    ["docker", "kubepods", "containerd", "libpod", "lxc"]
+        .into_iter()
+        .find(|it| cgroup.contains(it))
+        .map(|it| format!("/proc/1/cgroup naming {it}"))
+}
+
+/// What is said after a user namespace refused with `EPERM` in a container known by `known`
+/// ([`container`]): the container's seccomp profile (Docker's default) is what refuses it, and
+/// the ways on: a profile that allows it, or no sandbox at all.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn container_hint(known: &str) -> String {
+    format!(
+        "; this runs in a container ({known}), and its seccomp profile (Docker's default) refuses \
+         `unshare(CLONE_NEWUSER)`: run the container with `--security-opt seccomp=unconfined` \
+         (or a seccomp profile that allows user namespaces; on Kubernetes \
+         `securityContext.seccompProfile.type: Unconfined`), or set `{VAR_BLAZE}=off` to run \
+         build scripts, proc macros and tests outside a sandbox, as cargo does"
+    )
+}
+
 /// `path` with `.` and empty parts left out.
 fn tidy(path: &Path) -> String {
     use std::path::Component;
@@ -475,6 +510,35 @@ mod tests {
         assert!(!with(&[("RA_JIT_SANDBOX", "off")]) && !with(&[("RA_JIT_SANDBOX", "0")]));
         assert!(with(&[("RA_JIT_SANDBOX", "off"), ("BLAZE_SANDBOX", "on")]));
         assert!(!with(&[("RA_JIT_SANDBOX", "on"), ("BLAZE_SANDBOX", "off")]));
+    }
+
+    // The paths a sandbox records are a Unix machine's: there is one on Linux and macOS alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_container_is_known_by_its_marks() {
+        let root =
+            std::env::temp_dir().join(format!("ra-jit-container-test-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("proc/1")).unwrap();
+        std::fs::create_dir_all(root.join("run")).unwrap();
+        assert_eq!(container(&root, None), None);
+        assert_eq!(container(&root, Some("")), None);
+        assert_eq!(container(&root, Some("podman")).as_deref(), Some("`container=podman`"));
+        std::fs::write(root.join("proc/1/cgroup"), "0::/\n").unwrap();
+        assert_eq!(container(&root, None), None);
+        std::fs::write(root.join("proc/1/cgroup"), "12:pids:/kubepods/burstable/pod1/abc\n")
+            .unwrap();
+        assert_eq!(container(&root, None).as_deref(), Some("/proc/1/cgroup naming kubepods"));
+        std::fs::write(root.join("run/.containerenv"), "").unwrap();
+        assert_eq!(container(&root, None).as_deref(), Some("/run/.containerenv"));
+        std::fs::write(root.join(".dockerenv"), "").unwrap();
+        let known = container(&root, Some("podman")).unwrap();
+        assert_eq!(known, "/.dockerenv");
+        let hint = container_hint(&known);
+        assert!(hint.contains("container (/.dockerenv)"), "{hint}");
+        assert!(hint.contains("--security-opt seccomp=unconfined"), "{hint}");
+        assert!(hint.contains("`BLAZE_SANDBOX=off`"), "{hint}");
+        _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -25,7 +25,7 @@ mod state;
 pub(crate) mod switch;
 mod toolchain;
 mod units;
-mod whole;
+pub(crate) mod whole;
 
 use std::{collections::BTreeMap, path::Path, process::Command, time::Instant};
 

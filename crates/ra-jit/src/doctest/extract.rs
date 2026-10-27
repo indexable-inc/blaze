@@ -77,8 +77,7 @@ fn is_error_code(token: &str) -> bool {
 /// The examples of the crate, in the order of a walk of its modules.
 pub(crate) fn examples(db: &RootDatabase, krate: hir::Crate) -> Vec<Example> {
     let whole_files = krate.edition(db).at_least_2024();
-    let mut found =
-        Found { db, examples: Vec::new(), seen: Default::default(), whole_files, nth: 0 };
+    let mut found = Found { db, examples: Vec::new(), seen: Default::default(), whole_files };
     found.module(krate.root_module(db), "");
     found.examples
 }
@@ -87,9 +86,7 @@ struct Found<'db> {
     db: &'db RootDatabase,
     examples: Vec<Example>,
     /// Where the blocks found are: a macro that is exported is in two modules.
-    seen: rustc_hash::FxHashSet<(PathBuf, usize, String, usize)>,
-    /// Which of the items of a `use` is being read: they share its documentation.
-    nth: usize,
+    seen: rustc_hash::FxHashSet<(PathBuf, usize, String)>,
     /// Whether the crate is of an edition from which rustdoc has the text of a file that
     /// `include_str!` reads be in that file.
     whole_files: bool,
@@ -141,19 +138,11 @@ impl Found<'_> {
         for it in module.extern_blocks(db) {
             self.documented(it, path);
         }
-        // rustdoc has an item for every name a `use` brings in, and one without a name for
-        // a list or a glob: the documentation of the `use` is that of each of them.
+        // rustdoc tests the examples of a `use` once, under the name it brings in, or under
+        // none for a list or a glob (rustdoc of nightly-2026-10-25).
         for it in module.use_decls(db) {
-            let mut names = Vec::new();
-            if let Some(tree) = it.source(db).value.use_tree() {
-                use_names(&tree, None, &mut names);
-            }
-            for (nth, name) in names.into_iter().enumerate() {
-                let path = if name.is_empty() { path.to_owned() } else { join(path, name) };
-                self.nth = nth;
-                self.documented(it, &path);
-            }
-            self.nth = 0;
+            let name = it.source(db).value.use_tree().and_then(|tree| use_name(&tree));
+            self.documented(it, &name.map_or_else(|| path.to_owned(), |name| join(path, name)));
         }
         for it in module.extern_crate_decls(db) {
             let name = it.alias_or_name(db);
@@ -211,7 +200,7 @@ impl Found<'_> {
         for block in blocks(text) {
             let Some(marks) = Marks::parse(&block.lang) else { continue };
             let place = (file.clone(), first + text[..block.start].matches('\n').count());
-            if !self.seen.insert((place.0.clone(), place.1, path.to_owned(), self.nth)) {
+            if !self.seen.insert((place.0.clone(), place.1, path.to_owned())) {
                 continue;
             }
             self.examples.push(Example {
@@ -301,22 +290,16 @@ fn included(call: &syntax::ast::MacroCall) -> Option<String> {
     includes.then(|| file.value().ok().map(|it| it.into_owned())).flatten()
 }
 
-/// The names rustdoc has the items of a `use` under: the name each path is brought in as,
-/// and none for a list and for a glob. `stem` is what `self` in a list names.
-fn use_names(tree: &syntax::ast::UseTree, stem: Option<String>, names: &mut Vec<String>) {
-    let last = tree.path().and_then(|it| it.segment()).map(|it| it.syntax().text().to_string());
-    if let Some(list) = tree.use_tree_list() {
-        names.push(String::new());
-        for inner in list.use_trees() {
-            use_names(&inner, last.clone(), names);
-        }
-    } else if tree.star_token().is_some() {
-        names.push(String::new());
-    } else if let Some(rename) = tree.rename() {
-        names.push(rename.name().map_or("_".to_owned(), |it| it.text().to_string()));
-    } else if let Some(last) = last {
-        names.push(if last == "self" { stem.unwrap_or(last) } else { last });
+/// The name a `use` is tested under: the one it brings its path in as, and none for a list
+/// or a glob.
+fn use_name(tree: &syntax::ast::UseTree) -> Option<String> {
+    if tree.use_tree_list().is_some() || tree.star_token().is_some() {
+        return None;
     }
+    if let Some(rename) = tree.rename() {
+        return Some(rename.name().map_or("_".to_owned(), |it| it.text().to_string()));
+    }
+    tree.path().and_then(|it| it.segment()).map(|it| it.syntax().text().to_string())
 }
 
 fn is_macro_rules(db: &RootDatabase, it: hir::Macro) -> bool {

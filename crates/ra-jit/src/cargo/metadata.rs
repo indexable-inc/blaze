@@ -1,7 +1,7 @@
 //! The workspace as `cargo metadata --format-version 1` prints it, read by blaze-manifest as
 //! cargo 1.99.0 reads it and resolved by blaze-resolve, with no cargo run (docs/resolve.md).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use blaze_manifest::diagnostic::ManifestDiagnostic;
@@ -97,7 +97,104 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
     Some(project_model::OwnMetadata {
         root: std::sync::Arc::new(root),
         metadata: std::sync::Arc::new(metadata),
+        library: std::sync::Arc::new(library),
     })
+}
+
+/// What a library's metadata is asked with: its manifest, the features, the target, whether
+/// `--no-deps`, and the variables set or unset for it.
+type LibraryAsked = (PathBuf, String, Option<String>, bool, Vec<(String, Option<String>)>);
+
+/// `cargo metadata` of the standard library's workspace at `manifest` (a toolchain's
+/// `library/Cargo.toml`), as rust-analyzer's `Sysroot::load_workspace` asked cargo for it, with
+/// cargo told it is a nightly and the toolchain's lock file never written: read by
+/// blaze-manifest, resolved by blaze-metadata, its crates.io packages those the toolchain
+/// vendors (`library/vendor`, which its `.cargo/config.toml` replaces crates.io with). The
+/// toolchain's source does not change, so each way of asking is answered once per process.
+fn library(
+    manifest: &project_model::ManifestPath,
+    features: &project_model::CargoFeatures,
+    triple: Option<&str>,
+    no_deps: bool,
+    env: &rustc_hash::FxHashMap<String, Option<String>>,
+) -> anyhow::Result<Metadata> {
+    static READ: std::sync::OnceLock<
+        std::sync::Mutex<rustc_hash::FxHashMap<LibraryAsked, Metadata>>,
+    > = std::sync::OnceLock::new();
+    let manifest: &Path = manifest.as_ref();
+    let mut set: Vec<(String, Option<String>)> =
+        env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    set.sort();
+    let key =
+        (manifest.to_owned(), format!("{features:?}"), triple.map(str::to_owned), no_deps, set);
+    let read = READ.get_or_init(Default::default);
+    if let Some(metadata) = read.lock().unwrap_or_else(|it| it.into_inner()).get(&key) {
+        return Ok(metadata.clone());
+    }
+    let metadata = library_read(manifest, features, triple, no_deps, env)?;
+    read.lock().unwrap_or_else(|it| it.into_inner()).insert(key, metadata.clone());
+    Ok(metadata)
+}
+
+fn library_read(
+    manifest: &Path,
+    features: &project_model::CargoFeatures,
+    triple: Option<&str>,
+    no_deps: bool,
+    env: &rustc_hash::FxHashMap<String, Option<String>>,
+) -> anyhow::Result<Metadata> {
+    // cargo is run in the library's directory, whose `.cargo/config.toml` is read.
+    let cwd = manifest.parent().context("a manifest with no directory")?;
+    let mut vars: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    for (key, value) in env {
+        match value {
+            Some(value) => vars.insert(key.clone(), value.clone()),
+            None => vars.remove(key),
+        };
+    }
+    let (features, all_features, no_default_features) = match features {
+        project_model::CargoFeatures::All => (Vec::new(), true, false),
+        project_model::CargoFeatures::Selected { features, no_default_features } => {
+            (features.clone(), false, *no_default_features)
+        }
+    };
+    // `--filter-platform`: the target's `cfg`, as the toolchain's rustc answers it.
+    let cfg = match triple {
+        None => Vec::new(),
+        Some(triple) => {
+            let sysroot = manifest.ancestors().nth(6).context("a library not in a toolchain")?;
+            let rustc = sysroot.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
+            let args = ["--print", "cfg", "--target", triple];
+            let printed = super::state::rustc_says(rustc.as_os_str(), &args)
+                .filter(|it| !it.is_empty())
+                .with_context(|| {
+                    format!("`{} {}` says nothing", rustc.display(), args.join(" "))
+                })?;
+            let cfg = printed.lines().filter(|it| !it.is_empty()).map(|it| {
+                use std::str::FromStr;
+                cargo_platform::Cfg::from_str(it).with_context(|| format!("the cfg {it}"))
+            });
+            cfg.collect::<anyhow::Result<Vec<_>>>()?
+        }
+    };
+    let asked = blaze_metadata::Asked {
+        cwd,
+        env: vars.into_iter().collect(),
+        manifest_path: Some(manifest),
+        config: &[],
+        features: &features,
+        all_features,
+        no_default_features,
+        build: None,
+        platform: triple.map(|triple| blaze_metadata::TargetPlatform { triple, cfg: &cfg }),
+        offline: false,
+        store: None,
+    };
+    let json = match no_deps {
+        true => blaze_metadata::metadata_no_deps(&asked)?,
+        false => blaze_metadata::metadata_locked(&asked)?,
+    };
+    serde_json::from_str(&json).context("blaze's own metadata of the library is not cargo's form")
 }
 
 /// The programs a build of `selection` links of `targets`, asked for in `cwd` (of the package
@@ -178,7 +275,9 @@ pub(super) fn refused(err: &anyhow::Error, cwd: &Path) {
     }
 }
 
-#[cfg(test)]
+// `expected.json` is what cargo printed on Linux, Linux paths put in a JSON text as they are,
+// which a Windows path's `\` is not (blaze-manifest's `tests/fixtures.rs`).
+#[cfg(all(test, unix))]
 mod tests {
     use std::path::{Path, PathBuf};
 

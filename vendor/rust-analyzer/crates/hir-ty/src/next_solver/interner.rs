@@ -1112,9 +1112,14 @@ impl<'db> Interner for DbInterner<'db> {
 
     fn variances_of(self, def_id: Self::DefId) -> Self::VariancesOf {
         let generic_def = match def_id {
-            SolverDefId::Ctor(Ctor::Enum(def_id)) | SolverDefId::EnumVariantId(def_id) => {
-                def_id.loc(self.db).parent.into()
+            // A constructor's variances come from its signature, not its type's.
+            SolverDefId::Ctor(Ctor::Enum(def_id)) => {
+                return crate::variance::ctor_variances(self.db, def_id.into());
             }
+            SolverDefId::Ctor(Ctor::Struct(def_id)) => {
+                return crate::variance::ctor_variances(self.db, def_id.into());
+            }
+            SolverDefId::EnumVariantId(def_id) => def_id.loc(self.db).parent.into(),
             SolverDefId::InternedOpaqueTyId(_def_id) => {
                 // FIXME(next-solver): track variances
                 //
@@ -1124,7 +1129,6 @@ impl<'db> Interner for DbInterner<'db> {
                     (0..self.generics_of(def_id).count()).map(|_| Variance::Invariant),
                 );
             }
-            SolverDefId::Ctor(Ctor::Struct(def_id)) => def_id.into(),
             SolverDefId::AdtId(def_id) => def_id.into(),
             SolverDefId::FunctionId(def_id) => def_id.into(),
             SolverDefId::ConstId(_)
