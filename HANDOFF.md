@@ -1,5 +1,10 @@
 # borrowck lane (2026-10-27) — HANDOFF
 
+**2026-10-27 09:47Z (operator): a separate lane `bkperf` now owns borrowck SPEED** (tmux
+blaze-bkperf, brief /tmp/blaze-lanes/bkperf.txt, HANDOFF /Volumes/Projects/blaze-bkperf-1027/HANDOFF.md).
+It works in the same crate (timing mode, data structures in regions/liveness/loans/polonius).
+Keep your fixes to rule changes; if one needs a structural rewrite, note it in both HANDOFFs.
+
 Brief: /tmp/blaze-lanes/borrowck.txt. Worktree /Volumes/Projects/blaze-borrowck-1027, branch borrowck-1027.
 VM: `borrowck` (arm64, 32 GiB committed, ttl 12h; nodes had at most ~43 GiB free, and the first
 VM OOMed growing on demand). In VM: /root/bk/blaze (tree), /root/bk/rust (rust tests @ pin
@@ -86,3 +91,4 @@ I. misc — associated-types/unconstrained-lifetime-in-projection (E0716),
   `borrowck`, update docs/borrowck.md numbers, write /tmp/blaze-lanes/borrowck.result.md.
 - 02:45 bk-main unit in VM borrowck: all.sh on origin/main 40e72e14 (logs /root/bk/{main,ui,apps}.log, ui.json)
 - main 40e72e14 (with #469 E, #470 F): Polonius 1546/1584, NLL 1543/1582, 0 errors on units rustc accepts, no panics. Apps sweep running in bk-main (/root/bk/apps.log).
+- Apps on main 40e72e14: still 20/23 clean, same false errors (nushell E0716, ruff E0716+lifetimes, r-a E0515): owned by subagents t and l.
