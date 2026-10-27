@@ -92,3 +92,4 @@ I. misc — associated-types/unconstrained-lifetime-in-projection (E0716),
 - 02:45 bk-main unit in VM borrowck: all.sh on origin/main 40e72e14 (logs /root/bk/{main,ui,apps}.log, ui.json)
 - main 40e72e14 (with #469 E, #470 F): Polonius 1546/1584, NLL 1543/1582, 0 errors on units rustc accepts, no panics. Apps sweep running in bk-main (/root/bk/apps.log).
 - Apps on main 40e72e14: still 20/23 clean, same false errors (nushell E0716, ruff E0716+lifetimes, r-a E0515): owned by subagents t and l.
+- 02:53 G done: PR #490 queued (main 5441c2c8: Pol 1550->1558, NLL 1547->1555). Left: general member-constraint pick recheck.
