@@ -84,3 +84,13 @@ State: sysroot PR #477 open, auto-merge on, CI running (14->8 / 43->15 cargo exe
 toolq 4 commits (built? next: test, resolve.py toolchain, measure, land); unitgraph 6 WIP commits
 (blaze-units + resolve.py units part); ctdeps 4 WIP commits. VMs nc-{toolq,unitgraph,ctdeps} RUNNING.
 Re-spawned toolq, unitgraph, ctdeps as foreground agents (one message). sysroot: parent watches #477.
+
+## Restart 4 (2026-10-27 03:45, watchdog)
+State found: #477 sysroot MERGED. #485 toolq: VM step5 green (toolchain 35/35, rustcsites ok,
+tests ok) -> queued with land.py --no-wait (03:50). #516 unitgraph: CI failed on rustcsites (the
+units example ran rustc for host cfg) and stale nix/units. Parent fixed it on nocargo-unitgraph
+(668afdff73: example takes --host/--host-cfg-file from resolve.py; sites.json recorded), rebased on
+main 56cb5bd311; VM nc-unitgraph2 unit ug-r7 (/root/ug/r7.log): nix/unit_graph.py, cargo test
+blaze-units/metadata, resolve.py units. Then: copy nix/units back (/root/ug/r7-units.tar), commit, push.
+ctdeps: harness 1/14 equal (10 bench blaze-failed, error text truncated to "ce:"+backtrace);
+re-spawned ctdeps agent (background, 03:55) to fix driver/harness and land; VM nc-ctdeps.
