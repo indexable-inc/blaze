@@ -144,6 +144,15 @@ docs placeholders COUNTS_TABLE/CTDEPS_RESULTS, git rm --cached HANDOFF.md, squas
 - Running nc-h11 (/root/nc/h11.log): rebuild, answers:: tests, harness sandbox on
   (/root/ct/h11-on.json) and off (/root/ct/h11-off.json). Then: fill resolve.md CTDEPS_RESULTS,
   squash (drop HANDOFF.md), land.py, result.md.
+- 07:25 nocargo3 died too (h11 lost), removed. PR #658 opened (land.py --no-wait, auto-merge),
+  body /tmp/nocargo-scripts/658-body.md. Rebased again on main bcb5f9577e (closure/fetches mods,
+  build_nothing `shipped` arg), + Cargo.lock (ra-jit -> blaze-build-script; CI --locked failed).
+  Head 8470a70e6a. Backup branches nocargo-ctdeps-{prerebase,prelandsquash,pre2}.
+  nix/units NOT regenerated: nix/unit_graph.py fails on arm64 on main too ("two units both named
+  libc custom-build ... aarch64-darwin"); no x86_64 capacity. "nix unit graphs are current" is not
+  required (only `ci`). Report it.
+- VM nocargo4 (arm64 16/16G commit) unit nc-all (/root/nc/all.log): r5 trace, rustcsites, cargo
+  test -p ra-jit, harness on (/root/ct/on.json) and off (/root/ct/off.json) on the rebased tree.
 - (old) Running: nocargo unit nc-r4 (build, cargo test -p ra-jit -p project-model, rustcsites, r4 trace,
   /root/nc/r4.log); nc-ctdeps unit ct-h10 (rebased build, srv, full harness, /root/ct/h10.log).
 
@@ -167,3 +176,9 @@ fresh machine whose store was pulled, this step is ~0 s. Today it is 4.9 s of a 
   (nushell/biome blaze-failed, helix anyhow cfgs differ; fd/cargo/ripgrep/bat equal by hand).
   Final re-trace plan (VM nocargo): replace /root/nc/src with main's tree, bash build.sh,
   server.sh, ROUND=final measure.sh (traces fixture/ripgrep build/test, --whole too).
+
+## From release (2026-10-27 14:17Z)
+The train's `harness (*, buildmodel)` (all platforms) stays red on case `dep_replace`: "`[replace]` is not read
+by blaze yet" (blaze-metadata; since #516 the daemon's unit graph comes from blaze-metadata). It passed at
+07d08dab6e via cargo's unit graph. Please read `[replace]` (or say it is refused by design, and the release lane
+will make the case expect a refusal). Release's fixture fix for git-index registries: PR #641 (merged).
