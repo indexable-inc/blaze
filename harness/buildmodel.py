@@ -443,6 +443,13 @@ class Case:
         got = tested("target", ra_jit=True)
         verdict, said = judge_doctests(want, got)
         if verdict == "WRONG":
+            print(f"DEBUG-DOCTEST ws={self.ws!r} cwd={os.getcwd()!r} TEMP={os.environ.get('TEMP')!r}", file=sys.stderr)
+            for who, it in (("cargo", want), ("ra-jit", got)):
+                print(f"DEBUG-DOCTEST {who} exit {it[0]}", file=sys.stderr)
+                for l in it[1]:
+                    print(f"DEBUG-DOCTEST {who} out: {l}", file=sys.stderr)
+                for l in it[2].splitlines()[-60:]:
+                    print(f"DEBUG-DOCTEST {who} err: {l}", file=sys.stderr)
             raise Wrong(said)
         return ("supported", said, [])
 
