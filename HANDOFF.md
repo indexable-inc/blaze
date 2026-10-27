@@ -78,3 +78,9 @@ unitgraph 3 WIP commits (blaze-units crate, blaze-metadata units()), no HANDOFF.
 + uncommitted WIP (compile_time.rs etc). VMs nc-* all RUNNING. No PRs yet.
 Re-spawned all 4 as FOREGROUND agents in one message (parent blocks until they return), so the
 parent stays alive. If restarted again: same check, same re-spawn.
+
+## Restart 3 (2026-10-27 02:37, watchdog)
+State: sysroot PR #477 open, auto-merge on, CI running (14->8 / 43->15 cargo execs; VM removed).
+toolq 4 commits (built? next: test, resolve.py toolchain, measure, land); unitgraph 6 WIP commits
+(blaze-units + resolve.py units part); ctdeps 4 WIP commits. VMs nc-{toolq,unitgraph,ctdeps} RUNNING.
+Re-spawned toolq, unitgraph, ctdeps as foreground agents (one message). sysroot: parent watches #477.
