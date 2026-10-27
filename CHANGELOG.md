@@ -1001,6 +1001,12 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ### Fixed
 
+- A foreign function or static whose `#[link_name]` starts with `\u{1}` links: the mark names
+  the symbol exactly, as rustc reads it, and bindgen writes it where a symbol differs from its
+  Rust name (`aws-lc-sys`, so anything on `rustls` with its default provider). blaze passed the name
+  to the object writer as written, which put Mach-O's `_` before the mark, so the link failed
+  with `"_\u{1}_strlen"` undefined (shown as `__strlen`); on ELF the mark stayed in the name.
+  `harness/breakers` has the case (`link_name_exact`).
 - The borrow checker: lifetime elision counts none of the impl's lifetimes in a parameter
   that writes `Self`, as rustc counts only what a parameter's type writes or elides, so
   `fn store(self, db: &dyn Db) -> &Store` in `impl Id<'_>` returns a borrow of `db`. It

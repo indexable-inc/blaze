@@ -4351,6 +4351,40 @@ pub fn link_name(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
     Some(name.as_str().to_owned())
 }
 
+/// The name to declare the foreign symbol `symbol` under, for the object file to name it as
+/// rustc's does. The object writer puts the format's global prefix before every name it is
+/// given (`_` on Mach-O and on 32-bit Windows, [`global_prefix`]). A `#[link_name]` that starts
+/// with `\u{1}` names the symbol exactly, prefix included: LLVM's mark, which rustc honors and
+/// bindgen writes where a symbol differs from its Rust name (`aws-lc-sys` declares
+/// `#[link_name = "\u{1}_aws_lc_0_45_0_SHA384"]` on Apple targets). Declared as written, it became
+/// `_\u{1}_aws_lc_0_45_0_SHA384`, which no library defines, and the link failed. The mark and
+/// the prefix it carries are taken off, so that the writer puts the prefix back once.
+pub fn declared_symbol<'a>(symbol: &'a str, triple: &target_lexicon::Triple) -> Result<&'a str> {
+    let Some(exact) = symbol.strip_prefix('\u{1}') else {
+        return Ok(symbol);
+    };
+    let Some(prefix) = global_prefix(triple) else {
+        return Ok(exact);
+    };
+    match exact.strip_prefix(prefix) {
+        Some(declared) => Ok(declared),
+        None => unsupported!(
+            "the foreign symbol `{exact}`, named exactly by `\\u{{1}}`: it has no `{prefix}`, \
+             which every symbol written into a {triple} object starts with"
+        ),
+    }
+}
+
+/// The prefix the object writer puts before every global name it is given for `triple`:
+/// `object`'s `Mangling::default`, which cranelift-object writes with.
+fn global_prefix(triple: &target_lexicon::Triple) -> Option<char> {
+    use target_lexicon::{Architecture, BinaryFormat};
+    match (triple.binary_format, triple.architecture) {
+        (BinaryFormat::Macho, _) | (BinaryFormat::Coff, Architecture::X86_32(_)) => Some('_'),
+        _ => None,
+    }
+}
+
 /// The symbol a function that isn't exported takes in a crate rustc built nothing of, for the
 /// declarations in other crates of the standard library that name it as written: rustc gives
 /// it a name of its own. core declares the `#[panic_handler]` as `panic_impl`, and the
@@ -6684,7 +6718,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         if let Some(symbol) = static_link_name(db, id).or_else(theirs) {
             let data = self.module.declare_data(
-                &symbol,
+                declared_symbol(&symbol, self.module.isa().triple())?,
                 Linkage::Import,
                 false,
                 is_thread_local(db, id),
@@ -7300,6 +7334,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// linked defines it.
     fn weak_static(&mut self, symbol: &str) -> Result<DataId> {
         use cranelift_module::FuncOrDataId;
+        let symbol = declared_symbol(symbol, self.module.isa().triple())?;
         let target = match self.module.declarations().get_name(symbol) {
             Some(known) => known,
             None => FuncOrDataId::Data(
@@ -7359,9 +7394,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if let Some(&id) = self.imports.get(symbol) {
             return Ok(id);
         }
+        let declared = declared_symbol(symbol, self.module.isa().triple())?;
         let id = self
             .module
-            .declare_function(symbol, Linkage::Import, sig)
+            .declare_function(declared, Linkage::Import, sig)
             .map_err(|e| CodegenError::Backend(e.to_string()))?;
         self.imports.insert(symbol.to_owned(), id);
         Ok(id)
@@ -17224,5 +17260,45 @@ mod tests {
         let mut ctx = cranelift_codegen::Context::for_function(func);
         let code = super::emit(&mut ctx).unwrap();
         assert!(!code.bytes.is_empty());
+    }
+
+    /// The name a foreign function declared as `link_name` is written under in an object for
+    /// `triple`, as the linker reads it.
+    fn written_symbol(triple: &str, link_name: &str) -> String {
+        use cranelift_module::{Linkage, Module};
+        use cranelift_object::{ObjectBuilder, ObjectModule, object::write::SymbolId};
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        let isa = cranelift_codegen::isa::lookup_by_name(triple).unwrap().finish(flags).unwrap();
+        let declared = super::declared_symbol(link_name, isa.triple()).unwrap().to_owned();
+        let sig = ir::Signature::new(isa.default_call_conv());
+        let builder =
+            ObjectBuilder::new(isa, "test", cranelift_module::default_libcall_names()).unwrap();
+        let mut module = ObjectModule::new(builder);
+        let id = module.declare_function(&declared, Linkage::Import, &sig).unwrap();
+        let product = module.finish();
+        let symbol: SymbolId = product.function_symbol(id);
+        String::from_utf8(product.object.symbol(symbol).name.clone()).unwrap()
+    }
+
+    /// A `#[link_name]` that starts with `\u{1}` is the symbol exactly, prefix included, as
+    /// bindgen writes where a symbol differs from its Rust name. Declared as written, Mach-O got
+    /// `_\u{1}_getpid` and the link failed with `"__getpid"` undefined (the `\u{1}` is not
+    /// printed); without the mark the writer adds the prefix itself.
+    #[test]
+    fn a_link_name_marked_exact_is_written_as_is() {
+        assert_eq!(written_symbol("aarch64-apple-darwin", "\u{1}_getpid"), "_getpid");
+        assert_eq!(written_symbol("aarch64-apple-darwin", "getpid"), "_getpid");
+        assert_eq!(written_symbol("x86_64-unknown-linux-gnu", "\u{1}getpid"), "getpid");
+        assert_eq!(written_symbol("x86_64-unknown-linux-gnu", "getpid"), "getpid");
+    }
+
+    /// An exact name without the prefix Mach-O gives every symbol can't be written through a
+    /// writer that adds it: an error, not a symbol the linker would look for in vain.
+    #[test]
+    fn an_exact_link_name_without_the_prefix_is_refused_on_mach_o() {
+        let triple: target_lexicon::Triple = "aarch64-apple-darwin".parse().unwrap();
+        assert!(super::declared_symbol("\u{1}getpid", &triple).is_err());
+        let triple: target_lexicon::Triple = "x86_64-unknown-linux-gnu".parse().unwrap();
+        assert_eq!(super::declared_symbol("\u{1}getpid", &triple).unwrap(), "getpid");
     }
 }
