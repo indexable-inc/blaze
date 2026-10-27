@@ -153,6 +153,11 @@ docs placeholders COUNTS_TABLE/CTDEPS_RESULTS, git rm --cached HANDOFF.md, squas
   required (only `ci`). Report it.
 - VM nocargo4 (arm64 16/16G commit) unit nc-all (/root/nc/all.log): r5 trace, rustcsites, cargo
   test -p ra-jit, harness on (/root/ct/on.json) and off (/root/ct/off.json) on the rebased tree.
+- 07:52 #658 MERGED (ci green). r5 on final tree: 8/8 runs 1 cargo. ctdeps harness on merged
+  tree (sandbox on): 10/14 equal (helix now equal; fd SHELL only, equal with sandbox off by pair).
+  Docs follow-up #682 queued (auto-merge). nocargo4 removed; sub worktrees removed (handoffs
+  copied to /tmp/nocargo-scripts/handoffs). Result written: /tmp/blaze-lanes/nocargo.result.md.
+  LANE DONE. Only #682 left to merge (check `gh pr view 682`).
 - (old) Running: nocargo unit nc-r4 (build, cargo test -p ra-jit -p project-model, rustcsites, r4 trace,
   /root/nc/r4.log); nc-ctdeps unit ct-h10 (rebased build, srv, full harness, /root/ct/h10.log).
 
