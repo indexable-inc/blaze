@@ -69,7 +69,8 @@ where
     ) -> VerifyResult {
         let data = <super::IngredientImpl<C>>::data_raw(zalsa.table(), input);
         let field_changed_at = unsafe { (&(*data).revisions)[self.field_index].load() };
-        VerifyResult::changed_if(field_changed_at > revision)
+        let durability = unsafe { (*data).durability };
+        VerifyResult::changed_if(field_changed_at > revision, durability)
     }
 
     unsafe fn collect_minimum_serialized_edges(

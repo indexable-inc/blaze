@@ -624,6 +624,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake3"
+version = "1.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d9e454fc11f76977dc803893aff6304ed33d6a26efae8696573bea74baa27ae"
+dependencies = [
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures 0.3.1",
+]
+
+[[package]]
+name = "blaze-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "blaze-build-script"
 version = "0.1.0"
 dependencies = [
@@ -633,6 +653,13 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_json",
+]
+
+[[package]]
+name = "blaze-core"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -681,6 +708,23 @@ dependencies = [
  "unicode-properties",
  "unicode-segmentation",
  "unicode-width 0.1.14",
+]
+
+[[package]]
+name = "blaze-items"
+version = "0.1.0"
+dependencies = [
+ "base-db",
+ "blake3",
+ "hir",
+ "hir-def",
+ "hir-expand",
+ "hir-ty",
+ "intern",
+ "ra-ap-rustc_type_ir",
+ "rustc-hash 2.1.2",
+ "salsa",
+ "syntax",
 ]
 
 [[package]]
@@ -805,6 +849,15 @@ dependencies = [
  "blaze-manifest",
  "blaze-metadata",
  "blaze-resolve",
+ "rustc-hash 2.1.2",
+]
+
+[[package]]
+name = "blaze-vfs"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "blaze-core",
  "rustc-hash 2.1.2",
 ]
 
@@ -1034,6 +1087,12 @@ name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+
+[[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "core-foundation"
@@ -2048,6 +2107,7 @@ name = "hir-ty-codegen"
 version = "0.1.0"
 dependencies = [
  "base-db",
+ "blaze-items",
  "cfg",
  "cranelift-codegen",
  "cranelift-frontend",
@@ -3434,8 +3494,11 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "aws-smithy-http-client",
+ "blaze-api",
+ "blaze-core",
  "blaze-doc",
  "blaze-fmt",
+ "blaze-items",
  "blaze-lints",
  "blaze-manifest",
  "blaze-metadata",
@@ -3443,6 +3506,7 @@ dependencies = [
  "blaze-registry",
  "blaze-resolve",
  "blaze-tree",
+ "blaze-vfs",
  "cargo-platform",
  "cargo-util-schemas",
  "cargo_metadata",
@@ -3455,6 +3519,7 @@ dependencies = [
  "gimli",
  "hir",
  "hir-def",
+ "hir-expand",
  "hir-ty",
  "hir-ty-codegen",
  "http-body-util",
@@ -3470,6 +3535,7 @@ dependencies = [
  "memchr",
  "memmap2",
  "mimalloc",
+ "notify",
  "object 0.37.3",
  "paths",
  "pdb",
@@ -3491,6 +3557,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "shlex",
+ "span",
  "syntax",
  "tar",
  "tempfile",

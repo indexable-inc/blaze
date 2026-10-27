@@ -25,7 +25,9 @@ The edits:
   fn.add, fn.signature, fn.remove    a function of the edit's own, and the call of it
   undo              the source of an earlier step again
 
-RA_JIT_BIN names the ra-jit under test. The exit status is 1 when there is a finding.
+RA_JIT_BIN names the ra-jit under test. Under RA_JIT_CHECK_ALL the daemon also looks at what
+no edit can have changed, and a change it finds there is a finding. The exit status is 1 when
+there is a finding.
 """
 import argparse, collections, concurrent.futures, copy, json, os, random, re, shutil, subprocess, sys, tempfile, time
 
@@ -419,6 +421,10 @@ def round_of(seed, cases, steps, backend, work, out, budget):
         log = open(daemon.log).read()
         if "panicked at" in log and not any(row["wrong"] for row in rows):
             rows.append({"kind": "end", "what": "", "how": "", "ms": 0, "wrong": "panicked: " + panic_of(log)})
+        # Under RA_JIT_CHECK_ALL: what changed that the look after an edit would have skipped.
+        missed = [line for line in log.splitlines() if line.startswith("check-all: MISSED")]
+        if missed and not any(row["wrong"] for row in rows):
+            rows.append({"kind": "end", "what": "", "how": "", "ms": 0, "wrong": "missed: " + missed[0]})
         if any(row["wrong"] for row in rows):
             shutil.copy(daemon.log, os.path.join(out, f"{seed}-{backend}.daemon.log"))
     finally:

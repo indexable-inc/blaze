@@ -7,6 +7,9 @@ back them is under [docs/upstream/](../upstream/), each with a `SOURCE.md`. Sear
 - [rust-compiler-2026.md](rust-compiler-2026.md): the Rust compiler's 2026 (next solver,
   Polonius, LLVM 23, move elimination, polymorphization, cargo's build-dir) and what ra-jit
   does about each. 2026-10-20.
+- [item-identity.md](item-identity.md): Rust items hashed by content after Unison: Unison's
+  hashes, cycles and codebase format, den's three identities, today's keys, and what a Rust
+  item's hash must hold. 2026-10-25.
 - [mir-gap.md](mir-gap.md): ra-jit's MIR against rustc's optimized MIR, match rates, the
   passes ported and not, and the production gaps ranked. 2026-10-20.
 - [glancer.md](glancer.md): Rust Glancer (frozen, offloaded per-package index, phase-wise memory

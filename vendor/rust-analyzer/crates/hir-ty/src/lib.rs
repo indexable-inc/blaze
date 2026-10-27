@@ -206,6 +206,20 @@ impl<'db> MemoryMap<'db> {
         }
     }
 
+    /// What the map holds: each piece of memory at its address, the type of each vtable id
+    /// from the first, and each static's memory as its start and size.
+    pub fn parts(&self) -> (Vec<(usize, &[u8])>, &[Ty<'db>], Vec<(hir_def::StaticId, usize, usize)>) {
+        match self {
+            MemoryMap::Empty => (Vec::new(), &[], Vec::new()),
+            MemoryMap::Simple(memory) => (vec![(0, &**memory)], &[], Vec::new()),
+            MemoryMap::Complex(map) => (
+                map.memory.iter().map(|(&at, memory)| (at, &**memory)).collect(),
+                map.vtable.tys(),
+                map.statics.iter().map(|it| (it.id, it.start, it.size)).collect(),
+            ),
+        }
+    }
+
     pub fn vtable_ty(&self, id: usize) -> Result<Ty<'db>, MirEvalError<'db>> {
         match self {
             MemoryMap::Empty | MemoryMap::Simple(_) => Err(MirEvalError::InvalidVTableId(id)),

@@ -329,6 +329,10 @@ name = "lru"
 path = "tests/lru.rs"
 
 [[test]]
+name = "lru_backdate"
+path = "tests/lru_backdate.rs"
+
+[[test]]
 name = "lru_cycle"
 path = "tests/lru_cycle.rs"
 

@@ -73,6 +73,7 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
         Asked::Own(args) => own::command(args)?,
         Asked::Cache(args) => cache(args)?,
         Asked::Status => status()?,
+        Asked::Apply(args) => daemon::api::run(&args)?,
         Asked::Stop => stop()?,
         Asked::Enable => switch::enable()?,
         Asked::Disable => switch::disable()?,
@@ -114,6 +115,9 @@ usage: blaze <command> [cargo's flags]    (or cargo blaze <command>)
                      otherwise what the daemon finds loading the workspace as it, with no rustc
   status             whether blaze is enabled, what the daemon has loaded, what fell back
   stop               ends the daemon; the next build starts one
+  apply PATH[=FROM]  files as one change of the loaded workspace: PATH as it is on disk, as the
+                     file FROM is, or deleted (`PATH=`); `--build` builds what has them,
+                     `--memory` writes none to disk, `--json` shows the daemon's answer
   enable, disable    plain `cargo build|run|test|check` through blaze, and back
   toolchain          blaze's own toolchain, which it builds every project with, downloaded once
                      if it has none (`--path`: its directory)

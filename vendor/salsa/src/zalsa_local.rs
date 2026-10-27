@@ -19,7 +19,7 @@ use crate::accumulator::{
 };
 use crate::active_query::{CompletedQuery, DetachedInputOutputs, QueryCompletion, QueryStack};
 use crate::cycle::{AtomicIterationStamp, CycleHeads, IterationStamp, empty_cycle_heads};
-use crate::durability::Durability;
+use crate::durability::{AtomicDurability, Durability};
 use crate::key::DatabaseKeyIndex;
 use crate::runtime::Stamp;
 use crate::sync::atomic::AtomicBool;
@@ -503,8 +503,9 @@ pub(crate) struct QueryRevisions {
     /// The most revision in which some input changed.
     pub(crate) changed_at: Revision,
 
-    /// Minimum durability of the inputs to this query.
-    pub(crate) durability: Durability,
+    /// Minimum durability of the inputs to this query, as of when it was last verified: an
+    /// input that became less durable since lowers it then.
+    pub(crate) durability: AtomicDurability,
 
     /// The query origin and optional data for tracked structs, cycles, and accumulators.
     pub(crate) origin_and_extra: OriginAndExtra,
@@ -545,7 +546,7 @@ impl QueryRevisions {
     /// by that execution.
     #[cfg(not(feature = "persistence"))]
     pub(crate) fn discard_edges_if_never_change(&mut self) {
-        if self.durability != Durability::NEVER_CHANGE
+        if self.durability.load() != Durability::NEVER_CHANGE
             || !matches!(self.origin(), QueryOriginRef::Derived(_))
             || !self.cycle_heads().is_empty()
         {
@@ -754,7 +755,7 @@ impl QueryRevisions {
     pub(crate) fn fixpoint_initial(query: DatabaseKeyIndex, iteration: IterationStamp) -> Self {
         Self {
             changed_at: Revision::start(),
-            durability: Durability::MAX,
+            durability: AtomicDurability::new(Durability::MAX),
             origin_and_extra: OriginAndExtra::derived(
                 std::iter::empty(),
                 QueryRevisionsExtra::new(
@@ -1933,7 +1934,7 @@ impl<'me> ActiveQueryGuard<'me> {
 
     /// Append the given `outputs` to the query's output list.
     pub(crate) fn seed_iteration(&self, previous: &QueryRevisions) {
-        let durability = previous.durability;
+        let durability = previous.durability.load();
         let changed_at = previous.changed_at;
         let edges = previous.origin().edges();
         let untracked_read = previous.is_derived_untracked();
@@ -2193,7 +2194,7 @@ pub(crate) mod persistence {
         ) -> MappedQueryRevisions<'_> {
             let QueryRevisions {
                 changed_at,
-                durability,
+                ref durability,
                 ref verified_final,
                 #[cfg(feature = "accumulator")]
                     accumulated_inputs: _, // TODO: Support serializing accumulators
@@ -2202,7 +2203,7 @@ pub(crate) mod persistence {
 
             MappedQueryRevisions {
                 changed_at,
-                durability,
+                durability: durability.load(),
                 extra: origin_and_extra.extra(),
                 origin: serialized_origin,
                 verified_final: AtomicBool::new(verified_final.load(Ordering::Relaxed)),
@@ -2230,7 +2231,7 @@ pub(crate) mod persistence {
 
             Ok(QueryRevisions {
                 changed_at: revisions.changed_at,
-                durability: revisions.durability,
+                durability: AtomicDurability::new(revisions.durability),
                 origin_and_extra: OriginAndExtra::new(revisions.origin, revisions.extra),
                 #[cfg(feature = "accumulator")]
                 accumulated_inputs: Default::default(), // TODO: Support serializing accumulators

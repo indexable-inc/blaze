@@ -91,12 +91,17 @@ pub(super) enum TextPart {
 
 /// Everything a compiled function or static refers to. `FuncId` and `DataId` index these
 /// until the stitcher replaces them with the ids of its module.
-#[derive(Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub(super) struct Requests {
     pub(super) funcs: Vec<FuncRequest>,
     pub(super) datas: Vec<DataRequest>,
+    /// Whether the code has where something is written in it, which moving that changes and
+    /// no request stands for: the value of a `line!()`, `column!()` or `file!()`, or the path
+    /// of a type `type_name` is of.
+    pub(super) placed: bool,
 }
 
+#[derive(Clone)]
 pub(super) struct Code {
     pub(super) signature: Signature,
     pub(super) bytes: Vec<u8>,
@@ -149,7 +154,7 @@ impl PartialEq for Code {
 
 /// Compared by the database when a function is compiled again: one that came out the same
 /// leaves what was built from it alone.
-#[derive(PartialEq, Hash)]
+#[derive(Clone, PartialEq, Hash)]
 pub struct CompiledFunction {
     pub(super) requests: Requests,
     pub(super) code: Code,
@@ -166,7 +171,7 @@ pub struct CompiledFunction {
 
 /// A local written with a name that is kept in one slot of the frame for as long as the
 /// function runs.
-#[derive(PartialEq, Hash)]
+#[derive(Clone, PartialEq, Hash)]
 pub(super) struct Variable {
     pub(super) binding: BindingId,
     pub(super) param: bool,
@@ -251,6 +256,7 @@ pub(super) struct Mark {
 }
 
 /// A function built to be put where it is called, and what it refers to.
+#[derive(PartialEq)]
 pub(super) struct Inlinable {
     pub(super) func: ir::Function,
     pub(super) requests: Requests,
@@ -301,7 +307,7 @@ impl Requests {
 /// The body of a function the function being built calls, which LLVM is shown in a compile
 /// at a level above 1 (see `tier::seen_body`): it builds the body in where it finds that
 /// worth it, and knows what a call it keeps does.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(super) struct Seen {
     /// The function the calls are of, among the requests.
     pub(super) id: FuncId,
@@ -538,8 +544,7 @@ impl Wants {
     #[cfg(feature = "llvm")]
     pub(super) fn referenced(&self, code: &mut Code) -> Requests {
         let Some(kept) = self.kept(code) else {
-            let Requests { funcs, datas } = &self.requests;
-            return Requests { funcs: funcs.clone(), datas: datas.clone() };
+            return self.requests.clone();
         };
         let funcs = iter::zip(&self.requests.funcs, &kept.funcs);
         let funcs = funcs.filter(|it| it.1.is_some()).map(|it| it.0.clone()).collect();
@@ -552,7 +557,7 @@ impl Wants {
             }
             request
         });
-        Requests { funcs, datas: datas.collect() }
+        Requests { funcs, datas: datas.collect(), placed: self.requests.placed }
     }
 
     pub(super) fn func(&mut self, target: FuncTarget, sig: &Signature) -> FuncId {
@@ -793,11 +798,18 @@ impl<'db> Recorder<'db> {
     }
 
     pub(super) fn file_path(&mut self, file: FileId) -> DataId {
+        self.requests.placed = true;
         self.data(DataRequest::FilePath(file))
     }
 
     pub(super) fn text(&mut self, parts: Vec<TextPart>) -> DataId {
+        self.requests.placed = true;
         self.data(DataRequest::Text(parts))
+    }
+
+    /// Notes that the code has where something is written in it: see [`Requests::placed`].
+    pub(super) fn placed(&mut self) {
+        self.requests.placed = true;
     }
 
     pub(super) fn target_config(&self) -> cranelift_codegen::isa::TargetFrontendConfig {
@@ -833,7 +845,7 @@ impl<'db> Recorder<'db> {
     #[cfg(feature = "llvm")]
     pub(super) fn keep_referenced(&mut self, code: &mut Code) {
         let Some(kept) = self.wants.kept(code) else { return };
-        let Requests { funcs: all_funcs, datas: all_datas } =
+        let Requests { funcs: all_funcs, datas: all_datas, placed } =
             std::mem::take(&mut self.wants.requests);
         let kept_funcs: Vec<FuncRequest> =
             iter::zip(all_funcs, &kept.funcs).filter(|it| it.1.is_some()).map(|it| it.0).collect();
@@ -861,13 +873,14 @@ impl<'db> Recorder<'db> {
         let still = |id: &mut DataId| kept.data(*id).map(|it| *id = it).is_some();
         self.statics.retain(|_, id| still(id));
         self.vtables.retain(|_, id| still(id));
-        wants.requests = Requests { funcs: kept_funcs, datas: kept_datas };
+        wants.requests = Requests { funcs: kept_funcs, datas: kept_datas, placed };
     }
 
     /// Puts `requests`, another function's, among what this function asks for: what each
     /// of them is here. Each blob of `requests` points only at what came before it
     /// ([`Inlinable::of`]).
     pub(super) fn moved_requests(&mut self, requests: &Requests) -> (Vec<FuncId>, Vec<DataId>) {
+        self.requests.placed |= requests.placed;
         let funcs: Vec<FuncId> =
             requests.funcs.iter().map(|it| self.func(it.target.clone(), &it.sig)).collect();
         let mut datas: Vec<DataId> = Vec::with_capacity(requests.datas.len());

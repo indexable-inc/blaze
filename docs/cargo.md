@@ -80,6 +80,7 @@ set, the `BLAZE_` one wins.
     cargo blaze check [cargo's flags]
     cargo blaze status
     cargo blaze stop
+    cargo blaze apply [--build] [--memory] [--json] PATH[=FROM]...
     cargo blaze toolchain
 
 `blaze <command>` is the same as `cargo blaze <command>`, for a machine where blaze brought
@@ -100,9 +101,10 @@ is not there: the labels and the help and notes of an error, its other spans, an
 `code.explanation`; the message is rust-analyzer's, worded otherwise than rustc's. E0061's
 span is where the missing argument goes, not the function called. `harness/check_json.py`
 compares it with `cargo check` on the same errors. `status` prints what the daemon holds, and for every workspace how many builds
-the daemon served and how many went to cargo, with the reasons. `stop` ends the daemon. Every
-other subcommand of cargo's is blaze's own, or fails saying blaze has none yet: none is passed
-to cargo, and no cargo plugin is run ([Every subcommand](#every-subcommand)).
+the daemon served and how many went to cargo, with the reasons. `stop` ends the daemon.
+`apply` hands files to the daemon as one change ([the agent API](#the-agent-api)). Every other
+subcommand of cargo's is blaze's own, or fails saying blaze has none yet: none is passed to
+cargo, and no cargo plugin is run ([Every subcommand](#every-subcommand)).
 
 ## What a build does
 
@@ -570,7 +572,8 @@ starts its own.
 ### Files
 
 The daemon's directory is `$RA_JIT_HOME` if set, else `$XDG_RUNTIME_DIR/ra-jit`, else
-`~/.cache/ra-jit`. It holds `daemon.sock`, `daemon.sock.lock`, `daemon.log`,
+`~/.cache/ra-jit`. It holds `daemon.sock`, `daemon.sock.lock`, `daemon.log`, `daemon.api`
+(the schema of the calls the daemon takes), `http-token` when it serves HTTP,
 `workers/<id>/` with each worker's socket and log, and `states/`. The directory must belong
 to you and be closed to group and others (mode 0700); otherwise the client and the daemon
 refuse to use it. The socket is 0600, and a connection from another user is refused before
@@ -591,6 +594,39 @@ is.
 Cargo keeps what it builds through a workspace wrapper apart from what it builds without
 one. `cargo build` and `cargo ra-jit build` in one checkout therefore each compile the
 workspace's crates once, and share the dependencies.
+
+### The agent API
+
+The daemon's socket takes calls as well as `cargo ra-jit`'s lines: deterministic CBOR (RFC 8949
+section 4.2: the shortest form of every number, definite lengths, map keys in bytewise order,
+no floats or tags), each call framed by its length as four big-endian bytes, at most 16 MiB.
+A frame begins with a 0 byte, which no line does, and that is how the daemon tells a
+connection of calls. A call is a map `{id, schema, body}`, and its answer `{id, schema, body}`
+with the same `id`. A connection takes any number of calls, each answered when it is done, so
+a call that waits for a build holds up none sent after it. `schema` is 1; a call of another,
+or bytes that are not deterministic CBOR, is answered `{"Refused": why}`.
+
+| Body | Answer |
+|---|---|
+| `"Hello"` | `{"Hello": {version, schema}}` |
+| `{"Apply": {files: [{path, bytes}], build, disk}}` | `{"Applied": {root, built}}` |
+| `{"Cargo": request}` | `{"Cargo": reply}`: what `cargo ra-jit` asks for its builds |
+
+`Apply` is a transaction of files of one loaded workspace, absolute paths: `bytes` is the
+file's new text, or null to delete it. The next build reads all of them or none, with no look
+at the disk, and `root` is the BLAKE3 root of the workspace's sources after it (32 bytes).
+`disk` (default true) writes them too; a file that is no source yet, a new module, has to be
+written. With `build` the programs that have the files are built and linked as
+`cargo ra-jit build` builds them, `built` says how (`ok ...`, or why not), and the next
+`cargo ra-jit build` places what was built. `cargo ra-jit apply PATH[=FROM]...` is a client of
+it: `PATH` as it is on disk, as the file `FROM` is, or deleted with `PATH=`; `--json` prints
+the answer as JSON, a rendering of the CBOR for people.
+
+With `RA_JIT_HTTP` set to an address of the loopback (`127.0.0.1:0` picks a port, which the
+daemon's log says), the daemon takes the same calls as `POST /v1` with the call as the body,
+and answers in CBOR, or in JSON for `Accept: application/json`. A request has to send
+`Authorization: Bearer` with the token in `http-token`: the loopback is open to every user of
+the machine, and only you can read the file. `harness/api.py` tests both.
 
 ## Environment variables
 
@@ -620,6 +656,7 @@ started it. To change one, run `cargo ra-jit stop` first.
 |---|---|---|
 | `RA_JIT_HOME` | the daemon's directory (also read by every client) | see above |
 | `RA_JIT_IDLE_SECS` | seconds without a request before the daemon exits; 0 is never | 1800 |
+| `RA_JIT_HTTP` | an address of the loopback, such as `127.0.0.1:7171`, where the daemon takes [calls](#the-agent-api) over HTTP | not set |
 | `RA_JIT_MEMORY_MAX` | the most the workers hold together, a size such as `6G`, or `off` | half the machine's memory (on Linux, or of what its control group allows) |
 | `RA_JIT_SPARE` | `ready` keeps a spare worker with the library loaded at all times, for the next project; `0` starts none, and a workspace loads once cargo has built it | a spare for each build of a new workspace, as it begins |
 | `RA_JIT_OWN_BASE_MEMORY` | the most a worker may hold while it builds its own base in the background, a size such as `40G`, past which it gives that base up and edits patch rustc's executable; `off` is no bound | a quarter of the machine's memory (on Linux, or of what its control group allows) |

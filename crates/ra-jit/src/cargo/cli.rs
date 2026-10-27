@@ -148,6 +148,8 @@ pub(crate) enum Asked {
     /// disk store.
     Cache(Vec<String>),
     Status,
+    /// `cargo ra-jit apply`, with what follows it.
+    Apply(Vec<String>),
     Stop,
     Enable,
     Disable,
@@ -222,6 +224,7 @@ impl Asked {
             (_, Some(subcommand)) => Asked::Build(Box::new(Invocation::parse(subcommand, rest))),
             ("cache", _) => Asked::Cache(rest.to_vec()),
             ("status", _) => Asked::Status,
+            ("apply", _) => Asked::Apply(rest.to_vec()),
             ("stop", _) => Asked::Stop,
             ("enable", _) => Asked::Enable,
             ("disable", _) => Asked::Disable,

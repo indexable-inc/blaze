@@ -1,0 +1,32 @@
+[package]
+name = "blaze-items"
+description = "blaze's items by what they are: each function, type, trait, impl, const, static, alias and macro hashed in its normalized form, with what it refers to by hash and never by path"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blake3 = { version = "1.8", default-features = false, features = ["std"] }
+rustc-hash.workspace = true
+salsa.workspace = true
+
+ra-ap-rustc_type_ir.workspace = true
+
+base-db.workspace = true
+hir.workspace = true
+hir-def.workspace = true
+hir-expand.workspace = true
+hir-ty.workspace = true
+intern.workspace = true
+syntax.workspace = true
+
+[lints]
+workspace = true

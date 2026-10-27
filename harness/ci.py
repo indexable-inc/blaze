@@ -125,6 +125,11 @@ HARNESSES = [
     ("store", ["storetracked.py"], {}, on("linux", "macos"), 2),
     ("store", ["storebuilds.py"], {}, on("linux", "macos"), 2),
     ("daemon", ["stress.py"], {}, EVERYWHERE, 2),
+    # The agent API: calls framed on the socket and over HTTP, transactions of files.
+    ("daemon", ["api.py"], {}, on("linux", "macos"), 1),
+    ("daemon", ["checkscope.py"], {}, on("linux", "macos"), 1),
+    # Edits that move what names are bound to, pushed by the items they change (#344).
+    ("daemon", ["itempush.py"], {}, on("linux", "macos"), 1),
     ("daemon", ["selects.py"], {}, on("linux"), 2),
     # MinIO as one program in ~/s3tools, which CI puts there on Linux.
     ("daemon", ["remote.py"], {}, on("linux"), None),

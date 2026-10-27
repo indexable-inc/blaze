@@ -63,7 +63,10 @@ where
         revision: Revision,
     ) -> VerifyResult {
         let value = <IngredientImpl<C>>::data(zalsa, input);
-        VerifyResult::changed_if(value.revisions[self.field_index] > revision)
+        VerifyResult::changed_if(
+            value.revisions[self.field_index] > revision,
+            value.durabilities[self.field_index],
+        )
     }
 
     unsafe fn collect_minimum_serialized_edges(

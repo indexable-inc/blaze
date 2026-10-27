@@ -331,29 +331,37 @@ def seconds(text):
     return float(number) * UNITS[unit]
 
 
-def write_edit(ws, changes, back):
-    """Makes every change of an edit, or takes it back. The result is how many places changed.
-    A change whose old text is None appends its new text to the end of the file."""
-    places = 0
+def edit_texts(ws, changes, back):
+    """The text of every file an edit, or taking it back, changes, by path, and how many places
+    changed. A change whose old text is None appends its new text to the end of the file."""
+    places, texts = 0, {}
     for pattern, old, new in changes:
         if old is None:
             path = os.path.join(ws, pattern)
-            text = open(path).read()
+            text = texts.get(path) or open(path).read()
             if back:
                 assert text.endswith(new), f"{path} does not end with what was appended"
                 text = text[:-len(new)]
             else:
                 text += new
-            open(path, "w").write(text)
+            texts[path] = text
             places += 1
             continue
         old, new = (new, old) if back else (old, new)
         for path in sorted(glob.glob(os.path.join(ws, pattern), recursive=True)):
-            text = open(path).read()
+            text = texts.get(path) or open(path).read()
             if old in text:
                 places += text.count(old)
-                open(path, "w").write(text.replace(old, new))
+                texts[path] = text.replace(old, new)
     assert places >= len(changes), f"an edit found only {places} places: {changes}"
+    return texts, places
+
+
+def write_edit(ws, changes, back):
+    """Makes every change of an edit, or takes it back. The result is how many places changed."""
+    texts, places = edit_texts(ws, changes, back)
+    for path, text in texts.items():
+        open(path, "w").write(text)
     return places
 
 

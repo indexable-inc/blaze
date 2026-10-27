@@ -17,7 +17,7 @@ use std::os::unix::net::UnixStream;
 use uds_windows::UnixStream;
 
 use super::{
-    daemon::{Envelope, Reply, Request, SPARE, home, socket_in, version},
+    daemon::{Envelope, Reply, Request, SPARE, api, home, socket_in, version},
     switch, wrapper,
 };
 use crate::socket::{connect, private_dir, private_file};
@@ -45,7 +45,16 @@ pub(crate) fn ask(request: Request, start: Start) -> anyhow::Result<Option<Reply
     // A whole build is asked for at once: no cargo builds meanwhile for a spare to load beside.
     let spares = !matches!(&request, Request::Build(checkout) if checkout.config.whole);
     let started = |home: &Path| started(home, spares);
-    let envelope = serde_json::to_string(&Envelope { version: version(), replaces, request })?;
+    let envelope = Envelope { version: version(), replaces, request };
+    let line = serde_json::to_string(&envelope)?;
+    let call = api::Call {
+        id: 1,
+        schema: blaze_api::SCHEMA,
+        version: Some(envelope.version),
+        replaces,
+        body: api::Body::Cargo(envelope.request),
+    };
+    let envelope = Sent { home: &home, line, call: blaze_api::to_vec(&call)? };
     let mut stream = match (connect(&socket), start) {
         (Ok(stream), _) => stream,
         (Err(_), Start::Never) => return Ok(None),
@@ -161,8 +170,34 @@ pub(crate) fn why_none() -> String {
     }
 }
 
-fn exchange(stream: &mut UnixStream, envelope: &str) -> anyhow::Result<Reply> {
-    stream.write_all(format!("{envelope}\n").as_bytes())?;
+/// A request as a line of JSON and as a call of the agent API, which a daemon that takes calls
+/// is sent.
+struct Sent<'a> {
+    home: &'a Path,
+    line: String,
+    call: Vec<u8>,
+}
+
+fn exchange(stream: &mut UnixStream, envelope: &Sent<'_>) -> anyhow::Result<Reply> {
+    if api::marker_in(envelope.home).exists() {
+        blaze_api::frame::write(stream, &envelope.call)?;
+        let answer = blaze_api::frame::read(stream).ok().flatten();
+        let Some(answer) = answer else {
+            let log = envelope.home.join("daemon.log");
+            anyhow::bail!(
+                "the daemon ended before it answered (killed?), its log is {}",
+                log.display()
+            );
+        };
+        let answer: api::Answer = blaze_api::from_slice(&answer)
+            .context("the daemon's answer is not one of this schema")?;
+        return match answer.body {
+            api::Answered::Cargo(reply) => Ok(reply),
+            api::Answered::Refused(why) => anyhow::bail!("the daemon refused the request: {why}"),
+            other => anyhow::bail!("the daemon answered {other:?}"),
+        };
+    }
+    stream.write_all(format!("{}\n", envelope.line).as_bytes())?;
     let mut line = String::new();
     let read = BufReader::new(stream).read_line(&mut line);
     // A line without its end is one the daemon did not live to finish.

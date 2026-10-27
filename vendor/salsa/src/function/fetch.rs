@@ -36,7 +36,7 @@ where
         let revisions = &memo.header.revisions;
         zalsa_local.report_tracked_read(
             database_key_index,
-            revisions.durability,
+            revisions.durability.load(),
             revisions.changed_at,
             memo.header.cycle_heads(),
             #[cfg(feature = "accumulator")]
@@ -138,15 +138,17 @@ where
         // Now that we've claimed the item, check again to see if there's a "hot" value.
         let opt_old_memo = self.get_memo_from_table_for(zalsa, id, memo_ingredient_index);
 
+        // A memo the LRU dropped the value of is verified too: computed again, the value is
+        // backdated when it is (`backdate_if_appropriate`), and what read it is not run again.
         if let Some(old_memo) = opt_old_memo
-            && old_memo.value.is_some()
             && old_memo.header.verify_memo(
                 db.into(),
                 &claim_guard,
                 C::CYCLE_STRATEGY,
                 #[cfg(feature = "detailed-trace")]
-                true,
+                old_memo.value.is_some(),
             )
+            && old_memo.value.is_some()
         {
             // SAFETY: memo is present in memo_map and we have verified that it is
             // still valid for the current revision.

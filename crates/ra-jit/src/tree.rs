@@ -17,6 +17,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use triomphe::Arc;
 use vfs::{AbsPathBuf, FileId, Vfs, VfsPath, file_set::FileSet};
 
+use crate::sources::Changed;
+
 /// The directories of the source files that can change.
 pub(crate) struct Tree {
     vfs: Vfs,
@@ -81,19 +83,35 @@ impl Tree {
     /// The source files that are new since the last look. Each is in its source root once
     /// this returns, with no text in it yet.
     /// Whether [`Tree::added`] has directories to list again.
-    pub(crate) fn relisted(&self, db: &RootDatabase) -> bool {
+    pub(crate) fn relisted(&self, db: &RootDatabase, changed: &Changed) -> bool {
         self.directories.iter().any(|(path, dir)| {
-            let now = std::fs::metadata(db.on_disk(path)).and_then(|it| it.modified()).ok();
+            let on_disk = db.on_disk(path);
+            if !changed.dir(&on_disk) {
+                return false;
+            }
+            let now = std::fs::metadata(on_disk).and_then(|it| it.modified()).ok();
             now.is_some() && now != dir.listed
         })
     }
 
-    pub(crate) fn added(&mut self, db: &mut RootDatabase) -> Moved {
+    /// The directories it lists, as read on disk.
+    pub(crate) fn directories<'a>(
+        &'a self,
+        db: &'a RootDatabase,
+    ) -> impl Iterator<Item = PathBuf> + 'a {
+        self.directories.keys().map(|it| db.on_disk(it))
+    }
+
+    pub(crate) fn added(&mut self, db: &mut RootDatabase, changed: &Changed) -> Moved {
         let mut stale: Vec<PathBuf> = self
             .directories
             .iter()
             .filter(|(path, dir)| {
-                let now = std::fs::metadata(db.on_disk(path)).and_then(|it| it.modified()).ok();
+                let on_disk = db.on_disk(path);
+                if !changed.dir(&on_disk) {
+                    return false;
+                }
+                let now = std::fs::metadata(on_disk).and_then(|it| it.modified()).ok();
                 now.is_some() && now != dir.listed
             })
             .map(|(path, _)| path.clone())

@@ -1126,7 +1126,7 @@ where
                     revision: current_revision,
                 })
             });
-            return VerifyResult::unchanged();
+            return VerifyResult::unchanged(value.durability.load());
         }
 
         // SAFETY: `value.shard` is guaranteed to be in-bounds for `self.shards`.
@@ -1153,7 +1153,7 @@ where
         });
 
         // Any change to an interned value results in a new ID generation.
-        VerifyResult::unchanged()
+        VerifyResult::unchanged(value.durability.load())
     }
 
     unsafe fn collect_minimum_serialized_edges(

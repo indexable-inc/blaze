@@ -14,25 +14,36 @@ use base_db::{Crate, EditionedFileId, FileId};
 use cranelift_module::{Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use hir_def::{
-    DefWithBodyId, FunctionId, HasModule, Lookup, StaticId, signatures::FunctionSignature,
+    AdtId, CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup, StaticId,
+    signatures::FunctionSignature,
 };
 use hir_expand::{FileRange, HirFileId};
 use hir_ty::mir::location::line_and_column;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use span::ErasedFileAstId;
 
-type FxIndexMap<K, V> = indexmap::IndexMap<K, V, FxBuildHasher>;
+pub(super) type FxIndexMap<K, V> = indexmap::IndexMap<K, V, FxBuildHasher>;
 
-use hir_ty::{db::HirDatabase, traits::StoredParamEnvAndCrate};
+use hir_ty::{
+    db::HirDatabase,
+    next_solver::{DbInterner, Ty, TyKind},
+    traits::StoredParamEnvAndCrate,
+};
+use intern::Symbol;
+use rustc_type_ir::{TypeFoldable, TypeFolder, TypeSuperFoldable, inherent::IntoKind as _};
 
 use super::{
-    CodegenError, ContentId, Instance, InstanceDef, ObjectCodegen, OwnStatics, Phases, Rejections,
-    Result, Roots, SymbolResolver, TheirStatics, Walked, async_blocks,
+    CodegenError, ContentId, Fan, Instance, InstanceDef, ObjectCodegen, OwnStatics, Phases,
+    Rejections, Result, Roots, SymbolResolver, TheirStatics, Walked, async_blocks,
     cached::WrittenItem,
     compiled_instance, compiled_root, compiled_static, declaration_location,
     fragment::{CompiledFunction, DataRequest, FuncTarget, Requests, TextPart},
-    home::{body_file, body_files, mentioned_crates, written_in},
-    instance_serial, is_thread_local, left_to_rustc, root_serial, row_location, source_location,
+    home::{body_file, body_files, instance_gone, mentioned_crates, type_gone, written_in},
+    instance_serial, is_thread_local,
+    itempush::{Asked, ItemPush, Settled},
+    left_to_rustc,
+    naming::Naming,
+    root_serial, row_location, source_location,
     stable::StableNames,
     static_serial, target,
 };
@@ -312,7 +323,7 @@ impl Node {
 /// taken away what the base knew it by, and only looking tells. A build that is interrupted
 /// goes on unwinding: that says nothing about the base. One that waited for a thread whose
 /// own look panicked has found what that thread found.
-fn probe<T>(query: impl FnOnce() -> T) -> Option<T> {
+pub(super) fn probe<T>(query: impl FnOnce() -> T) -> Option<T> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(query)) {
         Ok(found) => Some(found),
         Err(stopped) => match stopped.downcast_ref::<salsa::Cancelled>() {
@@ -823,6 +834,8 @@ pub(super) struct Base {
     reached: Vec<Reached>,
     pub(super) instances: FxIndexMap<Instance, BaseInstance>,
     homes: Homes,
+    /// What the bodies of `compiled` and `instances` name.
+    naming: Naming,
     pub(super) statics: FxHashMap<StaticId, BaseStatic>,
     /// The symbols of the functions built from entries of the store, by their stable names.
     /// No edit reaches what those are compiled from.
@@ -877,7 +890,241 @@ pub(super) struct Base {
     /// rustc's copies of those of the name is an instance of the base, which a patch replaces
     /// under rustc's symbol.
     copies_homed: FxHashMap<FileId, FxHashMap<String, bool>>,
+    /// What the roots and instances refer to by item, for an edit that changes items: `None`
+    /// for a base of rustc's, and once an edit left it unable to tell.
+    items: Option<Box<ItemPush>>,
+    /// Where a thread of its own puts [`Self::items`] once it made them, of the revision the
+    /// base is of: they are taken before the next edit, and none are when they aren't ready.
+    making: Option<Making>,
+    /// Those an edit asked about by a name bound to another thing, whose items are to be
+    /// taken again before the next edit.
+    reitem: Option<Asked>,
+    /// Where threads of their own put what [`Self::reitem`] refers to once the patch of the
+    /// edit is made: the next edit waits for it, and asks itself when it is of another
+    /// revision or the threads were stopped.
+    settling: Option<Settling>,
+    /// The revisions the database went through since the last edit by taking in files it did
+    /// not have, each from one to the next: the edit they are of pushes them, so what was made
+    /// of the items at one of them is of the next too.
+    went: Vec<(salsa::Revision, salsa::Revision)>,
+    /// Where a thread of its own puts the code of the functions of [`Self::items`] it wrote,
+    /// which moves are found by: taken before the next edit if it is done by then.
+    coding: Option<Coding>,
+    /// The instances of the base whose function an edit moved to another place, which the
+    /// base's symbol of each stands for still: what called it there calls it so.
+    relocated: FxHashMap<Instance, Relocated>,
+    /// The instances of `relocated` by the one each is now.
+    relocated_now: FxHashMap<Instance, Instance>,
+    /// The functions of `relocated` by the one each is now.
+    relocated_funcs: FxHashMap<FunctionId, FunctionId>,
+    /// The code of the instances of functions of the files an edit changes, from before it,
+    /// by the function each is of then: what one the edit moves compiles to where it is now.
+    snapshots: FxHashMap<FunctionId, (Instance, Arc<CompiledFunction>)>,
 }
+
+/// An instance of the base whose function an edit moved.
+#[derive(Clone)]
+struct Relocated {
+    /// The instance it is now.
+    now: Instance,
+    /// What it compiles to now, when that is known without compiling it: the edit that moved
+    /// it changed nothing its code is of, so that is the code from before with what the edit
+    /// moved of it where it is now. Each edit after compiles it.
+    code: Option<Arc<CompiledFunction>>,
+}
+
+/// `code` from before an edit, of the function where the edit moved it, with what else of it
+/// the edit moved (`moved`) where that is now. `None` when it refers to anything else the
+/// edit took away, is generic over anything, or has where something is written in it: `named`
+/// has each item moved as a path ends in it.
+fn relocated(
+    db: &dyn HirDatabase,
+    code: &CompiledFunction,
+    moved: &FxHashMap<FunctionId, FunctionId>,
+    adts: &FxHashMap<AdtId, AdtId>,
+    named: &[Vec<u8>],
+    live: &blaze_items::Live,
+) -> Option<CompiledFunction> {
+    use blaze_items::ItemId;
+    let func = |it: FunctionId| match moved.get(&it) {
+        Some(&now) => Some(now),
+        None => live.has(db, ItemId::Function(it)).then_some(it),
+    };
+    let body = |it: DefWithBodyId| match it {
+        DefWithBodyId::FunctionId(it) => func(it).map(Into::into),
+        other => live.has_body(db, other).then_some(other),
+    };
+    let plain = |env: &StoredParamEnvAndCrate| {
+        let param_env = hir_ty::next_solver::ParamEnv::empty();
+        *env == hir_ty::traits::ParamEnvAndCrate { param_env, krate: env.krate }.store()
+    };
+    // A constant can have the path of an item in it, as `type_name` writes it in a `const`
+    // block: one that has the name of an item moved anywhere in it is compiled again.
+    let names = |bytes: &[u8]| named.iter().any(|it| bytes.windows(it.len()).any(|w| w == &it[..]));
+    let blob_named = code.requests.datas.iter().any(|it| match it {
+        DataRequest::Blob { blob, .. } => names(&blob.bytes),
+        _ => false,
+    });
+    if code.requests.placed || blob_named {
+        return None;
+    }
+    let mut types = Moves { interner: DbInterner::new_no_crate(db), funcs: moved, adts };
+    let mut now = code.clone();
+    for request in &mut now.requests.funcs {
+        let FuncTarget::Instance(instance, env) = &mut request.target else { continue };
+        match &mut instance.def {
+            InstanceDef::Fn(it) | InstanceDef::VtableShim(it) => *it = func(*it)?,
+            _ => {}
+        }
+        instance.args = instance.args.as_ref().fold_with(&mut types).store();
+        if !plain(env) || instance_gone(db, instance, live) {
+            return None;
+        }
+    }
+    for request in &mut now.requests.datas {
+        match request {
+            DataRequest::Vtable { ty, trait_ref, .. } => {
+                *ty = ty.as_ref().fold_with(&mut types).store();
+                if let Some((_, args)) = trait_ref {
+                    *args = args.as_ref().fold_with(&mut types).store();
+                }
+                let trait_gone = trait_ref.as_ref().is_some_and(|(id, args)| {
+                    !live.has(db, ItemId::Trait(*id)) || type_gone(db, &args.as_ref(), live)
+                });
+                if trait_gone || type_gone(db, &ty.as_ref(), live) {
+                    return None;
+                }
+            }
+            DataRequest::Static(id) if !live.has(db, ItemId::Static(*id)) => return None,
+            DataRequest::Location(Some((owner, _))) => *owner = body(*owner)?,
+            DataRequest::Declaration(it) => *it = func(*it)?,
+            _ => {}
+        }
+    }
+    if let Some((owner, _)) = &mut now.source {
+        *owner = body(*owner)?;
+    }
+    if let Some((env, variables)) = &mut now.variables {
+        for it in variables.iter_mut() {
+            it.ty = it.ty.as_ref().fold_with(&mut types).store();
+        }
+        if !plain(env) || variables.iter().any(|it| type_gone(db, &it.ty.as_ref(), live)) {
+            return None;
+        }
+    }
+    Some(now)
+}
+
+/// The name an item is written with, which a path to it ends in.
+fn item_name(db: &dyn HirDatabase, id: blaze_items::ItemId) -> Option<String> {
+    use blaze_items::ItemId;
+    use hir_def::signatures::{
+        ConstSignature, EnumSignature, StaticSignature, StructSignature, TraitSignature,
+        TypeAliasSignature, UnionSignature,
+    };
+    let name = match id {
+        ItemId::Function(it) => FunctionSignature::of(db, it).name.clone(),
+        ItemId::Adt(AdtId::StructId(it)) => StructSignature::of(db, it).name.clone(),
+        ItemId::Adt(AdtId::EnumId(it)) => EnumSignature::of(db, it).name.clone(),
+        ItemId::Adt(AdtId::UnionId(it)) => UnionSignature::of(db, it).name.clone(),
+        ItemId::Trait(it) => TraitSignature::of(db, it).name.clone(),
+        ItemId::Const(it) => ConstSignature::of(db, it).name.clone()?,
+        ItemId::Static(it) => StaticSignature::of(db, it).name.clone(),
+        ItemId::Alias(it) => TypeAliasSignature::of(db, it).name.clone(),
+        ItemId::Impl(_) | ItemId::Macro(_) => return None,
+    };
+    Some(name.as_str().to_owned())
+}
+
+/// Types with what an edit moved of them where that is now: each is written as it was, so
+/// is laid out as it was.
+struct Moves<'db, 'a> {
+    interner: DbInterner<'db>,
+    funcs: &'a FxHashMap<FunctionId, FunctionId>,
+    adts: &'a FxHashMap<AdtId, AdtId>,
+}
+
+impl<'db> TypeFolder<DbInterner<'db>> for Moves<'db, '_> {
+    fn cx(&self) -> DbInterner<'db> {
+        self.interner
+    }
+
+    fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
+        match ty.kind() {
+            TyKind::Adt(adt, args) if let Some(&now) = self.adts.get(&adt.def_id()) => {
+                Ty::new_adt(self.interner, now, args.fold_with(self))
+            }
+            TyKind::FnDef(def, args) => {
+                let def = match def.0 {
+                    CallableDefId::FunctionId(it) => {
+                        CallableDefId::FunctionId(*self.funcs.get(&it).unwrap_or(&it))
+                    }
+                    CallableDefId::StructId(it) => match self.adts.get(&AdtId::StructId(it)) {
+                        Some(&AdtId::StructId(now)) => CallableDefId::StructId(now),
+                        _ => def.0,
+                    },
+                    other => other,
+                };
+                Ty::new(self.interner, TyKind::FnDef(def.into(), args.fold_with(self)))
+            }
+            _ => ty.super_fold_with(self),
+        }
+    }
+}
+
+/// See [`Base::making`].
+type Making = Arc<std::sync::Mutex<Option<(salsa::Revision, Box<ItemPush>)>>>;
+
+/// See [`Base::coding`]: the code of each function, of the index after so many pushes.
+type Coding = Arc<std::sync::Mutex<Option<(u64, Vec<FunctionId>, Vec<blaze_items::Code>)>>>;
+
+/// The code of the functions of `index` without it, on the threads `fan` has, for `coding`.
+fn write_codes(
+    db: &dyn HirDatabase,
+    fan: &Fan<'_>,
+    (pushes, funcs): (u64, Vec<FunctionId>),
+    live: blaze_items::Live,
+    coding: &Coding,
+) {
+    let start = std::time::Instant::now();
+    let stats = std::env::var_os("RA_JIT_STATS").is_some();
+    if stats {
+        eprintln!("items-coding: {} functions", funcs.len());
+    }
+    // A revision the daemon goes to meanwhile, as it takes in a file, stops the queries, and
+    // nothing here can go on before the thread lets go of the database: what was written by
+    // then is kept, and an edit of two files writes what its files lack.
+    let mut stopped = false;
+    let mut codes = Vec::with_capacity(funcs.len());
+    for part in funcs.chunks(1024) {
+        let write = || blaze_items::codes_of(db, fan, part, Some(&live));
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(write)) {
+            Ok(written) => codes.extend(written),
+            Err(why) if why.is::<salsa::Cancelled>() => {
+                stopped = true;
+                break;
+            }
+            Err(why) => std::panic::resume_unwind(why),
+        }
+    }
+    let mut funcs = funcs;
+    funcs.truncate(codes.len());
+    drop(live);
+    if stats {
+        let written = codes.iter().filter(|it| it.is_some()).count();
+        eprintln!(
+            "items-codes: {written} of {} functions in {} us{}",
+            funcs.len(),
+            start.elapsed().as_micros(),
+            if stopped { ", stopped by a revision" } else { "" }
+        );
+    }
+    *coding.lock().unwrap_or_else(|e| e.into_inner()) = Some((pushes, funcs, codes));
+}
+
+/// See [`Base::settling`].
+type Settling =
+    Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<(salsa::Revision, Settled)>>>>;
 
 /// A function of the checkout the base has from the store: no build here compiled it, so
 /// nothing but its name says what it is an instance of. A look finds that out from the code
@@ -988,11 +1235,67 @@ impl Homes {
     }
 }
 
-/// One part in `parts` of `all`, in order and each once.
-fn part_of(mut all: Vec<u32>, part: usize, parts: usize) -> impl Iterator<Item = usize> {
+/// `all` in order, each once.
+fn sorted(mut all: Vec<u32>) -> Vec<usize> {
     all.sort_unstable();
     all.dedup();
-    all.into_iter().skip(part).step_by(parts).map(|it| it as usize)
+    all.into_iter().map(|it| it as usize).collect()
+}
+
+/// What [`Base::stale`] looks at, handed to the threads that look a batch at a time. A
+/// question takes from microseconds to most of an edit, and a thread that is done with its
+/// batch takes the next of what is left rather than wait for the others to finish their share.
+/// A batch is a quarter of a thread's share of what is left: taking one is an atomic add on a
+/// line the others write too, hundreds of nanoseconds across the sockets, against the tens
+/// of microseconds of the question it hands out.
+pub struct Handout<'a> {
+    parts: usize,
+    check_all: bool,
+    roots: Vec<usize>,
+    instances: Vec<usize>,
+    statics: Vec<(&'a StaticId, &'a BaseStatic)>,
+    next: [std::sync::atomic::AtomicUsize; Look::COUNT],
+}
+
+/// The kinds of things [`Base::stale`] looks at, one after another.
+#[derive(Clone, Copy)]
+enum Look {
+    Rejected,
+    Roots,
+    Unnamed,
+    Closures,
+    Instances,
+    Hydrated,
+    Statics,
+    Skipped,
+    TheirInstances,
+    TheirStatics,
+}
+
+impl Look {
+    const COUNT: usize = Look::TheirStatics as usize + 1;
+}
+
+impl Handout<'_> {
+    /// The indices of the `len` things of the kind that this thread takes, as it gets to them.
+    fn each(&self, look: Look, len: usize) -> impl Iterator<Item = usize> + '_ {
+        use std::sync::atomic::Ordering::Relaxed;
+        let next = &self.next[look as usize];
+        let mut taken = 0..0;
+        std::iter::from_fn(move || {
+            if let Some(it) = taken.next() {
+                return Some(it);
+            }
+            let seen = next.load(Relaxed);
+            if seen >= len {
+                return None;
+            }
+            let batch = ((len - seen) / (self.parts * 4)).max(1);
+            let at = next.fetch_add(batch, Relaxed);
+            taken = at..(at + batch).min(len);
+            taken.next()
+        })
+    }
 }
 
 /// What an edit since the base was last looked at can have changed the code of, and what
@@ -1008,6 +1311,12 @@ struct Touched {
     bodies: FxHashSet<FileId>,
     /// A file changed that we can't tell the crates of.
     any: bool,
+    /// The crates that see a file of which only the signatures of functions changed that
+    /// nothing else sees into, and the roots and instances of those whose bodies name one of
+    /// them, by their index in the base. Of what else those crates have, everything.
+    around: FxHashSet<Crate>,
+    named_roots: FxHashSet<u32>,
+    named_instances: FxHashSet<u32>,
     /// What the last look found changed.
     roots: FxHashSet<FunctionId>,
     instances: FxHashSet<Instance>,
@@ -1021,9 +1330,14 @@ impl Touched {
         self.any || self.crates.contains(&krate)
     }
 
+    /// [`Touched::reaches`], or one of the crates around signatures that changed.
+    fn reaches_around(&self, krate: Crate) -> bool {
+        self.reaches(krate) || self.around.contains(&krate)
+    }
+
     /// Whether a file changed since the last look.
     fn edited(&self) -> bool {
-        self.any || !self.crates.is_empty() || !self.bodies.is_empty()
+        self.any || !self.crates.is_empty() || !self.bodies.is_empty() || !self.around.is_empty()
     }
 
     /// Starts over from what a look at the whole base found: the edits before it can have
@@ -1037,6 +1351,9 @@ impl Touched {
         *self = Touched::default();
         for stale in found {
             self.roots.extend(&stale.roots);
+            // One taken away differs from the base until an edit brings it back, which a look
+            // tells only by asking again.
+            self.roots.extend(&stale.gone);
             self.instances.extend(stale.instances.iter().cloned());
             self.statics.extend(&stale.statics);
             self.hydrated.extend(stale.hydrated.iter().map(|(at, ..)| *at));
@@ -1096,6 +1413,16 @@ pub struct StaleSteps {
     pub instances_unchanged: usize,
     /// The longest any one of them took to answer.
     pub slowest: std::time::Duration,
+    /// How many took how long: the `n`th counts those under 2^n ns and not under half that.
+    pub sizes: [u32; 32],
+}
+
+impl StaleSteps {
+    fn asked(&mut self, took: std::time::Duration) {
+        self.slowest = self.slowest.max(took);
+        let ns = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
+        self.sizes[(64 - ns.leading_zeros() as usize).min(31)] += 1;
+    }
 }
 
 impl Stale {
@@ -1466,6 +1793,14 @@ impl Base {
             compiled: compiled.to_vec(),
             marks,
             homes: Homes::new(compiled, &crates, &files, &instances),
+            naming: {
+                let start = std::time::Instant::now();
+                let naming = Naming::new(db, compiled, &instances);
+                if std::env::var_os("RA_JIT_STATS").is_some() {
+                    eprintln!("naming-us: {}", start.elapsed().as_micros());
+                }
+                naming
+            },
             crates,
             files,
             touched: Touched::default(),
@@ -1509,7 +1844,55 @@ impl Base {
             unnamed: Vec::new(),
             closures: Vec::new(),
             copies_homed: FxHashMap::default(),
+            items: None,
+            making: None,
+            reitem: None,
+            settling: None,
+            went: Vec::new(),
+            coding: None,
+            relocated: FxHashMap::default(),
+            relocated_now: FxHashMap::default(),
+            relocated_funcs: FxHashMap::default(),
+            snapshots: FxHashMap::default(),
         })
+        .map(|mut base| {
+            base.make_items(db, cg.symbols);
+            base
+        })
+    }
+
+    /// Has [`Self::items`] made on threads of their own, of the revision the database is at,
+    /// when edits are to follow.
+    fn make_items(&mut self, db: &dyn HirDatabase, symbols: &dyn SymbolResolver) {
+        if self.rustc
+            || !super::do_edits_follow()
+            || std::env::var_os("RA_JIT_ITEM_PUSH").is_some_and(|it| it == "0")
+        {
+            return;
+        }
+        let making = Making::default();
+        let (made, at) = (making.clone(), salsa::plumbing::current_revision(db));
+        let (compiled, instances) =
+            (self.compiled.clone(), self.instances.keys().cloned().collect::<Vec<_>>());
+        let coding = Coding::default();
+        let codes = coding.clone();
+        let work = move |db: &dyn HirDatabase, fan: &Fan<'_>| {
+            let start = std::time::Instant::now();
+            let items = ItemPush::new(db, fan, &compiled, &instances);
+            if std::env::var_os("RA_JIT_STATS").is_some() {
+                eprintln!(
+                    "items-us: {} for {} items",
+                    start.elapsed().as_micros(),
+                    items.index.items()
+                );
+            }
+            let (wanting, live) = (items.index.wanting_code(), items.index.live());
+            *made.lock().unwrap_or_else(|e| e.into_inner()) = Some((at, Box::new(items)));
+            write_codes(db, fan, wanting, live, &codes);
+        };
+        symbols.when_idle(db, Box::new(work));
+        self.making = Some(making);
+        self.coding = Some(coding);
     }
 
     /// The executable rustc linked as a base, before anything of it is known: `home` takes
@@ -1532,6 +1915,7 @@ impl Base {
             reached: Vec::new(),
             instances: FxIndexMap::default(),
             homes: Homes::default(),
+            naming: Naming::default(),
             statics: FxHashMap::default(),
             found: FxHashMap::default(),
             found_instances: FxHashMap::default(),
@@ -1554,6 +1938,16 @@ impl Base {
             unnamed: Vec::new(),
             closures: Vec::new(),
             copies_homed: FxHashMap::default(),
+            items: None,
+            making: None,
+            reitem: None,
+            settling: None,
+            went: Vec::new(),
+            coding: None,
+            relocated: FxHashMap::default(),
+            relocated_now: FxHashMap::default(),
+            relocated_funcs: FxHashMap::default(),
+            snapshots: FxHashMap::default(),
         }
     }
 
@@ -1840,6 +2234,10 @@ impl Base {
     pub(super) fn touch(&mut self, db: &dyn HirDatabase, crates: Option<&[Crate]>) {
         // rustc's copies of what sees the file are of before, and nothing here says which.
         self.outdate_rustc("an edit that is more than the bodies of functions");
+        match crates {
+            Some(_) => self.bindings_edited(),
+            None => (self.items, self.making) = (None, None),
+        }
         let Some(crates) = crates else {
             self.touched.any = true;
             self.outdated |= self.untracked;
@@ -1863,9 +2261,514 @@ impl Base {
         if !files.iter().all(|it| self.homed.contains(it)) {
             return self.touch(db, Some(crates));
         }
+        self.bindings_edited();
         self.touched.crates.extend(crates.iter().copied());
         self.outdated |=
             self.untracked && self.crates.iter().any(|it| self.touched.crates.contains(it));
+    }
+
+    /// Notes that a file of `crates` changed in the signatures of the functions named `names`
+    /// and in bodies alone: functions of its modules and plain `impl`s, not generic, and none of
+    /// which the rest of the program sees into. What can have changed is their own code and
+    /// that of what names them, and of what is seen into that names them, and so on.
+    pub(super) fn touch_signatures(
+        &mut self,
+        db: &dyn HirDatabase,
+        crates: &[Crate],
+        file: FileId,
+        names: &[Symbol],
+    ) {
+        let reached = self.naming.made.then(|| self.naming.reach(names)).flatten();
+        let Some(reached) = reached.filter(|_| !self.rustc) else {
+            return self.touch(db, Some(crates));
+        };
+        self.bindings_edited();
+        // Its bodies too, as a body edit's.
+        self.touched.bodies.insert(file);
+        for &krate in crates {
+            if !self.touched.around.contains(&krate) {
+                self.touched.around.extend(krate.transitive_rev_deps(db));
+            }
+        }
+        let around = &self.touched.around;
+        let roots =
+            self.naming.roots(&reached).filter(|&i| around.contains(&self.crates[i as usize]));
+        self.touched.named_roots.extend(roots.collect::<Vec<_>>());
+        let instances = self.naming.instances(&reached).filter(|&i| {
+            self.instances
+                .get_index(i as usize)
+                .is_some_and(|(_, was)| around.contains(&was.env.krate))
+        });
+        self.touched.named_instances.extend(instances.collect::<Vec<_>>());
+        // What came from the store is not in `naming`: all of it that can name them is asked.
+        let hydrated = self.hydrated.iter().enumerate().filter_map(|(i, was)| {
+            was.krate.is_none_or(|it| around.contains(&it)).then_some(i as u32)
+        });
+        self.touched.hydrated.extend(hydrated.collect::<Vec<_>>());
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            eprintln!(
+                "signatures: {} names reach {} names, {} roots and {} instances",
+                names.len(),
+                reached.len(),
+                self.touched.named_roots.len(),
+                self.touched.named_instances.len()
+            );
+        }
+        self.outdated |=
+            self.untracked && self.crates.iter().any(|it| self.touched.around.contains(it));
+    }
+
+    /// The items [`Self::making`] has, when they are of the revision the database is at.
+    fn take_made(&mut self, db: &dyn HirDatabase) {
+        let Some(making) = self.making.take() else { return };
+        let made = making.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let now = salsa::plumbing::current_revision(db);
+        let why = match &made {
+            None => "not made before the edit",
+            Some(_) => "made of another revision",
+        };
+        self.items = made.filter(|(at, _)| self.of_now(*at, now)).map(|(_, items)| items);
+        if self.items.is_none() && std::env::var_os("RA_JIT_STATS").is_some() {
+            eprintln!("items: {why}");
+        }
+    }
+
+    /// Whether what was made at revision `at` is of `now`: the database went from one to the
+    /// other by taking in files alone, which the next edit pushes.
+    fn of_now(&self, mut at: salsa::Revision, now: salsa::Revision) -> bool {
+        while at != now {
+            match self.went.iter().find(|(from, _)| *from == at) {
+                Some(&(_, to)) => at = to,
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// Notes that the database went from revision `from` to `to` by taking in files it did
+    /// not have, which the next edit is of.
+    pub(super) fn files_added(&mut self, from: salsa::Revision, to: salsa::Revision) {
+        self.went.push((from, to));
+    }
+
+    /// Once the patch of an edit is made: what the edit asked about refers to now is asked on
+    /// threads of their own, of the revision the patch is of, for the next edit to take; with
+    /// no items, those are made again, as an edit stopped the threads making them or left
+    /// them unable to tell.
+    pub(super) fn after_patch(&mut self, db: &dyn HirDatabase, symbols: &dyn SymbolResolver) {
+        if self.items.is_none() {
+            self.reitem = None;
+            return self.make_items(db, symbols);
+        }
+        let Some(asked) = &self.reitem else { return };
+        let (roots, instances) = Settled::asked(asked, &self.compiled, &self.instances);
+        let live = self.items.as_ref().map(|it| it.index.live());
+        let (send, settling) = std::sync::mpsc::channel();
+        let at = salsa::plumbing::current_revision(db);
+        let work = move |db: &dyn HirDatabase, fan: &Fan<'_>| {
+            let start = std::time::Instant::now();
+            let Some(live) = live else { return };
+            let settled = Settled::new(db, fan, &roots, &instances, &live);
+            // The index is written again at the next edit, which needn't copy what it has.
+            drop(live);
+            if std::env::var_os("RA_JIT_STATS").is_some() {
+                eprintln!(
+                    "items-settled: {} roots and {} instances in {} us",
+                    roots.len(),
+                    instances.len(),
+                    start.elapsed().as_micros()
+                );
+            }
+            _ = send.send((at, settled));
+        };
+        symbols.in_background(db, Box::new(work));
+        self.settling = Some(Arc::new(std::sync::Mutex::new(Some(settling))));
+        self.write_codes(db, symbols);
+    }
+
+    /// Writes the code of the functions of the items whose code is not written yet, on
+    /// threads of their own.
+    fn write_codes(&mut self, db: &dyn HirDatabase, symbols: &dyn SymbolResolver) {
+        let Some(items) = &self.items else { return };
+        let wanting = items.index.wanting_code();
+        if wanting.1.is_empty() {
+            return;
+        }
+        let (live, coding) = (items.index.live(), Coding::default());
+        let codes = coding.clone();
+        let work = move |db: &dyn HirDatabase, fan: &Fan<'_>| {
+            write_codes(db, fan, wanting, live, &codes);
+        };
+        symbols.when_idle(db, Box::new(work));
+        self.coding = Some(coding);
+    }
+
+    fn bindings_edited(&mut self) {
+        self.making = None;
+        if let Some(items) = &mut self.items {
+            items.index.bindings_edited();
+        }
+    }
+
+    /// Before an edit of `files`: what the edits before it left of the items is taken in, of
+    /// the revision they left.
+    pub(super) fn before_edit(
+        &mut self,
+        db: &dyn HirDatabase,
+        files: &[FileId],
+        fan: &Fan<'_>,
+        moves: bool,
+    ) {
+        let start = std::time::Instant::now();
+        self.take_made(db);
+        // Nothing changes: what the last edit asked about is taken before one that does.
+        if files.is_empty() {
+            return;
+        }
+        let moves = moves && files.len() >= 2;
+        self.snapshot(db, files, fan, moves);
+        let now = salsa::plumbing::current_revision(db);
+        let settled = (self.settling.take().filter(|_| self.items.is_some()))
+            .and_then(|it| it.lock().unwrap_or_else(|e| e.into_inner()).take())
+            .and_then(|it| it.recv().ok())
+            .filter(|(at, _)| self.of_now(*at, now));
+        self.went.clear();
+        let Some(items) = &mut self.items else { return };
+        let coded =
+            self.coding.take().and_then(|it| it.lock().unwrap_or_else(|e| e.into_inner()).take());
+        if let Some((pushes, funcs, codes)) = coded {
+            items.index.take_codes(pushes, &funcs, codes);
+        }
+        let (reitem, compiled, instances) = (self.reitem.take(), &self.compiled, &self.instances);
+        let took = start.elapsed();
+        let asked = reitem.clone();
+        let settling = probe(|| {
+            hir_ty::attach_db(db, || match (reitem, settled) {
+                (Some(_), Some((_, settled))) => items.take_settled(settled),
+                (Some(asked), None) => items.settle(db, fan, &asked, compiled, instances),
+                (None, _) => {}
+            })
+        });
+        // What could not be settled is asked about at every edit until it is: the threads
+        // building the last patch, stopped by this edit, can have left what it reads unasked.
+        if settling.is_none()
+            && let Some(asked) = &asked
+        {
+            items.forget(asked);
+        }
+        let settled = start.elapsed();
+        let written = probe(|| hir_ty::attach_db(db, || items.index.before_edit(db, files, fan)));
+        let rewritten = start.elapsed();
+        // What a move out of the files is found by, when the threads writing it were stopped.
+        let coded = match written {
+            Some(()) if moves => {
+                probe(|| hir_ty::attach_db(db, || items.index.write_codes(db, fan, files)))
+            }
+            _ => Some(0),
+        };
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            eprintln!(
+                "items-before: taken {} us, settled {} us{}, written {} us, {} codes in {} us",
+                took.as_micros(),
+                (settled - took).as_micros(),
+                if settling.is_none() { " (unsettled)" } else { "" },
+                (rewritten - settled).as_micros(),
+                coded.unwrap_or(0),
+                (start.elapsed() - rewritten).as_micros()
+            );
+        }
+        let written = written.zip(coded).map(|_| ());
+        if written.is_none() {
+            self.items = None;
+        }
+    }
+
+    /// Whether an edit that moves items between files keeps their code: the base is its own and
+    /// its items are made.
+    pub(super) fn keeps_moves(&self) -> bool {
+        !self.rustc && self.items.is_some()
+    }
+
+    /// Whether the items refuse a push of an edit of `files` before it is made: one of them
+    /// could not be hashed at the last build.
+    pub(super) fn unhashed_in(&self, files: &[FileId]) -> bool {
+        (self.items.as_ref()).is_some_and(|it| it.index.unhashed_in(files).is_some())
+    }
+
+    /// Before an edit of `files`, of the revision before it: the code of the instances of the
+    /// base, or of what it relocated, of functions written in them, for [`Self::relocate`].
+    /// Only an edit of two files or more moves a function, and the items tell which it moved.
+    fn snapshot(&mut self, db: &dyn HirDatabase, files: &[FileId], fan: &Fan<'_>, moves: bool) {
+        let start = std::time::Instant::now();
+        self.snapshots.clear();
+        let mut wanted: Vec<(Instance, Instance, StoredParamEnvAndCrate, Option<_>)> = Vec::new();
+        let moves = self.keeps_moves() && moves;
+        let edited: FxHashSet<FileId> = files.iter().copied().collect();
+        for (key, it) in &mut self.relocated {
+            let code = it.code.take();
+            let InstanceDef::Fn(func) = it.now.def else { continue };
+            if moves && probe(|| edited.contains(&body_file(db, func.into()))) == Some(true) {
+                wanted.push((key.clone(), it.now.clone(), self.instances[key].env.clone(), code));
+            }
+        }
+        if !moves {
+            return;
+        }
+        for (instance, was) in &self.instances {
+            let written =
+                was.files.as_deref().is_some_and(|it| it.iter().any(|f| edited.contains(f)));
+            if !written
+                || was.mark.is_none()
+                || was.forwarded
+                || self.relocated.contains_key(instance)
+                || !matches!(instance.def, InstanceDef::Fn(_))
+                || instance.args.as_ref().iter().any(|it| it.region().is_none())
+            {
+                continue;
+            }
+            wanted.push((instance.clone(), instance.clone(), was.env.clone(), None));
+        }
+        let found: Vec<std::sync::OnceLock<Option<Arc<CompiledFunction>>>> =
+            wanted.iter().map(|_| std::sync::OnceLock::new()).collect();
+        let slowest = std::sync::atomic::AtomicU64::new(0);
+        let work = |db: &dyn HirDatabase, at: usize| {
+            found[at].get_or_init(|| {
+                let (_, now, env, code) = &wanted[at];
+                if let Some(code) = code {
+                    return Some(Arc::clone(code));
+                }
+                let one = std::time::Instant::now();
+                let compiled =
+                    || compiled_instance(db, now.clone(), env.clone()).as_ref().ok().cloned();
+                let compiled = probe(|| hir_ty::attach_db(db, compiled)).flatten().map(Arc::new);
+                let took = one.elapsed().as_micros() as u64;
+                slowest.fetch_max(took, std::sync::atomic::Ordering::Relaxed);
+                compiled
+            });
+        };
+        fan(wanted.len(), &work);
+        (0..wanted.len()).for_each(|at| work(db, at));
+        let asked = wanted.len();
+        for ((key, now, ..), code) in wanted.into_iter().zip(found) {
+            if let (InstanceDef::Fn(func), Some(code)) = (now.def, code.into_inner().flatten()) {
+                self.snapshots.insert(func, (key, code));
+            }
+        }
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            eprintln!(
+                "relocate-snapshot: {} of {asked} instances in {} us, the slowest {} us",
+                self.snapshots.len(),
+                start.elapsed().as_micros(),
+                slowest.into_inner()
+            );
+        }
+    }
+
+    /// After an edit is pushed through the items, `pushed` when it is: each instance of the base
+    /// whose function the edit moved within its crate is the one of where it is now, under
+    /// the base's symbol. Its code is that from before the edit when nothing it is of changed
+    /// but the items moved, and is compiled otherwise.
+    fn relocate(&mut self, db: &dyn HirDatabase, pushed: Option<&blaze_items::Pushed>) {
+        use blaze_items::ItemId;
+        let snapshots = std::mem::take(&mut self.snapshots);
+        let Some(items) = &self.items else {
+            self.relocated.clear();
+            self.relocated_now.clear();
+            self.relocated_funcs.clear();
+            return;
+        };
+        let start = std::time::Instant::now();
+        let live = items.index.live();
+        let index_moved = items.index.moved();
+        let moved: FxHashMap<FunctionId, FunctionId> = (index_moved.iter())
+            .filter_map(|it| match it {
+                (ItemId::Function(was), ItemId::Function(now)) => Some((*was, *now)),
+                _ => None,
+            })
+            .collect();
+        let adts: FxHashMap<AdtId, AdtId> = (index_moved.iter())
+            .filter_map(|it| match it {
+                (ItemId::Adt(was), ItemId::Adt(now)) => Some((*was, *now)),
+                _ => None,
+            })
+            .collect();
+        let named: Vec<Vec<u8>> = (index_moved.values())
+            .filter_map(|it| probe(|| item_name(db, *it)).flatten())
+            .map(|it| format!("::{it}").into_bytes())
+            .collect();
+        let asked: Option<FxHashSet<u32>> =
+            pushed.map(|it| items.asked(&it.unmoved(index_moved)).instances.into_iter().collect());
+        let (mut kept, mut compiled) = (0, 0);
+        let mut why: FxHashMap<&'static str, usize> = FxHashMap::default();
+        for (was, now) in &moved {
+            let Some((key, code)) = snapshots.get(was) else { continue };
+            let base = &self.instances[key];
+            if key.def == InstanceDef::Fn(*now) || probe(|| now.krate(db)) != Some(base.env.krate) {
+                self.relocated.remove(key);
+                continue;
+            }
+            let at = self.instances.get_index_of(key).expect("a key of the base") as u32;
+            let renamed = items.index.renamed().contains(&ItemId::Function(*was));
+            let unasked = !renamed && asked.as_ref().is_some_and(|it| !it.contains(&at));
+            let relocate =
+                || hir_ty::attach_db(db, || relocated(db, code, &moved, &adts, &named, &live));
+            let code = unasked.then(|| probe(relocate)).flatten().flatten().map(Arc::new);
+            if code.is_some() {
+                kept += 1;
+            } else {
+                compiled += 1;
+                let reason = match () {
+                    _ if renamed => "renamed",
+                    _ if asked.is_none() => "refused",
+                    _ if !unasked => items.instance_unknown(at).unwrap_or("asked"),
+                    _ => "not remapped",
+                };
+                *why.entry(reason).or_default() += 1;
+            }
+            let now = Instance { def: InstanceDef::Fn(*now), ..key.clone() };
+            self.relocated.insert(key.clone(), Relocated { now, code });
+        }
+        // A push refused leaves the index as it was, and a patch finds one gone uncalled.
+        if pushed.is_some() {
+            self.relocated.retain(|_, it| match it.now.def {
+                InstanceDef::Fn(func) => {
+                    probe(|| live.has(db, ItemId::Function(func))) == Some(true)
+                }
+                _ => false,
+            });
+        }
+        self.relocated_now =
+            self.relocated.iter().map(|(key, it)| (it.now.clone(), key.clone())).collect();
+        self.relocated_funcs = (self.relocated.iter())
+            .filter_map(|(key, it)| match (key.def, it.now.def) {
+                (InstanceDef::Fn(was), InstanceDef::Fn(now)) => Some((now, was)),
+                _ => None,
+            })
+            .collect();
+        if std::env::var_os("RA_JIT_STATS").is_some() && !moved.is_empty() {
+            eprintln!(
+                "relocated: {} instances, {kept} moved now by their code and {compiled} to compile {why:?}, of {} functions moved, in {} us",
+                self.relocated.len(),
+                moved.len(),
+                start.elapsed().as_micros()
+            );
+        }
+    }
+
+    /// The mark of `compiled` with what it calls of [`Self::relocated`] called as the base
+    /// does: the base's code that is the same calls the base's symbol, which stands for it.
+    fn moved_mark(&self, db: &dyn HirDatabase, compiled: &CompiledFunction) -> Mark {
+        let func = |it: FunctionId| self.relocated_funcs.get(&it).copied().unwrap_or(it);
+        let mut was = compiled.clone();
+        for request in &mut was.requests.funcs {
+            if let FuncTarget::Instance(instance, _) = &mut request.target
+                && let Some(key) = self.relocated_now.get(instance)
+            {
+                *instance = key.clone();
+            }
+        }
+        for request in &mut was.requests.datas {
+            match request {
+                DataRequest::Location(Some((DefWithBodyId::FunctionId(it), _)))
+                | DataRequest::Declaration(it) => *it = func(*it),
+                _ => {}
+            }
+        }
+        if let Some((DefWithBodyId::FunctionId(it), _)) = &mut was.source {
+            *it = func(*it);
+        }
+        Mark::of_function(db, super::print_of(&was), compiled, self.debug)
+    }
+
+    /// Notes that `files` of `crates` changed in their items: what can have changed is what
+    /// refers to an item that changed, through its interface, or calls something by a name
+    /// bound to another thing now. All of what sees the files when that can't be told.
+    pub(super) fn touch_items(
+        &mut self,
+        db: &dyn HirDatabase,
+        crates: &[Crate],
+        files: &[FileId],
+        fan: &Fan<'_>,
+    ) {
+        let stats = std::env::var_os("RA_JIT_STATS").is_some();
+        let start = std::time::Instant::now();
+        let pushed = match &mut self.items {
+            Some(items) if !self.rustc => {
+                let push = || hir_ty::attach_db(db, || items.index.push(db, files, fan));
+                probe(push).unwrap_or(Err("a query that panicked"))
+            }
+            Some(_) => Err("a base of rustc's"),
+            None => Err("no items"),
+        };
+        let pushed = match pushed {
+            Ok(it) => it,
+            Err(why) => {
+                // What a panic left of the index is of no revision.
+                if why == "a query that panicked" {
+                    self.items = None;
+                }
+                if stats {
+                    eprintln!("items: whole crates: {why}");
+                }
+                let refused = start.elapsed();
+                self.relocate(db, None);
+                self.touch(db, Some(crates));
+                if stats {
+                    eprintln!(
+                        "items-whole-us: refused at {}, all touched at {}",
+                        refused.as_micros(),
+                        start.elapsed().as_micros()
+                    );
+                }
+                return;
+            }
+        };
+        self.relocate(db, Some(&pushed));
+        let items = self.items.as_ref().expect("pushed through them");
+        let asked = items.asked(&pushed);
+        // Their bodies too, as a body edit's.
+        self.touched.bodies.extend(pushed.files.iter().copied());
+        for &krate in crates {
+            if !self.touched.around.contains(&krate) {
+                self.touched.around.extend(krate.transitive_rev_deps(db));
+            }
+        }
+        let around = &self.touched.around;
+        let roots =
+            asked.roots.iter().copied().filter(|&i| around.contains(&self.crates[i as usize]));
+        self.touched.named_roots.extend(roots);
+        let instances = asked.instances.iter().copied().filter(|&i| {
+            self.instances
+                .get_index(i as usize)
+                .is_some_and(|(_, was)| around.contains(&was.env.krate))
+        });
+        self.touched.named_instances.extend(instances);
+        // What came from the store is not in `items`: all of it that can see them is asked.
+        let hydrated = self.hydrated.iter().enumerate().filter_map(|(i, was)| {
+            was.krate.is_none_or(|it| around.contains(&it)).then_some(i as u32)
+        });
+        self.touched.hydrated.extend(hydrated.collect::<Vec<_>>());
+        if stats {
+            eprintln!(
+                "items: {} written, {} changed, {} names, {} roots and {} instances asked in {} us",
+                pushed.written,
+                pushed.changed.len(),
+                pushed.names(),
+                asked.roots.len(),
+                asked.instances.len(),
+                start.elapsed().as_micros()
+            );
+        }
+        self.reitem = Some(match self.reitem.take() {
+            Some(mut was) => {
+                was.roots.extend(asked.roots);
+                was.instances.extend(asked.instances);
+                was
+            }
+            None => asked,
+        });
+        self.outdated |=
+            self.untracked && self.crates.iter().any(|it| self.touched.around.contains(it));
     }
 
     /// Notes that a file changed in the bodies of functions alone, none of which the rest of
@@ -1918,38 +2821,42 @@ impl Base {
         first.steps.left += start.elapsed();
     }
 
-    /// The roots an edit can have changed, or all of them, one part in `parts`.
-    fn roots_to_ask(
-        &self,
-        all: bool,
-        part: usize,
-        parts: usize,
-    ) -> Box<dyn Iterator<Item = usize> + '_> {
+    /// What of the base an edit can have changed, for `parts` threads to look at together.
+    pub(super) fn handout(&self, parts: usize) -> Handout<'_> {
+        let check_all = std::env::var_os("RA_JIT_CHECK_ALL").is_some();
+        Handout {
+            parts: parts.max(1),
+            check_all,
+            roots: self.roots_to_ask(check_all),
+            instances: self.instances_to_ask(check_all),
+            statics: self.statics.iter().collect(),
+            next: Default::default(),
+        }
+    }
+
+    /// The roots an edit can have changed, or all of them.
+    fn roots_to_ask(&self, all: bool) -> Vec<usize> {
         let touched = &self.touched;
         if all || touched.any {
-            return Box::new((part..self.compiled.len()).step_by(parts));
+            return (0..self.compiled.len()).collect();
         }
         let homes = &self.homes;
         let of_crates = touched.crates.iter().filter_map(|it| homes.roots_of_crate.get(it));
         let of_files = touched.bodies.iter().filter_map(|it| homes.roots_of_file.get(it));
         let mut asked: Vec<u32> = of_crates.chain(of_files).flatten().copied().collect();
         asked.extend(touched.roots.iter().filter_map(|it| homes.root.get(it)));
+        asked.extend(&touched.named_roots);
         if touched.edited() {
             asked.extend(&self.cached_roots);
         }
-        Box::new(part_of(asked, part, parts))
+        sorted(asked)
     }
 
-    /// The instances an edit can have changed, or all of them, one part in `parts`.
-    fn instances_to_ask(
-        &self,
-        all: bool,
-        part: usize,
-        parts: usize,
-    ) -> Box<dyn Iterator<Item = usize> + '_> {
+    /// The instances an edit can have changed, or all of them.
+    fn instances_to_ask(&self, all: bool) -> Vec<usize> {
         let touched = &self.touched;
         if all || touched.any {
-            return Box::new((part..self.instances.len()).step_by(parts));
+            return (0..self.instances.len()).collect();
         }
         let homes = &self.homes;
         let of_crates = touched.crates.iter().filter_map(|it| homes.instances_of_crate.get(it));
@@ -1958,6 +2865,7 @@ impl Base {
         if !touched.bodies.is_empty() {
             asked.extend(&homes.instances_of_any_file);
         }
+        asked.extend(&touched.named_instances);
         if touched.edited() {
             asked.extend(&self.cached_instances);
         }
@@ -1968,21 +2876,15 @@ impl Base {
                 .filter_map(|it| self.instances.get_index_of(it))
                 .map(|it| it as u32),
         );
-        Box::new(part_of(asked, part, parts))
+        sorted(asked)
     }
 
-    /// The code from the store an edit can have changed, or all of it, one part in `parts`.
-    /// `edited` names the files whose bodies changed, `None` when one has no name.
-    fn hydrated_to_ask(
-        &self,
-        all: bool,
-        edited: Option<&[String]>,
-        part: usize,
-        parts: usize,
-    ) -> Box<dyn Iterator<Item = usize> + '_> {
+    /// The code from the store an edit can have changed, or all of it. `edited` names the
+    /// files whose bodies changed, `None` when one has no name.
+    fn hydrated_to_ask(&self, all: bool, edited: Option<&[String]>) -> Vec<usize> {
         let touched = &self.touched;
         if all || touched.any || edited.is_none() {
-            return Box::new((part..self.hydrated.len()).step_by(parts));
+            return (0..self.hydrated.len()).collect();
         }
         let homes = &self.hydrated_homes;
         let of_crates = touched.crates.iter().filter_map(|it| homes.of_crate.get(it));
@@ -1995,7 +2897,7 @@ impl Base {
             asked.extend(&homes.of_any_crate);
         }
         asked.extend(&touched.hydrated);
-        Box::new(part_of(asked, part, parts))
+        sorted(asked)
     }
 
     /// The files edited since the last look, by the names a look names them by, when nothing
@@ -2018,17 +2920,17 @@ impl Base {
             .collect()
     }
 
-    /// Looks at one part in `parts` of the code the base has from the store for what an edit
-    /// changed, comparing what it compiles to now with the mark the store had of it.
+    /// Looks at what this thread takes from `handout` of the code the base has from the store,
+    /// for what an edit changed, comparing what it compiles to now with the mark the store had
+    /// of it.
     fn stale_hydrated(
         &self,
         db: &dyn HirDatabase,
         names: &StableNames<'_, '_>,
-        check_all: bool,
-        part: usize,
-        parts: usize,
+        handout: &Handout<'_>,
         stale: &mut Stale,
     ) -> std::result::Result<(), &'static str> {
+        let check_all = handout.check_all;
         if self.hydrated.is_empty() {
             return Ok(());
         }
@@ -2038,7 +2940,8 @@ impl Base {
         let bodies_edited = self.bodies_edited(db, names);
         let mut homes = super::home::Homes::default();
         let mut found = FoundHydrated::default();
-        for i in self.hydrated_to_ask(check_all, edited.as_deref(), part, parts) {
+        let asked = self.hydrated_to_ask(check_all, edited.as_deref());
+        for i in handout.each(Look::Hydrated, asked.len()).map(|it| asked[it]) {
             let was = &self.hydrated[i];
             let unchanged = !self.touched.hydrated.contains(&(i as u32))
                 && bodies_edited.as_ref().is_some_and(|edited| {
@@ -2221,19 +3124,17 @@ impl Base {
         dropped
     }
 
-    /// What one part in `parts` of the base no longer is what it was. Looking is most of the
-    /// work of a patch, and the parts can be looked at on a thread each.
+    /// What of the base this thread takes from `handout` no longer is what it was. Looking is
+    /// most of the work of a patch, and threads look at it together.
     /// `symbols` names what the base has from the store, which nothing else tells an edit of.
     pub(super) fn stale(
         &self,
         db: &dyn HirDatabase,
         symbols: Option<&dyn SymbolResolver>,
-        part: usize,
-        parts: usize,
+        handout: &Handout<'_>,
     ) -> Stale {
         let start = stdx::time::Instant::now();
         let mut stale = Stale::default();
-        let every = |len: usize| (part..len).step_by(parts);
         let names = symbols.filter(|_| !self.ids.is_empty()).map(|symbols| {
             StableNames::new(db, symbols, self.owned.clone(), true).frozen(self.ids.clone())
         });
@@ -2242,8 +3143,8 @@ impl Base {
         }
         // A check of the skipping below: looks at what no edit can have changed too, and says
         // so if one did.
-        let check_all = std::env::var_os("RA_JIT_CHECK_ALL").is_some();
-        for i in every(self.rejected.len()) {
+        let check_all = handout.check_all;
+        for i in handout.each(Look::Rejected, self.rejected.len()) {
             let (instance, env) = &self.rejected[i];
             let compiles = probe(|| compiled_instance(db, instance.clone(), env.clone()).is_ok());
             if compiles != Some(false) {
@@ -2251,11 +3152,12 @@ impl Base {
             }
         }
         let bodies_edited = names.as_ref().and_then(|names| self.bodies_edited(db, names));
-        for i in self.roots_to_ask(check_all, part, parts) {
+        for i in handout.each(Look::Roots, handout.roots.len()).map(|it| handout.roots[it]) {
             let root = self.compiled[i].0;
             let touched = self.touched.reaches(self.crates[i])
                 || self.touched.reaches_bodies(Some(&[self.files[i]]))
                 || self.touched.roots.contains(&root)
+                || self.touched.named_roots.contains(&(i as u32))
                 || self.touched.edited() && self.cached_roots.binary_search(&(i as u32)).is_ok();
             if !touched && !check_all {
                 continue;
@@ -2275,14 +3177,22 @@ impl Base {
                     let compiled = compiled_root(db, root).as_ref().ok()?;
                     Some(stable_mark(db, names, compiled, self.debug) == Some(was))
                 }),
-                _ => probe(|| Some(Mark::of_root(db, root, self.debug)? == self.marks[i])),
+                _ => probe(|| {
+                    let now = Mark::of_root(db, root, self.debug)?;
+                    if now == self.marks[i] || self.relocated.is_empty() {
+                        return Some(now == self.marks[i]);
+                    }
+                    let compiled = compiled_root(db, root).as_ref().ok()?;
+                    Some(self.moved_mark(db, compiled) == self.marks[i])
+                }),
             };
             stale.steps.roots_asked += 1;
-            stale.steps.slowest = stale.steps.slowest.max(asked.elapsed());
+            stale.steps.asked(asked.elapsed());
             match same {
                 Some(Some(true)) => {}
                 _ if !touched || unchanged => {
-                    eprintln!("check-all: MISSED root {root:?} of {:?}", self.crates[i]);
+                    let (crate_of, name) = (self.crates[i], &self.compiled[i].1);
+                    eprintln!("check-all: MISSED root {root:?} `{name}` of {crate_of:?}");
                     continue;
                 }
                 Some(Some(false)) => stale.roots.push(root),
@@ -2290,9 +3200,12 @@ impl Base {
                 None => stale.gone.push(root),
             }
         }
-        for (root, was, file) in self.unnamed.iter().skip(part).step_by(parts) {
-            let touched =
-                self.touched.reaches(root.krate(db)) || self.touched.reaches_bodies(Some(&[*file]));
+        for (root, was, file) in
+            handout.each(Look::Unnamed, self.unnamed.len()).map(|it| &self.unnamed[it])
+        {
+            let touched = probe(|| root.krate(db)).is_none_or(|it| self.touched.reaches_around(it))
+                || self.touched.reaches_bodies(Some(&[*file]))
+                || self.touched.roots.contains(root);
             if !touched {
                 continue;
             }
@@ -2306,9 +3219,12 @@ impl Base {
                 return stale.declined("a function that rustc's symbols name no copy of changed");
             }
         }
-        for homed in self.closures.iter().skip(part).step_by(parts) {
-            let touched = self.touched.reaches(homed.root.krate(db))
-                || self.touched.reaches_bodies(Some(&[homed.file]));
+        for homed in handout.each(Look::Closures, self.closures.len()).map(|it| &self.closures[it])
+        {
+            let krate = probe(|| homed.root.krate(db));
+            let touched = krate.is_none_or(|it| self.touched.reaches_around(it))
+                || self.touched.reaches_bodies(Some(&[homed.file]))
+                || self.touched.roots.contains(&homed.root);
             if !touched {
                 continue;
             }
@@ -2339,20 +3255,40 @@ impl Base {
             }
         }
         stale.steps.roots = start.elapsed();
-        for i in self.instances_to_ask(check_all, part, parts) {
+        let instances = &handout.instances;
+        for i in handout.each(Look::Instances, instances.len()).map(|it| instances[it]) {
             let Some((instance, was)) = self.instances.get_index(i) else { continue };
+            // What it is now is the patch's to tell.
+            if self.relocated.contains_key(instance) {
+                continue;
+            }
             let touched = self.touched.reaches(was.env.krate)
                 || self.touched.reaches_bodies(was.files.as_deref())
                 || self.touched.instances.contains(instance)
+                || self.touched.named_instances.contains(&(i as u32))
                 || self.touched.edited()
                     && self.cached_instances.binary_search(&(i as u32)).is_ok();
             if !touched && !check_all {
                 continue;
             }
             let asked = stdx::time::Instant::now();
-            let mark = probe(|| Mark::of_instance(db, instance, &was.env, self.debug));
+            let mut mark = probe(|| Mark::of_instance(db, instance, &was.env, self.debug));
+            if !self.relocated.is_empty()
+                && let Some(Some(now)) = mark
+                && Some(now) != was.mark
+            {
+                let moved = probe(|| {
+                    let compiled = compiled_instance(db, instance.clone(), was.env.clone());
+                    compiled.as_ref().ok().map(|it| self.moved_mark(db, it))
+                });
+                if let Some(Some(moved)) = moved
+                    && Some(moved) == was.mark
+                {
+                    mark = Some(Some(moved));
+                }
+            }
             stale.steps.instances_asked += 1;
-            stale.steps.slowest = stale.steps.slowest.max(asked.elapsed());
+            stale.steps.asked(asked.elapsed());
             stale.their_walk_changed |= touched
                 && was.theirs
                 && mark.flatten().map(|it| it.serial) != was.mark.map(|it| it.serial);
@@ -2371,13 +3307,14 @@ impl Base {
             }
         }
         if let Some(names) = &names
-            && let Err(why) = self.stale_hydrated(db, names, check_all, part, parts, &mut stale)
+            && let Err(why) = self.stale_hydrated(db, names, handout, &mut stale)
         {
             return stale.declined(why);
         }
         stale.steps.instances = start.elapsed() - stale.steps.roots;
-        for (&id, was) in self.statics.iter().skip(part).step_by(parts) {
-            let touched = self.touched.reaches(was.krate)
+        let statics = &handout.statics;
+        for (&id, was) in handout.each(Look::Statics, statics.len()).map(|it| statics[it]) {
+            let touched = self.touched.reaches_around(was.krate)
                 || self.touched.reaches_bodies(Some(&[was.file]))
                 || self.touched.statics.contains(&id);
             if !touched && !check_all {
@@ -2417,11 +3354,13 @@ impl Base {
             }
         }
         stale.steps.statics = start.elapsed() - stale.steps.roots - stale.steps.instances;
-        for i in every(self.skipped.len()) {
+        for i in handout.each(Look::Skipped, self.skipped.len()) {
             let Some(was) = &self.left[i] else { continue };
             let root = self.skipped[i].0;
-            let touched = self.touched.reaches(root.krate(db))
-                || self.touched.reaches_bodies(Some(&[body_file(db, root.into())]));
+            let at = probe(|| (root.krate(db), body_file(db, root.into())));
+            let touched = at.is_none_or(|(krate, file)| {
+                self.touched.reaches_around(krate) || self.touched.reaches_bodies(Some(&[file]))
+            }) || self.touched.roots.contains(&root);
             if !touched && !check_all {
                 continue;
             }
@@ -2438,9 +3377,9 @@ impl Base {
                 return stale.declined("a function left to rustc changed");
             }
         }
-        for i in every(self.their_walk.instances.len()) {
+        for i in handout.each(Look::TheirInstances, self.their_walk.instances.len()) {
             let was = &self.their_walk.instances[i];
-            if !self.touched.reaches(was.env.krate)
+            if !self.touched.reaches_around(was.env.krate)
                 && !self.touched.reaches_bodies(was.files.as_deref())
             {
                 continue;
@@ -2454,9 +3393,11 @@ impl Base {
             });
             stale.their_walk_changed |= serial != Some(was.serial);
         }
-        for i in every(self.their_walk.statics.len()) {
+        for i in handout.each(Look::TheirStatics, self.their_walk.statics.len()) {
             let was = &self.their_walk.statics[i];
-            if !self.touched.reaches(was.krate) && !self.touched.reaches_bodies(Some(&[was.file])) {
+            if !self.touched.reaches_around(was.krate)
+                && !self.touched.reaches_bodies(Some(&[was.file]))
+            {
                 continue;
             }
             let serial = probe(|| {
@@ -2611,6 +3552,7 @@ impl Base {
                     let known = self.instances.get(instance);
                     if known.is_some_and(|it| it.env == *env && it.mark.is_some() && !it.forwarded)
                         && !changed_instances.contains(instance)
+                        && !self.relocated.contains_key(instance)
                     {
                         changed_instances.push(instance.clone());
                     }
@@ -2672,6 +3614,51 @@ impl Base {
             )?;
             cg.instances.insert(instance.clone(), id);
             cg.pending.push((instance.clone(), was.env.clone(), id));
+        }
+        // What a moved function's instance is called by is the base's symbol, which the patch
+        // defines again when the code under it is other code or tells of other places.
+        let mut relocated = 0;
+        let check_all = std::env::var_os("RA_JIT_CHECK_ALL").is_some();
+        let compiling: Vec<(&Instance, &StoredParamEnvAndCrate)> = (self.relocated.iter())
+            .filter(|(_, it)| it.code.is_none() || check_all)
+            .map(|(key, it)| (&it.now, &self.instances[key].env))
+            .collect();
+        symbols.in_parallel(compiling.len(), &|db, _, at| {
+            let (now, env) = compiling[at];
+            probe(|| compiled_instance(db, now.clone(), env.clone()).is_ok());
+        });
+        for (key, it) in &self.relocated {
+            let was = &self.instances[key];
+            let compiled = || compiled_instance(db, it.now.clone(), was.env.clone()).as_ref();
+            // A check of the items: what the code from before is taken for is what compiles.
+            if check_all
+                && let Some(code) = &it.code
+                && probe(compiled).is_some_and(|now| !matches!(now, Ok(now) if now == &**code))
+            {
+                eprintln!("check-all: MISSED relocated {:?} as {:?}", key, it.now);
+            }
+            let code: &CompiledFunction = match &it.code {
+                Some(code) => code,
+                None => match probe(compiled) {
+                    Some(Ok(code)) => code,
+                    Some(Err(_)) => return Ok(Err("a function moved no longer compiles")),
+                    // Gone since, with nothing that calls it.
+                    None => continue,
+                },
+            };
+            if Some(self.moved_mark(db, code)) == was.mark {
+                let id = cg.import(&was.symbol, &code.code.signature)?;
+                cg.instances.insert(it.now.clone(), id);
+                continue;
+            }
+            relocated += 1;
+            let id =
+                cg.module.declare_function(&was.symbol, Linkage::Hidden, &code.code.signature)?;
+            cg.instances.insert(it.now.clone(), id);
+            if let Some(code) = &it.code {
+                cg.given.insert(it.now.clone(), Arc::clone(code));
+            }
+            cg.pending.push((it.now.clone(), was.env.clone(), id));
         }
         // What calls code from the store calls it by the base's symbol, which the patch takes.
         for (i, instance, env) in changed_hydrated {
@@ -2749,6 +3736,16 @@ impl Base {
             }
         }
         if std::env::var_os("RA_JIT_STATS").is_some() {
+            let known: FxHashSet<FunctionId> = known_roots().collect();
+            let new = queue.iter().filter(|it| !known.contains(it)).count();
+            eprintln!(
+                "patch-made: {} roots changed and {new} new, {} gone; {} instances, {} of them of the base and {relocated} relocated of {}",
+                queue.len() - new,
+                cg.replaced.gone.len(),
+                cg.instances.len(),
+                changed_instances.len(),
+                self.relocated.len()
+            );
             let decls = cg.module.declarations();
             let anew = (cg.instances.values())
                 .filter(|&&id| {

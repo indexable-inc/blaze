@@ -1,0 +1,22 @@
+[package]
+name = "blaze-vfs"
+description = "blaze's source of truth: a content-addressed Merkle tree of roots, atomic multi-file transactions, diffs of roots, and a crash-safe journal, sans-IO"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blake3 = { version = "1.8", default-features = false, features = ["std"] }
+blaze-core = { path = "../blaze-core" }
+rustc-hash.workspace = true
+
+[lints]
+workspace = true

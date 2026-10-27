@@ -35,6 +35,7 @@ ra-ap-rustc_index.workspace = true
 ra-ap-rustc_type_ir.workspace = true
 
 base-db.workspace = true
+blaze-items.workspace = true
 cfg.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true

@@ -27,6 +27,8 @@ use std::os::unix::net::UnixStream;
 #[cfg(windows)]
 use uds_windows::UnixStream;
 
+pub(crate) mod api;
+
 use super::{plan::Plan, units::stamp_of};
 use crate::socket::{self, NotServed, Served, private_dir, private_file, read_request};
 
@@ -1105,6 +1107,8 @@ pub(crate) fn serve() -> anyhow::Result<()> {
         let daemon = daemon.clone();
         std::thread::spawn(move || daemon.reap());
     }
+    api::serve_http(daemon.clone())?;
+    std::fs::write(api::marker_in(&daemon.home), format!("{}\n", blaze_api::SCHEMA))?;
     for (stream, open) in served.incoming() {
         let daemon = daemon.clone();
         std::thread::spawn(move || {
@@ -1121,6 +1125,9 @@ impl Daemon {
     /// Reads the one request of a connection and answers it.
     fn answer(&self, stream: UnixStream) -> anyhow::Result<()> {
         let began = Instant::now();
+        if socket::framed(&stream)? {
+            return self.answer_frames(stream);
+        }
         let line = read_request(&stream)?;
         // An editor's text, on a line of its own that is not JSON: it is long and comes
         // with every key typed. The worker answers as to `cargo ra-jit build`.
@@ -1158,19 +1165,7 @@ impl Daemon {
     fn edit(&self, line: &str) -> anyhow::Result<String> {
         *lock(&self.asked) = Instant::now();
         let escaped = line["edit\t".len()..].split('\t').next().unwrap_or_default();
-        let path = PathBuf::from(ra_jit_live::format::unescape(escaped));
-        let path = dunce::canonicalize(&path).unwrap_or(path);
-        let worker = lock(&self.workers).values().find_map(|worker| {
-            let checkouts = lock(&worker.checkouts);
-            let has = checkouts.values().any(|it| {
-                matches!(it.warmth, Warmth::Ready)
-                    && dunce::canonicalize(&it.root).is_ok_and(|root| path.starts_with(root))
-            });
-            has.then(|| worker.clone())
-        });
-        let worker = worker.with_context(|| {
-            format!("the daemon has no workspace loaded that has {}", path.display())
-        })?;
+        let worker = self.worker_of(Path::new(&ra_jit_live::format::unescape(escaped)))?;
         *lock(&worker.asked) = Instant::now();
         let mut stream = socket::connect(&worker.socket)?;
         // The worker builds it for the process its last build was for.
@@ -1556,6 +1551,8 @@ impl Daemon {
         for worker in workers.values() {
             worker.finish();
         }
+        let _ = std::fs::remove_file(api::marker_in(&self.home));
+        let _ = std::fs::remove_file(api::token_in(&self.home));
         let _ = std::fs::remove_file(socket_in(&self.home));
         eprintln!("daemon of pid {} ends at {:?}", std::process::id(), SystemTime::now());
         std::process::exit(0)

@@ -1,0 +1,23 @@
+[package]
+name = "blaze-api"
+description = "blaze's agent API: one versioned schema in deterministic CBOR (RFC 8949 section 4.2), framed on a Unix socket and carried over HTTP, with JSON as a rendering for people"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde = { workspace = true, features = ["derive"] }
+
+[lints]
+workspace = true

@@ -16,7 +16,8 @@ use crate::{
     Id,
     cycle::{CycleHeads, IterationStamp},
 };
-use crate::{durability::Durability, tracked_struct::Identity};
+use crate::durability::{AtomicDurability, Durability};
+use crate::tracked_struct::Identity;
 
 #[derive(Debug)]
 pub(crate) struct ActiveQuery {
@@ -473,7 +474,7 @@ impl QueryCompletion {
         CompletedQuery {
             revisions: QueryRevisions {
                 changed_at: self.changed_at,
-                durability: self.durability,
+                durability: AtomicDurability::new(self.durability),
                 origin_and_extra,
                 #[cfg(feature = "accumulator")]
                 accumulated_inputs: self.accumulated_inputs,

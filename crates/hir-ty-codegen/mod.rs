@@ -110,9 +110,12 @@ mod later;
 pub use home::body_file;
 #[cfg(feature = "llvm")]
 mod imports;
+mod itempush;
 #[cfg(feature = "llvm")]
 mod llvm;
+mod naming;
 mod patch;
+pub use patch::Handout;
 mod places;
 #[cfg(feature = "llvm")]
 mod units;
@@ -420,7 +423,40 @@ pub trait SymbolResolver {
         _ = (count, work);
         beside();
     }
+    /// Runs `work` on a thread of its own, with a database of its own that the next change
+    /// cancels, and a [`Fan`] over databases of their own; here, on this thread over `db`.
+    fn in_background(&self, db: &dyn HirDatabase, work: Background) {
+        work(db, &|count, each| self.in_parallel(count, &|db, _, at| each(db, at)));
+    }
+    /// [`Self::in_background`] once nothing has been asked for a while, and not at all when
+    /// the database has changed by then: work no edit waits on, which would take the threads
+    /// of the edits that come one after another.
+    fn when_idle(&self, db: &dyn HirDatabase, work: Background) {
+        self.in_background(db, work);
+    }
 }
+
+static EDITS_FOLLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Says that edits follow the builds of this process, which a base keeps what tells them
+/// apart for: a daemon's.
+pub fn edits_follow() {
+    EDITS_FOLLOW.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn do_edits_follow() -> bool {
+    EDITS_FOLLOW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub use blaze_items::Fan;
+
+/// The revision the database is at, which [`Rejections::files_added`] is told of.
+pub fn revision(db: &dyn HirDatabase) -> salsa::Revision {
+    salsa::plumbing::current_revision(db)
+}
+
+/// See [`SymbolResolver::in_background`].
+pub type Background = Box<dyn FnOnce(&dyn HirDatabase, &Fan<'_>) + Send>;
 
 /// What an instance is called in every run of the daemon, if anything.
 type StableName = std::sync::Arc<str>;
@@ -746,7 +782,7 @@ impl CodegenUnit {
         let forgot = known.forgot_rustc.take().filter(|_| replaced.is_none());
         let mut declined =
             replaced.as_ref().filter(|it| it.rustc).and_then(|it| it.why_outdated()).or(forgot);
-        if let Some(base) = replaced.take_if(|it| !it.outdated()) {
+        if let Some(mut base) = replaced.take_if(|it| !it.outdated()) {
             let start = stdx::time::Instant::now();
             // Every static is rustc's, which rustc's code reads.
             let own_statics = match base.rustc {
@@ -763,7 +799,7 @@ impl CodegenUnit {
             let statics = start.elapsed();
             let mut stale = std::mem::take(&mut known.stale);
             if stale.is_empty() {
-                stale.push(base.stale(db, Some(symbols), 0, 1));
+                stale.push(base.stale(db, Some(symbols), &base.handout(1)));
             }
             let patch = loop {
                 let patch = base.patch(
@@ -812,6 +848,7 @@ impl CodegenUnit {
                     skipped: base.skipped.clone(),
                     instances: base.instances.len(),
                 };
+                base.after_patch(db, symbols);
                 known.put_base(base);
                 return Ok(Some(unit));
             }
@@ -1410,17 +1447,21 @@ impl Rejections {
         total - std::mem::replace(&mut self.counted, total)
     }
 
-    /// Looks at one part in `parts` of what the last full build compiled for what an edit
-    /// changed, which threads can do a part each. `None` when no patch is to be made.
-    /// `symbols` names what the last build had from the store.
+    /// What of the last full build an edit can have changed, for `parts` threads to look at
+    /// together with [`Self::stale`]. `None` when no patch is to be made.
+    pub fn handout(&self, parts: usize) -> Option<Handout<'_>> {
+        Some(self.patched()?.handout(parts))
+    }
+
+    /// Looks at what this thread takes from `handout` of what the last full build compiled,
+    /// for what an edit changed. `symbols` names what the last build had from the store.
     pub fn stale(
         &self,
         db: &dyn HirDatabase,
         symbols: Option<&dyn SymbolResolver>,
-        part: usize,
-        parts: usize,
+        handout: &Handout<'_>,
     ) -> Option<Stale> {
-        Some(self.patched()?.stale(db, symbols, part, parts))
+        Some(self.patched()?.stale(db, symbols, handout))
     }
 
     /// What the next build is a patch of, if it is one.
@@ -1528,6 +1569,18 @@ impl Rejections {
     /// Whether [`Self::home`] has to note `file` yet.
     pub fn homes_file(&self, file: base_db::FileId) -> bool {
         self.homes() && self.rustc.as_ref().is_some_and(|it| !it.homed(file))
+    }
+
+    /// Whether an edit that moves items between files keeps their code: the base is its own and
+    /// its items are made.
+    pub fn keeps_moves(&self) -> bool {
+        self.base.as_ref().is_some_and(|it| it.keeps_moves())
+    }
+
+    /// Whether an edit of `files` keeps the code of items it moves: the base does, and its items
+    /// do not refuse the edit's push before it is made.
+    pub fn keeps_moves_of(&self, files: &[base_db::FileId]) -> bool {
+        self.base.as_ref().is_some_and(|it| it.keeps_moves() && !it.unhashed_in(files))
     }
 
     /// Whether a patch of what rustc linked has to know `file` before it changes.
@@ -1644,6 +1697,71 @@ impl Rejections {
         self.forget();
     }
 
+    /// Notes that the database went from revision `from` to `to` by taking in files it did not
+    /// have, which the next edit is of: see [`revision`].
+    pub fn files_added(&mut self, from: salsa::Revision, to: salsa::Revision) {
+        if let Some(base) = &mut self.base {
+            base.files_added(from, to);
+        }
+    }
+
+    /// Before an edit of `files`, of the revision before it, with the threads `fan` has.
+    /// `moves` is whether the edit can move items between the files, which what they are
+    /// before it is kept for.
+    pub fn before_edit(
+        &mut self,
+        db: &dyn HirDatabase,
+        files: &[base_db::FileId],
+        fan: &Fan<'_>,
+        moves: bool,
+    ) {
+        if let Some(base) = &mut self.base {
+            base.before_edit(db, files, fan, moves);
+        }
+    }
+
+    /// Notes that `files` of `crates` changed in more than the bodies of functions, and what
+    /// changed can be told by the items that did, with the threads `fan` has.
+    pub fn touch_items(
+        &mut self,
+        db: &dyn HirDatabase,
+        crates: &[Crate],
+        files: &[base_db::FileId],
+        fan: &Fan<'_>,
+    ) {
+        self.frozen.edit(crates.iter().flat_map(|it| it.transitive_rev_deps(db)));
+        if let Some(base) = &mut self.base {
+            base.touch_items(db, crates, files, fan);
+        }
+        if let Some(rustc) = &mut self.rustc {
+            rustc.touch(db, Some(crates));
+        }
+        self.forget();
+    }
+
+    /// Notes that a file of `crates` changed in the signatures of the functions named `names`
+    /// and in bodies alone: functions of its modules and plain `impl`s, not generic, and none of
+    /// which the rest of the program sees into. Only what names them is looked at again, and
+    /// what rustc linked is of before, as of any edit that is more than bodies.
+    pub fn touch_signatures(
+        &mut self,
+        db: &dyn HirDatabase,
+        crates: &[Crate],
+        file: base_db::FileId,
+        names: &[&str],
+    ) {
+        self.frozen.edit(crates.iter().flat_map(|it| it.transitive_rev_deps(db)));
+        let names: Vec<intern::Symbol> =
+            names.iter().map(|it| intern::Symbol::intern(it)).collect();
+        if let Some(base) = &mut self.base {
+            base.touch_signatures(db, crates, file, &names);
+        }
+        if let Some(rustc) = &mut self.rustc {
+            rustc.touch(db, Some(crates));
+        }
+        self.forget();
+    }
+
     /// Notes that a file changed in the bodies of functions alone, none of which the rest of
     /// the program sees into: not `const` or `async`, not returning `impl Trait`, declaring no
     /// items, and not handed to a macro.
@@ -1690,6 +1808,7 @@ impl Rejections {
             roots_unchanged: self.stale.iter().map(|it| it.steps.roots_unchanged).sum(),
             instances_unchanged: self.stale.iter().map(|it| it.steps.instances_unchanged).sum(),
             slowest: longest(|it| it.slowest),
+            sizes: std::array::from_fn(|n| self.stale.iter().map(|it| it.steps.sizes[n]).sum()),
         }
     }
 }
@@ -2226,6 +2345,9 @@ struct ObjectCodegen<'a, 'db> {
     tiers: Option<&'a tier::Tiers>,
     /// What each function built from an entry of the store is an instance of.
     found_instances: FxHashMap<FuncId, (Instance, StoredParamEnvAndCrate)>,
+    /// The code of instances a patch has without compiling them: a moved function's, from
+    /// before the edit that moved it.
+    given: FxHashMap<Instance, std::sync::Arc<CompiledFunction>>,
     /// Whether the store has the code of a root whole, by its name, for the roots asked
     /// about: those it has are put in the object from it, not compiled.
     stored_roots: FxHashMap<FunctionId, Option<StableName>>,
@@ -4630,8 +4752,9 @@ pub fn set_code_capacity(db: &mut dyn HirDatabase, compiled: usize, inlinable_bo
     inlinable::set_lru_capacity(db, inlinable_bodies);
 }
 
-/// The body of a small function, built to be put where the function is called.
-#[salsa::tracked(returns(ref), no_eq, cycle_result = inlinable_cycle, lru = 0)]
+/// The body of a small function, built to be put where the function is called. Compared, so
+/// that one built again the same leaves each caller it is put in as it was.
+#[salsa::tracked(returns(ref), cycle_result = inlinable_cycle, lru = 0)]
 fn inlinable(
     db: &dyn HirDatabase,
     instance: Instance,
@@ -5071,6 +5194,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             hidden: Vec::new(),
             tiers: None,
             found_instances: FxHashMap::default(),
+            given: FxHashMap::default(),
             stored_roots: FxHashMap::default(),
             root_names: FxHashMap::default(),
         })
@@ -5520,8 +5644,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     let wave = std::mem::take(&mut self.pending);
                     let start = stdx::time::Instant::now();
                     let told = self.tells_variables().then_some(&self.told);
+                    let given = &self.given;
                     self.symbols.in_parallel(wave.len(), &|db, _, at| {
                         let (instance, env, _) = &wave[at];
+                        if given.contains_key(instance) {
+                            return;
+                        }
                         let compiled = compiled_instance(db, instance.clone(), env.clone());
                         if let (Ok(compiled), Some(told)) = (compiled.as_ref(), told) {
                             told.ahead(db, compiled);
@@ -5802,9 +5930,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let node = tier::Node(tier::Kind::Instance(instance.clone(), env.clone()));
         let tiered = tiers.and_then(|it| it.code(self.db, &node));
         let unit = self.unit_instances.remove(instance).filter(|_| tiered.is_none());
+        let given = self.given.get(instance).cloned();
         let compiled = match (tiered, &unit) {
             (Some(code), _) => code,
             (None, Some(unit)) => unit,
+            (None, None) if let Some(given) = &given => given,
             (None, None) => compiled_instance(self.db, instance.clone(), env.clone())
                 .as_ref()
                 .map_err(Clone::clone)?,
@@ -11680,6 +11810,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if !matches!(ty.kind(), TyKind::Uint(UintTy::U32)) {
             return Ok(None);
         }
+        self.cg.placed();
         let layout = self.layout(ty)?;
         let addr = self.stack_slot(&layout);
         let value = self.builder.ins().iconst(types::I32, number as i64);
@@ -13685,6 +13816,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let Some(name) = hir_ty::mir::type_name::rustc_type_name(self.cg.db, ty) else {
                     unsupported!("`type_name` of `{ty:?}`");
                 };
+                self.cg.placed();
                 let len = self.builder.ins().iconst(ptr(), name.len() as i64);
                 let data = self.cg.define_const(ConstBlob {
                     bytes: name.into_bytes(),

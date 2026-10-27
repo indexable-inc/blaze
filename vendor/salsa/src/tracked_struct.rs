@@ -737,6 +737,8 @@ where
                 .expect("already verified that generation is not maximum");
         }
 
+        // A struct less durable now has every field changed, as a memo less durable is not
+        // backdated (`can_backdate`).
         let durability = unsafe { &mut (*data_raw).durability };
         if current_deps.durability < *durability {
             let new_revisions = C::new_revisions(current_deps.changed_at);

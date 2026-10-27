@@ -39,6 +39,7 @@ anyhow.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
 serde_json.workspace = true
+blaze-api.workspace = true
 tracing.workspace = true
 cfg.workspace = true
 cargo-platform = "0.3.3"
@@ -68,6 +69,7 @@ typed-arena = "2.0.2"
 
 hir.workspace = true
 hir-def.workspace = true
+hir-expand.workspace = true
 hir-ty.workspace = true
 hir-ty-codegen.workspace = true
 ra-jit-expand.workspace = true
@@ -92,6 +94,7 @@ vfs.workspace = true
 triomphe.workspace = true
 paths.workspace = true
 syntax.workspace = true
+span.workspace = true
 # Without the features that bring a second HTTP and TLS stack (`rustls`), a C library built
 # with cmake (`default-https-client`, which is aws-lc) and SigV4A. The client is hyper 1 over
 # rustls with ring, which is in the tree already.
@@ -121,6 +124,12 @@ zstd = "0.13.3"
 # of liblzma's time on rustc's 84 MB.
 lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "xz", "optimization"] }
 ra-jit-live = { path = "../ra-jit-live" }
+blaze-core.workspace = true
+blaze-vfs.workspace = true
+blaze-items.workspace = true
+# The operating system's notices of changed files (FSEvents, inotify); in the tree already for
+# rust-analyzer's `vfs-notify`.
+notify = "8.2.0"
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

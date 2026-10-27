@@ -304,6 +304,30 @@ fn check_peer(stream: &UnixStream) -> io::Result<()> {
 #[cfg(windows)]
 use windows::check_peer;
 
+/// Whether a client of the user sends frames of the agent API ([`blaze_api::frame`]) rather
+/// than lines: a frame's first byte is 0, which begins no line. Nothing is read from the
+/// stream. Waits for the first byte as long as a request may take.
+#[cfg(unix)]
+pub(crate) fn framed(stream: &UnixStream) -> io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+    check_peer(stream)?;
+    unless_hung_up(stream.set_read_timeout(Some(REQUEST_TIMEOUT)))?;
+    let mut first = 0u8;
+    // SAFETY: one byte is written to `first`, which is one byte long.
+    let read =
+        unsafe { libc::recv(stream.as_raw_fd(), (&raw mut first).cast(), 1, libc::MSG_PEEK) };
+    match read {
+        1 => Ok(first == 0),
+        0 => Err(io::ErrorKind::UnexpectedEof.into()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn framed(_: &UnixStream) -> io::Result<bool> {
+    Ok(false)
+}
+
 /// Reads the one line a client sends, without its end: of the user, within the time and
 /// the length a request may take.
 pub(crate) fn read_request(stream: &UnixStream) -> io::Result<String> {

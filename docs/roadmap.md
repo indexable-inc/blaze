@@ -39,6 +39,11 @@ results, and lints run in the same pipeline, per function.
   subtrees. Measured on nushell (2,240 files, 15.1 MB, one M5 Max core): hashing the whole tree
   with BLAKE3 is 10.5 ms, a three-file 233 KB transaction 135 us, and the diff of the two roots
   11 us (**read**).
+- **Items by content above it.** Every function, type, trait, impl, const, static and macro is
+  hashed by its form after expansion, resolution and inference, with what it refers to as slots
+  and names in a separate map, as Unison does; a rename, a move, rustfmt or a reorder changes no
+  hash. The code key takes callees' interfaces, not their bodies, so a body edit stops at its
+  function ([below](#1b-items-by-content-the-layer-above-the-vfs)).
 - **Isolation, settled.** An ix VM fork (copy-on-write memory and disk, 1.7 s at best,
   **reported**) is the boundary for untrusted code and whole jobs; a new root (microseconds, on
   any Mac) is the unit of speculation and sharing in one warm daemon. No `fork(2)` of the daemon
@@ -242,8 +247,195 @@ mapped (**unverified** until built).
 | Google CitC / Piper | a workspace stores only what the developer changed, over the repository at a revision; most reads come from build and test (**reported**, CACM 2016) | the same idea per agent, inside one daemon or one ix fork |
 | Bazel Skyframe | bottom-up invalidation must `stat()` every input unless told; change pruning resurrects nodes whose value did not change (**reported**, Bazel docs) | the root diff is the "told", and early cutoff is change pruning |
 | REAPI `Directory` digests | Merkle input trees for remote execution (**reported**, `remote_execution.proto`) | the same shape; an edge adapter can speak it (#226) |
-| Nix store, Unison | everything named by content, nothing mutated in place (**reported**) | blaze's store already is; the VFS joins it |
+| Nix store, Unison | everything named by content, nothing mutated in place (**reported**) | blaze's store already is; the VFS joins it, and items follow Unison's hashing ([section 1b](#1b-items-by-content-the-layer-above-the-vfs)) |
 | Watchman | cookies to order a query after every write before it (**reported**) | needed only for the disk input |
+
+## 1b. Items by content: the layer above the VFS
+
+[#344](https://github.com/indexable-inc/blaze/issues/344). Andrew: "A VFS layer but also a
+'Unison' layer: VFS (Merkle tree) -> Unison, where EVERYTHING is proper CAS like Unison: every
+function has its syntax tree and the things it depends on, anonymized, so a refactor would still
+be cached."
+
+The VFS says which files changed. This layer says which items changed, and what each item is
+whatever it is called and wherever it is written, so a rename, a move to another file or module,
+rustfmt or a reorder changes no hash and recompiles nothing. The claims behind this section, and
+what it takes from Unison's hashing and codebase format and from den's `structure.md` and
+`build.md`, are in [research/item-identity.md](research/item-identity.md).
+
+### The model
+
+- **An item** is a function, struct, enum, union, trait, impl, const, static, type alias or
+  macro; a closure is part of the body it is written in. Its **form** is what it is once macros
+  are expanded, `cfg` evaluated, names resolved and the body inferred: generics and bounds, the
+  signature, the attributes that change code or linking (`repr`, `inline`, `track_caller`,
+  `target_feature`, `no_mangle`, `export_name`, `link_section`, `used`, not docs or lints), and
+  the body as MIR. Blocks and locals are numbered in the order a walk from the start block
+  reaches them. Names, spans, comments, formatting and item order are not in it, and every item
+  it refers to is a numbered **slot**, never a path.
+- **Four hashes** fill the slots differently:
+
+| hash | slots filled with | changes when | what it keys |
+|---|---|---|---|
+| local | nothing | the item's own form changes | the item-level diff of two roots |
+| interface | interface hashes of what its signature refers to | what a dependent can see changes: a signature, a type's fields, variants and `repr`, a trait's items, an impl's header and associated types, a const's value | early cutoff |
+| code | interface hashes of everything it refers to | its own form, or an interface it uses | compiled code, in the daemon and in the store |
+| deep | deep hashes of everything | anything it reaches (Unison's hash) | test results, code with bodies inlined into it |
+
+  Unison and loom's hash-rustc have only the deep one, which pins the bodies of dependencies and
+  so gives exact cones and no cutoff, as den's `build.md` (3g) says of hash-rustc. blaze's code
+  for a function depends on its callees' interfaces and not on their bodies, because a build
+  inlines nothing across functions (**read**, [support.md](support.md)): a callee's body edit
+  leaves every caller's code key as it was.
+- **Cycles** hash as one component, as Unison's do: each member is hashed with the slots of
+  the cycle blanked, the members are sorted by that, the component is hashed with each in-cycle
+  slot as its member's place, and a member's hash is the component's and its index (**read**,
+  upstream/unison/hashes.md, for Unison's rule). Members of a fully symmetric cycle tie and are
+  ordered as found (**unverified** that this matters).
+- **Names are a separate map**, per root, from path to item, like Unison's namespace and den's
+  `ns` tree. A rename or a move changes the map and no hash. Diagnostics, backtraces, symbols,
+  `type_name` and the agent API read the map.
+- **An item is its place in its root; its hash is a key.** This is den's rule (ids in storage,
+  hashes derived, `structure.md` section 2), not Unison's (references are hashes). Stored code
+  refers to other items by slot, and the root that loads it binds the slots, as each definition
+  in Unison's codebase carries a lookup array that a sync rewrites without touching the
+  definition (**read**, upstream/unison/repoformat-v2.md).
+
+### What each hash must hold so a hit is never wrong
+
+A hit hands back what was computed for another item with the same key. Content is not identity:
+`struct Meters(f64)` and `struct Feet(f64)` have one interface hash, and two equal `static`s
+have one deep hash (**read**, the fixture below), as Unison's structural types are one type
+unless declared `unique` (**read**). So whatever observes *which* item is bound by the root,
+and whatever depends on items the form does not name is recorded and checked.
+
+| what code depends on | where it is |
+|---|---|
+| name resolution: imports, globs, the prelude, shadowing, hygiene | its result: the slots in the form. Never the paths. A new item that shadows a glob import changes the resolution, so the form |
+| method and impl selection in a body | its result, the callee and its generic arguments in MIR: in the form. Which items to look at again when an impl is added is invalidation's job (section 4: who read the impls of that trait for that self type) |
+| inference, adjustments, coercions, closure kinds | in MIR: in the form |
+| the layout of a type | its interface (fields, `repr`, generics, variants, discriminants) and the target. Target, backend, options and the build of blaze are the store key's prefix as today ([cache.md](cache.md), #326) |
+| an instance of a generic body | the generic body's code key, the type arguments' interface hashes, and the answers monomorphizing got: the impl each obligation selected, each associated type and const it normalized, each `needs_drop` and auto-trait answer. They are kept with the entry and checked on a hit: a verifying trace, as Shake keeps (**reported**, den `build.md` section 2) |
+| facts no named item holds: a `Drop` impl, `Copy`, `Send`, `Freeze` | the same answers, kept and checked |
+| macros | the expansion is in the form. The macro's own hash is an edge for invalidation (expand again when it changes), not part of the key: an edit to a macro that expands the same keeps the code |
+| `cfg` | the form is after `cfg`; `cfg!()` is a literal in it; the cfg set and features are in the key's prefix |
+| consts | a const's interface holds its body, its value once evaluated; array lengths and const arguments are values in the types |
+| `line!()`, `column!()`, `file!()`, panic `Location`, `#[track_caller]` | requests the code generator fills, outside the code's bytes (**read**, today's `DataRequest::Location`). The form holds the request; the root fills in the place |
+| `module_path!()`, `type_name`, `TypeId`, symbol names | they observe a path or which item. `module_path!()` expands to a literal today (**read**), so moving a function that logs through `tracing` changes its hash: it becomes a request like `file!()`. `type_name` and `TypeId` become requests the root answers. Symbols are written from the name map at link |
+| debug info: line tables, variable names, scopes | outside the form: a side table of the entry, moved on a hit as marks move lines today (**read**, `patch.rs`) |
+| inlined code (the tier-up at level 2, `RA_JIT_INLINE` builds) | the deep hashes of the bodies built in |
+| what a form could not write (no MIR, a type with an error, an anonymous constant) | the reason is in the dump, and the hash is pinned to the item's file and place in it, so it is never shared with another item and misses on a move (**read**, `of_crates`) |
+
+### Measured
+
+`ra-jit items` on both sides of 15 real commits of nushell, ripgrep and helix, picked by their
+messages as renames, moves, rustfmt and refactors, with a fix or two as controls; dev-aws-8,
+16 cores pinned, release build of `blaze-next-items` at `062d38fc52` (**read**). An item counts
+when its crate has a changed file, or depends on such a crate in the checkout: the crates whose
+keys today's store gives new names. "New" is a hash found nowhere among the parent's.
+
+| commit | items counted | new code hashes | interface kept | deep kept | today: names kept | today: store keys kept | edit to result today |
+|---|---|---|---|---|---|---|---|
+| ripgrep `bb8172f` rustfmt, 40 files | 4,705 | 1 | 100% | 99.8% | 100% | 0% | 0.35-0.52 s |
+| ripgrep `861f6d3` inline format args, 5 files | 1,691 | 1 | 100% | 99.4% | 100% | 0% | 1.9-2.1 s (`build.rs` changed: cargo) |
+| ripgrep `756a945` `Cargo.toml` only, 10 files | 4,805 | 1 | 100% | 99.8% | 100% | 0% | |
+| ripgrep `626b895` refactor `is_hidden` | 2,174 | 1 | 100% | 99.4% | 99.9% | 0% | |
+| ripgrep `d47663b` a fix (control) | 2,760 | 2 | 100% | 99.0% | 100% | 0% | 0.18-0.22 s |
+| helix `7fccb499d` cargo fmt | 2,902 | 0 | 100% | 100% | 100% | 0% | 0.09 s (0.48 s the first) |
+| helix `5f5c5a30e` a dependency moved to the workspace | 5,687 | 0 | 100% | 100% | 100% | 0% | |
+| helix `bd1b25b5c` `once_cell` to std, 22 files | 23,482 | 1,325 | 92.0% | 91.6% | 100% | 0% | 9.1-31.9 s (manifests: cargo) |
+| helix `e19c0ea02` a `Debug` bound dropped | 5,848 | 1 | 100% | 100% | 100% | 0% | |
+| helix `59f323140` `IndexMap` in `KeyTrieNode` | 2,109 | 115 | 92.4% | 91.6% | 98.5% | 0% | |
+| nushell `f97cd76f2` std's `fetch_update` to `try_update` | 37,828 | 2 | 100% | 99.5% | 100% | 0% | 20.8-27.4 s (manifest: cargo) |
+| nushell `f70ed723c` the parser split into 16 files | 10,543 | 46 | 100% | 96.7% | 98.0% | 0% | 0.88-1.39 s |
+| nushell `728b88abf` `merge` moved to another crate | 7,626 | 8 | 99.8% | 99.7% | 99.6% | 0% | 0.45-3.68 s |
+| nushell `686de561b` spread checks consolidated | 10,574 | 12 | 100% | 96.9% | 100% | 0% | |
+| nushell `2529074fc` a fix (control) | 37,785 | 10 | 100% | 96.6% | 100% | 0% | (the parent's build failed) |
+
+What changed, read item by item (**read**):
+
+- **Pure layout changes keep every hash** but one: rustfmt of 40 files, `cargo fmt`, a `Cargo.toml`
+  edit and a dependency moved to the workspace. The one is ripgrep's `generate_digits`, which
+  reads the git revision `build.rs` passes, so it is new at every commit: a real input.
+- **The parser split** (16 new files, 10,543 items) changed 46 code hashes: 38 call `log::trace!`,
+  whose `module_path!()` is a string literal that a move changes (the table above makes it a
+  request); 2 call `str::from_utf8`, which the old file resolved to `core::str::from_utf8` through
+  `use std::str` and the new ones to `str`'s inherent function, a different item; 6 were edited
+  by the commit. None changed for having moved.
+- **The renames** of `fetch_update` are of a std function: the 2 callers now call another item.
+- **Refactors that change types** (`once_cell` to std, `IndexMap`) change what uses those types,
+  and nothing else: 88% and 91% of the code hashes kept.
+- **Before normalizing the body's order**, ripgrep's rustfmt changed `hiargs::printer`: `return x`
+  became `return x;`, which gives lowering one more local of type `!` and its storage marks. Bodies
+  are now written in the order a walk from the start block reaches them, leaving out blocks it
+  does not reach and the marks of locals nothing else uses.
+- **Today's names already survive most of this inside one daemon**: an item's name is its file and
+  its place in the file's table of items, which rustfmt and reorders keep; moves to another file
+  lose them (the split: 2.0%). Today's store keys are all new in every crate counted, whatever the
+  edit, because they name crates by their sources.
+- **Missed forms**: nushell's newest commits have 3,952 items (10%) whose types have an error
+  in blaze's front end, the June ones 1,994 without MIR and 1,359 with errors; ripgrep 28,
+  helix 18. Their hashes are pinned to their place, so they never share wrongly and miss on a
+  move. They are what the front end does not yet check, not the hash.
+
+**Cost** (**read**): hashing is 3.2-4.2 us an item, 15-17 ms for ripgrep's 4,800 items, 80-103 ms
+for helix's 25,000 and 120-157 ms for nushell's 34,000-41,000, on one thread: 0.13-0.25% of
+computing the forms (8.2-8.5 s, 33-35 s and 79-94 s, the MIR of every item from nothing, on one
+thread). On an edit only the edited files' items and the dependents whose interfaces changed are
+hashed. **Size**: four 32-byte hashes an item, 5.2 MB for nushell's 40,605; the code hashes
+alone, which are the store's keys, 1.3 MB.
+
+The edit-to-result times are today's daemon, warm, with each commit applied and taken back
+twice (`harness/commits.py`). Times with item keys wait for step 3 below; the commits whose
+manifests or build scripts change go through cargo today and are not this layer's to speed up.
+
+### The store's key, and main's keys
+
+Today's key ([cache.md](cache.md)) names a function of the checkout by a hash of its crate's
+sources and those of the crates of the checkout it depends on, its file and its place in the
+file, so every edit gives new keys to all of the edited crate and its dependents (**read**).
+The warm-store lane on main makes the keys content-only and adds the build of blaze to them
+(#326); c18d96d6 ("store reuse") has not landed and was not found on any branch (**read**,
+2026-10-25). The item hash goes under the same scheme, not beside it:
+
+- **The key of a function of the checkout** becomes SHA-256 over today's prefix (backend,
+  level, target, debug, overflow, blaze's build), the tag `item`, its code hash, and for an
+  instance its type arguments' interface hashes. Dependencies keep rustc's stable crate id: they
+  never change under a checkout.
+- **The entry** keeps its code, relocations and unwind information as now. Its relocations
+  name slots, bound at load by the root, instead of stable names; it adds the answers it was
+  built with (the trace) and its debug side table.
+- **Migration**: none is needed for soundness. An old entry is under a key nobody asks for
+  again, and goes by the store's LRU. The entry's layout changes (slots, trace), so the store
+  format's version moves and old packs are read as misses. Both kinds of key can live in one
+  store, so main's format stays readable while the branch moves.
+
+### What agents get
+
+- **What-if roots and best-of-N candidates** share every item no candidate changed semantically.
+  Four agents' renames of one helper are four name maps over one set of entries.
+- **A refactor costs nothing to check.** An agent that moves a module or runs rustfmt gets its
+  result from the store; the diff says "no item changed", and only the name map is new.
+- **Early cutoff is free**: an edit whose item hash is unchanged stops at the diff; one whose
+  interface hash is unchanged stops at the item.
+
+### Plan
+
+1. *(done on `blaze-next-items`)* `crates/blaze-items`: forms, the four hashes, cycles;
+   `ra-jit items <checkout>`; `harness/items.py` and `harness/commits.py`.
+2. Changed items from the VFS diff: a changed file's items are hashed again and compared by
+   local hash; the push of section 4 starts from the items whose local hash changed and stops
+   where the interface hash did not.
+3. Code keys in the daemon: the patch base and marks keyed by code hash, so a rename or a move
+   keeps the compiled code in a running daemon.
+4. Slots in stored relocations, the name map, `type_name`, `TypeId` and `module_path!` as
+   requests, debug info as a side table.
+5. Instance keys with their traces; the store's key switched (above).
+
+**Kill criterion.** Hashing has to cost under 5% of what computing the forms costs, and under
+1 ms on an edit (it hashes the items of the edited files and the dependents whose interfaces
+changed). If a measured refactor commit keeps under 90% of the code hashes of the items it does
+not change semantically, the form is wrong somewhere and is fixed before anything keys on it.
 
 ## 2. Isolation: ix VM forks and roots
 
@@ -583,7 +775,8 @@ The order inside the branch, by what the floor needs and what depends on what:
 |---|---|---|---|
 | 1 | the sans-IO core crate, the simulation and threads backends, and the Merkle VFS on it (roots, transactions, diffs, persistence) | nothing | simulation finds no lost or half-applied transaction over 10^6 seeds; a transaction under 1 ms on nushell |
 | 2 | the daemon takes transactions (socket and CLI), disk watching becomes one input producing them, builds pin roots | 1 | every edit harness passes with the watcher as the only input; notice to apply under 1 ms on the socket path |
-| 3 | invalidation driven by root diffs: changed items from the diff, the push layer in front of salsa | 2 | a body edit's revalidation share from 38% to under 5%; a signature edit's instances asked from 106k to its callers |
+| 2b | items by content: forms and the four hashes per item, changed items from the diff, code keys in the daemon, then slots, the name map and the store's key (section 1b) | 1 | hashing under 5% of the forms and under 1 ms an edit; a refactor commit keeps over 90% of the code hashes of what it does not change |
+| 3 | invalidation driven by root diffs: changed items from the diff, the push layer in front of salsa | 2, 2b | a body edit's revalidation share from 38% to under 5%; a signature edit's instances asked from 106k to its callers |
 | 3b | the compute plane: revisions as immutable snapshots, a work-stealing scheduler over per-item tasks with one committer, per-worker interning, the deterministic scheduler | 3 | beats rayon on the same tasks; the deterministic run's hashes equal the parallel run's; lock and queue time on an edit under 5% |
 | 4 | the agent API: check, build, test, run and what-if on a root, structured results; `cargo blaze` a client | 2 | edit-to-result end to end on nushell; best-of-4 candidates in under twice one |
 | 5 | diagnostics off the critical path with rollback; the patch path without a link on the reply | 3 | build-rest from 35-76 ms to 0; refuse-and-link from 28 ms to under 3 |
@@ -616,3 +809,6 @@ and on the Mac for what fits; the io_uring backend needs a Linux host.
   charged per fork is not stated by ix.
 - No agent harness exists yet, so "edit tool call to structured result" has no baseline beyond the
   daemon's own stage timeline.
+- The item hashes were replayed on 15 commits of three projects, picked by their messages, not
+  sampled; whether an equal code hash always means code that may be reused is argued (section
+  1b's table), not tested against rustc: no harness yet builds with item keys and compares.

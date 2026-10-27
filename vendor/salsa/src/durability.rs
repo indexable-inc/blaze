@@ -143,4 +143,16 @@ impl AtomicDurability {
     pub(crate) fn store(&self, durability: Durability) {
         self.0.store(durability.0 as u8, Ordering::Release);
     }
+
+    /// Lowers the durability to `durability`, when that is lower.
+    #[inline]
+    pub(crate) fn lower_to(&self, durability: Durability) {
+        self.0.fetch_min(durability.0 as u8, Ordering::AcqRel);
+    }
+}
+
+impl std::fmt::Debug for AtomicDurability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.load().fmt(f)
+    }
 }

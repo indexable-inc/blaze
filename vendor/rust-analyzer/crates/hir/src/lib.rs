@@ -1521,6 +1521,19 @@ impl fmt::Debug for Function {
 }
 
 impl Function {
+    /// Fills `acc` with the diagnostics of the function alone, as [`Module::diagnostics`] has
+    /// them: of its signature and its body, not of the impl or trait it is in.
+    pub fn diagnostics<'db>(
+        self,
+        db: &'db dyn HirDatabase,
+        acc: &mut Vec<AnyDiagnostic<'db>>,
+        style_lints: bool,
+    ) {
+        if let AnyFunctionId::FunctionId(id) = self.id {
+            crate::diagnostics::DiagnosticsCollector::collect_function(db, id, acc, style_lints);
+        }
+    }
+
     pub fn lang(db: &dyn HirDatabase, krate: Crate, lang_item: LangItem) -> Option<Function> {
         let lang_items = hir_def::lang_item::lang_items(db, krate.id);
         match lang_item.from_lang_items(lang_items)? {

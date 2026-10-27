@@ -104,6 +104,11 @@ pub struct VTableMap<'db> {
 impl<'db> VTableMap<'db> {
     const OFFSET: usize = 1000; // We should add some offset to ids to make 0 (null) an invalid id.
 
+    /// The type of each vtable, in the order of their ids.
+    pub(crate) fn tys(&self) -> &[Ty<'db>] {
+        &self.id_to_ty
+    }
+
     fn id(&mut self, ty: Ty<'db>) -> usize {
         if let Some(it) = self.ty_to_id.get(&ty) {
             return *it;

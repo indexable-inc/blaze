@@ -407,7 +407,7 @@ impl<'db> DbInterner<'db> {
             // As an approximation, when we call `new_with` we're trait solving, therefore we need the lang items.
             // This is also convenient since here we have a starting crate but not in `new_no_crate`.
             lang_items: Some(hir_def::lang_item::lang_items(db, krate)),
-            recursion_limit: hir_def::nameres::crate_def_map(db, krate).recursion_limit(),
+            recursion_limit: hir_def::nameres::crate_recursion_limit(db, krate),
             solved: tls_cache::Solved::new(),
             regions: false,
         }

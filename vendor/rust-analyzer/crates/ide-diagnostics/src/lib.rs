@@ -391,6 +391,20 @@ pub fn semantic_diagnostics_within(
     file_id: FileId,
     within: Option<std::sync::Arc<ide_db::FxHashSet<ide_db::base_db::Crate>>>,
 ) -> Vec<Diagnostic> {
+    semantic_diagnostics_of(db, config, resolve, file_id, within, None)
+}
+
+/// [`semantic_diagnostics_within`], of the functions written at `functions` alone when they are
+/// given: their signatures and bodies, not the items around them, and none of the lints of the
+/// file's syntax.
+pub fn semantic_diagnostics_of(
+    db: &RootDatabase,
+    config: &DiagnosticsConfig,
+    resolve: &AssistResolveStrategy,
+    file_id: FileId,
+    within: Option<std::sync::Arc<ide_db::FxHashSet<ide_db::base_db::Crate>>>,
+    functions: Option<&[TextRange]>,
+) -> Vec<Diagnostic> {
     let _p = tracing::info_span!("semantic_diagnostics").entered();
     let sema = match within {
         Some(crates) => Semantics::new_within(db, crates),
@@ -403,10 +417,26 @@ pub fn semantic_diagnostics_within(
 
     let parse = sema.parse(editioned_file_id);
 
+    // The functions asked about, when each of them is one the file's modules have.
+    let functions: Option<Vec<hir::Function>> = functions.and_then(|ranges| {
+        let root = parse.syntax();
+        ranges
+            .iter()
+            .map(|&range| {
+                let node = root.covering_element(range).into_node()?;
+                let func = node
+                    .ancestors()
+                    .filter_map(ast::Fn::cast)
+                    .find(|it| it.syntax().text_range() == range)?;
+                sema.to_def(&func)
+            })
+            .collect()
+    });
+
     // FIXME: This iterates the entire file which is a rather expensive operation.
     // We should implement these differently in some form?
     // Salsa caching + incremental re-parse would be better here
-    for node in parse.syntax().descendants() {
+    for node in parse.syntax().descendants().filter(|_| functions.is_none()) {
         handlers::useless_braces::useless_braces(db, &mut res, editioned_file_id, &node);
         handlers::field_shorthand::field_shorthand(db, &mut res, editioned_file_id, &node);
         handlers::json_is_not_rust::json_in_items(
@@ -445,7 +475,14 @@ pub fn semantic_diagnostics_within(
         // file, so we skip semantic diagnostics so we can show these faster.
         Some(m) => {
             if editioned_file_id.parse_errors(db).is_none_or(|es| es.len() < 16) {
-                m.diagnostics(db, &mut diags, config.style_lints);
+                match &functions {
+                    Some(functions) => {
+                        for func in functions {
+                            func.diagnostics(db, &mut diags, config.style_lints);
+                        }
+                    }
+                    None => m.diagnostics(db, &mut diags, config.style_lints),
+                }
             }
         }
         None => handlers::unlinked_file::unlinked_file(&ctx, &mut res, editioned_file_id),

@@ -28,6 +28,10 @@ text-size.opt-level = 3
 serde.opt-level = 3
 salsa.opt-level = 3
 dissimilar.opt-level = 3
+# The VFS's simulation runs thousands of seeds in a test.
+blaze-core.opt-level = 3
+blaze-vfs.opt-level = 3
+blake3.opt-level = 3
 
 # This speeds up `cargo xtask dist`.
 miniz_oxide.opt-level = 3
@@ -85,6 +89,10 @@ hir-ty-wfcheck = { path = "vendor/rust-analyzer/crates/hir-ty-wfcheck", version 
 hir-ty-codegen = { path = "crates/hir-ty-codegen" }
 ra-jit-expand = { path = "crates/ra-jit-expand" }
 ra-jit-store = { path = "crates/ra-jit-store" }
+blaze-core = { path = "crates/blaze-core" }
+blaze-vfs = { path = "crates/blaze-vfs" }
+blaze-items = { path = "crates/blaze-items" }
+blaze-api = { path = "crates/blaze-api" }
 blaze-doc = { path = "crates/blaze-doc" }
 blaze-fmt = { path = "crates/blaze-fmt" }
 blaze-lints = { path = "crates/blaze-lints" }

@@ -786,6 +786,21 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
             .collect_module(module);
     }
 
+    /// What [`DiagnosticsCollector::collect`] finds of one function of the module: of its
+    /// signature and its body, not of the impl or trait it is in.
+    pub(crate) fn collect_function(
+        db: &'db dyn HirDatabase,
+        func: hir_def::FunctionId,
+        acc: &'a mut Vec<AnyDiagnostic<'db>>,
+        style_lints: bool,
+    ) {
+        let module = hir_def::HasModule::module(&func, db);
+        let krate = module.krate(db);
+        let def_map = module.def_map(db);
+        DiagnosticsCollector { db, krate, edition: krate.data(db).edition, style_lints, acc }
+            .collect_module_def(func.into(), def_map);
+    }
+
     fn emit_def_diagnostic(&mut self, diag: &DefDiagnosticKind) {
         match diag {
             DefDiagnosticKind::UnresolvedModule { ast: declaration, candidates } => {

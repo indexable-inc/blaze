@@ -14,6 +14,7 @@ mod doctest;
 mod errors;
 mod frozen;
 mod inputs;
+mod items;
 mod link;
 mod live;
 mod macro_list;
@@ -22,11 +23,13 @@ mod memory;
 mod mirdump;
 mod outline;
 mod plan;
+mod pool;
 mod process;
 mod remote;
 mod sandbox;
 mod shipped;
 mod socket;
+mod sources;
 mod splice;
 mod splicer;
 mod stub;
@@ -1413,6 +1416,21 @@ impl SymbolResolver for Resolver<'_> {
             }
             beside();
         });
+    }
+
+    fn in_background(&self, _: &dyn hir_ty::db::HirDatabase, work: hir_ty_codegen::Background) {
+        in_background(self.db, work);
+    }
+
+    fn when_idle(&self, db: &dyn hir_ty::db::HirDatabase, work: hir_ty_codegen::Background) {
+        let at = salsa::plumbing::current_revision(db);
+        IDLE_WORK.lock().unwrap_or_else(|e| e.into_inner()).push((at, Instant::now(), work));
+        if let Some(wake) = lock(&IDLE_WAKE).clone() {
+            _ = std::thread::Builder::new().name("idle".to_owned()).spawn(move || {
+                std::thread::sleep(IDLE_WORK_AFTER);
+                _ = wake.send(Event::Idle);
+            });
+        }
     }
 
     fn source_path(&self, file: vfs::FileId) -> Option<String> {
@@ -4044,6 +4062,90 @@ fn start_from_rustc(
     Ok(())
 }
 
+/// What [`SymbolResolver::when_idle`] was handed, by the revision it is of.
+static IDLE_WORK: Mutex<Vec<(salsa::Revision, Instant, hir_ty_codegen::Background)>> =
+    Mutex::new(Vec::new());
+
+/// What wakes the loop that starts [`IDLE_WORK`] once some is due.
+static IDLE_WAKE: Mutex<Option<std::sync::mpsc::Sender<Event>>> = Mutex::new(None);
+
+/// How long nothing is asked before [`IDLE_WORK`] starts: an edit that follows sooner finds
+/// the threads its own.
+const IDLE_WORK_AFTER: Duration = Duration::from_millis(1000);
+
+/// Starts the work of [`IDLE_WORK`] handed over [`IDLE_WORK_AFTER`] ago of the revision `db`
+/// is at, which no edit came after, and drops what is of another revision.
+fn start_idle_work(db: &RootDatabase) {
+    let at = salsa::plumbing::current_revision(db);
+    let mut queued = IDLE_WORK.lock().unwrap_or_else(|e| e.into_inner());
+    if queued.is_empty() {
+        return;
+    }
+    let (mut started, mut dropped) = (0, 0);
+    for (of, since, work) in std::mem::take(&mut *queued) {
+        if of != at {
+            dropped += 1;
+        } else if since.elapsed() >= IDLE_WORK_AFTER {
+            started += 1;
+            in_background(db, work);
+        } else {
+            queued.push((of, since, work));
+        }
+    }
+    if std::env::var_os("RA_JIT_STATS").is_some() && started + dropped > 0 {
+        eprintln!("idle-work: {started} started, {dropped} of an older revision dropped");
+    }
+}
+
+/// Runs `work` on a thread of its own over a database of its own, which the next change
+/// cancels.
+fn in_background(db: &RootDatabase, work: hir_ty_codegen::Background) {
+    let db = db.clone();
+    let run = move || {
+        let fan = |count: usize, each: &(dyn Fn(&dyn hir_ty::db::HirDatabase, usize) + Sync)| {
+            fan(&db, count, each)
+        };
+        let work = std::panic::AssertUnwindSafe(|| hir::attach_db(&db, || work(&db, &fan)));
+        if let Err(why) = std::panic::catch_unwind(work)
+            && std::env::var_os("RA_JIT_STATS").is_some()
+        {
+            let by = if why.is::<salsa::Cancelled>() { "a new revision" } else { "a panic" };
+            eprintln!("background: stopped by {by}");
+        }
+    };
+    _ = std::thread::Builder::new().name("items".to_owned()).spawn(run);
+}
+
+/// Runs `each` for each of `0..count` on as many threads as there are, each with a clone of
+/// `db`. What a thread does not get to, as an edit cancelled it or it panicked, is left: the
+/// caller does it.
+fn fan(
+    db: &RootDatabase,
+    count: usize,
+    each: &(dyn Fn(&dyn hir_ty::db::HirDatabase, usize) + Sync),
+) {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..cores().min(count) {
+            let (db, next) = (db.clone(), &next);
+            scope.spawn(move || {
+                let each = std::panic::AssertUnwindSafe(|| {
+                    hir::attach_db(&db, || {
+                        loop {
+                            let at = next.fetch_add(1, Ordering::Relaxed);
+                            if at >= count {
+                                break;
+                            }
+                            each(&db, at);
+                        }
+                    })
+                });
+                _ = std::panic::catch_unwind(each);
+            });
+        }
+    });
+}
+
 /// Has each program whose edits are patches of what rustc linked take in what rustc compiled
 /// of `files`, which are about to change: the functions written in them and the statics
 /// their bodies declare. A static declared outside a body is no edit of bodies alone.
@@ -4353,6 +4455,21 @@ thread_local! {
     /// Set on a thread that asks about what an edit may have removed. A query about something
     /// that is gone panics, which is the answer and not worth a report.
     static PROBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Has the thread be one that probes for as long as it lives.
+pub(crate) struct Probing(bool);
+
+impl Probing {
+    pub(crate) fn new() -> Probing {
+        Probing(PROBING.replace(true))
+    }
+}
+
+impl Drop for Probing {
+    fn drop(&mut self) {
+        PROBING.set(self.0);
+    }
 }
 
 /// Whether the edits of the build are patches of an object that has the standard library in
@@ -4780,30 +4897,41 @@ fn build(
     // What every question about a crate's code comes down to first, asked one crate to a
     // thread: left to the questions, whichever gets there has the others wait for all of it.
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let stale: Option<Vec<_>> = std::thread::scope(|scope| {
-        let parts: Vec<_> = (0..threads)
-            .map(|part| {
-                let (db, known, local, next) = (db.clone(), &*known, &local, &next);
-                let parts = resolver.parts();
-                scope.spawn(move || {
-                    PROBING.set(true);
-                    let resolver = parts.over(&db);
-                    hir::attach_db(&db, || {
-                        while let Some(&krate) =
-                            local.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-                        {
-                            hir_ty::method_resolution::TraitImpls::for_crate(&db, krate.into());
-                            hir_ty::method_resolution::InherentImpls::for_crate(&db, krate.into());
-                        }
-                        known.stale(&db, Some(&resolver), part, threads)
-                    })
-                })
-            })
-            .collect();
-        parts.into_iter().map(|it| it.join().ok().flatten()).collect()
+    let mut spent = Vec::new();
+    // A thread asks of a database of its own.
+    let slots: Vec<_> =
+        (0..threads).map(|_| std::sync::Mutex::new(Some((db.clone(), resolver.parts())))).collect();
+    let handout = known.handout(threads);
+    let parts = pool::on_all(threads, |part| {
+        let (db, parts) = lock(&slots[part]).take().expect("a database for each part");
+        let _probing = Probing::new();
+        let (start, cpu) = (Instant::now(), thread_cpu());
+        let resolver = parts.over(&db);
+        hir::attach_db(&db, || {
+            while let Some(&krate) =
+                local.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+            {
+                hir_ty::method_resolution::TraitImpls::for_crate(&db, krate.into());
+                hir_ty::method_resolution::InherentImpls::for_crate(&db, krate.into());
+            }
+            let impls = start.elapsed();
+            let stale = handout.as_ref().and_then(|it| known.stale(&db, Some(&resolver), it));
+            (stale, Spent { impls, wall: start.elapsed(), cpu: thread_cpu() - cpu })
+        })
     });
+    let stale: Option<Vec<_>> = parts
+        .into_iter()
+        .map(|it| {
+            let (stale, it) = it?;
+            spent.push(it);
+            stale
+        })
+        .collect();
     hir::attach_db(db, || known.set_stale(hir_db, stale.unwrap_or_default()));
     let looked = known.stale_steps();
+    if std::env::var_os("RA_JIT_STATS").is_some() {
+        report_spread(&spent, &looked);
+    }
     let revalidate = start.elapsed();
     // Salsa attaches the database for the duration of the closure; the solver needs it.
     let undoable = hold.is_some();
@@ -5858,8 +5986,10 @@ fn unparsed(
         let edition = ide_db::base_db::relevant_crates(db, file)
             .first()
             .map_or(syntax::Edition::CURRENT, |it| it.data(db).edition);
-        let parse = ide_db::base_db::EditionedFileId::new(db, file, edition).parse(db);
-        if let Some(error) = parse.errors().first() {
+        // The errors as the check of the edit found them: validating the tree again is
+        // milliseconds of a file of thousands of lines.
+        let errors = ide_db::base_db::EditionedFileId::new(db, file, edition).parse_errors(db);
+        if let Some(error) = errors.and_then(|it| it.first()) {
             let text = db.file_text(file).text(db);
             // A file that is included where an expression goes is not one of items.
             if syntax::ast::Expr::parse(text, edition).errors().is_empty() {
@@ -5929,6 +6059,7 @@ const DENIED_BORROWCK: &[&str] = &["unused_mut"];
 fn broken_in(
     db: &RootDatabase,
     edited: &[vfs::FileId],
+    scoped: &FxHashMap<vfs::FileId, Vec<syntax::TextRange>>,
     watched: &Sources,
     root: &Path,
     within: Option<Arc<FxHashSet<ide_db::base_db::Crate>>>,
@@ -5943,6 +6074,7 @@ fn broken_in(
                 let (db, config, within) = (db.clone(), &config, &within);
                 scope.spawn(move || {
                     let files = edited.iter().skip(part).step_by(threads);
+                    let files = files.filter(|it| scoped.get(it).is_none_or(|it| !it.is_empty()));
                     hir::attach_db(&db, || {
                         files
                             .flat_map(|&file| {
@@ -5963,12 +6095,13 @@ fn broken_in(
                                 };
                                 let db = &db;
                                 let each = each.into_iter().flat_map(move |within| {
-                                    ide_diagnostics::semantic_diagnostics_within(
+                                    ide_diagnostics::semantic_diagnostics_of(
                                         db,
                                         config,
                                         &ide_db::assists::AssistResolveStrategy::None,
                                         file,
                                         within,
+                                        scoped.get(&file).map(Vec::as_slice),
                                     )
                                 });
                                 each.collect::<Vec<_>>()
@@ -6477,6 +6610,8 @@ struct Program {
     /// The tests last found, with the listings of the crates they were found in. A listing
     /// stays until an edit to more than bodies, which is all that changes a test.
     tests_now: Option<(Vec<Arc<ListedCrate>>, Tests)>,
+    /// The edited files as its last check for errors found them, which the next looks past.
+    checked: outline::Checked,
 }
 
 /// The functions of a program's own crate that a test harness runs, each with its
@@ -6555,14 +6690,20 @@ type Asked = (Request, Option<Target>, Client);
 struct Client {
     stream: UnixStream,
     env: ide_db::base_db::Env,
+    /// Whether it is [`Client::nobody`]: no one waits for its answer.
+    nobody: bool,
 }
 
 impl Client {
+    fn new(stream: UnixStream, env: ide_db::base_db::Env) -> Client {
+        Client { stream, env, nobody: false }
+    }
+
     /// A client that hears nothing: the one a build the daemon asks for itself answers.
     #[cfg(unix)]
     fn nobody() -> Option<Client> {
         let (stream, _) = UnixStream::pair().ok()?;
-        Some(Client { stream, env: ide_db::base_db::Env::default() })
+        Some(Client { stream, env: ide_db::base_db::Env::default(), nobody: true })
     }
 
     #[cfg(not(unix))]
@@ -6752,6 +6893,8 @@ impl std::io::Write for &Client {
 /// What the daemon waits for.
 enum Event {
     Asked(Asked),
+    /// [`IDLE_WORK`] may be due.
+    Idle,
     /// The text of a source file as an editor has it, which it has not written yet.
     Edited(Edited),
     /// The build of a program is over, with what to tell its clients: nothing when a change
@@ -6767,6 +6910,10 @@ enum Event {
     Tiered(usize, Tiered),
     /// The daemon's own base of the program at the index holds more memory than it may.
     OverBudget(usize),
+    /// A file changed on disk.
+    Noticed,
+    /// An agent's transaction of files.
+    Applied(Applied),
 }
 
 /// The functions of a program compiled at a higher level, for its next patch.
@@ -6786,6 +6933,51 @@ struct Edited {
     /// When it was read.
     at: Instant,
 }
+
+/// The files of one transaction an agent asks for: all of them or none are what the next build
+/// reads. A file `None` is deleted.
+struct Applied {
+    files: Vec<(PathBuf, Option<String>)>,
+    /// Whether the programs that have the files are built, and answered for as of an edit.
+    build: bool,
+    /// Whether the files are written to disk too.
+    disk: bool,
+    client: Client,
+}
+
+impl Applied {
+    /// The request line of `apply`: its flags, then each file's path and `w` with the text or
+    /// `d`, escaped as an edit's are.
+    fn parse(rest: &str) -> Option<(Vec<(PathBuf, Option<String>)>, bool, bool)> {
+        let mut fields = rest.split('\t');
+        let flags = fields.next()?;
+        let (build, disk) = (flags.contains('b'), flags.contains('d'));
+        let mut files = Vec::new();
+        while let Some(path) = fields.next() {
+            let path = PathBuf::from(ra_jit_live::format::unescape(path));
+            let op = fields.next()?;
+            let text = match op.strip_prefix('w') {
+                Some(text) => Some(ra_jit_live::format::unescape(text)),
+                None if op == "d" => None,
+                None => return None,
+            };
+            files.push((path, text));
+        }
+        Some((files, build, disk))
+    }
+}
+
+/// Writes `text` to `path` whole or not at all: a reader sees the file before or after.
+fn write_whole(path: &Path, text: &str) -> std::io::Result<()> {
+    let name = path.file_name().map(|it| it.to_string_lossy()).unwrap_or_default();
+    let temporary = path.with_file_name(format!(".{name}.blaze-{}", std::process::id()));
+    std::fs::write(&temporary, text)?;
+    std::fs::rename(&temporary, path).inspect_err(|_| _ = std::fs::remove_file(&temporary))
+}
+
+/// How long the daemon waits for more of a save it was told of, when no client asked for a
+/// build: an editor writes the files of one save within this of each other.
+const SETTLE: Duration = Duration::from_millis(5);
 
 /// Set while the builds under way are told to stop for a change to the source.
 static INTERRUPTING: AtomicBool = AtomicBool::new(false);
@@ -6874,6 +7066,8 @@ struct Builds {
     /// The edits that wait, the newest of each file: one typed over before it was built is
     /// answered as superseded.
     edits: Vec<Edited>,
+    /// The transactions that wait, in the order they came.
+    applied: Vec<Applied>,
     /// What the tier watcher asked for that waits for its program's build to be over.
     tier_asks: Vec<tier::Ask>,
     /// Compiled functions that wait for their program's build to be over, and the programs
@@ -6945,6 +7139,11 @@ impl Builds {
         let (at, program, answer) = match event {
             Event::Asked(asked) => {
                 self.waiting.push_back(asked);
+                return Ok(false);
+            }
+            Event::Noticed | Event::Idle => return Ok(false),
+            Event::Applied(applied) => {
+                self.applied.push(applied);
                 return Ok(false);
             }
             Event::Edited(edited) => {
@@ -7182,15 +7381,23 @@ fn requested(stream: UnixStream) -> Option<Event> {
     {
         let path = PathBuf::from(ra_jit_live::format::unescape(path));
         let text = ra_jit_live::format::unescape(text);
-        let client = Client { stream, env: process::decode(&env) };
+        let client = Client::new(stream, process::decode(&env));
         return Some(Event::Edited(Edited { path, text, client, at: Instant::now() }));
+    }
+    if name == "apply" {
+        let Some((files, build, disk)) = Applied::parse(rest) else {
+            let _ = writeln!(&stream, "failed: an apply that can't be read");
+            return None;
+        };
+        let client = Client::new(stream, process::decode(&env));
+        return Some(Event::Applied(Applied { files, build, disk, client }));
     }
     let fields: Vec<&str> = request.split('\t').collect();
     let target = Target::parse(&fields[1..]);
     if let Some(request) = Request::parse(fields[0])
         && (fields.len() == 1 || target.is_some())
     {
-        let client = Client { stream, env: process::decode(&env) };
+        let client = Client::new(stream, process::decode(&env));
         return Some(Event::Asked((request, target, client)));
     }
     let _ = writeln!(&stream, "failed: unknown request {request:?}");
@@ -7379,6 +7586,9 @@ fn main() -> anyhow::Result<()> {
     }
     if std::env::args().nth(1).as_deref() == Some("mir") {
         return mirdump::command(std::env::args().skip(2));
+    }
+    if std::env::args().nth(1).as_deref() == Some("items") {
+        return items::command(std::env::args().skip(2));
     }
     if let Some((request, socket)) =
         std::env::args().nth(1).and_then(|it| Request::parse(&it)).zip(std::env::args().nth(2))
@@ -8272,7 +8482,9 @@ fn run_holding(
         let mut edited: Vec<_> = paths.keys().copied().collect();
         edited.sort_unstable();
         let sources = Sources { paths };
-        let broken = broken_in(&db, &edited, &sources, &args.checkout, None, !args.lints_capped);
+        let none = FxHashMap::default();
+        let broken =
+            broken_in(&db, &edited, &none, &sources, &args.checkout, None, !args.lints_capped);
         let why =
             hir::attach_db(&db, || refusal(&db, &edited, &sources, &args.checkout, broken, None));
         if let Some(why) = why {
@@ -8414,7 +8626,11 @@ fn run_holding(
     // Requests wait here while a build is under way, and those that have come by the time it
     // is done are built together.
     let (sender, events) = std::sync::mpsc::channel();
+    *lock(&IDLE_WAKE) = Some(sender.clone());
     let serving = listener.is_some();
+    if serving || args.watch {
+        hir_ty_codegen::edits_follow();
+    }
     if let Some(served) = listener {
         let sender = sender.clone();
         // Each connection is read by a thread of its own: one that sends nothing, or
@@ -8457,6 +8673,7 @@ fn run_holding(
         whole,
         interrupted: 0,
         moved: false,
+        checked: outline::Checked::default(),
     }];
     let overlay = match std::env::var("RA_JIT_OVERLAY").as_deref() {
         Ok("0") => Overlay::Never,
@@ -8469,6 +8686,7 @@ fn run_holding(
         waiting: Default::default(),
         stuck: false,
         edits: Vec::new(),
+        applied: Vec::new(),
         tier_asks: Vec::new(),
         tiered: Vec::new(),
         unasked: Vec::new(),
@@ -8500,6 +8718,15 @@ fn run_holding(
     let mut placed = Placed::default();
     // The programs whose tests ra-jit's harness lists, by their object.
     let mut harnessed: FxHashSet<PathBuf> = FxHashSet::default();
+    // The source files as the builds read them, and the disk's notices of changes to them.
+    let mut held = sources::Sources::new();
+    // A change on disk is taken in when it comes, before the build that asks for it.
+    let mut notices = {
+        let sender = sender.clone();
+        sources::Notices::new(move || _ = sender.send(Event::Noticed))
+    };
+    // How many files and directories were watched when the watch was last made.
+    let mut watched_len = (usize::MAX, usize::MAX);
     loop {
         if WatchedFile::unwatched(&files, &db) || tree.includes_more(&db) {
             builds.settle(&mut db, &mut programs)?;
@@ -8523,13 +8750,14 @@ fn run_holding(
         let mut outputs: FxHashMap<usize, Outputs> = FxHashMap::default();
         // The checkout each loaded one has to be read from for them.
         let mut looked: FxHashMap<PathBuf, PathBuf> = FxHashMap::default();
-        // The text editors sent of files they have not written yet, and when it came.
-        let mut sent: FxHashMap<vfs::FileId, (String, Instant)> = FxHashMap::default();
+        // When the text of each file an editor sent came.
+        let mut edited_at: FxHashMap<PathBuf, Instant> = FxHashMap::default();
         match serving {
             true => {
                 let mut later = Vec::new();
                 let idle = builds.waiting.is_empty()
                     && builds.edits.is_empty()
+                    && builds.applied.is_empty()
                     && builds.tier_asks.is_empty()
                     && builds.unasked.is_empty();
                 // A base of its own is built in the background, which edits interrupt.
@@ -8566,6 +8794,11 @@ fn run_holding(
                         }
                     }
                     _ => {}
+                }
+                // Nor while a build runs, the daemon's own of its base too: the work would share
+                // the threads with it, and what the build's end lets go of stops it.
+                if idle && builds.running.is_empty() {
+                    start_idle_work(&db);
                 }
                 if !builds.over_budget.is_empty() {
                     builds.settle(&mut db, &mut programs)?;
@@ -8857,6 +9090,7 @@ fn run_holding(
                                 whole: None,
                                 interrupted: 0,
                                 moved: false,
+                                checked: outline::Checked::default(),
                             };
                             if let Some(built) =
                                 programs.iter().find(|it| it.same_as(&db, &program))
@@ -8964,12 +9198,17 @@ fn run_holding(
                         builds.edits.push(edited);
                         continue;
                     }
-                    let rust = path.extension().is_some_and(|it| it == "rs");
+                    // The text is what the next build reads; the editor writes it after.
                     let text = std::mem::take(&mut edited.text);
-                    let text = if rust { load_cargo::source_text(text) } else { text };
-                    if *text != **db.file_text(id).text(&db) {
-                        sent.insert(id, (text, edited.at));
+                    let write = blaze_vfs::Op::Write {
+                        path: path.to_string_lossy().into_owned(),
+                        bytes: text.into_bytes().into(),
+                    };
+                    if let Err(error) = held.commit(None, &[write]) {
+                        let _ = writeln!(&edited.client, "error: {error}");
+                        continue;
                     }
+                    edited_at.insert(path.clone(), edited.at);
                     // Built for the process the last build was for.
                     edited.client.env = ide_db::base_db::ProcessEnv::try_get(&db)
                         .map(|it| it.vars(&db).clone())
@@ -8979,12 +9218,141 @@ fn run_holding(
                     for &at in &owners[1..] {
                         outputs.insert(at, Outputs::of(&programs[at].args));
                         if let Ok(stream) = edited.client.stream.try_clone() {
-                            let client = Client { stream, env: edited.client.env.clone() };
+                            let client = Client::new(stream, edited.client.env.clone());
                             clients.push((at, (Request::Edit, target(at), client)));
                         }
                     }
                     outputs.insert(owners[0], Outputs::of(&programs[owners[0]].args));
                     clients.push((owners[0], (Request::Edit, target(owners[0]), edited.client)));
+                }
+                // An agent's transaction: every file of it is in the next build or none is.
+                for mut applied in std::mem::take(&mut builds.applied) {
+                    let source_of = |path: &Path| {
+                        let path = dunce::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+                        files.iter().find_map(|it| match it.file {
+                            Watched::Source(id)
+                                if it.path == path
+                                    || dunce::canonicalize(&it.path).is_ok_and(|it| it == path) =>
+                            {
+                                Some((id, it.path.clone()))
+                            }
+                            _ => None,
+                        })
+                    };
+                    let sources: Vec<_> =
+                        applied.files.iter().map(|(path, _)| source_of(path)).collect();
+                    if let Some((path, _)) = applied
+                        .files
+                        .iter()
+                        .find(|(path, _)| viewed.keys().any(|base| path.starts_with(base)))
+                    {
+                        let shown = path.display();
+                        let _ = writeln!(
+                            &applied.client.stream,
+                            "error: {shown} is read from elsewhere"
+                        );
+                        continue;
+                    }
+                    let mut owners: Vec<usize> = (0..programs.len())
+                        .filter(|&at| {
+                            programs[at].wrote.is_some() || builds.running.contains_key(&at)
+                        })
+                        .filter(|&at| {
+                            sources
+                                .iter()
+                                .flatten()
+                                .any(|(id, path)| programs[at].args.owns(&db, *id, path))
+                        })
+                        .collect();
+                    owners.sort_unstable();
+                    let busy = owners.iter().any(|at| {
+                        builds.running.contains_key(at)
+                            || outputs
+                                .get(at)
+                                .is_some_and(|it| *it != Outputs::of(&programs[*at].args))
+                    });
+                    if busy {
+                        interrupt |= owners
+                            .iter()
+                            .any(|at| builds.running.get(at).is_some_and(|it| it.own_base));
+                        builds.applied.push(applied);
+                        continue;
+                    }
+                    // A file that is no source yet is one once the disk has it and a module
+                    // names it.
+                    let new: Vec<PathBuf> = (applied.files.iter().zip(&sources))
+                        .filter(|(_, source)| source.is_none())
+                        .map(|((path, _), _)| path.clone())
+                        .collect();
+                    if let Some(path) = new.first().filter(|_| !applied.disk) {
+                        let shown = path.display();
+                        let _ = writeln!(
+                            &applied.client.stream,
+                            "error: {shown} is no source of the workspace yet, and a file is made \
+                             or deleted on disk"
+                        );
+                        continue;
+                    }
+                    let ops: Vec<blaze_vfs::Op> = (applied.files.iter().zip(&sources))
+                        .filter_map(|((path, text), source)| {
+                            let path = match source {
+                                Some((_, path)) => path,
+                                None if text.is_none() && held.read(path).is_none() => return None,
+                                None => path,
+                            };
+                            let path = path.to_string_lossy().into_owned();
+                            Some(match text {
+                                Some(text) => {
+                                    blaze_vfs::Op::Write { path, bytes: text.as_bytes().into() }
+                                }
+                                None => blaze_vfs::Op::Delete { path },
+                            })
+                        })
+                        .collect();
+                    if let Err(error) = held.commit(None, &ops) {
+                        let _ = writeln!(&applied.client.stream, "error: {error}");
+                        continue;
+                    }
+                    let now = Instant::now();
+                    for (_, path) in sources.iter().flatten() {
+                        edited_at.insert(path.clone(), now);
+                    }
+                    if applied.disk {
+                        let written =
+                            applied.files.iter().try_for_each(|(path, text)| match text {
+                                Some(text) => write_whole(path, text),
+                                None => std::fs::remove_file(path).or_else(|it| match it.kind() {
+                                    std::io::ErrorKind::NotFound => Ok(()),
+                                    _ => Err(it),
+                                }),
+                            });
+                        if let Err(error) = written {
+                            let _ = writeln!(
+                                &applied.client.stream,
+                                "error: writing the files: {error}"
+                            );
+                            continue;
+                        }
+                        notices.wrote(new);
+                    }
+                    let _ = writeln!(&applied.client.stream, "root {:x}", held.head());
+                    if !applied.build || owners.is_empty() {
+                        let _ = writeln!(&applied.client.stream, "ok applied");
+                        continue;
+                    }
+                    applied.client.env = ide_db::base_db::ProcessEnv::try_get(&db)
+                        .map(|it| it.vars(&db).clone())
+                        .unwrap_or_default();
+                    let target = |at: usize| (at != 0).then(|| Target::of(&programs[at].args));
+                    for &at in &owners[1..] {
+                        outputs.insert(at, Outputs::of(&programs[at].args));
+                        if let Ok(stream) = applied.client.stream.try_clone() {
+                            let client = Client::new(stream, applied.client.env.clone());
+                            clients.push((at, (Request::Sync, target(at), client)));
+                        }
+                    }
+                    outputs.insert(owners[0], Outputs::of(&programs[owners[0]].args));
+                    clients.push((owners[0], (Request::Sync, target(owners[0]), applied.client)));
                 }
                 if interrupt {
                     builds.settle(&mut db, &mut programs)?;
@@ -8999,7 +9367,9 @@ fn run_holding(
                 }
                 // What waited for the build that was interrupted is asked again at once.
                 builds.stuck = clients.is_empty() && !interrupt;
-                if clients.is_empty() {
+                // A change on disk is read and applied without a client, so that the build a
+                // client asks for next has it already.
+                if clients.is_empty() && !notices.pending() {
                     continue;
                 }
                 // A package that was the same in two checkouts may have been edited in one.
@@ -9021,7 +9391,17 @@ fn run_holding(
                     eprintln!("split again: {:.1?}", start.elapsed());
                 }
             }
-            false => std::thread::sleep(Duration::from_millis(5)),
+            // Without clients a change on disk is what starts a build.
+            false => {
+                notices.wait(if notices.watching() {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::from_millis(5)
+                });
+                if builds.running.is_empty() {
+                    start_idle_work(&db);
+                }
+            }
         }
         // The checkouts that are read from somewhere else than for the last build. Their files
         // have the times of another checkout, so they are compared by what is in them.
@@ -9063,77 +9443,171 @@ fn run_holding(
             lock(&as_built).remove(&wanted.out);
         }
         let mut noticed = None;
-        // Keep scanning until a pass finds nothing new, so one save of several files is one build.
-        // Files are read after that: a timestamp can be that of a write still under way, and
-        // the rest of that write may not change it again. Whoever asks for a build has finished
-        // writing, so one pass is enough then.
+        // Keep looking until a look finds nothing new, so one save of several files is one
+        // build. Whoever asks for a build has finished writing, so one look is enough then.
+        // The disk is one input of the sources: what it says is committed to them, and the
+        // source files to read again are what the sources hold otherwise than the last build.
         let mut touched = FxHashSet::default();
         // Source files that are no longer there.
         let mut gone = FxHashSet::default();
-        for (index, file) in files.iter().enumerate() {
-            if let Watched::Source(id) = file.file
-                && let Some((_, at)) = sent.get(&id)
-            {
-                touched.insert(index);
-                noticed.get_or_insert((*at, Duration::ZERO));
-            }
+        if files.len() != watched_len.0 || tree.directories(&db).count() != watched_len.1 {
+            watched_len = (files.len(), tree.directories(&db).count());
+            let texts: Vec<(PathBuf, triomphe::Arc<str>)> = files
+                .iter()
+                .filter_map(|it| match it.file {
+                    Watched::Source(id) => {
+                        Some((it.path.clone(), db.file_text(id).text(&db).clone()))
+                    }
+                    Watched::Included(_) => None,
+                })
+                .collect();
+            held.hold(texts.iter().map(|(path, text)| (&**path, &**text)));
+            let parents =
+                files.iter().filter_map(|it| db.on_disk(&it.path).parent().map(Path::to_owned));
+            let dirs: Vec<PathBuf> = tree.directories(&db).chain(parents).collect();
+            notices.watch(dirs);
         }
+        let mut changed = notices.take();
+        if !switched.is_empty() {
+            changed = sources::Changed::All;
+        }
+        let (looking, mut looked) = (Instant::now(), 0usize);
+        // Looks in a row that found nothing new while notices kept coming.
+        let mut unchanged = 0;
         loop {
-            if tree.relisted(&db) {
+            if tree.relisted(&db, &changed) {
                 builds.settle(&mut db, &mut programs)?;
             }
             // A new file has no timestamp yet, so the pass below takes it for a changed one.
-            for (file, path) in tree.added(&mut db).added {
+            let from = hir_ty_codegen::revision(&db);
+            let added = tree.added(&mut db, &changed).added;
+            if !added.is_empty() {
+                let to = hir_ty_codegen::revision(&db);
+                programs.iter_mut().for_each(|it| it.known.files_added(from, to));
+            }
+            for (file, path) in added {
                 files.push(WatchedFile {
                     file: Watched::Source(file),
                     path,
                     mtime: SystemTime::UNIX_EPOCH,
                 });
             }
-            let before = touched.len() + gone.len();
+            let before = (touched.len() + gone.len(), held.head());
+            let named = |on_disk: &Path| {
+                matches!(&changed, sources::Changed::Some { .. }) && changed.file(on_disk)
+            };
             for (index, file) in files.iter_mut().enumerate() {
                 let on_disk = db.on_disk(&file.path);
+                let fresh = file.mtime == SystemTime::UNIX_EPOCH;
+                if !fresh && !changed.file(&on_disk) {
+                    continue;
+                }
+                looked += 1;
                 let Ok(now) = std::fs::metadata(&on_disk).and_then(|m| m.modified()) else {
-                    if matches!(file.file, Watched::Source(_)) && gone.insert(index) {
-                        touched.remove(&index);
-                        noticed.get_or_insert((Instant::now(), Duration::ZERO));
+                    if matches!(file.file, Watched::Source(_)) {
+                        let kept = held.read_on_disk(&file.path, None);
+                        if !kept && gone.insert(index) {
+                            touched.remove(&index);
+                        }
                     }
                     continue;
                 };
                 gone.remove(&index);
-                if switched.iter().any(|base| file.path.starts_with(base)) {
-                    file.mtime = now;
-                    let same = match file.file {
-                        Watched::Source(id) => source_on_disk(&on_disk)
-                            .is_ok_and(|text| *text == **db.file_text(id).text(&db)),
-                        Watched::Included(ref path) => db.included_is_read(path),
-                    };
-                    if !same {
-                        touched.insert(index);
-                        noticed.get_or_insert((Instant::now(), Duration::ZERO));
-                    }
-                } else if now != file.mtime {
-                    let was = std::mem::replace(&mut file.mtime, now);
-                    // An editor that sent its text writes it after: the same text again.
-                    let built = match file.file {
-                        Watched::Source(id) if was != SystemTime::UNIX_EPOCH => {
-                            !sent.contains_key(&id)
-                                && source_on_disk(&on_disk)
-                                    .is_ok_and(|text| *text == **db.file_text(id).text(&db))
+                let switch = switched.iter().any(|base| file.path.starts_with(base));
+                if !switch && now == file.mtime && !named(&on_disk) {
+                    continue;
+                }
+                let age = if switch { Duration::ZERO } else { now.elapsed().unwrap_or_default() };
+                file.mtime = now;
+                match &file.file {
+                    // What the sources hold already (the text an editor sent before it wrote
+                    // it, the daemon's own write) is no change.
+                    Watched::Source(_) => {
+                        let head = held.head();
+                        let bytes = std::fs::read(&on_disk).ok();
+                        if !held.read_on_disk(&file.path, bytes) {
+                            touched.insert(index);
+                            noticed.get_or_insert((Instant::now(), age));
+                        } else if held.head() != head {
+                            noticed.get_or_insert((Instant::now(), age));
                         }
-                        _ => false,
-                    };
-                    if !built {
-                        touched.insert(index);
-                        noticed.get_or_insert((Instant::now(), now.elapsed().unwrap_or_default()));
+                    }
+                    Watched::Included(path) => {
+                        if !switch || !db.included_is_read(path) {
+                            touched.insert(index);
+                            noticed.get_or_insert((Instant::now(), age));
+                        }
                     }
                 }
             }
             switched.clear();
-            if touched.len() + gone.len() == before || !clients.is_empty() {
+            // A build the daemon asks for itself waits for the rest of a save of several
+            // files that takes names out of one and puts them in no other yet, as one change:
+            // a move of an item between them is seen whole. A write is several notices: a look
+            // at the rest of one file's finds nothing new, and the next file's notice can come
+            // meanwhile.
+            let waited_for = clients.iter().any(|(_, (_, _, it))| !it.nobody);
+            let quiet = waited_for || !notices.wait(SETTLE);
+            let same = (touched.len() + gone.len(), held.head()) == before;
+            unchanged = if same { unchanged + 1 } else { 0 };
+            let moving = || {
+                let by_path: FxHashMap<&Path, vfs::FileId> = (files.iter())
+                    .filter_map(|it| match it.file {
+                        Watched::Source(id) => Some((&*it.path, id)),
+                        Watched::Included(_) => None,
+                    })
+                    .collect();
+                let changes = held.changed();
+                let texts: Vec<(vfs::FileId, String)> = (changes.iter())
+                    .filter_map(|(path, bytes)| {
+                        let text = String::from_utf8_lossy(bytes.as_deref().unwrap_or_default());
+                        Some((*by_path.get(&**path)?, text.into_owned()))
+                    })
+                    .collect();
+                let written: Vec<_> = texts.iter().map(|(id, text)| (*id, text.as_str())).collect();
+                blaze_items::moved_out(&db, &written)
+            };
+            // A client comes once its files are written; the daemon's own build waits a while
+            // for the other half of a move, even past a quiet look.
+            if waited_for || unchanged > 2 || (quiet || same) && !moving() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            if quiet {
+                notices.wait(SETTLE);
+            }
+            changed = notices.take();
+        }
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            let all = if notices.watching() { "notices" } else { "every file" };
+            eprintln!(
+                "looked: {looked} of {} files ({all}) in {}us",
+                files.len(),
+                looking.elapsed().as_micros()
+            );
+        }
+        // The source files whose text the sources hold otherwise than the last build.
+        let changes = held.changed();
+        if !changes.is_empty() {
+            let at: FxHashMap<&Path, usize> = files
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| matches!(it.file, Watched::Source(_)))
+                .map(|(index, it)| (&*it.path, index))
+                .collect();
+            for (path, bytes) in &changes {
+                let Some(&index) = at.get(&**path) else { continue };
+                if let Some(at) = edited_at.remove(path) {
+                    noticed.get_or_insert((at, Duration::ZERO));
+                }
+                noticed.get_or_insert((Instant::now(), Duration::ZERO));
+                if bytes.is_some() {
+                    touched.insert(index);
+                    gone.remove(&index);
+                } else {
+                    gone.insert(index);
+                    touched.remove(&index);
+                }
+            }
         }
         // Without clients, the first program is built whenever a file changes.
         let building: FxHashSet<usize> = match serving {
@@ -9180,13 +9654,24 @@ fn run_holding(
             Watched::Included(_) => None,
         });
         let editing: Vec<_> = editing.collect();
+        let emptied: Vec<_> = (gone.iter())
+            .filter_map(|&index| match files[index].file {
+                Watched::Source(id) => Some(id),
+                Watched::Included(_) => None,
+            })
+            .collect();
         let mut texts = Vec::new();
         for index in touched {
             let WatchedFile { file, path, .. } = &files[index];
             match file {
                 Watched::Source(id) => {
-                    let text = match sent.remove(id) {
-                        Some((text, _)) => text,
+                    let text = match held.read(path) {
+                        Some(bytes) => {
+                            let text = String::from_utf8(bytes.to_vec())
+                                .with_context(|| format!("{} is not UTF-8", path.display()))?;
+                            let rust = path.extension().is_some_and(|it| it == "rs");
+                            if rust { load_cargo::source_text(text) } else { text }
+                        }
                         None => source_on_disk(&db.on_disk(path))?,
                     };
                     let text = test_harness::kept(&db.file_text(*id).text(&db), text);
@@ -9202,8 +9687,37 @@ fn run_holding(
         homed.extend(&editing);
         homed.sort_unstable();
         homed.dedup();
+        let homes = read.elapsed();
         home_in_rustcs(&db, &listed, &mut programs, &homed);
+        let homed_in = read.elapsed();
         outlines.before_edit(&db, &listed, &editing);
+        let outlined = read.elapsed();
+        let mut checked = Duration::ZERO;
+        // What moves would be found by is kept from before an edit only when its texts can move
+        // an item between its files, and its push is not refused already: a file gone is
+        // written empty.
+        let written: Vec<_> = (texts.iter().map(|(file, text)| (*file, text.as_str())))
+            .chain(emptied.iter().map(|&file| (file, "")))
+            .collect();
+        let moves = editing.len() >= 2
+            && programs.iter().any(|it| it.known.keeps_moves_of(&editing))
+            && blaze_items::moves_written(&db, &written);
+        for program in &mut programs {
+            let at = Instant::now();
+            program.checked.before_edit(&db, &listed, &editing, &program.unbuilt.edited);
+            checked += at.elapsed();
+            program.known.before_edit(&db, &editing, &|count, each| fan(&db, count, each), moves);
+        }
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            eprintln!(
+                "read-us: texts={} homes={} outlines={} checked={} known={}",
+                homes.as_micros(),
+                (homed_in - homes).as_micros(),
+                (outlined - homed_in).as_micros(),
+                checked.as_micros(),
+                (read.elapsed() - outlined - checked).as_micros()
+            );
+        }
         for &index in &gone {
             if let Watched::Source(id) = files[index].file {
                 change.change_file(id, None);
@@ -9222,6 +9736,7 @@ fn run_holding(
         if changed != 0 || !background {
             db.apply_change(change);
         }
+        held.built_head();
         // The tests of a crate an edited file is of are listed again after the edit, and those
         // of a program asked for the first time; a root file the edit did not touch is noted
         // as it was before its harness is written.
@@ -9241,6 +9756,15 @@ fn run_holding(
             untouched = roots.iter().copied().filter(|it| !editing.contains(it)).collect();
             home_in_rustcs(&db, &listed, &mut programs, &untouched);
             outlines.before_edit(&db, &listed, &untouched);
+            for program in &mut programs {
+                program.checked.before_edit(&db, &listed, &untouched, &program.unbuilt.edited);
+                program.known.before_edit(
+                    &db,
+                    &untouched,
+                    &|count, each| fan(&db, count, each),
+                    true,
+                );
+            }
             for file in write_harnesses(&mut db, texts) {
                 if !sources.contains(&file) {
                     sources.push(file);
@@ -9289,7 +9813,13 @@ fn run_holding(
         let before_outlines = start.elapsed();
         let sources = outlines.after_edit(&db, &listed, sources);
         let outlined = start.elapsed();
-        for outline::Changed { file, bodies_only, copied, generics, inline, added } in sources {
+        // The files that changed in more than what the outline tells, and their crates: what
+        // changed is told by their items, together, as an item moved from one to another is.
+        let mut by_items: Vec<vfs::FileId> = Vec::new();
+        let mut items_crates: Vec<ide_db::base_db::Crate> = Vec::new();
+        for outline::Changed { file, bodies_only, copied, generics, inline, added, signatures } in
+            sources
+        {
             if copied || !generics.is_empty() || !inline.is_empty() {
                 let why = "an edit of a generic, inline or default trait function, which rustc copies into its callers";
                 let inline_unlinked = |program: &Program| {
@@ -9320,8 +9850,38 @@ fn run_holding(
             }
             let crates = ide_db::base_db::relevant_crates(&db, file);
             let crates = (!crates.is_empty()).then_some(crates);
-            programs.iter_mut().for_each(|it| it.known.touch(&db, crates));
-            listed.touch(&db, crates);
+            if let Some(crates) = crates.filter(|_| !signatures.is_empty()) {
+                if std::env::var_os("RA_JIT_STATS").is_some() {
+                    eprintln!("signatures only: {file:?} {}", signatures.join(" "));
+                }
+                let names: Vec<&str> = signatures.iter().map(String::as_str).collect();
+                for program in &mut programs {
+                    program.known.touch_signatures(&db, crates, file, &names);
+                }
+                // Which functions and statics each crate has, and their attributes, are as
+                // they were.
+                continue;
+            }
+            match crates {
+                Some(crates) => {
+                    by_items.push(file);
+                    for &krate in crates {
+                        if !items_crates.contains(&krate) {
+                            items_crates.push(krate);
+                        }
+                    }
+                }
+                None => {
+                    programs.iter_mut().for_each(|it| it.known.touch(&db, None));
+                    listed.touch(&db, None);
+                }
+            }
+        }
+        if !by_items.is_empty() {
+            let crates = &items_crates;
+            let fan: &hir_ty_codegen::Fan<'_> = &|count, each| fan(&db, count, each);
+            programs.iter_mut().for_each(|it| it.known.touch_items(&db, crates, &by_items, fan));
+            listed.touch(&db, Some(crates));
         }
         if !moved.is_empty() {
             programs.iter_mut().for_each(|it| {
@@ -9370,6 +9930,7 @@ fn run_holding(
                     moved: program.moved,
                     tests: None,
                     tests_now: None,
+                    checked: outline::Checked::default(),
                 };
                 let mut program = Box::new(std::mem::replace(program, away));
                 builds.running.insert(at, Running { clients, kept, own_base });
@@ -9916,7 +10477,18 @@ impl Program {
         let named_anew = std::mem::take(&mut self.unbuilt.named_anew);
         let unnamed = if named_anew { None } else { self.widen(db) };
         self.read_copies_again(db)?;
-        let Program { args, table, known, unbuilt, wrote, whole, tests, tests_now, .. } = self;
+        let Program {
+            args,
+            table,
+            known,
+            unbuilt,
+            wrote,
+            whole,
+            tests,
+            tests_now,
+            checked: last_checked,
+            ..
+        } = self;
         if let Some((cmd, exe)) = own_link_line(db, args)? {
             (args.link_cmd, args.splice) = (Some(cmd), Some(exe));
         }
@@ -9951,17 +10523,30 @@ impl Program {
         // build that can't be a patch waits for it, and a text that does not compile is not
         // built whole: what it would make of the program is not what runs, and the next edit
         // that compiles is to be a patch of what does.
+        // Of a file the last check found no error in, it looks at what changed since.
+        let scoped: FxHashMap<vfs::FileId, Vec<syntax::TextRange>> = edited
+            .iter()
+            .filter_map(|&file| Some((file, last_checked.to_check(db, listed, file)?)))
+            .collect();
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            let functions: usize = scoped.values().map(Vec::len).sum();
+            eprintln!(
+                "check-scope: {} files whole, {functions} functions of {} others",
+                edited.len() - scoped.len(),
+                scoped.len()
+            );
+        }
         let (warm, broken) = std::thread::scope(|scope| {
             let within = listed.programs(db);
             if let Some(crates) = &within {
                 verify_impls(scope, db, crates);
             }
             let check = {
-                let (db, edited, root) = (db.clone(), &edited, &args.checkout);
+                let (db, edited, root, scoped) = (db.clone(), &edited, &args.checkout, &scoped);
                 let lints = !args.lints_capped;
                 scope.spawn(move || {
                     let start = Instant::now();
-                    let broken = broken_in(&db, edited, paths, root, within, lints);
+                    let broken = broken_in(&db, edited, scoped, paths, root, within, lints);
                     if std::env::var_os("RA_JIT_STATS").is_some() {
                         eprintln!("check-us: {}", start.elapsed().as_micros());
                     }
@@ -9979,6 +10564,9 @@ impl Program {
             (warm, broken())
         });
         let hold = || unparsed(db, &edited, paths, &args.checkout).is_some() || broken.is_some();
+        if !hold() {
+            last_checked.passed(db, listed, &edited);
+        }
         let held = |known: &Rejections| {
             let why = refusal(db, &edited, paths, &args.checkout, broken.clone(), None);
             let why = why.unwrap_or_else(|| {
@@ -10235,6 +10823,65 @@ fn worker_spans(
 #[allow(dead_code)]
 fn abs(path: &Path) -> anyhow::Result<VfsPath> {
     Ok(VfsPath::from(AbsPathBuf::assert_utf8(dunce::canonicalize(path)?)))
+}
+
+/// How long one thread spent looking for what an edit left stale, and of that on a CPU.
+struct Spent {
+    /// Making the crates' tables of impls first, which all the threads share.
+    impls: Duration,
+    wall: Duration,
+    cpu: Duration,
+}
+
+/// The CPU time the calling thread has had.
+fn thread_cpu() -> Duration {
+    #[cfg(unix)]
+    {
+        let mut it = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: the call writes the timespec it is handed, and nothing else.
+        let read = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut it) };
+        if read == 0 {
+            return Duration::new(it.tv_sec as u64, it.tv_nsec as u32);
+        }
+    }
+    Duration::ZERO
+}
+
+/// How evenly the threads that looked for what is stale shared the work, how much of their
+/// time they ran rather than waited, and how long each question took.
+fn report_spread(spent: &[Spent], looked: &hir_ty_codegen::StaleSteps) {
+    let Some(longest) = spent.iter().map(|it| it.wall).max() else { return };
+    let wall: Duration = spent.iter().map(|it| it.wall).sum();
+    let cpu: Duration = spent.iter().map(|it| it.cpu).sum();
+    let impls = spent.iter().map(|it| it.impls).max().unwrap_or_default();
+    let share = |part: Duration, of: Duration| {
+        100.0 * part.as_secs_f64() / of.as_secs_f64().max(f64::MIN_POSITIVE)
+    };
+    let threads = u32::try_from(spent.len()).unwrap_or(u32::MAX);
+    eprintln!(
+        "spread: {threads} threads, longest {longest:.1?} (impls {impls:.1?}), busy {:.0}% of \
+         threads by longest, on a CPU {:.0}% of their time",
+        share(wall, longest * threads),
+        share(cpu, wall),
+    );
+    let asked: u64 = looked.sizes.iter().map(|&it| u64::from(it)).sum();
+    if asked == 0 {
+        return;
+    }
+    let (mut seen, mut quantiles, mut buckets) = (0, [(50, None), (90, None), (99, None)], vec![]);
+    for (n, &count) in looked.sizes.iter().enumerate().filter(|it| *it.1 != 0) {
+        seen += u64::from(count);
+        let under = Duration::from_nanos(1 << n);
+        buckets.push(format!("<{under:.0?} {count}"));
+        for (quantile, at) in &mut quantiles {
+            if at.is_none() && seen * 100 >= asked * *quantile {
+                *at = Some(under);
+            }
+        }
+    }
+    let quantiles: Vec<String> =
+        quantiles.iter().filter_map(|(it, at)| Some(format!("p{it} <{:.0?}", (*at)?))).collect();
+    eprintln!("asks by time: {}; {}", quantiles.join(", "), buckets.join(", "));
 }
 
 fn report_stats(stats: &hir_ty_codegen::BuildStats) {

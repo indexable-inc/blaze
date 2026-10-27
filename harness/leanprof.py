@@ -12,23 +12,25 @@ phases: `cold` (`cargo ra-jit build` from nothing until the daemon is ready), `b
 build of its own base it makes once idle), each edit of `--edits` (default `body,signature`,
 from bench.py's `PROJECTS`) made and taken back `--rounds` times (default 3), and `warm` (the
 daemon stopped and started again on the same store and target directory, until ready) and
-`warm base` (left out with `--no-warm`). The first daemon's home, logs and all, is kept in
+`warm base` (left out with `--no-warm`). With `--api` each edit is made again as an agent makes it,
+`<kind> api`: one `Apply` call of the agent API that builds, on a connection kept open, timed
+from the call to its answer. The first daemon's home, logs and all, is kept in
 WORK/logs-cold. `--env` is given to the daemon; `RA_JIT_MEMORY=DIR` is given as DIR/cold for the
 first daemon and DIR/warm for the second, so the reports of the two do not overwrite each
 other. Writes the phases as JSON to WORK/phases.json and on stdout's last line. Projects are
 bench.py's, fetched as it fetches them. It measures and checks nothing.
 """
-import json, os, shutil, subprocess, sys, time
+import json, os, shutil, socket, subprocess, sys, time
 
-import bench, cargo_ra_jit, memory
+import bench, cargo_ra_jit, cbor, memory
 from cargo_ra_jit import Side, fetch, wait_warm
 from memsplit import wait_own_base
 
 
 def main():
     argv = sys.argv[1:]
-    cold_only = "--no-warm" in argv
-    argv = [it for it in argv if it != "--no-warm"]
+    cold_only, api = "--no-warm" in argv, "--api" in argv
+    argv = [it for it in argv if it not in ("--no-warm", "--api")]
     work = os.path.realpath(bench.options(argv, "--work", "/tmp/leanprof")[0])
     kinds = bench.options(argv, "--edits", "body,signature")[0].split(",")
     rounds = int(bench.options(argv, "--rounds", "3")[0])
@@ -85,6 +87,20 @@ def main():
                         took, ran = ours.cargo("build", *build)
                         walls.append((round(took, 3), bench.how_built(ran.stderr)[:40]))
             phase(kind, began, walls=walls, peak_mb=sampler.peak_mb, resident_mb=daemon.resident_mb())
+        for kind in kinds if api else []:
+            began = time.monotonic()
+            walls = []
+            with socket.socket(socket.AF_UNIX) as conn:
+                conn.connect(os.path.join(home, "daemon.sock"))
+                for at in range(rounds * 2):
+                    texts, _ = bench.edit_texts(ws, spec["edits"][kind], at % 2 == 1)
+                    files = [{"path": path, "bytes": text.encode()} for path, text in texts.items()]
+                    asked = time.monotonic()
+                    cbor.call(conn, at, {"Apply": {"files": files, "build": True, "disk": True}})
+                    answer = cbor.read_frame(conn)["body"]
+                    built = (answer.get("Applied") or {}).get("built") or str(answer)
+                    walls.append((round(time.monotonic() - asked, 3), " ".join(built.split(" ")[:2]).split("=")[0][:40]))
+            phase(f"{kind} api", began, walls=walls)
         ours.cargo("stop")
         # The second daemon writes its logs where the first did.
         shutil.copytree(home, os.path.join(work, "logs-cold"), ignore=lambda at, names: [n for n in names if n in ("cargo", "rustup", "target") or n.endswith(".sock")])

@@ -8,6 +8,7 @@ use crate::function::{Configuration, IngredientImpl, Reentrancy, SyncTable};
 use crate::table::memo::MemoSlot;
 use std::sync::atomic::Ordering;
 
+use crate::durability::Durability;
 use crate::key::DatabaseKeyIndex;
 use crate::zalsa::{MemoIngredientIndex, Zalsa, ZalsaDatabase};
 use crate::zalsa_local::{QueryEdgeKind, QueryEdges, QueryOriginRef, QueryRevisions, ZalsaLocal};
@@ -21,20 +22,22 @@ pub enum VerifyResult {
 
     /// Memo remains valid.
     ///
-    /// The inner value tracks whether the memo or any of its dependencies have an
-    /// accumulated value.
+    /// `durability` is that of what was verified as it is now, which a memo verified unchanged
+    /// lowers its own to. The inner value tracks whether the memo or any of its dependencies
+    /// have an accumulated value.
     Unchanged {
+        durability: Durability,
         #[cfg(feature = "accumulator")]
         accumulated: InputAccumulatedValues,
     },
 }
 
 impl VerifyResult {
-    pub(crate) const fn changed_if(changed: bool) -> Self {
+    pub(crate) const fn changed_if(changed: bool, durability: Durability) -> Self {
         if changed {
             Self::changed()
         } else {
-            Self::unchanged()
+            Self::unchanged(durability)
         }
     }
 
@@ -42,8 +45,9 @@ impl VerifyResult {
         Self::Changed
     }
 
-    pub(crate) const fn unchanged() -> Self {
+    pub(crate) const fn unchanged(durability: Durability) -> Self {
         Self::Unchanged {
+            durability,
             #[cfg(feature = "accumulator")]
             accumulated: InputAccumulatedValues::Empty,
         }
@@ -51,14 +55,17 @@ impl VerifyResult {
 
     #[inline]
     #[cfg(feature = "accumulator")]
-    pub(crate) fn unchanged_with_accumulated(accumulated: InputAccumulatedValues) -> Self {
-        Self::Unchanged { accumulated }
+    pub(crate) fn unchanged_with_accumulated(
+        durability: Durability,
+        accumulated: InputAccumulatedValues,
+    ) -> Self {
+        Self::Unchanged { durability, accumulated }
     }
 
     #[inline]
     #[cfg(not(feature = "accumulator"))]
-    pub(crate) fn unchanged_with_accumulated() -> Self {
-        Self::unchanged()
+    pub(crate) fn unchanged_with_accumulated(durability: Durability) -> Self {
+        Self::unchanged(durability)
     }
 
     /// Returns an unchanged result that propagates accumulated values from both
@@ -69,6 +76,7 @@ impl VerifyResult {
         let _ = revisions;
 
         Self::unchanged_with_accumulated(
+            revisions.durability.load(),
             #[cfg(feature = "accumulator")]
             match revisions.accumulated() {
                 Some(_) => InputAccumulatedValues::Any,
@@ -374,7 +382,7 @@ impl MemoHeader {
         database_key_index: DatabaseKeyIndex,
         verified_at: Revision,
     ) -> ShallowUpdate {
-        let last_changed = zalsa.last_changed_revision(self.revisions.durability);
+        let last_changed = zalsa.last_changed_revision(self.revisions.durability.load());
         crate::tracing::trace!(
             "{database_key_index:?}: check_durability({database_key_index:#?}, last_changed={:?} <= verified_at={:?}) = {:?}",
             last_changed,
@@ -517,7 +525,10 @@ impl MemoHeader {
                     database_key_index,
                 );
 
-                if result.is_unchanged() {
+                if let VerifyResult::Unchanged { durability, .. } = result {
+                    // Before `verified_at`: a reader that sees the memo verified now reads the
+                    // durability its inputs have now, which an edit may have lowered.
+                    self.revisions.durability.lower_to(durability);
                     self.mark_as_verified(zalsa, database_key_index);
                 }
 
@@ -587,6 +598,7 @@ fn deep_verify_edges(
 ) -> VerifyResult {
     #[cfg(feature = "accumulator")]
     let mut inputs = InputAccumulatedValues::Empty;
+    let mut durability = Durability::MAX;
 
     // Fully tracked inputs? Iterate over the inputs and check them, one by one.
     //
@@ -605,11 +617,17 @@ fn deep_verify_edges(
                         return VerifyResult::changed();
                     }
                     #[cfg(feature = "accumulator")]
-                    VerifyResult::Unchanged { accumulated } => {
+                    VerifyResult::Unchanged {
+                        durability: of_input,
+                        accumulated,
+                    } => {
+                        durability = durability.min(of_input);
                         inputs |= accumulated;
                     }
                     #[cfg(not(feature = "accumulator"))]
-                    VerifyResult::Unchanged { .. } => {}
+                    VerifyResult::Unchanged {
+                        durability: of_input,
+                    } => durability = durability.min(of_input),
                 }
             }
             QueryEdgeKind::Output => {
@@ -635,6 +653,7 @@ fn deep_verify_edges(
         }
     }
     let result = VerifyResult::unchanged_with_accumulated(
+        durability,
         #[cfg(feature = "accumulator")]
         inputs,
     );

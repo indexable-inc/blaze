@@ -5,7 +5,8 @@ usage: editbench.py [name ...] [--edits N]
 
 Benchmarks are listed in benches.json. For each one the daemon is started in watch mode, a
 literal in a function body is flipped back and forth N times, and the daemon's own timings are
-collected. Then the same edits are timed against cargo. Results go to bench.json and BENCH.md.
+collected, and `save_ms`, from the file written to the daemon saying it linked, which has the
+daemon's notice of the write in it. Then the same edits are timed against cargo. Results go to bench.json and BENCH.md.
 
 RA_JIT_SPLICE: edits are added to the linked binary where that can be done, and the results go
 to bench-splice.json and BENCH-splice.md instead.
@@ -98,10 +99,13 @@ def ra_jit_loop(fx, crate, edit, n):
         cold = {"load_ms": millis(re.search(r"load workspace: (\S+)", text)[1]),
                 "codegen_ms": millis(re.search(r"cold: compiled .* in (\S+) \(", text)[1])}
         coverage = re.search(r"cold: compiled (\d+) of (\d+)", text)
+        saves = []
         for i in range(n):
             time.sleep(0.05)
+            saved = time.monotonic()
             edit.flip()
             wait_for(r"edit-to-binary: \S+", i)
+            saves.append((time.monotonic() - saved) * 1000)
         text = read_log()
         rss = resident_mb(daemon.pid)
     finally:
@@ -115,7 +119,7 @@ def ra_jit_loop(fx, crate, edit, n):
     }
     return {"cold": cold, "rss_mb": rss, "compiled": int(coverage[1]), "functions": int(coverage[2]),
             **{f"{k}_ms": statistics.median(v) for k, v in series.items()},
-            "first_edit_ms": series["total"][0], "spliced": len(re.findall(r"^link: .*\(spliced", text, re.M)),
+            "save_ms": statistics.median(saves), "first_edit_ms": series["total"][0], "spliced": len(re.findall(r"^link: .*\(spliced", text, re.M)),
             "edits": n}
 
 

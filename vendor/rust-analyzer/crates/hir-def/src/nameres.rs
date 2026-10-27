@@ -459,6 +459,13 @@ pub fn crate_def_map(db: &dyn SourceDatabase, crate_id: Crate) -> &DefMap {
     crate_local_def_map(db, crate_id).def_map(db)
 }
 
+/// The crate's `#![recursion_limit]`, apart from the rest of its `DefMap`: what reads only this
+/// is not run again for an edit that adds, renames or takes away an item.
+#[salsa::tracked(returns(copy))]
+pub fn crate_recursion_limit(db: &dyn SourceDatabase, crate_id: Crate) -> u32 {
+    crate_def_map(db, crate_id).recursion_limit()
+}
+
 #[salsa::tracked]
 pub(crate) struct DefMapPair<'db> {
     #[tracked]
@@ -768,6 +775,12 @@ impl DefMap {
     pub fn recursion_limit(&self) -> u32 {
         // 128 is the default in rustc
         self.data.recursion_limit.unwrap_or(128)
+    }
+
+    /// What the crate's own attributes and the derives it exports say, written out: equal for
+    /// two revisions when none of that changed between them.
+    pub fn crate_data_print(&self) -> String {
+        format!("{:?}", self.data)
     }
 
     // FIXME: this can use some more human-readable format (ideally, an IR

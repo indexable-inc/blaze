@@ -9,6 +9,7 @@ use crate::table::memo::MemoSlot;
 use crate::tracked_struct::TrackedStructInDb;
 use crate::zalsa::{Zalsa, ZalsaDatabase};
 use crate::zalsa_local::{OriginAndExtra, QueryOriginRef, QueryRevisions};
+use crate::durability::AtomicDurability;
 use crate::{DatabaseKeyIndex, Id};
 
 impl<C> IngredientImpl<C>
@@ -111,7 +112,7 @@ where
         let mut completed_query = CompletedQuery {
             revisions: QueryRevisions {
                 changed_at: current_deps.changed_at,
-                durability: current_deps.durability,
+                durability: AtomicDurability::new(current_deps.durability),
                 origin_and_extra: OriginAndExtra::assigned(active_query_key),
                 #[cfg(feature = "accumulator")]
                 accumulated_inputs: Default::default(),
@@ -135,6 +136,7 @@ where
                 database_key_index,
                 &mut completed_query.revisions,
                 &value,
+                revision,
             );
             old_memo
                 .header
