@@ -107,3 +107,25 @@ re-spawned ctdeps agent (background, 03:55) to fix driver/harness and land; VM n
 - 04:31 #516 unitgraph MERGED; nc-toolq and nc-unitgraph2 removed. Waiting on ctdeps agent
   (background; if dead, re-spawn from /Volumes/Projects/blaze-nocargo-ctdeps-1027/HANDOFF.md).
   After it lands: re-trace main in VM nocargo, update docs/no-rustc.md self-contained text, result.md.
+
+
+## Operator note 2026-10-27 11:33Z (Andrew: build scripts and proc macros are cached, and hermetic)
+DECISION: compiling a build script, running it, and building a proc macro are each ordinary store entries,
+keyed by what they are built from (sources, deps, cfgs, env the script declares or is recorded reading, target,
+toolchain), and they travel through the remote (rcache) like any compiled function. Goal from lane warmstate: on a
+fresh machine whose store was pulled, this step is ~0 s. Today it is 4.9 s of a 7 s no-edit ripgrep build (70%).
+- Build-script runs are hermetic by default, the same deny-by-default sandbox as tests (lane testcache, one
+  sandbox implementation, not two): no network (netns with loopback only), executables only from recorded inputs
+  (the toolchain, the C compiler, pkg-config as the operator allows), writes only to OUT_DIR, reads recorded.
+  The recorded reads and env lookups go into the key, so `rerun-if-*` is a hint, not the truth.
+- A denial fails the build with a clear error naming the script and what it tried. No silent fallback to an
+  unsandboxed run or to cargo. Opt-out is explicit per package (manifest/config), and opted-out runs are not
+  cached remotely.
+- Measure first: over the bench corpus, list which build scripts the sandbox would deny (network fetches,
+  stray executables, reads outside the package) and put the list in the PR.
+- Proc-macro dylibs are content-addressed by their inputs; a hit loads the stored dylib with no compile.
+- Report the warmstate fresh-none number before and after.
+- ~05:30 ctdeps agent (background) on run 5: rebased on #516, harness h8 running in nc-ctdeps
+  (nushell/biome blaze-failed, helix anyhow cfgs differ; fd/cargo/ripgrep/bat equal by hand).
+  Final re-trace plan (VM nocargo): replace /root/nc/src with main's tree, bash build.sh,
+  server.sh, ROUND=final measure.sh (traces fixture/ripgrep build/test, --whole too).
