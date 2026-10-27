@@ -94,3 +94,7 @@ I. misc — associated-types/unconstrained-lifetime-in-projection (E0716),
 - Apps on main 40e72e14: still 20/23 clean, same false errors (nushell E0716, ruff E0716+lifetimes, r-a E0515): owned by subagents t and l.
 - 02:53 G done: PR #490 queued (main 5441c2c8: Pol 1550->1558, NLL 1547->1555). Left: general member-constraint pick recheck.
 - 03:02 H+I done: PRs #481 #486 #487 #500 #501 queued (all 6 units). Read rustc from May nightly src, not the pin.
+- 03:13 D done: #480 #484 #499 #509 queued (stacked on #475; tango on #475 = bench noise). 4/6 units.
+  Left: higher-ranked-auto-trait-11#no_assumptions, implementation-not-general-enough-ice-133252 need coroutine
+  witness types (r-a coroutine_hidden_types stub, hir-ty next_solver/interner.rs:2150) = async-block Send checking.
+  Also: old prove() path maps 'x: placeholder to always-true where rustc wants 'x: 'static (latent missed error).
