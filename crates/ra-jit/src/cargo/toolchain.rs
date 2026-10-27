@@ -147,7 +147,7 @@ pub(crate) fn settle() -> Result<Chosen, String> {
              there is no home directory: `BLAZE_HOME` names where to keep it"
         ));
     };
-    if !own::complete(&dir) {
+    if !release.whole_at(&dir) {
         own::fetch(&release, &dir)?;
     }
     use_own(&dir);

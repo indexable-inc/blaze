@@ -26,6 +26,9 @@ HOSTS = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-li
          "x86_64-pc-windows-msvc"]
 # rustup's `minimal` profile without rust-docs, and the standard library's source.
 COMPONENTS = ["rustc", "cargo", "rust-std", "rust-src"]
+# The standard libraries of other targets, by package, that every host's copy has: a proc
+# macro's module is built for wasm32-wasip1 and linked with its WASI libc (own_macro.rs).
+TARGETS = [("rust-std", "wasm32-wasip1")]
 
 
 def get(url):
@@ -62,8 +65,8 @@ def pins():
         f"manifest {digest} {len(manifest)}",
     ]
     for host in HOSTS:
-        for package in COMPONENTS:
-            target = "*" if package == "rust-src" else host
+        wanted = [(package, "*" if package == "rust-src" else host) for package in COMPONENTS]
+        for package, target in wanted + TARGETS:
             built = channel["pkg"][package]["target"][target]
             if not built.get("available"):
                 sys.exit(f"{package} is not built for {target} in Rust {RELEASE}")

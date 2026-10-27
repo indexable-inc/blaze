@@ -135,6 +135,18 @@ impl Release {
     pub(crate) fn dir(&self) -> Option<PathBuf> {
         Some(home()?.join("toolchains").join(format!("{}-{}", self.version, self.host)))
     }
+
+    /// Whether `dir` has this release whole: a toolchain ([`complete`]) whose records list
+    /// every component pinned for it. What a blaze that pinned fewer downloaded there, before
+    /// the standard library of wasm32-wasip1 that proc macros are linked with, is downloaded
+    /// again.
+    pub(crate) fn whole_at(&self, dir: &Path) -> bool {
+        let Ok(listed) = std::fs::read_to_string(dir.join("lib/rustlib/components")) else {
+            return false;
+        };
+        let has = |name: &str| listed.lines().any(|it| it.trim() == name);
+        complete(dir) && self.components.iter().all(|it| has(&it.name()))
+    }
 }
 
 /// What the rustc of the toolchain blaze builds with says it is after `rustc `, on every host:
@@ -216,7 +228,7 @@ fn fetch_from(
     std::fs::create_dir_all(parent).map_err(|e| failed(&e))?;
     let lock = File::create(parent.join(format!(".{name}.lock"))).map_err(|e| failed(&e))?;
     lock.lock().map_err(|e| failed(&e))?;
-    if complete(dir) {
+    if release.whole_at(dir) {
         return Ok(());
     }
     eprintln!(
@@ -729,14 +741,43 @@ mod tests {
         assert_eq!(ours.version, super::super::OURS.trim(), "harness/toolchain_pins.py --write");
         assert_eq!(ours.channel, "nightly");
         assert!(ours.rustc.contains("-nightly ("), "{}", ours.rustc);
-        let packages: Vec<_> = ours.components.iter().map(|it| it.package).collect();
-        assert_eq!(packages, ["rustc", "cargo", "rust-std", "rust-src"]);
+        let names: Vec<_> = ours.components.iter().map(Component::name).collect();
+        assert_eq!(
+            names,
+            [
+                "rustc-x86_64-unknown-linux-gnu",
+                "cargo-x86_64-unknown-linux-gnu",
+                "rust-std-x86_64-unknown-linux-gnu",
+                "rust-src",
+                "rust-std-wasm32-wasip1",
+            ]
+        );
         assert_eq!(ours.components[3].file(ours.channel), "rust-src-nightly.tar.xz");
+        assert_eq!(ours.components[4].file(ours.channel), "rust-std-nightly-wasm32-wasip1.tar.xz");
         assert!(Release::read(PINS, "riscv64gc-unknown-linux-gnu").is_none());
         for host in ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
         {
-            assert_eq!(Release::read(PINS, host).unwrap().components.len(), 4, "{host}");
+            let release = Release::read(PINS, host).unwrap();
+            let wasi = release.components.iter().any(|it| it.name() == "rust-std-wasm32-wasip1");
+            assert!(wasi, "{host} has the standard library proc macros are linked with");
+            assert_eq!(release.components.len(), 5, "{host}");
         }
+    }
+
+    #[test]
+    fn a_toolchain_without_a_component_of_the_pins_is_downloaded_again() {
+        let work = tempfile::tempdir().unwrap();
+        let dist = work.path().join("dist");
+        let release = release(&dist, &rustc());
+        let dir = work.path().join("toolchains/9.9.9-test-host");
+        fetched(&dist, &release, &dir).unwrap();
+        assert!(release.whole_at(&dir));
+        // As a blaze that pinned no rust-src would have left it.
+        let components = dir.join("lib/rustlib/components");
+        std::fs::write(&components, "rustc-test-host\n").unwrap();
+        assert!(complete(&dir) && !release.whole_at(&dir));
+        fetched(&dist, &release, &dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&components).unwrap(), "rustc-test-host\nrust-src\n");
     }
 
     #[test]
