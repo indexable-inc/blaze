@@ -94,3 +94,9 @@ main 56cb5bd311; VM nc-unitgraph2 unit ug-r7 (/root/ug/r7.log): nix/unit_graph.p
 blaze-units/metadata, resolve.py units. Then: copy nix/units back (/root/ug/r7-units.tar), commit, push.
 ctdeps: harness 1/14 equal (10 bench blaze-failed, error text truncated to "ce:"+backtrace);
 re-spawned ctdeps agent (background, 03:55) to fix driver/harness and land; VM nc-ctdeps.
+- 04:02 #485 toolq MERGED. #516 became unmergeable after it: rebased nocargo-unitgraph on main
+  babd08e169 (resolve.py/resolve.md: kept both toolchain and units parts; no-rustc.md: combined
+  text, table has @FB@/@FT@/@RB@/@RT@ placeholders for the combined counts, fill from the trace).
+  VM nc-unitgraph2 unit ug-r8 (/root/ug/r8.log): nix/unit_graph.py (-> /root/ug/r8-units.tar),
+  build, rustcsites, trace (/root/ug/out/after8), resolve.py units toolchain. Then commit units,
+  fill placeholders, force-push (lease on 64d9cb4893's predecessor at origin), land.py again.
