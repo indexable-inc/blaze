@@ -98,3 +98,5 @@ I. misc — associated-types/unconstrained-lifetime-in-projection (E0716),
   Left: higher-ranked-auto-trait-11#no_assumptions, implementation-not-general-enough-ice-133252 need coroutine
   witness types (r-a coroutine_hidden_types stub, hir-ty next_solver/interner.rs:2150) = async-block Send checking.
   Also: old prove() path maps 'x: placeholder to always-true where rustc wants 'x: 'static (latent missed error).
+- 03:35 AB done: #505 (A: borrowck expands builtin derives, packed copies) + #515 (B: unsized temporaries). 5 units once both land.
+  RISK: #505 makes `ra-jit borrowck --project` check derived impls on real code -> must rerun full apps sweep after it merges.
