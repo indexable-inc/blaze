@@ -104,3 +104,6 @@ re-spawned ctdeps agent (background, 03:55) to fix driver/harness and land; VM n
   fixture 2/2, ripgrep 2/3 cargo execs (left: check --compile-time-deps + typed). units 13/14,
   toolchain 35/35. Pushed + re-queued with land.py. nix/units regenerated in VM.
   Next: ctdeps agent lands its PR (must rebase on #516); then parent re-traces main (VM nocargo).
+- 04:31 #516 unitgraph MERGED; nc-toolq and nc-unitgraph2 removed. Waiting on ctdeps agent
+  (background; if dead, re-spawn from /Volumes/Projects/blaze-nocargo-ctdeps-1027/HANDOFF.md).
+  After it lands: re-trace main in VM nocargo, update docs/no-rustc.md self-contained text, result.md.
