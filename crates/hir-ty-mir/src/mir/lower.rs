@@ -3833,7 +3833,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         place: Place<'db>,
         current: BasicBlockId,
     ) -> Result<'db, Option<BasicBlockId>> {
-        let Some(CoroutineLocals { poll, context }) = self.result.coroutine else {
+        let Some(CoroutineLocals { poll, context, .. }) = self.result.coroutine else {
             not_supported!("await outside of an async block");
         };
         let lang_items = self.lang_items();
@@ -4696,7 +4696,34 @@ fn lower_closure_body<'db>(
             GenericArgs::new_from_slice(&[output.into()]),
         );
         let poll = ctx.result.locals.alloc(Local { ty: poll.store() });
-        ctx.result.coroutine = Some(CoroutineLocals { poll, context });
+        // Lowering wraps the block an `async fn` or closure is written with in one that moves
+        // the parameters ahead of it.
+        let span = match (&store[expr], &store[*root]) {
+            (
+                Expr::Closure {
+                    closure_kind:
+                        ClosureKind::Coroutine {
+                            kind: CoroutineKind::Async,
+                            source: CoroutineSource::Block,
+                        },
+                    ..
+                },
+                _,
+            ) => expr,
+            (
+                Expr::Closure {
+                    closure_kind:
+                        ClosureKind::Coroutine {
+                            kind: CoroutineKind::Async,
+                            source: CoroutineSource::Fn | CoroutineSource::Closure,
+                        },
+                    ..
+                },
+                Expr::Block { tail: Some(written), .. },
+            ) => *written,
+            _ => implementation_error!("async body that is not an async block, fn or closure"),
+        };
+        ctx.result.coroutine = Some(CoroutineLocals { poll, context, span: span.into() });
     }
     let resolver_guard = ctx.resolver.update_to_inner_scope(db, ctx.store_owner, expr);
     let current = ctx.lower_params_and_bindings(

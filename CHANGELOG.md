@@ -31,6 +31,7 @@ since the release before and the title of each change merged since.
 
 ### Fixed
 
+- A future polled again after it panicked panics with "`async fn` resumed after panicking", and one polled after it returned with "`async fn` resumed after completion", as rustc's do. ra-jit marked a future as panicked only where the call that unwound had something to clean up, so one that panicked with nothing in scope resumed at its last await, ran that code again and freed what it had freed already; one polled after it returned trapped.
 - Windows: a `raw-dylib` named with `+verbatim` imports from the DLL as it is written, as rustc does: `ort-sys`'s `#[link(name = "SHELL32.DLL", kind = "raw-dylib", modifiers = "+verbatim")]` imported from `SHELL32.DLL.dll`, and its build script stopped with 0xc0000135 (DLL not found).
 
 ## [0.20261028.9] - 2026-10-28
