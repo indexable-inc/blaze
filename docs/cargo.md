@@ -127,8 +127,8 @@ build, which says which and why; nothing is handed to cargo or rustc:
 What blaze does not build yet fails the same way, saying what: the targets `--bins`,
 `--examples`, `--tests`, `--benches` and `--all-targets` pick, several `--target`s,
 `--target-dir`, `--message-format`, `-Z`, and `--build-plan` and `--unit-graph`, and a
-library whose crate types include `staticlib` when the build would write it (a plain `build`,
-or `--lib`): blaze does not link one yet, and says which
+library whose crate types include `staticlib` or `dylib` when the build would write it (a
+plain `build`, or `--lib`): blaze does not link one yet, and says which
 ([#262](https://github.com/indexable-inc/blaze/issues/262)). A library's `cdylib` (a native
 Node addon, a Python extension, a plugin) is a program of the build: a plain `build` or
 `--lib` links it as a shared library at cargo's path (`target/debug/lib<name>.so`, `.dylib`

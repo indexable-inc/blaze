@@ -86,6 +86,9 @@ HARNESSES = [
     ("core", ["anonstatics.py"], {}, on("linux", "macos"), 1),
     # A static with state LLVM renamed (`SERVING.0`) at opt-level 1 is rustc's copy for both.
     ("core", ["loadedits.py"], {}, on("linux", "macos"), 2),
+    # An edit of a dependency reaches each kind of artifact a build says it wrote, or the build
+    # fails naming it (#730); a program built with #731's unstable rustflags has its edits spliced.
+    ("core", ["artifactedits.py"], {}, on("linux", "macos"), 1),
     ("core", ["testselect.py"], {}, on("linux", "macos"), 2),
     ("core", ["doctestonce.py"], {}, on("linux", "macos"), 1),
     ("core", ["asmedits.py"], {}, EVERYWHERE, 1),
@@ -162,6 +165,7 @@ FAST = {
     "unreached.py": (9, ()),
     "anonstatics.py": (9, ()),
     "loadedits.py": (19, (X64, MAC)),
+    "artifactedits.py": (40, ()),
     "testselect.py": (58, (X64, MAC)),
     "doctestonce.py": (92, (X64,)),
     "asmedits.py": (12, ()),

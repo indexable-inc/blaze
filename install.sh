@@ -247,12 +247,28 @@ if [ -x "$unpacked/blaze" ]; then
         fail "blaze is installed, but the Rust it builds with could not be downloaded; the first build tries again."
     fi
 else
-    # A release from before blaze had its own copy builds with rustup's.
+    # A release from before blaze had its own copy builds with rustup's copy of the Rust it was
+    # built for, which its tag's harness/toolchain names: not $TOOLCHAIN, which is this
+    # installer's, and the binary refuses any other rustc.
+    if [ -z "$tag" ]; then
+        TOOLCHAIN=""
+        rust_note="This archive has no blaze program, so it builds with rustup's copy of the Rust named in
+harness/toolchain of the commit it was built from. Install that with:
+
+    rustup toolchain install <that toolchain> --component rust-src"
+    else
+        fetch "https://raw.githubusercontent.com/$REPO/$tag/harness/toolchain" "$tmp/toolchain" 2>"$tmp/error" ||
+            fail "blaze $tag is installed, but which Rust it builds with could not be read." \
+                "$(cat "$tmp/error")
+https://raw.githubusercontent.com/$REPO/$tag/harness/toolchain"
+        TOOLCHAIN=$(tr -d ' \r\n' <"$tmp/toolchain")
+        [ -n "$TOOLCHAIN" ] || fail "blaze $tag is installed, but its harness/toolchain names no Rust."
+    fi
     has_toolchain() {
         rustup run "$TOOLCHAIN" rustc --version >/dev/null 2>&1 &&
             rustup component list --toolchain "$TOOLCHAIN" --installed 2>/dev/null | grep -q '^rust-src'
     }
-    if [ -n "$NO_TOOLCHAIN" ]; then
+    if [ -n "$NO_TOOLCHAIN" ] || [ -z "$TOOLCHAIN" ]; then
         step "leaving Rust alone"
     elif command -v rustup >/dev/null 2>&1; then
         if has_toolchain; then

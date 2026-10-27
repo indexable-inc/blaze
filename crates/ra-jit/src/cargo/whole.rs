@@ -101,7 +101,7 @@ pub(super) fn build(asked: &Invocation) -> anyhow::Result<i32> {
     if asked.subcommand == Subcommand::Run {
         programs.retain(|it| !it.kind.linked_library());
     }
-    if let Some(it) = programs.iter().find(|it| it.kind == Kind::Staticlib) {
+    if let Some(it) = programs.iter().find(|it| matches!(it.kind, Kind::Staticlib | Kind::Dylib)) {
         let kind = format!("{:?}", it.kind).to_lowercase();
         say::error(&format!(
             "blaze does not link the `{kind}` of `{}` (target `{}`) yet, so it would write no `{}` (#262)",
@@ -356,7 +356,7 @@ fn state_kind(kind: Kind) -> super::state::Kind {
         Kind::Bin => super::state::Kind::Bin,
         Kind::Example => super::state::Kind::Example,
         Kind::Test => super::state::Kind::Test,
-        Kind::Cdylib | Kind::Staticlib => super::state::Kind::Lib,
+        Kind::Cdylib | Kind::Staticlib | Kind::Dylib => super::state::Kind::Lib,
     }
 }
 
@@ -412,8 +412,8 @@ impl Unbuilt {
 fn turned_down(program: &Program, said: &crate::errors::Said) -> String {
     let name = &program.name;
     let target = match (program.kind, program.test) {
-        (Kind::Lib | Kind::Cdylib | Kind::Staticlib, false) => "lib".to_owned(),
-        (Kind::Lib | Kind::Cdylib | Kind::Staticlib, true) => "lib test".to_owned(),
+        (Kind::Lib | Kind::Cdylib | Kind::Staticlib | Kind::Dylib, false) => "lib".to_owned(),
+        (Kind::Lib | Kind::Cdylib | Kind::Staticlib | Kind::Dylib, true) => "lib test".to_owned(),
         (Kind::Bin, false) => format!("bin \"{name}\""),
         (Kind::Bin, true) => format!("bin \"{name}\" test"),
         (Kind::Example, _) => format!("example \"{name}\""),
@@ -775,7 +775,9 @@ fn planned(
         };
         let executable = match (program.kind, program.test) {
             (Kind::Example, _) => out.join("examples").join(exe(&program.name)),
-            (Kind::Cdylib, _) => out.join(library(named.dll_prefix, named.dll_suffix)),
+            (Kind::Cdylib | Kind::Dylib, _) => {
+                out.join(library(named.dll_prefix, named.dll_suffix))
+            }
             (Kind::Staticlib, _) => out.join(match cfg!(windows) {
                 true => library("", ".lib"),
                 false => library("lib", ".a"),

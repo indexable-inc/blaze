@@ -129,13 +129,15 @@ pub enum Kind {
     Cdylib,
     /// The `staticlib` of a library, an archive `cargo build` writes.
     Staticlib,
+    /// The `dylib` of a library, a shared library of Rust's own ABI `cargo build` links.
+    Dylib,
 }
 
 impl Kind {
-    /// Whether it is a library's linked output, a `cdylib` or a `staticlib`, and not an
+    /// Whether it is a library's linked output, a `cdylib`, `staticlib` or `dylib`, and not an
     /// executable.
     pub fn linked_library(self) -> bool {
-        matches!(self, Kind::Cdylib | Kind::Staticlib)
+        matches!(self, Kind::Cdylib | Kind::Staticlib | Kind::Dylib)
     }
 }
 
@@ -192,7 +194,7 @@ impl Targets<'_> {
             Kind::Bin => self.bin == Some(name),
             Kind::Example => self.example == Some(name),
             Kind::Test => tests.test == Some(name),
-            Kind::Cdylib | Kind::Staticlib => false,
+            Kind::Cdylib | Kind::Staticlib | Kind::Dylib => false,
         };
         named.then_some(kind != Kind::Example || tested)
     }
@@ -263,10 +265,12 @@ pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<
                 _ if of("kind", "custom-build") => continue,
                 _ => Kind::Lib,
             };
-            // A build links a library's `cdylib` and `staticlib`, each a program of its own;
-            // its `rlib` is linked into the others.
+            // A build links a library's `cdylib`, `staticlib` and `dylib`, each a program of
+            // its own; its `rlib` is linked into the others.
+            let linked =
+                [("cdylib", Kind::Cdylib), ("staticlib", Kind::Staticlib), ("dylib", Kind::Dylib)];
             let kinds: Vec<Kind> = match (kind, targets.test) {
-                (Kind::Lib, None) => [("cdylib", Kind::Cdylib), ("staticlib", Kind::Staticlib)]
+                (Kind::Lib, None) => linked
                     .into_iter()
                     .filter(|(it, _)| of("crate_types", it))
                     .map(|(_, kind)| kind)
