@@ -124,7 +124,27 @@ docs placeholders COUNTS_TABLE/CTDEPS_RESULTS, git rm --cached HANDOFF.md, squas
   rustc/rustdoc (the rustc execs are ra-jit-rustc stand-ins = ra-jit). ripgrep test: 320 of 329
   integration tests fail NotFound (`../rg`) since #569 (release lane: matches pinned nightly cargo's
   second layout, where cargo fails the same). Not this lane's.
-- Running: nocargo unit nc-r4 (build, cargo test -p ra-jit -p project-model, rustcsites, r4 trace,
+- 06:25 VM nocargo died (FAILED, unreachable) during nc-r4; removed. arm64/x86 had no room for
+  32G committed; now VM nocargo3 (arm64 16 cpu 16G committed), same /root/nc layout, unit nc-all
+  (/root/nc/all.sh: setup, build, server, r4 trace, rustcsites, cargo test; log /root/nc/all.log).
+  Ship with `VM=nocargo3 bash /tmp/nocargo-scripts/ship.sh <worktree>`.
+- h10 first result: fd different (tikv-jemalloc-sys OUT_DIR build/config.log) after the rebase.
+- 06:40 nc-ctdeps also died (FAILED); h10 lost; removed. All work now on nocargo3.
+- 06:55 r4 (nocargo3, final tree 2 commits): all 8 runs 1 cargo (typed), rustcsites ok (13, none
+  new). project-model not a workspace member (cargo test -p fails); running unit nc-t2: cargo test
+  --release -p ra-jit, then LIMIT=100 /root/ct/harness.sh (full ctdeps harness), log /root/nc/t2.log.
+- 07:10 cargo test --release -p ra-jit: ok (279). fmt ok. Full harness (rebased, sandbox on):
+  9/14 equal. fd different = SHELL withheld by main's script sandbox env filter
+  (script_sandbox.rs `given`, from #585) -> configure's config.log says SHELL=/bin/sh; with
+  BLAZE_SANDBOX=off fd 9/9 packages equal. helix blaze-failed = sandbox withholds the bench's
+  HELIX_DISABLE_AUTO_GRAMMAR_BUILD=1, script fetches grammars, writes into its source, refused;
+  with the env + BLAZE_SANDBOX=off helix 38/38 equal. -> bscache lane's (report, don't fix).
+  zed: my strict said() hit `--print cfg -C symbol-mangling-version=v0`: fixed in answers/own.rs
+  (commit 3, IGNORED_CODEGEN). nushell now equal; biome still #327.
+- Running nc-h11 (/root/nc/h11.log): rebuild, answers:: tests, harness sandbox on
+  (/root/ct/h11-on.json) and off (/root/ct/h11-off.json). Then: fill resolve.md CTDEPS_RESULTS,
+  squash (drop HANDOFF.md), land.py, result.md.
+- (old) Running: nocargo unit nc-r4 (build, cargo test -p ra-jit -p project-model, rustcsites, r4 trace,
   /root/nc/r4.log); nc-ctdeps unit ct-h10 (rebased build, srv, full harness, /root/ct/h10.log).
 
 ## Operator note 2026-10-27 11:33Z (Andrew: build scripts and proc macros are cached, and hermetic)
