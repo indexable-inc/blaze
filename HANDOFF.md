@@ -69,3 +69,7 @@ I. misc — associated-types/unconstrained-lifetime-in-projection (E0716),
   uncommitted regions.rs WIP for H/I in worktree). Uncommitted WIP in worktrees c, d, g, t, l; ab none.
   All bk-* VMs still running. #465 merged.
 - Respawned subagents (resume from worktree WIP + existing VM): T, L, C, D, G, AB, EHI(H+I).
+- Run 3 subagents spawned 02:25 (each resumes its worktree WIP, own VM, writes /tmp/blaze-lanes/borrowck-<g>.md):
+  t, l (app false errors, priority), c, d, g, ab, ehi (H+I on new branch bk-h-1027).
+- Next for parent: when PRs merge, rerun UI suite + apps sweep on main in VM `borrowck`, update docs/borrowck.md
+  numbers table, write /tmp/blaze-lanes/borrowck.result.md. Then step 4 (r-a diagnostics) if time.
