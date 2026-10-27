@@ -84,3 +84,5 @@ I. misc — associated-types/unconstrained-lifetime-in-projection (E0716),
   On next restart: read those files, respawn only unfinished groups with the same prompts (resume rules + group task).
 - Parent still to do: after PRs merge, rerun UI both modes + apps sweep (harness/borrowck_apps.py) on main in VM
   `borrowck`, update docs/borrowck.md numbers, write /tmp/blaze-lanes/borrowck.result.md.
+- 02:45 bk-main unit in VM borrowck: all.sh on origin/main 40e72e14 (logs /root/bk/{main,ui,apps}.log, ui.json)
+- main 40e72e14 (with #469 E, #470 F): Polonius 1546/1584, NLL 1543/1582, 0 errors on units rustc accepts, no panics. Apps sweep running in bk-main (/root/bk/apps.log).
