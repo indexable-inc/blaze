@@ -455,7 +455,7 @@ jobs:
     if: inputs.smoke && inputs.tier != 'gate'
     needs: build
     runs-on: ${{ inputs.os }}
-    timeout-minutes: ${{ (inputs.tier == 'fast' || inputs.tier == 'full') && 15 || 150 }}
+    timeout-minutes: ${{ (inputs.tier == 'fast' || inputs.tier == 'full') && 15 || 60 }}
     steps:
       - uses: actions/checkout@v7
       # With Nix: the build's programs ask for the dev shell's glibc, from the Nix store.
@@ -472,12 +472,6 @@ jobs:
         run: |
           BLAZE_HOME="$RUNNER_TEMP/blaze-home" $PYTHON harness/smoke.py \
             "{\"groups\": [\"std\"], \"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze\", \"work\": \"$RUNNER_TEMP/smoke\"}"
-      # TEMPORARY (#1367, reverted before landing): the const-eval cases of the crates group.
-      - name: smoke corpus (const-eval crates cases)
-        if: always()
-        run: |
-          BLAZE_HOME="$RUNNER_TEMP/blaze-home" $PYTHON harness/smoke.py \
-            "{\"groups\": [\"crates\"], \"only\": [\"ce_sha256\", \"ce_toml\", \"ce_inflate\"], \"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze\", \"work\": \"$RUNNER_TEMP/smoke-ce\"}"
 
   # `blaze` in place of cargo on projects at pinned commits, and the flags, the daemon's
   # life and plain cargo after `blaze enable`. Incremental compilation is left to the profile,
