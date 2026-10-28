@@ -50,7 +50,7 @@ pub enum TargetFeatureIsSafeInTarget {
 pub fn target_feature_is_safe_in_target(target: &TargetData) -> TargetFeatureIsSafeInTarget {
     match target.arch {
         target::Arch::Wasm32 | target::Arch::Wasm64 => TargetFeatureIsSafeInTarget::Yes,
-        _ => TargetFeatureIsSafeInTarget::No,
+        _ => std::hint::black_box(TargetFeatureIsSafeInTarget::No),
     }
 }
 
