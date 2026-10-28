@@ -149,6 +149,20 @@ def cmake_args(target):
     return args
 
 
+def cmake_env(target):
+    """What cmake is run with. On Windows the STL's vectorized algorithms are off: the STL calls
+    them in its static library under names that change between MSVC versions
+    (`__std_max_element_8u` in 14.4x is `__std_max_element_8` in 14.50), and without them the
+    archive links with any MSVC from the one it was built with on, Visual Studio 2022's and
+    2026's (#1387). In CFLAGS and CXXFLAGS, which cmake adds to its own defaults when it first
+    configures the build; `-DCMAKE_CXX_FLAGS` would replace them."""
+    env = dict(os.environ)
+    if "windows" in target:
+        for name in ("CFLAGS", "CXXFLAGS"):
+            env[name] = " ".join(filter(None, [env.get(name), "/D_USE_STD_VECTOR_ALGORITHMS=0"]))
+    return env
+
+
 def pack(prefix, out, top):
     """`prefix` archived as `out` (tar.xz; the members under the one directory `top`, as LLVM's
     own releases are, so `tar --strip-components=1` and Nix's unpacker both take it)."""
@@ -177,7 +191,7 @@ async def build(args):
     shutil.rmtree(prefix, ignore_errors=True)
     bld.mkdir(exist_ok=True)
     await run("cmake", "cmake", *cmake_args(args.target), f"-DCMAKE_INSTALL_PREFIX={prefix}", src / "llvm",
-              cwd=bld, limit=900)
+              cwd=bld, env=cmake_env(args.target), limit=900)
     jobs = ["-j", str(args.jobs)] if args.jobs else []
     await run("ninja", "ninja", *jobs, "install-distribution", cwd=bld, limit=5 * 3600)
     exe = ".exe" if WINDOWS else ""
