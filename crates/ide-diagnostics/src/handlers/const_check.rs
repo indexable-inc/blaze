@@ -128,8 +128,8 @@ const C: u32 = Counter.fetch_add();
         check_diagnostics(
             r#"
 //- minicore: size_of
-const S: usize = core::intrinsics::size_of::<u64>();
-static T: usize = core::intrinsics::size_of::<u32>();
+const S: usize = core::mem::size_of::<u64>();
+static T: usize = core::mem::size_of::<u32>();
 "#,
         );
     }

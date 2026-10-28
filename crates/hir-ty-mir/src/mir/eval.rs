@@ -3946,7 +3946,7 @@ impl<'db> Evaluator<'db> {
                     .map_err(|_| {
                         MirEvalError::NotSupported(format!("dropping {ty:?}, which does not normalize"))
                     })?;
-                if matches!(normalized.kind(), TyKind::Alias(..)) {
+                if matches!(normalized.kind(), TyKind::Alias(..) | TyKind::Infer(..)) {
                     not_supported!("dropping {ty:?}, which does not normalize");
                 }
                 normalized
