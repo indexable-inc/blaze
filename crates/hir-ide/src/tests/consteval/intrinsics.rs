@@ -801,7 +801,13 @@ fn a_promoted_temporary_outlives_its_call() {
 const INTEGER_LOG: &str = r#"
         //- minicore: option, panic, assert, slice, index
         #[rustc_intrinsic]
-        pub const unsafe fn assume(b: bool);
+        pub const unsafe fn unreachable() -> !;
+        #[rustc_intrinsic]
+        pub const unsafe fn assume(b: bool) {
+            if !b {
+                unsafe { unreachable() }
+            }
+        }
         struct U64;
         impl U64 {
             const MAX: u64 = 18446744073709551615;
