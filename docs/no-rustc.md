@@ -693,7 +693,9 @@ over ripgrep: 2.5 s against 0.25 s), and the native libraries the crates linked 
 `#[link(name, kind, modifiers, cfg)]`, read from their `extern` blocks, a crate's before those
 of the crates it depends on; no list of libraries is fixed. What the link leaves out it proves
 unreachable, so a stand-in left in the executable is a function the program can reach that
-blaze could not compile: blaze says how many after the link and fails on any.
+blaze could not compile: blaze says how many after the link and fails on any. Not yet on
+Windows: blaze's COFF objects have no COMDAT sections for `link.exe`'s `/OPT:REF` to take out,
+so every stand-in stays, and one says what blaze could not compile only when it is called.
 None is left in hello, the four `allblaze.py` programs or ripgrep. The rest of what rustc
 does around the link: the allocator shim calls the `#[global_allocator]`'s methods (through the
 four functions the attribute's expansion exports) or else std's defaults; the panic runtime is
