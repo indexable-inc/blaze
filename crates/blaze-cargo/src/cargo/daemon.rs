@@ -2210,9 +2210,23 @@ mod tests {
             let daemon = daemon.clone();
             std::thread::spawn(move || daemon.check(&stuck, "check"))
         };
-        while lock(&daemon.checkers)[0].asking.try_lock().is_ok() {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        // Its request is read once it waits for the answer.
+        never.set_nonblocking(true).unwrap();
+        let given_up = Instant::now() + Duration::from_secs(10);
+        let asked = loop {
+            match never.accept() {
+                Ok((asked, _)) => break asked,
+                Err(_) if waiting.is_finished() => {
+                    panic!("the check asked nothing: {:?}", waiting.join().unwrap())
+                }
+                Err(_) if Instant::now() < given_up => std::thread::sleep(POLL),
+                Err(why) => panic!("the check asked nothing in 10 s: {why}"),
+            }
+        };
+        asked.set_nonblocking(false).unwrap();
+        let mut line = String::new();
+        BufReader::new(&asked).read_line(&mut line).unwrap();
+        assert!(!waiting.is_finished(), "the check did not wait for its checker");
         let within = |what: &'static str, ask: Box<dyn FnOnce() -> Reply + Send>| {
             let (to, told) = std::sync::mpsc::channel();
             std::thread::spawn(move || _ = to.send(ask()));
@@ -2229,8 +2243,8 @@ mod tests {
             within("a check of another build", Box::new(move || daemon.check(&answers, "check")))
         };
         assert!(matches!(other, Reply::Checked { errors: None }), "{other:?}");
-        // The stuck one's connection is reset, which ends its check.
-        drop(never);
+        // The stuck one hangs up, which ends its check.
+        drop(asked);
         assert!(matches!(waiting.join().unwrap(), Reply::Cold { .. }));
         for checker in lock(&daemon.checkers).iter() {
             checker.stop();
