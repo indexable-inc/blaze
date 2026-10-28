@@ -230,6 +230,9 @@ pub struct Evaluator<'db> {
     /// Where a promoted temporary of a body (`&[1, 2]`) is: in the heap, as its borrow
     /// outlives the call, once for every call of the body.
     promoted: FxHashMap<(usize, LocalId), Address>,
+    /// Where the value of a constant operand is, once read: the program never writes it, so
+    /// every use of the constant reads the same copy.
+    constants: FxHashMap<Either<Const<'db>, Allocation<'db>>, Interval>,
     code_stack: Vec<StackFrame<'db>>,
     /// The `callee` and `span` of the frame being run, which is not on `code_stack`.
     running: Option<(Option<FunctionId>, (MirSpan, InferBodyId<'db>))>,
@@ -560,6 +563,7 @@ impl<'db> Evaluator<'db> {
             heap_blocks: BTreeMap::new(),
             free_blocks: FxHashMap::default(),
             promoted: FxHashMap::default(),
+            constants: FxHashMap::default(),
             code_stack: vec![],
             running: None,
             vtable_map: VTableMap::default(),
@@ -2008,13 +2012,30 @@ impl<'db> Evaluator<'db> {
             }
             OperandKind::Constant { konst, ty } => match self.placed(it, ty.as_ref(), locals)? {
                 Some(placed) => placed,
-                None => self.allocate_const_in_heap(locals, konst.as_ref())?,
+                None => {
+                    let konst = konst.as_ref();
+                    if let Some(&interval) = self.constants.get(&Either::Left(konst)) {
+                        return Ok(interval);
+                    }
+                    let interval = self.allocate_const_in_heap(locals, konst)?;
+                    if self.shares_one_copy(konst) {
+                        self.constants.insert(Either::Left(konst), interval);
+                    }
+                    interval
+                }
             },
             OperandKind::Allocation { allocation } => {
                 let allocation = allocation.as_ref();
                 match self.placed(it, allocation.ty, locals)? {
                     Some(placed) => placed,
-                    None => self.allocate_allocation_in_heap(locals, allocation)?,
+                    None => match self.constants.get(&Either::Right(allocation)) {
+                        Some(&interval) => interval,
+                        None => {
+                            let interval = self.allocate_allocation_in_heap(locals, allocation)?;
+                            self.constants.insert(Either::Right(allocation), interval);
+                            interval
+                        }
+                    },
                 }
             }
         })
@@ -2286,6 +2307,21 @@ impl<'db> Evaluator<'db> {
                 self.allocate_allocation_in_heap(locals, allocation)
             }
             _ => not_supported!("evaluating unknown const"),
+        }
+    }
+
+    /// Whether every use of `konst` reads the same copy ([`Self::constants`]): not of a
+    /// static, which may be written, nor of an inline `const { .. }`, which is run again as
+    /// its `TypeId`s are this evaluation's ([`Self::inline_const_in_heap`]).
+    fn shares_one_copy(&self, konst: Const<'db>) -> bool {
+        match konst.kind() {
+            ConstKind::Value(_) => true,
+            ConstKind::Unevaluated(UnevaluatedConst { def, .. }) => match def.0 {
+                GeneralConstId::ConstId(_) => true,
+                GeneralConstId::StaticId(_) => false,
+                GeneralConstId::AnonConstId(it) => !it.is_inline_const(self.db),
+            },
+            _ => false,
         }
     }
 

@@ -736,6 +736,26 @@ fn stack_frames_are_freed() {
 }
 
 #[test]
+fn a_constant_read_again_is_not_copied_again() {
+    // 2 GiB if every read of `K` copied it to the heap.
+    check_number(
+        r#"
+        const K: [u32; 65536] = [3; 65536];
+        const GOAL: u32 = {
+            let mut i = 0;
+            let mut sum = 0;
+            while i < 8192 {
+                sum += K[i];
+                i += 1;
+            }
+            sum
+        };
+        "#,
+        3 * 8192,
+    );
+}
+
+#[test]
 fn a_promoted_temporary_outlives_its_call() {
     check_number(
         r#"
