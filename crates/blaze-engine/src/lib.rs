@@ -7397,6 +7397,8 @@ struct Builds {
     over_budget: Vec<usize>,
     /// The programs whose own base is not built again: one held more memory than it may.
     given_up: FxHashSet<usize>,
+    /// What the first build left for the first edit, prepared beside the first requests.
+    warming: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Builds {
@@ -7532,6 +7534,9 @@ impl Builds {
     /// thread that reads it. The builds that are kept are waited for, the others interrupted.
     fn settle(&mut self, db: &mut RootDatabase, programs: &mut [Program]) -> anyhow::Result<()> {
         use ide_db::base_db::salsa::Database as _;
+        if let Some(warming) = self.warming.take() {
+            _ = warming.join();
+        }
         while self.running.values().any(|it| it.kept) {
             let event = self.events.recv()?;
             self.take(event, programs)?;
@@ -9197,11 +9202,11 @@ fn run_holding(
     };
 
     // The first change after a build of everything waits for what that build left behind.
-    // Paid here, the first edit does not.
+    // Paid beside the first requests, which read the database and need none of it, the
+    // first edit does not: its write waits for it in `Builds::settle`.
     {
         use ide_db::base_db::salsa::{Database, Durability};
         db.synthetic_write(Durability::LOW);
-        prepare_macro_sessions(&db);
     }
     // Only a worker that serves builds again and lets go after; the bookkeeping of an `lru`
     // costs every fetch of its queries.
@@ -9210,7 +9215,24 @@ fn run_holding(
     }
     memory::report(&mut db, "warm-up")?;
     eprintln!("watching {} files", files.len());
-    ide_db::executions::take(&db);
+    let warming = {
+        let db = db.clone();
+        std::thread::Builder::new().name("blaze warm-up".to_owned()).spawn(move || {
+            let start = Instant::now();
+            // A write that does not wait for it stops it, and the edit prepares the rest.
+            let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                prepare_macro_sessions(&db)
+            }));
+            match prepared {
+                Ok(()) => eprintln!("warm-up: macro sessions in {:.1?}", start.elapsed()),
+                Err(panic) if panic.is::<ide_db::base_db::salsa::Cancelled>() => {
+                    eprintln!("warm-up: stopped by a write after {:.1?}", start.elapsed())
+                }
+                Err(panic) => eprintln!("warm-up: {}", panic_message(&*panic)),
+            }
+            ide_db::executions::take(&db);
+        })?
+    };
     // Requests wait here while a build is under way, and those that have come by the time it
     // is done are built together.
     let (sender, events) = std::sync::mpsc::channel();
@@ -9275,6 +9297,7 @@ fn run_holding(
         unasked: Vec::new(),
         over_budget: Vec::new(),
         given_up: FxHashSet::default(),
+        warming: Some(warming),
     };
     if from_manifest {
         programs[0].build_from_store();
