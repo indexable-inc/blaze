@@ -320,6 +320,13 @@ fn output_of(name: &str, sh_type: u32, flags: u64) -> (String, Segment, u32) {
     (name.to_owned(), Segment::Read, 12)
 }
 
+/// The relocations of `relocs` (in the order of their offsets) at `start..end`.
+fn within(relocs: &[Reloc], start: u64, end: u64) -> &[Reloc] {
+    let from = relocs.partition_point(|it| it.offset < start);
+    let to = relocs.partition_point(|it| it.offset < end);
+    &relocs[from..to]
+}
+
 /// The order `.init_array.N` and `.fini_array.N` run in: by `N`, those without one last.
 fn priority(name: &str) -> u32 {
     name.rsplit_once('.').and_then(|(_, it)| it.parse().ok()).unwrap_or(65536)
@@ -387,7 +394,7 @@ impl<'a> Plan<'_, 'a> {
                 }
                 let (object, section, start) = (frame.object, frame.section, frame.start);
                 let sec = &self.link.objects[object as usize].sections[section as usize];
-                let Some(first) = sec.relocs.iter().find(|it| it.offset == start + 8) else {
+                let Some(first) = within(&sec.relocs, start + 8, start + 9).first() else {
                     continue;
                 };
                 if !self.is_live(first.to) {
@@ -399,12 +406,7 @@ impl<'a> Plan<'_, 'a> {
                 let mut targets: Vec<To> = Vec::new();
                 for which in [f, cie] {
                     let Frame { start, len, .. } = self.frames[which];
-                    targets.extend(
-                        sec.relocs
-                            .iter()
-                            .filter(|it| it.offset >= start && it.offset < start + len)
-                            .map(|it| it.to),
-                    );
+                    targets.extend(within(&sec.relocs, start, start + len).iter().map(|it| it.to));
                 }
                 for to in targets {
                     self.reached(to, &mut work);
@@ -593,13 +595,19 @@ impl<'a> Plan<'_, 'a> {
                     continue;
                 }
                 let writable = sec.flags & u64::from(elf::SHF_WRITE) != 0;
-                let relocs = sec.relocs.clone();
+                // Of `.eh_frame`, the relocations of the records that are kept.
+                let relocs: Vec<Reloc> = match frame {
+                    true => self
+                        .frames
+                        .iter()
+                        .filter(|it| it.object == o as u32 && it.section == s as u32 && it.kept)
+                        .flat_map(|it| within(&sec.relocs, it.start, it.start + it.len).iter().copied())
+                        .collect(),
+                    false => sec.relocs.clone(),
+                };
                 let mut skip = None;
                 for reloc in relocs {
                     let from = (o as u32, s as u32, reloc.offset);
-                    if frame && !self.frame_keeps(o as u32, s as u32, reloc.offset) {
-                        continue;
-                    }
                     if skip == Some(reloc.offset) {
                         skip = None;
                         continue;
@@ -690,17 +698,6 @@ impl<'a> Plan<'_, 'a> {
             }
         }
         Ok(())
-    }
-
-    /// Whether the relocation at `offset` of `.eh_frame` is in a record that is kept.
-    fn frame_keeps(&self, object: u32, section: u32, offset: u64) -> bool {
-        self.frames.iter().any(|it| {
-            it.object == object
-                && it.section == section
-                && it.kept
-                && offset >= it.start
-                && offset < it.start + it.len
-        })
     }
 
     fn string(&mut self, text: &str) -> u32 {
@@ -1325,10 +1322,7 @@ impl<'a> Plan<'_, 'a> {
                 let pointer = (frame.at + 4) - self.frames[cie].at;
                 bytes[to + 4..to + 8].copy_from_slice(&u32::try_from(pointer)?.to_le_bytes());
             }
-            for reloc in &sec.relocs {
-                if reloc.offset < frame.start || reloc.offset >= frame.start + frame.len {
-                    continue;
-                }
+            for reloc in within(&sec.relocs, frame.start, frame.start + frame.len) {
                 let kind = kind(machine, reloc.r_type).context("a relocation the scan did not see")?;
                 let place = eh + frame.at + (reloc.offset - frame.start);
                 let from = (frame.object, frame.section, reloc.offset);

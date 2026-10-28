@@ -711,6 +711,9 @@ impl<'a> Link<'a> {
                 };
                 relocs.push(Reloc { offset, r_type, to: target, addend: relocation.addend() });
             }
+            // In the order of their offsets, which the image looks them up by; a stable sort
+            // keeps the order of those at one offset, and of a sequence's.
+            relocs.sort_by_key(|it| it.offset);
             sections[slot].relocs = relocs;
         }
         self.objects.push(Obj { name, sections, symbols, has_debug, has_property_note });
