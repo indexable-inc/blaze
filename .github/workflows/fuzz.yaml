@@ -9,7 +9,7 @@ on:
         required: false
       rounds:
         description: cold builds per arm and project
-        default: "3"
+        default: "2"
 
 env:
   CARGO_INCREMENTAL: 0
@@ -44,8 +44,12 @@ jobs:
           git clone -q --depth 1 --branch 15.1.0 https://github.com/BurntSushi/ripgrep ripgrep
           basic=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
           git init -q anim
-          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $basic" -C anim fetch -q --depth 1 https://github.com/indexable-inc/anim 92c64f7276b3444a518904eaad2e107b36f77e08
-          git -C anim checkout -q FETCH_HEAD
+          git clone -q --depth 1 --branch 0.108.0 https://github.com/nushell/nushell nushell
+          if git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $basic" -C anim fetch -q --depth 1 https://github.com/indexable-inc/anim 92c64f7276b3444a518904eaad2e107b36f77e08; then
+            git -C anim checkout -q FETCH_HEAD
+          else
+            rm -rf anim
+          fi
       - name: cold builds, alternating
         run: |
           set -euxo pipefail
@@ -53,7 +57,7 @@ jobs:
           export COLD_WORK="$RUNNER_TEMP/cold-work"
           python3 -I tools/bench/results/2026-10-28-bmemo/cold.py "$RUNNER_TEMP/out" "${{ inputs.rounds }}" \
             base="$RUNNER_TEMP/arm-base/blaze-engine" memo="$RUNNER_TEMP/arm-memo/blaze-engine" \
-            -- ripgrep="$RUNNER_TEMP/ripgrep" anim="$RUNNER_TEMP/anim"
+            -- ripgrep="$RUNNER_TEMP/ripgrep" nushell="$RUNNER_TEMP/nushell" $([ -d "$RUNNER_TEMP/anim" ] && echo anim="$RUNNER_TEMP/anim")
       - name: unit tests of the memo
         if: always()
         run: |
