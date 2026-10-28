@@ -1501,10 +1501,12 @@ impl<'db> Evaluator<'db> {
                                 }
                                 _ => (l128.wrapping_mul(r128), l128.checked_mul(r128).is_none()),
                             };
-                            // `(T, bool)`: the value, the flag, and padding to twice `T`.
+                            // `(T, bool)`: the value, the flag right after it, and padding to
+                            // `T`'s alignment, which the target sets (`u128`'s is 8 or 16).
+                            let align = self.layout(ty)?.align.abi.bytes() as usize;
                             let mut bytes = value.to_bytes();
                             bytes.push(u8::from(overflowed));
-                            bytes.resize(2 * lc.len(), 0);
+                            bytes.resize(bytes.len().next_multiple_of(align), 0);
                             Owned(bytes)
                         }
                         BinOp::Offset => not_supported!("offset binop"),
