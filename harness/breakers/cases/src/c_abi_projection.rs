@@ -41,7 +41,7 @@ pub struct Mixed {
 #[derive(Clone, Copy, Debug)]
 pub struct Held<R: ConvertReturn<()>>
 where
-    <R as ConvertReturn<()>>::Inner: Copy,
+    <R as ConvertReturn<()>>::Inner: Copy + std::fmt::Debug,
 {
     pub inner: <R as ConvertReturn<()>>::Inner,
     pub tag: u32,
@@ -59,7 +59,7 @@ extern "C" fn echo<R: ConvertReturn<()>>(
 
 extern "C" fn held<R: ConvertReturn<()>>(value: Held<R>) -> Held<R>
 where
-    <R as ConvertReturn<()>>::Inner: Copy,
+    <R as ConvertReturn<()>>::Inner: Copy + std::fmt::Debug,
 {
     Held { tag: value.tag + 1, ..value }
 }
