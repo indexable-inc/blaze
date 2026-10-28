@@ -11238,8 +11238,9 @@ mod tests {
         assert!(immutable(&format!(
             "{home}/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.7.4/src/lib.rs"
         )));
-        assert!(immutable(&format!("{home}/git/checkouts/gix-0f1c5b2bd2cb9a5e/1a2b3c4/src/lib.rs")));
-        // cargo's own tree, whose edits there went unseen.
+        assert!(immutable(&format!(
+            "{home}/git/checkouts/gix-0f1c5b2bd2cb9a5e/1a2b3c4/src/lib.rs"
+        )));
         assert!(!immutable("/ws/cargo/src/cargo/ops/registry/publish.rs"));
         assert!(!immutable("/ws/cargo/src/cargo/sources/registry/index/mod.rs"));
         assert!(!immutable("/ws/crates/registry/src/lib.rs"));
