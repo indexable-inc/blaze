@@ -1,42 +1,50 @@
-//! The build page (docs/web.md): the daemon keeps the graph of each workspace's functions
-//! from its builds' records ([`Graphs`]), and once asked serves a page of it on 127.0.0.1
-//! ([`serve`]), with the records of every build over a websocket as they come.
+//! The build page (docs/web.md): the daemon keeps the functions of each workspace's program
+//! from its builds' records in a Flecs world ([`world`]), on a thread of its own ([`Graphs`]),
+//! and once asked serves a page of it on 127.0.0.1 ([`serve`]), with the records of every
+//! build over a websocket as they come and Flecs's REST over the world.
 
-mod graph;
 mod http;
 #[cfg(test)]
 mod tests;
+pub mod world;
 
 use std::{
+    io::Write,
     net::TcpListener,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
 };
 
 use blaze_protocol::events::{Event, Record};
+use world::{Answer, Applied, Program, World};
 
-pub use graph::{Applied, Graph};
-
-/// How many workspaces' graphs the daemon keeps.
+/// How many workspaces' programs the daemon keeps.
 const KEPT: usize = 16;
 
 /// The most messages a page may have waiting to be sent: one that falls this far behind is
 /// hung up on, and starts over from a snapshot when it connects again.
 const BEHIND: usize = 1 << 16;
 
-/// The graphs of the workspaces built last, and the pages that follow them.
+/// The world's thread, started by the first record: what the daemon and the pages ask it.
 #[derive(Default)]
 pub struct Graphs {
-    state: Mutex<State>,
+    asked: OnceLock<Result<mpsc::Sender<Asked>, String>>,
 }
 
-#[derive(Default)]
+enum Asked {
+    Record { root: PathBuf, build: u64, record: Record },
+    Follow(mpsc::Sender<Following>),
+    Rest { method: String, path: String, answer: mpsc::Sender<Result<Answer, String>> },
+}
+
+/// The world's thread's own.
 struct State {
-    graphs: Vec<Graph>,
+    world: World,
+    programs: Vec<Program>,
     /// The workspace whose build began last: the one the pages show.
     shown: Option<usize>,
     followers: Vec<Follower>,
@@ -58,7 +66,7 @@ pub enum Next {
     Message(Arc<[u8]>),
     /// Nothing came in the time waited.
     Nothing,
-    /// The graphs hung up on it: it fell too far behind.
+    /// The world hung up on it: it fell too far behind.
     Gone,
 }
 
@@ -77,62 +85,152 @@ impl Following {
 }
 
 impl Graphs {
-    /// Takes in `record` of build `build` of the workspace at `root`, and tells the pages.
-    pub fn record(&self, root: &Path, build: u64, record: &Record) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let at = match state.graphs.iter().position(|it| it.root() == root) {
+    /// Hands `record` of build `build` of the workspace at `root` to the world; it never
+    /// waits for it.
+    pub fn record(&self, root: &Path, build: u64, record: Record) {
+        let _ = self.ask(Asked::Record { root: root.to_owned(), build, record });
+    }
+
+    /// The messages a page is sent from now on: the snapshot of the workspace shown, its last
+    /// build's records, and every one after as it comes.
+    pub fn follow(&self) -> Result<Following, String> {
+        let (to, following) = mpsc::channel();
+        self.ask(Asked::Follow(to))?;
+        following.recv().map_err(|_| "the build page's world is gone".to_owned())
+    }
+
+    /// What Flecs's REST answers `method` of `path`, over the world.
+    pub fn rest(&self, method: &str, path: &str) -> Result<Answer, String> {
+        let (answer, answered) = mpsc::channel();
+        self.ask(Asked::Rest { method: method.to_owned(), path: path.to_owned(), answer })?;
+        answered.recv().map_err(|_| "the build page's world is gone".to_owned())?
+    }
+
+    fn ask(&self, asked: Asked) -> Result<(), String> {
+        let to = self.asked.get_or_init(start).as_ref().map_err(Clone::clone)?;
+        to.send(asked).map_err(|_| "the build page's world is gone".to_owned())
+    }
+}
+
+/// Starts the world's thread. The world is made on it, so a world that cannot be made is said
+/// back before the thread waits for anything.
+fn start() -> Result<mpsc::Sender<Asked>, String> {
+    let (to, asked) = mpsc::channel();
+    let (made, making) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("blaze-web-world".into())
+        .spawn(move || {
+            let world = match World::new() {
+                Ok(world) => {
+                    let _ = made.send(Ok(()));
+                    world
+                }
+                Err(why) => {
+                    let _ = made.send(Err(why));
+                    return;
+                }
+            };
+            let mut state = State { world, programs: Vec::new(), shown: None, followers: Vec::new() };
+            for asked in asked {
+                state.answer(asked);
+            }
+        })
+        .map_err(|e| format!("no thread for the build page's world: {e}"))?;
+    making.recv().map_err(|_| "the build page's world did not start".to_owned())??;
+    Ok(to)
+}
+
+impl State {
+    fn answer(&mut self, asked: Asked) {
+        match asked {
+            Asked::Record { root, build, record } => self.record(&root, build, &record),
+            Asked::Follow(to) => {
+                let _ = to.send(self.follow());
+            }
+            Asked::Rest { method, path, answer } => {
+                let _ = answer.send(self.world.rest(&method, &path));
+            }
+        }
+    }
+
+    fn record(&mut self, root: &Path, build: u64, record: &Record) {
+        let at = match self.programs.iter().position(|it| it.root() == root) {
             Some(at) => at,
             None => {
-                if state.graphs.len() >= KEPT {
-                    let oldest = (0..state.graphs.len())
-                        .filter(|&it| Some(it) != state.shown)
-                        .min_by_key(|&it| state.graphs[it].build());
+                if self.programs.len() >= KEPT {
+                    let oldest = (0..self.programs.len())
+                        .filter(|&it| Some(it) != self.shown)
+                        .min_by_key(|&it| self.programs[it].build());
                     if let Some(oldest) = oldest {
-                        state.graphs.remove(oldest);
-                        state.shown = state.shown.map(|it| if it > oldest { it - 1 } else { it });
+                        let program = self.programs.remove(oldest);
+                        self.world.forget(program);
+                        self.shown = self.shown.map(|it| if it > oldest { it - 1 } else { it });
                     }
                 }
-                state.graphs.push(Graph::new(root));
-                state.graphs.len() - 1
+                let program = self.world.program(root);
+                self.programs.push(program);
+                self.programs.len() - 1
             }
         };
         let began = matches!(record.event, Event::Began { .. });
-        let applied = state.graphs[at].apply(build, record);
-        let moved = began && state.shown != Some(at);
+        let applied = self.world.apply(&mut self.programs[at], build, record);
+        let moved = began && self.shown != Some(at);
         if moved {
-            state.shown = Some(at);
+            self.shown = Some(at);
         }
-        if state.shown != Some(at) || state.followers.is_empty() {
+        if self.shown != Some(at) || self.followers.is_empty() {
             return;
         }
         let message: Arc<[u8]> = if moved || applied == Applied::Anew {
-            state.graphs[at].snapshot().into()
+            match self.snapshot(at) {
+                Some(it) => it,
+                None => return,
+            }
         } else {
             match blaze_protocol::cbor::to_vec(record) {
                 Ok(item) => item.into(),
                 Err(_) => return,
             }
         };
-        state.followers.retain(|it| it.send(message.clone()));
+        self.followers.retain(|it| it.send(message.clone()));
     }
 
-    /// The messages a page is sent from now on: the snapshot of the workspace shown, its last
-    /// build's records, and every one after as it comes.
-    pub fn follow(&self) -> Following {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+    fn follow(&mut self) -> Following {
         let (to, told) = mpsc::channel();
         let follower = Follower { to, waiting: Arc::default() };
         let waiting = follower.waiting.clone();
-        let empty = Graph::new(Path::new(""));
-        let graph = state.shown.map_or(&empty, |at| &state.graphs[at]);
-        follower.send(graph.snapshot().into());
-        for record in graph.records() {
+        let at = match self.shown {
+            Some(at) => at,
+            None => {
+                self.programs.push(self.world.program(Path::new("")));
+                self.programs.len() - 1
+            }
+        };
+        if let Some(snapshot) = self.snapshot(at) {
+            follower.send(snapshot);
+        }
+        for record in self.programs[at].records() {
             if let Ok(item) = blaze_protocol::cbor::to_vec(record) {
                 follower.send(item.into());
             }
         }
-        state.followers.push(follower);
+        if self.shown.is_none() {
+            let program = self.programs.remove(at);
+            self.world.forget(program);
+        }
+        self.followers.push(follower);
         Following { told, waiting }
+    }
+
+    /// The snapshot of program `at`, gzipped (docs/web.md, "The snapshot").
+    fn snapshot(&self, at: usize) -> Option<Arc<[u8]>> {
+        let snapshot = self.world.snapshot(&self.programs[at]);
+        let mut gzip = flate2::write::GzEncoder::new(
+            Vec::with_capacity(snapshot.len() / 8),
+            flate2::Compression::fast(),
+        );
+        gzip.write_all(&snapshot).ok()?;
+        Some(gzip.finish().ok()?.into())
     }
 }
 

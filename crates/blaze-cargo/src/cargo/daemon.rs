@@ -1125,10 +1125,7 @@ impl Watched {
 
     fn record(&mut self, build: u64, record: &Record) {
         let Some(watching) = self.watching.iter_mut().find(|it| it.build == build) else { return };
-        self.graphs.record(&watching.root, build, record);
-        if matches!(record.event, Event::Fns { .. }) {
-            return;
-        }
+        self.graphs.record(&watching.root, build, record.clone());
         watching.records.push(record.clone());
         let done = matches!(record.event, Event::Finished { .. });
         watching.done |= done;
@@ -1139,6 +1136,12 @@ impl Watched {
             let ours = watcher.root.as_ref().is_none_or(|it| it == root);
             !ours || watcher.to.send(record.clone()).is_ok() && !(done && watcher.root.is_some())
         });
+    }
+
+    /// The functions build `build` put in its program: the build page's alone.
+    fn functions(&mut self, build: u64, record: Record) {
+        let Some(watching) = self.watching.iter().find(|it| it.build == build) else { return };
+        self.graphs.record(&watching.root, build, record);
     }
 
     /// The build under way in the workspace `at` is in, or else its last.
@@ -1378,10 +1381,14 @@ struct Relayed {
 impl Relay {
     fn send(&self, relayed: &mut Relayed, event: Event, at_ns: u64) {
         let record = Record { at_ns: at_ns.saturating_sub(self.began_ns), event };
+        // The functions of a cold build are some megabytes: they are the build page's alone.
+        if matches!(record.event, Event::Functions { .. }) {
+            lock(&self.watched).functions(self.number, record);
+            return;
+        }
         relayed.build.apply(&record);
         lock(&self.watched).record(self.number, &record);
-        // The functions of a cold build are some megabytes: they are the build page's alone.
-        if !relayed.gone && !matches!(record.event, Event::Fns { .. }) {
+        if !relayed.gone {
             let message = Message::new(self.id, Answer::Record(record));
             relayed.gone = blaze_protocol::send(&mut relayed.unsent, &message).is_err();
         }

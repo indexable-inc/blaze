@@ -1,10 +1,11 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{io::Read, path::Path, sync::Arc, time::Duration};
 
 use blaze_protocol::events::{Event, Function, How, Record};
 
 use crate::{
-    Applied, Graph, Graphs, Next,
+    Graphs, Next,
     http::{self, Frame, Refused, Request, Route, Site},
+    world::{Applied, World, path_of},
 };
 
 fn site() -> Site {
@@ -126,7 +127,7 @@ fn function(id: u32, key: u64, name: &str, calls: &[u32], how: How) -> Function 
 }
 
 fn fns(object: u32, whole: bool, fns: Vec<Function>) -> Record {
-    Record { at_ns: 1, event: Event::Fns { object, whole, fns } }
+    Record { at_ns: 1, event: Event::Functions { object, whole, functions: fns } }
 }
 
 fn began(build: u64, root: &str) -> Record {
@@ -170,31 +171,65 @@ fn read(snapshot: &[u8]) -> Vec<(String, u8, Vec<String>)> {
 
 #[test]
 fn an_edit_is_merged_into_the_program_by_key() {
-    let mut graph = Graph::new(Path::new("/w"));
-    graph.apply(1, &began(1, "/w"));
+    let mut world = World::new().unwrap();
+    let mut program = world.program(Path::new("/w"));
+    world.apply(&mut program, 1, &began(1, "/w"));
     // The calls of a batch may name functions of a later one.
     let cold = fns(0, true, vec![function(0, 10, "main", &[1, 9], How::Compiled { ns: 5 })]);
-    assert_eq!(graph.apply(1, &cold), Applied::Anew);
+    assert_eq!(world.apply(&mut program, 1, &cold), Applied::Anew);
     let more = fns(0, true, vec![function(1, 11, "render", &[], How::Stored)]);
-    assert_eq!(graph.apply(1, &more), Applied::Told);
-    assert_eq!((graph.functions(), graph.calls()), (2, 1));
+    assert_eq!(world.apply(&mut program, 1, &more), Applied::Told);
+    assert_eq!((program.functions(), program.calls()), (2, 1));
     // An edit's patch numbers its functions anew; `render` calls into the base, id 0 of
     // the patch is `render` itself.
-    graph.apply(2, &began(2, "/w"));
+    world.apply(&mut program, 2, &began(2, "/w"));
     let patch = fns(1, false, vec![function(0, 11, "render", &[5], How::Compiled { ns: 9 })]);
-    assert_eq!(graph.apply(2, &patch), Applied::Told);
-    let read = read(&graph.snapshot());
+    assert_eq!(world.apply(&mut program, 2, &patch), Applied::Told);
+    let read = read(&world.snapshot(&program));
     assert_eq!(read, [("main".into(), 0, vec!["render".into()]), ("render".into(), 0, vec![])]);
-    // A build that writes the program again starts the graph again.
-    graph.apply(3, &began(3, "/w"));
+    // A build that writes the program again starts it again.
+    world.apply(&mut program, 3, &began(3, "/w"));
     let again = fns(2, true, vec![function(0, 12, "main", &[], How::Unchanged)]);
-    assert_eq!(graph.apply(3, &again), Applied::Anew);
-    assert_eq!(read_names(&graph), ["main"]);
-    assert_eq!(graph.records().len(), 1, "the last build's records, but its functions");
+    assert_eq!(world.apply(&mut program, 3, &again), Applied::Anew);
+    let names: Vec<_> = read(&world.snapshot(&program)).into_iter().map(|it| it.0).collect();
+    assert_eq!(names, ["main"]);
+    assert_eq!(program.records().len(), 1, "the last build's records, but its functions");
 }
 
-fn read_names(graph: &Graph) -> Vec<String> {
-    read(&graph.snapshot()).into_iter().map(|it| it.0).collect()
+#[test]
+fn the_world_is_read_over_flecs_rest_and_never_written() {
+    let mut world = World::new().unwrap();
+    let mut program = world.program(Path::new("/w"));
+    world.apply(&mut program, 1, &began(1, "/w"));
+    let name = "<alloc::vec::Vec<u8>>::push";
+    let cold = fns(0, true, vec![function(0, 10, "anim::scene::render", &[1], How::Compiled { ns: 5 }),
+                                 function(1, 11, name, &[], How::Stored)]);
+    world.apply(&mut program, 1, &cold);
+    let answer = world.rest("GET", "/query?expr=Function").unwrap();
+    assert_eq!(answer.code, 200);
+    let body = String::from_utf8(answer.body).unwrap();
+    assert!(body.contains("anim::scene::render") && body.contains(name), "{body}");
+    let answer = world.rest("GET", "/query?expr=(Calls,*)").unwrap();
+    assert_eq!(answer.code, 200, "{}", String::from_utf8_lossy(&answer.body));
+    assert_eq!(world.rest("PUT", "/entity/made").unwrap().code, 403);
+    assert_eq!(world.rest("DELETE", "/entity/flecs").unwrap().code, 403);
+    // The modules of a function's path are entities under its crate.
+    let answer = world.rest("GET", "/query?expr=Module").unwrap();
+    let body = String::from_utf8(answer.body).unwrap();
+    assert!(body.contains("scene"), "{body}");
+}
+
+#[test]
+fn a_path_is_a_name_without_its_generic_arguments() {
+    assert_eq!(path_of("<alloc::vec::Vec<u8>>::push"), "alloc::vec::Vec::push");
+    assert_eq!(path_of("core::ptr::drop_in_place::<anim::Scene>"), "core::ptr::drop_in_place");
+    assert_eq!(
+        path_of("<wgpu::Texture as core::ops::drop::Drop>::drop"),
+        "<wgpu::Texture as core::ops::drop::Drop>::drop"
+    );
+    assert_eq!(path_of("<[u8] as core::ops::Index<core::ops::Range<usize>>>::index"),
+               "<[u8] as core::ops::Index>::index");
+    assert_eq!(path_of("anim::main::{closure#0}"), "anim::main::{closure#0}");
 }
 
 fn message(next: Next) -> Vec<u8> {
@@ -205,31 +240,48 @@ fn message(next: Next) -> Vec<u8> {
     }
 }
 
+fn gunzip(message: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(message.as_slice()).read_to_end(&mut out).unwrap();
+    out
+}
+
 #[test]
 fn a_page_is_sent_the_snapshot_then_each_record() {
     let graphs = Graphs::default();
-    let wait = Duration::from_millis(1);
-    graphs.record(Path::new("/w"), 1, &began(1, "/w"));
+    let wait = Duration::from_secs(10);
+    // What was handed to the world before is done once it answers.
+    let done = || assert_eq!(graphs.rest("GET", "/world").unwrap().code, 200);
+    graphs.record(Path::new("/w"), 1, began(1, "/w"));
     let cold = fns(0, true, vec![function(0, 10, "main", &[], How::Compiled { ns: 5 })]);
-    graphs.record(Path::new("/w"), 1, &cold);
-    let page = graphs.follow();
-    assert_eq!(read(&message(page.next(wait)))[0].0, "main");
+    graphs.record(Path::new("/w"), 1, cold.clone());
+    let page = graphs.follow().unwrap();
+    assert_eq!(read(&gunzip(message(page.next(wait))))[0].0, "main");
     let began_again = blaze_protocol::cbor::from_slice::<Record>(&message(page.next(wait)));
     assert_eq!(began_again.unwrap(), began(1, "/w"));
-    assert!(matches!(page.next(wait), Next::Nothing), "its functions are in the snapshot");
+    done();
+    assert!(matches!(page.next(Duration::ZERO), Next::Nothing), "its functions are in the snapshot");
     // A record of the build is sent as it is; one of another workspace is not, until that
-    // one's build begins, which sends its graph.
+    // one's build begins, which sends its program.
     let said = Record { at_ns: 2, event: Event::Unlisted { count: 3 } };
-    graphs.record(Path::new("/w"), 1, &said);
+    graphs.record(Path::new("/w"), 1, said.clone());
     assert_eq!(blaze_protocol::cbor::from_slice::<Record>(&message(page.next(wait))).unwrap(), said);
-    graphs.record(Path::new("/v"), 2, &said);
-    assert!(matches!(page.next(wait), Next::Nothing));
-    graphs.record(Path::new("/v"), 3, &began(3, "/v"));
-    assert!(read(&message(page.next(wait))).is_empty());
-    // A whole object of the workspace shown sends the graph anew, with the record in it.
-    graphs.record(Path::new("/v"), 3, &cold);
-    assert_eq!(read(&message(page.next(wait)))[0].0, "main");
-    drop(page);
-    graphs.record(Path::new("/v"), 3, &said);
-    assert!(graphs.state.lock().unwrap().followers.is_empty(), "a page that left is let go");
+    graphs.record(Path::new("/v"), 2, said.clone());
+    done();
+    assert!(matches!(page.next(Duration::ZERO), Next::Nothing));
+    graphs.record(Path::new("/v"), 3, began(3, "/v"));
+    assert!(read(&gunzip(message(page.next(wait)))).is_empty());
+    // A whole object of the workspace shown sends the program anew, with the record in it.
+    graphs.record(Path::new("/v"), 3, cold);
+    assert_eq!(read(&gunzip(message(page.next(wait))))[0].0, "main");
+}
+
+#[test]
+fn the_flecs_rest_of_the_page_is_under_its_token() {
+    let site = site();
+    let route = site.route(&get("/0123abcd/flecs/query?expr=Function"));
+    assert_eq!(route, Ok(Route::Flecs { path: "/query?expr=Function".into() }));
+    assert_eq!(site.route(&get("/0123abcd0/flecs/world")), Err(Refused::Forbidden));
+    let put = Request { method: "PUT".into(), ..get("/0123abcd/flecs/entity/made") };
+    assert_eq!(site.route(&put), Err(Refused::MethodNotAllowed));
 }

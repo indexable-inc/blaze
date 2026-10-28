@@ -16,6 +16,8 @@ doctest = false
 [dependencies]
 base64 = "0.23"
 blaze-protocol.workspace = true
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+flecs-c = { workspace = true, features = ["rest"] }
 getrandom = "0.3"
 rustc-hash.workspace = true
 sha1 = "0.10"

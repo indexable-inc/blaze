@@ -312,7 +312,7 @@ impl Build {
             // The live view finds the longest chain as it goes ([`Build::critical_path`]).
             Event::Critical { .. } => Change::Nothing,
             // The build page's (docs/web.md).
-            Event::Fns { .. } => Change::Nothing,
+            Event::Functions { .. } => Change::Nothing,
         }
     }
 

@@ -1,4 +1,4 @@
-//! The functions each build puts in the program, said as [`Event::Fns`] records beside the
+//! The functions each build puts in the program, said as [`Event::Functions`] records beside the
 //! process's socket as the codegen puts them in the object ([`hir_ty_codegen::watch`]): what
 //! the build page draws (docs/web.md).
 
@@ -11,8 +11,8 @@ use hir_ty_codegen::watch;
 /// only once it has a socket to say them beside.
 pub(crate) fn said() {
     watch::watch(Some(Arc::new(|object, whole, placed: Vec<watch::Placed>| {
-        let fns = placed.into_iter().map(function).collect();
-        crate::events::say(Event::Fns { object, whole, fns });
+        let functions = placed.into_iter().map(function).collect();
+        blaze_cargo::events::say(Event::Functions { object, whole, functions });
     })));
 }
 

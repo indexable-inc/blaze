@@ -71,6 +71,8 @@ impl Refused {
 pub(crate) enum Route {
     Asset(&'static str, &'static [u8]),
     Websocket { accept: String },
+    /// Flecs's REST over the world, at `path` (with its query) of it.
+    Flecs { path: String },
 }
 
 impl Site {
@@ -83,6 +85,7 @@ impl Site {
         let answered = match route {
             Ok(Route::Asset(kind, body)) => respond(&mut stream, "200 OK", kind, body),
             Ok(Route::Websocket { accept }) => self.follow(stream, &accept),
+            Ok(Route::Flecs { path }) => self.flecs(&mut stream, &path),
             Err(refused) => {
                 let body = refused.status().as_bytes();
                 respond(&mut stream, refused.status(), "text/plain; charset=utf-8", body)
@@ -114,6 +117,9 @@ impl Site {
         if request.method != "GET" {
             return Err(Refused::MethodNotAllowed);
         }
+        if let Some(path) = file.strip_prefix("flecs/") {
+            return Ok(Route::Flecs { path: format!("/{path}") });
+        }
         let file = file.split_once('?').map_or(file, |it| it.0);
         if file == "ws" {
             // A page of another site would send its own origin; a websocket from no page
@@ -139,7 +145,26 @@ impl Site {
         Ok(Route::Asset(kind_of(file), body))
     }
 
-    /// Sends the page what the graphs say, until it closes or goes away.
+    /// What Flecs's REST answers, read only.
+    fn flecs(&self, stream: &mut TcpStream, path: &str) -> io::Result<()> {
+        match self.graphs.rest("GET", path) {
+            Ok(answer) => {
+                let status = match answer.code {
+                    200 => "200 OK",
+                    400 => "400 Bad Request",
+                    403 => "403 Forbidden",
+                    404 => "404 Not Found",
+                    _ => "500 Internal Server Error",
+                };
+                respond(stream, status, &answer.kind, &answer.body)
+            }
+            Err(why) => {
+                respond(stream, "500 Internal Server Error", "text/plain; charset=utf-8", why.as_bytes())
+            }
+        }
+    }
+
+    /// Sends the page what the world says, until it closes or goes away.
     fn follow(&self, stream: TcpStream, accept: &str) -> io::Result<()> {
         let mut writer = stream.try_clone()?;
         let head = format!(
@@ -147,7 +172,7 @@ impl Site {
              Sec-WebSocket-Accept: {accept}\r\n\r\n"
         );
         writer.write_all(head.as_bytes())?;
-        let following = self.graphs.follow();
+        let following = self.graphs.follow().map_err(io::Error::other)?;
         // The page's side is read on a thread of its own, which writes nothing: a frame of
         // its would land inside one of this thread's.
         let reader = stream.try_clone()?;

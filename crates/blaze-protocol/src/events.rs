@@ -53,7 +53,7 @@ pub enum Event {
     /// Functions put in object `object` of the process's builds, as they were put in it. An
     /// object is `whole`, all of the program, or a patch of the last whole one with what an
     /// edit compiled again. A function is in one record of an object.
-    Fns { object: u32, whole: bool, fns: Vec<Function> },
+    Functions { object: u32, whole: bool, functions: Vec<Function> },
 }
 
 /// A function or instance of the program a build writes: what the build page draws.
