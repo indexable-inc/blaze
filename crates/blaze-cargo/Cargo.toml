@@ -62,6 +62,7 @@ blaze-new.workspace = true
 blaze-protocol.workspace = true
 blaze-tree.workspace = true
 blaze-ui.workspace = true
+blaze-web.workspace = true
 blaze-units.workspace = true
 blaze-resolve = { path = "../blaze-resolve" }
 blaze-registry = { path = "../blaze-registry" }

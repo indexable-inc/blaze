@@ -10,9 +10,9 @@ use hir_ty_codegen::watch;
 /// Has the codegen say the functions of every object from now on. A process says them
 /// only once it has a socket to say them beside.
 pub(crate) fn said() {
-    watch::watch(Some(Arc::new(|object, placed: Vec<watch::Placed>| {
+    watch::watch(Some(Arc::new(|object, whole, placed: Vec<watch::Placed>| {
         let fns = placed.into_iter().map(function).collect();
-        crate::events::say(Event::Fns { object, fns });
+        crate::events::say(Event::Fns { object, whole, fns });
     })));
 }
 

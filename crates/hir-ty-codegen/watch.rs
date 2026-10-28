@@ -45,9 +45,9 @@ pub enum How {
     Stored,
 }
 
-/// What is told the functions of an object, a batch at a time: the number of the object, and
-/// the batch.
-pub type Sink = dyn Fn(u32, Vec<Placed>) + Send + Sync;
+/// What is told the functions of an object, a batch at a time: the number of the object,
+/// whether it is of the whole program rather than a patch, and the batch.
+pub type Sink = dyn Fn(u32, bool, Vec<Placed>) + Send + Sync;
 
 static SINK: RwLock<Option<Arc<Sink>>> = RwLock::new(None);
 static WATCHED: AtomicBool = AtomicBool::new(false);
@@ -114,6 +114,7 @@ const EVERY: Duration = Duration::from_millis(100);
 /// What an object being built tells of its functions.
 pub(crate) struct Watch {
     object: u32,
+    whole: bool,
     sink: Arc<Sink>,
     batch: Vec<Placed>,
     since: Instant,
@@ -129,11 +130,12 @@ pub(crate) enum Of<'a> {
 }
 
 impl Watch {
-    /// The watch of a new object, when the build is watched.
-    pub(crate) fn new() -> Option<Watch> {
+    /// The watch of a new object, of the whole program or a patch, when the build is watched.
+    pub(crate) fn new(whole: bool) -> Option<Watch> {
         let sink = SINK.read().unwrap_or_else(|e| e.into_inner()).clone()?;
         Some(Watch {
             object: OBJECTS.fetch_add(1, Ordering::Relaxed),
+            whole,
             sink,
             batch: Vec::new(),
             since: Instant::now(),
@@ -199,7 +201,7 @@ impl Watch {
     fn flush(&mut self) {
         self.since = Instant::now();
         if !self.batch.is_empty() {
-            (self.sink)(self.object, std::mem::take(&mut self.batch));
+            (self.sink)(self.object, self.whole, std::mem::take(&mut self.batch));
         }
     }
 }

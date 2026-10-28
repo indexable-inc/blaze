@@ -35,9 +35,11 @@ in the object (`crates/hir-ty-codegen/watch.rs`), with
 | `calls` | the object's functions it calls, by `id`                                   |
 | `how`   | `Compiled { ns }`, `Unit` (an LLVM unit's), `Unchanged`, `Stored`          |
 
-A cold build says every function of the program; a build of an edit says only those it put in
-the patch. The daemon keeps one graph per workspace, merging each build's functions into it
-by `key`, so the page of an edited program still shows all of it.
+A record is of one `object` and says whether it is `whole`. A whole object (a cold build,
+or a build that wrote the program again) says every function of the program, and begins the
+workspace's graph again; a patch (a build of an edit) says only those it compiled again,
+which are merged into the graph by `key`, so the page of an edited program still shows all of
+it. The daemon keeps one graph per workspace.
 
 ## The wire
 
@@ -56,7 +58,8 @@ messages from the server are binary:
    has), and each record of every build from then on as it comes: one CBOR item of
    [`Record`](../crates/blaze-protocol/src/events.rs) per message, in the deterministic
    encoding of the socket, without the socket's length prefix.
-3. A build of another workspace sends a new snapshot first.
+3. A build of another workspace, and the first record of a whole object, send a new snapshot
+   in place of the record (it is in the snapshot): the page starts over from it.
 
 What the page sends is ignored but for a close.
 

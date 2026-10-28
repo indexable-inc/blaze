@@ -5389,7 +5389,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             found_instances: FxHashMap::default(),
             stored_roots: FxHashMap::default(),
             root_names: FxHashMap::default(),
-            watch: watch::Watch::new(),
+            watch: watch::Watch::new(base.is_none()),
         })
     }
 

@@ -50,10 +50,10 @@ pub enum Event {
     /// What held the build up: each node of it is the one the next waited for last, from the
     /// first to the one that finished last.
     Critical { path: Vec<u32> },
-    /// Functions put in object `object` of the process's builds, as they were put in it: the
-    /// first build of a program writes all of it, a build of an edit only what it compiled
-    /// again. A function is in one record of an object.
-    Fns { object: u32, fns: Vec<Function> },
+    /// Functions put in object `object` of the process's builds, as they were put in it. An
+    /// object is `whole`, all of the program, or a patch of the last whole one with what an
+    /// edit compiled again. A function is in one record of an object.
+    Fns { object: u32, whole: bool, fns: Vec<Function> },
 }
 
 /// A function or instance of the program a build writes: what the build page draws.
