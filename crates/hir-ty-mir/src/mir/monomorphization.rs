@@ -8,7 +8,7 @@
 //! So the monomorphization should be called even if the substitution is empty.
 
 use rustc_next_trait_solver::placeholder::BoundVarReplacer;
-use rustc_type_ir::inherent::{IntoKind, Ty as _};
+use rustc_type_ir::inherent::IntoKind;
 use rustc_type_ir::{
     FallibleTypeFolder, TypeFlags, TypeFoldable, TypeSuperFoldable, TypeVisitableExt, UniverseIndex,
 };
@@ -24,7 +24,7 @@ use crate::{
 use crate::{
     db::{HirDatabase, InternedClosureId, InternedCoroutineId, InternedOpaqueTyId},
     next_solver::{
-        AliasTy, AliasTyKind, Binder, DbInterner, GenericArgs, SolverDefId, Ty, TyKind, TypingMode,
+        AliasTyKind, Binder, DbInterner, GenericArgs, SolverDefId, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
         references_non_lt_error,
@@ -377,7 +377,7 @@ pub fn monomorphized<'db>(
     Ok(body)
 }
 
-/// The opaque type of the impl's method that `opaque`, the `impl Trait` a trait's method returns,
+/// The type of the impl's method that `opaque`, the `impl Trait` a trait's method returns,
 /// is with `args`, once they name the impl: `None` for one of another function, or while they
 /// don't.
 pub fn opaque_of_impl<'db>(
@@ -400,7 +400,8 @@ pub fn opaque_of_impl<'db>(
     // The arguments for the lifetimes the method's parameters leave out follow its own.
     let elided = crate::elided_lifetimes(db, func).len() as usize;
     let own = args.len().checked_sub(elided)?;
-    let (own, elided_args) = args.as_slice().split_at(own);
+    let args_for_bounds = args.as_slice();
+    let (own, _) = args_for_bounds.split_at(own);
     // Which impl it is does not depend on lifetimes, and those of a solver's own are not ours.
     let own = rustc_type_ir::fold_regions(interner, GenericArgs::new_from_slice(own), |_, _| {
         Region::new_erased(interner)
@@ -411,20 +412,69 @@ pub fn opaque_of_impl<'db>(
     if implemented == func {
         return None;
     }
-    let args = match crate::elided_lifetimes(db, implemented).len() as usize {
-        len if len == elided => {
-            GenericArgs::new_from_iter(args.iter().chain(elided_args.iter().copied()))
-        }
-        len => GenericArgs::new_from_iter(
-            args.iter().chain(std::iter::repeat_n(Region::error(interner).into(), len)),
-        ),
+    let output = |method: hir_def::FunctionId, args: GenericArgs<'db>| {
+        db.callable_item_signature(method.into())
+            .instantiate(interner, args)
+            .skip_norm_wip()
+            .skip_binder()
+            .output()
     };
-    let opaque =
-        InternedOpaqueTyId::new(db, crate::ImplTraitId::ReturnTypeImplTrait(implemented, idx));
-    Some(Ty::new_alias(
+    let declared = output(func, own);
+    let actual = rustc_type_ir::fold_regions(interner, output(implemented, args), |_, _| {
+        Region::new_erased(interner)
+    });
+    let opaque_id = |ty: Ty<'db>| {
+        let TyKind::Alias(alias) = ty.kind() else { return None };
+        let AliasTyKind::Opaque { def_id } = alias.kind else { return None };
+        let SolverDefId::InternedOpaqueTyId(id) = def_id.into() else { return None };
+        Some(id)
+    };
+    if opaque_id(declared) == Some(opaque) {
+        return Some(actual);
+    }
+    // Match the implementation's return type and associated type bindings with the
+    // trait's. Its concrete types need not declare any opaque types in the same positions.
+    let bounds = crate::SelfAndAssocBounds::return_type_impl_traits(db, func);
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    let vars: Vec<_> = bounds.iter().map(|_| infcx.next_ty_var(crate::Span::Dummy)).collect();
+    let mut folder = crate::next_solver::util::BottomUpFolder {
         interner,
-        AliasTy::new_from_args(interner, AliasTyKind::Opaque { def_id: opaque.into() }, args),
-    ))
+        ty_op: |ty| match opaque_id(ty).map(|id| id.loc(db)) {
+            Some(crate::ImplTraitId::ReturnTypeImplTrait(f, i)) if f == func => {
+                vars.get(i.into_raw().into_u32() as usize).copied().unwrap_or(ty)
+            }
+            _ => ty,
+        },
+        lt_op: |region| region,
+        ct_op: |ct| ct,
+    };
+    let mut ocx = ObligationCtxt::new(&infcx);
+    let cause = ObligationCause::dummy();
+    let declared =
+        rustc_type_ir::fold_regions(interner, declared, |_, _| Region::new_erased(interner));
+    ocx.eq(&cause, env.param_env, declared.fold_with(&mut folder), actual).ok()?;
+    for bound in bounds {
+        for clause in bound.self_bounds().iter_instantiated_copied(interner, args_for_bounds) {
+            if matches!(clause.kind().skip_binder(), rustc_type_ir::ClauseKind::Projection(_)) {
+                let clause =
+                    rustc_type_ir::fold_regions(interner, clause.skip_norm_wip(), |_, _| {
+                        Region::new_erased(interner)
+                    });
+                ocx.register_obligation(crate::next_solver::infer::traits::Obligation::new(
+                    interner,
+                    cause.clone(),
+                    env.param_env,
+                    clause.fold_with(&mut folder),
+                ));
+            }
+        }
+    }
+    if !ocx.evaluate_obligations_error_on_ambiguity().is_empty() {
+        return None;
+    }
+    let ty = infcx.resolve_vars_if_possible(*vars.get(idx.into_raw().into_u32() as usize)?);
+    (!ty.has_infer() && !ty.has_escaping_bound_vars() && !references_non_lt_error(&ty))
+        .then_some(ty)
 }
 
 /// `ty` of a monomorphized body with its aliases normalized, as the body's own types are.

@@ -10,8 +10,8 @@
 //! A registry package the lock file does not pin is chosen from the registry's index, as
 //! cargo chooses it, and a lock file that is missing or that the manifests no longer agree
 //! with is written again, as cargo writes it. What it does not do yet is an error: a git or
-//! vendored-directory package the lock file does not pin, `[replace]`, a registry with a git
-//! index, and a dependency of a registry package whose `.crate` cannot be fetched.
+//! vendored-directory package the lock file does not pin, a registry with a git index, and a
+//! dependency of a registry package whose `.crate` cannot be fetched.
 
 mod graph;
 mod summary;
@@ -604,9 +604,7 @@ fn resolving_with<R>(
     let ctx = Context::new(config);
     let ws = Workspace::new(&root_manifest(asked.manifest_path, &ctx)?, &ctx)?;
     let root = ws.root().to_owned();
-    if summary::has_replace(&root)? {
-        bail!("`[replace]` is not read by blaze yet");
-    }
+    let replace = summary::replace_table(&root)?;
     let lock_path = root.join("Cargo.lock");
     let lock_text = match std::fs::read_to_string(&lock_path) {
         Ok(text) => Some(text),
@@ -690,7 +688,7 @@ fn resolving_with<R>(
         members: members_of(),
         path_packages: &by_path,
         patch: &patch,
-        replace: &[],
+        replace: &replace,
         require_optional_deps: true,
         version_ordering: VersionOrdering::MaximumVersionsFirst,
         rust_versions: rust_versions(asked, &ctx, behavior, &member_rust_versions)?,
@@ -944,12 +942,13 @@ fn selected(
     Ok(ids.iter().map(|id| id.to_spec()).collect())
 }
 
-/// The path packages that are not members: those the members and the root's `[patch]` name
-/// by path, and theirs in turn.
+/// The path packages that are not members: those the members and the root's `[patch]` and
+/// `[replace]` name by path, and theirs in turn.
 fn path_packages(ws: &Workspace<'_>, root: &Path, ctx: &Context) -> Result<Vec<Package>> {
     let members: Vec<PathBuf> =
         ws.members().filter_map(|(path, _)| path.parent().map(Path::to_owned)).collect();
     let mut queue = summary::patch_paths(root)?;
+    queue.extend(summary::replace_paths(&summary::replace_table(root)?));
     for (path, m) in ws.members() {
         queue.extend(path_dependencies(&serde_json::to_value(export_package(path, m))?));
     }

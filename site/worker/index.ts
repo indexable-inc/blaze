@@ -35,7 +35,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 	if (p.startsWith('/audio/')) return handleAudio(request, env, url);
 	if (p === '/learn' || p === '/learn/') return new Response(null, { status: 301, headers: { location: `${outer('/')}${url.search}`, 'cache-control': 'public, max-age=3600' } });
 	if (p === '/' && !acceptsHtml(request)) return installer(request, env, url);
-	const res = (await handlePage(request, env, ctx, url)) ?? assetHeaders(await env.ASSETS.fetch(request));
+	const res = (await handlePage(request, env, ctx, url)) ?? assetHeaders(await env.ASSETS.fetch(request), p);
 	if (p === '/') res.headers.append('vary', 'Accept');
 	return res;
 }

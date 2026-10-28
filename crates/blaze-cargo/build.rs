@@ -1,44 +1,14 @@
-//! `BLAZE_GIT_SHA`, the commit `blaze --version` names, and on macOS the sandbox's library
-//! (`BLAZE_SANDBOX_LIBRARY`). The SHA-256 is written here rather than taken from `sha2`, as in
-//! crates/blaze-engine/build.rs: a build dependency is built for the machine that builds.
+//! On macOS, the sandbox's library (`BLAZE_SANDBOX_LIBRARY`). The SHA-256 is written here rather
+//! than taken from `sha2`, as in crates/blaze-engine/build.rs: a build dependency is built for
+//! the machine that builds. Which blaze this is (its version and commit) is crates/blaze-engine's
+//! build.rs's, the one crate that changes with every commit anyway, and reaches this crate
+//! through `engine::Engine`: this crate's build stays the same from commit to commit.
 
 use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    git_sha();
     sandbox_library();
-}
-
-/// `BLAZE_GIT_SHA`, the commit `blaze --version` names (`blaze 0.20261026.0 (fb82b09)`): what
-/// the build was told (the release workflow and the flake set it, where there is no `.git`),
-/// else the checkout's HEAD in seven characters, else none, as a published crate builds. The
-/// build runs again when HEAD moves (its reflog grows with each commit and checkout).
-fn git_sha() {
-    println!("cargo:rerun-if-env-changed=BLAZE_GIT_SHA");
-    let given = std::env::var("BLAZE_GIT_SHA").unwrap_or_default();
-    let sha = if given.is_empty() {
-        let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(env!("CARGO_MANIFEST_DIR"))
-                .output()
-                .ok()
-                .filter(|out| out.status.success())?;
-            String::from_utf8(out.stdout).ok().map(|it| it.trim().to_owned())
-        };
-        for path in ["HEAD", "logs/HEAD"] {
-            if let Some(file) = git(&["rev-parse", "--path-format=absolute", "--git-path", path]) {
-                println!("cargo:rerun-if-changed={file}");
-            }
-        }
-        git(&["rev-parse", "--short=7", "HEAD"]).unwrap_or_default()
-    } else {
-        given
-    };
-    if !sha.is_empty() {
-        println!("cargo:rustc-env=BLAZE_GIT_SHA={sha}");
-    }
 }
 
 /// On macOS, the library every process of a sandbox loads (`src/sandbox/macos_interpose.c`),

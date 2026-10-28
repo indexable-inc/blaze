@@ -12,10 +12,18 @@
 #       write the caches every other run reads. They are not cancelled by the next push, as the
 #       train is, so the caches are written for every commit.
 #
-# A change to nothing but documentation, the site or the agent rules (agents/) runs the script
-# checks alone. `ci` is the one check that says whether everything that ran passed: it is the
-# check branch rules and the merge queue require. The queue tests each pull request merged onto main and whatever is ahead
-# of it, and main moves only to what it tested.
+# A change runs the build and the unit tests only when it touches a file they read: the crates,
+# the vendored crates, the workspace's manifest, lock file, cargo config, .rustfmt.toml and
+# .clippy.toml, the pinned nightly (harness/toolchain), harness/unittests.py, the flake, the
+# release of blaze that builds blaze (.github/blaze-version, install.sh), and these workflows
+# and the actions they use; on a push to main, also the smoke corpus (harness/smoke.py,
+# harness/smoke/). .github/scripts/gate_changes.py has the list and why each path is on it. It
+# names what is code, so a new directory is not: any other change (documentation, the site,
+# benches, the other harnesses and workflows) runs the script checks alone, and a list of files
+# that cannot be had counts as code. `ci` is the one check that says whether everything that
+# ran passed: it is the check branch rules and the merge queue require. The queue tests each
+# pull request merged onto main and whatever is ahead of it, and main moves only to what it
+# tested.
 name: blaze
 on:
   push:
@@ -36,9 +44,9 @@ permissions:
 
 jobs:
   # Which tier runs: `gate` for a pull request and the merge queue, `warm` for a push to main
-  # (or by hand), or `none` for a change to nothing but documentation (the pull request's files,
-  # the merge queue entry's or the push's against the commit before it). Anything that cannot
-  # be told counts as code.
+  # (or by hand), or `none` for a change that touches no file the tier reads (the pull
+  # request's files, the merge queue entry's or the push's against the commit before it;
+  # .github/scripts/gate_changes.py). Anything that cannot be told counts as code.
   changes:
     name: changes
     runs-on: ubuntu-24.04
@@ -46,39 +54,20 @@ jobs:
     outputs:
       tier: ${{ steps.files.outputs.tier }}
     steps:
+      # The script alone: the job decides in seconds, before a whole checkout.
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
       - id: files
         env:
           GH_TOKEN: ${{ github.token }}
-          EVENT: ${{ github.event_name }}
-          BEFORE: ${{ github.event.before }}
-          AFTER: ${{ github.sha }}
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD: ${{ github.event.pull_request.head.sha }}
-          QUEUE_BASE: ${{ github.event.merge_group.base_sha }}
-          QUEUE_HEAD: ${{ github.event.merge_group.head_sha }}
           TIER: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'warm' || 'gate' }}
+          # Empty on a run by hand, which then counts as code.
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
         run: |
-          case "$EVENT" in
-            pull_request) range="$PR_BASE...$PR_HEAD";;
-            push) range="$BEFORE...$AFTER";;
-            merge_group) range="$QUEUE_BASE...$QUEUE_HEAD";;
-            *) range=;;
-          esac
-          files=
-          if [ -n "$range" ]; then
-            files=$(gh api "repos/$GITHUB_REPOSITORY/compare/$range" --jq 'if (.files | length) >= 300 then "" else .files[].filename end') || files=
-          fi
-          code=false
-          [ -n "$files" ] || code=true
-          while read -r file; do
-            case "$file" in
-              .github/workflows/blaze*.yaml|.github/actions/*) code=true;;
-              *.md|docs/*|site/*|agents/*|LICENSE*|.github/*) ;;
-              *) code=true;;
-            esac
-          done <<< "$files"
-          [ "$code" = true ] || TIER=none
-          echo "tier=$TIER" | tee -a "$GITHUB_OUTPUT"
+          python3 .github/scripts/gate_changes.py \
+            "{\"tier\": \"$TIER\", \"repository\": \"$GITHUB_REPOSITORY\", \"base\": \"$BASE\", \"head\": \"$HEAD\"}"
 
   scripts:
     name: harness imports, rustc sites
@@ -91,11 +80,11 @@ jobs:
       - run: python3 harness/imports.py
       # No new place in blaze's code starts rustc, rustdoc or cargo (docs/no-rustc.md).
       - run: python3 harness/rustcsites.py
-      # The agent rules: agents/rules.ts type-checks, and AGENTS.md is what it generates.
+      # The agent rules: tools/agents/rules.ts type-checks, and AGENTS.md is what it generates.
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile --cwd site
-      - run: site/node_modules/.bin/tsc -p agents
-      - run: bun agents/rules.ts --check
+      - run: site/node_modules/.bin/tsc -p tools/agents
+      - run: bun tools/agents/rules.ts --check
 
   linux-x64:
     name: linux x64

@@ -93,8 +93,9 @@ impl Site {
         self.pages.iter().find(|p| p.url == url)
     }
 
+    /// The page takes comments: block by block (`Discussable`), or on the page as a whole (every page not `Quiet`).
     pub fn is_discussable(&self, page: &Page) -> bool {
-        self.world.get(page.node).has_tag("Discussable")
+        crate::render::talks(self.world.get(page.node))
     }
 
     /// The spoken lines of the page at `url` (`spoken.rs`), in order.

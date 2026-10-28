@@ -10,8 +10,22 @@ blaze has two release channels, made of the same releases:
 
 ## Versions
 
-A release is `v0.YYYYMMDD.N` (`0.YYYYMMDD.N` in Cargo.toml and `blaze --version`), N counting
-the releases of that day (UTC) from 0. `.github/scripts/train_release.py` picks the number.
+A release is `v0.YYYYMMDD.N` (`0.YYYYMMDD.N` in `blaze --version`), N counting the releases of
+that day (UTC) from 0. `.github/scripts/train_release.py` picks the number.
+
+The version is never committed. Cargo.toml's workspace version stays `0.0.0` on main: it is
+part of every crate's identity (`CARGO_PKG_VERSION`), so a version committed with each release
+made every build of main after it miss blaze's store and rebuild all of blaze. A release's
+build is told which release it is by `BLAZE_RELEASE` (the tag), which release.yaml sets and
+only `crates/blaze-engine/build.rs` reads, the one crate that changes with every commit anyway;
+the rest of blaze is asked through `blaze_cargo::engine`. It says
+
+    blaze 0.20261028.9 (fb82b09 2026-10-28)     a release: the version, the commit and its date (UTC)
+    blaze 0.0.0-dev (fb82b09)                   a build of the tree: no release, and no pin names it
+
+The version is the second field (`.github/actions/blaze` reads it). The binary does not know its
+channel: a canary is made stable unchanged. Where a manifest's version must be the release's
+(publishing to crates.io), `canary.py stamp` writes it into that job's checkout only.
 
 A version is one release on one tag, for good: **promotion flips that same release** from
 prerelease to stable and makes it GitHub's *Latest*. No second tag is made and no asset is
@@ -53,16 +67,15 @@ through the API and dispatches `release.yaml` on the tag, when
   green push or the hourly run.
 
 No commit goes to main, so a cut never races a merge, and a canary is the bytes of a commit
-that passed the gate as it is. release.yaml stamps the tag's version into its own checkout
-(Cargo.toml's workspace version and the workspace's entries of Cargo.lock, `canary.py stamp`),
-so `blaze --version` and the archives' names are the tag's, and writes the notes: CHANGELOG.md's
-[Unreleased] and the title of each change merged since the previous release. Main's Cargo.toml
-keeps the version of the last release commit.
+that passed the gate as it is. release.yaml builds it with `BLAZE_RELEASE` set to the tag, so
+`blaze --version` and the archives' names are the tag's, and writes the notes (`canary.py
+notes`): the lines CHANGELOG.md's [Unreleased] gained since the previous release and the title
+of each change merged since then. [Unreleased] is never emptied: a release's notes are in its
+GitHub release, not in a section of CHANGELOG.md.
 
-`release-cut.yaml` (by hand, on main) or the release train's `release` job still cuts a release
-the old way: it commits `release: v0.YYYYMMDD.N` (the version, a CHANGELOG.md section, Cargo.lock,
-nix/units) and tags it, and that release's notes are its CHANGELOG.md section. Both count every
-tag, so they never take the same number.
+`release-cut.yaml` (by hand, on main) or the release train's `release` job cuts a release of
+main's HEAD the same way (`train_release.py`): a tag through the API and release.yaml on it,
+no commit. Both count every tag, so they never take the same number.
 
 Either way `release.yaml` builds the archives on the tag for macOS (Apple silicon) and Linux
 (x86-64, ARM64) and publishes them as a prerelease with `SHA256SUMS`. PGO is off for now (#870):

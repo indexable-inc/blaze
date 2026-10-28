@@ -1,13 +1,13 @@
 //! A package as `cargo metadata` prints it, read as blaze-resolve's `Summary`, and the root
-//! manifest's `[patch]` tables.
+//! manifest's `[patch]` and `[replace]` tables.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use blaze_resolve::workspace_resolve::Patch;
 use blaze_resolve::{
-    DepKind, Dependency, GitReference, InternedString, Platform, SourceId, Summary,
+    DepKind, Dependency, GitReference, InternedString, PackageIdSpec, Platform, SourceId, Summary,
 };
 use serde_json::Value;
 use url::Url;
@@ -211,7 +211,117 @@ pub(crate) fn patch_tables(root: &Path) -> Result<Vec<(Url, Vec<Patch>)>> {
     Ok(tables)
 }
 
-/// Whether the root manifest has a `[replace]` table, which blaze does not read yet.
-pub(crate) fn has_replace(root: &Path) -> Result<bool> {
-    Ok(root_table(root)?.contains_key("replace"))
+/// The root manifest's `[replace]`, as cargo 1.99's `toml::replace` reads it: each key a spec
+/// with a version (its source crates.io unless it names one), each value the source it is
+/// replaced with, required at exactly that version.
+pub(crate) fn replace_table(root: &Path) -> Result<Vec<(PackageIdSpec, Dependency)>> {
+    let manifest = root_table(root)?;
+    let Some(table) = manifest.get("replace").and_then(|r| r.as_table()) else {
+        return Ok(Vec::new());
+    };
+    if manifest.contains_key("patch") {
+        bail!("cannot specify both [replace] and [patch]");
+    }
+    let mut replace = Vec::new();
+    for (key, entry) in table {
+        let mut spec = PackageIdSpec::parse(key).with_context(|| {
+            format!(
+                "replacements must specify a valid semver version to replace, but `{key}` does not"
+            )
+        })?;
+        if spec.url().is_none() {
+            spec = spec.with_url(SourceId::crates_io().url().clone());
+        }
+        if entry.is_str() || entry.get("version").is_some() {
+            bail!("replacements cannot specify a version requirement, but found one for `{spec}`");
+        }
+        if entry.get("registry").is_some() {
+            bail!("blaze reads no `registry` in `[replace]` (for `{spec}`)");
+        }
+        let version = spec.version().ok_or_else(|| {
+            anyhow!("replacements must specify a version to replace, but `{spec}` does not")
+        })?;
+        let mut entry = entry.clone();
+        if let Some(it) = entry.as_table_mut() {
+            it.insert("version".to_owned(), toml::Value::String(format!("={version}")));
+        }
+        let dep = patch_dependency(root, spec.name(), &entry)?.context("a `[replace]` entry")?;
+        replace.push((spec, dep));
+    }
+    Ok(replace)
+}
+
+/// The directories of the path packages the root manifest's `[replace]` names.
+pub(crate) fn replace_paths(replace: &[(PackageIdSpec, Dependency)]) -> Vec<PathBuf> {
+    replace.iter().filter_map(|(_, dep)| dep.source_id().local_path()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root_with(name: &str, manifest: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("blaze-replace-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Cargo.toml"), manifest).unwrap();
+        root
+    }
+
+    fn replace_of(name: &str, table: &str) -> Result<Vec<(PackageIdSpec, Dependency)>> {
+        replace_table(&root_with(name, &format!("[workspace]\n\n[replace]\n{table}")))
+    }
+
+    #[test]
+    fn a_name_and_version_is_a_crates_io_package_replaced_at_exactly_that_version() {
+        let replace =
+            replace_of("crates-io", "\"foo:0.1.0\" = { path = \"vendor/../foo\" }").unwrap();
+        let [(spec, dep)] = &replace[..] else { panic!("{replace:?}") };
+        assert_eq!(spec.name(), "foo");
+        assert_eq!(spec.version(), Some(semver::Version::new(0, 1, 0)));
+        assert_eq!(spec.url(), Some(SourceId::crates_io().url()));
+        assert_eq!(dep.package_name().as_str(), "foo");
+        assert_eq!(dep.version_req().to_string(), "=0.1.0");
+        let root = root_with("crates-io", "");
+        assert_eq!(dep.source_id().local_path(), Some(root.join("foo")));
+        assert_eq!(replace_paths(&replace), vec![root.join("foo")]);
+    }
+
+    #[test]
+    fn a_spec_names_its_own_source() {
+        let replace = replace_of(
+            "source",
+            "\"registry+file:///r/index#dep@0.1.0\" = { git = \"https://example.com/dep\", tag = \"v1\" }",
+        )
+        .unwrap();
+        let [(spec, dep)] = &replace[..] else { panic!("{replace:?}") };
+        assert_eq!(spec.url().map(Url::as_str), Some("file:///r/index"));
+        assert!(dep.source_id().is_git());
+        assert!(replace_paths(&replace).is_empty());
+    }
+
+    #[test]
+    fn what_cargo_refuses_is_refused() {
+        let err = |name, table| replace_of(name, table).unwrap_err().to_string();
+        assert_eq!(
+            err("noversion", "foo = { path = \"foo\" }"),
+            "replacements must specify a version to replace, but \
+             `https://github.com/rust-lang/crates.io-index#foo` does not"
+        );
+        assert!(
+            err("req", "\"foo:0.1.0\" = { path = \"foo\", version = \"0.1\" }")
+                .starts_with("replacements cannot specify a version requirement")
+        );
+        assert!(err("string", "\"foo:0.1.0\" = \"0.1\"").starts_with("replacements cannot"));
+        let both = "[workspace]\n[patch.crates-io]\nfoo = { path = \"foo\" }\n[replace]\n\"foo:0.1.0\" = { path = \"foo\" }";
+        assert_eq!(
+            replace_table(&root_with("both", both)).unwrap_err().to_string(),
+            "cannot specify both [replace] and [patch]"
+        );
+    }
+
+    #[test]
+    fn no_replace_table_is_no_replacement() {
+        assert!(replace_table(&root_with("none", "[workspace]\n")).unwrap().is_empty());
+    }
 }

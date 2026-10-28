@@ -20,6 +20,10 @@
  * A page is swapped in only when it was built with the same scripts and styles as this document (the worker's
  * `x-blaze-assets` header against `BLAZE_ASSETS`, both from gen/build.ts): after a deploy, the next click is a load.
  *
+ * A deploy that changed only content (client/lib/update.ts asks with `blaze:refresh`) fetches the page in view again,
+ * past the cache, and swaps it in where it is: no history entry, the scroll and focus kept, the sidebar left alone.
+ * It answers with `blaze:refreshed` (whether it could); it never falls back to a load itself.
+ *
  * Only left clicks with no modifier on a same-origin link under the site's base are taken: not downloads, links with
  * a target, hash links within the page (the browser scrolls), the worker's routes that act (/api, /auth) or serve
  * files (/audio), or files (`install.sh`, `search.json`). Anything that goes wrong (not 200, not HTML, a redirect out of
@@ -28,13 +32,13 @@
  * a plain link.
  */
 
-import { LEAVE, PAGE } from './lib/page';
+import { LEAVE, PAGE, REFRESH, REFRESHED } from './lib/page';
 
 /** The hash of the client scripts and styles this bundle was built with (gen/build.ts, Bun.build `define`). */
 declare const BLAZE_ASSETS: string;
 
 type Got = { url: string; html: string; live: boolean };
-type How = { mode: 'push' | 'replace' | 'pop'; scroll?: number };
+type How = { mode: 'push' | 'replace' | 'pop' | 'refresh'; scroll?: number };
 
 class Miss extends Error {}
 
@@ -83,8 +87,9 @@ function linkOf(e: Event): HTMLAnchorElement | null {
 const cache = new Map<string, Promise<Got>>();
 const key = (u: URL) => u.origin + u.pathname + u.search;
 
-async function fetchPage(url: URL): Promise<Got> {
-	const res = await fetch(key(url), { headers: { Accept: 'text/html' }, credentials: 'same-origin' });
+async function fetchPage(url: URL, fresh = false): Promise<Got> {
+	// Fresh: revalidated with the server, so a page the browser kept from before a deploy isn't swapped back in.
+	const res = await fetch(key(url), { headers: { Accept: 'text/html' }, credentials: 'same-origin', cache: fresh ? 'no-cache' : 'default' });
 	if (!res.ok) throw new Miss(`HTTP ${res.status}`);
 	if (!/^text\/html\b/.test(res.headers.get('content-type') ?? '')) throw new Miss('not HTML');
 	if (res.headers.get('x-blaze-assets') !== BLAZE_ASSETS) throw new Miss('built with other scripts or styles');
@@ -125,7 +130,10 @@ function fits(doc: Document): boolean {
 	if (rows(doc) !== rows(document)) return false;
 	const sheets = (d: Document) => [...d.querySelectorAll('link[rel="stylesheet"]')].map((l) => l.getAttribute('href')).join('\n');
 	if (sheets(doc) !== sheets(document)) return false;
-	return [...doc.querySelectorAll('script[src]')].every((s) => new URL(s.getAttribute('src')!, location.href).origin === location.origin);
+	// A script from elsewhere that this page doesn't have would need a load to run. One both have, like the analytics
+	// beacon Cloudflare adds to every page, is not a different frame.
+	const have = new Set([...document.querySelectorAll('script[src]')].map((s) => s.getAttribute('src')));
+	return [...doc.querySelectorAll('script[src]')].every((s) => have.has(s.getAttribute('src')) || new URL(s.getAttribute('src')!, location.href).origin === location.origin);
 }
 
 function saveScroll() {
@@ -149,7 +157,7 @@ function swapHead(doc: Document) {
 }
 
 /** The sidebar's open row and section, from the new page's. */
-function swapSide(doc: Document) {
+function swapSide(doc: Document, scroll = true) {
 	const href = doc.querySelector('.navlist [aria-current="page"]')?.getAttribute('href') ?? null;
 	for (const r of document.querySelectorAll('.navlist [aria-current]')) r.removeAttribute('aria-current');
 	const open = new Set([...doc.querySelectorAll<HTMLElement>('details.sec[data-here]')].map((d) => d.dataset.sec));
@@ -165,6 +173,7 @@ function swapSide(doc: Document) {
 	row.setAttribute('aria-current', 'page');
 	for (let d = row.parentElement?.closest('details'); d; d = d.parentElement?.closest('details')) d.open = true;
 	// Into view if it is out of it, as a load would centre it; otherwise the sidebar doesn't move.
+	if (!scroll) return;
 	const box = document.querySelector<HTMLElement>('.side .scrollbox');
 	if (!box || box.clientHeight === 0) return;
 	const a = row.getBoundingClientRect();
@@ -214,19 +223,20 @@ function focusTitle() {
 let seq = 0;
 
 function fallback(url: URL, how: How) {
-	if (how.mode === 'pop') location.reload();
+	if (how.mode === 'refresh') dispatchEvent(new CustomEvent(REFRESHED, { detail: false }));
+	else if (how.mode === 'pop') location.reload();
 	else location.assign(url.href);
 }
 
 async function go(url: URL, how: How) {
 	const n = ++seq;
-	if (how.mode !== 'pop') saveScroll();
+	if (how.mode === 'push' || how.mode === 'replace') saveScroll();
 	// A slow fetch shows the progress cursor, as a load would show its bar.
 	const wait = setTimeout(() => document.documentElement.classList.add('nav-wait'), 150);
 	let got: Got;
 	let doc: Document;
 	try {
-		got = await load(url);
+		got = how.mode === 'refresh' ? await fetchPage(url, true) : await load(url);
 		if (n !== seq) return;
 		doc = new DOMParser().parseFromString(got.html, 'text/html');
 		if (!fits(doc)) throw new Miss('a different frame');
@@ -248,19 +258,23 @@ async function go(url: URL, how: How) {
 		// A later navigation (a click, back or forward) started while this one waited for the transition: it wins.
 		if (n !== seq) return;
 		dispatchEvent(new Event(LEAVE));
+		const refresh = how.mode === 'refresh';
 		if (how.mode === 'push') history.pushState({ blaze: 1, scroll: 0 }, '', next.href);
 		else if (how.mode === 'replace') history.replaceState({ blaze: 1, scroll: 0 }, '', next.href);
 		shown = here();
 		swapHead(doc);
 		document.querySelector('.pane > .grid')!.replaceWith(document.adoptNode(doc.querySelector('.pane > .grid')!));
-		swapSide(doc);
+		swapSide(doc, !refresh);
 		place(how);
 		// Before the page scripts, so one that focuses something of its own (a comment form for #block-x) keeps it.
-		focusTitle();
+		// A refresh leaves the focus where the reader has it (the chat, the search), unless it was in the old page.
+		if (!refresh || !document.activeElement || document.activeElement === document.body) focusTitle();
 		dispatchEvent(new Event(PAGE));
+		if (refresh) dispatchEvent(new CustomEvent(REFRESHED, { detail: true }));
 	};
 	try {
-		if (still.matches || typeof document.startViewTransition !== 'function') apply();
+		// A refresh is the same page: no cross-fade.
+		if (still.matches || how.mode === 'refresh' || typeof document.startViewTransition !== 'function') apply();
 		else await document.startViewTransition(apply).updateCallbackDone;
 	} catch (e) {
 		// Half swapped: the browser loads the URL now in the address bar, which is the new page's.
@@ -360,3 +374,13 @@ let scrolled: ReturnType<typeof setTimeout> | undefined;
 		{ passive: true },
 	);
 }
+
+// A deploy changed the content (client/lib/update.ts): every page kept ahead may be the old one, and this one is.
+addEventListener(REFRESH, () => {
+	cache.clear();
+	const n = seq + 1;
+	void go(new URL(location.href), { mode: 'refresh', scroll: scrollY }).then(() => {
+		// A click, back or forward took over: that page came past the cleared cache, so it is the new one too.
+		if (seq !== n) dispatchEvent(new CustomEvent(REFRESHED, { detail: true }));
+	});
+});

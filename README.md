@@ -29,7 +29,8 @@ rustup already has that same nightly). Rather use crates.io or Nix?
 [Other ways to install](docs/install.md).
 
 That installs **stable**: a release that passed the heavy tests (real projects on macOS and
-Linux). **Canary** is the newest release, out as soon as it is built and promoted to stable
+Linux: cargo, zed, servo, bun, NVIDIA Dynamo, fff and fframes each build, build again after an
+edit faster than with cargo, and pass their tests). **Canary** is the newest release, out as soon as it is built and promoted to stable
 unchanged once it passes them ([release.md](docs/release.md)):
 
 ```sh
@@ -136,7 +137,7 @@ we work with get early access and a direct say in what we build next.
 
 How to build blaze from a checkout, run its tests and send a change:
 [docs/contributing.md](docs/contributing.md). To report a security problem:
-[SECURITY.md](SECURITY.md).
+[.github/SECURITY.md](.github/SECURITY.md).
 
 ## Credits
 
@@ -149,6 +150,8 @@ blaze stands on the shoulders of giants. Thank you to the people who built:
 - [object](https://github.com/gimli-rs/object), for reading and writing executables
 - [Rust](https://github.com/rust-lang/rust) and its compiler crates
 - [rustd](https://github.com/DioxusLabs/rustd) (DioxusLabs), whose code blaze includes
+- [Makepad](https://github.com/makepad/makepad), whose live-coding work inspired much of blaze, and
+  its JIT [relax](https://github.com/makepad/makepad/tree/work/libs/relax), behind `makepad run`
 
 None of these projects endorses blaze.
 

@@ -33,6 +33,11 @@ runs:
         version=$(echo "$said" | awk '$1 == "blaze" { print $2 }')
         [ -n "$version" ] || { echo "::error::blaze-engine --version said no version: $said"; exit 1; }
         echo "BLAZE_CACHE=$RUNNER_TEMP/blaze-store" >> "$GITHUB_ENV"
+        # No limit on the store: its default, a tenth of the free disk (about 3 GB on a hosted
+        # runner), left a third of main's packs unpulled ("318 left that do not fit under
+        # BLAZE_CACHE_MAX"), so a warm run still rebuilt what they held. A runner's disk lives
+        # for one job, so nothing needs collecting.
+        echo "BLAZE_CACHE_MAX=off" >> "$GITHUB_ENV"
         echo "project=blaze-$RUNNER_OS-$RUNNER_ARCH-$JOB-$version" | tee -a "$GITHUB_OUTPUT"
     # A cold store (a new release, or a project main has not pushed yet) builds blaze in about
     # 28 GB, more than a hosted runner's 16 (rcache, #664): swap lets that run finish, slowly,
