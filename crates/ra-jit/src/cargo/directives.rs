@@ -8,7 +8,8 @@
 //! - `rustc-link-search` and `rustc-flags`' `-L`: a directory inside the script's `OUT_DIR`,
 //!   its package, the target directory's build directory (the `OUT_DIR`s of its dependencies,
 //!   which `DEP_*` names), or a system directory ([`SYSTEM`], and what the workspace adds in
-//!   `build-script-link-dirs`).
+//!   `build-script-link-dirs`). Homebrew's versioned `Cellar` library paths are allowed when
+//!   they resolve to the same directory through the installed formula's allowed `opt` link.
 //! - `rustc-link-arg` (and its `-bins`, `-bin=`, `-tests`, `-benches`, `-examples` and
 //!   `-cdylib` forms): one of [`LINK_ARGS`], or an rpath to a directory `rustc-link-search`
 //!   may name.
@@ -125,6 +126,9 @@ impl Ran<'_> {
             .chain(SYSTEM.iter().map(Path::new))
             .chain(self.link_dirs.iter().map(PathBuf::as_path))
             .any(|it| dir.starts_with(it))
+            || ["/opt/homebrew", "/usr/local"]
+                .iter()
+                .any(|prefix| homebrew_lib_alias(&dir, Path::new(prefix)))
     }
 
     /// Why the link argument `arg` is refused, `None` when it is not.
@@ -154,6 +158,26 @@ impl Ran<'_> {
          `build-script-link-dirs` names"
             .to_owned()
     }
+}
+
+/// Whether a versioned Homebrew library directory is the same directory reached through
+/// its already allowed `opt/<formula>/lib` path. pkg-config may print the Cellar spelling.
+/// Only existing library directories of the linked formula qualify, and a nested symlink
+/// must not lead outside that library directory.
+fn homebrew_lib_alias(dir: &Path, prefix: &Path) -> bool {
+    let Ok(relative) = dir.strip_prefix(prefix.join("Cellar")) else { return false };
+    let mut parts = relative.components();
+    let Some(std::path::Component::Normal(formula)) = parts.next() else { return false };
+    let Some(std::path::Component::Normal(_version)) = parts.next() else { return false };
+    if parts.next() != Some(std::path::Component::Normal(std::ffi::OsStr::new("lib"))) {
+        return false;
+    }
+    let opt_lib = prefix.join("opt").join(formula).join("lib");
+    let Ok(library) = opt_lib.canonicalize() else { return false };
+    let Ok(directory) = dir.canonicalize() else { return false };
+    directory.is_dir()
+        && directory.starts_with(library)
+        && opt_lib.join(parts.as_path()).canonicalize().is_ok_and(|alias| alias == directory)
 }
 
 /// Whether a value names no path above where it is.
@@ -352,6 +376,52 @@ mod tests {
                 "cargo::rustc-link-arg-bin=tool=-Wl,-plugin,/tmp/p.so",
             ]
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn homebrew_cellar_search_requires_the_same_opt_library_directory() {
+        use std::{fs, os::unix::fs::symlink, time::SystemTime};
+
+        let nonce = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+        // Use the logical temporary directory: the macOS sandbox's physical TMPDIR has
+        // remapped ancestors that realpath cannot currently traverse.
+        let root = Path::new("/tmp")
+            .join(format!("ra-jit-directives-homebrew-{}-{nonce}", std::process::id()));
+        let prefix = root.join("homebrew");
+        let lib = prefix.join("Cellar/x264/r3222/lib");
+        let old = prefix.join("Cellar/x264/r3000/lib");
+        let unlinked = prefix.join("Cellar/unlinked/1.0/lib");
+        let bin = prefix.join("Cellar/x264/r3222/bin");
+        let outside = root.join("outside");
+        for dir in [&lib.join("private"), &old, &unlinked, &bin, &outside, &prefix.join("opt")] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        symlink("../Cellar/x264/r3222", prefix.join("opt/x264")).unwrap();
+        symlink(&outside, lib.join("escaped")).unwrap();
+        fs::write(lib.join("not-a-directory"), b"").unwrap();
+
+        assert!(homebrew_lib_alias(&lib, &prefix));
+        assert!(homebrew_lib_alias(&lib.join("private"), &prefix));
+        for dir in [
+            old,
+            unlinked,
+            bin,
+            prefix.join("Cellar/x264/r3222"),
+            prefix.join("Cellarish/x264/r3222/lib"),
+            prefix.join("opt/x264/lib"),
+            lib.join("missing"),
+            lib.join("not-a-directory"),
+            lib.join("escaped"),
+            outside,
+        ] {
+            assert!(!homebrew_lib_alias(&dir, &prefix), "{}", dir.display());
+        }
+
+        fs::remove_file(prefix.join("opt/x264")).unwrap();
+        symlink("../Cellar/x264/not-installed", prefix.join("opt/x264")).unwrap();
+        assert!(!homebrew_lib_alias(&lib, &prefix));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

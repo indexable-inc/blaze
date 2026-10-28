@@ -1,0 +1,7 @@
+{
+  "row": "NEON saturating narrowing shifts (JPEG color conversion)",
+  "package": "app",
+  "crates": ["app"],
+  "on": "aarch64",
+  "env": {"RUSTC_BOOTSTRAP": "1"}
+}

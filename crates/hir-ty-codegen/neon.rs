@@ -156,6 +156,26 @@ pub(super) fn lower(name: &str) -> Option<Lowered> {
     Some(finish(lowered, &types))
 }
 
+/// A saturating right shift into lanes of half the width. The last operand is an
+/// immediate in `1..=max_shift`, returned alongside the lowering; the caller substitutes
+/// it for `{shift}` and passes only the first operand to the assembly function.
+/// `sqshrun` shifts signed lanes before saturating to unsigned ones. The `r` variants
+/// round before narrowing, including when the rounding addition exceeds the input width.
+pub(super) fn narrowing_shift(name: &str) -> Option<(Lowered, u32)> {
+    let (op, result) = name.strip_prefix("aarch64.neon.")?.split_once('.')?;
+    if !matches!(op, "sqshrn" | "uqshrn" | "sqshrun" | "sqrshrn" | "uqrshrn" | "sqrshrun") {
+        return None;
+    }
+    let r = Lanes::parse(result)?;
+    if !r.is_int() || !matches!(r.bits, 8 | 16 | 32) || !(r.count == 1 || r.bytes() == 8) {
+        return None;
+    }
+    let a = r.with_bits(2 * r.bits);
+    let text = format!("{op} {}, {}, #{{shift}}", r.reg(0), a.reg(1));
+    let lowered = instruction(&[], text, [a], [r])?;
+    Some((finish(lowered, &[r, a]), r.bits))
+}
+
 /// `lowered` with the features every intrinsic needs: NEON, and the half-precision
 /// instructions where a value has lanes of `f16`.
 fn finish(lowered: Lowered, types: &[Lanes]) -> Lowered {
@@ -819,6 +839,38 @@ fn describe(names: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn narrowing_shifts_keep_the_signedness_rounding_and_lane_width() {
+        for op in ["sqshrn", "uqshrn", "sqshrun", "sqrshrn", "uqrshrn", "sqrshrun"] {
+            for (ty, result, input, bytes, limit) in [
+                ("v8i8", "v0.8b", "v1.8h", 8, 8),
+                ("v4i16", "v0.4h", "v1.4s", 8, 16),
+                ("v2i32", "v0.2s", "v1.2d", 8, 32),
+                ("i8", "b0", "h1", 1, 8),
+                ("i16", "h0", "s1", 2, 16),
+                ("i32", "s0", "d1", 4, 32),
+            ] {
+                let name = format!("aarch64.neon.{op}.{ty}");
+                let (lowered, max_shift) = narrowing_shift(&name).unwrap();
+                assert_eq!(lowered.text, format!("{op} {result}, {input}, #{{shift}}"));
+                assert_eq!(lowered.args, [Some(2 * bytes)]);
+                assert_eq!(lowered.results, [bytes]);
+                assert_eq!(lowered.features, ["neon"]);
+                assert_eq!(max_shift, limit);
+            }
+        }
+        for name in [
+            "aarch64.neon.sqshrun.v16i8",
+            "aarch64.neon.sqshrun.v4i32",
+            "aarch64.neon.sqshrun.v1i64",
+            "aarch64.neon.sqshrun.v4f16",
+            "aarch64.neon.sqshrun.v4i16.i32",
+            "aarch64.neon.sqshl.v4i16",
+        ] {
+            assert!(narrowing_shift(name).is_none(), "{name}");
+        }
+    }
 
     #[test]
     fn the_lanes_a_name_says_are_the_registers_the_instruction_names() {

@@ -1,0 +1,9 @@
+[registries.local]
+index = "file://@HERE@/registry/index"
+
+[source.local-index]
+registry = "file://@HERE@/registry/index"
+replace-with = "local-files"
+
+[source.local-files]
+local-registry = "registry"

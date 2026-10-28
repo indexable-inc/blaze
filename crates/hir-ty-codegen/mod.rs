@@ -8106,17 +8106,20 @@ pub(crate) fn erase_regions<'db>(
 fn track_caller(db: &dyn HirDatabase, func: FunctionId) -> bool {
     let has =
         |func: FunctionId| AttrFlags::query(db, func.into()).contains(AttrFlags::TRACK_CALLER);
-    if has(func) {
-        return true;
+    has(func) || trait_declaration(db, func).is_some_and(has)
+}
+
+/// The trait method declared by `func` or implemented by it.
+fn trait_declaration(db: &dyn HirDatabase, func: FunctionId) -> Option<FunctionId> {
+    match func.lookup(db).container {
+        ItemContainerId::TraitId(_) => Some(func),
+        ItemContainerId::ImplId(impl_id) => {
+            let trait_ref = db.impl_trait(impl_id)?;
+            let name = &FunctionSignature::of(db, func).name;
+            trait_ref.skip_binder().def_id.0.trait_items(db).method_by_name(name)
+        }
+        _ => None,
     }
-    let ItemContainerId::ImplId(impl_id) = func.lookup(db).container else {
-        return false;
-    };
-    let Some(trait_ref) = db.impl_trait(impl_id) else {
-        return false;
-    };
-    let name = &FunctionSignature::of(db, func).name;
-    trait_ref.skip_binder().def_id.0.trait_items(db).method_by_name(name).is_some_and(has)
 }
 
 /// The integer an address is on the target.
@@ -13863,16 +13866,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let Some(receiver) = body.params.first() else {
             unsupported!("vtable method without a receiver");
         };
-        // A by-value `self` reaches the method through a pointer and needs a shim, unless the
-        // method takes it through a pointer too.
+        // A by-value `self` reaches the method through a pointer. Its shim adapts that to
+        // the concrete ABI and supplies the trait declaration location for impl-only tracking.
         if receiver.as_ref() == self_ty {
             let layout = self.layout(self_ty)?;
             let mode = self.pass_mode(&layout, false)?;
-            if !matches!(mode, PassMode::Indirect) {
-                if track_caller(db, callee) {
-                    unsupported!("vtable method taking `self` by value that tracks its caller");
+            if !matches!(mode, PassMode::Indirect)
+                || (track_caller(db, callee) && !track_caller(db, func))
+            {
+                let mut sig = Self::by_pointer(&self.body_signature(body)?, mode);
+                if track_caller(db, func) {
+                    sig.params.push(AbiParam::new(ptr()));
                 }
-                let sig = Self::by_pointer(&self.body_signature(body)?, mode);
                 return self.cg.callee(
                     InstanceDef::VtableShim(callee),
                     callee_args,
@@ -14308,6 +14313,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         layout: &Layout,
     ) -> Result<()> {
         self.builder.func.signature = Self::by_pointer(sig, mode);
+        let tracked = track_caller(self.cg.db, callee);
+        let Some(method) = trait_declaration(self.cg.db, callee) else {
+            unsupported!("vtable shim for a method without a trait");
+        };
+        let inherited = track_caller(self.cg.db, method);
+        if inherited {
+            self.builder.func.signature.params.push(AbiParam::new(ptr()));
+        }
         let entry = self.builder.create_block();
         self.builder.append_block_params_for_function_params(entry);
         self.builder.switch_to_block(entry);
@@ -14316,7 +14329,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let Some(&receiver) = params.get(sret as usize) else {
             unsupported!("shim for a receiver that is not passed");
         };
-        let callee = self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, sig)?;
+        let mut callee_sig = sig.clone();
+        if tracked {
+            callee_sig.params.push(AbiParam::new(ptr()));
+            if !inherited {
+                // The trait's ABI has no caller argument. The vtable adapter calls the
+                // tracked implementation at the trait method's declaration.
+                let location = self.cg.declaration(method);
+                let location = self.cg.declare_data_in_func(location, self.builder.func);
+                params.push(self.builder.ins().symbol_value(ptr(), location));
+            }
+        }
+        let callee = self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &callee_sig)?;
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
         let mut values = Vec::new();
         self.pass(mode, receiver, layout, &mut values);
@@ -17527,6 +17551,26 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             ("x86.avx.vzeroupper", []) => {}
             // A hint to the cache, which the program behaves the same without.
             ("prefetch.p0", [_address, _write, _locality, _cache]) => {}
+            _ if self.cg.target.arch == Arch::Aarch64
+                && let Some((mut lowered, max_shift)) = neon::narrowing_shift(name) =>
+            {
+                let [value, shift] = args else {
+                    unsupported!("`{name}` with {} arguments", args.len());
+                };
+                let Some(shift) =
+                    self.immediate(shift)?.filter(|it| (1..=u128::from(max_shift)).contains(it))
+                else {
+                    unsupported!("`{name}` with a shift that is not a constant in 1..={max_shift}");
+                };
+                lowered.text = lowered.text.replace("{shift}", &shift.to_string());
+                self.neon_assembly(
+                    &format!("llvm.{name}"),
+                    &lowered,
+                    std::slice::from_ref(value),
+                    dst,
+                    dst_ty,
+                )?;
+            }
             _ if self.cg.target.arch == Arch::Aarch64
                 && let Some(lowered) = neon::lower(name) =>
             {

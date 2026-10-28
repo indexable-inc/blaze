@@ -1,0 +1,7 @@
+{
+  "row": "included macro definitions precede child modules inside a function",
+  "package": "app",
+  "crates": [
+    "app"
+  ]
+}

@@ -21,7 +21,7 @@ use tracing::{debug, instrument};
 use base_db::Crate;
 use hir_def::{
     AssocItemId, BlockIdLt, BuiltinDeriveImplId, ConstId, DefWithBodyId, FunctionId,
-    GenericParamId, HasModule, ImplId, ItemContainerId, ModuleDefId, ModuleId, TraitId,
+    GenericParamId, HasModule, ImplId, ItemContainerId, MacroId, ModuleDefId, ModuleId, TraitId,
     attrs::AttrFlags,
     builtin_derive::BuiltinDeriveImplMethod,
     expr_store::{Body, path::GenericArgs as HirGenericArgs},
@@ -687,8 +687,9 @@ fn impl_holders(db: &dyn HirDatabase, krate: Crate, scope: &ItemScope) -> Vec<De
 }
 
 /// Whether an impl of [`impls_in_bodies`] is in the text of `function`, or a call of one of
-/// `krate`'s [`macros_writing_impls`]. The file is parsed for the function's range only when its
-/// lexing found one.
+/// `krate`'s [`macros_writing_impls`]. A body containing both an import and a macro call must
+/// also be lowered: the import may rename a macro, and body imports are not resolved yet.
+/// The file is parsed for the function's range only when its lexing found a candidate.
 fn holds_impl(db: &dyn HirDatabase, krate: Crate, function: FunctionId) -> bool {
     let ast_id = function.loc(db).id;
     let Some(file) = ast_id.file_id.file_id() else { return false };
@@ -697,21 +698,43 @@ fn holds_impl(db: &dyn HirDatabase, krate: Crate, function: FunctionId) -> bool 
         return false;
     }
     let range = ast_id.file_id.ast_id_map(db).get(ast_id.value).text_range();
-    at.iter().any(|(it, call)| {
-        range.contains(*it)
-            && call.as_ref().is_none_or(|name| macros_writing_impls(db, krate).contains(name))
-    })
+    let mut has_import = false;
+    let mut has_macro = false;
+    for (at, candidate) in at {
+        if !range.contains(*at) {
+            continue;
+        }
+        match candidate {
+            BodyImplCandidate::Impl => return true,
+            BodyImplCandidate::Import => has_import = true,
+            BodyImplCandidate::Macro(name) => {
+                if macros_writing_impls(db, krate).contains(name) {
+                    return true;
+                }
+                has_macro = true;
+            }
+        }
+    }
+    has_import && has_macro
+}
+
+#[derive(Debug, PartialEq, Eq, SalsaValue)]
+enum BodyImplCandidate {
+    Impl,
+    Import,
+    Macro(Symbol),
 }
 
 /// Where `file` writes an impl in the body of a function, found by its tokens: an `impl` after
 /// `{`, `}`, `;`, an attribute or `unsafe`, inside the braces that follow `fn name`. A macro's
 /// `impl` is found as well, which costs a lowering and nothing else. A macro called in a body
-/// is found with its name, for an impl the macro writes.
+/// is found with its name, for an impl the macro writes. Imports are recorded too, since
+/// they can introduce aliases for macros that are only resolved when lowering the body.
 #[salsa::tracked(returns(deref))]
 fn impls_in_bodies(
     db: &dyn HirDatabase,
     file: base_db::EditionedFileId,
-) -> Box<[(TextSize, Option<Symbol>)]> {
+) -> Box<[(TextSize, BodyImplCandidate)]> {
     let text = db.file_text(file.file_id(db)).text(db);
     let lexed = syntax::LexedStr::new(file.edition(db), text);
     // For each open brace, whether it is a function's body.
@@ -743,11 +766,17 @@ fn impls_in_bodies(
                 if bodies > 0
                     && matches!(previous, T!['{'] | T!['}'] | T![;] | T![']'] | T![unsafe]) =>
             {
-                found.push((TextSize::from(lexed.text_start(i) as u32), None));
+                found.push((TextSize::from(lexed.text_start(i) as u32), BodyImplCandidate::Impl));
+            }
+            T![use] if bodies > 0 => {
+                found.push((TextSize::from(lexed.text_start(i) as u32), BodyImplCandidate::Import));
             }
             T![!] if bodies > 0 && previous == SyntaxKind::IDENT => {
                 let name = Symbol::intern(lexed.text(previous_at));
-                found.push((TextSize::from(lexed.text_start(previous_at) as u32), Some(name)));
+                found.push((
+                    TextSize::from(lexed.text_start(previous_at) as u32),
+                    BodyImplCandidate::Macro(name),
+                ));
             }
             _ => {}
         }
@@ -759,8 +788,10 @@ fn impls_in_bodies(
 
 /// The `macro_rules!` of `krate` and of its dependencies that write an impl, in their own text
 /// or by calling another that does: dtoa's `dtoa!`, called in the body of `<f64 as
-/// Sealed>::write`, calls `diyfp!`, which writes `impl DiyFp` there. Known by name, so a
-/// macro of the same name costs a lowering and nothing else.
+/// Sealed>::write`, calls `diyfp!`, which writes `impl DiyFp` there. Proc macros can write
+/// impls as well; include their visible names, including imports and reexports, without
+/// trying to infer their output from their Rust source. Known by name, so a macro of the
+/// same name costs a lowering and nothing else.
 #[salsa::tracked(returns(deref))]
 fn macros_writing_impls(db: &dyn HirDatabase, krate: Crate) -> Box<[Symbol]> {
     let mut writing: Vec<Symbol> = krate
@@ -772,6 +803,11 @@ fn macros_writing_impls(db: &dyn HirDatabase, krate: Crate) -> Box<[Symbol]> {
     let mut calling = Vec::new();
     let mut files = FxHashSet::default();
     for (_, module) in crate_def_map(db, krate).modules(db) {
+        for (name, item) in module.scope(db).macros() {
+            if matches!(item.def, MacroId::ProcMacroId(_)) {
+                writing.push(name.symbol().clone());
+            }
+        }
         let Some(file) = module.origin.file_id() else { continue };
         if !files.insert(file) {
             continue;

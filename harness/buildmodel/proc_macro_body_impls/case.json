@@ -1,0 +1,8 @@
+{
+  "row": "proc macros in dependency function bodies contribute trait impls",
+  "package": "app",
+  "crates": [
+    "app",
+    "dep"
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "row": "By-value vtable shims preserve track_caller and ownership",
+  "package": "app",
+  "crates": ["app"],
+  "env": {"RUSTC_BOOTSTRAP": "1"}
+}

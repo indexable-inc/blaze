@@ -2870,7 +2870,9 @@ impl ModCollector<'_, '_> {
                 // follows: syn 1's `#[macro_use] mod token` has `Token!` from
                 // `include!("await.rs")`, and its `mod op` names it with nothing imported.
                 let prelude = || {
-                    if def_map.block.is_some() {
+                    // Only a block's pseudo-module resolves through its enclosing scope.
+                    // Named modules inside that block still use the standard prelude.
+                    if def_map.block.is_some() && self.module_id == def_map.root {
                         return None;
                     }
                     let (prelude, _) = def_map.prelude?;
