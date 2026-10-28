@@ -77,15 +77,10 @@ pub fn end_with_reader() {
     }
 }
 
-/// `blaze 0.20261026.0 (fb82b09)`: the crate's version (`0.YYYYMMDD.N`, the release train's,
-/// docs/harness.md "CI"), and the commit, which build.rs takes from `BLAZE_GIT_SHA` (the
-/// release workflow and the flake set it) or the checkout's HEAD.
+/// `blaze 0.20261028.9 (fb82b09 2026-10-28)` for a release, `blaze 0.0.0-dev (fb82b09)` for a
+/// build of the tree: the engine's (`engine::Engine::version_line`, from its build.rs).
 pub fn version() -> String {
-    let version = env!("CARGO_PKG_VERSION");
-    match option_env!("BLAZE_GIT_SHA") {
-        Some(sha) if !sha.is_empty() => format!("blaze {version} ({sha})"),
-        _ => format!("blaze {version}"),
-    }
+    engine::get().version_line.to_owned()
 }
 
 /// What a worker that was started before its build was known is told on its standard input.
