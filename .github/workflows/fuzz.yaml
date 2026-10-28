@@ -42,8 +42,10 @@ jobs:
           set -euxo pipefail
           cd "$RUNNER_TEMP"
           git clone -q --depth 1 --branch 15.1.0 https://github.com/BurntSushi/ripgrep ripgrep
-          git clone -q "https://x-access-token:${GH_TOKEN}@github.com/indexable-inc/anim" anim
-          git -C anim checkout -q 92c64f7276b3444a518904eaad2e107b36f77e08
+          basic=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git init -q anim
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $basic" -C anim fetch -q --depth 1 https://github.com/indexable-inc/anim 92c64f7276b3444a518904eaad2e107b36f77e08
+          git -C anim checkout -q FETCH_HEAD
       - name: cold builds, alternating
         run: |
           set -euxo pipefail
