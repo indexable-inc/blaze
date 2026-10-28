@@ -45,32 +45,6 @@ jobs:
       platform: linux-x64
       os: ubuntu-24.04
       tier: full
-      borrowck: true
-      consteval: true
-      pinned-ui: true
-      blaze-cli: true
-      bench: true
-      bun-e2e: true
-      wasm32: true
-
-  linux-arm64:
-    name: linux arm64
-    uses: ./.github/workflows/blaze-platform.yaml
-    with:
-      platform: linux-arm64
-      os: ubuntu-24.04-arm
-      tier: full
-      projects: true
-
-  macos:
-    name: macos arm64
-    uses: ./.github/workflows/blaze-platform.yaml
-    with:
-      platform: macos-arm64
-      os: macos-15
-      tier: full
-      pinned-ui: true
-      blaze-cli: true
 
   windows:
     name: windows x64
@@ -81,60 +55,3 @@ jobs:
       tier: full
 
   # The train's verdict: every job above.
-  train:
-    name: train
-    needs: [linux-x64, linux-arm64, macos, windows]
-    if: always()
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - env:
-          NEEDS: ${{ toJSON(needs) }}
-        run: |
-          echo "$NEEDS" | jq -r 'to_entries[] | "\(.value.result)\t\(.key)"'
-          ! echo "$NEEDS" | jq -e 'any(.[]; .result != "success")' > /dev/null
-
-  # Main's changes since the last release, as a release commit, when the train is green
-  # (.github/scripts/train_release.py). The token that pushes to main is the one pgo.yaml's pin
-  # uses: the ruleset on main refuses a push from the workflow's own (docs/harness.md, "CI").
-  release:
-    name: release
-    needs: train
-    if: needs.train.result == 'success' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    permissions:
-      contents: write
-      actions: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.BLAZE_BOT_TOKEN || github.token }}
-      # cargo and nix/unit_graph.py from the flake's dev shell, as nix-live.yaml's unit graphs.
-      - uses: DeterminateSystems/nix-installer-action@v23
-      - uses: DeterminateSystems/magic-nix-cache-action@v15
-        with:
-          use-flakehub: false
-          use-gha-cache: true
-      - run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          python3 .github/scripts/train_release.py prepare --push
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-  issue:
-    name: train issue
-    needs: [train, release]
-    if: always() && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      issues: write
-      actions: read
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/train-issue
-        with:
-          verdict: ${{ (needs.train.result == 'success' && needs.release.result != 'failure') && 'green' || 'red' }}

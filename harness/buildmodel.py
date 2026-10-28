@@ -91,6 +91,8 @@ def sysroot_rlibs(triple, env):
 def reason_of(stderr):
     """What blaze gave as the reason it stopped: its last line, unless it crashed."""
     lines = [l for l in stderr.strip().splitlines() if l.strip()]
+    if "link failed" in stderr or "LNK" in stderr:
+        print("DEBUG-LINK " + repr(stderr[-20000:]), file=sys.stderr, flush=True)
     if not lines:
         raise Wrong("blaze failed and said nothing")
     if any("panicked at" in l for l in lines) or "stack backtrace" in stderr:
@@ -444,6 +446,12 @@ class Case:
         want = tested("target-ref")
         got = tested("target", blaze=True)
         verdict, said = judge_doctests(want, got)
+        for who, it in (("cargo", want), ("blaze", got)):
+            print(f"DEBUG-DOCTEST {self.name} {self.backend} {who} exit {it[0]}", file=sys.stderr, flush=True)
+            for l in it[1]:
+                print(f"DEBUG-DOCTEST {self.name} {who} out: {l!r}", file=sys.stderr, flush=True)
+            for l in it[2].splitlines()[-80:]:
+                print(f"DEBUG-DOCTEST {self.name} {who} err: {l}", file=sys.stderr, flush=True)
         if verdict == "WRONG":
             raise Wrong(said)
         return ("supported", said, [])

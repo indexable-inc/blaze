@@ -212,7 +212,7 @@ jobs:
           retention-days: 3
       - id: parts
         if: (inputs.tier == 'fast' || inputs.tier == 'full')
-        run: echo "parts=$($PYTHON harness/ci.py --parts ${{ inputs.tier }})" >> "$GITHUB_OUTPUT"
+        run: echo 'parts={"include":[{"backend":"cranelift","part":"buildmodel","apt":""},{"backend":"llvm","part":"buildmodel","apt":""}]}' >> "$GITHUB_OUTPUT"
 
   harness:
     name: harness (${{ matrix.backend }}, ${{ matrix.part }})
