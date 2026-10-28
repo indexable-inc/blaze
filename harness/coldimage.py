@@ -135,7 +135,9 @@ async def run(step: str, argv: list[str], cwd: str | None = None, env: dict | No
 # without what nothing reaches. Each is what `patch-image` writes whatever it is told.
 SAID_ANYWAY = {"-pie", "--eh-frame-hdr", "--build-id", "--hash-style=gnu", "--gc-sections", "-EL", "-fuse-ld=lld",
                # Every path of the line is absolute.
-               "--sysroot=/"}
+               "--sysroot=/",
+               # `.L` labels left out of the symbol table, which the diff does not compare.
+               "-X"}
 Z_SAID_ANYWAY = {"now", "relro", "noexecstack"}
 EMULATIONS = {"x86_64": "elf_x86_64", "aarch64": "aarch64linux"}
 
