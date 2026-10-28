@@ -52,7 +52,7 @@ Train runs record it (`consteval` job of `blaze-platform.yaml`, linux x64, artif
 `consteval-linux-x64`), failing under `min_evaluation`. By hand, on a VM with rustc's tests and a
 built blaze:
 
-    python3 harness/consteval_ui.py '{"rust": "<rust checkout>", "bin": "target/release/blaze-engine", "out": "bench/results/<date>-consteval"}'
+    python3 harness/consteval_ui.py '{"rust": "<rust checkout>", "bin": "target/release/blaze-engine", "out": "tools/bench/results/<date>-consteval"}'
 
 Runs: before https://github.com/indexable-inc/blaze/actions/runs/40665753306, after
 https://github.com/indexable-inc/blaze/actions/runs/40665753384 (the harness's branch and that

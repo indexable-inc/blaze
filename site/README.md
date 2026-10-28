@@ -148,9 +148,28 @@ to `env.ASSETS`, which serves `dist/` (built by `bun gen/build.ts`, laid out wit
   and no IP is kept. `client/lib/presence.ts` (loaded by `side.ts`, so on every page) draws the pane's top line: the
   page's discussion with its comment count, the faces on this page (click for everyone and where), and the reader's
   GitHub login with Sign out, or Sign in with GitHub; and faces on the sidebar rows others are reading.
+  On the page itself (`client/lib/cursors.ts`) the others there show as live pointers (desktop only; "Hide cursors"
+  in the who-is-here list turns them off) and as bands on a rail at the right edge where each is reading (click a
+  face to go there). Positions are anchors in the text (a block index and a fraction of it, x a fraction of `main`'s
+  width), so different window sizes line up; the object passes them only to the other tabs on the same page, rate
+  limited per person, and never stores them.
   The same object holds the site's chat (`client/lib/chat.ts`, a panel at the right): its last 500 messages in the
-  object's SQLite, readable by anyone, written by signed-in readers (5 per 15 s, 120 an hour), taken back by their
-  author or a `COMMENT_ADMINS` id. Comment writes (`comments.ts`) tell it too, and open pages refresh their threads.
+  object's SQLite, readable by anyone, written by signed-in readers (5 per 15 s, 120 an hour, replies counted), taken
+  back by their author or a `COMMENT_ADMINS` id. Messages have Slack-style threads, one level deep (a `parent` column):
+  the list shows top-level messages with a line for their replies (faces, count, last reply), and a thread opens over
+  the list, or as a column beside it in full screen; taking back a message takes its thread, and pruning never leaves
+  a reply without its message. Replies make no bubbles, pop-ups or badge count unless they mention the reader. Both
+  composers complete `@login` from people online and recent authors; a message that mentions the reader is marked,
+  and while the chat is shut it pops up (even muted) and counts. Comment writes (`comments.ts`) tell the object too,
+  and open pages refresh their comment threads.
+  On every connect the object also sends the live build (`.gen/build.json`), and a deploy's code sends it to every
+  open socket the first time it wakes (a deploy keeps hibernated sockets open), so each open tab hears of a new
+  version as soon as anyone on the site moves (`client/lib/update.ts`). New scripts or styles
+  reload the tab; new content alone is fetched again and swapped in place by the router. Either waits until the
+  reader isn't typing, playing the narration or dragging (a hidden tab goes at once), with an "update ready" pop-up
+  and a button meanwhile, then says "Site updated". Drafts (chat and comments), the open thread, full screen, scroll
+  positions and the narration's place go through sessionStorage and come back; a reload that still gets the old
+  assets doesn't retry for a minute.
 - `updates.ts`: the `/updates` form.
 - `http.ts`: cookies, origin check, `next` validation, tokens. `env.ts`: the `Env` type.
 

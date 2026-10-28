@@ -267,7 +267,7 @@ PROJECTS = {
     # router and the mocker, without a GPU (CUDA is loaded at run time, NIXL is nixl-sys's
     # stubs). Its build scripts need protoc and libclang. cargo builds with the project's pin
     # (rust-toolchain.toml), as its users do: blaze's nightly does not compile dynamo-llm
-    # (E0277 in block_manager, bench/results/2026-10-27-dynamo).
+    # (E0277 in block_manager, tools/bench/results/2026-10-27-dynamo).
     "dynamo": dict(
         repo="ai-dynamo/dynamo", tag="v1.6.1", rev="0d9c24a8bf6db13c1a1223cf15fcbee9140d1ac3",
         env=dict(RUSTUP_TOOLCHAIN="1.96.1"), named=True,

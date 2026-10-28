@@ -22,6 +22,7 @@
 
 import { PAGE, onPage } from './lib/page';
 import './lib/presence';
+import './lib/tip';
 import { SIDE, handle } from './lib/resize';
 import { KEY as PROGRESS, load, stateOf, stateWords } from './lib/progress';
 

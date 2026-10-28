@@ -2,7 +2,7 @@
 
 blaze was called ra-jit until 2026-10-24, and `cargo blaze` was its command until 2026-10-28.
 Nothing of either is read or run any more: `blaze` is the only command, and the names below
-are the only ones. [scripts/rename.py](../scripts/rename.py) made the change, and makes it again
+are the only ones. [tools/rename.py](../tools/rename.py) made the change, and makes it again
 on any branch from before it.
 
 | before | now |
@@ -42,7 +42,7 @@ neither finds what was stored under the old ones.
 
 ## A branch from before the rename
 
-    python3 scripts/rename.py && git commit -qam 'rename.py'
+    python3 tools/rename.py && git commit -qam 'rename.py'
     git rebase origin/main
 
 The script rewrites every tracked text file and `git mv`s every path whose name says ra-jit.

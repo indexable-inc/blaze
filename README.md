@@ -137,7 +137,7 @@ we work with get early access and a direct say in what we build next.
 
 How to build blaze from a checkout, run its tests and send a change:
 [docs/contributing.md](docs/contributing.md). To report a security problem:
-[SECURITY.md](SECURITY.md).
+[.github/SECURITY.md](.github/SECURITY.md).
 
 ## Credits
 
