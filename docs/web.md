@@ -43,8 +43,10 @@ which are merged into the graph by `key`, so the page of an edited program still
 it.
 
 The daemon keeps the program of each of the 16 workspaces built last in a
-[Flecs](https://www.flecs.dev) world, on a thread of its own that the first record starts
-(`crates/blaze-web/src/world.rs`; Flecs's C is `vendor/flecs-c`):
+[Flecs](https://www.flecs.dev) world, on a thread of its own that the first `blaze ui` starts
+(`crates/blaze-web/src/world.rs`; Flecs's C is `vendor/flecs-c`). Until then the daemon keeps
+no world, only the records it would be made from: of each workspace, those since the build
+that said its functions whole, and all of its last build's.
 
 | entity    | what                                                                       |
 |-----------|----------------------------------------------------------------------------|

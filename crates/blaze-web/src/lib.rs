@@ -1,6 +1,6 @@
 //! The build page (docs/web.md): the daemon keeps the functions of each workspace's program
-//! from its builds' records in a Flecs world ([`world`]), on a thread of its own ([`Graphs`]),
-//! and once asked serves a page of it on 127.0.0.1 ([`serve`]), with the records of every
+//! from its builds' records in a Flecs world ([`world`]), on a thread of its own ([`Graphs`])
+//! made once a page is first asked for, and serves the page on 127.0.0.1 ([`serve`]), with the records of every
 //! build over a websocket as they come and Flecs's REST over the world.
 
 mod http;
@@ -13,7 +13,7 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, MutexGuard, OnceLock, PoisonError,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -29,10 +29,73 @@ const KEPT: usize = 16;
 /// hung up on, and starts over from a snapshot when it connects again.
 const BEHIND: usize = 1 << 16;
 
-/// The world's thread, started by the first record: what the daemon and the pages ask it.
+/// The world's thread, started once a page is served: what the daemon and the pages ask it.
 #[derive(Default)]
 pub struct Graphs {
     asked: OnceLock<Result<mpsc::Sender<Asked>, String>>,
+    /// Until then, the records the world is made from when it starts, the workspace whose
+    /// build began last at the end. A daemon no page is asked of keeps no world.
+    kept: Mutex<Vec<Kept>>,
+}
+
+/// The records that make a workspace's program: those since the build that said its functions
+/// whole, and all of its last build's. Each is kept gzipped ([`gzip`]): a cold build's are some megabytes.
+struct Kept {
+    root: PathBuf,
+    records: Vec<Held>,
+}
+
+struct Held {
+    build: u64,
+    kind: Kind,
+    gzip: Box<[u8]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Kind {
+    Began,
+    Functions { object: u32 },
+    Other,
+}
+
+impl Kept {
+    /// As [`World::apply`] does: a Began ends the last build's records but for its functions,
+    /// and the first whole object of a build makes the program anew.
+    fn keep(&mut self, build: u64, record: &Record) {
+        let kind = match &record.event {
+            Event::Began { .. } => Kind::Began,
+            Event::Functions { object, .. } => Kind::Functions { object: *object },
+            _ => Kind::Other,
+        };
+        match &record.event {
+            Event::Began { .. } => {
+                let mut said: Vec<u64> = self
+                    .records
+                    .iter()
+                    .filter(|it| matches!(it.kind, Kind::Functions { .. }))
+                    .map(|it| it.build)
+                    .collect();
+                said.dedup();
+                self.records.retain(|it| match it.kind {
+                    Kind::Functions { .. } => true,
+                    Kind::Began => said.contains(&it.build),
+                    Kind::Other => false,
+                });
+            }
+            Event::Functions { whole: true, .. } => {
+                if !self.records.iter().any(|it| it.build == build && it.kind == kind) {
+                    self.records.retain(|it| it.build == build);
+                }
+            }
+            _ => {}
+        }
+        let Some(gzip) = gzip(record) else { return };
+        self.records.push(Held { build, kind, gzip });
+    }
+
+    fn build(&self) -> u64 {
+        self.records.last().map_or(0, |it| it.build)
+    }
 }
 
 enum Asked {
@@ -88,7 +151,31 @@ impl Graphs {
     /// Hands `record` of build `build` of the workspace at `root` to the world; it never
     /// waits for it.
     pub fn record(&self, root: &Path, build: u64, record: Record) {
-        let _ = self.ask(Asked::Record { root: root.to_owned(), build, record });
+        let mut kept = lock(&self.kept);
+        if self.asked.get().is_some() {
+            drop(kept);
+            let _ = self.ask(Asked::Record { root: root.to_owned(), build, record });
+            return;
+        }
+        let mut at = match kept.iter().position(|it| it.root == root) {
+            Some(at) => at,
+            None => {
+                if kept.len() >= KEPT {
+                    let oldest = (0..kept.len()).min_by_key(|&it| kept[it].build());
+                    if let Some(oldest) = oldest {
+                        kept.remove(oldest);
+                    }
+                }
+                kept.push(Kept { root: root.to_owned(), records: Vec::new() });
+                kept.len() - 1
+            }
+        };
+        if matches!(record.event, Event::Began { .. }) {
+            let began = kept.remove(at);
+            kept.push(began);
+            at = kept.len() - 1;
+        }
+        kept[at].keep(build, &record);
     }
 
     /// The messages a page is sent from now on: the snapshot of the workspace shown, its last
@@ -107,8 +194,25 @@ impl Graphs {
     }
 
     fn ask(&self, asked: Asked) -> Result<(), String> {
+        self.start()?.send(asked).map_err(|_| "the build page's world is gone".to_owned())
+    }
+
+    /// The world's thread, started the first time and handed what was kept until then.
+    fn start(&self) -> Result<&mpsc::Sender<Asked>, String> {
+        if let Some(to) = self.asked.get() {
+            return to.as_ref().map_err(Clone::clone);
+        }
+        // Held until the kept records are handed over, so none comes in before them.
+        let mut held = lock(&self.kept);
+        let kept = std::mem::take(&mut *held);
         let to = self.asked.get_or_init(start).as_ref().map_err(Clone::clone)?;
-        to.send(asked).map_err(|_| "the build page's world is gone".to_owned())
+        for it in kept {
+            for held in it.records {
+                let Some(record) = gunzip(&held.gzip) else { continue };
+                let _ = to.send(Asked::Record { root: it.root.clone(), build: held.build, record });
+            }
+        }
+        Ok(to)
     }
 }
 
@@ -130,7 +234,8 @@ fn start() -> Result<mpsc::Sender<Asked>, String> {
                     return;
                 }
             };
-            let mut state = State { world, programs: Vec::new(), shown: None, followers: Vec::new() };
+            let mut state =
+                State { world, programs: Vec::new(), shown: None, followers: Vec::new() };
             for asked in asked {
                 state.answer(asked);
             }
@@ -243,6 +348,28 @@ impl Follower {
     }
 }
 
+/// A record as it is kept until the world starts: its CBOR, gzipped.
+fn gzip(record: &Record) -> Option<Box<[u8]>> {
+    let cbor = blaze_protocol::cbor::to_vec(record).ok()?;
+    let mut gzip = flate2::write::GzEncoder::new(
+        Vec::with_capacity(cbor.len() / 8),
+        flate2::Compression::fast(),
+    );
+    gzip.write_all(&cbor).ok()?;
+    Some(gzip.finish().ok()?.into())
+}
+
+fn gunzip(gzip: &[u8]) -> Option<Record> {
+    let mut cbor = Vec::new();
+    std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(gzip), &mut cbor).ok()?;
+    blaze_protocol::cbor::from_slice(&cbor).ok()
+}
+
+/// A lock whose holder panicked holds records still whole: each is kept or not.
+fn lock<T>(it: &Mutex<T>) -> MutexGuard<'_, T> {
+    it.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// The page's server, once started.
 pub struct Served {
     /// Where the page is, its token in it.
@@ -250,11 +377,9 @@ pub struct Served {
 }
 
 /// Serves the page of `graphs` on a port of 127.0.0.1 the system picks, on threads of its
-/// own, until the process exits. `asked` is called for each request: the daemon is in use.
-pub fn serve(
-    graphs: Arc<Graphs>,
-    asked: Arc<dyn Fn() + Send + Sync>,
-) -> std::io::Result<Served> {
+/// own, until the process exits, its world made from the records kept until now. `asked` is called for each request: the daemon is in use.
+pub fn serve(graphs: Arc<Graphs>, asked: Arc<dyn Fn() + Send + Sync>) -> std::io::Result<Served> {
+    graphs.start().map_err(std::io::Error::other)?;
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     let mut token = [0u8; 16];

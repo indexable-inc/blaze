@@ -3,7 +3,7 @@ use std::{io::Read, path::Path, sync::Arc, time::Duration};
 use blaze_protocol::events::{Event, Function, How, Record};
 
 use crate::{
-    Graphs, Next,
+    Graphs, Kind, Next,
     http::{self, Frame, Refused, Request, Route, Site},
     world::{Applied, World, module_path},
 };
@@ -71,7 +71,8 @@ fn what_is_not_the_page_is_refused() {
 
 #[test]
 fn a_request_head_is_read_strictly() {
-    let head = b"GET /t/ HTTP/1.1\r\nHost: 127.0.0.1:1\r\nORIGIN:  http://127.0.0.1:1 \r\nX-Other: y";
+    let head =
+        b"GET /t/ HTTP/1.1\r\nHost: 127.0.0.1:1\r\nORIGIN:  http://127.0.0.1:1 \r\nX-Other: y";
     let request = http::parse(head).unwrap();
     assert_eq!(request.path, "/t/");
     assert_eq!(request.origin.as_deref(), Some("http://127.0.0.1:1"));
@@ -203,9 +204,15 @@ fn the_world_is_read_over_flecs_rest_and_never_written() {
     let mut program = world.program(Path::new("/w"));
     world.apply(&mut program, 1, &began(1, "/w"));
     let name = "<alloc::vec::Vec<u8>>::push";
-    let cold = fns(0, true, vec![function(0, 10, "anim::scene::render", &[1], How::Compiled { ns: 5 }),
-                                 function(1, 11, name, &[], How::Stored),
-                                 function(2, 12, "anim::main", &[0], How::Compiled { ns: 7 })]);
+    let cold = fns(
+        0,
+        true,
+        vec![
+            function(0, 10, "anim::scene::render", &[1], How::Compiled { ns: 5 }),
+            function(1, 11, name, &[], How::Stored),
+            function(2, 12, "anim::main", &[0], How::Compiled { ns: 7 }),
+        ],
+    );
     world.apply(&mut program, 1, &cold);
     // `main` is at its crate's root, in no module: its call is of no module, and of no other crate.
     let answer = world.rest("GET", "/query?expr=Crate,(Calls,*)").unwrap();
@@ -218,7 +225,10 @@ fn the_world_is_read_over_flecs_rest_and_never_written() {
     // `render` calls `push`: `render` has it as callee, and `scene` has `Vec`.
     let answer = world.rest("GET", "/query?expr=Module,Callees").unwrap();
     let body = String::from_utf8_lossy(&answer.body);
-    assert!(answer.code == 200 && body.contains("\"name\":\"scene\"") && body.contains("vec.Vec"), "{body}");
+    assert!(
+        answer.code == 200 && body.contains("\"name\":\"scene\"") && body.contains("vec.Vec"),
+        "{body}"
+    );
     let answer = world.rest("GET", "/query?expr=Function,Callees").unwrap();
     let body = String::from_utf8_lossy(&answer.body);
     let render = r##""name":"anim::scene::render", "how":0, "ns":5, "build":1}, ["#"##;
@@ -289,12 +299,18 @@ fn a_page_is_sent_the_snapshot_then_each_record() {
     let began_again = blaze_protocol::cbor::from_slice::<Record>(&message(page.next(wait)));
     assert_eq!(began_again.unwrap(), began(1, "/w"));
     done();
-    assert!(matches!(page.next(Duration::ZERO), Next::Nothing), "its functions are in the snapshot");
+    assert!(
+        matches!(page.next(Duration::ZERO), Next::Nothing),
+        "its functions are in the snapshot"
+    );
     // A record of the build is sent as it is; one of another workspace is not, until that
     // one's build begins, which sends its program, then the Began.
     let said = Record { at_ns: 2, event: Event::Unlisted { count: 3 } };
     graphs.record(Path::new("/w"), 1, said.clone());
-    assert_eq!(blaze_protocol::cbor::from_slice::<Record>(&message(page.next(wait))).unwrap(), said);
+    assert_eq!(
+        blaze_protocol::cbor::from_slice::<Record>(&message(page.next(wait))).unwrap(),
+        said
+    );
     graphs.record(Path::new("/v"), 2, said.clone());
     done();
     assert!(matches!(page.next(Duration::ZERO), Next::Nothing));
@@ -306,7 +322,67 @@ fn a_page_is_sent_the_snapshot_then_each_record() {
     graphs.record(Path::new("/v"), 3, cold);
     assert_eq!(read(&gunzip(message(page.next(wait))))[0].0, "main");
     done();
-    assert!(matches!(page.next(Duration::ZERO), Next::Nothing), "its functions are in the snapshot");
+    assert!(
+        matches!(page.next(Duration::ZERO), Next::Nothing),
+        "its functions are in the snapshot"
+    );
+}
+
+#[test]
+fn until_a_page_is_asked_for_only_what_makes_the_program_is_kept() {
+    let graphs = Graphs::default();
+    let w = Path::new("/w");
+    let said = Record { at_ns: 2, event: Event::Unlisted { count: 3 } };
+    graphs.record(w, 1, began(1, "/w"));
+    graphs.record(
+        w,
+        1,
+        fns(0, true, vec![function(0, 10, "anim::old", &[], How::Compiled { ns: 5 })]),
+    );
+    graphs.record(w, 1, said.clone());
+    graphs.record(w, 2, began(2, "/w"));
+    let render = function(1, 12, "anim::scene::render", &[], How::Stored);
+    graphs.record(
+        w,
+        2,
+        fns(0, true, vec![function(0, 11, "anim::main", &[1], How::Compiled { ns: 5 })]),
+    );
+    graphs.record(w, 2, fns(0, true, vec![render]));
+    graphs.record(w, 3, began(3, "/w"));
+    graphs.record(w, 4, began(4, "/w"));
+    graphs.record(
+        w,
+        4,
+        fns(0, false, vec![function(0, 11, "anim::main", &[1], How::Compiled { ns: 7 })]),
+    );
+    graphs.record(w, 4, said.clone());
+    let kept: Vec<(u64, Kind)> =
+        crate::lock(&graphs.kept)[0].records.iter().map(|it| (it.build, it.kind)).collect();
+    let functions = Kind::Functions { object: 0 };
+    let made = [
+        (2, Kind::Began),
+        (2, functions),
+        (2, functions),
+        (4, Kind::Began),
+        (4, functions),
+        (4, Kind::Other),
+    ];
+    assert_eq!(kept, made);
+    let page = graphs.follow().unwrap();
+    assert!(crate::lock(&graphs.kept).is_empty());
+    let mut names: Vec<String> = read(&gunzip(message(page.next(Duration::from_secs(10)))))
+        .into_iter()
+        .map(|it| it.0)
+        .collect();
+    names.sort();
+    assert_eq!(names, ["anim::main", "anim::scene::render"]);
+    let wait = Duration::from_secs(10);
+    let began_again = blaze_protocol::cbor::from_slice::<Record>(&message(page.next(wait)));
+    assert_eq!(began_again.unwrap(), began(4, "/w"));
+    assert_eq!(
+        blaze_protocol::cbor::from_slice::<Record>(&message(page.next(wait))).unwrap(),
+        said
+    );
 }
 
 #[test]
