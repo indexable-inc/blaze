@@ -9,6 +9,10 @@ since the release before and the title of each change merged since.
 
 ## [Unreleased]
 
+### Added
+
+- Remote cache: every push writes the project's key index (`manifests/<project>.index`, runs and shards under `index/`), which says which pack holds a key without the key list of every pack; the gateway takes `index/<sha256>` (docs/cache.md, "The remote").
+
 ### Changed
 
 - Releases: a canary is cut as soon as main's Linux x86-64 build of a commit passes, without waiting for the unit tests; stable now also needs main's merge gate on that commit green, with the unit tests run and passed on Linux x86-64, Linux ARM64 and macOS (docs/release.md).

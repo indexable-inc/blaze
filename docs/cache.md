@@ -205,7 +205,21 @@ packs that project's builds were served from.
                                  uncompressed in the store, to be read in place)
     keys/<sha256>                the keys of one pack
     manifests/<project>          one line per pack
+    manifests/<project>.index    the project's key index: one line per run, signed as the manifest is
+    index/<sha256>               a run or a shard of the key index
     units/<sha256>, deps/<project>   cargo's builds of dependencies, see below
+
+The key index says which pack holds which key, so that a store lacking one key can fetch the
+pack that has it without reading the key list of every pack first (650 MB of them for the 830
+packs of blaze's own CI). Each push writes it after the manifest: the packs the manifest lists
+that no run of the index covers (those it sent, and those a blaze from before the index listed)
+go into a new run, whose entries are the first 6 bytes of each key, grouped by pack and cut by
+the keys' first bits into shards of at most about 256 KB. Runs of about one size are merged
+into one, without the packs the manifest no longer lists, so a project has a few runs. The
+root is signed and turned as the manifest is, and runs and shards are named by the hash of
+their bytes, so what the root names is checked as far down as it goes; a pack the index names
+is still checked to be in the manifest, and the key in the pack. The format is in
+`crates/blaze-store/src/remote_index.rs`. Nothing reads the index during a build yet.
 
 **Real AWS S3 has not been run.** Everything was measured against MinIO and SeaweedFS on
 the same machine over loopback. The client is the AWS SDK, so the code is the same, but

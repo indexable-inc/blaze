@@ -28,6 +28,7 @@
 pub mod collect;
 pub mod gateway;
 pub mod https;
+pub mod index;
 pub mod keeper;
 pub mod s3;
 pub mod signed;
@@ -836,7 +837,8 @@ pub async fn push(store: &Path, remote: &Remote, project: &str) -> anyhow::Resul
             Manifest::default()
         }
     };
-    let missing: Vec<Digest> = local.into_iter().filter(|it| !listed.0.contains_key(it)).collect();
+    let missing: Vec<Digest> =
+        local.iter().filter(|it| !listed.0.contains_key(it)).copied().collect();
     let (mut sent, mut bytes, mut failed) = (Manifest::default(), 0, Vec::new());
     let mut sending = stream::iter(
         missing.iter().map(|&pack| async move { (pack, send_pack(store, remote, pack).await) }),
@@ -860,7 +862,15 @@ pub async fn push(store: &Path, remote: &Remote, project: &str) -> anyhow::Resul
         };
         remote.extend_list(&Manifest::at(project), extend).await?;
     }
-    let said = format!("{} packs added to `{project}`, {bytes} bytes sent", sent.0.len());
+    let mut said = format!("{} packs added to `{project}`, {bytes} bytes sent", sent.0.len());
+    // After the manifest, so that the index never names a pack the manifest does not list.
+    match index::update(store, remote, project, &local).await {
+        Ok((indexed, failures)) => {
+            said += &format!("; {indexed}");
+            failed.extend(failures);
+        }
+        Err(e) => failed.push(e.context(format!("writing the index of `{project}`"))),
+    }
     Tally { failed, ..Tally::default() }.settle(said, &remote.traffic)
 }
 
@@ -1205,6 +1215,12 @@ pub fn project_name(given: Option<String>) -> anyhow::Result<String> {
     let project = given.unwrap_or_else(|| "default".to_owned());
     if project.is_empty() || project.contains(['/', '\\']) || project.starts_with('.') {
         bail!("`{project}` is not the name of a project");
+    }
+    if project.ends_with(index::SUFFIX) {
+        bail!(
+            "`{project}` is not the name of a project: `{}` names the index of one",
+            index::SUFFIX
+        );
     }
     Ok(project)
 }
@@ -1950,6 +1966,79 @@ pub mod tests {
             assert!(signed.read().await.is_err());
         });
         _ = std::fs::remove_dir_all(&signed.dir);
+    }
+
+    /// The disk keys of each sealed pack of the store in `dir`.
+    fn keys_by_pack(dir: &Path) -> BTreeMap<Digest, Vec<[u8; 32]>> {
+        let packs = local_packs(&StoreDir::at(dir)).unwrap();
+        let keys = |pack: &Digest| {
+            let name = pack_file(pack);
+            blaze_store::pack_keys(&name, &std::fs::read(dir.join(&name)).unwrap()).unwrap()
+        };
+        packs.iter().map(|pack| (*pack, keys(pack))).collect()
+    }
+
+    /// Every key of every listed pack is found through the index in the pack that holds it,
+    /// whoever pushed the pack and whether the index was there when they did.
+    #[test]
+    fn a_push_indexes_what_the_manifest_lists() {
+        blaze_store::compiles_against("remote index test");
+        let (remote, dir) = unsigned("index", 1 << 30);
+        let mut packs = BTreeMap::new();
+        let mut push_from = |name: &str, first: u32, count: u32| {
+            let at = dir.join(name);
+            let store = blaze_store::Store::open_at(&at).unwrap();
+            for n in first..first + count {
+                for key in 0..200u32 {
+                    let key: [u8; 32] =
+                        Digest::of(&(n * 1000 + key).to_le_bytes()).bytes().to_owned();
+                    store.insert(&key, &key[..8]);
+                }
+                store.seal();
+            }
+            drop(store);
+            packs.extend(keys_by_pack(&at));
+            wait(push(&at, &remote, "default")).unwrap()
+        };
+        let found_all = |packs: &BTreeMap<Digest, Vec<[u8; 32]>>| {
+            for (pack, keys) in packs {
+                for key in keys {
+                    let holders = wait(index::holders(&remote, "default", key)).unwrap();
+                    assert_eq!(holders, vec![*pack], "{pack}");
+                }
+            }
+            let absent = Digest::of(b"no pack holds this").bytes().to_owned();
+            assert!(wait(index::holders(&remote, "default", &absent)).unwrap().is_empty());
+        };
+        let said = push_from("a", 0, 3);
+        assert!(said.contains("3 packs indexed"), "{said}");
+        found_all(&packs);
+        // A push of nothing new writes nothing.
+        let said = push_from("a", 0, 0);
+        assert!(said.contains("nothing to add"), "{said}");
+        // An index taken away (or never written, by a blaze from before it) is made again
+        // from the key lists of the packs that are not here.
+        std::fs::remove_file(dir.join(index::root_at("default"))).unwrap();
+        let said = push_from("b", 3, 1);
+        assert!(said.contains("4 packs indexed"), "{said}");
+        found_all(&packs);
+        // Pushes of one pack each are merged into few runs.
+        for n in 0..8 {
+            let said = push_from(&format!("c{n}"), 10 + n, 1);
+            assert!(said.contains("1 packs indexed"), "{said}");
+        }
+        found_all(&packs);
+        let root = std::fs::read_to_string(dir.join(index::root_at("default"))).unwrap();
+        let runs = blaze_store::remote_index::Root::parse(&root).runs;
+        assert!(runs.len() < 6, "{root}");
+        assert_eq!(runs.iter().map(|it| it.packs).sum::<u32>(), 12, "{root}");
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_project_is_not_named_as_an_index_is() {
+        assert!(project_name(Some("blaze.index".to_owned())).is_err());
+        assert!(project_name(Some("blaze.indexed".to_owned())).is_ok());
     }
 
     #[test]
