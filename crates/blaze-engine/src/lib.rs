@@ -11641,3 +11641,4 @@ mod user {
         assert_eq!(*lock(&held), 2);
     }
 }
+// ci measurement (lane cibl): a change no function sees.
