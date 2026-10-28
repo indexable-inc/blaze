@@ -454,12 +454,28 @@ fn const_eval_discriminant_cycle_result<'db>(
     Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
 }
 
+type TraceConst = fn(&dyn HirDatabase, ConstId, bool) -> Option<fn(std::time::Instant)>;
+static TRACE_CONST: std::sync::OnceLock<TraceConst> = std::sync::OnceLock::new();
+
+/// Has `observer` see each request for a named constant (`false`) and each run of its query
+/// (`true`): for one it follows, it gives what to call at the end with when it began.
+pub fn trace_consts_with(observer: TraceConst) {
+    _ = TRACE_CONST.set(observer);
+}
+
+fn trace_const(db: &dyn HirDatabase, def: ConstId, executing: bool) -> Option<impl Drop> {
+    let finish = TRACE_CONST.get()?(db, def, executing)?;
+    let start = std::time::Instant::now();
+    Some(stdx::defer(move || finish(start)))
+}
+
 pub(crate) fn const_eval<'db>(
     db: &'db dyn HirDatabase,
     def: ConstId,
     subst: GenericArgs<'db>,
     trait_env: Option<ParamEnvAndCrate<'db>>,
 ) -> Result<Allocation<'db>, ConstEvalError<'db>> {
+    let _request = trace_const(db, def, false);
     return match const_eval_query(db, def, subst.store(), trait_env.map(|env| env.store())) {
         Ok(konst) => Ok(konst.as_ref()),
         Err(err) => Err(err.clone()),
@@ -472,6 +488,7 @@ pub(crate) fn const_eval<'db>(
         subst: StoredGenericArgs,
         trait_env: Option<StoredParamEnvAndCrate>,
     ) -> Result<StoredAllocation, ConstEvalError<'db>> {
+        let _execution = trace_const(db, def, true);
         let body = db.monomorphized_runtime_mir_body(
             def.into(),
             subst,

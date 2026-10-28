@@ -200,7 +200,8 @@ impl Line {
         }
         cmd.args(&self.after).arg("-o").arg(exe);
         let start = Instant::now();
-        let ran = cmd.output().with_context(|| format!("running {cmd:?}"))?;
+        let ran = blaze_cargo::trace::link_output(&mut cmd, "link executable")
+            .with_context(|| format!("running {cmd:?}"))?;
         if !ran.status.success() {
             bail!(
                 "the link of {} failed ({}):\n{:?}\n{}",
@@ -298,7 +299,8 @@ impl Line {
         let mut cmd = Command::new(&linker);
         cmd.arg(format!("@{}", response.display()));
         let start = Instant::now();
-        let ran = cmd.output().with_context(|| format!("running {cmd:?}"))?;
+        let ran = blaze_cargo::trace::link_output(&mut cmd, "link executable")
+            .with_context(|| format!("running {cmd:?}"))?;
         if !ran.status.success() {
             bail!(
                 "the link of {} failed ({}):\n{:?}\n{}{}",

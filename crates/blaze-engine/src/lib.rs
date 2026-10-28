@@ -1456,11 +1456,14 @@ impl SymbolResolver for Resolver<'_> {
         if threads < 2 {
             return beside();
         }
+        let batch = trace::cold_batch(count);
+        let mut join = None;
         let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 let (db, next, parts) = (self.db.clone(), &next, self.parts());
                 scope.spawn(move || {
+                    let _worker = trace::cold_span("worker", batch);
                     let resolver = parts.over(&db);
                     hir::attach_db(&db, || {
                         loop {
@@ -1473,8 +1476,14 @@ impl SymbolResolver for Resolver<'_> {
                     })
                 });
             }
-            beside();
+            {
+                let _caller = trace::cold_span("caller", batch);
+                beside();
+            }
+            // From when the caller is done to when the last thread is.
+            join = trace::cold_span("join", batch);
         });
+        drop(join);
     }
 
     fn source_path(&self, file: vfs::FileId) -> Option<String> {
@@ -5762,7 +5771,7 @@ fn packs_whole(args: &Args) -> bool {
 fn run_link(cmd: &str, binary: Option<&Path>, start: Instant, note: &str) -> anyhow::Result<()> {
     let aside = binary.and_then(|binary| Some((binary, linked_aside(cmd, binary)?)));
     let line = aside.as_ref().map_or(cmd, |(_, (line, _))| line);
-    let linked = shell(line).output();
+    let linked = trace::link_output(&mut shell(line), "link");
     let placed = match (&aside, &linked) {
         (Some((binary, (_, at))), Ok(linked)) if linked.status.success() => {
             std::fs::rename(at, binary)
@@ -7952,7 +7961,46 @@ pub fn main() -> anyhow::Result<()> {
         return ask(request, Path::new(&socket), Target::from_flags(std::env::args().skip(3))?);
     }
     trace::install();
-    run(Args::parse(std::env::args().skip(1))?, None)
+    let args = Args::parse(std::env::args().skip(1))?;
+    // A worker the daemon started answers its builds' traces; one started directly has
+    // only its own to write its first build to.
+    if args.socket.is_none()
+        && std::env::var_os(cargo::daemon::ENDS_WITH_INPUT).is_none()
+        && trace::start_cold().is_some()
+    {
+        hir_ty::consteval::trace_consts_with(followed_const);
+    }
+    let result = run(args, None);
+    trace::finish_cold(if result.is_ok() { "complete" } else { "failed" });
+    result
+}
+
+/// Whether `def` is the constant `BLAZE_TRACE_CONST` names, `crate::module::NAME`: its
+/// crate, every module and its name, so one of the same name elsewhere, in an impl or in a
+/// block is not. What to note for it, a request or a run of its query.
+fn followed_const(
+    db: &dyn hir_ty::db::HirDatabase,
+    def: hir_def::ConstId,
+    executing: bool,
+) -> Option<fn(Instant)> {
+    use hir_def::{HasModule as _, Lookup as _, signatures::ConstSignature};
+    let mut path = trace::cold_const()?.rsplit("::");
+    if ConstSignature::of(db, def).name.as_ref()?.as_str() != path.next()? {
+        return None;
+    }
+    let ItemContainerId::ModuleId(mut module) = def.lookup(db).container else { return None };
+    while let Some(parent) = module.containing_module(db) {
+        // A block's module has no name, so no path names a constant in a block.
+        if module.name(db)?.as_str() != path.next()? {
+            return None;
+        }
+        module = parent;
+    }
+    let krate = def.krate(db).extra_data(db).display_name.as_ref()?.crate_name();
+    if krate.as_str() != path.next()? || path.next().is_some() {
+        return None;
+    }
+    Some(if executing { trace::const_execution } else { trace::const_request })
 }
 
 /// Compiles the crates `args` names on `threads` threads until `done`, giving up on what is
@@ -9261,6 +9309,7 @@ fn run_holding(
         memo_capacities(&mut db)?;
     }
     memory::report(&mut db, "warm-up")?;
+    trace::finish_cold("watch ready");
     eprintln!("watching {} files", files.len());
     ide_db::executions::take(&db);
     // Requests wait here while a build is under way, and those that have come by the time it
