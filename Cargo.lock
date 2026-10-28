@@ -823,6 +823,7 @@ dependencies = [
  "blaze-cargo",
  "blaze-doc",
  "blaze-expand",
+ "blaze-graph",
  "blaze-lints",
  "blaze-live",
  "blaze-macro-wasm",
