@@ -447,10 +447,10 @@ impl Checker {
             let Some(now) = modified(&watched.path) else {
                 return Some(format!("{} is gone", watched.path.display()));
             };
-            if now == watched.mtime {
+            if Some(now) == watched.mtime {
                 continue;
             }
-            watched.mtime = now;
+            watched.mtime = Some(now);
             let Ok(text) = crate::source_on_disk(&watched.path) else {
                 return Some(format!("{} can't be read", watched.path.display()));
             };
