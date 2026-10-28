@@ -49,11 +49,18 @@ A change is not done until all of it exits 0 under both backends.
 `harness/ci.py` is the one list of it: which harness runs in which part, in which tier, on
 which hosts and under which backend.
 
-    python3 ci.py --list            # every harness, its part, fast-tier seconds and hosts
-    python3 ci.py --parts           # the full tier's parts on this machine (the train's)
-    python3 ci.py --parts fast      # the fast tier's parts here (quick-1 .. quick-N)
-    python3 ci.py core-1            # run one part here, as CI does
-    python3 ci.py fast              # every fast harness of this host, one after another
+    uv run --frozen python harness/ci.py list '{}'                  # every harness, its part, fast-tier seconds and hosts
+    uv run --frozen python harness/ci.py parts '{}'                 # the full tier's parts on this machine (the train's)
+    uv run --frozen python harness/ci.py parts '{"tier": "fast"}'   # the fast tier's parts here (quick-1 .. quick-N)
+    uv run --frozen python harness/ci.py run '{"part": "core-1"}'   # run one part here, as CI does
+    uv run --frozen python harness/ci.py run '{"part": "fast"}'     # every fast harness of this host, one after another
+
+`ci.py` runs from the repository's root in its Python workspace (`pyproject.toml`, `uv.lock`),
+and each harness in the Python that runs it. A harness moved to one typed input (AGENTS.md,
+scripts-take-typed-input) reads it with the workspace's `typed_input`, so it runs the same way
+by hand: `uv run --frozen python harness/keys.py '{"cases": ["a feature"]}'`.
+`includes.py`, `keys.py`, `fuzz/edits.py` and `ci.py` itself take their JSON so far; the
+fields are in each script's docstring.
 
 The fast tier is the harnesses marked fast in `HARNESSES` that `FAST` (in `ci.py`) gives to
 this host: each line there has the harness's measured seconds on CI (the slowest median of
@@ -164,7 +171,7 @@ writes them again.
 | `stress.py` | 100 edits of the kinds people make (bodies, signatures, new items, moved lines, broken code, reverts, an editor's edit while another client's build runs) applied in order to a three-crate workspace under one warm daemon, each compared with `cargo build` of the same source. The first edit cargo builds after broken code has to be a patch of the build before it ([#31](https://github.com/indexable-inc/blaze/issues/31)), and the edit sent during a build has to be taken ([#32](https://github.com/indexable-inc/blaze/issues/32)); it exits 1 when a step is wrong |
 | `programs.py` | Two programs of one workspace built by one daemon. With `BLAZE_ALONE=1` rustc builds stand-ins for the workspace's crates and the daemon compiles every function of both programs, `main` too: under LLVM an edit of what both use has to reach each ([#63](https://github.com/indexable-inc/blaze/issues/63)) |
 | `worktrees.py` | Several checkouts of one workspace built by one daemon, edited independently |
-| `includes.py` | Edits to a file only `include!` names |
+| `includes.py '{}'` | Edits to a file only `include!` names |
 | `latelisted.py` | What a file named by `include!` through a build script's variable declares is listed in its crate though the daemon reads the file only once the names are resolved, as bun's generated bindings are: an edit that adds a function then patches a few functions, not every one the file declares |
 | `rustsrc.py` | A toolchain without `rust-src` is turned down, saying how to install it |
 | `splices.py` | Edits that are hard on the splice: thread-locals, statics, vtables, function pointers, closures, panics, foreign calls. Counts how each step was linked |
@@ -201,7 +208,7 @@ writes them again.
 
 | Script | What it checks |
 |---|---|
-| `keys.py` | Whether the store ever hands a build code compiled from something else. One case per thing code depends on besides its file's text |
+| `keys.py '{"cases": [...], "shard": {"index": K, "count": N}}'` | Whether the store ever hands a build code compiled from something else. One case per thing code depends on besides its file's text; `cases` picks those whose names contain one of its strings, `shard` every Nth build from the Kth (CI's `keys-1..3`) |
 | `storekills.py` | The daemon killed at random moments while writing its store |
 | `storecorrupts.py` | Packs damaged on disk, and stores of other formats |
 | `storefull.py` | A store on a disk with no room |
@@ -404,7 +411,7 @@ Two workflows run part of what the train does, by hand, for a change that wants 
 before or without the whole train. Neither releases anything or is part of `ci`.
 
 `focused.yaml` runs the harnesses it is given by name (`harness/focused.py`: a label of
-`ci.py --list`, or its start up to a space) against one build of the ref, on the platforms asked
+`ci.py list '{}'`, or its start up to a space) against one build of the ref, on the platforms asked
 for, under both backends, as the train builds and runs them:
 
     gh workflow run focused.yaml --ref <branch> -f harnesses='["anonstatics.py", "testselect.py"]'
@@ -449,7 +456,7 @@ It builds blaze once per platform (Linux x86-64, Linux AArch64, macOS arm64, Win
 with the `llvm` feature, hands the binary to its other jobs, and runs:
 
 - `harness/unittests.py` on each platform;
-- every part of `ci.py --parts` under each backend, a job each: `core-1` ... `core-N` (the
+- every part of `ci.py parts` under each backend, a job each: `core-1` ... `core-N` (the
   harnesses of `core`, packed by the seconds `CORE` in ci.py says each takes, so that no part
   is longer than its longest harness, `wholeprogram.py` at 19 minutes on macOS), `keys-1..3`,
   `buildmodel`, `store-kills`, `store` and `daemon`;
@@ -499,7 +506,7 @@ A check that fails now and then is **quarantined** in the fast tier, never dropp
 its failure and output are printed with "FLAKY, not counted in the fast tier" and its issue,
 and it still counts in the full tier. The list is `FLAKY` in the harness (today one step of
 `testselect.py`, [#412](https://github.com/indexable-inc/blaze/issues/412)); a check comes off
-it when its issue is fixed. The fast tier (`ci.py --parts fast`, `ci.py fast`) is what a lane
+it when its issue is fixed. The fast tier (`ci.py parts '{"tier": "fast"}'`, `ci.py run '{"part": "fast"}'`) is what a lane
 runs by hand in its ix VM: every harness of `FAST`, in parts of about four minutes.
 
 ### Concurrency, the check and the ruleset

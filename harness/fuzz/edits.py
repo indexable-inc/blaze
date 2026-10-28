@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """edits.py: generated edits, what the daemon makes of each against a cold cargo build.
 
-usage: edits.py smoke                                         a short run on fixed seeds, for CI
-       edits.py run --seed S --rounds N [--steps K] [--jobs J]   N programs from seed S, K edits each
-       edits.py run --seed S --first R --rounds 1                round R of that run again
-       edits.py check [FILE.rs ...]                              the sequences under found/edits/, each again
-       edits.py report DIR                                    adds up the logs a run left in DIR
+usage: edits.py smoke '{"backends": ["cranelift"]}'             a short run on fixed seeds, for CI
+       edits.py run '{"seed": "S", "rounds": N, "steps": K}'      N programs from seed S, K edits each
+       edits.py run '{"seed": "S", "first": R, "rounds": 1}'      round R of that run again
+       edits.py check '{"files": ["FILE.rs"]}'                   the sequences under found/edits/, each again
+       edits.py report '{"dir": "DIR"}'                          adds up the logs a run left in DIR
+
+After the subcommand comes one JSON object (inline, the path of a file, or `-` for standard
+input) with the fields of its class below (Smoke, Run, Check, Report); a field it does not have
+is refused. Run it in the repository's Python workspace: `uv run --frozen python
+harness/fuzz/edits.py ...` from the root.
 
 A round is one generated program (`gen.py`) under a daemon that keeps its binary up to date,
 as `splices.py` runs one. Each step edits the source, asks the daemon for the binary (which it
@@ -27,7 +32,11 @@ The edits:
 
 BLAZE_BIN names the blaze under test. The exit status is 1 when there is a finding.
 """
-import argparse, collections, concurrent.futures, copy, json, os, random, re, shutil, subprocess, sys, tempfile, time
+import collections, concurrent.futures, copy, json, os, random, re, shutil, subprocess, sys, tempfile, time
+from dataclasses import dataclass
+from typing import Literal
+
+from typed_input import fail, parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -39,7 +48,6 @@ from fuzz import BACKENDS, FOUND, MANIFEST, differences, edition_of, run
 EDITS = os.path.join(FOUND, "edits")
 # The line between one source and the next in a file under found/edits/.
 THEN = "//// then"
-SMOKE = {"seed": "smoke", "rounds": 2, "cases": 4, "steps": 8}
 SCALARS = {"bool", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize"}
 # The function `fn.add` adds, in the shapes `fn.signature` goes through: its text and its call.
 EXTRA = [
@@ -349,7 +357,7 @@ def write_found(tag, edition, backend, kind, what, wrong, sources, alone):
     os.makedirs(EDITS, exist_ok=True)
     path = os.path.join(EDITS, f"{tag}.rs")
     head = [f"// Found by edits.py: seed {tag}, edition {edition}, backend {backend}.", f"// The edit ({kind}): {what}",
-            f"// Again: edits.py check {os.path.basename(path)}" if alone else
+            f"// Again: edits.py check '{json.dumps({'files': [os.path.basename(path)]})}'" if alone else
             "// Not alone: a daemon that has only built the first of these gets the second right. It took the edits before.",
             *("// " + line for line in wrong.splitlines()[:30])]
     parts = ["\n\n".join(gen.module(name, lines) for name, lines in modules) for modules in sources]
@@ -472,38 +480,97 @@ def report(directory):
     return findings
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("mode", choices=["smoke", "run", "check", "report"])
-    parser.add_argument("targets", nargs="*")
-    parser.add_argument("--seed", default="edits")
-    parser.add_argument("--first", type=int, default=0, help="the round to begin at, to run one again")
-    parser.add_argument("--rounds", type=int, default=20)
-    parser.add_argument("--cases", type=int, default=6)
-    parser.add_argument("--steps", type=int, default=12)
-    parser.add_argument("--jobs", type=int, default=2)
-    parser.add_argument("--reduce", type=int, default=12, help="builds a reduction may take")
-    parser.add_argument("--backends", default="cranelift,llvm")
-    parser.add_argument("--out")
-    parser.add_argument("--work")
-    args = parser.parse_args()
-    if args.mode == "report":
-        sys.exit(1 if report(args.targets[0]) else 0)
-    if args.mode == "smoke":
-        args.seed, args.rounds, args.cases, args.steps = (SMOKE[name] for name in ("seed", "rounds", "cases", "steps"))
-    out = args.out or tempfile.mkdtemp(prefix="blaze-edits-out-")
-    work = args.work or tempfile.mkdtemp(prefix="blaze-edits-")
-    os.makedirs(out, exist_ok=True)
-    os.makedirs(work, exist_ok=True)
-    if args.mode == "check":
-        sys.exit(1 if check(args.targets, args.backends.split(","), work) else 0)
-    jobs = [(f"{args.seed}-{index}", args.cases, args.steps, args.backends.split(","), work, out, args.reduce) for index in range(args.first, args.first + args.rounds)]
-    with concurrent.futures.ProcessPoolExecutor(args.jobs) as pool:
+SCRIPT = "edits.py"
+type Backend = Literal["cranelift", "llvm", "llvm-O0", "llvm-full"]
+
+
+@dataclass(frozen=True)
+class Smoke:
+    """The fixed seeds of CI: 2 programs of 4 cases, 8 edits each, then found/edits/ again."""
+    backends: tuple[Backend, ...] = ("cranelift", "llvm")
+    jobs: int = 2
+    # The builds a reduction may take.
+    reduce: int = 12
+    # Where the logs go, and the daemons' projects; a new temporary directory when not given.
+    out: str | None = None
+    work: str | None = None
+
+
+@dataclass(frozen=True)
+class Run:
+    seed: str = "edits"
+    # The round to begin at, to run one again.
+    first: int = 0
+    rounds: int = 20
+    cases: int = 6
+    steps: int = 12
+    jobs: int = 2
+    reduce: int = 12
+    backends: tuple[Backend, ...] = ("cranelift", "llvm")
+    out: str | None = None
+    work: str | None = None
+
+
+@dataclass(frozen=True)
+class Check:
+    # Files under found/edits/ (or paths); none is all of them.
+    files: tuple[str, ...] = ()
+    backends: tuple[Backend, ...] = ("cranelift", "llvm")
+    work: str | None = None
+
+
+@dataclass(frozen=True)
+class Report:
+    dir: str
+
+
+def positive(**fields):
+    """Stops at a field below 1, naming it."""
+    for name, value in fields.items():
+        if value < 1:
+            fail(SCRIPT, f"{name} is at least 1, not {value}")
+
+
+def directory(path, prefix):
+    path = path or tempfile.mkdtemp(prefix=prefix)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def rounds(seed, first, count, cases, steps, it):
+    """Runs rounds `first` .. `first + count` of `seed` and reports them. Returns (findings, out, work)."""
+    if not it.backends:
+        fail(SCRIPT, "backends is empty: name at least one")
+    positive(jobs=it.jobs, reduce=it.reduce)
+    out, work = directory(it.out, "blaze-edits-out-"), directory(it.work, "blaze-edits-")
+    jobs = [(f"{seed}-{index}", cases, steps, list(it.backends), work, out, it.reduce) for index in range(first, first + count)]
+    with concurrent.futures.ProcessPoolExecutor(it.jobs) as pool:
         for result in pool.map(one, jobs):
             say(result)
-    findings = report(out)
-    if args.mode == "smoke":
-        findings += check([], args.backends.split(","), work)
+    return report(out), out, work
+
+
+def main():
+    match sys.argv[1:]:
+        case ["smoke", text]:
+            it = parse(Smoke, text, SCRIPT)
+            findings, out, work = rounds("smoke", 0, 2, 4, 8, it)
+            findings += check([], list(it.backends), work)
+        case ["run", text]:
+            it = parse(Run, text, SCRIPT)
+            if it.first < 0:
+                fail(SCRIPT, f"first is at least 0, not {it.first}")
+            positive(rounds=it.rounds, cases=it.cases, steps=it.steps)
+            findings, out, _ = rounds(it.seed, it.first, it.rounds, it.cases, it.steps, it)
+        case ["check", text]:
+            it = parse(Check, text, SCRIPT)
+            if not it.backends:
+                fail(SCRIPT, "backends is empty: name at least one")
+            sys.exit(1 if check(list(it.files), list(it.backends), directory(it.work, "blaze-edits-")) else 0)
+        case ["report", text]:
+            sys.exit(1 if report(parse(Report, text, SCRIPT).dir) else 0)
+        case _:
+            fail(SCRIPT, f"usage: {SCRIPT} smoke|run|check|report JSON (see the top of the file)")
     print(f"logs: {out}")
     sys.exit(1 if findings else 0)
 

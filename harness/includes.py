@@ -4,8 +4,18 @@
 The file is not a `.rs` file, so nothing loads it until the macro is expanded. Each step edits
 it or the file that includes it, asks the daemon for the program and compares what it prints
 with what `cargo build` of the same source prints.
+
+usage: includes.py '{}'
+
+Its steps are fixed, so its input is the empty JSON object (inline, the path of a file, or `-`
+for standard input): any field is refused. Run it in the repository's Python workspace: `uv run
+--frozen python harness/includes.py '{}'` from the root. The scripts that import `follow` run
+steps of their own.
 """
 import errno, os, re, shlex, subprocess, sys, tempfile, time
+from dataclasses import dataclass
+
+from typed_input import fail, parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -168,5 +178,18 @@ def follow(files, steps):
     sys.exit(1 if wrong else 0)
 
 
+SCRIPT = "includes.py"
+
+
+@dataclass(frozen=True)
+class Input:
+    """No field: the steps are STEPS."""
+
+
 if __name__ == "__main__":
+    match sys.argv[1:]:
+        case [text]:
+            parse(Input, text, SCRIPT)
+        case _:
+            fail(SCRIPT, f"usage: {SCRIPT} '{{}}' (see the top of the file)")
     follow([(DATA, DATA_TEXT), (MAIN, MAIN_TEXT), (LABEL, "old label"), (BYTES, "old bytes")], STEPS)

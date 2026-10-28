@@ -215,15 +215,17 @@ jobs:
           name: blaze-${{ inputs.platform }}
           path: target/release/blaze.tar
           retention-days: 3
-      - id: parts
-        if: (inputs.tier == 'fast' || inputs.tier == 'full') && inputs.harnesses == ''
-        run: echo "parts=$($PYTHON harness/ci.py --parts ${{ inputs.tier }})" >> "$GITHUB_OUTPUT"
-      # focused.yaml's harnesses, by name (harness/focused.py), from the repository's Python workspace.
-      - if: inputs.harnesses != ''
+      # ci.py and focused.py run in the repository's Python workspace (pyproject.toml, uv.lock),
+      # and the harnesses in the Python that runs them: they read their input with typed_input.
+      - if: inputs.tier == 'fast' || inputs.tier == 'full'
         uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: '0.13.5'
           enable-cache: false
+      - id: parts
+        if: (inputs.tier == 'fast' || inputs.tier == 'full') && inputs.harnesses == ''
+        run: echo "parts=$(uv run --frozen python harness/ci.py parts '{"tier": "${{ inputs.tier }}"}')" >> "$GITHUB_OUTPUT"
+      # focused.yaml's harnesses, by name (harness/focused.py).
       - id: focused
         if: inputs.harnesses != ''
         env:
@@ -296,13 +298,13 @@ jobs:
           tar -xf blaze.tar
           if [ "$RUNNER_OS" = Windows ]; then bin="$(cygpath -w "$PWD")\\blaze-engine.exe"; else bin="$PWD/blaze-engine"; fi
           echo "BLAZE_BIN=$bin" >> "$GITHUB_ENV"
-      - if: inputs.harnesses == ''
-        run: $PYTHON harness/ci.py ${{ matrix.part }}
-      - if: inputs.harnesses != ''
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      # The harnesses run in the Python of the repository's workspace, as ci.py and focused.py do.
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: '0.13.5'
           enable-cache: false
+      - if: inputs.harnesses == ''
+        run: uv run --frozen python harness/ci.py run '{"part": "${{ matrix.part }}"}'
       - if: inputs.harnesses != ''
         env:
           HARNESSES: ${{ inputs.harnesses }}

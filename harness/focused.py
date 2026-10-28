@@ -1,14 +1,14 @@
 """focused.py: named harnesses of ci.py, alone, against one build (focused.yaml).
 
     focused.py parts '{"harnesses": ["anonstatics.py", "worktrees.py --overlay"]}'
-        CI's matrix for this machine, as ci.py's `--parts` gives it: {"include": [{"backend",
+        CI's matrix for this machine, as ci.py's `parts` gives it: {"include": [{"backend",
         "part": "focused", "apt"}, ...]}, one entry per backend that runs any of them here.
     focused.py run '{"harnesses": ["anonstatics.py"], "backend": "llvm"}'
         each named harness that runs here under `backend`, as ci.py runs a part: with a daemon
         home of its own, every one even when one before it fails, then the times and a
         `failed:` line.
 
-A name is a harness's label in ci.py (`ci.py --list`), or the start of one up to a space, as
+A name is a harness's label in ci.py (`ci.py list '{}'`), or the start of one up to a space, as
 FAST and CORE name them: `worktrees.py` is all three of its runs, `worktrees.py --overlay` the
 one. A name that is no harness's, or one whose harnesses run on no backend of this machine,
 stops it with an error rather than run nothing. Harnesses run as the full tier's do
@@ -63,13 +63,13 @@ def named(ci: ModuleType, names: tuple[str, ...], backend: str) -> list[Any]:
     """The harnesses `names` picks that run here under `backend`, in ci.py's order; stops at a
     name that is no harness's."""
     if not names:
-        fail(SCRIPT, "harnesses is empty: name at least one (`ci.py --list` lists them)")
+        fail(SCRIPT, "harnesses is empty: name at least one (`ci.py list '{}'` lists them)")
     labels = [(harness, ci.label(harness)) for harness in ci.HARNESSES]
     picked: list[Any] = []
     for name in names:
         matched = [h for h, label in labels if label == name or label.startswith(name + " ")]
         if not matched:
-            fail(SCRIPT, f"no harness of ci.py is {name!r}: `ci.py --list` lists them")
+            fail(SCRIPT, f"no harness of ci.py is {name!r}: `ci.py list '{}'` lists them")
     for harness, label in labels:
         if any(label == name or label.startswith(name + " ") for name in names) and harness[3](backend):
             picked.append(harness)

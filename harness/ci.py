@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """ci.py: the harnesses CI runs, in parts that take about the same time on a hosted runner.
 
-usage: ci.py PART                 run the harnesses of PART for BLAZE_BACKEND on this machine
-       ci.py fast                 run every harness of the fast tier here, one after another
-       ci.py --parts [TIER]       CI's matrix for this machine, as JSON: {"include": [{"backend",
-                                  "part", "apt"}, ...]}, TIER `full` (the default) or `fast`
-       ci.py --list               which harness runs in which part, on which hosts and backends
+usage: ci.py run '{"part": "core-1"}'   run the harnesses of a part for BLAZE_BACKEND on this machine
+       ci.py run '{"part": "fast"}'     run every harness of the fast tier here, one after another
+       ci.py parts '{"tier": "full"}'   CI's matrix for this machine, as JSON: {"include": [{"backend",
+                                        "part", "apt"}, ...]}, tier `full` (the default) or `fast`
+       ci.py list '{}'                  which harness runs in which part, on which hosts and backends
+
+After the subcommand comes one JSON object (inline, the path of a file, or `-` for standard
+input) with the fields of its class below (Run, Parts, List); a field it does not have is
+refused. Run it in the repository's Python workspace, `uv run --frozen python harness/ci.py ...`
+from the root: the harnesses run in the Python that runs it, and some read their input with the
+workspace's typed_input. BLAZE_BACKEND is the environment's, as the harnesses and blaze read it.
 
 The fast tier, of every pull request and merge-queue entry, is the harnesses that FAST names,
 each on the hosts FAST gives it: on Linux x86-64 all of them, and on Linux AArch64 and macOS the
@@ -25,6 +31,10 @@ Every harness in a part runs even when one before it fails; the part fails at th
 them. BLAZE_BIN is the blaze the harnesses run, as for each harness on its own.
 """
 import json, math, os, platform, shutil, subprocess, sys, tempfile, time
+from dataclasses import dataclass
+from typing import Literal
+
+from typed_input import fail, parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SYSTEM = {"linux": "linux", "darwin": "macos", "win32": "windows"}[sys.platform]
@@ -37,6 +47,11 @@ def here(hosts):
     """Whether this machine is one of `hosts` ("linux", "macos", "windows", "linux-aarch64"...);
     no hosts is every one."""
     return not hosts or SYSTEM in hosts or f"{SYSTEM}-{ARCH}" in hosts
+
+
+def arg(value):
+    """A harness's one typed input, as short as JSON writes it: it is the harness's label too."""
+    return json.dumps(value, separators=(",", ":"))
 
 
 def on(*hosts, backend=None):
@@ -100,7 +115,7 @@ HARNESSES = [
     ("core", ["asmedits.py"], {}, EVERYWHERE, 1),
     # The assembler of a build of blaze without LLVM, which is the release's.
     ("core", ["asmedits.py"], {"BLAZE_ASSEMBLER": "cc"}, on("linux", "macos", backend="cranelift"), 1),
-    ("core", ["includes.py"], {}, EVERYWHERE, 1),
+    ("core", ["includes.py", arg({})], {}, EVERYWHERE, 1),
     ("core", ["latelisted.py"], {}, on("linux", "macos"), 1),
     ("core", ["rustsrc.py"], {}, EVERYWHERE, 1),
     # Each scenario runs rustc and rustdoc no more often than norustc/baseline.json says.
@@ -123,7 +138,7 @@ HARNESSES = [
     ("core", ["fuzz/fuzz.py", "smoke", "--backends", BACKEND], {}, on("linux-x86_64"), 2),
     # #418: the same seeds with an empty and a warm store, and asm! text changed under one IR.
     ("core", ["fuzz/store.py", "--backends", BACKEND], {}, on("linux-x86_64"), 2),
-    ("core", ["fuzz/edits.py", "smoke", "--backends", BACKEND], {}, on("linux-x86_64"), 2),
+    ("core", ["fuzz/edits.py", "smoke", arg({"backends": [BACKEND]})], {}, on("linux-x86_64"), 2),
     # Every reduced program fuzzing found blaze building wrong, on both architectures they
     # were found on; a part of its own, as it takes minutes.
     ("core", ["fuzz/fuzz.py", "check", "--backends", BACKEND], {}, on("linux"), 3),
@@ -131,7 +146,7 @@ HARNESSES = [
     ("core", ["backends.py", "corpus", "runner", "cases", "--bin", "runner", "--levels", "2f"], {}, on(backend="llvm"), 2),
     # DWARF read by gdb out of an ELF executable, or a PDB read by cdb.
     ("core", ["debuginfo.py"], {}, on("linux", "windows"), None),
-    *((f"keys-{k}", ["keys.py", "--shard", f"{k}/{KEYS}"], {}, EVERYWHERE, None) for k in range(1, KEYS + 1)),
+    *((f"keys-{k}", ["keys.py", arg({"shard": {"index": k, "count": KEYS}})], {}, EVERYWHERE, None) for k in range(1, KEYS + 1)),
     # Builds for Linux targets besides the host; the cases of another host say so.
     ("buildmodel", ["buildmodel.py", "--backend", BACKEND], {}, on("linux", "windows"), None),
     ("store-kills", ["storekills.py", "--kills", "100"], {}, EVERYWHERE, None),
@@ -383,24 +398,43 @@ def run(part):
     sys.exit(1 if failed else 0)
 
 
+SCRIPT = "ci.py"
+
+
+@dataclass(frozen=True)
+class Run:
+    # A part of `parts`, or `fast` for the whole fast tier here.
+    part: str
+
+
+@dataclass(frozen=True)
+class Parts:
+    tier: Literal["full", "fast"] = "full"
+
+
+@dataclass(frozen=True)
+class List:
+    """No field."""
+
+
 def main():
     check_tables()
-    arg = sys.argv[1] if len(sys.argv) in (2, 3) else "--help"
-    if arg == "--parts" and sys.argv[2:] in ([], ["full"], ["fast"]):
-        print(json.dumps(parts(*sys.argv[2:])))
-    elif arg == "--list" and len(sys.argv) == 2:
-        for harness in HARNESSES:
-            fast = ""
-            if harness[4] is not None:
-                secs, hosts = fast_of(harness)
-                fast = f"fast {secs:3d} s {','.join(hosts) or 'all'}"
-            part = f"core {core_secs(harness)} s" if harness[0] == "core" else harness[0]
-            print(f"{part:12} {fast:28} {label(harness)}")
-    elif arg.startswith("-"):
-        print(__doc__)
-        sys.exit(0 if arg == "--help" else 2)
-    else:
-        run(arg)
+    match sys.argv[1:]:
+        case ["run", text]:
+            run(parse(Run, text, SCRIPT).part)
+        case ["parts", text]:
+            print(json.dumps(parts(parse(Parts, text, SCRIPT).tier)))
+        case ["list", text]:
+            parse(List, text, SCRIPT)
+            for harness in HARNESSES:
+                fast = ""
+                if harness[4] is not None:
+                    secs, hosts = fast_of(harness)
+                    fast = f"fast {secs:3d} s {','.join(hosts) or 'all'}"
+                part = f"core {core_secs(harness)} s" if harness[0] == "core" else harness[0]
+                print(f"{part:12} {fast:28} {label(harness)}")
+        case _:
+            fail(SCRIPT, f"usage: {SCRIPT} run|parts|list JSON (see the top of the file)")
 
 
 if __name__ == "__main__":

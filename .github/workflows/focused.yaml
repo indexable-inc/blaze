@@ -4,7 +4,7 @@
 #   gh workflow run focused.yaml --ref <branch> -f harnesses='["anonstatics.py", "testselect.py"]'
 #   gh workflow run focused.yaml --ref <branch> -f harnesses='["splices.py"]' -f macos=true
 #
-# A name is a label of `ci.py --list`, or its start up to a space (harness/focused.py). Each
+# A name is a label of `ci.py list '{}'`, or its start up to a space (harness/focused.py). Each
 # platform asked for builds blaze as the train does and runs the named harnesses that run there,
 # under both backends; a name that runs on none of a platform's backends fails that platform.
 # Its `blaze-<platform>` build is kept three days, for downstream.yaml's `build-run`.
@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       harnesses:
-        description: a JSON list of ci.py's harnesses, as `ci.py --list` names them
+        description: a JSON list of ci.py's harnesses, as `ci.py list '{}'` names them
         required: true
       linux-x64:
         type: boolean

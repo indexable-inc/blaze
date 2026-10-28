@@ -7,12 +7,20 @@ and builds again with the store the first build filled: the program has to print
 does. "again" changes the checkout where it is, "elsewhere" changes a copy of it at another
 path, as a second worktree or another machine would have it.
 
-usage: keys.py [case ...] [--shard K/N]
+usage: keys.py '{}'
+       keys.py '{"cases": ["a feature", "release"], "shard": {"index": 2, "count": 3}}'
 
---shard K/N runs every Nth build of the chosen ones, starting at the Kth: N machines with K
-from 1 to N run all of them between them.
+The input is one JSON object (inline, the path of a file, or `-` for standard input), an Input
+below; a field it does not have is refused. `cases` picks the cases whose names contain any of
+its strings (all of them when there are none). `shard` runs every `count`th build of the chosen
+ones, starting at the `index`th: `count` machines with `index` from 1 to `count` run all of them
+between them. Run it in the repository's Python workspace: `uv run --frozen python
+harness/keys.py ...` from the root.
 """
 import os, shutil, subprocess, sys, tempfile
+from dataclasses import dataclass
+
+from typed_input import fail, parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -89,6 +97,21 @@ CASES = [
 ]
 
 
+SCRIPT = "keys.py"
+
+
+@dataclass(frozen=True)
+class Shard:
+    index: int
+    count: int
+
+
+@dataclass(frozen=True)
+class Input:
+    cases: tuple[str, ...] = ()
+    shard: Shard = Shard(1, 1)
+
+
 def size(directory):
     return sum(os.path.getsize(os.path.join(directory, name)) for name in os.listdir(directory))
 
@@ -111,15 +134,19 @@ def build(ws, env, args):
 
 
 def main():
+    match sys.argv[1:]:
+        case [text]:
+            it = parse(Input, text, SCRIPT)
+        case _:
+            fail(SCRIPT, f"usage: {SCRIPT} JSON (see the top of the file)")
+    if not 1 <= it.shard.index <= it.shard.count:
+        fail(SCRIPT, f"shard.index is from 1 to shard.count ({it.shard.count}), not {it.shard.index}")
+    if unknown := [case for case in it.cases if not any(case in name for name, _, _ in CASES)]:
+        fail(SCRIPT, f"cases: {unknown} is in the name of no case")
     work = os.path.realpath(tempfile.mkdtemp(prefix="blaze-keys-"))
-    chosen, shard = sys.argv[1:], (1, 1)
-    if "--shard" in chosen:
-        at = chosen.index("--shard")
-        shard = tuple(int(it) for it in chosen[at + 1].split("/"))
-        del chosen[at:at + 2]
     runs = [(name, change, line, mode) for name, change, line in CASES
-            if not chosen or any(it in name for it in chosen) for mode in ("again", "elsewhere")]
-    runs = runs[shard[0] - 1::shard[1]]
+            if not it.cases or any(case in name for case in it.cases) for mode in ("again", "elsewhere")]
+    runs = runs[it.shard.index - 1::it.shard.count]
     wrong = total = fixed = refusals = 0
     for name, change, line, mode in runs:
         total += 1
