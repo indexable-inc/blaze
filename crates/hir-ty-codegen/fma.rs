@@ -1574,7 +1574,7 @@ fn reaches_fma(db: &dyn HirDatabase, func: FunctionId) -> bool {
             ) {
                 return true;
             }
-        } else if rustc_inlines_at(db, Some(func), callee, 0).map_or(true, |it| it != Some(false))
+        } else if !rustc_inlines_at(db, Some(func), callee, 0).is_ok_and(|it| it == Some(false))
             && reaches_fma(db, callee)
         {
             return true;
