@@ -368,7 +368,21 @@ for each platform, each on a machine of its own kind.
 | `blaze.yaml` (`warm`) | push to main | the same on Linux x86-64, AArch64 and macOS, every test, then a push of the store for the runs after it; and on Linux x86-64 the std cases of the smoke corpus (`harness/smoke.py`, [release.md](release.md#the-smoke-corpus): `blaze run` and `blaze test`, dev and `--release`) with the blaze blaze built, 17 to 30 min until [#899](https://github.com/indexable-inc/blaze/issues/899) (74 s with rustc's) | |
 | `fmt.yaml` | push to main | `cargo fmt --all`, and a commit `fmt` when it changed a file | 2 min |
 | `train.yaml` | push to main, by hand | everything below, then a release or the train's issue | about 45 min |
-| `blaze.yaml` | docs or site only | the two scripts | 1 min |
+| `blaze.yaml` | a change the build and the unit tests do not read | the two scripts | 1 min |
+
+The build and the unit tests run only for a change that touches a file they read; any other
+change runs the two scripts alone. `.github/scripts/gate_changes.py` (the `changes` job) names
+those files, and why each: the crates (`crates/`, with their test data, the LLVM pin
+`crates/hir-ty-codegen/llvm.json` and the toolchain's `pins.txt`), the vendored crates
+(`vendor/`), `Cargo.toml`, `Cargo.lock`, `.cargo/`, `.rustfmt.toml` and `.clippy.toml`, the
+pinned nightly (`harness/toolchain`), `harness/unittests.py`, the flake (`flake.nix`,
+`flake.lock`), the release of blaze that builds blaze (`.github/blaze-version`, `install.sh`),
+`blaze.yaml`, `blaze-platform.yaml` and the actions they use (`toolchain`, `blaze`,
+`blaze-remote`, `rust-tests`); on a push to main, the smoke corpus too (`harness/smoke.py`,
+`harness/smoke/`), which the `warm` tier runs. It names what is code rather than what is not,
+so a new directory of documents, benches or harnesses runs no build; a list of files that
+cannot be had (a run by hand, a comparison of 300 files or more, GitHub refusing) counts as
+code. When the build or the unit tests start reading a new file, add it there.
 
 A change reaches main through a **pull request** alone
 ([contributing.md](contributing.md#landing-a-change)), merged directly once `ci` passes on it;
@@ -397,7 +411,7 @@ starts rustc, rustdoc or cargo ([no-rustc.md](no-rustc.md)).
 runs it on a branch, without the release or the issue). On every push to main it never
 finished and was red for reasons the merge gate (`ci`) does not share, so releases are cut by
 hand until it runs on pushes again: `gh workflow run release-cut.yaml` runs the train's release
-job alone on main (the release commit, then pgo.yaml tags it and release.yaml builds it). One train runs at a time: a
+job alone on main (a tag on main's HEAD, and release.yaml on it). One train runs at a time: a
 push while it runs waits, and a newer push replaces the one waiting, so the train always runs
 on the newest commit of main once the one before it is done. It does not cancel the running
 train: with a merge every few minutes, a train of 45 would never end.
@@ -431,20 +445,18 @@ it.
 
 Versions are dated and chosen by nobody: `0.YYYYMMDD.N`, N counting the releases of that day
 (UTC) from 0 (0.20261026.0, then 0.20261026.1), which is semver, as cargo and crates.io need.
-`blaze --version` says the commit too, `blaze 0.20261026.0 (fb82b09)`: crates/blaze-engine's build.rs
-takes it from `BLAZE_GIT_SHA` (release.yaml and the flake set it) or the checkout's HEAD.
+`blaze --version` says the commit and its date too, `blaze 0.20261026.0 (fb82b09 2026-10-26)`, and a
+build of the tree `blaze 0.0.0-dev (fb82b09)`: crates/blaze-engine's build.rs takes the release from
+`BLAZE_RELEASE` (release.yaml sets it on a tag) and the commit from `BLAZE_GIT_SHA` and
+`BLAZE_GIT_DATE` (release.yaml and the flake set them) or the checkout's HEAD. The version is
+never committed to main (Cargo.toml stays `0.0.0`), so a release changes no crate's identity
+and no build of main misses the store after one ([release.md](release.md#versions)).
 
 The job `train` is the train's verdict: every job but the bench. When it is green and
-main has changes since the last release, the job `release` (`.github/scripts/train_release.py
-prepare`) makes one commit on main, `release: v0.YYYYMMDD.N [skip ci]`: the workspace version
-of today's next release, a CHANGELOG.md section with what `[Unreleased]` had and the title of each change merged
-since, and Cargo.lock and `nix/units` for the new version. A release is built against PGO
-profiles of its own crates (`build_release.py --strict`), and the version is in every crate's
-hash, so the job then runs `pgo.yaml`, whose pin job tags `v0.YYYYMMDD.N` on the commit that pins the
-new profiles (`train_release.py tag`) and runs `release.yaml` on the tag. While a release waits
-for its profiles, the trains after it release nothing; if the pgo run fails, the next train's
-`release` job fails and says so. The last release is the newest tag `v*`, or before the first,
-the commit that added the workspace version's CHANGELOG.md section. The bots' own commits
+main has changes since the last release, the job `release` (`.github/scripts/train_release.py`)
+tags main's commit `v0.YYYYMMDD.N`, today's next release, through the API and runs `release.yaml`
+on the tag. No commit goes to main. The last release is the newest dated tag on main's history.
+The bots' own commits
 (`fmt`, `pgo: ...`, `release: ...`) are not changes to release.
 
 When the train is red, or its release failed, the job `train issue`

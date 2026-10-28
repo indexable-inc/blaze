@@ -37,7 +37,7 @@
     // The secret is set with `wrangler secret put TURNSTILE_SECRET_KEY`.
     "TURNSTILE_SITE_KEY": "",
     // GitHub OAuth App client id (public). Empty turns sign-in off. Secret: GITHUB_CLIENT_SECRET.
-    "GITHUB_CLIENT_ID": "",
+    "GITHUB_CLIENT_ID": "Ov23liKCekdY039uBlQf",
     // Comma-separated numeric GitHub user ids (https://api.github.com/users/<login> -> "id") that may delete any
     // comment. Ids, not logins: a login can be renamed and then registered by someone else.
     "COMMENT_ADMINS": "7644264"

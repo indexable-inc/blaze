@@ -2,11 +2,14 @@
 // imperative; `reason` is why (Andrew's words, dates, history), kept for people and for AGENTS.md
 // but not put into an agent's context.
 //
-//   bun agents/rules.ts            header and numbered rules, no reasons: what Claude's SessionStart
+//   bun tools/agents/rules.ts            header and numbered rules, no reasons: what Claude's SessionStart
 //                                  hook (.claude/settings.json) puts into every session
-//   bun agents/rules.ts --reasons  the same with each rule's reason
-//   bun agents/rules.ts --write    regenerate AGENTS.md (read by Codex and other tools)
-//   bun agents/rules.ts --check    fail if AGENTS.md is not what --write would write (CI, fmt job)
+//   bun tools/agents/rules.ts --reasons  the same with each rule's reason
+//   bun tools/agents/rules.ts --write    regenerate AGENTS.md (read by Codex and other tools)
+//   bun tools/agents/rules.ts --check    fail if AGENTS.md is not what --write would write (CI, fmt job)
+//
+// AGENTS.md also carries `reviewRules`, the "## Code Review Rules" section Codex code review reads
+// on every pull request; it is not in the SessionStart hook's output.
 //
 // A rule's identity is its `id` (kebab case, never reused or renamed lightly); its number is only
 // its position in the printed list and moves when a rule is inserted.
@@ -24,7 +27,7 @@ type Rule = {
 
 const header = `# blaze
 
-How to build, test and change blaze, including its rust-analyzer-derived front end (crates/hir-ty, hir-def, syntax, parser and the rest): docs/contributing.md. What the harnesses check: docs/harness.md. Rules live in agents/rules.ts (edit there, then \`bun agents/rules.ts --write\` for AGENTS.md).`;
+How to build, test and change blaze, including its rust-analyzer-derived front end (crates/hir-ty, hir-def, syntax, parser and the rest): docs/contributing.md. What the harnesses check: docs/harness.md. Rules live in tools/agents/rules.ts (edit there, then \`bun tools/agents/rules.ts --write\` for AGENTS.md).`;
 
 export const rules = [
 	{
@@ -115,10 +118,32 @@ export const rules = [
 	},
 	{
 		id: "scripts-take-typed-input",
-		info: "A script (Python in `.github/scripts/`, `harness/`, `bench/`, `scripts/`, `nix/`) takes one typed input, not a set of flags: a single JSON value, given as a path to a file, `-` for standard input, or inline as the one argument. It parses that into a typed structure (a frozen `dataclass` with `Literal` and exact types, every field named, unknown fields refused) and fails naming the field that is wrong. At most a positional subcommand may come before it. No `argparse` flag sets, no environment variables as hidden parameters (an environment variable is only for what the environment is, like a token). A workflow writes the JSON inline (`python3 x.py '{\"target\": \"...\", \"pgo\": false}'`). An existing script moves to this when it is next changed.",
+		info: "A script (Python in `.github/scripts/`, `harness/`, `tools/`) takes one typed input, not a set of flags: a single JSON value, given as a path to a file, `-` for standard input, or inline as the one argument. It parses that into a typed structure (a frozen `dataclass` with `Literal` and exact types, every field named, unknown fields refused) and fails naming the field that is wrong. At most a positional subcommand may come before it. No `argparse` flag sets, no environment variables as hidden parameters (an environment variable is only for what the environment is, like a token). A workflow writes the JSON inline (`python3 x.py '{\"target\": \"...\", \"pgo\": false}'`). An existing script moves to this when it is next changed.",
 		reason: "Andrew, 2026-10-28: \"for parser things it should be typed like json instead of cli args, json through a file or stdin or a single value\". Flags drift (build_release.py grew --strict, --no-pgo, --server, --server-beside, ...), are untyped, and an agent or a workflow has to guess their combinations; one JSON value is checkable, diffable and the same from a workflow, a person or another script.",
 	},
 ] as const satisfies readonly Rule[];
+
+/**
+ * The "## Code Review Rules" section of AGENTS.md, which Codex code review follows on pull requests
+ * (https://learn.chatgpt.com/docs/third-party/github). Only checks a reviewer has to reason about:
+ * formatting, lint and the rustc comparison harnesses stay in CI.
+ */
+const reviewRules = `## Code Review Rules
+
+These guide Codex code review on pull requests. They add to the rustc comparison harnesses and a maintainer's approval; they replace neither.
+
+### Compiler correctness
+
+- Flag any change that can make a program built by blaze behave differently from the same program built by the pinned nightly rustc (\`harness/toolchain\`): layout, ABI, drop order, overflow and panic behavior, const eval, trait and method resolution, MIR passes, borrow checking, linking. Safe path: port rustc's rule and add a differential test against rustc. The one allowed difference is sandboxing build scripts and proc macros.
+- Flag a fallback: a path that, when blaze can't do something, quietly takes another route (rustc or cargo, rustc's copy of a function or static, a whole rebuild in place of a refused patch, a slower backend, an older cached result). Safe path: stop with an error that names what and where.
+- Flag a cache key, code-identity hash or live-patch check that misses an input the output depends on (source, cfg, features, target, toolchain, layout of a type it uses), so stale code can be reused or a patch applied after a layout or ABI change.
+- Flag unsafe code in the loader, the splice and the live runtime whose soundness rests on an unchecked assumption (alignment, lifetime of patched code, aliasing, thread safety of a swap), unless a comment states the invariant and where it is upheld.
+
+### Security
+
+- Flag anything that runs user code (build scripts, proc macros, tests in the sandboxed-tests experiment) outside the sandbox by default, or widens what the sandbox allows (writes outside \`OUT_DIR\`, network, new syscalls or paths), unless it goes through one of the documented opt-outs.
+- Flag the store, remote cache or daemon trusting bytes it did not verify: an artifact used without checking its content hash, archive or path entries that can escape their directory, a socket or HTTP endpoint reachable by other users, or CBOR from the network decoded without size limits.
+- Flag secrets (tokens, keys) written to logs, CI output, artifacts or the store, and workflows that expose secrets to code from forked pull requests.`;
 
 /** What the SessionStart hook prints: header, then `N. id: info (see link)`, with `reason` only on request. */
 export function render(withReasons: boolean): string {
@@ -158,15 +183,19 @@ export function agentsMd(): string {
 		return `${n}${body}${why}`;
 	});
 	const note =
-		"<!-- Generated by `bun agents/rules.ts --write` from agents/rules.ts; edit that file, not this one. -->";
-	return `${note}\n${header.split("\n").map((line) => wrap(line, 100, "")).join("\n")}\n\n${items.join("\n")}\n`;
+		"<!-- Generated by `bun tools/agents/rules.ts --write` from tools/agents/rules.ts; edit that file, not this one. -->";
+	const review = reviewRules
+		.split("\n")
+		.map((line) => (line.startsWith("- ") ? wrap(line, 100, "  ") : wrap(line, 100, "")))
+		.join("\n");
+	return `${note}\n${header.split("\n").map((line) => wrap(line, 100, "")).join("\n")}\n\n${items.join("\n")}\n\n${review}\n`;
 }
 
 // Claude Code replaces a hook's stdout past this many characters with a 2,000-character preview.
 const hookLimit = 10_000;
-const agentsPath = `${import.meta.dir}/../AGENTS.md`;
+const agentsPath = `${import.meta.dir}/../../AGENTS.md`;
 const [flag, ...rest] = process.argv.slice(2);
-if (rest.length > 0) throw new Error(`agents/rules.ts: one flag at most, got ${process.argv.slice(2).join(" ")}`);
+if (rest.length > 0) throw new Error(`tools/agents/rules.ts: one flag at most, got ${process.argv.slice(2).join(" ")}`);
 switch (flag) {
 	case undefined:
 		process.stdout.write(render(false));
@@ -180,15 +209,15 @@ switch (flag) {
 	case "--check": {
 		const printed = render(false).length;
 		if (printed > hookLimit) {
-			console.error(`agents/rules.ts prints ${printed} characters; Claude Code cuts SessionStart output past ${hookLimit}`);
+			console.error(`tools/agents/rules.ts prints ${printed} characters; Claude Code cuts SessionStart output past ${hookLimit}`);
 			process.exit(1);
 		}
 		if ((await Bun.file(agentsPath).text()) !== agentsMd()) {
-			console.error("AGENTS.md is stale: run `bun agents/rules.ts --write` and commit it");
+			console.error("AGENTS.md is stale: run `bun tools/agents/rules.ts --write` and commit it");
 			process.exit(1);
 		}
 		break;
 	}
 	default:
-		throw new Error(`agents/rules.ts: unknown flag ${flag} (none, --reasons, --write or --check)`);
+		throw new Error(`tools/agents/rules.ts: unknown flag ${flag} (none, --reasons, --write or --check)`);
 }

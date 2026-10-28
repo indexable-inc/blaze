@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-// Checks and measures the gateway's signed index (worker/remote-cache/API.md, "Index") from this
+// Checks and measures the gateway's signed index (tools/remote-cache/API.md, "Index") from this
 // machine, against a private tenant whose root key is registered with the gateway.
 //
-//     node bench/remote-cache/index_v1.mjs smoke|bench|refresh-prep|refresh-run
+//     node tools/bench/remote-cache/index_v1.mjs smoke|bench|refresh-prep|refresh-run
 //
 // Settings come from the environment, so no secret is in an argv: GW (gateway URL), TENANT,
 // WRITE_HDR and READ_HDR (files holding `Authorization: Bearer <token>`), ROOT_KEY and CI_KEY
@@ -18,7 +18,7 @@
 
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
-import { decode, encode } from "../../worker/remote-cache/src/cbor.ts";
+import { decode, encode } from "../../remote-cache/src/cbor.ts";
 
 const env = process.env;
 const GW = env.GW;

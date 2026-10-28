@@ -191,7 +191,7 @@ A remote is a directory, `s3://bucket/prefix`, an `https://` address it is only 
 whose files are named by their paths with `.` for `/` (a GitHub release's assets: see "The
 standard library" below), or a tenant of blaze's cache gateway,
 `blaze+https://<gateway>/t/<tenant>/v3` ([remote-cache.md](remote-cache.md), the API in
-`worker/remote-cache/API-v0.md`). The gateway's token is read from `BLAZE_REMOTE_TOKEN`, or
+`tools/remote-cache/API-v0.md`). The gateway's token is read from `BLAZE_REMOTE_TOKEN`, or
 from the variable `?token=env:NAME` names; without one the tenant is read anonymously, which a
 public tenant allows, and nothing is sent. Packs of 16 MB and more are fetched from it in ranges
 of 8 MB, `BLAZE_REMOTE_JOBS` at a time, and objects over 90 MB go up in parts. A gateway is not

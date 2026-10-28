@@ -1,21 +1,21 @@
 # A shared remote cache: one store for CI and everyone
 
-2026-10-27. Status: slice 1's gateway is built and deployed (`worker/remote-cache`, API-v0.md,
-measured in `bench/remote-cache/gateway-v0.tsv`), and so is slice 3's server side: `/has`, `/get`,
-`/blob`, `/put`, the D1 location table and the private HMAC namespaces (`worker/remote-cache/API.md`,
-`bench/remote-cache/cas-v1.tsv`; `/put` decompresses with workerd's own zstd, `node:zlib`, not
+2026-10-27. Status: slice 1's gateway is built and deployed (`tools/remote-cache`, API-v0.md,
+measured in `tools/bench/remote-cache/gateway-v0.tsv`), and so is slice 3's server side: `/has`, `/get`,
+`/blob`, `/put`, the D1 location table and the private HMAC namespaces (`tools/remote-cache/API.md`,
+`tools/bench/remote-cache/cas-v1.tsv`; `/put` decompresses with workerd's own zstd, `node:zlib`, not
 `ruzstd`). Slice 4's server side is deployed too: key lists, heads and segments with every
 index-write check, the refresh inside head writes, the 80-day location expiry, and the lifecycle
-rules (API.md "Index", `bench/remote-cache/index-v1.tsv`). One deviation: the refresh rewrites each
+rules (API.md "Index", `tools/bench/remote-cache/index-v1.tsv`). One deviation: the refresh rewrites each
 old object onto its own name through the R2 binding (a streamed get and put, R2 checking the MD5 or
 SHA-256), not S3 `CopyObject`, since no R2 S3 credential is readable to the Worker; measured live, a
 rewrite moves the upload date. The client speaks v0: `BLAZE_REMOTE=blaze+https://<gateway>/t/<tenant>/v3`
 with `BLAZE_REMOTE_TOKEN` pushes and pulls today's packs through the gateway
-([#525](https://github.com/indexable-inc/blaze/pull/525), `bench/remote-cache/e2e-client.tsv`), and
+([#525](https://github.com/indexable-inc/blaze/pull/525), `tools/bench/remote-cache/e2e-client.tsv`), and
 `.github/actions/blaze-remote` is CI's step for it (pull on every run, push from main after the
 tests), which goes into the merge gate once the gate builds with blaze and a release contains the
 client. The client's use of `/has`, `/get`, `/put` and the index needs #283. On blaze's own store
-(`bench/remote-cache/selfbuild.tsv`, ix arm64 VM in us-west-2), a pull of 121 packs, 237.8 MB, took
+(`tools/bench/remote-cache/selfbuild.tsv`, ix arm64 VM in us-west-2), a pull of 121 packs, 237.8 MB, took
 8.6 s (26.5 MiB/s), against 51 to 55 s for cargo's no-edit build with main's target dir. The build
 from a warm store is not measured yet: a cold `blaze build -p blaze-engine` of blaze needs more than
 16 GB (OOM-killed at 14.8 GB on 4 CPUs; 28.3 GB peak where it finished, in 389.6 s), so main's

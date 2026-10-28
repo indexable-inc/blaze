@@ -588,3 +588,38 @@ mod numbers {
         "#]],
     );
 }
+
+#[test]
+fn public_reexport_after_private_glob() {
+    check(
+        r#"
+//- /main.rs crate:main deps:dep
+use dep::Diagnostic;
+
+//- /dep.rs crate:dep deps:macros
+pub use rules::diagnostics::Diagnostic;
+mod rules { pub(crate) mod diagnostics; }
+
+//- /rules/diagnostics.rs
+pub use errors::Diagnostic;
+pub(crate) use errors::*;
+mod errors {
+    #[rustc_builtin_macro]
+    pub macro derive($item:item) {}
+
+    #[derive(macros::Metadata)]
+    #[metadata]
+    pub struct Diagnostic { pub code: u8 }
+}
+
+//- /macros.rs crate:macros
+#![crate_type="proc-macro"]
+#[proc_macro_derive(Metadata, attributes(metadata))]
+fn derive_metadata() {}
+"#,
+        expect![[r#"
+            crate
+            - Diagnostic : type (import)
+        "#]],
+    );
+}

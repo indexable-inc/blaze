@@ -13,6 +13,7 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261019.1",
+    "@huggingface/transformers": "4.3.2",
     "@types/bun": "^1.4.4",
     "flecs-content-mapper": "workspace:*",
     "highlight.js": "^11.12.0",

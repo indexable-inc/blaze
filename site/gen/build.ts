@@ -13,13 +13,15 @@
  *    audio files are at hand (.audio/files/, or served from R2 when SITE_AUDIO_REMOTE=1), gets `Audio {manifest}` in a
  *    second snapshot, and the renderer adds the player; its manifest and files are copied to dist/audio/. Any other
  *    page simply has no player, so the build never needs audio.
- * 4. Bundles client/*.ts, concatenates styles/, copies static/. For the worker, under .gen/:
+ * 4. Bundles client/*.ts, concatenates styles/, copies static/, and puts the chat translator's ONNX Runtime in dist/ort/
+ *    (`ortFiles`). For the worker, under .gen/:
  *
  *      site.wasm, site.cbor   the renderer and the snapshot (worker/renderer.ts)
  *      pages.json             every page: [{url, file, doc, discussable}] (what the worker routes)
  *      discussable.json       doc -> title and each block's text (what comments may attach to)
  *      build.json             {hash} of the module, the snapshot and the client scripts (part of the cache key), and
- *                             {assets}, of the client scripts' and styles' sources (client/nav.ts, worker/http.ts)
+ *                             {assets}, of the client scripts' and styles' sources (client/nav.ts, worker/http.ts),
+ *                             and {at}, when it was built (worker/presence.ts tells an old Durable Object by it)
  *      spoken.json            every page's spoken lines and their hash (the input of audio/generate.py)
  *      site.json              {origin, base}: where the site is served (`Served` on `site` in content/site.flecs)
  *
@@ -32,6 +34,7 @@
  *   bun gen/build.ts --watch   # again on every change under content/, gen/, client/, styles/
  */
 import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, watch, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Site, snapshot, type Page, type SnapshotInput, type SpokenLine } from '../worker/site-wasm';
@@ -206,6 +209,31 @@ function searchIndex(pages: Page[], html: Map<string, string>, tree: Map<string,
 
 const xmlEsc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+/**
+ * The WebGPU ONNX Runtime the chat translator runs on (client/translate-worker.ts), from the onnxruntime-web that
+ * @huggingface/transformers bundles: its loader as `<hash>.mjs` and its wasm (about 27 MB) in ORT_PART-sized pieces
+ * `<hash>.<i>.wasm`, since Workers serves no static file over 25 MiB. The worker fetches the pieces and joins them.
+ * Named by content, so a browser keeps them until onnxruntime-web changes.
+ */
+const ORT_PART = 16 * 1024 * 1024;
+function ortFiles(): { mjs: string; parts: string[] } {
+	const ort = path.dirname(createRequire(createRequire(path.join(root, 'package.json')).resolve('@huggingface/transformers')).resolve('onnxruntime-web/package.json'));
+	const out = path.join(dist, 'ort');
+	rmSync(out, { recursive: true, force: true });
+	mkdirSync(out, { recursive: true });
+	const mjs = readFileSync(path.join(ort, 'dist', 'ort-wasm-simd-threaded.asyncify.mjs'));
+	const wasm = readFileSync(path.join(ort, 'dist', 'ort-wasm-simd-threaded.asyncify.wasm'));
+	const id = createHash('sha256').update(mjs).update(wasm).digest('hex').slice(0, 16);
+	writeFileSync(path.join(out, `${id}.mjs`), mjs);
+	const parts: string[] = [];
+	for (let at = 0; at < wasm.length; at += ORT_PART) {
+		const name = `${id}.${parts.length}.wasm`;
+		writeFileSync(path.join(out, name), wasm.subarray(at, at + ORT_PART));
+		parts.push(name);
+	}
+	return { mjs: `${id}.mjs`, parts };
+}
+
 function write(file: string, data: string | Uint8Array) {
 	mkdirSync(path.dirname(file), { recursive: true });
 	writeFileSync(file, data);
@@ -254,7 +282,7 @@ async function build() {
 		outdir: path.join(dist, 'js'),
 		minify: true,
 		target: 'browser',
-		define: { BLAZE_ASSETS: JSON.stringify(assets) },
+		define: { BLAZE_ASSETS: JSON.stringify(assets), BLAZE_ORT: JSON.stringify(ortFiles()) },
 	});
 	if (!bundled.success) throw new AggregateError(bundled.logs, 'client bundle failed');
 
@@ -285,7 +313,7 @@ async function build() {
 	const hash = createHash('sha256');
 	for (const f of ['site.cbor', 'site.wasm']) hash.update(f).update(readFileSync(path.join(gen, f)));
 	for (const f of readdirSync(path.join(dist, 'js')).sort()) hash.update(f).update(readFileSync(path.join(dist, 'js', f)));
-	write(path.join(gen, 'build.json'), JSON.stringify({ hash: hash.digest('hex').slice(0, 16), assets }));
+	write(path.join(gen, 'build.json'), JSON.stringify({ hash: hash.digest('hex').slice(0, 16), assets, at: Date.now() }));
 	const narrated = Object.keys(audio).length ? `, ${Object.keys(audio).length} with audio` : '';
 	console.log(`built ${pages.length} pages${narrated} (snapshot ${snap.length} bytes) in ${Math.round(performance.now() - t0)} ms`);
 }
