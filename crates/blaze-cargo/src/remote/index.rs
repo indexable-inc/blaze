@@ -250,9 +250,10 @@ pub async fn update(
     }
     let added = match &made {
         Some(made) => {
-            let send = |bytes: &Vec<u8>| async move {
+            let send = |bytes: &Vec<u8>| {
                 let hash: Hash = Sha256::digest(bytes).into();
-                remote.send_named_by_hash(&object(&hash), bytes.clone()).await
+                let bytes = bytes.clone();
+                async move { remote.send_named_by_hash(&object(&hash), bytes).await }
             };
             stream::iter(made.shards.iter().map(send))
                 .buffer_unordered(remote.jobs())
