@@ -18,8 +18,10 @@ use rustc_hash::FxHashMap;
 
 use super::FunctionDebug;
 
-/// What starts a version string of blaze's, which tells its modules in a PDB from rustc's.
-const PRODUCER: &str = concat!("blaze ", env!("CARGO_PKG_VERSION"));
+/// What starts a version string of blaze's, which tells its modules in a PDB from rustc's. No
+/// version: the release blaze is is told only to the engine, so that a release changes no crate
+/// below it (crates/blaze-engine/build.rs).
+const PRODUCER: &str = "blaze";
 
 /// The first four bytes of a `.debug$S` section of the C13 format.
 const SIGNATURE_C13: u32 = 4;

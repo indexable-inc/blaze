@@ -7774,6 +7774,8 @@ pub fn main() -> anyhow::Result<()> {
         stand_ins: link::stand_ins,
         pin: versions::pin,
         why_this_one: versions::why_this_one,
+        version: pin::OURS,
+        version_line: env!("BLAZE_VERSION_LINE"),
     });
     trace::began();
     renamed::refuse_old_settings();
