@@ -524,6 +524,7 @@ impl SymbolTable {
             }
         }
         let added_in = start.elapsed() - read_in;
+        eprintln!("DBG table gen {generation} files {files:?} linked {:?}", table.linked);
         table.place(unplaced);
         table.index(symbols);
         if std::env::var_os("BLAZE_STATS").is_some() {

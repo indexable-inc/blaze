@@ -304,6 +304,9 @@ class Case:
             return [self.step(step, env, daemon, socket, binary) for step in self.spec["steps"]]
         finally:
             daemon.kill()
+            if self.name == "reload_lock_version":
+                for line in open(log_path, errors="replace").read().splitlines():
+                    print("DBG-DAEMON " + line[:600], flush=True)
             shutil.rmtree(os.path.dirname(socket), ignore_errors=True)
 
     def ask(self, link, env):
@@ -569,7 +572,7 @@ def main():
     ap.add_argument("--keep", action="store_true", help="keep the scratch copies")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 4), help="cases built at once")
     a = ap.parse_args()
-    names = a.cases or sorted(n for n in os.listdir(CASES) if os.path.exists(os.path.join(CASES, n, "case.json")))
+    names = a.cases or ["reload_lock_version"] or sorted(n for n in os.listdir(CASES) if os.path.exists(os.path.join(CASES, n, "case.json")))
     backends = a.backend or ["cranelift", "llvm"]
     table, bad = [], 0
     here = host().split("-")[0]

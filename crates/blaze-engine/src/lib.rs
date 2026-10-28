@@ -971,6 +971,16 @@ impl Resolver<'_> {
     /// The name blaze gives a non-generic function of the crate `id` names: where it is, and
     /// for one in a body where in the source that is.
     fn function_named_in(&self, func: FunctionId, id: u64) -> Option<String> {
+        {
+            let krate = hir_def::HasModule::krate(&func, self.db);
+            eprintln!(
+                "DBG own name {:?} id {id:x} root {:?} gen {} rustc_id {:?}",
+                self.path(func),
+                self.crate_root(krate.into()),
+                self.table.generation(),
+                self.rustc_crate_id(krate)
+            );
+        }
         let Some(path) = self.path(func) else {
             // No path to write (the `impl` is for `!`, `dyn Trait`, a type taking a constant, or
             // the function sits where `item_path` cannot reach): its name and where it is
@@ -9433,10 +9443,12 @@ fn run_holding(
                                 let same = parts.members == program.args.members
                                     && parts.debug == program.args.debug;
                                 if same && (linked.is_none() || new.is_empty()) {
+                                    eprintln!("DBG reload kept linked {} new {}", linked.is_some(), new.len());
                                     program.known.touch(&db, Some(&new));
                                     program.unbuilt.stale |= !new.is_empty();
                                     continue;
                                 }
+                                eprintln!("DBG start_over linked {:?} new {}", linked.map(|it| &it.symbol_files), new.len());
                                 let again = program.start_over(&db, parts, linked, &new, &files);
                                 started = started.and(again);
                             }
