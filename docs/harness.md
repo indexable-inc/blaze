@@ -59,8 +59,15 @@ which hosts and under which backend.
 and each harness in the Python that runs it. A harness moved to one typed input (AGENTS.md,
 scripts-take-typed-input) reads it with the workspace's `typed_input`, so it runs the same way
 by hand: `uv run --frozen python harness/keys.py '{"cases": ["a feature"]}'`.
-`includes.py`, `keys.py`, `fuzz/edits.py` and `ci.py` itself take their JSON so far; the
+`includes.py`, `keys.py`, `fuzz/edits.py`, `fnincr.py` and `ci.py` itself take their JSON so far; the
 fields are in each script's docstring.
+
+The flake's `scripts` shell supplies uv, Python 3.13 and Node for pyright, all from `flake.lock`:
+`nix develop .#scripts --command uv run --frozen pyright` (the same workspace as CI).
+The development, wasm and benchmark shells also provide uv and Python 3.13. On NixOS they
+select Nix's interpreter explicitly and disable Python downloads; uv's standalone Linux Python
+does not use Nix's dynamic loader. CI installs uv 0.13.5 on every harness runner, Windows
+included, and `uv run --frozen --no-dev` installs the workspace helper without the lint tools.
 
 The fast tier is the harnesses marked fast in `HARNESSES` that `FAST` (in `ci.py`) gives to
 this host: each line there has the harness's measured seconds on CI (the slowest median of

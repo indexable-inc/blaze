@@ -149,10 +149,16 @@ jobs:
       # another yet (https://github.com/indexable-inc/blaze/issues/899; the smoke corpus took
       # 15 min instead of 74 s, unit tests 60 s instead of 5). The merge gate and main build
       # with blaze.
-      BLAZE: ${{ !startsWith(inputs.os, 'windows') && inputs.tier != 'fast' && inputs.tier != 'full' }}
+      # Named harness runs are a new route: bootstrap them with blaze too.
+      BLAZE: ${{ !startsWith(inputs.os, 'windows') && (inputs.harnesses != '' || (inputs.tier != 'fast' && inputs.tier != 'full')) }}
     outputs:
       parts: ${{ steps.parts.outputs.parts || steps.focused.outputs.parts }}
     steps:
+      - name: blaze bootstrap for named harnesses
+        if: runner.os == 'Windows' && inputs.harnesses != ''
+        run: |
+          echo 'Named harness builds on Windows need a released Windows blaze to bootstrap with; none is shipped yet.' >&2
+          exit 1
       # Nightly cargo's build-dir layout gives rustc one `-L dependency=` per dependency: for
       # blaze-cargo that is over Windows' 32K command line, and sccache spawns rustc with it as is.
       - if: runner.os == 'Windows'
@@ -224,7 +230,9 @@ jobs:
           enable-cache: false
       - id: parts
         if: (inputs.tier == 'fast' || inputs.tier == 'full') && inputs.harnesses == ''
-        run: echo "parts=$(uv run --frozen python harness/ci.py parts '{"tier": "${{ inputs.tier }}"}')" >> "$GITHUB_OUTPUT"
+        run: |
+          parts=$(uv run --frozen --no-dev python harness/ci.py parts '{"tier": "${{ inputs.tier }}"}')
+          echo "parts=$parts" >> "$GITHUB_OUTPUT"
       # focused.yaml's harnesses, by name (harness/focused.py).
       - id: focused
         if: inputs.harnesses != ''
@@ -232,7 +240,7 @@ jobs:
           HARNESSES: ${{ inputs.harnesses }}
         # A name that is no harness's, or runs nowhere here, fails this step.
         run: |
-          parts=$(uv run --frozen python harness/focused.py parts "{\"harnesses\": $HARNESSES}")
+          parts=$(uv run --frozen --no-dev python harness/focused.py parts "{\"harnesses\": $HARNESSES}")
           echo "parts=$parts" >> "$GITHUB_OUTPUT"
 
   harness:
@@ -304,12 +312,13 @@ jobs:
           version: '0.13.5'
           enable-cache: false
       - if: inputs.harnesses == ''
-        run: uv run --frozen python harness/ci.py run '{"part": "${{ matrix.part }}"}'
+        run: |
+          uv run --frozen --no-dev python harness/ci.py run '{"part": "${{ matrix.part }}"}'
       - if: inputs.harnesses != ''
         env:
           HARNESSES: ${{ inputs.harnesses }}
         run: |
-          uv run --frozen python harness/focused.py run "{\"harnesses\": $HARNESSES, \"backend\": \"${{ matrix.backend }}\"}"
+          uv run --frozen --no-dev python harness/focused.py run "{\"harnesses\": $HARNESSES, \"backend\": \"${{ matrix.backend }}\"}"
       # What the daemons said when a harness failed (each harness keeps its daemon's log in a
       # temporary directory of its own), and the report of a process that crashed on macOS.
       - name: Daemon logs

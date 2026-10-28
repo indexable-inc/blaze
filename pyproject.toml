@@ -23,9 +23,43 @@ typed-input = { workspace = true }
 [tool.ruff]
 target-version = "py313"
 line-length = 110
-include = [".github/scripts/downstream.py", "harness/focused.py", "python/**/*.py"]
+include = [
+  ".github/scripts/downstream.py",
+  "harness/check_json.py",
+  "harness/ci.py",
+  "harness/focused.py",
+  "harness/fnincr.py",
+  "harness/fuzz/edits.py",
+  "harness/includes.py",
+  "harness/keys.py",
+  "harness/own_inputs.py",
+  "harness/storerevisions.py",
+  "harness/toolchain_bump.py",
+  "python/**/*.py",
+]
+
+# These older harnesses arrange their sibling imports after computing HERE. Their runtime
+# migration keeps that existing import order; new workspace packages use normal imports.
+[tool.ruff.lint.per-file-ignores]
+"harness/fnincr.py" = ["E402"]
+"harness/fuzz/edits.py" = ["E402"]
+"harness/includes.py" = ["E402"]
+"harness/keys.py" = ["E402"]
 
 [tool.pyright]
-include = [".github/scripts/downstream.py", "harness/focused.py", "python"]
+include = [
+  ".github/scripts/downstream.py",
+  "harness/check_json.py",
+  "harness/ci.py",
+  "harness/focused.py",
+  "harness/fnincr.py",
+  "harness/fuzz/edits.py",
+  "harness/includes.py",
+  "harness/keys.py",
+  "harness/own_inputs.py",
+  "harness/storerevisions.py",
+  "harness/toolchain_bump.py",
+  "python",
+]
 pythonVersion = "3.13"
 typeCheckingMode = "strict"

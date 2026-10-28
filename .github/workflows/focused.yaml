@@ -5,7 +5,7 @@
 #   gh workflow run focused.yaml --ref <branch> -f harnesses='["splices.py"]' -f macos=true
 #
 # A name is a label of `ci.py list '{}'`, or its start up to a space (harness/focused.py). Each
-# platform asked for builds blaze as the train does and runs the named harnesses that run there,
+# supported platform builds blaze with the released blaze and runs the named harnesses that run there,
 # under both backends; a name that runs on none of a platform's backends fails that platform.
 # Its `blaze-<platform>` build is kept three days, for downstream.yaml's `build-run`.
 #
@@ -30,6 +30,7 @@ on:
         type: boolean
         default: false
       windows:
+        description: requires a released Windows blaze for bootstrap (currently unavailable)
         type: boolean
         default: false
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# pyright: basic
 """edits.py: generated edits, what the daemon makes of each against a cold cargo build.
 
 usage: edits.py smoke '{"backends": ["cranelift"]}'             a short run on fixed seeds, for CI
@@ -32,8 +33,21 @@ The edits:
 
 BLAZE_BIN names the blaze under test. The exit status is 1 when there is a finding.
 """
-import collections, concurrent.futures, copy, json, os, random, re, shutil, subprocess, sys, tempfile, time
+
+import collections
+import concurrent.futures
+import copy
+import json
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 from typed_input import fail, parse
@@ -41,22 +55,47 @@ from typed_input import fail, parse
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
-import gen, linkline
-from difftest import Fixture, BLAZE, TARGET_ARGS, built, sysroot_rlibs, minimize
+import gen
+import linkline
+from difftest import BLAZE, TARGET_ARGS, Fixture, built, minimize, sysroot_rlibs
 from fuzz import BACKENDS, FOUND, MANIFEST, differences, edition_of, run
 
 EDITS = os.path.join(FOUND, "edits")
 # The line between one source and the next in a file under found/edits/.
 THEN = "//// then"
-SCALARS = {"bool", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize"}
+SCALARS = {
+    "bool",
+    "f32",
+    "f64",
+    "i8",
+    "i16",
+    "i32",
+    "i64",
+    "i128",
+    "isize",
+    "u8",
+    "u16",
+    "u32",
+    "u64",
+    "u128",
+    "usize",
+}
 # The function `fn.add` adds, in the shapes `fn.signature` goes through: its text and its call.
 EXTRA = [
     ("#[inline(never)] pub fn {name}(x: u64) -> u64 {{ x.wrapping_mul({k}) }}", "feed({name}(3));"),
-    ("#[inline(never)] pub fn {name}(x: u64, y: u8) -> u64 {{ x.wrapping_mul({k}) + y as u64 }}", "feed({name}(3, 4));"),
-    ("#[inline(never)] pub fn {name}(x: u32, y: [u64; 3]) -> (u64, u8) {{ (y[1] ^ {k}, x as u8) }}", "feed({name}(3, [1, 2, 3]).0);"),
+    (
+        "#[inline(never)] pub fn {name}(x: u64, y: u8) -> u64 {{ x.wrapping_mul({k}) + y as u64 }}",
+        "feed({name}(3, 4));",
+    ),
+    (
+        "#[inline(never)] pub fn {name}(x: u32, y: [u64; 3]) -> (u64, u8) {{ (y[1] ^ {k}, x as u8) }}",
+        "feed({name}(3, [1, 2, 3]).0);",
+    ),
     ("#[inline(never)] pub fn {name}<T: Mix>(x: T) -> T {{ x.mix(); feed({k}); x }}", "{name}(3u16).mix();"),
-    ("#[inline(never)] pub fn {name}(x: &mut Vec<u64>, y: Option<Box<u8>>) {{ x.push({k} + y.map_or(0, |it| *it as u64)); }}",
-     "{{ let mut seen = Vec::new(); {name}(&mut seen, Some(Box::new(5))); seen.mix(); }}"),
+    (
+        "#[inline(never)] pub fn {name}(x: &mut Vec<u64>, y: Option<Box<u8>>) {{ x.push({k} + y.map_or(0, |it| *it as u64)); }}",
+        "{{ let mut seen = Vec::new(); {name}(&mut seen, Some(Box::new(5))); seen.mix(); }}",
+    ),
 ]
 
 
@@ -76,13 +115,22 @@ class Editor:
         self.cases, self.count = [], 0
         for index in range(cases):
             lines, made = gen.case(seed, index)
-            self.cases.append(Case(f"c{index}", made.index, lines, made.phases))
+            # gen.case records the retry's index dynamically on its generator.
+            self.cases.append(Case(f"c{index}", vars(made)["index"], lines, made.phases))
         self.history = [copy.deepcopy(self.cases)]
         self.kinds = [
-            (3, "regen.run", self.regen_run), (3, "regen.fn", self.regen_fn), (1.5, "regen.constants", self.regen_constants),
-            (1.5, "regen.adts", self.regen_adts), (3, "const.value", self.const_value), (2, "layout.fields", self.layout_fields),
-            (2, "layout.repr", self.layout_repr), (3, "body.literal", self.body_literal), (2, "fn.add", self.fn_add),
-            (2, "fn.signature", self.fn_signature), (1.5, "fn.remove", self.fn_remove), (1.5, "undo", self.undo),
+            (3, "regen.run", self.regen_run),
+            (3, "regen.fn", self.regen_fn),
+            (1.5, "regen.constants", self.regen_constants),
+            (1.5, "regen.adts", self.regen_adts),
+            (3, "const.value", self.const_value),
+            (2, "layout.fields", self.layout_fields),
+            (2, "layout.repr", self.layout_repr),
+            (3, "body.literal", self.body_literal),
+            (2, "fn.add", self.fn_add),
+            (2, "fn.signature", self.fn_signature),
+            (1.5, "fn.remove", self.fn_remove),
+            (1.5, "undo", self.undo),
         ]
 
     def text(self):
@@ -128,15 +176,30 @@ class Editor:
 
     def lines_like(self, pattern):
         """Every `(case, line number, match)` of a pattern in the program."""
-        return [(case, at, found) for case in self.cases for at, line in enumerate(case.lines) if (found := re.match(pattern, line))]
+        return [
+            (case, at, found)
+            for case in self.cases
+            for at, line in enumerate(case.lines)
+            if (found := re.match(pattern, line))
+        ]
 
     def const_value(self):
-        items = [it for it in self.lines_like(r"(\s*(?:const|static|static mut) \w+: (\w+) = )(.*);$") if it[2].group(2) in SCALARS]
+        items = [
+            it
+            for it in self.lines_like(r"(\s*(?:const|static|static mut) \w+: (\w+) = )(.*);$")
+            if it[2].group(2) in SCALARS
+        ]
         if not items:
             return None
         case, at, found = self.r.choice(items)
         ty = found.group(2)
-        value = self.r.choice(["true", "false"] if ty == "bool" else ["0.5", "2.0", "-1.0", "1e9"] if ty in ("f32", "f64") else ["0", "1", "2", "7", "100", f"{ty}::MAX"])
+        value = self.r.choice(
+            ["true", "false"]
+            if ty == "bool"
+            else ["0.5", "2.0", "-1.0", "1e9"]
+            if ty in ("f32", "f64")
+            else ["0", "1", "2", "7", "100", f"{ty}::MAX"]
+        )
         case.lines[at] = f"{found.group(1)}{value};"
         return f"{case.name}: {case.lines[at].strip()}"
 
@@ -152,7 +215,7 @@ class Editor:
             case.lines[at] = found.group(1) + ", ".join(fields) + found.group(3)
         else:
             end = next(i for i in range(at + 1, len(case.lines)) if case.lines[i].strip() == "}")
-            case.lines[at + 1:end] = case.lines[at + 2:end] + case.lines[at + 1:at + 2]
+            case.lines[at + 1 : end] = case.lines[at + 2 : end] + case.lines[at + 1 : at + 2]
         return f"{case.name}: {case.lines[at].strip()[:60]}"
 
     def layout_repr(self):
@@ -179,7 +242,7 @@ class Editor:
         self.drop_extra(case, name)
         text, call = (part.format(name=name, k=self.r.randrange(1, 1 << 30)) for part in EXTRA[shape])
         start = next(i for i, line in enumerate(case.lines) if line.strip() == "pub fn run() {")
-        case.lines[start + 1:start + 1] = [f"        {call}"]
+        case.lines[start + 1 : start + 1] = [f"        {call}"]
         case.lines[0:0] = [f"    {text}"]
         case.extras[name] = shape
 
@@ -230,35 +293,59 @@ class Daemon:
         self.ws, self.work, self.cold = (os.path.join(directory, name) for name in ("ws", "work", "cold"))
         os.makedirs(os.path.join(self.ws, "src"))
         os.makedirs(self.work)
-        open(os.path.join(self.ws, "Cargo.toml"), "w").write(MANIFEST.format(edition=edition))
+        Path(self.ws, "Cargo.toml").write_text(MANIFEST.format(edition=edition))
         self.main = os.path.join(self.ws, "src", "main.rs")
-        open(self.main, "w").write(text)
+        Path(self.main).write_text(text)
         self.env = {**os.environ, **BACKENDS[backend]}
         self.fx = Fixture(self.ws, ["fz"], ["-p", "fz"], touch=self.main)
         self.fx.rustc_build()
         obj, patch, self.binary = (os.path.join(self.work, f"fz.{name}") for name in ("o", "patch.o", "bin"))
         link = linkline.with_output(linkline.ahead(list(self.fx.link_args), [patch, obj], BLAZE), self.binary)
         symbols = [x for rlib in self.fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
-        self.ask = ["--crate", "fz", "--out", obj, "--patch", patch, "--link-cmd", linkline.join(link), "--binary", self.binary, *symbols]
+        self.ask = [
+            "--crate",
+            "fz",
+            "--out",
+            obj,
+            "--patch",
+            patch,
+            "--link-cmd",
+            linkline.join(link),
+            "--binary",
+            self.binary,
+            *symbols,
+        ]
         self.socket, self.log = os.path.join(self.work, "blaze.sock"), os.path.join(self.work, "daemon.log")
-        out = open(self.log, "a")
-        self.process = subprocess.Popen([BLAZE, self.ws, *TARGET_ARGS, "--socket", self.socket, *self.ask], stderr=out, stdout=out, env=self.env)
+        with open(self.log, "a") as out:
+            self.process = subprocess.Popen(
+                [BLAZE, self.ws, *TARGET_ARGS, "--socket", self.socket, *self.ask],
+                stderr=out,
+                stdout=out,
+                env=self.env,
+            )
         began = time.time()
-        while "watching" not in open(self.log).read():
+        while "watching" not in Path(self.log).read_text():
             if self.process.poll() is not None or time.time() - began > 600:
-                raise SystemExit(f"the daemon did not start:\n{open(self.log).read()[-2000:]}")
+                raise SystemExit(f"the daemon did not start:\n{Path(self.log).read_text()[-2000:]}")
             time.sleep(0.05)
 
     def sync(self, text):
         """Writes the source and asks the daemon for the binary. Returns its reply and how it linked."""
-        open(self.main, "w").write(text)
-        seen = len(open(self.log).read())
+        Path(self.main).write_text(text)
+        seen = len(Path(self.log).read_text())
         try:
-            reply = subprocess.run([BLAZE, "sync", self.socket, *self.ask], capture_output=True, text=True, timeout=600, env=self.env)
+            reply = subprocess.run(
+                [BLAZE, "sync", self.socket, *self.ask],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                env=self.env,
+            )
             said = (reply.stdout + reply.stderr).strip()
         except subprocess.TimeoutExpired:
             said = "no reply after 600s"
-        links = re.findall(r"^link: \S+ \((.*)\)$", open(self.log).read()[seen:], re.M)
+        links = re.findall(r"^link: \S+ \((.*)\)$", Path(self.log).read_text()[seen:], re.MULTILINE)
         if not links:
             return said, "no link"
         if links[-1].startswith("spliced"):
@@ -268,9 +355,15 @@ class Daemon:
 
     def cargo(self, text):
         """What cargo's build of the source from nothing prints, or None when rustc turns it down."""
-        open(self.main, "w").write(text)
-        build = subprocess.run(["cargo", "build", "-q", *TARGET_ARGS], cwd=self.ws, capture_output=True, text=True,
-                               env={**os.environ, "CARGO_TARGET_DIR": self.cold, "CARGO_INCREMENTAL": "0"})
+        Path(self.main).write_text(text)
+        build = subprocess.run(
+            ["cargo", "build", "-q", *TARGET_ARGS],
+            check=False,
+            cwd=self.ws,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "CARGO_TARGET_DIR": self.cold, "CARGO_INCREMENTAL": "0"},
+        )
         return run(built(self.cold, "fz")) if build.returncode == 0 else None
 
     def alive(self):
@@ -303,11 +396,15 @@ def verdict(daemon, text, expected):
     reply, how = daemon.sync(text)
     took = int((time.time() - began) * 1000)
     if not reply.startswith("ok") and daemon.gone():
-        return "died: " + panic_of(open(daemon.log).read()), how, took
+        return "died: " + panic_of(Path(daemon.log).read_text()), how, took
     if not reply.startswith("ok"):
         return "refused: " + reply[:300], how, took
     found = differences(expected, run(daemon.binary))
-    return (f"differs in {found[0].case}: {found[0].key}\n{found[0].detail[:1500]}" if found else None), how, took
+    return (
+        (f"differs in {found[0].case}: {found[0].key}\n{found[0].detail[:1500]}" if found else None),
+        how,
+        took,
+    )
 
 
 def modules_of(cases, names=None):
@@ -327,7 +424,7 @@ def replay(work, edition, backend, sources):
             wrong = verdict(daemon, text, expected)[0]
             if wrong:
                 return f"step {at}: {wrong}"
-        log = open(daemon.log).read()
+        log = Path(daemon.log).read_text()
         return "panicked: " + panic_of(log) if "panicked at" in log else None
     finally:
         daemon.close()
@@ -343,7 +440,9 @@ def reduce_pair(work, edition, backend, before, after, budget):
         if tests[0] >= budget:
             return False
         tests[0] += 1
-        return replay(work, edition, backend, [modules_of(before, names), modules_of(after, names)]) is not None
+        return (
+            replay(work, edition, backend, [modules_of(before, names), modules_of(after, names)]) is not None
+        )
 
     names = [case.name for case in after if any(case.name == other.name for other in before)]
     if not fails(names):
@@ -356,22 +455,29 @@ def write_found(tag, edition, backend, kind, what, wrong, sources, alone):
     """Files a finding under found/edits/: the sources a daemon is to be shown in turn."""
     os.makedirs(EDITS, exist_ok=True)
     path = os.path.join(EDITS, f"{tag}.rs")
-    head = [f"// Found by edits.py: seed {tag}, edition {edition}, backend {backend}.", f"// The edit ({kind}): {what}",
-            f"// Again: edits.py check '{json.dumps({'files': [os.path.basename(path)]})}'" if alone else
-            "// Not alone: a daemon that has only built the first of these gets the second right. It took the edits before.",
-            *("// " + line for line in wrong.splitlines()[:30])]
+    head = [
+        f"// Found by edits.py: seed {tag}, edition {edition}, backend {backend}.",
+        f"// The edit ({kind}): {what}",
+        f"// Again: edits.py check '{json.dumps({'files': [os.path.basename(path)]})}'"
+        if alone
+        else "// Not alone: a daemon that has only built the first of these gets the second right. It took the edits before.",
+        *("// " + line for line in wrong.splitlines()[:30]),
+    ]
     parts = ["\n\n".join(gen.module(name, lines) for name, lines in modules) for modules in sources]
-    open(path, "w").write("\n".join(head) + "\n" + f"\n{THEN}\n".join(parts) + "\n")
+    Path(path).write_text("\n".join(head) + "\n" + f"\n{THEN}\n".join(parts) + "\n")
     return path
 
 
 def read_found(path):
     """The sources of a file under found/edits/, each as modules, and the edition they are of."""
-    text = open(path).read()
-    edition = re.search(r"edition (\d+)", text).group(1)
+    text = Path(path).read_text()
+    found_edition = re.search(r"edition (\d+)", text)
+    if found_edition is None:
+        fail("edits.py", f"files: {path} has no edition")
+    edition = found_edition.group(1)
     sources = []
     for part in text.split(f"\n{THEN}\n"):
-        found = re.findall(r"^mod (c\d+) \{\n    use super::\*;\n(.*?)^\}$", part, re.M | re.S)
+        found = re.findall(r"^mod (c\d+) \{\n    use super::\*;\n(.*?)^\}$", part, re.MULTILINE | re.DOTALL)
         sources.append([(name, body.rstrip("\n").split("\n")) for name, body in found])
     return sources, edition
 
@@ -386,7 +492,10 @@ def check(paths, backends, work):
         for backend in backends:
             said = replay(work, edition, backend, sources)
             wrong += said is not None
-            print(f"{'WRONG    ' if said else 'same     '} {os.path.basename(path)} ({backend}) {(said or '').splitlines()[0][:200] if said else ''}", flush=True)
+            print(
+                f"{'WRONG    ' if said else 'same     '} {os.path.basename(path)} ({backend}) {(said or '').splitlines()[0][:200] if said else ''}",
+                flush=True,
+            )
     return wrong
 
 
@@ -411,7 +520,9 @@ def round_of(seed, cases, steps, backend, work, out, budget):
             kind, what = edit
             expected = daemon.cargo(editor.text())
             if expected is None or expected[0] == "timeout":
-                rows.append({"kind": kind, "what": what, "how": "not accepted by rustc", "ms": 0, "wrong": None})
+                rows.append(
+                    {"kind": kind, "what": what, "how": "not accepted by rustc", "ms": 0, "wrong": None}
+                )
                 editor.back()
                 continue
             wrong, how, took = verdict(daemon, editor.text(), expected)
@@ -419,15 +530,21 @@ def round_of(seed, cases, steps, backend, work, out, budget):
             if wrong and wrong.startswith("differs"):
                 pair = reduce_pair(work, edition, backend, before, editor.cases, budget)
                 sources = pair or [modules_of(before), modules_of(editor.cases)]
-                row["found"] = [write_found(f"{seed}-s{step}-{backend}", edition, backend, kind, what, wrong, sources, bool(pair))]
+                row["found"] = [
+                    write_found(
+                        f"{seed}-s{step}-{backend}", edition, backend, kind, what, wrong, sources, bool(pair)
+                    )
+                ]
             rows.append(row)
             editor.keep()
             # What the daemon has after it refused is from before the edit: the round is over.
             if wrong and not wrong.startswith("differs"):
                 break
-        log = open(daemon.log).read()
+        log = Path(daemon.log).read_text()
         if "panicked at" in log and not any(row["wrong"] for row in rows):
-            rows.append({"kind": "end", "what": "", "how": "", "ms": 0, "wrong": "panicked: " + panic_of(log)})
+            rows.append(
+                {"kind": "end", "what": "", "how": "", "ms": 0, "wrong": "panicked: " + panic_of(log)}
+            )
         if any(row["wrong"] for row in rows):
             shutil.copy(daemon.log, os.path.join(out, f"{seed}-{backend}.daemon.log"))
     finally:
@@ -442,8 +559,10 @@ def one(job):
         try:
             result["backends"][backend] = round_of(seed, cases, steps, backend, work, out, budget)
         except SystemExit as error:
-            result["backends"][backend] = [{"kind": "start", "what": "", "how": "no daemon", "ms": 0, "wrong": f"died: {error}"}]
-    json.dump(result, open(os.path.join(out, f"{seed}.json"), "w"))
+            result["backends"][backend] = [
+                {"kind": "start", "what": "", "how": "no daemon", "ms": 0, "wrong": f"died: {error}"}
+            ]
+    Path(out, f"{seed}.json").write_text(json.dumps(result))
     return result
 
 
@@ -459,17 +578,27 @@ def say(result):
 
 def report(directory):
     """Adds up the logs of a run. Returns the number of findings."""
-    results = [json.load(open(os.path.join(directory, name))) for name in sorted(os.listdir(directory)) if name.endswith(".json")]
+    results = [
+        json.loads(Path(directory, name).read_text())
+        for name in sorted(os.listdir(directory))
+        if name.endswith(".json")
+    ]
     findings = 0
     for backend in sorted({backend for result in results for backend in result["backends"]}):
         rows = [row for result in results for row in result["backends"].get(backend, [])]
-        edits = [row for row in rows if row["kind"] not in ("start", "end") and row["how"] != "not accepted by rustc"]
+        edits = [
+            row
+            for row in rows
+            if row["kind"] not in ("start", "end") and row["how"] != "not accepted by rustc"
+        ]
         wrong = [row for row in rows if row["wrong"]]
         findings += len(wrong)
         kinds = collections.Counter(row["wrong"].split(":")[0].split(" in ")[0] for row in wrong)
-        print(f"{backend}: {len(results)} programs, {len(edits)} edits shown to the daemon, "
-              f"{sum(row['how'] == 'not accepted by rustc' for row in rows)} edits rustc turned down, {len(wrong)} findings"
-              + "".join(f", {count} {kind}" for kind, count in sorted(kinds.items())))
+        print(
+            f"{backend}: {len(results)} programs, {len(edits)} edits shown to the daemon, "
+            f"{sum(row['how'] == 'not accepted by rustc' for row in rows)} edits rustc turned down, {len(wrong)} findings"
+            + "".join(f", {count} {kind}" for kind, count in sorted(kinds.items()))
+        )
         print("  edit                 shown  wrong")
         for kind in sorted({row["kind"] for row in edits}):
             of_kind = [row for row in edits if row["kind"] == kind]
@@ -487,6 +616,7 @@ type Backend = Literal["cranelift", "llvm", "llvm-O0", "llvm-full"]
 @dataclass(frozen=True)
 class Smoke:
     """The fixed seeds of CI: 2 programs of 4 cases, 8 edits each, then found/edits/ again."""
+
     backends: tuple[Backend, ...] = ("cranelift", "llvm")
     jobs: int = 2
     # The builds a reduction may take.
@@ -543,7 +673,10 @@ def rounds(seed, first, count, cases, steps, it):
         fail(SCRIPT, "backends is empty: name at least one")
     positive(jobs=it.jobs, reduce=it.reduce)
     out, work = directory(it.out, "blaze-edits-out-"), directory(it.work, "blaze-edits-")
-    jobs = [(f"{seed}-{index}", cases, steps, list(it.backends), work, out, it.reduce) for index in range(first, first + count)]
+    jobs = [
+        (f"{seed}-{index}", cases, steps, list(it.backends), work, out, it.reduce)
+        for index in range(first, first + count)
+    ]
     with concurrent.futures.ProcessPoolExecutor(it.jobs) as pool:
         for result in pool.map(one, jobs):
             say(result)

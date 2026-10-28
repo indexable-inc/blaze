@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# pyright: basic
 """keys.py: whether the store hands a build code that was compiled from something else.
 
 The workspace in harness/keys has a function for each thing code can depend on that is not the
@@ -17,8 +18,13 @@ ones, starting at the `index`th: `count` machines with `index` from 1 to `count`
 between them. Run it in the repository's Python workspace: `uv run --frozen python
 harness/keys.py ...` from the root.
 """
-import os, shutil, subprocess, sys, tempfile
+
+import os
+import shutil
+import sys
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 
 from typed_input import fail, parse
 
@@ -33,9 +39,10 @@ def write(path, text):
 
 def replace(path, old, new):
     def edit(ws, env, args):
-        text = open(os.path.join(ws, path)).read()
+        text = Path(ws, path).read_text()
         assert old in text, (path, old)
-        open(os.path.join(ws, path), "w").write(text.replace(old, new))
+        Path(ws, path).write_text(text.replace(old, new))
+
     return edit
 
 
@@ -72,28 +79,102 @@ CASES = [
     ("a cfg a build script sets", write("klib/flag", ""), "script_cfg"),
     ("a feature", arg("--features", "extra"), "feature"),
     ("a variable of the process read by option_env!", setenv("KEYS_PROCESS", "set"), "process_env"),
-    ("a variable of .cargo/config.toml", replace(".cargo/config.toml", '"config"', '"config anew"'), "config_env"),
+    (
+        "a variable of .cargo/config.toml",
+        replace(".cargo/config.toml", '"config"', '"config anew"'),
+        "config_env",
+    ),
     # With the flag `difftest` sets, which this would otherwise take the place of: without it
     # rustc keeps to one object the functions nothing else calls, and those are left to rustc.
     ("a cfg of RUSTFLAGS", setenv("RUSTFLAGS", "-C link-dead-code --cfg keys_flag"), "flag_cfg"),
     # The crate's identity is in the TypeIds of its types (astral-experiments/blaze#56).
     ("the identity of a crate", setenv("RUSTFLAGS", "-C link-dead-code -C metadata=keys"), "identity"),
     ("the release profile", arg("--release"), "assertions"),
-    ("overflow checks of the dev profile", append("Cargo.toml", "\n[profile.dev]\noverflow-checks = false\n"), "overflows"),
-    ("debug assertions of the dev profile", append("Cargo.toml", "\n[profile.dev]\ndebug-assertions = false\n"), "assertions"),
-    ("a profile of its own", both(append("Cargo.toml", '\n[profile.quick]\ninherits = "dev"\noverflow-checks = false\n'), arg("--profile", "quick")), "overflows"),
-    ("overflow checks of the package a function is written in", append("Cargo.toml", "\n[profile.dev.package.kdep]\noverflow-checks = false\n"), "checks"),
-    ("overflow checks of a package that calls generic code", append("Cargo.toml", "\n[profile.dev.package.klib]\noverflow-checks = false\n"), "checks"),
-    ("overflow checks of the package of the program", append("Cargo.toml", "\n[profile.dev.package.kapp]\noverflow-checks = false\n"), "checks"),
-    ("overflow checks of one package in release", both(append("Cargo.toml", "\n[profile.release.package.kdep]\noverflow-checks = true\n"), arg("--release")), "checks"),
-    ("overflow checks of the program alone in release", both(append("Cargo.toml", "\n[profile.release.package.kapp]\noverflow-checks = true\n"), arg("--release")), "checks"),
-    ("overflow checks of all but the package a small function is written in, in release", both(append("Cargo.toml", "\n[profile.release]\noverflow-checks = true\n[profile.release.package.kdep]\noverflow-checks = false\n"), arg("--release")), "checks"),
-    ("overflow checks of all but the package whose copy of generic code the program uses", append("Cargo.toml", "\n[profile.dev]\noverflow-checks = false\n[profile.dev.package.klib]\noverflow-checks = true\n"), "checks"),
-    ("debug assertions of one package", append("Cargo.toml", "\n[profile.dev.package.klib]\ndebug-assertions = false\n"), "assertions"),
+    (
+        "overflow checks of the dev profile",
+        append("Cargo.toml", "\n[profile.dev]\noverflow-checks = false\n"),
+        "overflows",
+    ),
+    (
+        "debug assertions of the dev profile",
+        append("Cargo.toml", "\n[profile.dev]\ndebug-assertions = false\n"),
+        "assertions",
+    ),
+    (
+        "a profile of its own",
+        both(
+            append("Cargo.toml", '\n[profile.quick]\ninherits = "dev"\noverflow-checks = false\n'),
+            arg("--profile", "quick"),
+        ),
+        "overflows",
+    ),
+    (
+        "overflow checks of the package a function is written in",
+        append("Cargo.toml", "\n[profile.dev.package.kdep]\noverflow-checks = false\n"),
+        "checks",
+    ),
+    (
+        "overflow checks of a package that calls generic code",
+        append("Cargo.toml", "\n[profile.dev.package.klib]\noverflow-checks = false\n"),
+        "checks",
+    ),
+    (
+        "overflow checks of the package of the program",
+        append("Cargo.toml", "\n[profile.dev.package.kapp]\noverflow-checks = false\n"),
+        "checks",
+    ),
+    (
+        "overflow checks of one package in release",
+        both(
+            append("Cargo.toml", "\n[profile.release.package.kdep]\noverflow-checks = true\n"),
+            arg("--release"),
+        ),
+        "checks",
+    ),
+    (
+        "overflow checks of the program alone in release",
+        both(
+            append("Cargo.toml", "\n[profile.release.package.kapp]\noverflow-checks = true\n"),
+            arg("--release"),
+        ),
+        "checks",
+    ),
+    (
+        "overflow checks of all but the package a small function is written in, in release",
+        both(
+            append(
+                "Cargo.toml",
+                "\n[profile.release]\noverflow-checks = true\n[profile.release.package.kdep]\noverflow-checks = false\n",
+            ),
+            arg("--release"),
+        ),
+        "checks",
+    ),
+    (
+        "overflow checks of all but the package whose copy of generic code the program uses",
+        append(
+            "Cargo.toml",
+            "\n[profile.dev]\noverflow-checks = false\n[profile.dev.package.klib]\noverflow-checks = true\n",
+        ),
+        "checks",
+    ),
+    (
+        "debug assertions of one package",
+        append("Cargo.toml", "\n[profile.dev.package.klib]\ndebug-assertions = false\n"),
+        "assertions",
+    ),
     ("a constant of a dependency", replace("kdep/src/lib.rs", "SCALE: u32 = 3", "SCALE: u32 = 4"), "scaled"),
     ("an inlined function of a dependency", replace("kdep/src/lib.rs", "x + 1", "x + 2"), "scaled"),
-    ("the layout of a type of a dependency", replace("kdep/src/lib.rs", "pub side: u32,", "pub side: u32,\n    pub other: u64,"), "shape"),
-    ("a generic function of a dependency", replace("kdep/src/lib.rs", '"{:?} {}"', '"{:?} of {}"'), "described"),
+    (
+        "the layout of a type of a dependency",
+        replace("kdep/src/lib.rs", "pub side: u32,", "pub side: u32,\n    pub other: u64,"),
+        "shape",
+    ),
+    (
+        "a generic function of a dependency",
+        replace("kdep/src/lib.rs", '"{:?} {}"', '"{:?} of {}"'),
+        "described",
+    ),
 ]
 
 
@@ -125,7 +206,12 @@ def build(ws, env, args):
         fx.blaze_args = list(args)
         fx.rustc_build()
         fx.blaze_build()
-        skipped = [row for rows in fx.reports.values() for row in rows if row[0] == "skipped" and "no rustc symbol" not in row[2]]
+        skipped = [
+            row
+            for rows in fx.reports.values()
+            for row in rows
+            if row[0] == "skipped" and "no rustc symbol" not in row[2]
+        ]
         return fx.behaviour(fx.reference), fx.behaviour(fx.binary), skipped
     finally:
         os.environ.clear()
@@ -144,9 +230,13 @@ def main():
     if unknown := [case for case in it.cases if not any(case in name for name, _, _ in CASES)]:
         fail(SCRIPT, f"cases: {unknown} is in the name of no case")
     work = os.path.realpath(tempfile.mkdtemp(prefix="blaze-keys-"))
-    runs = [(name, change, line, mode) for name, change, line in CASES
-            if not it.cases or any(case in name for case in it.cases) for mode in ("again", "elsewhere")]
-    runs = runs[it.shard.index - 1::it.shard.count]
+    runs = [
+        (name, change, line, mode)
+        for name, change, line in CASES
+        if not it.cases or any(case in name for case in it.cases)
+        for mode in ("again", "elsewhere")
+    ]
+    runs = runs[it.shard.index - 1 :: it.shard.count]
     wrong = total = fixed = refusals = 0
     for name, change, line, mode in runs:
         total += 1
@@ -179,7 +269,10 @@ def main():
         known = name in OPEN
         fixed += known and not problems
         wrong += bool(problems) and not known
-        print(f"{'same     ' if not problems else 'open     ' if known else 'DIFFERENT'} {mode:9} {name}: store {filled} bytes, {size(store) - filled} more", flush=True)
+        print(
+            f"{'same     ' if not problems else 'open     ' if known else 'DIFFERENT'} {mode:9} {name}: store {filled} bytes, {size(store) - filled} more",
+            flush=True,
+        )
         for problem in problems:
             print(f"    {problem}")
         for row in refused:
@@ -190,9 +283,13 @@ def main():
                 if a != b:
                     print(f"    rustc: {a}\n    blaze: {b}")
             if len(ours) != len(theirs):
-                print(f"    blaze: status {got[0]}, {len(ours)} lines of {len(theirs)}; {got[2].decode(errors='replace').strip()[-300:]}")
+                print(
+                    f"    blaze: status {got[0]}, {len(ours)} lines of {len(theirs)}; {got[2].decode(errors='replace').strip()[-300:]}"
+                )
     still = sum(1 for name, _, _, _ in runs if name in OPEN) - fixed
-    print(f"{total - wrong - still} of {total - still} right, {still} open, {refusals} functions refused; {work}")
+    print(
+        f"{total - wrong - still} of {total - still} right, {still} open, {refusals} functions refused; {work}"
+    )
     if fixed:
         print(f"{fixed} of the open cases are the same now: take them out of OPEN")
     sys.exit(1 if wrong or fixed else 0)

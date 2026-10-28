@@ -69,7 +69,7 @@ def named(ci: ModuleType, names: tuple[str, ...], backend: str) -> list[Any]:
     for name in names:
         matched = [h for h, label in labels if label == name or label.startswith(name + " ")]
         if not matched:
-            fail(SCRIPT, f"no harness of ci.py is {name!r}: `ci.py list '{}'` lists them")
+            fail(SCRIPT, f"no harness of ci.py is {name!r}: `ci.py list '{{}}'` lists them")
     for harness, label in labels:
         if any(label == name or label.startswith(name + " ") for name in names) and harness[3](backend):
             picked.append(harness)
