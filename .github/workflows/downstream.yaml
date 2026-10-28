@@ -4,13 +4,14 @@
 #
 #   gh workflow run downstream.yaml -f suite=uv                      the newest canary
 #   gh workflow run downstream.yaml -f suite=uv -f blaze=0.20261028.5
-#   gh workflow run downstream.yaml -f suite=uv -f build-run=<run id>
+#   gh workflow run downstream.yaml --ref <same-branch-or-tag> -f suite=uv -f build-run=<run id>
 #
 # `blaze` is a release (a channel, `canary` or `stable`, or a version): the blaze users get,
 # built where releases are. `build-run` takes the `blaze-linux-x64` build of a run of focused.yaml
 # or train.yaml instead, which is how a branch is tested before it lands: that build was linked
 # in the flake's dev shell, so it runs with that shell's libraries, from blaze's checkout at the
-# run's commit.
+# run's commit. Dispatch downstream on that same commit: if the branch has moved, use a
+# retained tag there. A mismatching commit, a fork or another workflow's artifact is refused.
 #
 # Every build script and proc macro runs in blaze's sandbox, as for any user; the projects'
 # tests run as cargo runs them (neither has opted into sandboxed tests). Each run has to say
@@ -42,21 +43,35 @@ env:
   REV: ${{ startsWith(inputs.suite, 'uv') && '5b5a53e1803d426ba04f4af8ff7d6ff747548218' || '07872adbafa7c00f42f1174d8aa3c3e324033009' }}
 
 jobs:
-  # The commit of blaze to check out: the run's, for its build, or the dispatched one.
+  # Validate the build against the trusted dispatch commit before consuming its artifact.
   blaze:
     name: blaze
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
-      sha: ${{ steps.sha.outputs.sha }}
+      run-id: ${{ steps.build.outputs.run-id }}
+      artifact-id: ${{ steps.build.outputs.artifact-id }}
     steps:
-      - id: sha
+      - if: inputs.build-run != ''
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - if: inputs.build-run != ''
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          checksum: f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f
+          enable-cache: false
+      - id: build
+        if: inputs.build-run != ''
         env:
           GH_TOKEN: ${{ github.token }}
-          RUN: ${{ inputs.build-run }}
+          BUILD: >-
+            {"repository": ${{ toJSON(github.repository) }}, "build_run": ${{ toJSON(inputs.build-run) }},
+             "sha": ${{ toJSON(github.sha) }}, "output": "${{ runner.temp }}/validated-build"}
         run: |
-          if [ -n "$RUN" ]; then sha=$(gh run view "$RUN" -R "$GITHUB_REPOSITORY" --json headSha --jq .headSha); else sha=$GITHUB_SHA; fi
-          echo "sha=$sha" | tee -a "$GITHUB_OUTPUT"
+          uv run --frozen --no-dev python .github/scripts/downstream_build.py "$BUILD"
+          cat "$RUNNER_TEMP/validated-build" >> "$GITHUB_OUTPUT"
 
   test:
     name: ${{ inputs.suite }}
@@ -72,7 +87,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: blaze
-          ref: ${{ needs.blaze.outputs.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
@@ -97,10 +112,11 @@ jobs:
         if: inputs.build-run != ''
         uses: actions/download-artifact@v8
         with:
-          name: blaze-linux-x64
+          artifact-ids: ${{ needs.blaze.outputs.artifact-id }}
           path: ${{ runner.temp }}/blaze
-          run-id: ${{ inputs.build-run }}
+          run-id: ${{ needs.blaze.outputs.run-id }}
           github-token: ${{ github.token }}
+          digest-mismatch: error
       # The dev shell's libraries in the Nix store, which that build's programs ask for.
       - if: inputs.build-run != ''
         uses: DeterminateSystems/nix-installer-action@v23
@@ -140,7 +156,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: blaze
-          ref: ${{ needs.blaze.outputs.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/checkout@v7
         with:

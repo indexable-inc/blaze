@@ -25,6 +25,7 @@ target-version = "py313"
 line-length = 110
 include = [
   ".github/scripts/downstream.py",
+  ".github/scripts/downstream_build.py",
   "harness/check_json.py",
   "harness/ci.py",
   "harness/focused.py",
@@ -49,6 +50,7 @@ include = [
 [tool.pyright]
 include = [
   ".github/scripts/downstream.py",
+  ".github/scripts/downstream_build.py",
   "harness/check_json.py",
   "harness/ci.py",
   "harness/focused.py",
