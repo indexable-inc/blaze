@@ -65,6 +65,12 @@ impl fmt::Display for Digest {
     }
 }
 
+impl fmt::Debug for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
 /// What a small object was when it was read, for a write that must not undo another's.
 pub struct Version(pub Option<String>);
 

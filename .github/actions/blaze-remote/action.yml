@@ -27,6 +27,10 @@ runs:
       env:
         REMOTE: blaze+https://blaze-gateway.indexable.workers.dev/t/blaze/v3
         BLAZE_REMOTE_REQUIRED: "1"
+        # 32 requests at a time through the gateway, not 8: a hosted runner pulled 5 GB in
+        # 57-63 s, against 86-87 s with 8 (64 was no faster). Past that the gateway is the
+        # limit, not the runner: R2 read directly gave 12-15 s.
+        BLAZE_REMOTE_JOBS: "32"
         # The public half of blaze-ci-1; the secret half is BLAZE_CACHE_SIGN_KEY.
         BLAZE_REMOTE_TRUST: 5a8e41ddc2c6e7c0f2de2e6aa4ed71b9e2b81115c3793a9f9b446d7bbfefbaf8
         MODE: ${{ inputs.mode }}

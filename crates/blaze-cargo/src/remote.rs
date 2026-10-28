@@ -737,6 +737,166 @@ impl Manifest {
     }
 }
 
+/// What the builds that pushed to a project used of its manifest, a pack at a time: what a
+/// pull fetches, rather than every pack the project ever listed. The manifest only grows, by
+/// what each build adds, and one build reads a part of it. It is a signed list of its own,
+/// `manifests/<project>.hot`: after [`Hot::HEADER`], a line for each pack of the manifest a
+/// push knew of, with the hour since 1970 a build that pushed last read or wrote it, or `-`
+/// when none did in [`HOT_FOR`]. Each push adds to it what its builds used and leaves the
+/// rest, so a push that used little (a daemon's, or one of several jobs') takes nothing out.
+/// A pull fetches the packs it says were used and those it does not name: ones listed since,
+/// by a push that wrote no line of them. A pack it names that the manifest does not list is
+/// not fetched: the manifest says what a pack is, this list only which ones.
+#[derive(Debug, Default, PartialEq)]
+struct Hot(BTreeMap<Digest, Option<u64>>);
+
+/// How long a pack no build read or wrote is still fetched.
+const HOT_FOR: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+
+impl Hot {
+    const SUFFIX: &str = ".hot";
+    const HEADER: &str = "blaze hot 1";
+
+    fn at(project: &str) -> String {
+        format!("{}{}", Manifest::at(project), Hot::SUFFIX)
+    }
+
+    /// The list in `text`, empty for no text. Anything else that does not start with
+    /// [`Hot::HEADER`] is not a list of this kind: a project's manifest of that name, say.
+    fn parse(name: &str, text: &str) -> anyhow::Result<Hot> {
+        let mut lines = text.lines();
+        match lines.next() {
+            None => return Ok(Hot::default()),
+            Some(Hot::HEADER) => {}
+            Some(_) => bail!("`{name}` is not a list of the packs a project used"),
+        }
+        let mut hot = Hot::default();
+        for line in lines {
+            let parsed = line.split_once(' ').and_then(|(pack, hour)| {
+                let hour = if hour == "-" { None } else { Some(hour.parse().ok()?) };
+                Some((Digest::parse(pack)?, hour))
+            });
+            let (pack, hour) = parsed.with_context(|| format!("`{name}` has a line `{line}`"))?;
+            hot.0.insert(pack, hour);
+        }
+        Ok(hot)
+    }
+
+    fn lines(&self) -> String {
+        let mut text = format!("{}\n", Hot::HEADER);
+        for (pack, hour) in &self.0 {
+            match hour {
+                Some(hour) => text += &format!("{pack} {hour}\n"),
+                None => text += &format!("{pack} -\n"),
+            }
+        }
+        text
+    }
+
+    /// Whether a pull at `hour` fetches `pack`.
+    fn wants(&self, pack: &Digest, hour: u64) -> bool {
+        match self.0.get(pack) {
+            None => true,
+            Some(used) => used.is_some_and(|used| hour.saturating_sub(used) < hours(HOT_FOR)),
+        }
+    }
+
+    /// This list with the packs of `used` used at `hour`, a line for each pack of `listed`,
+    /// a pack no build used in [`HOT_FOR`] said to be unused, and the lines of unused packs
+    /// `listed` lacks (a collection took them out of the manifest) left out.
+    fn merged(&self, listed: &BTreeSet<Digest>, used: &BTreeSet<Digest>, hour: u64) -> Hot {
+        let recent = |used: &Option<u64>| {
+            used.filter(|used| hour.saturating_sub(*used) < hours(HOT_FOR))
+        };
+        let mut next: BTreeMap<Digest, Option<u64>> = (self.0.iter())
+            .map(|(pack, used)| (*pack, recent(used)))
+            .filter(|(pack, used)| used.is_some() || listed.contains(pack))
+            .collect();
+        for pack in listed {
+            next.entry(*pack).or_insert(None);
+        }
+        for pack in used {
+            let at = next.entry(*pack).or_insert(None);
+            *at = Some(at.map_or(hour, |it| it.max(hour)));
+        }
+        Hot(next)
+    }
+
+    /// The list, or `None` when the project has none: one last pushed by a blaze that
+    /// wrote none, whose every pack is fetched then.
+    async fn fetch(remote: &Remote, project: &str) -> anyhow::Result<Option<Hot>> {
+        let name = Hot::at(project);
+        let Some(text) = remote.read_list(&name).await? else { return Ok(None) };
+        Ok(Some(Hot::parse(&name, &text)?))
+    }
+}
+
+fn hours(span: Duration) -> u64 {
+    span.as_secs() / 3600
+}
+
+/// The hour since 1970 it is now.
+fn this_hour() -> anyhow::Result<u64> {
+    Ok(hours(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?))
+}
+
+/// The file in a store's directory that names each pack a pull or a build fetched into it,
+/// with the time the pack had once it was in (nanoseconds since 1970). The store sets the
+/// time of a pack it reads, for its collection, so a pack whose time is still that one was
+/// fetched and not read since: a push tells what the builds here used by it.
+const FETCHED: &str = "remote-fetched";
+
+/// Notes in [`FETCHED`] that `pack` was fetched into the store.
+fn note_fetched(store: &Path, pack: &Digest) -> anyhow::Result<()> {
+    use std::io::Write;
+    let path = store.join(pack_file(pack));
+    let at = std::fs::metadata(&path).and_then(|it| it.modified());
+    let at = at.with_context(|| format!("the time of {}", path.display()))?;
+    let nanos = at.duration_since(SystemTime::UNIX_EPOCH)?.as_nanos();
+    let noted = File::options().create(true).append(true).open(store.join(FETCHED));
+    // One write of one line: lines of several fetches at a time are not mixed.
+    let noted = noted.and_then(|mut it| it.write_all(format!("{pack} {nanos}\n").as_bytes()));
+    noted.with_context(|| format!("noting the fetch of {pack}.pack in {}", store.display()))
+}
+
+/// The times [`note_fetched`] noted, the last of each pack. A line a stopped process left
+/// cut short is passed over: its pack then counts as used, as one fetched and read would.
+fn fetched_at(store: &Path) -> anyhow::Result<FxHashMap<Digest, u128>> {
+    let path = store.join(FETCHED);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FxHashMap::default()),
+        Err(e) => return Err(e).with_context(|| path.display().to_string()),
+    };
+    let lines = text.lines().filter_map(|line| {
+        let (pack, nanos) = line.split_once(' ')?;
+        Some((Digest::parse(pack)?, nanos.parse().ok()?))
+    });
+    Ok(lines.collect())
+}
+
+/// The sealed packs of the store the builds here read or wrote in the last [`HOT_FOR`]: each
+/// whose time is that recent, but for one fetched and not read since.
+fn used_packs(store: &Path, local: &BTreeSet<Digest>) -> anyhow::Result<BTreeSet<Digest>> {
+    let fetched = fetched_at(store)?;
+    let since = SystemTime::now() - HOT_FOR;
+    let mut used = BTreeSet::new();
+    for pack in local {
+        let path = store.join(pack_file(pack));
+        let at = match std::fs::metadata(&path).and_then(|it| it.modified()) {
+            Ok(at) => at,
+            // Collected since it was listed: it is not here to be read.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| path.display().to_string()),
+        };
+        let nanos = at.duration_since(SystemTime::UNIX_EPOCH)?.as_nanos();
+        if at > since && fetched.get(pack) != Some(&nanos) {
+            used.insert(*pack);
+        }
+    }
+    Ok(used)
+}
+
 /// Whether what a fetched file starts with is a pack of the format this build reads. A
 /// manifest that lists a pack as of this format and is wrong about it is not believed.
 fn is_pack_of_this_format(start: &[u8]) -> bool {
@@ -860,11 +1020,47 @@ pub async fn push(store: &Path, remote: &Remote, project: &str) -> anyhow::Resul
         };
         remote.extend_list(&Manifest::at(project), extend).await?;
     }
-    let said = format!("{} packs added to `{project}`, {bytes} bytes sent", sent.0.len());
+    let mut said = format!("{} packs added to `{project}`, {bytes} bytes sent", sent.0.len());
+    said += &push_hot(store, remote, project, &listed, &sent).await?;
     Tally { failed, ..Tally::default() }.settle(said, &remote.traffic)
 }
 
-/// Fetches a pack as its line of the manifest says it is held.
+/// Adds what the builds here used, of what the manifest now lists, to the project's [`Hot`]
+/// list. A pack that was not sent is not named, since no pull could fetch it.
+async fn push_hot(
+    store: &Path,
+    remote: &Remote,
+    project: &str,
+    listed: &Manifest,
+    sent: &Manifest,
+) -> anyhow::Result<String> {
+    let local = local_packs(&StoreDir::at(store))?;
+    let manifest: BTreeSet<Digest> = listed.0.keys().chain(sent.0.keys()).copied().collect();
+    let used = used_packs(store, &local)?;
+    let used: BTreeSet<Digest> = used.intersection(&manifest).copied().collect();
+    let (name, hour) = (Hot::at(project), this_hour()?);
+    let now = match remote.read_list_to_extend(&name).await {
+        Ok(text) => Hot::parse(&name, text.as_deref().unwrap_or_default())?,
+        Err(e) if required() => return Err(e.context(format!("reading `{name}` to add to"))),
+        // As a manifest this machine does not trust: see `extend_list`.
+        Err(e) => {
+            eprintln!("remote: {e:#}: it is written anew");
+            Hot::default()
+        }
+    };
+    if now.merged(&manifest, &used, hour) == now {
+        return Ok(String::new());
+    }
+    let merge = |text: &str| match Hot::parse(&name, text) {
+        Ok(now) => now.merged(&manifest, &used, hour).lines(),
+        // Not a list of this kind, written since it was read: left as it is.
+        Err(_) => text.to_owned(),
+    };
+    remote.extend_list(&name, merge).await?;
+    Ok(format!(", {} of its packs used here", used.len()))
+}
+
+/// Fetches a pack as its line of the manifest says it is held, and notes it in [`FETCHED`].
 async fn fetch_pack(
     remote: &Remote,
     store: &Path,
@@ -876,7 +1072,12 @@ async fn fetch_pack(
     let unpacked = listed.packed.map(|_| (*pack, listed.size));
     let most = listed.packed.map_or(listed.size, |(_, size)| size);
     let to = store.join(pack_file(pack));
-    remote.fetch_coded(&object, &want, unpacked, &to, most, is_pack_of_this_format).await
+    let fetched =
+        remote.fetch_coded(&object, &want, unpacked, &to, most, is_pack_of_this_format).await?;
+    if let Fetched::Whole(_) = fetched {
+        note_fetched(store, pack)?;
+    }
+    Ok(fetched)
 }
 
 /// The packs of `missing` that fit in a store that may hold `limit` bytes, the first listed
@@ -937,9 +1138,10 @@ pub async fn lists(remote: &Remote, project: &str) -> anyhow::Result<bool> {
     Ok(Manifest::fetch(remote, project).await?.is_some_and(|it| !it.0.is_empty()))
 }
 
-/// Fetches the packs of the project's manifest that are not in the local store, as far as
-/// they fit under `BLAZE_CACHE_MAX`. A pack of another format than this build reads is left
-/// where it is, and one that is longer than the manifest says is rejected.
+/// Fetches the packs of the project's manifest that are not in the local store and that its
+/// [`Hot`] list says builds used, as far as they fit under `BLAZE_CACHE_MAX`. A pack of
+/// another format than this build reads is left where it is, and one that is longer than the
+/// manifest says is rejected.
 pub async fn pull(store: &Path, remote: &Remote, project: &str) -> anyhow::Result<String> {
     let limit = limit_for(store).map_err(anyhow::Error::msg)?;
     let dir = claim(store, false).await?;
@@ -947,7 +1149,13 @@ pub async fn pull(store: &Path, remote: &Remote, project: &str) -> anyhow::Resul
     let Some(manifest) = Manifest::fetch(remote, project).await? else {
         return Ok(format!("`{project}` has no manifest on the remote: nothing fetched"));
     };
-    let (missing, other_format) = manifest.missing(&local);
+    let (mut missing, other_format) = manifest.missing(&local);
+    let mut cold = 0;
+    if let Some(hot) = Hot::fetch(remote, project).await? {
+        let (listed, hour) = (missing.len(), this_hour()?);
+        missing.retain(|(pack, _)| hot.wants(pack, hour));
+        cold = listed - missing.len();
+    }
     let (missing, here_already) = lacking(remote, StoreDir::at(store), missing).await?;
     let (fit, over) = fitting(missing, limit);
     let fetch = |(pack, listed): (Digest, Listed)| async move {
@@ -959,6 +1167,9 @@ pub async fn pull(store: &Path, remote: &Remote, project: &str) -> anyhow::Resul
         tally.done + tally.elsewhere,
         tally.bytes
     );
+    if cold != 0 {
+        said += &format!(", {cold} that no build that pushed used of late left");
+    }
     if other_format != 0 {
         said += &format!(", {other_format} of another format left");
     }
@@ -1203,7 +1414,14 @@ fn verify(store: &Path) -> anyhow::Result<()> {
 /// The name of a project, `default` when none is given, as the name of an object.
 pub fn project_name(given: Option<String>) -> anyhow::Result<String> {
     let project = given.unwrap_or_else(|| "default".to_owned());
-    if project.is_empty() || project.contains(['/', '\\']) || project.starts_with('.') {
+    // A name ending in `.hot` would be another project's list of what it used (`Hot`),
+    // and a gateway takes names of a project and its list of 128 bytes at most.
+    if project.is_empty()
+        || project.contains(['/', '\\'])
+        || project.starts_with('.')
+        || project.ends_with(Hot::SUFFIX)
+        || project.len() + Hot::SUFFIX.len() > 128
+    {
         bail!("`{project}` is not the name of a project");
     }
     Ok(project)
@@ -1380,13 +1598,19 @@ pub struct Lazy {
 }
 
 impl Lazy {
-    /// Fetches the keys of every pack the manifest lists that the store lacks. They are
-    /// kept in memory: the store's directory holds nothing that is not the store's.
+    /// Fetches the keys of every pack the manifest lists that the store lacks, and that the
+    /// project's [`Hot`] list says builds used. They are kept in memory, not in the store's
+    /// directory.
     async fn load(shared: &Shared) -> anyhow::Result<Lazy> {
         let (store, remote) = (&shared.store, &shared.remote);
         let local = local_packs(&claim(store, false).await?)?;
         let manifest = Manifest::fetch(remote, &shared.project).await?.unwrap_or_default();
-        let (missing, _) = manifest.missing(&local);
+        let (mut missing, _) = manifest.missing(&local);
+        // What the last push used, as a pull takes: the keys of the rest are not fetched.
+        if let Some(hot) = Hot::fetch(remote, &shared.project).await? {
+            let hour = this_hour()?;
+            missing.retain(|(pack, _)| hot.wants(pack, hour));
+        }
         // A pack the store may not hold is not one to fetch, and the keys of them all are
         // kept in memory: no more of them than one object may be.
         let limit = limit_for(store).map_err(anyhow::Error::msg)?.unwrap_or(u64::MAX);
@@ -1716,6 +1940,84 @@ pub mod tests {
         let more = held(&store) - (1 << 20);
         assert!(more < 100, "the pack and the store's two files, and {more} bytes more");
         _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A push names what the builds here read or wrote of late, not what was fetched and left
+    /// unread, and a pull fetches what it names.
+    #[test]
+    fn a_pull_fetches_what_the_builds_that_pushed_used() {
+        blaze_store::compiles_against("remote hot test");
+        let (remote, dir) = unsigned("hot", 1 << 30);
+        let (read, unread, written) = ([1; 32], [2; 32], [3; 32]);
+        let first = dir.join("first");
+        let packs = |store: &Path| local_packs(&StoreDir::at(store)).unwrap();
+        let store = blaze_store::Store::open_at(&first).unwrap();
+        store.insert(&read, &read);
+        store.seal();
+        let read_pack = *packs(&first).first().unwrap();
+        store.insert(&unread, &unread);
+        store.seal();
+        drop(store);
+        let unread_pack = *packs(&first).iter().find(|it| **it != read_pack).unwrap();
+        let old = SystemTime::now() - HOT_FOR - Duration::from_secs(60);
+        let unread_file = File::options().write(true).open(first.join(pack_file(&unread_pack)));
+        unread_file.unwrap().set_modified(old).unwrap();
+        let said = wait(push(&first, &remote, "default")).unwrap();
+        assert!(said.contains("2 packs added") && said.contains("1 of its packs used"), "{said}");
+
+        let second = dir.join("second");
+        let said = wait(pull(&second, &remote, "default")).unwrap();
+        assert!(said.contains("1 that no build that pushed used of late left"), "{said}");
+        assert_eq!(packs(&second), BTreeSet::from([read_pack]));
+        assert!(used_packs(&second, &packs(&second)).unwrap().is_empty(), "fetched, not read");
+        let store = blaze_store::Store::open_at(&second).unwrap();
+        assert_eq!(store.get(&read).as_deref(), Some(&read[..]));
+        store.insert(&written, &written);
+        store.seal();
+        drop(store);
+        let used = used_packs(&second, &packs(&second)).unwrap();
+        assert!(used.len() == 2 && used.contains(&read_pack), "{used:?}");
+        let said = wait(push(&second, &remote, "default")).unwrap();
+        assert!(said.contains("1 packs added") && said.contains("2 of its packs used"), "{said}");
+        let hot = wait(Hot::fetch(&remote, "default")).unwrap().unwrap();
+        assert_eq!(hot.0.len(), 3, "{hot:?}");
+        assert_eq!(hot.0[&unread_pack], None, "{hot:?}");
+
+        let third = dir.join("third");
+        let said = wait(pull(&third, &remote, "default")).unwrap();
+        assert!(said.contains("1 that no build that pushed used of late left"), "{said}");
+        let store = blaze_store::Store::open_at(&third).unwrap();
+        for key in [read, written] {
+            assert_eq!(store.get(&key).as_deref(), Some(&key[..]));
+        }
+        assert_eq!(store.get(&unread), None);
+        drop(store);
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A push adds what its builds used and takes out nothing another push's builds used
+    /// of late; a pull fetches what was used and what the list does not name.
+    #[test]
+    fn a_hot_list_is_added_to() {
+        let [a, b, c, d] = [1u8, 2, 3, 4].map(|it| Digest::of(&[it]));
+        let listed: BTreeSet<Digest> = [a, b, c].into();
+        let hour = 1_000_000;
+        let first = Hot::default().merged(&listed, &[a].into(), hour);
+        assert_eq!(first, Hot([(a, Some(hour)), (b, None), (c, None)].into()));
+        let second = first.merged(&listed, &[b].into(), hour + 1);
+        assert_eq!(second.0[&a], Some(hour), "a push that used less takes nothing out");
+        assert_eq!(second.0[&b], Some(hour + 1));
+        assert!([a, b, d].iter().all(|it| second.wants(it, hour + 1)), "d is listed since");
+        assert!(!second.wants(&c, hour + 1));
+        let later = hour + hours(HOT_FOR);
+        assert!(!second.wants(&a, later) && second.wants(&b, later));
+        // A pack nobody used of late, and that a collection took out of the manifest, goes.
+        let third = second.merged(&[b].into(), &BTreeSet::new(), later + 1);
+        assert_eq!(third, Hot([(b, None)].into()));
+        let name = "manifests/x.hot";
+        assert_eq!(Hot::parse(name, &second.lines()).unwrap(), second);
+        assert_eq!(Hot::parse(name, "").unwrap(), Hot::default());
+        assert!(Hot::parse(name, &format!("{a} 1 {b} 3\n")).is_err(), "a manifest is not one");
     }
 
     #[test]

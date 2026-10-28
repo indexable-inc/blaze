@@ -205,6 +205,7 @@ packs that project's builds were served from.
                                  uncompressed in the store, to be read in place)
     keys/<sha256>                the keys of one pack
     manifests/<project>          one line per pack
+    manifests/<project>.hot      the hour builds last used each pack of it, one a line
     units/<sha256>, deps/<project>   cargo's builds of dependencies, see below
 
 **Real AWS S3 has not been run.** Everything was measured against MinIO and SeaweedFS on
@@ -218,6 +219,16 @@ virtual-hosted addressing, IAM errors and role credentials are untested.
 
 `push` sends the packs the manifest lacks and adds them to it. `pull` fetches the packs the
 manifest lists that are not in the local store, as many as fit under `BLAZE_CACHE_MAX`.
+A manifest only grows, by what each build adds, and one build reads a part of it, so a push
+also adds to the project's hot list, a line for each pack of the manifest: the hour a build
+that pushed last read or wrote it, or that none did in the last three days. A push adds what
+the builds on its machine used and takes out nothing another push's builds used, so a
+daemon's push of an edit that read three packs leaves the rest. A pull fetches the packs the
+hot list says were used and those it does not name yet, and says how many it left; a key a
+build then lacks is compiled here. The hot list is signed and checked as the manifest is.
+What the builds used is told by each pack's time, which the store sets when it reads one: a
+store's `remote-fetched` notes each pack a pull or a build fetched and the time it had then,
+so a pack fetched and not read since is not counted.
 `PROJECT` picks the manifest and defaults to `default`. Each prints one line of what it moved,
 whether it went through or not, for a CI job's summary:
 

@@ -89,6 +89,10 @@ pub async fn collect(remote: &Remote, ages: &Ages) -> anyhow::Result<String> {
     let mut collected = Collected::default();
     let packs = by_name(remote.list("packs/").await?);
     for manifest in remote.list("manifests/").await? {
+        // A hot list names packs of its manifest, and is written whole by each push.
+        if manifest.name.ends_with(super::Hot::SUFFIX) {
+            continue;
+        }
         delist(remote, &manifest.name, &packs, ages, &mut collected).await?;
     }
     sweep(remote, ages, &mut collected).await?;
