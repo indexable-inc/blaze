@@ -287,7 +287,9 @@ plan, a pull request a step:
    salsa and the crate itself (`const_ast::tests`), and what a derive reads through them, folded
    into one number, evaluated by blaze's const evaluator against the same code compiled, on real
    files and on one with every kind of node the views read (`hir-ide`'s
-   `consteval::const_ast`).
+   `consteval::const_ast`). Running them in the evaluator found it laying out an overflowing
+   `u128` operation's `(u128, bool)` as twice a `u128` where the target aligns `u128` to 8;
+   it now pads to the alignment.
 2. The expander passes the flat input to a macro that takes `&const_ast::Item`: the input's
    token tree parsed back to a flat tree (so it is what a proc macro is given: cfg-stripped,
    the derive itself taken out), each token's span as its index in the call's span table, and
