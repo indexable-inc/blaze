@@ -143,20 +143,16 @@ of blaze is told where it is in `BLAZE_LIBRARY`, the first of:
   read from the nightly's channel manifest (`harness/library.py import` wrote it).
 - It is not a member of blaze's workspace: no fmt, clippy or test of blaze's reads it, and
   `.gitattributes` keeps upstream's bytes.
-- `python3 harness/library.py check '{}'` checks that `DIGEST` is the library's and lists
-  the files that differ from `UPSTREAM`'s nightly. blaze changes its library freely: that
-  diff is the record of what blaze changed, not a ledger a change has to be entered in.
 - The daily bump moves it with the pin as a merge (`harness/library.py merge`): upstream's
   changes from the old nightly to the new one are applied three-way, so blaze's own changes
   are kept. A conflict stops the bump, names the files and opens the bump's issue.
 
-To change the standard library, edit it under `library/` (a notable change can say what and
-why in `library/PATCHES.md`, a log, not a list of files) and run
-`python3 harness/library.py digest '{}'` (the test
-`the_library_is_the_one_its_digest_says` fails on a stale `DIGEST`). The next build copies
-the changed library into `~/.blaze/library/<new digest>`, and the store keys what it compiles
-of it apart from the old. There are no changes yet: with `library/` unpatched, blaze must
-behave exactly as with the nightly's own `rust-src`.
+To change the standard library, edit it under `library/`, run
+`python3 harness/library.py digest '{}'` (the test `the_library_is_the_one_its_digest_says`
+fails on a stale `DIGEST`) and commit. The next build copies the changed library into
+`~/.blaze/library/<new digest>`, and the store keys what it compiles of it apart from the old.
+Nothing checks it against upstream file by file: the integration tests (smoke, the rustc
+comparison harnesses, real crates) are what hold blaze's behaviour to the nightly's.
 
 ## How far behind it gets, and how long a bump takes
 

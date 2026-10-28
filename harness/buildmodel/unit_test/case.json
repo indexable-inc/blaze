@@ -9,7 +9,7 @@
   ],
   "verb": "test",
   "blaze": [
-    "--cfg-test",
+    "--unit-test",
     "--profile",
     "test"
   ],

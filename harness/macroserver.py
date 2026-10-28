@@ -548,7 +548,7 @@ def main():
 
         env = {"BLAZE_PROC_MACRO_COMPARE": server, "BLAZE_PROC_MACRO_LIBS": libs}
         # With its tests, whose `#[tokio::test]` is another attribute.
-        ran, took = blaze(root, ["macrouse"], os.path.join(work, "macrouse.o"), "--cfg-test",
+        ran, took = blaze(root, ["macrouse"], os.path.join(work, "macrouse.o"), "--unit-test",
                            env=env)
         counts = compared(ran.stderr)
         calls, derives, attrs, bangs, differed, failed, unloaded = (

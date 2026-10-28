@@ -21,7 +21,7 @@ use super::{
     FAILED,
     cli::{Invocation, Subcommand, worker_env},
     client::{self, Start},
-    daemon::{Checkout, NotBuilt, Reply, Request, WorkerConfig},
+    daemon::{Checkout, NotBuilt, Reply, Request, TestsTold, WorkerConfig},
     plan::Plan as Linked,
     run, say,
     state::{configured_env, library_path, place, repository, run_env},
@@ -133,7 +133,7 @@ pub fn build(asked: &Invocation) -> anyhow::Result<i32> {
     }
     let mut said = Vec::new();
     compiling(asked, programs.iter().filter(|it| !it.executable.exists()), &mut said);
-    let checkout = checkout(asked, &cwd, &metadata, &programs, false, BTreeMap::new());
+    let checkout = checkout(asked, &cwd, &metadata, &programs, None);
     match whole(&cwd, &checkout, &programs) {
         Ok(rebuilt) => compiling(asked, rebuilt.into_iter().map(|at| &programs[at]), &mut said),
         Err(why) => {
@@ -152,9 +152,10 @@ pub fn build(asked: &Invocation) -> anyhow::Result<i32> {
 }
 
 /// `test`: builds whole the tests of `asked`, and what they run, and runs them as cargo
-/// does. The unit tests of the libraries and binaries are built by a worker that loads the
-/// workspace with `cfg(test)`, the integration tests and the programs beside them by one
-/// that loads it without. The doc tests are still made through cargo, after.
+/// does. One worker loads the workspace as cargo builds it for the tests, once: each library
+/// and binary without `cfg(test)` and its unit tests apart with it, the integration tests,
+/// and the examples (`cargo_to_crate_graph`), and builds every program of it. The doc tests
+/// are made after.
 pub fn test(asked: &Invocation) -> anyhow::Result<i32> {
     if let Some(why) = refused(asked) {
         say::error(&why);
@@ -181,7 +182,7 @@ pub fn test(asked: &Invocation) -> anyhow::Result<i32> {
         let libraries: Vec<&Program> = programs.iter().filter(|it| it.kind == Kind::Lib).collect();
         return doc_tests(asked, &cwd, metadata.workspace_root.as_std_path(), &libraries);
     }
-    let unit = |it: &Program| it.test && it.kind != Kind::Test;
+    let unit = |it: &Program| it.test && matches!(it.kind, Kind::Lib | Kind::Bin);
     if let Some(it) = programs.iter().find(|it| unit(it) && !it.harness) {
         let why = "without libtest's harness (`harness = false`) yet";
         say::error(&format!("blaze does not build the unit tests of `{}` {why}", it.name));
@@ -189,23 +190,11 @@ pub fn test(asked: &Invocation) -> anyhow::Result<i32> {
     }
     let mut said = Vec::new();
     compiling(asked, programs.iter().filter(|it| !it.executable.exists()), &mut said);
-    // What an integration test's `env!` reads to run a binary of its package, and the scratch
-    // directory cargo makes for the integration tests and benchmarks, `target/tmp`. The whole
-    // build gives one environment to all its crates, so a program sees it too, where cargo's
-    // `env!` of it would not compile.
-    let mut places: BTreeMap<String, String> = programs
-        .iter()
-        .filter(|it| it.kind == Kind::Bin && !it.test)
-        .map(|it| (format!("CARGO_BIN_EXE_{}", it.name), it.executable.display().to_string()))
-        .collect();
+    // The scratch directory cargo makes for the integration tests and benchmarks.
     let scratch = metadata.target_directory.as_std_path().join("tmp");
     _ = std::fs::create_dir_all(&scratch);
-    places.insert("CARGO_TARGET_TMPDIR".to_owned(), scratch.display().to_string());
-    let (units, others): (Vec<Program>, Vec<Program>) = programs.into_iter().partition(unit);
-    let checkouts = [
-        checkout(asked, &cwd, &metadata, &others, false, places),
-        checkout(asked, &cwd, &metadata, &units, true, BTreeMap::new()),
-    ];
+    let told = TestsTold { executables: programs_dir(asked, &metadata), scratch };
+    let checkout = checkout(asked, &cwd, &metadata, &programs, Some(told));
     let profile = match asked.profile() {
         "dev" => "test",
         other => other,
@@ -219,30 +208,28 @@ pub fn test(asked: &Invocation) -> anyhow::Result<i32> {
         }
         let named =
             |it: &&Program| it.kind == Kind::Bin && !it.test && it.package.id == test.package.id;
-        others
+        programs
             .iter()
             .filter(named)
             .map(|it| (format!("CARGO_BIN_EXE_{}", it.name), it.executable.display().to_string()))
             .collect()
     };
     let mut ran = Vec::new();
-    for (at, programs) in [&others, &units].into_iter().enumerate() {
-        for (index, program) in programs.iter().enumerate().filter(|(_, it)| it.test) {
-            ran.push(super::state::Program::of_whole(
-                program.name.clone(),
-                state_kind(program.kind),
-                program.package.name.to_string(),
-                program.root.clone(),
-                super::state::package_dir(&program.package),
-                program.executable.clone(),
-                (at, index),
-                run_env(&program.package, &[])
-                    .into_iter()
-                    .chain(library_path(&program.executable, None))
-                    .chain(programs_named(program))
-                    .collect(),
-            ));
-        }
+    for (index, program) in programs.iter().enumerate().filter(|(_, it)| it.test) {
+        ran.push(super::state::Program::of_whole(
+            program.name.clone(),
+            state_kind(program.kind),
+            program.package.name.to_string(),
+            program.root.clone(),
+            super::state::package_dir(&program.package),
+            program.executable.clone(),
+            (0, index),
+            run_env(&program.package, &[])
+                .into_iter()
+                .chain(library_path(&program.executable, None))
+                .chain(programs_named(program))
+                .collect(),
+        ));
     }
     // Cargo runs a package's tests as it orders its targets, and stops at the first that fails.
     let rank = |kind: &super::state::Kind| {
@@ -257,34 +244,33 @@ pub fn test(asked: &Invocation) -> anyhow::Result<i32> {
     ran.sort_by(|a, b| {
         (&a.package, rank(&a.kind), &a.name).cmp(&(&b.package, rank(&b.kind), &b.name))
     });
-    let documented = units.iter().any(|it| it.kind == Kind::Lib);
+    let tested_library = |it: &&Program| unit(it) && it.kind == Kind::Lib;
+    let documented = programs.iter().any(|it| tested_library(&it));
     let root = metadata.workspace_root.as_std_path().to_owned();
     let state = super::state::State::of_whole(
-        checkouts[0].key.clone(),
+        checkout.key.clone(),
         root,
         profile.to_owned(),
         ran,
-        checkouts.clone().into(),
+        vec![checkout.clone()],
         configured_env(&cwd),
     );
     super::affected::ask(&state);
-    for (checkout, programs) in checkouts.iter().zip([&others, &units]) {
-        if programs.is_empty() {
-            continue;
+    for (plan, program) in checkout.programs.iter().zip(&programs) {
+        let tests = plan.object.with_file_name(super::plan::TESTS);
+        // An integration test, or an example that is tests (`test = true`), which cargo
+        // builds with `--test`: the load has it with `cfg(test)`.
+        let harnessed = matches!(program.kind, Kind::Test | Kind::Example) && program.test;
+        match harnessed && program.harness {
+            true => std::fs::write(&tests, "")?,
+            false => _ = std::fs::remove_file(&tests),
         }
-        for (plan, program) in checkout.programs.iter().zip(programs.iter()) {
-            let tests = plan.object.with_file_name(super::plan::TESTS);
-            match program.kind == Kind::Test && program.harness {
-                true => std::fs::write(&tests, "")?,
-                false => _ = std::fs::remove_file(&tests),
-            }
-        }
-        match whole(&cwd, checkout, programs) {
-            Ok(rebuilt) => compiling(asked, rebuilt.into_iter().map(|at| &programs[at]), &mut said),
-            Err(why) => {
-                why.say();
-                return Ok(FAILED);
-            }
+    }
+    match whole(&cwd, &checkout, &programs) {
+        Ok(rebuilt) => compiling(asked, rebuilt.into_iter().map(|at| &programs[at]), &mut said),
+        Err(why) => {
+            why.say();
+            return Ok(FAILED);
         }
     }
     finished(asked, profile, started);
@@ -304,7 +290,7 @@ pub fn test(asked: &Invocation) -> anyhow::Result<i32> {
     if stopped || picked || !documented {
         return Ok(code);
     }
-    let libraries: Vec<&Program> = units.iter().filter(|it| it.kind == Kind::Lib).collect();
+    let libraries: Vec<&Program> = programs.iter().filter(tested_library).collect();
     Ok(code.max(doc_tests(asked, &cwd, metadata.workspace_root.as_std_path(), &libraries)?))
 }
 
@@ -509,16 +495,15 @@ fn whole(cwd: &Path, checkout: &Checkout, programs: &[Program]) -> Result<Vec<us
     Ok(rebuilt)
 }
 
-/// The daemon's checkout of a whole build of `programs`, each linked in its `dir`, by a
-/// worker that loads the workspace with `cfg(test)` when `unit_tests`. `env` is what `env!`
-/// reads of the build.
+/// The daemon's checkout of a whole build of `programs`, each linked in its `dir`. Of the
+/// tests (`tests`, which says what the integration tests are told), by a worker that loads
+/// the workspace as `cargo test` builds it, with every program of it.
 fn checkout(
     asked: &Invocation,
     cwd: &Path,
     metadata: &Metadata,
     programs: &[Program],
-    unit_tests: bool,
-    env: BTreeMap<String, String>,
+    tests: Option<TestsTold>,
 ) -> Checkout {
     let root = metadata.workspace_root.as_std_path();
     let asked_in = asked.flags.manifest_path.as_ref().map_or(cwd.to_owned(), |it| cwd.join(it));
@@ -527,14 +512,23 @@ fn checkout(
     let asked_in = asked_in.strip_prefix(root).map_or(asked_in.clone(), Path::to_owned);
     let project = programs.first().map(|it| super::state::package_dir(&it.package));
     let project = project.as_deref().unwrap_or(root);
+    let inside = |it: PathBuf| it.strip_prefix(root).map_or(it.clone(), Path::to_owned);
+    let key = match tests {
+        Some(_) => "whole-test",
+        None => "whole",
+    };
     let config = WorkerConfig {
         repository: repository(root),
         project: project.strip_prefix(root).unwrap_or(Path::new("")).to_owned(),
-        cfg_test: unit_tests,
+        cfg_test: tests.is_some(),
         selection: Selection { asked_in: Some(asked_in), ..asked.selection() },
         env: worker_env(),
         command_env: BTreeMap::new(),
         whole: true,
+        tests_told: tests.map(|it| TestsTold {
+            executables: inside(it.executables),
+            scratch: inside(it.scratch),
+        }),
     };
     // A worker links its programs where it was started to and builds again only what was
     // edited: another worker's build, of other features or flags, is not in its files.
@@ -555,7 +549,8 @@ fn checkout(
             binary: dir.join(&name),
             link_cmd: String::new(),
             symbol_files: Vec::new(),
-            unit_test: unit_tests,
+            // A library's or a binary's unit tests: an integration test is its own target.
+            unit_test: program.test && matches!(program.kind, Kind::Lib | Kind::Bin),
             linked_as_built: Vec::new(),
             copies: Vec::new(),
             package: None,
@@ -574,11 +569,6 @@ fn checkout(
     // build again what was edited since.
     let generation = manifests.clone().chain([lock]).filter_map(|it| written_at(&it)).max();
     let sources = members.iter().flat_map(|it| sources_in(&super::state::package_dir(it)));
-    let key = match (asked.subcommand, unit_tests) {
-        (Subcommand::Test, false) => "whole-test",
-        (_, true) => "whole-unit",
-        _ => "whole",
-    };
     Checkout {
         key: format!("{}-{key}", asked.key(cwd)),
         generation: generation.unwrap_or(0),
@@ -588,7 +578,8 @@ fn checkout(
         root: root.to_owned(),
         programs: plans.collect(),
         sources: manifests.chain(sources).collect(),
-        env,
+        // What `env!` reads that cargo sets is each crate's own, in the load.
+        env: BTreeMap::new(),
         scripts: None,
     }
 }
@@ -775,16 +766,8 @@ fn planned(
     let target = metadata.target_directory.as_std_path();
     let kept_in = target.join("blaze/plans");
     let planned = super::metadata::programs(&selection, dir, manifest.as_deref(), named, &kept_in)?;
-    // cargo's directory of a profile: `dev`'s is `debug`.
-    let profile = match selection.profile.as_str() {
-        "dev" => "debug",
-        other => other,
-    };
-    let mut out = target.to_owned();
-    if let Some(triple) = &selection.target {
-        out.push(triple);
-    }
-    out.push(profile);
+    let profile = profile_dir(&selection);
+    let out = programs_dir(asked, metadata);
     // A test is in the `deps` of cargo's build directory (`build.build-dir`), where stable
     // cargo puts it, also where nightly's second layout would put it in its unit's directory:
     // a test that finds its package's programs from its own path (`current_exe()`'s
@@ -853,6 +836,26 @@ fn planned(
         });
     }
     Ok(programs)
+}
+
+/// cargo's directory of the profile of `selection`: `dev`'s is `debug`.
+fn profile_dir(selection: &Selection) -> &str {
+    match selection.profile.as_str() {
+        "dev" => "debug",
+        other => other,
+    }
+}
+
+/// Where cargo puts the programs of the build `asked` that are not tests: the directory of its
+/// profile in the target directory, in that of the target when one is named.
+fn programs_dir(asked: &Invocation, metadata: &Metadata) -> PathBuf {
+    let selection = asked.selection();
+    let mut out = metadata.target_directory.as_std_path().to_owned();
+    if let Some(triple) = &selection.target {
+        out.push(triple);
+    }
+    out.push(profile_dir(&selection));
+    out
 }
 
 /// Sixteen hexadecimal digits, as cargo names a unit by, of the test `name` of `kind` in
