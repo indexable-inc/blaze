@@ -20,6 +20,10 @@ export type Teardown = () => void;
 /** Fired on window by the router: just before it swaps the page, and just after the new one is in place. */
 export const LEAVE = 'blaze:leave';
 export const PAGE = 'blaze:page';
+/** Fired on window by client/lib/presence.ts when a doc's comments changed elsewhere (a CustomEvent, detail: the doc). */
+export const COMMENTS = 'blaze:comments';
+/** Fired on window by client/comments.ts after it swapped threads in, so the comment count can be redrawn. */
+export const THREADS = 'blaze:threads';
 
 export function onPage(init: (signal: AbortSignal) => Teardown | void): void {
 	let stop: Teardown | null = null;

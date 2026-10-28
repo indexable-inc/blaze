@@ -142,6 +142,12 @@ to `env.ASSETS`, which serves `dist/` (built by `bun gen/build.ts`, laid out wit
   `modules.d.ts` types the module imports: wrangler bundles `.gen/site.wasm` as a compiled module and `.gen/site.cbor`
   as bytes (the `Data` rule in `wrangler.jsonc`).
 - `comments.ts`: `/api/comments`.
+- `presence.ts`: `/api/presence`, a WebSocket to the `Presence` Durable Object (one, named `site`, hibernating), which
+  knows who is on which page. Signed-in readers are their GitHub login; anonymous ones get a key that is an HMAC of
+  their IP and user agent under a random key the object makes each UTC day and deletes the next, so a name lasts a day
+  and no IP is kept. `client/lib/presence.ts` (loaded by `side.ts`, so on every page) draws the pane's top line: the
+  page's discussion with its comment count, the faces on this page (click for everyone and where), and the reader's
+  GitHub login with Sign out, or Sign in with GitHub; and faces on the sidebar rows others are reading.
 - `updates.ts`: the `/updates` form.
 - `http.ts`: cookies, origin check, `next` validation, tokens. `env.ts`: the `Env` type.
 

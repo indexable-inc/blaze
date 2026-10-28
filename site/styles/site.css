@@ -184,3 +184,8 @@ li > .say-btn:has(+ .c-btn) { left: -102px; }
 @media (prefers-reduced-motion: reduce) {
 	.say-now, .say-btn { transition: none; }
 }
+
+/* A comment that arrived while the page was open (client/comments.ts refresh). */
+.c-item.c-new { animation: c-new 2.4s ease-out; }
+@keyframes c-new { from { background: color-mix(in srgb, var(--ok) 14%, transparent); } to { background: transparent; } }
+@media (prefers-reduced-motion: reduce) { .c-item.c-new { animation: none; } }

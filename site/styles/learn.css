@@ -44,6 +44,11 @@ main.lesson[data-on] {
 	padding: 0 0 calc(var(--foot-h) + 24px);
 }
 main.lesson[data-on] > :is(.head, .pager) { display: none; }
+/* The player keeps the page's discussion for the "Lesson complete" screen, and the top line (client/lib/presence.ts)
+   out of the way. */
+main.lesson[data-on]:not(:has(> .lp-end[data-cur])) > .discussion { display: none; }
+main.lesson[data-on] > .discussion { padding-bottom: 120px; }
+body:has(main.lesson[data-on]) .topline { display: none; }
 main.lesson[data-on] > section.step:not([data-cur]) { display: none; }
 main.lesson[data-on] > section.step {
 	padding: 28px 0 0;

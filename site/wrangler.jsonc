@@ -44,6 +44,9 @@
   },
   // Narration files (audio/README.md): content-hashed .webm, uploaded from the Mac after audio/generate.py.
   "r2_buckets": [{ "binding": "AUDIO", "bucket_name": "ra-jit-audio" }], // rename: old name, the Cloudflare resource is still called this
+  // Who is on the site right now (worker/presence.ts): one object, holding a hibernating WebSocket per open tab.
+  "durable_objects": { "bindings": [{ "name": "PRESENCE", "class_name": "Presence" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Presence"] }],
   "d1_databases": [
     {
       "binding": "DB",
