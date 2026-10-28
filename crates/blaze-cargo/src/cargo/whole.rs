@@ -229,6 +229,9 @@ pub fn test(asked: &Invocation) -> anyhow::Result<i32> {
                 .chain(library_path(&program.executable, None))
                 .chain(programs_named(program))
                 .collect(),
+            // A unit test is never without the harness (above); an integration test, or an
+            // example that is tests, starts in it as the file of its directory says (below).
+            program.harness && (unit(program) || matches!(program.kind, Kind::Test | Kind::Example)),
         ));
     }
     // Cargo runs a package's tests as it orders its targets, and stops at the first that fails.

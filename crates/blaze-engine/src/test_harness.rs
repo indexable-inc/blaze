@@ -157,8 +157,10 @@ pub(crate) fn module(
         (test.start, test.end) = (at(range.range.start()), at(range.range.end()));
         tests.push(test);
     }
-    // rustc lists them by name.
-    tests.sort_by(|a, b| a.path.cmp(&b.path));
+    // rustc lists them by name, the joined path libtest shows: `--exact` finds a name by a
+    // binary search of that order (`TestListOrder::Sorted`), which the path's own order is
+    // not (`a::b` comes after `a0` by name, before it by path).
+    tests.sort_by_cached_key(|it| it.path.join("::"));
     let root = krate.root_file(db);
     let test_type = match file_name(root).as_deref().map(std::path::Path::new) {
         Some(it) if it.parent().is_some_and(|it| it.ends_with("src")) => "UnitTest",
@@ -211,8 +213,12 @@ fn text(tests: &[Test], test_type: &str, tested: bool) -> String {
     for at in 0..tests.len() {
         _ = write!(text, "&T{at}, ");
     }
-    text.push_str("];\n        test::test_main_env_args(TESTS)\n    }\n");
+    text.push_str(
+        "];\n        if let ::std::option::Option::Some(code) = server::serve(TESTS) {\n            \
+         return code;\n        }\n        test::test_main_env_args(TESTS)\n    }\n",
+    );
     text.push_str(MARKED);
+    text.push_str(&SERVER.replace("{VAR}", blaze_cargo::cargo::forked::VAR));
     for (at, test) in tests.iter().enumerate() {
         let name = test.path.join("::");
         let ignore_message = match &test.ignore_message {
@@ -295,6 +301,378 @@ const MARKED: &str = r#"
 
         #[cfg(not(unix))]
         fn look(_: &[u8]) {}
+    }
+"#;
+
+/// The fork server ([`blaze_cargo::cargo::forked`]): a program of tests that `blaze test`
+/// starts with the variable `{VAR}` naming its end of a socket lists its tests, as libtest's
+/// own filters pick them from its arguments, and then runs none itself. For each test blaze
+/// asks for, with a file its output goes to, it forks a child that runs that one test with
+/// libtest (`--exact`, on a thread of its own, as `cargo test` would) and exits; the server
+/// says how each child ended. The server never starts a thread, so the fork is sound; one
+/// that has threads before it begins (a static constructor's) says so and runs nothing.
+///
+/// What it is told, 12 bytes each: an operation (1 runs the test at an index of the list,
+/// with the output file's descriptor; 2 kills the child of an id), the id blaze gives the run,
+/// and the index. What it says, a line each: `t <name>` or `i <name>\t<message>` (ignored)
+/// for each test of the list, `e <tests>` at its end with how many the program has, `x <id>
+/// <wait status>` as each child ends, and `f <why>` when it can't go on.
+const SERVER: &str = r#"
+    pub mod server {
+        use super::test;
+        use ::std::os::raw::{c_int, c_void};
+
+        #[cfg(target_os = "linux")]
+        type Nfds = ::std::os::raw::c_ulong;
+        #[cfg(not(target_os = "linux"))]
+        type Nfds = ::std::os::raw::c_uint;
+        #[cfg(target_os = "linux")]
+        type Len = usize;
+        #[cfg(not(target_os = "linux"))]
+        type Len = u32;
+
+        #[repr(C)]
+        struct PollFd {
+            fd: c_int,
+            events: i16,
+            revents: i16,
+        }
+
+        #[repr(C)]
+        struct IoVec {
+            base: *mut c_void,
+            len: usize,
+        }
+
+        #[cfg(target_os = "linux")]
+        #[repr(C)]
+        struct MsgHdr {
+            name: *mut c_void,
+            name_len: u32,
+            iov: *mut IoVec,
+            iov_len: usize,
+            control: *mut c_void,
+            control_len: Len,
+            flags: c_int,
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        #[repr(C)]
+        struct MsgHdr {
+            name: *mut c_void,
+            name_len: u32,
+            iov: *mut IoVec,
+            iov_len: c_int,
+            control: *mut c_void,
+            control_len: Len,
+            flags: c_int,
+        }
+
+        #[repr(C)]
+        struct CmsgHdr {
+            len: Len,
+            level: c_int,
+            kind: c_int,
+        }
+
+        #[cfg(target_os = "linux")]
+        const SOL_SOCKET: c_int = 1;
+        #[cfg(not(target_os = "linux"))]
+        const SOL_SOCKET: c_int = 0xffff;
+        const SCM_RIGHTS: c_int = 1;
+        #[cfg(target_os = "linux")]
+        const SIGCHLD: c_int = 17;
+        #[cfg(not(target_os = "linux"))]
+        const SIGCHLD: c_int = 20;
+        const SIGKILL: c_int = 9;
+        const WNOHANG: c_int = 1;
+        const POLLIN: i16 = 1;
+        const F_SETFD: c_int = 2;
+        const F_GETFL: c_int = 3;
+        const F_SETFL: c_int = 4;
+        const FD_CLOEXEC: c_int = 1;
+        #[cfg(target_os = "linux")]
+        const O_NONBLOCK: c_int = 0o4000;
+        #[cfg(not(target_os = "linux"))]
+        const O_NONBLOCK: c_int = 4;
+        const EINTR: i32 = 4;
+
+        unsafe extern "C" {
+            fn fork() -> c_int;
+            fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+            fn kill(pid: c_int, signal: c_int) -> c_int;
+            fn pipe(fds: *mut c_int) -> c_int;
+            fn dup2(from: c_int, to: c_int) -> c_int;
+            fn close(fd: c_int) -> c_int;
+            fn read(fd: c_int, buf: *mut c_void, len: usize) -> isize;
+            fn write(fd: c_int, buf: *const c_void, len: usize) -> isize;
+            fn poll(fds: *mut PollFd, count: Nfds, timeout: c_int) -> c_int;
+            fn recvmsg(fd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
+            fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+            fn signal(signal: c_int, handler: usize) -> usize;
+            #[cfg(target_os = "macos")]
+            fn pthread_is_threaded_np() -> c_int;
+        }
+
+        /// The write end of the pipe the handler of `SIGCHLD` wakes the loop with.
+        static WAKE: ::std::sync::atomic::AtomicI32 = ::std::sync::atomic::AtomicI32::new(-1);
+
+        extern "C" fn on_child(_: c_int) {
+            let byte = 0u8;
+            let fd = WAKE.load(::std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: `write` is async-signal-safe; the pipe does not block.
+            unsafe { write(fd, &byte as *const u8 as *const c_void, 1) };
+        }
+
+        fn interrupted() -> bool {
+            ::std::io::Error::last_os_error().raw_os_error() == ::std::option::Option::Some(EINTR)
+        }
+
+        fn say(fd: c_int, text: &str) {
+            let mut left = text.as_bytes();
+            while !left.is_empty() {
+                // SAFETY: `left` is that many bytes.
+                let wrote = unsafe { write(fd, left.as_ptr() as *const c_void, left.len()) };
+                if wrote <= 0 {
+                    if wrote < 0 && interrupted() {
+                        continue;
+                    }
+                    return;
+                }
+                left = &left[wrote as usize..];
+            }
+        }
+
+        /// Why this process can't fork soundly: it has threads.
+        #[cfg(target_os = "linux")]
+        fn threaded() -> ::std::option::Option<::std::string::String> {
+            match ::std::fs::read_dir("/proc/self/task") {
+                ::std::result::Result::Ok(it) => match it.count() {
+                    1 => ::std::option::Option::None,
+                    n => ::std::option::Option::Some(format!(
+                        "it has {} threads before any test runs (a static constructor started them), and a process with threads can't fork soundly", n
+                    )),
+                },
+                ::std::result::Result::Err(error) => ::std::option::Option::Some(format!(
+                    "it can't tell whether it has threads (`/proc/self/task`: {})", error
+                )),
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        fn threaded() -> ::std::option::Option<::std::string::String> {
+            // SAFETY: no arguments.
+            match unsafe { pthread_is_threaded_np() } {
+                0 => ::std::option::Option::None,
+                _ => ::std::option::Option::Some(::std::string::String::from(
+                    "it started a thread before any test runs (a static constructor's), and on macOS a process that has had threads can't fork soundly"
+                )),
+            }
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        fn threaded() -> ::std::option::Option<::std::string::String> {
+            ::std::option::Option::Some(::std::string::String::from("blaze runs a process per test on Linux and macOS only"))
+        }
+
+        /// Reads what blaze sent into `pending`, and the descriptors it passed into `fds`:
+        /// false once blaze is gone.
+        fn receive(fd: c_int, pending: &mut ::std::vec::Vec<u8>, fds: &mut ::std::vec::Vec<c_int>) -> bool {
+            let mut data = [0u8; 4096];
+            let mut control = [0u64; 32];
+            let mut iov = IoVec { base: data.as_mut_ptr() as *mut c_void, len: data.len() };
+            // SAFETY: every field is an integer or a pointer.
+            let mut msg: MsgHdr = unsafe { ::std::mem::zeroed() };
+            msg.iov = &mut iov;
+            msg.iov_len = 1;
+            msg.control = control.as_mut_ptr() as *mut c_void;
+            msg.control_len = ::std::mem::size_of_val(&control) as Len;
+            let got = loop {
+                // SAFETY: `msg` points at buffers of the lengths it says.
+                let got = unsafe { recvmsg(fd, &mut msg, 0) };
+                if got < 0 && interrupted() {
+                    continue;
+                }
+                break got;
+            };
+            if got <= 0 {
+                return false;
+            }
+            pending.extend_from_slice(&data[..got as usize]);
+            let (header, align) = (::std::mem::size_of::<CmsgHdr>(), ::std::mem::size_of::<Len>());
+            let aligned = |it: usize| (it + align - 1) & !(align - 1);
+            let base = control.as_ptr() as *const u8;
+            let (mut at, end) = (0usize, msg.control_len as usize);
+            while at + header <= end {
+                // SAFETY: a header is there, aligned as `control` is.
+                let head = unsafe { &*(base.add(at) as *const CmsgHdr) };
+                let len = head.len as usize;
+                if len < header || at + len > end {
+                    break;
+                }
+                if head.level == SOL_SOCKET && head.kind == SCM_RIGHTS {
+                    let first = at + aligned(header);
+                    for k in 0..(at + len).saturating_sub(first) / 4 {
+                        // SAFETY: within the message's data.
+                        fds.push(unsafe { ::std::ptr::read_unaligned(base.add(first + 4 * k) as *const c_int) });
+                    }
+                }
+                at += aligned(len);
+            }
+            true
+        }
+
+        /// The server, when blaze started this program as one: its code, or the code of
+        /// the child that ran a test. `None` when it was not.
+        pub fn serve(tests: &[&test::TestDescAndFn]) -> ::std::option::Option<test::ExitCode> {
+            let fd: c_int = ::std::env::var("{VAR}").ok()?.parse().ok()?;
+            // SAFETY: no thread has started (`threaded` says so before the first fork).
+            unsafe {
+                ::std::env::remove_var("{VAR}");
+                fcntl(fd, F_SETFD, FD_CLOEXEC);
+            }
+            let failed = ::std::option::Option::Some(test::ExitCode::from(101u8));
+            let one_line = |it: &str| it.replace('\n', " ");
+            if let ::std::option::Option::Some(why) = threaded() {
+                say(fd, &format!("f {}\n", one_line(&why)));
+                return failed;
+            }
+            let args: ::std::vec::Vec<::std::string::String> = ::std::env::args().collect();
+            let opts = match test::test::parse_opts(&args) {
+                ::std::option::Option::Some(::std::result::Result::Ok(it)) => it,
+                ::std::option::Option::Some(::std::result::Result::Err(why)) => {
+                    say(fd, &format!("f {}\n", one_line(&why)));
+                    return failed;
+                }
+                ::std::option::Option::None => {
+                    say(fd, "f the harness was asked for its usage\n");
+                    return failed;
+                }
+            };
+            let listed = test::filter_tests(&opts, test::TestList::new(tests, test::TestListOrder::Sorted));
+            let mut text = ::std::string::String::new();
+            for it in &listed {
+                let name = it.desc.name.as_slice();
+                match it.desc.ignore {
+                    true => text.push_str(&format!("i {}\t{}\n", name, one_line(it.desc.ignore_message.unwrap_or("")))),
+                    false => text.push_str(&format!("t {}\n", name)),
+                }
+            }
+            text.push_str(&format!("e {}\n", tests.len()));
+            say(fd, &text);
+            let mut wake = [0 as c_int; 2];
+            // SAFETY: two descriptors' room.
+            if unsafe { pipe(wake.as_mut_ptr()) } != 0 {
+                say(fd, "f no pipe could be made\n");
+                return failed;
+            }
+            // SAFETY: plain calls on descriptors this process owns.
+            unsafe {
+                for it in wake {
+                    fcntl(it, F_SETFD, FD_CLOEXEC);
+                    let flags = fcntl(it, F_GETFL);
+                    fcntl(it, F_SETFL, flags | O_NONBLOCK);
+                }
+            }
+            WAKE.store(wake[1], ::std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: the handler only writes to the pipe.
+            unsafe { signal(SIGCHLD, on_child as usize) };
+            let mut children: ::std::vec::Vec<(c_int, u32)> = ::std::vec::Vec::new();
+            let mut pending: ::std::vec::Vec<u8> = ::std::vec::Vec::new();
+            let mut fds: ::std::vec::Vec<c_int> = ::std::vec::Vec::new();
+            let mut open = true;
+            loop {
+                loop {
+                    let mut status: c_int = 0;
+                    // SAFETY: `status` is an int.
+                    let pid = unsafe { waitpid(-1, &mut status, WNOHANG) };
+                    if pid <= 0 {
+                        break;
+                    }
+                    if let ::std::option::Option::Some(at) = children.iter().position(|it| it.0 == pid) {
+                        let (_, id) = children.swap_remove(at);
+                        say(fd, &format!("x {} {}\n", id, status));
+                    }
+                }
+                if !open && children.is_empty() {
+                    return ::std::option::Option::Some(test::ExitCode::SUCCESS);
+                }
+                let mut polled = [
+                    PollFd { fd: if open { fd } else { -1 }, events: POLLIN, revents: 0 },
+                    PollFd { fd: wake[0], events: POLLIN, revents: 0 },
+                ];
+                // SAFETY: two entries.
+                if unsafe { poll(polled.as_mut_ptr(), 2, -1) } < 0 {
+                    if interrupted() {
+                        continue;
+                    }
+                    say(fd, "f poll failed\n");
+                    return failed;
+                }
+                if polled[1].revents != 0 {
+                    let mut drained = [0u8; 64];
+                    // SAFETY: into `drained`, which does not block.
+                    while unsafe { read(wake[0], drained.as_mut_ptr() as *mut c_void, drained.len()) } > 0 {}
+                }
+                if polled[0].revents == 0 {
+                    continue;
+                }
+                open = receive(fd, &mut pending, &mut fds);
+                while pending.len() >= 12 {
+                    let word = |at: usize| u32::from_ne_bytes([pending[at], pending[at + 1], pending[at + 2], pending[at + 3]]);
+                    let (op, id, index) = (word(0), word(4), word(8) as usize);
+                    pending.drain(..12);
+                    if op == 2 {
+                        if let ::std::option::Option::Some(it) = children.iter().find(|it| it.1 == id) {
+                            // SAFETY: a child of this process that has not been waited for.
+                            unsafe { kill(it.0, SIGKILL) };
+                        }
+                        continue;
+                    }
+                    if op != 1 || fds.is_empty() || index >= listed.len() {
+                        say(fd, &format!("x {} -1\n", id));
+                        continue;
+                    }
+                    let out = fds.remove(0);
+                    // SAFETY: this process has one thread.
+                    let pid = unsafe { fork() };
+                    if pid == 0 {
+                        // SAFETY: the child's own descriptors and signal disposition.
+                        unsafe {
+                            signal(SIGCHLD, 0);
+                            close(fd);
+                            close(wake[0]);
+                            close(wake[1]);
+                            for it in &fds {
+                                close(*it);
+                            }
+                            dup2(out, 1);
+                            dup2(out, 2);
+                            close(out);
+                        }
+                        let one: ::std::vec::Vec<::std::string::String> = [
+                            args.first().map_or("", |it| it.as_str()),
+                            listed[index].desc.name.as_slice(),
+                            "--exact",
+                            "--include-ignored",
+                            "--test-threads=1",
+                            "--nocapture",
+                            "--color=never",
+                        ]
+                        .iter()
+                        .map(|it| ::std::string::String::from(*it))
+                        .collect();
+                        return ::std::option::Option::Some(test::test_main(&one, tests));
+                    }
+                    // SAFETY: the child has its copy.
+                    unsafe { close(out) };
+                    match pid {
+                        p if p < 0 => say(fd, &format!("x {} -1\n", id)),
+                        p => children.push((p, id)),
+                    }
+                }
+            }
+        }
     }
 "#;
 
