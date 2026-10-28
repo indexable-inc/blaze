@@ -368,7 +368,21 @@ for each platform, each on a machine of its own kind.
 | `blaze.yaml` (`warm`) | push to main | the same on Linux x86-64, AArch64 and macOS, every test, then a push of the store for the runs after it; and on Linux x86-64 the std cases of the smoke corpus (`harness/smoke.py`, [release.md](release.md#the-smoke-corpus): `blaze run` and `blaze test`, dev and `--release`) with the blaze blaze built, 17 to 30 min until [#899](https://github.com/indexable-inc/blaze/issues/899) (74 s with rustc's) | |
 | `fmt.yaml` | push to main | `cargo fmt --all`, and a commit `fmt` when it changed a file | 2 min |
 | `train.yaml` | push to main, by hand | everything below, then a release or the train's issue | about 45 min |
-| `blaze.yaml` | docs or site only | the two scripts | 1 min |
+| `blaze.yaml` | a change the build and the unit tests do not read | the two scripts | 1 min |
+
+The build and the unit tests run only for a change that touches a file they read; any other
+change runs the two scripts alone. `.github/scripts/gate_changes.py` (the `changes` job) names
+those files, and why each: the crates (`crates/`, with their test data, the LLVM pin
+`crates/hir-ty-codegen/llvm.json` and the toolchain's `pins.txt`), the vendored crates
+(`vendor/`), `Cargo.toml`, `Cargo.lock`, `.cargo/`, `rustfmt.toml` and `clippy.toml`, the
+pinned nightly (`harness/toolchain`), `harness/unittests.py`, the flake (`flake.nix`,
+`flake.lock`), the release of blaze that builds blaze (`.github/blaze-version`, `install.sh`),
+`blaze.yaml`, `blaze-platform.yaml` and the actions they use (`toolchain`, `blaze`,
+`blaze-remote`, `rust-tests`); on a push to main, the smoke corpus too (`harness/smoke.py`,
+`harness/smoke/`), which the `warm` tier runs. It names what is code rather than what is not,
+so a new directory of documents, benches or harnesses runs no build; a list of files that
+cannot be had (a run by hand, a comparison of 300 files or more, GitHub refusing) counts as
+code. When the build or the unit tests start reading a new file, add it there.
 
 A change reaches main through a **pull request** alone
 ([contributing.md](contributing.md#landing-a-change)), merged directly once `ci` passes on it;
