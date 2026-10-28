@@ -821,6 +821,7 @@
      "blaze-cargo",
      "blaze-doc",
      "blaze-expand",
+     "blaze-graph",
      "blaze-lints",
      "blaze-live",
      "blaze-macro-wasm",
@@ -19561,6 +19562,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -19810,6 +19815,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -20057,6 +20066,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -20347,6 +20360,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -40806,6 +40823,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -41055,6 +41076,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -41302,6 +41327,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -41592,6 +41621,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -61924,6 +61957,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -62173,6 +62210,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -62420,6 +62461,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -62710,6 +62755,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -83196,6 +83245,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -83445,6 +83498,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -83692,6 +83749,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -83982,6 +84043,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
