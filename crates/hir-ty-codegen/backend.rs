@@ -408,13 +408,13 @@ pub(super) fn time_passes() {
         static SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
     if !SET.replace(true) {
-        cranelift_codegen::timing::set_thread_profiler(Box::new(Passes));
+        cranelift_codegen::timing::set_thread_profiler(Box::new(PassTimer));
     }
 }
 
-struct Passes;
+struct PassTimer;
 
-impl cranelift_codegen::timing::Profiler for Passes {
+impl cranelift_codegen::timing::Profiler for PassTimer {
     fn start_pass(&self, pass: cranelift_codegen::timing::Pass) -> Box<dyn std::any::Any> {
         match blaze_profile::pass(pass.description()) {
             Some(timed) => Box::new(timed) as Box<dyn std::any::Any>,
