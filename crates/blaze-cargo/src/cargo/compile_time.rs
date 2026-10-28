@@ -668,9 +668,10 @@ impl<'a> Driver<'a> {
             return Ok(it);
         }
         let manifest = &self.package(at)?.manifest;
-        let text = std::fs::read_to_string(manifest)
-            .with_context(|| format!("reading {manifest}"))?;
-        let table: toml::Table = text.parse().with_context(|| format!("reading {manifest}"))?;
+        let text =
+            std::fs::read_to_string(manifest).with_context(|| format!("reading {manifest}"))?;
+        let table: toml::Table =
+            toml::from_str(&text).with_context(|| format!("reading {manifest}"))?;
         let wasm_cfg = cfgs(&said(&["--print", "cfg", "--target", super::own_macro::WASM_TARGET])?);
         let platform = self.platform(at);
         let host_cfg = cfgs(&platform.cfg.join("\n"));
@@ -698,13 +699,16 @@ impl<'a> Driver<'a> {
     fn wasm_graph(&self) -> anyhow::Result<Arc<UnitGraph>> {
         let made = self.wasm_graph.get_or_init(|| {
             let target = super::own_macro::WASM_TARGET;
-            let printed = said(&["--print", "cfg", "--target", target]).map_err(|it| format!("{it:#}"))?;
+            let printed =
+                said(&["--print", "cfg", "--target", target]).map_err(|it| format!("{it:#}"))?;
             let cfg = atoms(&printed);
             let selection = Selection { target: None, ..self.selection.clone() };
             let asked = crate::plan::Asked { triple: target, cfg: &cfg, env: &self.extra_env };
             UnitGraph::asked(&self.manifest, &selection, &asked).map_err(|it| format!("{it:#}"))
         });
-        made.clone().map_err(|why| anyhow::anyhow!("making the build's unit graph for wasm32-wasip1: {why}"))
+        made.clone().map_err(|why| {
+            anyhow::anyhow!("making the build's unit graph for wasm32-wasip1: {why}")
+        })
     }
 
     /// The variables cargo sets for rustc of the crate `crate_name` whose root is `root`, of
@@ -724,9 +728,10 @@ impl<'a> Driver<'a> {
         let text = std::fs::read_to_string(&manifest)
             .with_context(|| format!("reading {}", manifest.display()))?;
         let table: toml::Table =
-            text.parse().with_context(|| format!("reading {}", manifest.display()))?;
+            toml::from_str(&text).with_context(|| format!("reading {}", manifest.display()))?;
         let package = table.get("package").and_then(toml::Value::as_table);
-        let package = package.with_context(|| format!("{} has no [package]", manifest.display()))?;
+        let package =
+            package.with_context(|| format!("{} has no [package]", manifest.display()))?;
         let field = |name: &str| match package.get(name) {
             Some(toml::Value::String(it)) => it.clone(),
             Some(toml::Value::Array(it)) => {
