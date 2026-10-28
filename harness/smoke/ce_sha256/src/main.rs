@@ -15,5 +15,6 @@ fn main() {
     let at_run_time = digest();
     #[cfg(feature = "const")]
     assert_eq!(AT_COMPILE_TIME, at_run_time, "the constant is not what the program computes");
-    println!("hashed 1048576 bytes");
+    let hex: String = at_run_time.iter().map(|b| format!("{b:02x}")).collect();
+    println!("sha256 of 1048576 bytes: {hex}");
 }

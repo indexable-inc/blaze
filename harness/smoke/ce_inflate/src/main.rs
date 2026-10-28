@@ -19,5 +19,5 @@ fn main() {
     let at_run_time = inflate();
     #[cfg(feature = "const")]
     assert_eq!(AT_COMPILE_TIME, at_run_time, "the constant is not what the program computes");
-    println!("inflated {} bytes", at_run_time.0);
+    println!("inflated {} bytes, FNV-1a {}", at_run_time.0, at_run_time.1);
 }

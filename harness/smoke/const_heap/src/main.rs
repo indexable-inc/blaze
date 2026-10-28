@@ -69,5 +69,5 @@ fn main() {
     assert_eq!(STRING, string_work(), "String");
     assert_eq!(BOX, box_work(), "Box");
     assert_eq!(BTREE, btree_work(), "BTreeMap");
-    println!("vec, string, box and btreemap: the constants are what the program computes");
+    println!("vec {VEC:?}, string {STRING:?}, box {BOX}, btreemap {BTREE:?}");
 }

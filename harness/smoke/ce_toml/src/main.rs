@@ -30,5 +30,5 @@ fn main() {
     #[cfg(feature = "const")]
     assert_eq!(AT_COMPILE_TIME, at_run_time, "the constant is not what the program computes");
     assert!(at_run_time > 0, "the manifest did not parse");
-    println!("parsed 10 manifests");
+    println!("parsed 10 manifests: {at_run_time} entries");
 }
