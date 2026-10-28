@@ -97,7 +97,8 @@ pub use infer::{
 pub use lower::{
     ElidedLifetimes, ElidedOutput, FieldType, GenericDefaults, GenericDefaultsRef,
     GenericPredicates, LifetimeElisionKind, LifetimeLoweringMode, LoweringMode, TyDefId,
-    TyLoweringContext, TyLoweringInferVarsCtx, TyLoweringResult, ValueTyDefId, diagnostics::*,
+    SelfAndAssocBounds, TyLoweringContext, TyLoweringInferVarsCtx, TyLoweringResult, ValueTyDefId,
+    diagnostics::*,
     elided_lifetimes, with_elided_regions,
 };
 pub use next_solver::interner::{attach_db, attach_db_allow_change, with_attached_db};

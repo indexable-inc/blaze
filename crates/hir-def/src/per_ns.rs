@@ -3,8 +3,6 @@
 //!
 //! `PerNs` (per namespace) captures this.
 
-use bitflags::bitflags;
-
 use crate::{
     MacroId, ModuleDefId,
     item_scope::{ImportId, ImportOrExternCrate, ImportOrGlob, ItemInNs},
@@ -18,16 +16,6 @@ pub enum Namespace {
     Macros,
 }
 
-bitflags! {
-    /// Describes only the presence/absence of each namespace, without its value.
-    #[derive(Debug, PartialEq, Eq)]
-    pub(crate) struct NsAvailability : u32 {
-        const TYPES = 1 << 0;
-        const VALUES = 1 << 1;
-        const MACROS = 1 << 2;
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Item<Def, Import = ImportId> {
     pub def: Def,
@@ -36,12 +24,10 @@ pub struct Item<Def, Import = ImportId> {
 }
 
 impl<Def: PartialEq, Import: Copy + PartialEq> Item<Def, Import> {
-    /// Whether `import` is the same import that produced `self`, now resolving to a different
-    /// `def`. This happens when an import is first recorded as an indeterminate resolution
-    /// (e.g. only one namespace was available at the time) and later re-resolves to another
-    /// def, such as an explicit import that shadows a glob only after the glob has been seen.
-    pub(crate) fn is_reresolved_by(&self, def: &Def, import: Option<Import>) -> bool {
-        import.is_some() && self.import == import && self.def != *def
+    /// An explicit import can shadow a glob with another definition or with a different
+    /// visibility for the same definition. Re-exports that saw the glob must follow it.
+    pub(crate) fn is_reresolved_by(&self, item: &Self, import: Option<Import>) -> bool {
+        import.is_some() && self.import == import && (self.def != item.def || self.vis != item.vis)
     }
 }
 
@@ -58,14 +44,6 @@ pub struct PerNs {
 }
 
 impl PerNs {
-    pub(crate) fn availability(&self) -> NsAvailability {
-        let mut result = NsAvailability::empty();
-        result.set(NsAvailability::TYPES, self.types.is_some());
-        result.set(NsAvailability::VALUES, self.values.is_some());
-        result.set(NsAvailability::MACROS, self.macros.is_some());
-        result
-    }
-
     pub fn none() -> PerNs {
         PerNs { types: None, values: None, macros: None }
     }
