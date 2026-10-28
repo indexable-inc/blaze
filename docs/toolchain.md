@@ -1,7 +1,7 @@
 # blaze's own toolchain
 
 blaze is its own Rust toolchain. It builds every project with one toolchain that blaze
-controls, names and ships, whatever the project pins: `blaze-2026-10-27` today. It is not the
+controls, names and ships, whatever the project pins: `blaze-2026-10-28` today. It is not the
 project's toolchain and it does not try to be. The project's own toolchain, and its CI, stay
 the final word on whether the code builds.
 
@@ -26,15 +26,15 @@ the standard library is part of a compiler.
 
 ## What it is today
 
-- **Name:** `blaze-<date>` (`blaze-2026-10-27`), after the date of the Rust nightly it is built
-  from (`harness/toolchain`, `nightly-2026-10-27`). `blaze toolchain` prints it and where it
+- **Name:** `blaze-<date>` (`blaze-2026-10-28`), after the date of the Rust nightly it is built
+  from (`harness/toolchain`, `nightly-2026-10-28`). `blaze toolchain` prints it and where it
   is; `blaze toolchain --path` prints the directory alone.
 - **Bytes:** the upstream nightly's `rustc`, `cargo`, `rust-std` (the host's, and `wasm32-wasip1`'s,
   which proc macros are built for) and `rust-src`, unchanged, from
   static.rust-lang.org, each checked against the sha256 compiled into blaze
   (`crates/blaze-engine/src/cargo/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
-  still says `1.101.0-nightly (16d1ffac1 2026-10-26)`.
-- **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>`, or rustup's `nightly-2026-10-27`
+  still says `1.101.0-nightly (41089d07a 2026-10-27)`.
+- **Where:** `~/.blaze/toolchains/nightly-2026-10-28-<host>`, or rustup's `nightly-2026-10-28`
   when rustup already has it with `rust-src` (the same bytes). The installer downloads it once;
   `blaze toolchain --path` prints its directory.
 - **Who uses it:** cargo, rustc and the daemon that blaze starts (`CARGO`, `RUSTC`, `RUSTDOC`,

@@ -27,7 +27,7 @@ set -eu
 
 REPO="${BLAZE_REPO:-indexable-inc/blaze}"
 # harness/toolchain; harness/toolchain_bump.py writes it
-TOOLCHAIN="nightly-2026-10-27"
+TOOLCHAIN="nightly-2026-10-28"
 VERSION="${BLAZE_VERSION:-}"
 CHANNEL="${BLAZE_CHANNEL:-}"
 NO_TOOLCHAIN="${BLAZE_NO_TOOLCHAIN:-}"

@@ -20,7 +20,7 @@ have to be installed side by side, with `blaze-rustc`. The [installer](../instal
 `cargo install` both do that:
 
     curl -fsSL https://ix.dev/blaze | sh
-    cargo +nightly-2026-10-27 install --locked blaze-engine
+    cargo +nightly-2026-10-28 install --locked blaze-engine
 
 From the release after 0.1.0, `--profile dist` builds the profile a release is built with, less
 the PGO a release adds ([reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md)); 0.1.0 has no such
@@ -38,7 +38,7 @@ same LLVM. `cargo build -p blaze-engine --release` is the quicker build the harn
 working on blaze; it is not what ships.
 
 `blaze` builds with the one toolchain blaze compiles, the dated nightly in
-`harness/toolchain` (`nightly-2026-10-27`): the language and standard library are the ones this
+`harness/toolchain` (`nightly-2026-10-28`): the language and standard library are the ones this
 blaze ships. It ignores `rust-toolchain`/`rust-toolchain.toml`, `rustup override`,
 `+toolchain`, `RUSTUP_TOOLCHAIN`, rustup's default and `RUSTC`, and never runs or asks a rustc
 to learn anything ([toolchain.md](toolchain.md)): it runs cargo and the daemon under its own
@@ -48,10 +48,10 @@ is, `#![feature(...)]` included. A project that needs another Rust pins another 
 `cargo` still builds with the project's toolchain, in the same target directory: cargo keys
 what it builds by the rustc, so neither rebuilds the other's.
 
-Where the nightly's files come from, found with nothing run: rustup's `nightly-2026-10-27`
+Where the nightly's files come from, found with nothing run: rustup's `nightly-2026-10-28`
 with `rust-src`, when rustup has it (only as a copy of the same files; what rustup would pick
 is not asked); else blaze's own copy in
-`~/.blaze/toolchains/nightly-2026-10-27-<host>` (`BLAZE_HOME` moves `~/.blaze`), laid out as rustup lays
+`~/.blaze/toolchains/nightly-2026-10-28-<host>` (`BLAZE_HOME` moves `~/.blaze`), laid out as rustup lays
 out a toolchain. blaze downloads its copy the first time it needs it, once, with a line on
 stderr while it does: rustc, cargo, the standard library and its source from the Rust project's
 own servers, 97 MB on macOS, 134 MB on Linux x86-64 and 118 MB on Linux ARM64 (548 MB on macOS

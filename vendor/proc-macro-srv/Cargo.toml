@@ -1,7 +1,7 @@
 # The proc-macro server of the toolchain in `harness/toolchain`, built by blaze, which loads the
 # libraries blaze links (docs/no-rustc.md, step J1). `crates/` is `src/tools/rust-analyzer/crates`
 # and `compiler/rustc_lexer` is `compiler/rustc_lexer` of rust-lang/rust at the toolchain's commit
-# (nightly-2026-10-27, 16d1ffac17ad8b739e32483ac2e65fe7e1804977), the crates the toolchain's
+# (nightly-2026-10-28, 41089d07a0a2afc16adfe28a760d94d73d7298a4), the crates the toolchain's
 # `rust-analyzer-proc-macro-srv` is built from, without their tests; `Cargo.lock` holds the
 # toolchain's root `Cargo.lock` entries for these crates' dependencies. The toolchain builds the
 # server in rustc's tree, against rustc's own crates; what is changed is what takes their place:
