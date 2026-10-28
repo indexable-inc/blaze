@@ -21,7 +21,7 @@ experimental = ["sandboxed-tests"]
 build-script-env = ["LLVM_SYS_231_PREFIX"]
 
 [workspace.package]
-version = "0.20261028.9"
+version = "0.0.0"
 rust-version = "1.101"
 edition = "2024"
 license = "MIT OR Apache-2.0"

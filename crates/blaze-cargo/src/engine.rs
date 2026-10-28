@@ -13,6 +13,13 @@ pub struct Engine {
     pub pin: fn(&[String]) -> anyhow::Result<i32>,
     /// Which blaze this is and why it is the one that runs, for `blaze --version`.
     pub why_this_one: fn() -> String,
+    /// This blaze's version: a release's `0.YYYYMMDD.N`, or `0.0.0-dev` for a build of the
+    /// tree. Said by the engine's build.rs alone (`BLAZE_RELEASE`), so that no release and no
+    /// commit changes this crate.
+    pub version: &'static str,
+    /// What `--version` prints first: `blaze 0.20261028.9 (fb82b09 2026-10-28)`, or
+    /// `blaze 0.0.0-dev (fb82b09)`.
+    pub version_line: &'static str,
 }
 
 static ENGINE: OnceLock<Engine> = OnceLock::new();

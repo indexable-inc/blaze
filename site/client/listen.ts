@@ -14,15 +14,20 @@
  *
  * Nothing plays until the reader presses something. DOM is built with createElement and textContent only.
  *
+ * A site update (client/lib/update.ts) waits while the narration plays; a paused place is kept across it, for the same
+ * doc and line, without scrolling to it.
+ *
  * Set up again on every page (client/lib/page.ts). Moving to another page stops the narration: it reads this page and
  * highlights its blocks, so it has nothing to follow on the next one (as a load would stop it).
  */
 
-import { onPage } from './lib/page';
+import { SAVE, kept, onPage } from './lib/page';
 
 type Word = [string, number, number];
 type ManifestLine = { id: string; block: string; src: string; duration: number; words: Word[] };
 type Manifest = { doc: string; duration: number; lines: ManifestLine[]; voice?: { id: string; attribution: string } };
+/** Where a paused narration was before a site update. */
+type Kept = { doc: string; line: string; time: number };
 
 const SPEEDS = [0.75, 1, 1.25, 1.5, 1.75, 2];
 const SPEED_KEY = 'blaze:listen-speed';
@@ -135,7 +140,7 @@ function follows(spoken: Word[], found: (Range | null)[]): boolean {
 	return said > 0 && hit / said >= MIN_MATCHED;
 }
 
-function start(root: HTMLElement, m: Manifest, base: URL): () => void {
+function start(root: HTMLElement, m: Manifest, base: URL, from?: Kept): () => void {
 	const main = root.closest('main') ?? document.body;
 	const lines = m.lines;
 	const total = lines.reduce((s, l) => s + l.duration, 0);
@@ -394,7 +399,28 @@ function start(root: HTMLElement, m: Manifest, base: URL): () => void {
 	showTime();
 	showPlaying();
 
+	// Back where it was paused before a site update: the line and the time, but no highlight or scroll until Play.
+	const at = from && from.doc === m.doc ? lines.findIndex((l) => l.id === from.line) : -1;
+	if (at >= 0) {
+		cur = at;
+		load(at, 0);
+		if (at + 1 < lines.length) load(at + 1, 1);
+		const a = players[0]!;
+		const seek = () => {
+			a.currentTime = Math.min(from!.time, lines[at]!.duration);
+			showTime();
+			showPlaying();
+		};
+		if (a.readyState >= 1) seek();
+		else a.addEventListener('loadedmetadata', seek, { once: true });
+	}
+	const keep = (e: Event) => {
+		if (elapsed() > 0) (e as CustomEvent<Record<string, unknown>>).detail.listen = { doc: m.doc, line: lines[cur]!.id, time: players[which]!.currentTime } satisfies Kept;
+	};
+	addEventListener(SAVE, keep);
+
 	return () => {
+		removeEventListener(SAVE, keep);
 		playing = false;
 		cancelAnimationFrame(raf);
 		for (const a of players) {
@@ -415,6 +441,8 @@ onPage((signal) => {
 	const root = document.querySelector<HTMLElement>('.listen[data-audio]');
 	if (!root) return;
 	const url = new URL(root.dataset.audio!, location.href);
+	// Taken now: the saved state is cleared once the page has loaded, before the manifest may arrive.
+	const from = kept<Kept>('listen');
 	let stop: (() => void) | undefined;
 	void (async () => {
 		try {
@@ -422,7 +450,7 @@ onPage((signal) => {
 			if (!res.ok) throw new Error(`HTTP ${res.status}`);
 			const m = (await res.json()) as Manifest;
 			if (signal.aborted || !m.lines?.length) return;
-			stop = start(root, m, url);
+			stop = start(root, m, url, from);
 		} catch (e) {
 			if (signal.aborted) return;
 			root.textContent = '';
