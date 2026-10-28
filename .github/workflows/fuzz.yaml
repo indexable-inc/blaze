@@ -1,48 +1,65 @@
-# A long differential fuzz run every night: generated programs built by rustc and by blaze
-# under both producers, outputs compared. The seed is the run number, so every night covers
-# new programs and a failing night can be repeated with `fuzz.py run --seed N`.
+# Throwaway probe (lane relax-bmemo, #1291): ix VMs could not be had, so the cold-build A/B of
+# the back-end memo runs here. Not for main.
 name: fuzz
 on:
-  schedule:
-    - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
       seed:
-        description: seed (defaults to the run number)
+        description: unused
         required: false
       rounds:
-        description: programs to generate
-        default: "200"
+        description: cold builds per arm and project
+        default: "3"
 
 env:
   CARGO_INCREMENTAL: 0
+  BASE: c2265497f9cbd720d70a94cfd734a82fefa4aba1
 
 jobs:
   fuzz:
     runs-on: ubuntu-24.04
-    timeout-minutes: 300
+    timeout-minutes: 340
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: ./.github/actions/toolchain
-        with:
-          llvm: build
-      # cargo, with no cache, as release.yaml builds blaze: a fuzzer's reach is its speed, and
-      # the blaze that blaze builds runs about ten times slower until it inlines one function
-      # into another (https://github.com/indexable-inc/blaze/issues/899).
-      - run: nix develop --command cargo build -p blaze-engine --release --features llvm --locked
-      - name: Fuzz
-        working-directory: harness
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libasound2-dev pkg-config
+      - name: build both arms
         run: |
-          export BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine"
-          python3 fuzz/fuzz.py run --seed "${{ inputs.seed || github.run_number }}" \
-            --rounds "${{ inputs.rounds || '200' }}" --backends cranelift,llvm \
-            --out "$RUNNER_TEMP/fuzz-out" || status=$?
-          python3 fuzz/fuzz.py report "$RUNNER_TEMP/fuzz-out" | tee -a "$GITHUB_STEP_SUMMARY"
-          exit "${status:-0}"
-      - uses: actions/upload-artifact@v7
+          set -euxo pipefail
+          export CARGO_TARGET_DIR=$RUNNER_TEMP/target
+          git worktree add "$RUNNER_TEMP/base" "$BASE"
+          (cd "$RUNNER_TEMP/base" && cargo build --release --locked -p blaze-engine)
+          mkdir -p "$RUNNER_TEMP/arm-base" "$RUNNER_TEMP/arm-memo"
+          cp "$CARGO_TARGET_DIR"/release/{blaze-engine,blaze,blaze-rustc} "$RUNNER_TEMP/arm-base/"
+          cargo build --release --locked -p blaze-engine
+          cp "$CARGO_TARGET_DIR"/release/{blaze-engine,blaze,blaze-rustc} "$RUNNER_TEMP/arm-memo/"
+      - name: projects
+        env:
+          GH_TOKEN: ${{ secrets.BLAZE_BOT_TOKEN || github.token }}
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP"
+          git clone -q --depth 1 --branch 15.1.0 https://github.com/BurntSushi/ripgrep ripgrep
+          git clone -q "https://x-access-token:${GH_TOKEN}@github.com/indexable-inc/anim" anim
+          git -C anim checkout -q 92c64f7276b3444a518904eaad2e107b36f77e08
+      - name: cold builds, alternating
+        run: |
+          set -euxo pipefail
+          nproc; free -g; lscpu | grep -E "Model name|^CPU\(s\)"
+          export COLD_WORK="$RUNNER_TEMP/cold-work"
+          python3 -I tools/bench/results/2026-10-28-bmemo/cold.py "$RUNNER_TEMP/out" "${{ inputs.rounds }}" \
+            base="$RUNNER_TEMP/arm-base/blaze-engine" memo="$RUNNER_TEMP/arm-memo/blaze-engine" \
+            -- ripgrep="$RUNNER_TEMP/ripgrep" anim="$RUNNER_TEMP/anim"
+      - name: unit tests of the memo
         if: always()
+        run: |
+          export CARGO_TARGET_DIR=$RUNNER_TEMP/target
+          cargo test --release --locked -p hir-ty-codegen --lib -- memo:: sibling a_slot_at_the_bottom emit_compiles
+      - if: always()
+        uses: actions/upload-artifact@v7
         with:
-          name: fuzz-${{ github.run_number }}
-          path: |
-            ${{ runner.temp }}/fuzz-out
-            harness/fuzz/found
+          name: bmemo
+          path: ${{ runner.temp }}/out
+          if-no-files-found: ignore
