@@ -8,14 +8,19 @@
 //! (client 0, daemon 1, the daemon's question to the worker 2, the worker 3), and the table
 //! gives each moment to the deepest step under way. One without is detail for the trace:
 //! a rust-analyzer query or a step of code generation, from [`install`].
+//!
+//! A worker started directly (not by the daemon) with `BLAZE_TRACE=<path>` writes its first
+//! build, the one before it starts watching, as a trace of its own ([`start_cold`]).
+//! `BLAZE_TRACE_CONST=crate::module::NAME` adds each request for that module's constant and
+//! each run of its query, however short.
 
 use std::{
     cell::Cell,
     fmt::Write as _,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Mutex, OnceLock,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -149,6 +154,151 @@ const MOST: usize = 4000;
 
 static DETAIL: Mutex<Vec<Span>> = Mutex::new(Vec::new());
 static DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+/// The first build of a worker started directly, traced: where it is written, the constant
+/// followed, and the spans kept apart from [`DETAIL`].
+struct Cold {
+    path: PathBuf,
+    selected: Option<String>,
+    active: AtomicBool,
+    batch: AtomicUsize,
+    events: Mutex<ColdEvents>,
+}
+
+/// Each kind has room of its own, so a full buffer of queries drops none of these, nor do
+/// many requests for the constant drop its runs.
+#[derive(Default)]
+struct ColdEvents {
+    spans: [Vec<Span>; 3],
+    dropped: [usize; 3],
+}
+
+#[derive(Clone, Copy)]
+enum ColdEvent {
+    Parallel,
+    Request,
+    Execution,
+}
+
+static COLD: OnceLock<Cold> = OnceLock::new();
+
+/// Traces the first build of a worker started directly, when `BLAZE_TRACE` says where to;
+/// the constant `BLAZE_TRACE_CONST` names, if any, for the caller to follow.
+pub fn start_cold() -> Option<&'static str> {
+    let path = std::env::var_os("BLAZE_TRACE").filter(|it| !it.is_empty())?;
+    let selected = std::env::var("BLAZE_TRACE_CONST").ok().filter(|it| !it.is_empty());
+    _ = COLD.set(Cold {
+        path: path.into(),
+        selected,
+        active: AtomicBool::new(true),
+        batch: AtomicUsize::new(1),
+        events: Mutex::default(),
+    });
+    COLD.get()?.selected.as_deref()
+}
+
+fn cold() -> Option<&'static Cold> {
+    COLD.get().filter(|it| it.active.load(Ordering::Relaxed))
+}
+
+impl Cold {
+    fn record(&self, kind: ColdEvent, start: Instant, name: impl FnOnce() -> String) {
+        let end = Instant::now();
+        let mut events = self.events.lock().unwrap_or_else(|it| it.into_inner());
+        let index = kind as usize;
+        if events.spans[index].len() < MOST {
+            events.spans[index].push(span(name(), None, start, end));
+        } else {
+            events.dropped[index] += 1;
+        }
+    }
+}
+
+/// The number of a parallel dispatch and how many items it has, for each of its threads.
+pub fn cold_batch(count: usize) -> Option<(usize, usize)> {
+    Some((cold()?.batch.fetch_add(1, Ordering::Relaxed), count))
+}
+
+/// A span of a parallel dispatch of the first build on this thread, until it is dropped.
+pub fn cold_span(name: &'static str, batch: Option<(usize, usize)>) -> Option<impl Drop> {
+    struct Phase(&'static Cold, &'static str, usize, usize, Instant);
+    impl Drop for Phase {
+        fn drop(&mut self) {
+            let Self(cold, name, id, count, start) = *self;
+            cold.record(ColdEvent::Parallel, start, || {
+                format!("parallel {id} {name} ({count} items)")
+            });
+        }
+    }
+    let (id, count) = batch?;
+    Some(Phase(cold()?, name, id, count, Instant::now()))
+}
+
+/// Runs the linker `command`, and in the first build's trace a span for it, each attempt of
+/// its own, saying how a failed one ended.
+pub fn link_output(
+    command: &mut std::process::Command,
+    name: &str,
+) -> std::io::Result<std::process::Output> {
+    let start = cold().map(|_| Instant::now());
+    let output = command.output();
+    if let Some(start) = start {
+        let name = match &output {
+            Ok(it) if it.status.success() => name.to_owned(),
+            Ok(it) => format!("{name} ({})", it.status),
+            Err(e) => format!("{name} ({e})"),
+        };
+        noted().push(span(name, Some(DAEMON), start, Instant::now()));
+    }
+    output
+}
+
+/// The constant the first build follows, while it is traced.
+pub fn cold_const() -> Option<&'static str> {
+    cold()?.selected.as_deref()
+}
+
+/// Notes a request for the followed constant from `start` to now: the caller's wait for it.
+pub fn const_request(start: Instant) {
+    record_const(ColdEvent::Request, "request", start);
+}
+
+/// Notes a run of the followed constant's query from `start` to now: its evaluation.
+pub fn const_execution(start: Instant) {
+    record_const(ColdEvent::Execution, "eval", start);
+}
+
+fn record_const(kind: ColdEvent, name: &str, start: Instant) {
+    if let Some(cold) = cold()
+        && let Some(selected) = &cold.selected
+    {
+        cold.record(kind, start, || format!("const {name} {selected}"));
+    }
+}
+
+/// Writes the first build's trace, once: when the worker starts watching or its one build
+/// ends, `outcome` saying which.
+pub fn finish_cold(outcome: &str) {
+    let Some(cold) = COLD.get() else { return };
+    if !cold.active.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let root = span("worker startup", Some(CLIENT), began(), Instant::now());
+    let (start, end) = (root.start_us, root.start_us + root.dur_us);
+    let mut spans = vec![root];
+    spans.append(&mut *noted());
+    let detail_dropped = DROPPED.load(Ordering::Relaxed);
+    spans.extend(take_detail(began()));
+    let events = std::mem::take(&mut *cold.events.lock().unwrap_or_else(|it| it.into_inner()));
+    spans.extend(events.spans.into_iter().flatten());
+    let [parallel, requests, executions] = events.dropped;
+    let info = serde_json::json!({"outcome": outcome, "constFilter": cold.selected, "dropped": {
+        "detail": detail_dropped, "parallel": parallel, "constRequests": requests,
+        "constExecutions": executions}});
+    if let Err(why) = write_trace(&cold.path, &spans, start, end, Some(info)) {
+        eprintln!("blaze: the trace is not written to {}: {why:#}", cold.path.display());
+    }
+}
 
 /// The detail spans that ended since `since`, taken; older ones are dropped.
 pub fn take_detail(since: Instant) -> Vec<Span> {
@@ -305,7 +455,7 @@ pub fn finish() {
         eprint!("{}", table(&spans, start, end));
     }
     if let Some(trace) = trace {
-        let written = write_trace(Path::new(&trace), &spans, start, end);
+        let written = write_trace(Path::new(&trace), &spans, start, end, None);
         if let Err(why) = written {
             eprintln!(
                 "blaze: the trace is not written to {}: {why:#}",
@@ -338,8 +488,14 @@ pub fn table(spans: &[Span], start: u64, end: u64) -> String {
 }
 
 /// Writes `spans` as a Chrome trace: to `path` when it ends in `.json`, else to a file of
-/// its own in the directory `path`.
-fn write_trace(path: &Path, spans: &[Span], start: u64, end: u64) -> anyhow::Result<()> {
+/// its own in the directory `path`. `startup` is what [`finish_cold`] says of the first build.
+fn write_trace(
+    path: &Path,
+    spans: &[Span],
+    start: u64,
+    end: u64,
+    startup: Option<serde_json::Value>,
+) -> anyhow::Result<()> {
     let path = if path.extension().is_some_and(|it| it == "json") {
         path.to_owned()
     } else {
@@ -347,19 +503,21 @@ fn write_trace(path: &Path, spans: &[Span], start: u64, end: u64) -> anyhow::Res
         let now = epoch_us(Instant::now());
         path.join(format!("blaze-{now}-{}.json", std::process::id()))
     };
-    std::fs::write(&path, chrome(spans, start, end))?;
+    std::fs::write(&path, chrome(spans, start, end, startup))?;
     eprintln!("blaze: trace written to {}", path.display());
     Ok(())
 }
 
 /// The Chrome trace event format: complete events, with names for the processes and
-/// threads. Key `blaze` has the client's wall time and [`breakdown`] of it, for a harness.
-fn chrome(spans: &[Span], start: u64, end: u64) -> String {
+/// threads. Key `blaze` has the client's wall time and [`breakdown`] of it, for a harness,
+/// and, for a worker's first build, `startup`: all of its steps are the worker's.
+fn chrome(spans: &[Span], start: u64, end: u64, startup: Option<serde_json::Value>) -> String {
     use serde_json::json;
     let mut events = Vec::new();
     let mut named = rustc_hash::FxHashSet::default();
     for it in spans {
         let process = match it.level {
+            Some(_) if startup.is_some() => Some("worker"),
             Some(CLIENT) => Some("client"),
             Some(DAEMON | ASKED) => Some("daemon"),
             Some(_) => Some("worker"),
@@ -383,7 +541,10 @@ fn chrome(spans: &[Span], start: u64, end: u64) -> String {
     }
     let rows = breakdown(spans, start, end);
     let breakdown: Vec<_> = rows.iter().map(|(name, us)| json!([name, us])).collect();
-    let ours = json!({"start_us": start, "total_us": end - start, "breakdown": breakdown});
+    let mut ours = json!({"start_us": start, "total_us": end - start, "breakdown": breakdown});
+    if let Some(startup) = startup {
+        ours["startup"] = startup;
+    }
     json!({"traceEvents": events, "displayTimeUnit": "ms", "blaze": ours}).to_string()
 }
 
@@ -430,5 +591,37 @@ mod tests {
         let joined = with_spans("ok patch=x ms=3".to_owned(), &spans);
         let (line, back) = split(&joined);
         assert_eq!((line, back.as_slice()), ("ok patch=x ms=3", &spans[..]));
+    }
+
+    #[test]
+    fn a_first_build_trace_is_the_workers_and_its_detail_is_not_a_step() {
+        use serde_json::json;
+        let mut query = at("const_eval_query", CLIENT, 20, 60);
+        query.level = None;
+        let spans = [at("worker startup", CLIENT, 0, 100), query, at("link", DAEMON, 80, 20)];
+        let startup = Some(json!({"outcome": "watch ready"}));
+        let trace: serde_json::Value =
+            serde_json::from_str(&chrome(&spans, 0, 100, startup)).unwrap();
+        assert_eq!(trace["blaze"]["breakdown"], json!([["worker startup", 80], ["link", 20]]));
+        assert_eq!(trace["blaze"]["startup"]["outcome"], "watch ready");
+        assert_eq!(trace["traceEvents"][0]["args"]["name"], "blaze worker (1)");
+    }
+
+    #[test]
+    fn a_full_buffer_of_requests_drops_no_evaluation() {
+        let cold = Cold {
+            path: PathBuf::new(),
+            selected: None,
+            active: AtomicBool::new(true),
+            batch: AtomicUsize::new(1),
+            events: Mutex::default(),
+        };
+        let request = ColdEvent::Request as usize;
+        cold.events.lock().unwrap().spans[request].resize(MOST, at("const request", CLIENT, 0, 10));
+        cold.record(ColdEvent::Request, Instant::now(), || unreachable!("a dropped span's name"));
+        cold.record(ColdEvent::Execution, Instant::now(), || "const eval".into());
+        let kept = cold.events.into_inner().unwrap();
+        assert_eq!(kept.dropped[request], 1);
+        assert_eq!(kept.spans[ColdEvent::Execution as usize][0].name, "const eval");
     }
 }
