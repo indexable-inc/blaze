@@ -155,5 +155,5 @@ blaze stands on the shoulders of giants. Thank you to the people who built:
 
 None of these projects endorses blaze.
 
-blaze was called blaze until 2026-10-24; `blaze` still works. Made at [ix](https://ix.dev)
+blaze was called ra-jit until 2026-10-24; `cargo ra-jit` still works. Made at [ix](https://ix.dev)
 for den's native app. MIT or Apache-2.0.
