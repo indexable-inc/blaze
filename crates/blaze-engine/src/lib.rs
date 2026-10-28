@@ -3533,7 +3533,7 @@ fn report_sharing(db: &RootDatabase) {
 
 fn resolve_crates(db: &RootDatabase, args: &Args, threads: usize) -> anyhow::Result<usize> {
     let crates = built_crates(db, args)?;
-    resolve_all(db, &crates, threads);
+    resolve_all(db, &crates, threads)?;
     Ok(crates.len())
 }
 
@@ -3581,66 +3581,109 @@ fn prepare_macro_sessions(db: &RootDatabase) {
     });
 }
 
-/// Resolves the names and finds the impls of `crates`, on `threads`.
-fn resolve_all(db: &RootDatabase, crates: &[ide_db::base_db::Crate], threads: usize) {
-    // A crate comes after its dependencies in the list: a thread that starts on one whose
-    // dependencies are not resolved resolves them itself, one after the other.
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let helping = std::sync::atomic::AtomicUsize::new(0);
+/// Resolves the names and finds the impls of `crates`, on `threads`: each crate is a node of a
+/// build graph (docs/driver.md) that runs once the crates it depends on are resolved, so no
+/// thread waits inside a query for another's. While fewer crates are ready than there are
+/// threads, the idle ones help with a crate's impls and files.
+fn resolve_all(
+    db: &RootDatabase,
+    crates: &[ide_db::base_db::Crate],
+    threads: usize,
+) -> anyhow::Result<()> {
+    use blaze_graph::{Config, Machine, NodeId, Pool, Spec, exec};
+    use blaze_protocol::events::NodeKind;
+    let first = exec::ids(crates.len());
+    let id = |at: usize| NodeId(first + at as u32);
+    let index: FxHashMap<ide_db::base_db::Crate, usize> =
+        crates.iter().enumerate().map(|(at, &krate)| (krate, at)).collect();
+    let nodes = crates
+        .iter()
+        .enumerate()
+        .map(|(at, &krate)| {
+            let mut deps: Vec<NodeId> = krate
+                .data(db)
+                .dependencies
+                .iter()
+                .filter_map(|dep| index.get(&dep.crate_id))
+                .map(|&it| id(it))
+                .collect();
+            deps.sort();
+            deps.dedup();
+            let name = krate.extra_data(db).display_name.as_ref();
+            let name = name.map(|it| it.to_string()).unwrap_or_default();
+            Spec { id: id(at), kind: NodeKind::Names, name, deps, pool: Pool::Work, cost: 1 }
+        })
+        .collect();
+    let threads = threads.max(1);
+    let mut machine = Machine::new(Config { io: 1, work: threads, keep_going: false })?;
+    // The threads at work: on a crate, or helping with one.
+    let busy = std::sync::atomic::AtomicUsize::new(0);
     let counting = events::Counting::new(events::Step::Resolve, crates.len(), threads);
-    std::thread::scope(|scope| {
-        for slot in 0..threads {
-            let db = db.clone();
-            let (next, helping, counting) = (&next, &helping, &counting);
-            scope.spawn(move || {
-                while let Some(&krate) =
-                    crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-                {
-                    let start = Instant::now();
-                    let before = memory::live();
-                    counting.on(slot, || crate_shown(&db, krate));
-                    events::crate_is(krate, events::CrateState::Resolving);
-                    hir::attach_db(&db, || {
-                        _ = hir::crate_def_map(&db, krate);
-                        let names = start.elapsed();
-                        let frozen = hir_ty::method_resolution::frozen::served(&db, krate);
-                        if !frozen {
-                            warm_impls(&db, krate, helping, threads);
-                        }
-                        _ = hir::TraitImpls::for_crate(&db, krate);
-                        // Which of its dependencies the crate names is read off its files,
-                        // and the first body inferred would wait for that of every crate.
-                        _ = hir::TraitImpls::for_crate_and_deps(&db, krate);
-                        if frozen {
-                            warm_files(&db, krate, helping, threads);
-                        } else if krate.data(&db).origin.is_lang() {
-                            // A build asks which functions written in the bodies of the
-                            // standard library share a path, which every body of the crate is
-                            // lowered for: threads are idle here, waiting for the crates that
-                            // come next.
-                            _ = declared_in(&db, krate.into());
-                        }
-                        if std::env::var_os("BLAZE_STATS").is_some() {
-                            let name = krate.extra_data(&db).display_name.as_ref();
-                            let name = name.map(|it| it.to_string()).unwrap_or_default();
-                            // What the heap grew by is this crate's when one thread resolves.
-                            let grew = memory::live().zip(before).map(|(now, before)| {
-                                let origin = &krate.data(&db).origin;
-                                format!(", {:+} bytes {origin:?}", now as i64 - before as i64)
-                            });
-                            eprintln!(
-                                "resolved {name}: names {names:.1?}, impls {:.1?}{}",
-                                start.elapsed() - names,
-                                grew.unwrap_or_default()
-                            );
-                        }
-                    });
-                    events::crate_is(krate, events::CrateState::Resolved);
-                    counting.done(slot);
-                }
-            });
-        }
-    });
+    // The slot a crate under way says what it works on in: at most `threads` are under way.
+    let free: Mutex<Vec<usize>> = Mutex::new((0..threads).rev().collect());
+    // `RootDatabase` is `Send` but not `Sync`: each node clones its own from this one.
+    let shared = Mutex::new(db.clone());
+    let work = |node: NodeId| {
+        let krate = crates[(node.0 - first) as usize];
+        let db = lock(&shared).clone();
+        let slot = lock(&free).pop().unwrap_or_default();
+        busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        counting.on(slot, || crate_shown(&db, krate));
+        events::crate_is(krate, events::CrateState::Resolving);
+        hir::attach_db(&db, || resolve_one(&db, krate, &busy, threads));
+        events::crate_is(krate, events::CrateState::Resolved);
+        counting.done(slot);
+        busy.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        lock(&free).push(slot);
+        blaze_graph::exec::Did::built()
+    };
+    // The crates' nodes are said by `events::graph`, with the names the build's view shows.
+    let ok = exec::drive(&mut machine, nodes, &work, &mut |_| {}, None)?;
+    anyhow::ensure!(ok, "resolving the names of a crate failed");
+    Ok(())
+}
+
+/// Resolves the names and finds the impls of `krate`, whose dependencies are resolved.
+fn resolve_one(
+    db: &RootDatabase,
+    krate: ide_db::base_db::Crate,
+    busy: &std::sync::atomic::AtomicUsize,
+    threads: usize,
+) {
+    let start = Instant::now();
+    let before = memory::live();
+    _ = hir::crate_def_map(db, krate);
+    let names = start.elapsed();
+    let frozen = hir_ty::method_resolution::frozen::served(db, krate);
+    if !frozen {
+        warm_impls(db, krate, busy, threads);
+    }
+    _ = hir::TraitImpls::for_crate(db, krate);
+    // Which of its dependencies the crate names is read off its files, and the first body
+    // inferred would wait for that of every crate.
+    _ = hir::TraitImpls::for_crate_and_deps(db, krate);
+    if frozen {
+        warm_files(db, krate, busy, threads);
+    } else if krate.data(db).origin.is_lang() {
+        // A build asks which functions written in the bodies of the standard library share a
+        // path, which every body of the crate is lowered for: threads are idle here, waiting
+        // for the crates that come next.
+        _ = declared_in(db, krate.into());
+    }
+    if std::env::var_os("BLAZE_STATS").is_some() {
+        let name = krate.extra_data(db).display_name.as_ref();
+        let name = name.map(|it| it.to_string()).unwrap_or_default();
+        // What the heap grew by is this crate's when one thread resolves.
+        let grew = memory::live().zip(before).map(|(now, before)| {
+            let origin = &krate.data(db).origin;
+            format!(", {:+} bytes {origin:?}", now as i64 - before as i64)
+        });
+        eprintln!(
+            "resolved {name}: names {names:.1?}, impls {:.1?}{}",
+            start.elapsed() - names,
+            grew.unwrap_or_default()
+        );
+    }
 }
 
 /// A crate as a person names it: its name, or `std` for the standard library's.
@@ -3661,11 +3704,11 @@ fn crate_shown(db: &RootDatabase, krate: ide_db::base_db::Crate) -> String {
 fn warm_impls(
     db: &RootDatabase,
     krate: ide_db::base_db::Crate,
-    helping: &std::sync::atomic::AtomicUsize,
+    busy: &std::sync::atomic::AtomicUsize,
     threads: usize,
 ) {
     let work = hir_ty::method_resolution::impl_work(db, krate);
-    on_idle_threads(db, &work, 64, helping, threads, |db, work| work.run(db));
+    on_idle_threads(db, &work, 64, busy, threads, |db, work| work.run(db));
 }
 
 /// Asks for the impls of each of `crates` on every core, without waiting for it. After an edit
@@ -3704,7 +3747,7 @@ fn verify_impls<'scope>(
 fn warm_files(
     db: &RootDatabase,
     krate: ide_db::base_db::Crate,
-    helping: &std::sync::atomic::AtomicUsize,
+    busy: &std::sync::atomic::AtomicUsize,
     threads: usize,
 ) {
     let def_map = hir_def::nameres::crate_def_map(db, krate);
@@ -3714,27 +3757,27 @@ fn warm_files(
         .filter_map(|(_, data)| data.origin.file_id())
         .filter(|&file| seen.insert(file))
         .collect();
-    on_idle_threads(db, &files, 4, helping, threads, |db, &file| {
+    on_idle_threads(db, &files, 4, busy, threads, |db, &file| {
         _ = hir::HirFileId::from(file).ast_id_map(db);
     });
 }
 
 /// Runs `run` on each of `work` here and on the threads no other crate has, one for each
-/// `per` items.
+/// `per` items. `busy` counts the threads at work, this one among them.
 fn on_idle_threads<T: Sync>(
     db: &RootDatabase,
     work: &[T],
     per: usize,
-    helping: &std::sync::atomic::AtomicUsize,
+    busy: &std::sync::atomic::AtomicUsize,
     threads: usize,
     run: impl Fn(&RootDatabase, &T) + Sync,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
     let wanted = (work.len() / per).min(threads - 1);
     let mut helpers = 0;
-    _ = helping.try_update(Relaxed, Relaxed, |busy| {
-        helpers = wanted.min(threads.saturating_sub(busy + 1));
-        Some(busy + helpers)
+    _ = busy.try_update(Relaxed, Relaxed, |now| {
+        helpers = wanted.min(threads.saturating_sub(now));
+        Some(now + helpers)
     });
     if helpers == 0 {
         return;
@@ -3753,7 +3796,7 @@ fn on_idle_threads<T: Sync>(
         }
         each(db);
     });
-    helping.fetch_sub(helpers, Relaxed);
+    busy.fetch_sub(helpers, Relaxed);
 }
 
 /// The functions of the crates being built, listed once and again for the crates an edit can
@@ -8254,7 +8297,7 @@ impl Held {
         let all: Vec<ide_db::base_db::Crate> =
             Crate::all(&db).into_iter().map(Into::into).collect();
         // The spare starts with the daemon, which the first build starts as cargo does.
-        resolve_all(&db, &all, beside_cargo());
+        resolve_all(&db, &all, beside_cargo())?;
         eprintln!("spare: {} crates in {:.1?}", all.len(), start.elapsed());
         Ok(Held { db, vfs, checkouts })
     }
