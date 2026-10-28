@@ -1185,7 +1185,7 @@ dependencies = [
 
 [[package]]
 name = "blaze-web"
-version = "0.20261028.3"
+version = "0.20261028.9"
 dependencies = [
  "base64",
  "blaze-protocol",
