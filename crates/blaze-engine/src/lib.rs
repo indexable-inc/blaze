@@ -1457,19 +1457,24 @@ impl SymbolResolver for Resolver<'_> {
             return beside();
         }
         let next = std::sync::atomic::AtomicUsize::new(0);
+        // What the threads compile, the build that asked counts.
+        let counted = hir_ty_codegen::counted::now();
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 let (db, next, parts) = (self.db.clone(), &next, self.parts());
+                let counted = counted.clone();
                 scope.spawn(move || {
                     let resolver = parts.over(&db);
-                    hir::attach_db(&db, || {
-                        loop {
-                            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if at >= count {
-                                break;
+                    hir_ty_codegen::counted::within(counted, || {
+                        hir::attach_db(&db, || {
+                            loop {
+                                let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if at >= count {
+                                    break;
+                                }
+                                work(&db, &resolver, at);
                             }
-                            work(&db, &resolver, at);
-                        }
+                        })
                     })
                 });
             }
@@ -5091,6 +5096,9 @@ fn build(
     hold: Option<&dyn Fn() -> bool>,
 ) -> anyhow::Result<Option<Build>> {
     let start = Instant::now();
+    // What this build compiles, here and on the threads that work for it: not what builds of
+    // other programs compile beside it.
+    let counting = hir_ty_codegen::counted::Counting::start();
     let contents = &content::Contents::default();
     let resolver = Resolver::of(db, table, args, contents, listed)?;
     let hir_db: &dyn HirDatabase = db;
@@ -5226,17 +5234,24 @@ fn build(
             .map(|part| {
                 let (db, known, local, next) = (db.clone(), &*known, &local, &next);
                 let parts = resolver.parts();
+                let counted = Some(counting.counted().clone());
                 scope.spawn(move || {
                     PROBING.set(true);
                     let resolver = parts.over(&db);
-                    hir::attach_db(&db, || {
-                        while let Some(&krate) =
-                            local.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-                        {
-                            hir_ty::method_resolution::TraitImpls::for_crate(&db, krate.into());
-                            hir_ty::method_resolution::InherentImpls::for_crate(&db, krate.into());
-                        }
-                        known.stale(&db, Some(&resolver), part, threads)
+                    // What an edit changed is compiled again to tell what changed.
+                    hir_ty_codegen::counted::within(counted, || {
+                        hir::attach_db(&db, || {
+                            while let Some(&krate) =
+                                local.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                            {
+                                hir_ty::method_resolution::TraitImpls::for_crate(&db, krate.into());
+                                hir_ty::method_resolution::InherentImpls::for_crate(
+                                    &db,
+                                    krate.into(),
+                                );
+                            }
+                            known.stale(&db, Some(&resolver), part, threads)
+                        })
                     })
                 })
             })
@@ -5250,7 +5265,10 @@ fn build(
     let undoable = hold.is_some();
     let hold = hold.unwrap_or(&|| false);
     let unit = hir::attach_db(db, || {
-        CodegenUnit::compile_or_hold(hir_db, &resolver, roots, &denied, known, hold, undoable)
+        let counted = counting.counted();
+        CodegenUnit::compile_or_hold(
+            hir_db, &resolver, roots, &denied, known, hold, undoable, counted,
+        )
     })
     .map_err(anyhow::Error::msg)?;
     let Some(mut unit) = unit else { return Ok(None) };
@@ -8939,10 +8957,11 @@ fn run_holding(
     let sysroot = checkouts.loaded.workspaces().first().and_then(|it| it.sysroot.root());
     let _ = SYSROOT.set(sysroot.map(|it| AsRef::<Path>::as_ref(it).to_owned()));
     let from_manifest;
+    // What the compile of the program counted, for what is said of it once it is built.
+    let mut counted = None;
     let cold = {
         if let Some(unit) = std_unit(&db, &table, &args, &listed)? {
             args.prebuilt = Some(unit);
-            known.not_counted();
         }
         if let Some((cmd, exe)) = own_link_line(&db, &args)? {
             (args.link_cmd, args.splice) = (Some(cmd), Some(exe));
@@ -8975,7 +8994,8 @@ fn run_holding(
             }
             None => {
                 fns::building();
-                let _compiling = events::compiling(&shown_crate(&db, &args));
+                let compiling = events::compiling(&shown_crate(&db, &args));
+                counted = compiling.counted();
                 let mut cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
                 // An `include!` in a body is first seen when the body is compiled.
                 if WatchedFile::include_sources(&mut files, &mut tree, &mut db) != Loaded::Nothing {
@@ -9005,7 +9025,7 @@ fn run_holding(
             bail!("{why}");
         }
         if events::heard() {
-            events::built(&db, &shown_crate(&db, &args), &known.stats, None);
+            events::built(&db, &shown_crate(&db, &args), &known.stats, None, counted.as_deref());
             if !served {
                 events::cache(&known.stats);
             }
@@ -9674,9 +9694,6 @@ fn run_holding(
                                 program.unbuilt.stale = false;
                                 program.whole = built.whole.clone();
                             }
-                            // Its first build counts what it compiles, not what the
-                            // programs before it did.
-                            program.known.not_counted();
                             let first = program.args.symbol_files == programs[0].args.symbol_files;
                             program.distrust_rustc(&db, &files, first.then_some(&as_compiled));
                             clients.push((programs.len(), (request, asked, stream)));
@@ -10957,6 +10974,7 @@ impl Program {
         eprint!("edit (apply {apply:.1?}): ");
         report(&warm);
         report_stats(&known.stats);
+        let counted = compiling.counted();
         drop(compiling);
         let edited_paths: FxHashMap<vfs::FileId, PathBuf> = edited
             .iter()
@@ -10965,7 +10983,7 @@ impl Program {
                 Some((*file, path.strip_prefix(&args.checkout).unwrap_or(path).to_owned()))
             })
             .collect();
-        events::built(db, &named, &known.stats, Some(&edited_paths));
+        events::built(db, &named, &known.stats, Some(&edited_paths), counted.as_deref());
         let reported = start.elapsed();
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
         let dated = start.elapsed();
