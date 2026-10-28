@@ -10397,6 +10397,8 @@ fn run_holding(
                                     program.refused_in_codegen(answer)
                                 }));
                             end_link();
+                            // Each build's steps are of its own thread ([`events::at`]).
+                            events::idle();
                             answer.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
                         });
                         (at, build)
