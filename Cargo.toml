@@ -114,6 +114,7 @@ project-model = { path = "crates/project-model", version = "0.0.0" }
 span = { path = "crates/span", version = "0.0.0" }
 stdx = { path = "crates/stdx", version = "0.0.0" }
 syntax = { path = "crates/syntax", version = "0.0.0" }
+const-ast = { path = "crates/const-ast", version = "0.0.0" }
 syntax-bridge = { path = "crates/syntax-bridge", version = "0.0.0" }
 test-fixture = { path = "crates/test-fixture", version = "0.0.0" }
 test-utils = { path = "crates/test-utils", version = "0.0.0" }

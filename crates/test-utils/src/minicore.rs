@@ -2056,6 +2056,9 @@ pub mod str {
         fn from_str(s: &str) -> Result<Self, Self::Err>;
     }
     impl str {
+        pub const fn as_bytes(&self) -> &[u8] {
+            unsafe { &*(self as *const str as *const [u8]) }
+        }
         pub fn parse<F: FromStr>(&self) -> Result<F, F::Err> {
             FromStr::from_str(self)
         }

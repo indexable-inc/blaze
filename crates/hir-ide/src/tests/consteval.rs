@@ -26,6 +26,7 @@ use crate::{
 };
 
 mod arch;
+mod const_ast;
 mod const_macro;
 mod const_traits;
 mod intrinsics;
