@@ -8,6 +8,10 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ## [Unreleased]
 
+### Added
+
+- promote.yaml: OpenAI's Codex CLI (rust-v0.165.0, its codex-rs workspace) in the gate to stable; smoke.py and bench.py take a project's `dir`, the workspace's place in its checkout.
+
 ## [0.20261028.3] - 2026-10-28
 
 ### Added

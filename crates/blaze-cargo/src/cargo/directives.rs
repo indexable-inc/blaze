@@ -64,8 +64,9 @@ pub const SYSTEM: [&str; 11] = [
 ];
 
 /// The link arguments a script may give, whole: what changes how the output is linked, never
-/// which program links it or what it loads.
-pub const LINK_ARGS: [&str; 14] = [
+/// which program links it or what it loads. `-ObjC` keeps every member of the archives already
+/// linked that defines an Objective-C class or category (codex-cli's script on macOS).
+pub const LINK_ARGS: [&str; 16] = [
     "-pthread",
     "-rdynamic",
     "-nostartfiles",
@@ -80,6 +81,8 @@ pub const LINK_ARGS: [&str; 14] = [
     "-Wl,-undefined,dynamic_lookup",
     "-Wl,-dead_strip",
     "-Wl,-headerpad_max_install_names",
+    "-ObjC",
+    "-Wl,-ObjC",
 ];
 
 /// The link arguments a script may give with a value of its own after the prefix.
@@ -339,6 +342,8 @@ mod tests {
                       cargo:rustc-link-arg=-Wl,-rpath,/nix/store/abc-libva/lib\n\
                       cargo:rustc-cdylib-link-arg=-Wl,-soname,libx.so.1\n\
                       cargo:rustc-link-arg=-lstdc++\n\
+                      cargo:rustc-link-arg=-ObjC\n\
+                      cargo:rustc-link-arg-bins=-Wl,-ObjC\n\
                       cargo:rustc-link-arg=-fuse-ld=/tmp/evil\n\
                       cargo:rustc-link-arg=-Wl,-rpath,/home/u/lib\n\
                       cargo:rustc-link-arg=-Wl,--version-script=../../etc/x\n\

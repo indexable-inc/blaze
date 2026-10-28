@@ -130,10 +130,13 @@ PATH for an installed release).
   or a GPU), bun's Rust port (bun-v1.4.3, after `harness/bunprep.py` built its C and C++ in
   `nix develop .#bench-bun`), and NVIDIA Dynamo v1.6.1 (the workspace, on macOS `dynamo-llm`
   without its Linux-only default feature; its Python bindings built and imported; the CPU-only
-  vLLM mocker server's `--help`; its tests that need no GPU). What a runner without a GPU cannot
+  vLLM mocker server's `--help`; its tests that need no GPU), and OpenAI's Codex CLI
+  rust-v0.165.0 (its workspace `codex-rs`, the entry's `dir`; `codex --version`; the tests of
+  codex-apply-patch, codex-protocol, codex-execpolicy and codex-features, which need no model,
+  network or credentials). What a runner without a GPU cannot
   build or test is listed with why in the entry's `excluded`, which smoke.py prints. Each is also
-  measured against cargo (above); cargo builds dynamo with its pinned Rust 1.96.1, which its
-  users build with.
+  measured against cargo (above); cargo builds dynamo and codex with their pinned Rust (1.96.1
+  and 1.99.1), which their users build with.
 
 The std cases are the merge gate's; all four groups are the promotion gate. blaze itself is in
 the corpus but not measured against cargo here: how fast blaze builds blaze is the self-build's
