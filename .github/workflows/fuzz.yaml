@@ -2,6 +2,8 @@
 # the back-end memo runs here. Not for main.
 name: fuzz
 on:
+  push:
+    branches: ["relax-bmemo-probe"]
   workflow_dispatch:
     inputs:
       seed:
@@ -55,7 +57,7 @@ jobs:
           set -euxo pipefail
           nproc; free -g; lscpu | grep -E "Model name|^CPU\(s\)"
           export COLD_WORK="$RUNNER_TEMP/cold-work"
-          python3 -I tools/bench/results/2026-10-28-bmemo/cold.py "$RUNNER_TEMP/out" "${{ inputs.rounds }}" \
+          python3 -I tools/bench/results/2026-10-28-bmemo/cold.py "$RUNNER_TEMP/out" "${{ inputs.rounds || 2 }}" \
             base="$RUNNER_TEMP/arm-base/blaze-engine" memo="$RUNNER_TEMP/arm-memo/blaze-engine" \
             -- ripgrep="$RUNNER_TEMP/ripgrep" nushell="$RUNNER_TEMP/nushell" $([ -d "$RUNNER_TEMP/anim" ] && echo anim="$RUNNER_TEMP/anim")
       - name: unit tests of the memo
