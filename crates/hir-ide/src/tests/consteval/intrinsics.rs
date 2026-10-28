@@ -798,11 +798,7 @@ fn a_promoted_temporary_outlives_its_call() {
     );
 }
 
-#[test]
-fn integer_formatting_buffer_lengths() {
-    // `core::fmt::num`'s: `MAX.ilog10() + 1` digits, and `MAX.ilog(BASE) + 1` in a radix.
-    check_number(
-        r#"
+const INTEGER_LOG: &str = r#"
         //- minicore: option, panic, assert, slice, index
         #[rustc_intrinsic]
         pub const unsafe fn assume(b: bool);
@@ -861,14 +857,54 @@ fn integer_formatting_buffer_lengths() {
         const BASE: u8 = DIG_TAB.len() as u8;
         const MAX_DIG_N: usize = ilog(255, BASE) as usize + 1;
         const MAX_DEC_N: usize = ilog10(U64::MAX) as usize + 1;
-        const GOAL: usize = {
+"#;
+
+/// `core::fmt::num`'s buffer lengths: `MAX.ilog10() + 1` digits, and `MAX.ilog(BASE) + 1` in a
+/// radix.
+#[test]
+fn integer_formatting_buffer_lengths() {
+    check_number(
+        &format!(
+            r#"{INTEGER_LOG}
+        const GOAL: usize = {{
             let a: [u8; MAX_DEC_N] = [0; MAX_DEC_N];
             let b: [u8; MAX_DIG_N] = [0; MAX_DIG_N];
             MAX_DEC_N * 100 + MAX_DIG_N
-        };
-        "#,
+        }};
+        "#
+        ),
         2002,
     );
+}
+
+#[test]
+fn integer_log_max_dec_n() {
+    check_number(&format!("{INTEGER_LOG}\n        const GOAL: usize = MAX_DEC_N;\n"), 20);
+}
+
+#[test]
+fn integer_log_max_dig_n() {
+    check_number(&format!("{INTEGER_LOG}\n        const GOAL: usize = MAX_DIG_N;\n"), 2);
+}
+
+#[test]
+fn integer_log_base() {
+    check_number(&format!("{INTEGER_LOG}\n        const GOAL: u8 = BASE;\n"), 16);
+}
+
+#[test]
+fn integer_log_u64_impl() {
+    check_number(&format!("{INTEGER_LOG}\n        const GOAL: u32 = u64_impl(U64::MAX);\n"), 19);
+}
+
+#[test]
+fn integer_log_ilog10() {
+    check_number(&format!("{INTEGER_LOG}\n        const GOAL: u32 = ilog10(U64::MAX);\n"), 19);
+}
+
+#[test]
+fn integer_log_ilog() {
+    check_number(&format!("{INTEGER_LOG}\n        const GOAL: u32 = ilog(255, 16);\n"), 1);
 }
 
 #[test]
