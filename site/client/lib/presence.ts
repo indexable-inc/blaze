@@ -6,8 +6,10 @@
  * - the top line of the pane (`.topline`, made here, outside `.grid` so a swap keeps it; on a phone it sits in the
  *   phone bar instead): the page's discussion
  *   (its comment count, a jump to it) on a page that has one, the faces on this page (click: everyone on the site
- *   and where), and the reader: their GitHub avatar and login with Sign out, or Sign in with GitHub;
- * - the sidebar: a small stack of faces on each page's row that someone else is reading;
+ *   and where), the chat (client/lib/chat.ts, which rides this socket), and the reader: their GitHub avatar and login
+ *   with Sign out, or Sign in with GitHub;
+ * - the sidebar: a small stack of faces on each page's row that someone else is reading, and when one of them says
+ *   something in the chat, a speech bubble out of their face for a few seconds (`speak`);
  * - comments: when someone posts or deletes one, the worker says so here, and client/comments.ts refreshes the
  *   threads of that doc if it is the page shown.
  *
@@ -17,10 +19,11 @@
  * (a hash, new every day). Someone whose tab is hidden is drawn faded ("away").
  */
 
-import { COMMENTS, PAGE, THREADS, onPage } from './page';
+import * as chat from './chat';
+import { COMMENTS, LEAVE, PAGE, THREADS, onPage } from './page';
 
 type Who = { key: string; login: string | null; avatar: string | null };
-type Person = Who & { pages: { path: string; away: boolean }[] };
+type Person = Who & { country: string | null; pages: { path: string; away: boolean }[] };
 type You = Who & { signIn: boolean };
 
 /** The site's base (`/blaze/`), from the stylesheet the renderer linked as `<base>/site.css`. */
@@ -83,6 +86,7 @@ function identicon(key: string): SVGSVGElement {
 
 function face(w: Who, away = false): HTMLElement {
 	const f = el('span', `face${away ? ' away' : ''}`);
+	f.dataset.key = w.key;
 	f.title = away ? `${name(w)} (away)` : name(w);
 	if (w.avatar && w.avatar.startsWith('https://avatars.githubusercontent.com/')) {
 		const img = el('img');
@@ -115,7 +119,9 @@ bar.setAttribute('aria-label', 'Discussion and who is here');
 const discussSlot = el('span', 'tl-discuss');
 const hereSlot = el('span', 'tl-here');
 const meSlot = el('span', 'tl-me');
-bar.append(discussSlot, el('span', 'tl-gap'), hereSlot, meSlot);
+const chatSlot = el('span', 'tl-chatslot');
+chatSlot.append(chat.button);
+bar.append(discussSlot, el('span', 'tl-gap'), hereSlot, chatSlot, meSlot);
 const list = el('div', 'tl-list');
 list.hidden = true;
 list.id = 'who-is-here';
@@ -172,6 +178,23 @@ function drawHere(): void {
 	hereSlot.append(b);
 }
 
+const regions = (() => {
+	try {
+		return new Intl.DisplayNames(undefined, { type: 'region' });
+	} catch {
+		return null;
+	}
+})();
+
+/** A country's flag: its two letters as regional indicator symbols, named in a tooltip. */
+function flag(cc: string): HTMLElement {
+	const f = el('span', 'flag', String.fromCodePoint(...[...cc].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65)));
+	const n = regions?.of(cc) ?? cc;
+	f.title = n;
+	f.setAttribute('aria-label', n);
+	return f;
+}
+
 function drawList(): void {
 	if (list.hidden) return;
 	list.replaceChildren(el('p', 'tl-head', total === 1 ? 'Only you, right now' : `${total} on the site`));
@@ -184,6 +207,7 @@ function drawList(): void {
 			who.rel = 'nofollow noopener';
 		}
 		li.append(face(p, p.pages.length > 0 && p.pages.every((x) => x.away)), who);
+		if (p.country) li.append(flag(p.country));
 		if (p.key === you?.key) li.append(el('span', 'tag', 'you'));
 		const where = el('span', 'where');
 		for (const pg of p.pages) {
@@ -264,6 +288,47 @@ function drawSide(): void {
 	}
 }
 
+const SAY_MS = 6000;
+const bubbles = new Map<string, HTMLElement>();
+
+/** A bubble with `text` out of `key`'s face on the sidebar row of the page they are on, if it is in view. */
+function speak(key: string, login: string, text: string): void {
+	bubbles.get(key)?.remove();
+	const p = people.find((x) => x.key === key);
+	// The page they are looking at first, then any other tab of theirs.
+	let at: Element | null = null;
+	const pages = p ? [...p.pages].sort((a, b) => Number(a.away) - Number(b.away)) : [];
+	for (const pg of pages) {
+		const row = `.navlist a.row[href="${CSS.escape(href(pg.path))}"] > .faces`;
+		at = document.querySelector(`${row} > .face[data-key="${CSS.escape(key)}"]`) ?? document.querySelector(row);
+		if (at) break;
+	}
+	at ??= document.querySelector(`.navlist .row > .faces > .face[data-key="${CSS.escape(key)}"]`);
+	const r = at?.getBoundingClientRect();
+	if (!at || !r || r.width === 0 || r.bottom < 0 || r.top > innerHeight) return;
+	const b = el('div', 'say-bubble');
+	b.setAttribute('aria-hidden', 'true');
+	b.append(el('b', '', login), el('span', '', text));
+	b.style.left = `${Math.round(r.right + 10)}px`;
+	b.style.top = `${Math.round(r.top + r.height / 2 - 14)}px`;
+	document.body.append(b);
+	bubbles.set(key, b);
+	at.classList.add('talking');
+	setTimeout(() => {
+		b.classList.add('out');
+		at.classList.remove('talking');
+		setTimeout(() => {
+			b.remove();
+			if (bubbles.get(key) === b) bubbles.delete(key);
+		}, 300);
+	}, SAY_MS);
+}
+// The sidebar scrolling or the page swapping moves the faces from under a bubble: let it go.
+for (const t of ['scroll', LEAVE] as const) addEventListener(t, () => {
+	for (const b of bubbles.values()) b.remove();
+	bubbles.clear();
+}, { capture: true, passive: true });
+
 function draw(): void {
 	mount();
 	drawDiscuss();
@@ -300,16 +365,21 @@ function connect(): void {
 		}
 		if (typeof m !== 'object' || m === null) return;
 		const msg = m as { t?: unknown };
+		if (chat.message(msg)) return;
 		if (msg.t === 'comments') {
 			const doc = (m as { doc?: unknown }).doc;
 			if (typeof doc === 'string') dispatchEvent(new CustomEvent(COMMENTS, { detail: doc }));
 			return;
 		}
-		if (msg.t === 'you') you = m as You;
+		if (msg.t === 'you') {
+			you = m as You;
+			chat.setYou(you);
+		}
 		else if (msg.t === 'here') {
 			const h = m as { people?: Person[]; total?: number };
 			people = Array.isArray(h.people) ? h.people : [];
 			total = typeof h.total === 'number' ? h.total : people.length;
+			chat.setOnline(total);
 		} else return;
 		draw();
 	});
@@ -340,6 +410,7 @@ document.addEventListener('click', (e) => {
 	if (!(e.target instanceof Node && list.contains(e.target))) closeList();
 });
 
+chat.setup({ send: (m) => ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify(m)), base: BASE, face, speak });
 onPage(() => {
 	closeList();
 	draw();

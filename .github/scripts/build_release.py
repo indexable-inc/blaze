@@ -7,7 +7,7 @@ build it with this.
                                                   # the build, into target/T/dist; DIR gets every binary of blaze,
                                                   # and with --server blaze's proc-macro server
   build_release.py --target T --train DIR         # a new profile for T, into DIR (the pgo workflow)
-  build_release.py --pin DIR                      # pgo/profiles.json names the profiles in DIR
+  build_release.py --pin DIR                      # tools/pgo/profiles.json names the profiles in DIR
   build_release.py --target T --show              # the command the build runs, for any other driver
   build_release.py --server-beside BLAZE         # blaze's proc-macro server beside a blaze already built (CI)
 
@@ -17,7 +17,7 @@ training's included, so that every user gets the LLVM tiers (docs/tiers.md): LLV
 statically from the build crates/hir-ty-codegen/llvm.json pins, which `LLVM_SYS_231_PREFIX`
 names (the flake's) or, unset, .github/scripts/llvm.py fetches into target/llvm/T. The binaries
 are refused when one loads libLLVM, or on Linux a C++ runtime: a machine that downloads them has
-neither. The profile is the one pgo/profiles.json pins for T: it
+neither. The profile is the one tools/pgo/profiles.json pins for T: it
 is downloaded from the `pgo-profiles` release and refused unless its sha256 is the pinned
 one; `--profdata` gives the file instead (the flake fetches it with the same hash, since a nix
 build has no network).
@@ -81,8 +81,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 HARNESS = ROOT / "harness"
 TOOLCHAIN = (HARNESS / "toolchain").read_text().strip()
-PINS = ROOT / "pgo" / "profiles.json"
-# Where pgo/profiles.json says its files are, when it is first written.
+PINS = ROOT / "tools" / "pgo" / "profiles.json"
+# Where tools/pgo/profiles.json says its files are, when it is first written.
 RELEASE = "https://github.com/indexable-inc/blaze/releases/download/pgo-profiles"
 # A training run that reached the workers counts tens of billions; one that lost them a few
 # million (the client's own short runs).
@@ -235,7 +235,7 @@ def llvm_tool(name):
 
 
 def train(target, out):
-    """A new profile for `target` in `out`, and beside it what pgo/profiles.json pins of it."""
+    """A new profile for `target` in `out`, and beside it what tools/pgo/profiles.json pins of it."""
     profdata = llvm_tool("llvm-profdata")
     # Short: the daemon's sockets live under it, and a Unix socket's path has a limit.
     work = Path(tempfile.mkdtemp(prefix="rjpgo-", dir="/tmp"))
@@ -283,7 +283,7 @@ def train(target, out):
 
 
 def pin(dirs):
-    """pgo/profiles.json names the profiles trained into `dirs`, beside those of other targets."""
+    """tools/pgo/profiles.json names the profiles trained into `dirs`, beside those of other targets."""
     table = pins() if PINS.exists() else {"toolchain": TOOLCHAIN, "release": RELEASE, "targets": {}}
     if table["toolchain"] != TOOLCHAIN:
         table = dict(table, toolchain=TOOLCHAIN, targets={})

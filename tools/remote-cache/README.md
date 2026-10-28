@@ -13,9 +13,9 @@ wasm, since blaze cannot build `wasm32` yet (AGENTS.md, blaze-builds-blaze).
 - Deploy: `npx wrangler deploy` here. Live at `https://blaze-gateway.indexable.workers.dev`,
   a tenant's base at `/t/<tenant>/v3`.
 - Check a deployment: `python3 smoke.py <gateway URL> <private tenant> <write header file> <read header file>`.
-- Measure: `bench/remote-cache/gateway_v0.py` (results in `gateway-v0.tsv`) and
-  `bench/remote-cache/cas_v1.py`, which also checks the blob store's threat model live (`cas-v1.tsv`),
-  and `bench/remote-cache/index_v1.mjs` (`smoke` checks the index live; `bench`, `refresh-prep`,
+- Measure: `tools/bench/remote-cache/gateway_v0.py` (results in `gateway-v0.tsv`) and
+  `tools/bench/remote-cache/cas_v1.py`, which also checks the blob store's threat model live (`cas-v1.tsv`),
+  and `tools/bench/remote-cache/index_v1.mjs` (`smoke` checks the index live; `bench`, `refresh-prep`,
   `refresh-run`; `index-v1.tsv`).
 - D1 `blaze-gateway` holds the blob store's tables: `npx wrangler d1 migrations apply blaze-gateway --remote`
   after adding one under `migrations/`. The Worker secret `GATEWAY_SECRET_1` is the HKDF input of

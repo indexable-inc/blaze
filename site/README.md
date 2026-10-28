@@ -148,6 +148,9 @@ to `env.ASSETS`, which serves `dist/` (built by `bun gen/build.ts`, laid out wit
   and no IP is kept. `client/lib/presence.ts` (loaded by `side.ts`, so on every page) draws the pane's top line: the
   page's discussion with its comment count, the faces on this page (click for everyone and where), and the reader's
   GitHub login with Sign out, or Sign in with GitHub; and faces on the sidebar rows others are reading.
+  The same object holds the site's chat (`client/lib/chat.ts`, a panel at the right): its last 500 messages in the
+  object's SQLite, readable by anyone, written by signed-in readers (5 per 15 s, 120 an hour), taken back by their
+  author or a `COMMENT_ADMINS` id. Comment writes (`comments.ts`) tell it too, and open pages refresh their threads.
 - `updates.ts`: the `/updates` form.
 - `http.ts`: cookies, origin check, `next` validation, tokens. `env.ts`: the `Env` type.
 
@@ -222,7 +225,7 @@ character, or more than 1024 chars gives `/`; otherwise the parsed path, query a
   rendered before the delete can stay in edge caches under their old keys for up to 24 h; they are served again only
   if `doc_versions` goes backwards (a D1 Time Travel restore, say), so deploy after a restore, which moves every key.
 
-Setup: create a GitHub OAuth App with the callback `https://ix.dev/blaze/auth/github/callback`, put its client id in
+The OAuth App is `blaze` in the indexable-inc org (client id in `wrangler.jsonc`). Setup from scratch: create a GitHub OAuth App with the callback `https://ix.dev/blaze/auth/github/callback`, put its client id in
 `GITHUB_CLIENT_ID` (`wrangler.jsonc` `vars`; empty turns sign-in off) and its secret with
 `wrangler secret put GITHUB_CLIENT_SECRET`. `COMMENT_ADMINS` is a comma-separated list of numeric GitHub user ids
 (`curl https://api.github.com/users/<login>` shows `id`), compared with the signed-in user's id; logins are not used,

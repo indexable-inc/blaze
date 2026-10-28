@@ -40,7 +40,7 @@ ROOT = Path(__file__).resolve().parents[2]
 REPO = os.environ.get("GITHUB_REPOSITORY", "indexable-inc/blaze")
 DATED = re.compile(r"v0\.(\d{8})\.(0|[1-9]\d*)")
 # A change to nothing but these makes no canary: blaze is the same program.
-DOCS = re.compile(r"^(docs/|site/|agents/|bench/results/)|\.md$")
+DOCS = re.compile(r"^(docs/|site/|tools/agents/|tools/bench/results/)|\.md$")
 # The workspace's version in Cargo.toml: `0.0.0` on main, the tree's (a build of it says
 # `0.0.0-dev`); `stamp` writes a release's into a checkout.
 TREE_VERSION = "0.0.0"

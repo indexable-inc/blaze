@@ -144,7 +144,7 @@ Branch `one-build`, from main at 22b1267233, 2026-10-21. Until then the flake an
 
 | way in | builds |
 |---|---|
-| a release's binaries | `build_release.py --target T --strict`: `dist` with the profile `pgo/profiles.json` pins for T |
+| a release's binaries | `build_release.py --target T --strict`: `dist` with the profile `tools/pgo/profiles.json` pins for T |
 | `nix run`, `nix profile install`, `nix build .#daemon` (and `.#dist`, `.#blaze`, the demo) | the same script inside the derivation, the same profile fetched by its sha256 |
 | from a checkout | the same script |
 | `cargo install --locked --profile dist blaze` | `dist` without PGO |
@@ -153,7 +153,7 @@ Branch `one-build`, from main at 22b1267233, 2026-10-21. Until then the flake an
 profile can no longer be trained inside the release job: the `pgo` workflow trains it, one
 per target on the runner that target's release is built on, uploads it to the `pgo-profiles`
 release under a name that carries its sha256, and commits that name and hash to
-`pgo/profiles.json`. `build_release.py` downloads the pinned file and refuses any other; the
+`tools/pgo/profiles.json`. `build_release.py` downloads the pinned file and refuses any other; the
 flake fetches it with `fetchurl` and the same hash (a nix build has no network) and passes it
 to the same script, which checks it again.
 

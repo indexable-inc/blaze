@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Checks and measures the gateway's blob store (worker/remote-cache/API.md) from this machine.
+"""Checks and measures the gateway's blob store (tools/remote-cache/API.md) from this machine.
 
     cas_v1.py <gateway URL> <write header file> <out.tsv>
 

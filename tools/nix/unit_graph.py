@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Cargo unit graph -> per-unit Nix build description, one graph per nix system.
 
-  nix/unit_graph.py   # cargo --unit-graph per target triple + cargo metadata -> nix/units/<project>.json
+  tools/nix/unit_graph.py   # cargo --unit-graph per target triple + cargo metadata -> tools/nix/units/<project>.json
 
 Two projects: the daemon (the workspace at the repo root, `-p blaze-engine`) and the Game of Life demo
-(demo/life, its own workspace and lock). Each `nix/units/<project>.json` is read by nix/units.nix,
+(demo/life, its own workspace and lock). Each `tools/nix/units/<project>.json` is read by tools/nix/units.nix,
 which picks `systems.<nix system>` and makes one derivation per unit, calling rustc directly
-(nix/unit_build.py). Platform-specific dependencies (num_threads -> libc
+(tools/nix/unit_build.py). Platform-specific dependencies (num_threads -> libc
 on apple, inotify on linux, ...) differ per target, so each nix system gets its own graph. Rerun whenever
-Cargo.toml, Cargo.lock or a feature set changes; nix/units.nix refuses to evaluate when units.json is
+Cargo.toml, Cargo.lock or a feature set changes; tools/nix/units.nix refuses to evaluate when units.json is
 stale against Cargo.lock / Cargo.toml.
 
 Units are keyed by `unit_key`, not by their position in cargo's list, and name their dependencies
@@ -30,7 +30,7 @@ import sys
 import tomllib
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 # nix system -> rust target triple. Builds are native, so the triple is also the host of that system.
 TARGETS = {
     "x86_64-linux": "x86_64-unknown-linux-gnu",
@@ -43,7 +43,7 @@ PROJECTS = {
     "daemon": (".", ["-p", "blaze-engine"]),
     "life": ("demo/life", []),
 }
-UNITS_DIR = ROOT / "nix" / "units"
+UNITS_DIR = ROOT / "tools" / "nix" / "units"
 
 
 class StepError(Exception):

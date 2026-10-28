@@ -2,13 +2,13 @@
 # unit graphs behind them, the Game of Life demo, and live edits (blaze-live). A cold build of
 # the flake takes up to two hours, so they run on every push to main in a workflow of their own,
 # not in the release train: the train's run would stay open until they ended, and main's next
-# train waits for it. A pull request that changes the flake, nix/ or the dependencies (which the
+# train waits for it. A pull request that changes the flake, tools/nix/ or the dependencies (which the
 # unit graphs are generated from) checks the unit graphs alone, in two minutes. The train's
 # harnesses have live edits too (live_e2e.py, tiers.py). Nothing waits on this workflow; what it
 # says is shown on main's commits. The unit graphs were stale for a week before 2026-10-26, and
 # nothing said so but this workflow.
 #
-#   unit graphs   nix/units/*.json are what `nix/unit_graph.py` generates from Cargo.lock now
+#   unit graphs   tools/nix/units/*.json are what `tools/nix/unit_graph.py` generates from Cargo.lock now
 #   nix           `nix build` of the daemon, the demo and the per-unit builds, and the flake's apps
 #   nix (darwin)  the flake evaluates and builds its cheapest outputs on aarch64-darwin
 #   demo          demo/life builds and its window opens (xvfb) and stays up
@@ -24,7 +24,7 @@ on:
     paths:
       - "flake.nix"
       - "flake.lock"
-      - "nix/**"
+      - "tools/nix/**"
       - "Cargo.lock"
       - "**/Cargo.toml"
       - ".github/workflows/nix-live.yaml"
@@ -53,11 +53,11 @@ jobs:
         with:
           use-flakehub: false
           use-gha-cache: true
-      - run: python3 nix/unit_graph.py
-      - name: nix/units is what unit_graph.py writes
+      - run: python3 tools/nix/unit_graph.py
+      - name: tools/nix/units is what unit_graph.py writes
         run: |
-          git diff --stat -- nix/units
-          git diff --exit-code -- nix/units || { echo "::error::nix/units is stale: run nix/unit_graph.py and commit the result"; exit 1; }
+          git diff --stat -- tools/nix/units
+          git diff --exit-code -- tools/nix/units || { echo "::error::tools/nix/units is stale: run tools/nix/unit_graph.py and commit the result"; exit 1; }
 
   nix:
     name: nix build (x86_64-linux)

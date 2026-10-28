@@ -42,8 +42,8 @@ Fixes CI asked for on the batch:
   nightly's memchr and hashbrown pass them, and every aarch64 harness main differed without it.
 - The fork's own workspace (`fork alone`) takes `rustc_abi` from `vendor/rustc_abi`
   beside it (a path patch), not the fork's git main, which only main's sync moves.
-- `build_release.py` builds without PGO, with a warning, while `pgo/profiles.json` is of
-  another toolchain (not `--strict`); `nix/units` regenerated for rust-version 1.101;
+- `build_release.py` builds without PGO, with a warning, while `tools/pgo/profiles.json` is of
+  another toolchain (not `--strict`); `tools/nix/units` regenerated for rust-version 1.101;
   install.yaml reads `harness/toolchain` before leaving the checkout.
 
 ## What I ran (dev-aws-8, x86-64 Linux, Cranelift)
@@ -74,7 +74,7 @@ An earlier lane ran the game's `rgb-arena` crate (allocator_api, `-Zthreads=8`) 
   shows as absent where nightly cargo's unit graph prints `"none"` (cargo-util-schemas is
   still 1.99's 0.14.3); `feature-metadata` and builtin dependencies are accepted but probably
   do not parse; blaze-resolve's docs and fixtures still name cargo 1.99.0.
-- `pgo/profiles.json` still names 1.99.0: the `pgo` workflow retrains on the toolchain change;
+- `tools/pgo/profiles.json` still names 1.99.0: the `pgo` workflow retrains on the toolchain change;
   until it has, releases build without PGO (and `--strict` refuses).
 - The whole game has not been built with `blaze build` yet. That is the next check
   (on the Mac, after it moves to nightly-2026-10-25).

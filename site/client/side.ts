@@ -22,6 +22,7 @@
 
 import { PAGE, onPage } from './lib/page';
 import './lib/presence';
+import { SIDE, handle } from './lib/resize';
 import { KEY as PROGRESS, load, stateOf, stateWords } from './lib/progress';
 
 type Entry = { u: string; t: string; h: string; x: string };
@@ -351,6 +352,9 @@ folds();
 glide();
 drawer();
 search();
+// The sidebar's right edge drags its width (client/lib/resize.ts); not in the phone drawer (styles/shell.css).
+document.querySelector('.side')?.append(handle(SIDE));
+
 onPage(spy);
 
 /** Each lesson row's mark: not started, started, finished, or every question right the first time. */
