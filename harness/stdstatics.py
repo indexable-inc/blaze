@@ -15,8 +15,8 @@ does not define and was refused ("writable static `MIN` without a rustc symbol")
 that spawned a thread or made a `HashMap` (anim, #840). Built where it is used, as the other
 harnesses have it, the unit names the same paths and nothing shows.
 
-Here the unit is made by `blaze-engine std` from a toolchain whose standard library's sources
-are in another directory, and each program is built by `blaze run`, dev and `--release`, with
+Here the unit is made by `blaze-engine std` from a copy of blaze's library/ in another
+directory (`BLAZE_LIBRARY`), and each program is built by `blaze run`, dev and `--release`, with
 the toolchain where it is: it has to fetch the unit, not build one, and print what cargo's
 build of the same source prints.
 
@@ -29,7 +29,7 @@ sys.path.insert(0, HERE)
 from blaze_cli import BLAZE, base_env
 
 TIMEOUT = 1800
-INSTALLED = os.path.join("lib", "rustlib", "src", "rust")
+LIBRARY = os.path.join(os.path.dirname(HERE), "library")
 MEMBERS = ("khash", "kspawn", "ktls")
 FILES = {
     "Cargo.toml": '[workspace]\nmembers = ["khash", "kspawn", "ktls"]\nresolver = "2"\n',
@@ -101,23 +101,15 @@ def write(root, files):
 
 
 def elsewhere(sysroot, to):
-    """The toolchain at `sysroot` as another machine has it: under `to`, with the standard
-    library's sources a copy of their own, and everything else linked to where it is."""
+    """The toolchain at `sysroot` and blaze's `library/` as another machine has them: under
+    `to`, the library a copy of its own (`to/library`, which the unit is made from with
+    `BLAZE_LIBRARY` naming it), and the toolchain linked to where it is. No toolchain's
+    `rust-src` is read: the standard library's source is blaze's library/ alone."""
     os.makedirs(to)
-    for at, dirs, files in os.walk(sysroot, followlinks=True):
-        rel = os.path.relpath(at, sysroot)
-        for name in list(dirs) + files:
-            path = os.path.normpath(os.path.join(rel, name))
-            source, target = os.path.join(sysroot, path), os.path.join(to, path)
-            if path == INSTALLED:
-                shutil.copytree(source, target, symlinks=False)
-            elif not (INSTALLED + os.sep).startswith(path + os.sep):
-                os.symlink(source, target)
-            else:
-                os.makedirs(target, exist_ok=True)
-                continue
-            if name in dirs:
-                dirs.remove(name)
+    os.symlink(sysroot, os.path.join(to, "toolchain"))
+    library = os.path.join(to, "library")
+    shutil.copytree(LIBRARY, library, symlinks=True)
+    return os.path.join(to, "toolchain"), library
 
 
 def main():
@@ -127,11 +119,11 @@ def main():
     env = base_env(os.path.join(root, "home"))
     sysroot = subprocess.run(["rustc", "--print", "sysroot"], capture_output=True, text=True, env=env,
                              check=True).stdout.strip()
-    other = os.path.join(root, "other-machine", "toolchain")
-    elsewhere(sysroot, other)
+    other, library = elsewhere(sysroot, os.path.join(root, "other-machine"))
     remote = os.path.join(root, "std")
     made = subprocess.run([BLAZE, "std", remote, other], capture_output=True, text=True,
-                          env=base_env(os.path.join(root, "home-std")), timeout=TIMEOUT)
+                          env=dict(base_env(os.path.join(root, "home-std")), BLAZE_LIBRARY=library),
+                          timeout=TIMEOUT)
     if made.returncode != 0:
         sys.exit(f"`blaze-engine std` failed:\n{made.stderr[-3000:]}")
     env["BLAZE_STD_FROM"] = remote

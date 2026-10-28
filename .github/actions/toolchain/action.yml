@@ -9,7 +9,7 @@ name: toolchain
 description: Rust (the nightly in harness/toolchain) and LLVM 23
 inputs:
   components:
-    description: rustup components besides rust-src, space separated
+    description: rustup components besides rust-src (see below), space separated
     default: ""
   targets:
     description: rustup targets besides the host, space separated
@@ -17,9 +17,6 @@ inputs:
   llvm:
     description: build, run or none
     default: none
-  nightly:
-    description: an additional nightly toolchain used by a focused harness
-    default: ""
 runs:
   using: composite
   steps:
@@ -27,13 +24,17 @@ runs:
       shell: bash
       run: |
         tc=$(cat harness/toolchain)
+        # rust-src is for the rustc side of the harnesses, not for blaze: blaze compiles the
+        # standard library only from its own library/ (docs/toolchain.md) and reads no
+        # toolchain's rust-src. A program plain rustc builds names a file of std it inlines
+        # (a panic's location) where rust-src installed it, and only when rust-src is there
+        # is that a file; blaze names its library's file the same way, and the harnesses
+        # compare the two (harness/breakers/cases/src/library_panic_location.rs).
         components="-c rust-src"
         for c in ${{ inputs.components }}; do components="$components -c $c"; done
         rustup toolchain install "$tc" --profile minimal $components
         rustup default "$tc"
         for t in ${{ inputs.targets }}; do rustup target add "$t"; done
-        # With its library's source, which blaze compiles code built by it from.
-        if [ -n "${{ inputs.nightly }}" ]; then rustup toolchain install "${{ inputs.nightly }}" --profile minimal -c rust-src; fi
 
     # `blaze test` runs every test in a sandbox made of namespaces a user makes, which
     # Ubuntu's AppArmor keeps users from making unless told otherwise.

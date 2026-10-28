@@ -23,8 +23,10 @@ depended on its library alone.
 
 ## Running them
 
-You need Python 3, the pinned nightly (`harness/toolchain`, `nightly-2026-10-25`) with
-`rust-src`, a C compiler and linker, and a release build of blaze. Some harnesses need
+You need Python 3, the pinned nightly (`harness/toolchain`) with `rust-src`, a C compiler
+and linker, and a release build of blaze. `rust-src` is for rustc's side alone: a program
+rustc builds names a file of std it inlines (a panic's location) where `rust-src` installed
+it, as blaze names its own `library/`'s; blaze reads no toolchain's `rust-src`. Some harnesses need
 more: `debuginfo.py` needs gdb and `llvm-dwarfdump`,
 `buildmodel.py` needs the `aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-musl`
 targets with their cross tools and qemu, `remote.py` needs a MinIO or SeaweedFS binary,

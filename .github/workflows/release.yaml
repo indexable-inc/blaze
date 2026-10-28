@@ -81,8 +81,7 @@ jobs:
       NAME: blaze-v${{ needs.notes.outputs.version }}-${{ matrix.target }}
     steps:
       - uses: actions/checkout@v7
-      # rust-src: blaze's proc-macro server and the standard library are compiled from it.
-      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal --component rust-src && rustup default "$tc"
+      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal && rustup default "$tc"
       # `blaze --version` names the commit and its date (UTC), as rustc does:
       # `blaze 0.20261028.9 (fb82b09 2026-10-28)` (crates/blaze-engine/build.rs).
       - run: |

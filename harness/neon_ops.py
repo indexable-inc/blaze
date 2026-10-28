@@ -8,10 +8,10 @@ compiled by whichever crate names it, with its immediate, and a refusal or a mis
 only shows in a program that calls it. The corpus runs them all against rustc's build
 (`harness/difftest.py`), on the extensions the machine has.
 
-    python3 harness/neon_ops.py            # from the pinned toolchain's rust-src
+    python3 harness/neon_ops.py            # from blaze's library/
     python3 harness/neon_ops.py --check    # fails when neon_ops.rs is not what it writes
 """
-import argparse, os, re, subprocess, sys
+import argparse, os, re, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "corpus", "cases", "src", "neon_ops.rs")
@@ -31,11 +31,8 @@ CALLS_PER_GROUP = int(os.environ.get("NEON_OPS_PER_GROUP", "120"))
 
 
 def sysroot():
-    toolchain = open(os.path.join(HERE, "toolchain")).read().strip()
-    root = subprocess.run(["rustc", f"+{toolchain}", "--print", "sysroot"], capture_output=True, text=True)
-    if root.returncode != 0:
-        root = subprocess.run(["rustc", "--print", "sysroot"], capture_output=True, text=True, check=True)
-    return os.path.join(root.stdout.strip(), "lib/rustlib/src/rust/library/stdarch/crates/core_arch/src")
+    """core::arch's source in blaze's library/ (no toolchain's `rust-src` is read)."""
+    return os.path.join(os.path.dirname(HERE), "library/stdarch/crates/core_arch/src")
 
 
 FN = re.compile(r"^pub (unsafe )?fn (\w+)<([^>]*)>\((.*?)\)(?: -> ([^{]+?))?\s*\{", re.S | re.M)

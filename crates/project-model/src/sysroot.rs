@@ -1,8 +1,9 @@
 //! Loads "sysroot" crate.
 //!
 //! One confusing point here is that normally sysroot is a bunch of `.rlib`s,
-//! but we can't process `.rlib` and need source code instead. The source code
-//! is typically installed with `rustup component add rust-src` command.
+//! but we can't process `.rlib` and need source code instead. blaze: the source code is
+//! blaze's own `library/`, which [`BLAZE_LIBRARY`] names; no toolchain's `rust-src` (nor
+//! `RUST_SRC_PATH`) is ever read.
 
 use core::fmt;
 use std::{env, fs, ops::Not, path::Path, process::Command};
@@ -69,8 +70,8 @@ impl Sysroot {
         self.root.as_deref()
     }
 
-    /// Returns the sysroot "source" directory, where stdlib sources are located, like:
-    /// `$HOME/.rustup/toolchains/nightly-2022-07-23-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library`
+    /// Returns the sysroot "source" directory, where stdlib sources are located: blaze's
+    /// `library/`, like `$HOME/.blaze/library/<digest>/library` ([`BLAZE_LIBRARY`])
     pub fn rust_lib_src_root(&self) -> Option<&AbsPath> {
         self.rust_lib_src_root.as_deref()
     }
@@ -127,9 +128,9 @@ impl Sysroot {
         Sysroot::assemble(Some(sysroot_dir), Some(Ok(rust_lib_src_dir)))
     }
 
+    /// The toolchain at `sysroot_dir` with blaze's library ([`BLAZE_LIBRARY`]), not its own.
     pub fn discover_rust_lib_src_dir(sysroot_dir: AbsPathBuf) -> Sysroot {
-        let rust_lib_src_dir = discover_rust_lib_src_dir(&sysroot_dir)
-            .ok_or_else(|| format_err!("can't find standard library sources in {sysroot_dir}"));
+        let rust_lib_src_dir = rust_lib_src_dir_of(&sysroot_dir);
         Sysroot::assemble(Some(Ok(sysroot_dir)), Some(rust_lib_src_dir))
     }
 
@@ -228,7 +229,7 @@ impl Sysroot {
     /// The library's workspace read; an error only when the embedder reads it in place of
     /// cargo (`CargoMetadataConfig::own_metadata`) and could not, which is not hidden by
     /// stitching the library together instead. A library with no `Cargo.toml` is stitched
-    /// either way: a toolchain without `rust-src` then has an empty one, which says so.
+    /// either way: a library without `core` then has an empty one, which says so.
     pub fn load_workspace(
         &self,
         sysroot_source_config: &RustSourceWorkspaceConfig,
@@ -354,10 +355,8 @@ impl Sysroot {
             if !has_core {
                 let var_note = if env::var_os(BLAZE_LIBRARY).is_some() {
                     " (it is blaze's, which `BLAZE_LIBRARY` names)"
-                } else if env::var_os("RUST_SRC_PATH").is_some() {
-                    " (env var `RUST_SRC_PATH` is set and may be incorrect, try unsetting it)"
                 } else {
-                    ", try running `rustup component add rust-src` to possibly fix this"
+                    " (it was given in place of blaze's library)"
                 };
                 self.error =
                     Some(format!("sysroot at `{src_root}` is missing a `core` library{var_note}",));
@@ -490,54 +489,40 @@ fn discover_sysroot_dir(
 
 /// blaze: the variable blaze names its own standard library's source in (`library/`,
 /// `blaze-cargo/src/cargo/toolchain/library.rs`), which every process of blaze has set, empty
-/// when blaze has none here. No toolchain's `rust-src` is read then.
+/// when blaze has none here. It is the only source of the standard library read: no
+/// toolchain's `rust-src` is, nor `RUST_SRC_PATH`, whether it is set or not.
 pub const BLAZE_LIBRARY: &str = "BLAZE_LIBRARY";
 
-fn discover_rust_lib_src_dir(sysroot_path: &AbsPathBuf) -> Option<AbsPathBuf> {
-    if let Some(named) = env::var_os(BLAZE_LIBRARY) {
-        let path = AbsPathBuf::try_from(named.to_str()?).ok()?;
-        return fs::metadata(path.join("core")).is_ok().then_some(path);
-    }
-    if let Ok(path) = env::var("RUST_SRC_PATH") {
-        if let Ok(path) = AbsPathBuf::try_from(path.as_str()) {
-            let core = path.join("core");
-            if fs::metadata(&core).is_ok() {
-                tracing::debug!("Discovered sysroot by RUST_SRC_PATH: {path}");
-                return Some(path);
-            }
-            tracing::debug!("RUST_SRC_PATH is set, but is invalid (no core: {core:?}), ignoring");
-        } else {
-            tracing::debug!("RUST_SRC_PATH is set, but is invalid, ignoring");
-        }
-    }
-
-    get_rust_lib_src(sysroot_path)
+/// The library [`BLAZE_LIBRARY`] names, when it has `core`.
+fn discover_rust_lib_src_dir() -> Option<AbsPathBuf> {
+    let named = env::var_os(BLAZE_LIBRARY)?;
+    let path = AbsPathBuf::try_from(named.to_str()?).ok()?;
+    fs::metadata(path.join("core")).is_ok().then_some(path)
 }
 
-/// blaze: a sysroot without the library's source is an error; rustup is not run to add it
+/// blaze: no library where [`BLAZE_LIBRARY`] says is an error naming it; the toolchain at
+/// `sysroot_path` is not looked in for a `rust-src`, and rustup is not run to add one
 /// (docs/no-rustc.md).
 fn rust_lib_src_dir_of(sysroot_path: &AbsPathBuf) -> Result<AbsPathBuf> {
-    discover_rust_lib_src_dir(sysroot_path).ok_or_else(|| {
-        if let Some(named) = env::var_os(BLAZE_LIBRARY) {
-            let named = named.to_string_lossy();
-            return match named.is_empty() {
-                true => format_err!(
-                    "blaze has no source of the standard library here: `blaze toolchain` \
-                     downloads it, and {BLAZE_LIBRARY} can name a checkout's `library/`"
-                ),
-                false => format_err!(
-                    "{BLAZE_LIBRARY} names {named}, which has no standard library (no `core`)"
-                ),
-            };
+    discover_rust_lib_src_dir().ok_or_else(|| {
+        let Some(named) = env::var_os(BLAZE_LIBRARY) else {
+            return format_err!(
+                "the standard library of the project loaded over {sysroot_path} is read from \
+                 blaze's own `library/`, which {BLAZE_LIBRARY} names to the processes blaze \
+                 starts, and this process has no {BLAZE_LIBRARY}: it was not started by blaze. \
+                 Set {BLAZE_LIBRARY} to a `library/` (no toolchain's `rust-src` is read)"
+            );
+        };
+        let named = named.to_string_lossy();
+        match named.is_empty() {
+            true => format_err!(
+                "blaze has no source of the standard library here: `blaze toolchain` \
+                 downloads it, and {BLAZE_LIBRARY} can name a checkout's `library/`"
+            ),
+            false => format_err!(
+                "{BLAZE_LIBRARY} names {named}, which has no standard library (no `core`)"
+            ),
         }
-        tracing::error!(%sysroot_path, "can't load standard library, try installing `rust-src`");
-        format_err!(
-            "\
-can't load standard library from sysroot
-{sysroot_path}
-(discovered via `rustc --print sysroot`)
-try installing `rust-src` the same way you installed `rustc`"
-        )
     })
 }
 
@@ -546,12 +531,6 @@ fn get_rustc_src(sysroot_path: &AbsPath) -> Option<ManifestPath> {
     let rustc_src = ManifestPath::try_from(rustc_src).ok()?;
     tracing::debug!("checking for rustc source code: {rustc_src}");
     if fs::metadata(&rustc_src).is_ok() { Some(rustc_src) } else { None }
-}
-
-fn get_rust_lib_src(sysroot_path: &AbsPath) -> Option<AbsPathBuf> {
-    let rust_lib_src = sysroot_path.join("lib/rustlib/src/rust/library");
-    tracing::debug!("checking sysroot library: {rust_lib_src}");
-    if fs::metadata(&rust_lib_src).is_ok() { Some(rust_lib_src) } else { None }
 }
 
 // FIXME: Remove this, that will bump our project MSRV to 1.82

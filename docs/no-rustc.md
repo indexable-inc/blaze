@@ -508,7 +508,8 @@ names another toolchain, which is what made main's no-op `blaze build` run 8 rus
 (4 questions through rustup's proxy, #833). `rustcsites.py`: 33 places to 27. rustup is not
 run either: loading a workspace took cargo from `rustup which cargo` and ran it through rustup's
 proxy, and ran `rustup component add rust-src` when the library's source was missing; the
-sysroot's own `bin/cargo` is run now, and a missing source is an error that says to add it.
+sysroot's own `bin/cargo` is run now, and a missing source is an error that names
+`BLAZE_LIBRARY` (no toolchain's `rust-src` is looked for).
 `rustcsites.py` counts the places that start rustup too: 29 to 28. The one left,
 `cargo/own_macro.rs`'s `rustup target add wasm32-wasip1`, installs WASI's libc for proc-macro
 modules when blaze's release has none; it asks nothing.
@@ -653,7 +654,7 @@ function to rustc but those step G removes ("no rustc symbol"). On Linux x86-64 
 
 **F. The standard library compiled by blaze.** ([#86](https://github.com/indexable-inc/blaze/issues/86)) `core`, `alloc`, `std`, `compiler_builtins`
 (with its intrinsics and `#[naked]` functions), `panic_unwind`, `panic_abort`, `unwind`,
-`proc_macro`, `test` and their dependencies, from `rust-src`, with std's own build script and
+`proc_macro`, `test` and their dependencies, from blaze's `library/` (no `rust-src`), with std's own build script and
 cfgs, kept in the store per target and profile and served by the remote. The harness's std
 tests (11 of 2,846 refused today) are the bar. Risk: lang items, intrinsics and
 `compiler_builtins` are where blaze has had least practice.

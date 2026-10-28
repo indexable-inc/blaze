@@ -475,7 +475,7 @@ def pinned_to_a_nightly(row):
     `-Z embed-metadata=no` and writes its build directory in its second layout, where the
     build script's output is. Each sent the build to cargo."""
     if shutil.which("rustup"):
-        subprocess.run(["rustup", "toolchain", "install", NIGHTLY, "--profile", "minimal", "-c", "rust-src"],
+        subprocess.run(["rustup", "toolchain", "install", NIGHTLY, "--profile", "minimal"],
                        check=True, capture_output=True)
     says_its_rustc(row)
     row.env.update(RUSTUP_TOOLCHAIN=NIGHTLY)

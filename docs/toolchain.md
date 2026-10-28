@@ -38,6 +38,13 @@ the standard library is part of a compiler.
   `blaze toolchain --path` prints its directory.
 - **The standard library's source** is not the toolchain's `rust-src`, which blaze neither
   downloads nor reads: it is blaze's own `library/` ([below](#the-standard-library-library)).
+  A rustup toolchain that has `rust-src` is used without it, `RUST_SRC_PATH` is not read,
+  and a process of blaze's front end with no `BLAZE_LIBRARY` stops with an error naming it
+  rather than looking for a `rust-src` (`crates/project-model/src/sysroot.rs`). Where
+  `rust-src` is still installed it is for something that is not blaze: rustc's side of the
+  harnesses (`.github/actions/toolchain`, [harness.md](harness.md#running-them)), rust-analyzer
+  in an editor of this repository (the dev shell of `flake.nix`), and `harness/library.py`,
+  which imports `library/` from the nightly's `rust-src` tarball.
 - **Who uses it:** cargo, rustc and the daemon that blaze starts (`CARGO`, `RUSTC`, `RUSTDOC`,
   `RUSTUP_TOOLCHAIN`, `PATH` for its own processes), whatever they were set to. The user's
   `cargo`, `rustc` and pins are untouched, and blaze reads none of them.
