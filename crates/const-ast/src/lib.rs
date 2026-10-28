@@ -304,4 +304,3 @@ pub const fn str_eq(a: &str, b: &str) -> bool {
     }
     true
 }
-

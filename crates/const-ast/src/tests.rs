@@ -15,8 +15,7 @@ use std::{
 
 use syntax::{
     AstNode, Edition, FlatTree, SourceFile as AstFile, SyntaxKind, SyntaxNode,
-    ast::{self, HasAttrs, HasGenericParams, HasModuleItem, HasName, HasTypeBounds,
-        HasVisibility},
+    ast::{self, HasAttrs, HasGenericParams, HasModuleItem, HasName, HasTypeBounds, HasVisibility},
 };
 
 use crate::*;
@@ -76,13 +75,46 @@ macro_rules! at_ast {
 }
 
 at_ast!(
-    ast::Item, ast::Struct, ast::Enum, ast::Union, ast::Adt, ast::FieldList, ast::RecordFieldList,
-    ast::RecordField, ast::TupleFieldList, ast::TupleField, ast::VariantList, ast::Variant,
-    ast::ConstArg, ast::Name, ast::NameRef, ast::Lifetime, ast::Visibility, ast::VisibilityInner,
-    ast::Attr, ast::Meta, ast::TokenTree, ast::Path, ast::PathSegment, ast::GenericParamList,
-    ast::GenericParam, ast::TypeParam, ast::LifetimeParam, ast::ConstParam, ast::TypeBoundList,
-    ast::WhereClause, ast::WherePred, ast::GenericArgList, ast::GenericArg, ast::Type,
-    ast::PathType, ast::RefType, ast::PtrType, ast::TupleType, ast::ArrayType, ast::SliceType
+    ast::Item,
+    ast::Struct,
+    ast::Enum,
+    ast::Union,
+    ast::Adt,
+    ast::FieldList,
+    ast::RecordFieldList,
+    ast::RecordField,
+    ast::TupleFieldList,
+    ast::TupleField,
+    ast::VariantList,
+    ast::Variant,
+    ast::ConstArg,
+    ast::Name,
+    ast::NameRef,
+    ast::Lifetime,
+    ast::Visibility,
+    ast::VisibilityInner,
+    ast::Attr,
+    ast::Meta,
+    ast::TokenTree,
+    ast::Path,
+    ast::PathSegment,
+    ast::GenericParamList,
+    ast::GenericParam,
+    ast::TypeParam,
+    ast::LifetimeParam,
+    ast::ConstParam,
+    ast::TypeBoundList,
+    ast::WhereClause,
+    ast::WherePred,
+    ast::GenericArgList,
+    ast::GenericArg,
+    ast::Type,
+    ast::PathType,
+    ast::RefType,
+    ast::PtrType,
+    ast::TupleType,
+    ast::ArrayType,
+    ast::SliceType
 );
 
 macro_rules! at_view {
@@ -96,11 +128,47 @@ macro_rules! at_view {
 }
 
 at_view!(
-    Item, Struct, Enum, Union, Adt, FieldList, RecordFieldList, RecordField, TupleFieldList,
-    TupleField, VariantList, Variant, ConstArg, Name, NameRef, Lifetime, Visibility,
-    VisibilityInner, Attr, Meta, TokenTree, Path, PathSegment, GenericParamList, GenericParam,
-    TypeParam, LifetimeParam, ConstParam, TypeBoundList, WhereClause, WherePred, GenericArgList,
-    GenericArg, Type, PathType, RefType, PtrType, TupleType, ArrayType, SliceType, SourceFile
+    Item,
+    Struct,
+    Enum,
+    Union,
+    Adt,
+    FieldList,
+    RecordFieldList,
+    RecordField,
+    TupleFieldList,
+    TupleField,
+    VariantList,
+    Variant,
+    ConstArg,
+    Name,
+    NameRef,
+    Lifetime,
+    Visibility,
+    VisibilityInner,
+    Attr,
+    Meta,
+    TokenTree,
+    Path,
+    PathSegment,
+    GenericParamList,
+    GenericParam,
+    TypeParam,
+    LifetimeParam,
+    ConstParam,
+    TypeBoundList,
+    WhereClause,
+    WherePred,
+    GenericArgList,
+    GenericArg,
+    Type,
+    PathType,
+    RefType,
+    PtrType,
+    TupleType,
+    ArrayType,
+    SliceType,
+    SourceFile
 );
 
 impl At for ast::SourceFile {
@@ -142,18 +210,47 @@ fn compare(tree: &Tree<'_>, node: &SyntaxNode, file: &FsPath) {
         )*};
     }
     casts!(
-        SourceFile = SourceFile, Item = Item, Struct = Struct, Enum = Enum, Union = Union,
-        Adt = Adt, FieldList = FieldList, RecordFieldList = RecordFieldList,
-        RecordField = RecordField, TupleFieldList = TupleFieldList, TupleField = TupleField,
-        VariantList = VariantList, Variant = Variant, ConstArg = ConstArg, Name = Name,
-        NameRef = NameRef, Lifetime = Lifetime, Visibility = Visibility,
-        VisibilityInner = VisibilityInner, Attr = Attr, Meta = Meta, TokenTree = TokenTree,
-        Path = Path, PathSegment = PathSegment, GenericParamList = GenericParamList,
-        GenericParam = GenericParam, TypeParam = TypeParam, LifetimeParam = LifetimeParam,
-        ConstParam = ConstParam, TypeBoundList = TypeBoundList, WhereClause = WhereClause,
-        WherePred = WherePred, GenericArgList = GenericArgList, GenericArg = GenericArg,
-        Type = Type, PathType = PathType, RefType = RefType, PtrType = PtrType,
-        TupleType = TupleType, ArrayType = ArrayType, SliceType = SliceType
+        SourceFile = SourceFile,
+        Item = Item,
+        Struct = Struct,
+        Enum = Enum,
+        Union = Union,
+        Adt = Adt,
+        FieldList = FieldList,
+        RecordFieldList = RecordFieldList,
+        RecordField = RecordField,
+        TupleFieldList = TupleFieldList,
+        TupleField = TupleField,
+        VariantList = VariantList,
+        Variant = Variant,
+        ConstArg = ConstArg,
+        Name = Name,
+        NameRef = NameRef,
+        Lifetime = Lifetime,
+        Visibility = Visibility,
+        VisibilityInner = VisibilityInner,
+        Attr = Attr,
+        Meta = Meta,
+        TokenTree = TokenTree,
+        Path = Path,
+        PathSegment = PathSegment,
+        GenericParamList = GenericParamList,
+        GenericParam = GenericParam,
+        TypeParam = TypeParam,
+        LifetimeParam = LifetimeParam,
+        ConstParam = ConstParam,
+        TypeBoundList = TypeBoundList,
+        WhereClause = WhereClause,
+        WherePred = WherePred,
+        GenericArgList = GenericArgList,
+        GenericArg = GenericArg,
+        Type = Type,
+        PathType = PathType,
+        RefType = RefType,
+        PtrType = PtrType,
+        TupleType = TupleType,
+        ArrayType = ArrayType,
+        SliceType = SliceType
     );
 
     let w = |what: &str| format!("{}: {what}", place());
@@ -227,10 +324,14 @@ fn compare(tree: &Tree<'_>, node: &SyntaxNode, file: &FsPath) {
         common!(v, a, "Union", generics);
         same!(w("Union::record_field_list"), at(v.record_field_list()), at(a.record_field_list()));
     }
-    if let (Some(v), Some(a)) = (RecordFieldList::cast(view), ast::RecordFieldList::cast(node.clone())) {
+    if let (Some(v), Some(a)) =
+        (RecordFieldList::cast(view), ast::RecordFieldList::cast(node.clone()))
+    {
         same!(w("RecordFieldList::fields"), all(v.fields()), all(a.fields()));
     }
-    if let (Some(v), Some(a)) = (TupleFieldList::cast(view), ast::TupleFieldList::cast(node.clone())) {
+    if let (Some(v), Some(a)) =
+        (TupleFieldList::cast(view), ast::TupleFieldList::cast(node.clone()))
+    {
         same!(w("TupleFieldList::fields"), all(v.fields()), all(a.fields()));
     }
     if let (Some(v), Some(a)) = (RecordField::cast(view), ast::RecordField::cast(node.clone())) {
@@ -267,9 +368,15 @@ fn compare(tree: &Tree<'_>, node: &SyntaxNode, file: &FsPath) {
         same!(w("Lifetime::text"), Some(String::from(v.text())).filter(|it| !it.is_empty()), text);
     }
     if let (Some(v), Some(a)) = (Visibility::cast(view), ast::Visibility::cast(node.clone())) {
-        same!(w("Visibility::visibility_inner"), at(v.visibility_inner()), at(a.visibility_inner()));
+        same!(
+            w("Visibility::visibility_inner"),
+            at(v.visibility_inner()),
+            at(a.visibility_inner())
+        );
     }
-    if let (Some(v), Some(a)) = (VisibilityInner::cast(view), ast::VisibilityInner::cast(node.clone())) {
+    if let (Some(v), Some(a)) =
+        (VisibilityInner::cast(view), ast::VisibilityInner::cast(node.clone()))
+    {
         same!(w("VisibilityInner::path"), at(v.path()), at(a.path()));
     }
     if let (Some(v), Some(a)) = (Attr::cast(view), ast::Attr::cast(node.clone())) {
@@ -306,14 +413,28 @@ fn compare(tree: &Tree<'_>, node: &SyntaxNode, file: &FsPath) {
     if let (Some(v), Some(a)) = (Path::cast(view), ast::Path::cast(node.clone())) {
         same!(w("Path::qualifier"), at(v.qualifier()), at(a.qualifier()));
         same!(w("Path::segment"), at(v.segment()), at(a.segment()));
-        same!(w("Path::as_single_name_ref"), at(v.as_single_name_ref()), at(a.as_single_name_ref()));
+        same!(
+            w("Path::as_single_name_ref"),
+            at(v.as_single_name_ref()),
+            at(a.as_single_name_ref())
+        );
     }
     if let (Some(v), Some(a)) = (PathSegment::cast(view), ast::PathSegment::cast(node.clone())) {
         same!(w("PathSegment::name_ref"), at(v.name_ref()), at(a.name_ref()));
-        same!(w("PathSegment::generic_arg_list"), at(v.generic_arg_list()), at(a.generic_arg_list()));
+        same!(
+            w("PathSegment::generic_arg_list"),
+            at(v.generic_arg_list()),
+            at(a.generic_arg_list())
+        );
     }
-    if let (Some(v), Some(a)) = (GenericParamList::cast(view), ast::GenericParamList::cast(node.clone())) {
-        same!(w("GenericParamList::generic_params"), all(v.generic_params()), all(a.generic_params()));
+    if let (Some(v), Some(a)) =
+        (GenericParamList::cast(view), ast::GenericParamList::cast(node.clone()))
+    {
+        same!(
+            w("GenericParamList::generic_params"),
+            all(v.generic_params()),
+            all(a.generic_params())
+        );
     }
     if let (Some(v), Some(a)) = (GenericParam::cast(view), ast::GenericParam::cast(node.clone())) {
         let kind = |v: &GenericParam<'_>| match v {
@@ -334,10 +455,15 @@ fn compare(tree: &Tree<'_>, node: &SyntaxNode, file: &FsPath) {
         same!(w("TypeParam::type_bound_list"), at(v.type_bound_list()), at(a.type_bound_list()));
         same!(w("TypeParam::default_type"), at(v.default_type()), at(a.default_type()));
     }
-    if let (Some(v), Some(a)) = (LifetimeParam::cast(view), ast::LifetimeParam::cast(node.clone())) {
+    if let (Some(v), Some(a)) = (LifetimeParam::cast(view), ast::LifetimeParam::cast(node.clone()))
+    {
         common!(v, a, "LifetimeParam", attrs);
         same!(w("LifetimeParam::lifetime"), at(v.lifetime()), at(a.lifetime()));
-        same!(w("LifetimeParam::type_bound_list"), at(v.type_bound_list()), at(a.type_bound_list()));
+        same!(
+            w("LifetimeParam::type_bound_list"),
+            at(v.type_bound_list()),
+            at(a.type_bound_list())
+        );
     }
     if let (Some(v), Some(a)) = (ConstParam::cast(view), ast::ConstParam::cast(node.clone())) {
         common!(v, a, "ConstParam", name);
@@ -353,7 +479,9 @@ fn compare(tree: &Tree<'_>, node: &SyntaxNode, file: &FsPath) {
         same!(w("WherePred::lifetime"), at(v.lifetime()), at(a.lifetime()));
         same!(w("WherePred::type_bound_list"), at(v.type_bound_list()), at(a.type_bound_list()));
     }
-    if let (Some(v), Some(a)) = (GenericArgList::cast(view), ast::GenericArgList::cast(node.clone())) {
+    if let (Some(v), Some(a)) =
+        (GenericArgList::cast(view), ast::GenericArgList::cast(node.clone()))
+    {
         same!(w("GenericArgList::generic_args"), all(v.generic_args()), all(a.generic_args()));
     }
     if let (Some(v), Some(a)) = (GenericArg::cast(view), ast::GenericArg::cast(node.clone())) {
@@ -460,7 +588,8 @@ fn the_views_are_syntax_asts() {
     let mut nodes = 0usize;
     let files = corpus();
     for file in &files {
-        let text = std::fs::read_to_string(file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+        let text =
+            std::fs::read_to_string(file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
         let root = AstFile::parse(&text, Edition::CURRENT).syntax_node();
         let root = match root.flat() {
             Some(_) => root,
@@ -481,7 +610,8 @@ fn the_views_are_syntax_asts() {
 
 #[test]
 fn a_derive_reads_a_struct() {
-    let text = "#[derive(Debug)] // a comment\npub struct A<'a, T: Copy = u8> { x: &'a T, y: [u8; 4] }";
+    let text =
+        "#[derive(Debug)] // a comment\npub struct A<'a, T: Copy = u8> { x: &'a T, y: [u8; 4] }";
     let root = AstFile::parse(text, Edition::CURRENT).syntax_node().to_flat();
     let arrays = Arrays::of(&flat(&root));
     let tree = arrays.tree();

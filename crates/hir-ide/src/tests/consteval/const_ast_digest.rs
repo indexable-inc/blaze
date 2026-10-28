@@ -131,7 +131,11 @@ const fn visibility(h: u64, vis: Option<Visibility<'_>>) -> u64 {
     }
 }
 
-const fn generics(mut h: u64, params: Option<GenericParamList<'_>>, clause: Option<WhereClause<'_>>) -> u64 {
+const fn generics(
+    mut h: u64,
+    params: Option<GenericParamList<'_>>,
+    clause: Option<WhereClause<'_>>,
+) -> u64 {
     if let Some(params) = params {
         let mut params = params.generic_params();
         while let Some(param) = params.next() {
