@@ -49,7 +49,10 @@ therefore found by any build of blaze from the same sources on any machine, for 
 toolchain: a CI runner that builds blaze for a commit that changes only the harnesses or
 the docs reuses the store of the commit before (`harness/storebuilds.py`). A blaze built
 outside this workspace (the published crate) keys by the bytes of its executable, as every
-build did before. Upgrading blaze makes the old
+build did before. `blaze-engine cache build` prints sixteen hex digits of the store's format
+and what the build was made from, and fails for a build keyed by its executable: two builds
+that print the same keep the same keys for a toolchain, whatever release each is, so CI names
+the remote's project by it rather than by the release (`.github/actions/blaze`). Upgrading blaze makes the old
 entries unreachable; they are removed over time as least recently used.
 
 A build script's run is kept under a key with the checkout and the target directory apart:
@@ -172,6 +175,7 @@ the least recently used; `blaze-engine cache gc --max 0` empties the store at on
 
 These act on the store `blaze status` names.
 
+    blaze-engine cache build                 what this build's keys are made with, but the toolchain
     blaze-engine cache stats                 format, packs, bytes, limit, oldest and newest use
     blaze-engine cache verify                read everything; exit 1 if a pack is not what was written
     blaze-engine cache gc [--max SIZE]       collect now, to BLAZE_CACHE_MAX or to SIZE

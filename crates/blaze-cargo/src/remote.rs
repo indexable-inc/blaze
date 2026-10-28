@@ -975,6 +975,7 @@ pub async fn pull(store: &Path, remote: &Remote, project: &str) -> anyhow::Resul
 }
 
 const USAGE: &str = "usage: blaze cache push|pull REMOTE [PROJECT]\n       \
+                     blaze cache build\n       \
                      blaze cache stats\n       \
                      blaze cache gc [--max SIZE]\n       \
                      blaze cache gc --remote REMOTE [--unlisted-after AGE] [--older-than AGE] \
@@ -986,6 +987,15 @@ const USAGE: &str = "usage: blaze cache push|pull REMOTE [PROJECT]\n       \
 /// `blaze-engine cache VERB`, on the store of the user's builds.
 pub fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let Some(verb) = args.next() else { bail!(USAGE) };
+    // What this build's keys are made with apart from the toolchain: CI's project name.
+    if verb == "build" {
+        let name = blaze_store::sources_name().context(
+            "this blaze was built outside blaze's workspace: its store keys by the bytes of its \
+             executable, which no other build of blaze shares",
+        )?;
+        println!("{name}");
+        return Ok(());
+    }
     if verb == "keygen" {
         return signed::keygen(Path::new(&args.next().context(USAGE)?));
     }

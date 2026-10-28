@@ -148,6 +148,22 @@ pub fn built_from(sources: &str) {
     _ = SOURCES.set(sources.to_owned());
 }
 
+/// Sixteen hex digits of what the store keys this process's values by apart from the
+/// toolchain: its format and what [`built_from`] was told. Two builds of blaze that say the same
+/// keep the same keys for the same toolchain, whatever their release, so it is what CI names the
+/// remote's project by (`blaze-engine cache build`). `None` for a build that cannot say, whose
+/// store keys by the bytes of its executable, which no other build shares.
+pub fn sources_name() -> Option<String> {
+    let sources = SOURCES.get()?;
+    let mut hasher = Sha256::new();
+    for field in [&FORMAT.to_le_bytes()[..], sources.as_bytes()] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field);
+    }
+    let hash: [u8; KEY] = hasher.finalize().into();
+    Some(hash[..8].iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 /// What stands for the build of this process in [`Identity`]: what it was built from, else the
 /// bytes of its executable.
 fn build() -> Option<Vec<u8>> {
