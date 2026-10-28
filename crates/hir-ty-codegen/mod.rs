@@ -19383,6 +19383,61 @@ mod tests {
         assert!(!code.bytes.is_empty());
     }
 
+    /// Two instances that differ only in which function they call are compiled once: the
+    /// second is found in the memo, and its code calls its own callee.
+    #[test]
+    fn a_sibling_that_calls_another_function_is_compiled_once() {
+        let isa = super::target().unwrap();
+        let calling = |callee: u32| {
+            let sig = ir::Signature::new(isa.default_call_conv());
+            let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), sig);
+            let name = func.declare_imported_user_function(ir::UserExternalName::new(0, callee));
+            let mut builder_ctx = FunctionBuilderContext::new();
+            let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let signature = builder.import_signature(ir::Signature::new(isa.default_call_conv()));
+            let callee = builder.import_function(ir::ExtFuncData {
+                name: ir::ExternalName::User(name),
+                signature,
+                colocated: false,
+                patchable: false,
+            });
+            let entry = builder.create_block();
+            builder.switch_to_block(entry);
+            builder.seal_block(entry);
+            // A constant no other test's function has, so that only this one makes its key.
+            builder.ins().iconst(types::I64, 0x51b1_1765);
+            builder.ins().call(callee, &[]);
+            builder.ins().return_(&[]);
+            builder.finalize(isa.frontend_config());
+            cranelift_codegen::Context::for_function(func)
+        };
+        let compiled = |callee: u32| {
+            let mut ctx = calling(callee);
+            let mut cache = super::IncrementalCache {
+                store: None,
+                started: std::time::Instant::now(),
+                found: Default::default(),
+            };
+            let (_, found) =
+                ctx.compile_with_cache(&**isa, &mut cache, &mut Default::default()).unwrap();
+            let code = ctx.compiled_code().unwrap();
+            let own = cranelift_module::FuncId::from_u32(u32::MAX - 1);
+            let targets = (code.buffer.relocs().iter())
+                .map(|it| match cranelift_module::ModuleReloc::from_mach_reloc(it, &ctx.func, own).name {
+                    cranelift_module::ModuleRelocTarget::User { namespace, index } => (namespace, index),
+                    _ => panic!("a call of something other than the callee"),
+                })
+                .collect::<Vec<_>>();
+            (found, code.buffer.data().to_vec(), targets)
+        };
+        let (found, bytes, targets) = compiled(5);
+        assert!(!found);
+        assert_eq!(targets, [(0, 5)]);
+        let (found, again, targets) = compiled(9);
+        assert!(found, "the second was compiled again");
+        assert_eq!((again, targets), (bytes, vec![(0, 9)]));
+    }
+
     /// A function Cranelift's incremental cache has the code of tells where its variables
     /// are as one compiled afresh does. The cache keeps the frame's layout without the slots
     /// at its end that are at the bottom of the frame, and the variables in them were left
