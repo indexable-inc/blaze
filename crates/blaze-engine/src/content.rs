@@ -118,7 +118,10 @@ impl Contents {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"blaze crate 3");
+        field(b"blaze crate 4");
+        // Code of the crate has its stable id in the TypeIds it makes, which can change while
+        // its source does not: the crate moved in the checkout.
+        field(&stable_crate_id(krate).map_or_else(Vec::new, |it| it.to_le_bytes().to_vec()));
         let name = krate.extra_data(db).display_name.as_ref().map(|it| it.to_string());
         field(name.unwrap_or_default().as_bytes());
         field(format!("{:?} {}", data.edition, data.target_kind.is_proc_macro()).as_bytes());
