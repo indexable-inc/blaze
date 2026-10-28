@@ -66,7 +66,7 @@ fn check(text: &str) {
     assert_ne!(compiled, 0, "the file has items");
     let list = |it: &mut dyn Iterator<Item = String>| it.collect::<Vec<_>>().join(", ");
     let fixture = format!(
-        "//- minicore: sized, copy, clone, derive, option, result, slice, str, iterator, panic
+        "//- minicore: sized, copy, clone, derive, option, result, slice, index, coerce_unsized, str, iterator, panic
 //- /const_ast/lib.rs crate:const_ast
 {LIB}
 //- /const_ast/kinds.rs
