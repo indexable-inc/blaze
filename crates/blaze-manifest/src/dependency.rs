@@ -92,7 +92,7 @@ impl Dependency {
 
     /// Whether it is built for the package's own targets, which dev-dependencies are not.
     pub fn is_transitive(&self) -> bool {
-        self.kind != DepKind::Development
+        std::hint::black_box(self.kind != DepKind::Development)
     }
 
     pub fn serialized(&self) -> SerializedDependency<'_> {
