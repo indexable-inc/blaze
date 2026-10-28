@@ -1896,6 +1896,12 @@ pub enum MirEvalError<'db> {
         spent: Budget,
         at: Option<(InferBodyId<'db>, MirSpan)>,
     },
+    /// The value of the constant points to memory allocated while evaluating it: by the
+    /// program's allocator (a `Box`, `Vec` or `String`), which it would free at run time, or
+    /// by `const_allocate` without `const_make_global`.
+    HeapInValue {
+        of_const_allocate: bool,
+    },
     StackOverflow,
     /// FIXME: Fold this into InternalError
     InvalidVTableId(usize),
@@ -1923,6 +1929,13 @@ impl std::fmt::Debug for MirEvalError<'_> {
             }
             Self::TypeIsUnsized(ty, it) => write!(f, "{ty:?} is unsized. {it} should be sized."),
             Self::OverBudget { spent, at: _ } => write!(f, "{spent}"),
+            Self::HeapInValue { of_const_allocate: true } => f.write_str(
+                "encountered `const_allocate` pointer in final value that was not made global",
+            ),
+            Self::HeapInValue { of_const_allocate: false } => f.write_str(
+                "the value points to memory allocated while evaluating it (a `Box`, `Vec`, \
+                 `String` or the like), which the program would free",
+            ),
             Self::StackOverflow => write!(f, "stack overflow"),
             Self::MirLowerError(arg0, arg1) => {
                 f.debug_tuple("MirLowerError").field(arg0).field(arg1).finish()

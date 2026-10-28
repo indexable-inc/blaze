@@ -3,6 +3,7 @@
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
+    collections::BTreeMap,
     iter, mem,
     ops::Range,
 };
@@ -180,15 +181,55 @@ struct Allocated {
     align: usize,
 }
 
+/// What made a block of the evaluation's heap, which says who may free it and whether the
+/// value of a constant may point into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// The evaluator itself: a constant it read, a literal, a static, a promoted temporary.
+    /// Nothing frees it, and a constant's value may point to it.
+    Evaluator,
+    /// The program's allocator (`__rust_alloc`, `Box::new`), freed by `__rust_dealloc`. A
+    /// constant's value may not point to it: the program would free it at run time.
+    Allocator,
+    /// `const_allocate`, freed by `const_deallocate`. A constant's value may point to it once
+    /// `const_make_global` has made it global.
+    ConstHeap { global: bool },
+}
+
+/// A block of the heap: the size and alignment it was asked for, the bytes it takes, of a
+/// size class ([`size_class`]) a freed block of the same class and alignment is reused for,
+/// and what made it.
+#[derive(Debug, Clone, Copy)]
+struct HeapBlock {
+    size: usize,
+    align: usize,
+    class: usize,
+    origin: Origin,
+}
+
+/// The bytes a heap block of `size` takes: a power of two, so a block freed by a `Vec` that
+/// grew is the one the next `Vec` of about that size gets.
+fn size_class(size: usize) -> usize {
+    size.max(8).checked_next_power_of_two().unwrap_or(usize::MAX)
+}
+
 pub struct Evaluator<'db> {
     db: &'db dyn HirDatabase,
     param_env: ParamEnvAndCrate<'db>,
     target_data_layout: &'db TargetDataLayout,
     stack: Vec<u8>,
     heap: Vec<u8>,
-    /// Every stack and heap allocation, in address order. A raw pointer in a constant
-    /// doesn't say how much memory it can reach, its allocation does.
-    allocations: [Vec<Allocated>; 2],
+    /// Every stack allocation, in address order. A raw pointer in a constant doesn't say how
+    /// much memory it can reach, its allocation does.
+    stack_allocations: Vec<Allocated>,
+    /// Every live block of the heap, by its offset in [`Self::heap`].
+    heap_blocks: BTreeMap<usize, HeapBlock>,
+    /// The offsets of freed heap blocks, by size class and alignment, for the next block of
+    /// that class and alignment.
+    free_blocks: FxHashMap<(usize, usize), Vec<usize>>,
+    /// Where a promoted temporary of a body (`&[1, 2]`) is: in the heap, as its borrow
+    /// outlives the call, once for every call of the body.
+    promoted: FxHashMap<(usize, LocalId), Address>,
     code_stack: Vec<StackFrame<'db>>,
     /// The `callee` and `span` of the frame being run, which is not on `code_stack`.
     running: Option<(Option<FunctionId>, (MirSpan, InferBodyId<'db>))>,
@@ -515,7 +556,10 @@ impl<'db> Evaluator<'db> {
             target_data_layout,
             stack: vec![0],
             heap: vec![0],
-            allocations: Default::default(),
+            stack_allocations: Vec::new(),
+            heap_blocks: BTreeMap::new(),
+            free_blocks: FxHashMap::default(),
+            promoted: FxHashMap::default(),
             code_stack: vec![],
             running: None,
             vtable_map: VTableMap::default(),
@@ -969,13 +1013,21 @@ impl<'db> Evaluator<'db> {
                     return Ok(return_interval);
                 }
                 Some(bb) => {
-                    // We don't support const promotion, so we can't truncate the stack yet.
-                    let _ = my_stack_frame.prev_stack_ptr;
-                    // self.stack.truncate(my_stack_frame.prev_stack_ptr);
+                    self.free_stack(my_stack_frame.prev_stack_ptr);
                     current_block_idx = bb;
                 }
             }
         }
+    }
+
+    /// Gives back the stack above `len`, of the frames that returned: nothing points there
+    /// any more but what a dangling pointer would, as the temporaries whose borrows outlive
+    /// a call are in the heap ([`Self::promoted`]).
+    fn free_stack(&mut self, len: usize) {
+        self.stack.truncate(len);
+        let end = Stack(len).to_usize();
+        let kept = self.stack_allocations.partition_point(|it| it.start < end);
+        self.stack_allocations.truncate(kept);
     }
 
     fn fill_locals_for_body(
@@ -1038,19 +1090,30 @@ impl<'db> Evaluator<'db> {
                     locals.ptr.insert(id, Interval { addr: Invalid(align), size });
                     continue;
                 }
+                if body.promoted_locals.iter().any(|&(it, _)| it == id) {
+                    let key = (std::ptr::from_ref(body) as usize, id);
+                    let addr = match self.promoted.get(&key) {
+                        Some(&addr) => addr,
+                        None => {
+                            let addr = self.heap_allocate(size, align)?;
+                            self.promoted.insert(key, addr);
+                            addr
+                        }
+                    };
+                    locals.ptr.insert(id, Interval { addr, size });
+                    continue;
+                }
                 while !stack_ptr.is_multiple_of(align) {
                     stack_ptr += 1;
                 }
                 let my_ptr = stack_ptr;
                 stack_ptr += size;
                 locals.ptr.insert(id, Interval { addr: Stack(my_ptr), size });
-                if size != 0 {
-                    self.allocations[0].push(Allocated {
-                        start: Stack(my_ptr).to_usize(),
-                        size,
-                        align,
-                    });
-                }
+                self.stack_allocations.push(Allocated {
+                    start: Stack(my_ptr).to_usize(),
+                    size,
+                    align,
+                });
             }
             stack_ptr - self.stack.len()
         };
@@ -2244,12 +2307,14 @@ impl<'db> Evaluator<'db> {
             let name = GeneralConstId::AnonConstId(konst).name(self.db);
             MirEvalError::ConstEvalError(name, Box::new(ConstEvalError::MirLowerError(e)))
         })?;
+        let mark = self.stack.len();
         let result = self.interpret_mir(body, iter::empty(), None)?;
         let ty = body.locals[return_slot()].ty.as_ref();
         let align = self.size_align_of(ty, locals)?.map_or(1, |it| it.1);
         let addr = self.heap_allocate(result.size, align)?;
         let interval = Interval::new(addr, result.size);
         interval.write_from_interval(self, result)?;
+        self.free_stack(mark);
         Ok(interval)
     }
 
@@ -2536,11 +2601,25 @@ impl<'db> Evaluator<'db> {
 
     /// The allocation `addr` is in.
     fn allocation_at(&self, addr: usize) -> Option<Allocated> {
-        self.allocations.iter().find_map(|allocations| {
-            let i = allocations.partition_point(|it| it.start <= addr);
-            let &allocation = allocations.get(i.checked_sub(1)?)?;
-            (addr - allocation.start < allocation.size).then_some(allocation)
-        })
+        match Address::from_usize(addr) {
+            Stack(_) => {
+                let i = self.stack_allocations.partition_point(|it| it.start <= addr);
+                let &allocation = self.stack_allocations.get(i.checked_sub(1)?)?;
+                (addr - allocation.start < allocation.size).then_some(allocation)
+            }
+            Heap(offset) => {
+                let (start, block) = self.heap_block_at(offset)?;
+                let start = Heap(start).to_usize();
+                Some(Allocated { start, size: block.size, align: block.align })
+            }
+            Invalid(_) => None,
+        }
+    }
+
+    /// The live heap block the heap offset `offset` is in, with where it starts.
+    fn heap_block_at(&self, offset: usize) -> Option<(usize, HeapBlock)> {
+        let (&start, &block) = self.heap_blocks.range(..=offset).next_back()?;
+        (offset - start < block.size).then_some((start, block))
     }
 
     /// Records in `map` what `addr` is known to be a multiple of: what its allocation was
@@ -2566,24 +2645,118 @@ impl<'db> Evaluator<'db> {
         Ok(())
     }
 
+    /// Memory of the evaluator's own ([`Origin::Evaluator`]), zeroed.
     fn heap_allocate(&mut self, size: usize, align: usize) -> Result<'db, Address> {
+        self.allocate(size, align, Origin::Evaluator)
+    }
+
+    /// A zeroed block of the heap: a freed one of its size class and alignment when there is
+    /// one, else one at the end.
+    fn allocate(&mut self, size: usize, align: usize, origin: Origin) -> Result<'db, Address> {
         if !align.is_power_of_two() || align > 10000 {
             return Err(MirEvalError::UndefinedBehavior(format!("Alignment {align} is invalid")));
         }
-        while !self.heap.len().is_multiple_of(align) {
-            self.heap.push(0);
+        if size == 0 {
+            // As a local of no size: aligned, of no block, so not where the next block starts.
+            return Ok(Invalid(align));
         }
-        self.check_memory(size)?;
-        let pos = self.heap.len();
-        self.heap.extend(std::iter::repeat_n(0, size));
-        if size != 0 {
-            self.allocations[1].push(Allocated {
-                start: Address::Heap(pos).to_usize(),
-                size,
-                align,
-            });
+        let class = size_class(size);
+        let pos = match self.free_blocks.get_mut(&(class, align)).and_then(Vec::pop) {
+            Some(pos) => {
+                self.heap[pos..pos + class].fill(0);
+                pos
+            }
+            None => {
+                let pos = self.heap.len().next_multiple_of(align);
+                self.check_memory((pos - self.heap.len()).saturating_add(class))?;
+                self.heap.resize(pos + class, 0);
+                pos
+            }
+        };
+        self.heap_blocks.insert(pos, HeapBlock { size, align, class, origin });
+        Ok(Heap(pos))
+    }
+
+    /// Frees the block `addr` starts, which `origin` made; `what` names the call, for its
+    /// error. As rustc's evaluation, freeing anything else is undefined behavior.
+    fn deallocate(&mut self, addr: Address, origin: Origin, what: &str) -> Result<'db, ()> {
+        let block = match addr {
+            Heap(pos) => self.heap_blocks.get(&pos).copied().map(|it| (pos, it)),
+            _ => None,
+        };
+        let Some((pos, block)) = block.filter(|(_, it)| it.origin == origin) else {
+            return Err(MirEvalError::UndefinedBehavior(format!(
+                "`{what}` of a pointer that is not the start of memory allocated by it"
+            )));
+        };
+        self.heap_blocks.remove(&pos);
+        self.free_blocks.entry((block.class, block.align)).or_default().push(pos);
+        Ok(())
+    }
+
+    /// `__rust_realloc`: the block grows or shrinks in place while it fits its size class,
+    /// else its bytes move to a new block and it is freed.
+    fn reallocate(&mut self, addr: Address, new_size: usize) -> Result<'db, Address> {
+        let block = match addr {
+            Heap(pos) => self.heap_blocks.get(&pos).copied().map(|it| (pos, it)),
+            _ => None,
+        };
+        let Some((pos, block)) = block.filter(|(_, it)| it.origin == Origin::Allocator) else {
+            return Err(MirEvalError::UndefinedBehavior(
+                "`__rust_realloc` of a pointer that is not the start of memory allocated by it"
+                    .to_owned(),
+            ));
+        };
+        if new_size != 0 && new_size <= block.class {
+            if new_size > block.size {
+                self.heap[pos + block.size..pos + new_size].fill(0);
+            }
+            self.heap_blocks.insert(pos, HeapBlock { size: new_size, ..block });
+            return Ok(addr);
         }
-        Ok(Address::Heap(pos))
+        let new = self.allocate(new_size, block.align, Origin::Allocator)?;
+        let kept = block.size.min(new_size);
+        Interval { addr: new, size: kept }
+            .write_from_interval(self, Interval { addr, size: kept })?;
+        self.deallocate(addr, Origin::Allocator, "__rust_realloc")?;
+        Ok(new)
+    }
+
+    /// `const_make_global`: the `const_allocate` block `addr` starts may be in the value of
+    /// a constant from now on, and is immutable.
+    fn make_global(&mut self, addr: Address) -> Result<'db, ()> {
+        let block = match addr {
+            Heap(pos) => self.heap_blocks.get_mut(&pos),
+            _ => None,
+        };
+        match block {
+            Some(HeapBlock { origin: origin @ Origin::ConstHeap { global: false }, .. }) => {
+                *origin = Origin::ConstHeap { global: true };
+                Ok(())
+            }
+            _ => Err(MirEvalError::UndefinedBehavior(
+                "`const_make_global` of a pointer that is not the start of memory \
+                 `const_allocate` allocated and nothing made global yet"
+                    .to_owned(),
+            )),
+        }
+    }
+
+    /// Refuses `addr` in the value of the constant: memory the program allocated, which it
+    /// would free at run time, or `const_allocate` memory not made global. rustc refuses the
+    /// latter alike ("encountered `const_allocate` pointer in final value that was not made
+    /// global"), and has no `Box` or `Vec` that allocates in a constant.
+    fn may_be_in_value(&self, addr: usize) -> Result<'db, ()> {
+        let Heap(offset) = Address::from_usize(addr) else { return Ok(()) };
+        match self.heap_block_at(offset) {
+            Some((_, HeapBlock { origin: Origin::Allocator, .. })) => {
+                Err(MirEvalError::HeapInValue { of_const_allocate: false })
+            }
+            Some((_, HeapBlock { origin: Origin::ConstHeap { global: false }, .. })) => {
+                Err(MirEvalError::HeapInValue { of_const_allocate: true })
+            }
+            _ => Ok(()),
+        }
     }
 
     fn detect_fn_trait(&self, def: FunctionId) -> Option<FnTrait> {
@@ -2706,6 +2879,7 @@ impl<'db> Evaluator<'db> {
                     }
                     return Ok(());
                 }
+                this.may_be_in_value(addr)?;
             }
             match ty.kind() {
                 // Nothing to find in these, and a large array of them is slow to walk.
@@ -2947,6 +3121,7 @@ impl<'db> Evaluator<'db> {
                 }
                 return Ok(());
             }
+            this.may_be_in_value(addr)?;
             let Some(Allocated { start, size, align }) = this.allocation_at(addr) else {
                 return Ok(());
             };
@@ -3272,6 +3447,7 @@ impl<'db> Evaluator<'db> {
         let arg_bytes = iter::once(Ok(closure_data))
             .chain(args.iter().map(|it| Ok(it.get(self)?.to_owned())))
             .collect::<Result<'db, Vec<_>>>()?;
+        let mark = self.stack.len();
         let interval = self
             .interpret_mir(mir_body, arg_bytes.into_iter().map(IntervalOrOwned::Owned), None)
             .map_err(|e| {
@@ -3281,6 +3457,7 @@ impl<'db> Evaluator<'db> {
                 )
             })?;
         destination.write_from_interval(self, interval)?;
+        self.free_stack(mark);
         Ok(None)
     }
 
@@ -3479,6 +3656,7 @@ impl<'db> Evaluator<'db> {
                 callee: Some(def),
             }))
         } else {
+            let mark = self.stack.len();
             let called = Some((def, span, locals.body.owner));
             let result = self.interpret_mir(mir_body, arg_bytes, called).map_err(|e| {
                 MirEvalError::InFunction(
@@ -3487,6 +3665,7 @@ impl<'db> Evaluator<'db> {
                 )
             })?;
             destination.write_from_interval(self, result)?;
+            self.free_stack(mark);
             Ok(None)
         }
     }

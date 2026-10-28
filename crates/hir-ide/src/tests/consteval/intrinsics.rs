@@ -626,6 +626,237 @@ fn allocator() {
     );
 }
 
+const ALLOCATOR: &str = r#"
+        extern "Rust" {
+            #[rustc_allocator]
+            fn __rust_alloc(size: usize, align: usize) -> *mut u8;
+            #[rustc_deallocator]
+            fn __rust_dealloc(ptr: *mut u8, size: usize, align: usize);
+            #[rustc_reallocator]
+            fn __rust_realloc(ptr: *mut u8, old_size: usize, align: usize, new_size: usize) -> *mut u8;
+            #[rustc_allocator_zeroed]
+            fn __rust_alloc_zeroed(size: usize, align: usize) -> *mut u8;
+        }
+        #[rustc_intrinsic]
+        pub const unsafe fn const_allocate(size: usize, align: usize) -> *mut u8;
+        #[rustc_intrinsic]
+        pub const unsafe fn const_deallocate(ptr: *mut u8, size: usize, align: usize);
+        #[rustc_intrinsic]
+        pub const unsafe fn const_make_global(ptr: *mut u8) -> *const u8;
+"#;
+
+#[test]
+fn freed_memory_is_reused() {
+    // 1.5 GiB allocated in all, more than the 1 GiB an evaluation may use at once.
+    check_number(
+        &format!(
+            r#"
+        //- minicore: sized
+        {ALLOCATOR}
+        const GOAL: u8 = unsafe {{
+            let mut i = 0;
+            let mut sum = 0u8;
+            while i < 512 {{
+                let ptr = __rust_alloc(1 << 20, 8);
+                sum = sum + *ptr;
+                *ptr = 1;
+                let ptr = __rust_realloc(ptr, 1 << 20, 8, (1 << 20) + 1);
+                sum = sum + *ptr - 1;
+                __rust_dealloc(ptr, (1 << 20) + 1, 8);
+                i += 1;
+            }}
+            sum
+        }};
+        "#
+        ),
+        0,
+    );
+}
+
+#[test]
+fn a_grown_block_keeps_its_bytes() {
+    check_number(
+        &format!(
+            r#"
+        //- minicore: sized
+        {ALLOCATOR}
+        const GOAL: u32 = unsafe {{
+            let mut cap = 1;
+            let mut ptr = __rust_alloc(cap * 4, 4) as *mut u32;
+            let mut len = 0;
+            while len < 1000 {{
+                if len == cap {{
+                    ptr = __rust_realloc(ptr as *mut u8, cap * 4, 4, cap * 8) as *mut u32;
+                    cap *= 2;
+                }}
+                *(((ptr as usize) + len * 4) as *mut u32) = len as u32;
+                len += 1;
+            }}
+            let mut sum = 0;
+            let mut i = 0;
+            while i < len {{
+                sum += *(((ptr as usize) + i * 4) as *const u32);
+                i += 1;
+            }}
+            __rust_dealloc(ptr as *mut u8, cap * 4, 4);
+            sum
+        }};
+        "#
+        ),
+        999 * 1000 / 2,
+    );
+}
+
+#[test]
+fn stack_frames_are_freed() {
+    // 2 GiB of locals in all, of 1 MiB a call.
+    check_number(
+        r#"
+        //- minicore: fn
+        const fn f(i: usize) -> u8 {
+            let a = [7u8; 1 << 20];
+            a[i]
+        }
+        const GOAL: u32 = {
+            let g = |i: usize| {
+                let a = [1u8; 1 << 20];
+                a[i]
+            };
+            let mut i = 0;
+            let mut sum = 0u32;
+            while i < 1024 {
+                sum = sum + f(i) as u32 + g(i) as u32;
+                i += 1;
+            }
+            sum
+        };
+        "#,
+        1024 * 8,
+    );
+}
+
+#[test]
+fn a_promoted_temporary_outlives_its_call() {
+    check_number(
+        r#"
+        const fn f() -> &'static [u8; 3] {
+            &[1, 2, 3]
+        }
+        const fn g() -> u8 {
+            let a = [9u8; 64];
+            a[3]
+        }
+        const GOAL: u8 = {
+            let a = f();
+            let b = g();
+            let c = f();
+            a[2] * 10 + b + c[0]
+        };
+        "#,
+        40,
+    );
+}
+
+#[test]
+fn allocated_memory_may_not_be_in_the_value() {
+    for value in ["__rust_alloc(4, 1)", "&*__rust_alloc(4, 1)"] {
+        let ty = if value.starts_with('&') { "&u8" } else { "*const u8" };
+        check_fail(
+            &format!(
+                r#"
+            //- minicore: sized
+            {ALLOCATOR}
+            const GOAL: {ty} = unsafe {{ {value} }};
+            "#
+            ),
+            |e| {
+                matches!(
+                    e,
+                    ConstEvalError::MirEvalError(MirEvalError::HeapInValue {
+                        of_const_allocate: false
+                    })
+                )
+            },
+        );
+    }
+    // Behind other memory: the data of a vector.
+    check_fail(
+        &format!(
+            r#"
+        //- minicore: sized
+        {ALLOCATOR}
+        struct RawVec {{ ptr: *mut u8, cap: usize }}
+        const GOAL: (RawVec, usize) = unsafe {{ (RawVec {{ ptr: __rust_alloc(8, 1), cap: 8 }}, 0) }};
+        "#
+        ),
+        |e| {
+            matches!(
+                e,
+                ConstEvalError::MirEvalError(MirEvalError::HeapInValue {
+                    of_const_allocate: false
+                })
+            )
+        },
+    );
+}
+
+#[test]
+fn const_allocate_is_in_the_value_once_made_global() {
+    check_fail(
+        &format!(
+            r#"
+        //- minicore: sized
+        {ALLOCATOR}
+        const GOAL: &u8 = unsafe {{ &*const_allocate(4, 4) }};
+        "#
+        ),
+        |e| {
+            matches!(
+                e,
+                ConstEvalError::MirEvalError(MirEvalError::HeapInValue { of_const_allocate: true })
+            )
+        },
+    );
+    check_number(
+        &format!(
+            r#"
+        //- minicore: sized
+        {ALLOCATOR}
+        const X: &u8 = unsafe {{
+            let ptr = const_allocate(4, 4);
+            *ptr = 7;
+            &*const_make_global(ptr)
+        }};
+        const GOAL: u8 = *X;
+        "#
+        ),
+        7,
+    );
+}
+
+#[test]
+fn freeing_what_was_not_allocated() {
+    for body in [
+        "let ptr = __rust_alloc(4, 1); __rust_dealloc(ptr, 4, 1); __rust_dealloc(ptr, 4, 1);",
+        "let ptr = __rust_alloc(4, 1); __rust_dealloc(((ptr as usize) + 1) as *mut u8, 3, 1);",
+        "let ptr = __rust_alloc(4, 1); const_deallocate(ptr, 4, 1);",
+        "let ptr = const_allocate(4, 1); __rust_dealloc(ptr, 4, 1);",
+        "let mut x = 0u8; __rust_dealloc(&mut x, 1, 1);",
+        "let ptr = __rust_alloc(4, 1); const_make_global(ptr);",
+    ] {
+        check_fail(
+            &format!(
+                r#"
+            //- minicore: sized
+            {ALLOCATOR}
+            const GOAL: u8 = unsafe {{ {body} 0 }};
+            "#
+            ),
+            |e| matches!(e, ConstEvalError::MirEvalError(MirEvalError::UndefinedBehavior(_))),
+        );
+    }
+}
+
 #[test]
 fn unchecked_arithmetic() {
     let fixture = |goal: &str| {

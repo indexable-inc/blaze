@@ -4287,10 +4287,11 @@ fn describe_scopes(
     of_binding
 }
 
-/// The error the build stops with when the evaluation of `of`, or of a constant it reads, ran
-/// past its budget (`const-eval` under `[workspace.metadata.blaze]`): what it ran out of, where,
-/// and the setting that raises it. `None` for any other error.
-fn over_budget(
+/// The error the build stops with when the evaluation of `of`, or of a constant it reads, is
+/// refused, naming the constant: it ran past its budget (`const-eval` under
+/// `[workspace.metadata.blaze]`), with what it ran out of, where, and the setting that raises
+/// it; or its value points to memory allocated while evaluating it. `None` for any other error.
+fn refused_const_eval(
     db: &dyn HirDatabase,
     of: GeneralConstId<'_>,
     e: &ConstEvalError<'_>,
@@ -4307,7 +4308,7 @@ fn over_budget(
     let mut what = name(of).unwrap_or_else(|| "a constant expression".to_owned());
     let ConstEvalError::MirEvalError(e) = e else { return None };
     let mut e: &MirEvalError<'_> = e;
-    let (spent, at) = loop {
+    loop {
         match e {
             MirEvalError::InFunction(inner, _) => e = &**inner,
             MirEvalError::ConstEvalError(inner, error) => {
@@ -4315,18 +4316,22 @@ fn over_budget(
                 what = format!("`{inner}`");
                 e = inner_error;
             }
-            MirEvalError::OverBudget { spent, at } => break (*spent, *at),
+            MirEvalError::OverBudget { spent, at } => {
+                let at = at
+                    .and_then(|(owner, span)| fncache::location(db, owner, span))
+                    .map(|it| format!(" at {it}"))
+                    .unwrap_or_default();
+                return Some(CodegenError::Refused(format!(
+                    "const eval of {what} {spent}{at} (raise {} under `[workspace.metadata.blaze]`)",
+                    spent.setting()
+                )));
+            }
+            MirEvalError::HeapInValue { .. } => {
+                return Some(CodegenError::Refused(format!("the value of {what}: {e:?}")));
+            }
             _ => return None,
         }
-    };
-    let at = at
-        .and_then(|(owner, span)| fncache::location(db, owner, span))
-        .map(|it| format!(" at {it}"))
-        .unwrap_or_default();
-    Some(CodegenError::Refused(format!(
-        "const eval of {what} {spent}{at} (raise {} under `[workspace.metadata.blaze]`)",
-        spent.setting()
-    )))
+    }
 }
 
 /// File, line and column of a place in a body for a debugger, as rustc gives code its lines.
@@ -10692,7 +10697,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             unsupported!("extern static without a rustc symbol");
         }
         let allocation = db.const_eval_static(id).map_err(|e| {
-            over_budget(db, GeneralConstId::StaticId(id), &e)
+            refused_const_eval(db, GeneralConstId::StaticId(id), &e)
                 .unwrap_or_else(|| CodegenError::Frontend(format!("const eval: {e:?}")))
         })?;
         // Nothing can be written to a static of no size.
@@ -10836,7 +10841,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let db = self.cg.db;
         let UnevaluatedConst { def, args } = unevaluated;
         let frontend = |e: ConstEvalError<'db>| {
-            over_budget(db, def.0, &e)
+            refused_const_eval(db, def.0, &e)
                 .unwrap_or_else(|| CodegenError::Frontend(format!("const eval: {e:?}")))
         };
         match def.0 {
