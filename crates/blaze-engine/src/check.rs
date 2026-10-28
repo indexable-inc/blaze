@@ -225,6 +225,8 @@ struct Checker {
     ran: FxHashSet<vfs::FileId>,
     /// Where new source files of the crates checked would be.
     dirs: Vec<PathBuf>,
+    /// The target directories of the workspaces, where no new source file is looked for.
+    targets: Vec<PathBuf>,
     /// Every file loaded, by path.
     loaded: FxHashSet<PathBuf>,
     /// The manifests, the lock file and cargo's configuration, as they were when loaded.
@@ -258,9 +260,11 @@ impl Checker {
         let mut script_roots = FxHashSet::default();
         let mut local_roots = FxHashSet::default();
         let mut manifests = FxHashMap::default();
+        let mut targets = Vec::new();
         for workspace in checkouts.loaded.workspaces() {
             let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind else { continue };
             let root: &Path = cargo.workspace_root().as_ref();
+            targets.push(PathBuf::from(cargo.target_directory().to_string()));
             for file in ["Cargo.lock", ".cargo/config.toml", ".cargo/config"] {
                 manifests.insert(root.join(file), None);
             }
@@ -347,6 +351,7 @@ impl Checker {
             crates,
             ran,
             dirs: outer,
+            targets,
             loaded,
             manifests,
             sources: Sources { paths },
@@ -431,7 +436,9 @@ impl Checker {
                 return Some(format!("{} changed", path.display()));
             }
         }
-        if let Some(new) = self.dirs.iter().find_map(|dir| new_source(dir, &self.loaded)) {
+        if let Some(new) =
+            self.dirs.iter().find_map(|dir| new_source(dir, &self.loaded, &self.targets))
+        {
             return Some(format!("{} is new", new.display()));
         }
         let mut change = ChangeWithProcMacros::default();
@@ -500,8 +507,9 @@ fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|it| it.modified()).ok()
 }
 
-/// A Rust source file below `dir` that was not loaded. What a build made is not looked in.
-fn new_source(dir: &Path, loaded: &FxHashSet<PathBuf>) -> Option<PathBuf> {
+/// A Rust source file below `dir` that was not loaded. What a build made, in `targets`, is not
+/// looked in; a directory that is only named `target` is.
+fn new_source(dir: &Path, loaded: &FxHashSet<PathBuf>, targets: &[PathBuf]) -> Option<PathBuf> {
     let mut dirs = vec![dir.to_owned()];
     while let Some(dir) = dirs.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
@@ -511,7 +519,7 @@ fn new_source(dir: &Path, loaded: &FxHashSet<PathBuf>) -> Option<PathBuf> {
             let name = name.to_string_lossy();
             match entry.file_type() {
                 Ok(kind) if kind.is_dir() => {
-                    if !name.starts_with('.') && name != "target" {
+                    if !name.starts_with('.') && !targets.contains(&path) {
                         dirs.push(path);
                     }
                 }

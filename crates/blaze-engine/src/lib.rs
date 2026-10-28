@@ -2775,6 +2775,7 @@ impl Checkouts {
             self.splits[at] = Some(Split { base: self.roots[base].1.clone(), own });
         }
         self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        *lock(&UNEDITED) = Unedited::of(self.loaded.workspaces());
         prepare_macro_sessions(db);
         Ok(())
     }
@@ -2920,6 +2921,7 @@ impl Checkouts {
         }
         let workspaces_at = start.elapsed();
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        *lock(&UNEDITED) = Unedited::of(self.loaded.workspaces());
         prepare_macro_sessions(db);
         if std::env::var_os("BLAZE_STATS").is_some() {
             let files = start.elapsed() - workspaces_at;
@@ -3012,6 +3014,7 @@ impl Checkouts {
             self.debug[at] = self.debug[base].clone();
         }
         self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        *lock(&UNEDITED) = Unedited::of(self.loaded.workspaces());
         prepare_macro_sessions(db);
         failed
     }
@@ -6538,6 +6541,41 @@ enum Loaded {
     New,
 }
 
+/// The registry directories the loaded workspaces' dependencies were installed in, and the
+/// target directories of those workspaces: what [`WatchedFile::immutable`] does not watch.
+/// They are the directories themselves, not their names, since a package can have modules of
+/// its own in a directory named `registry` or `target`.
+#[derive(Default)]
+struct Unedited {
+    installed: Vec<PathBuf>,
+    targets: Vec<PathBuf>,
+}
+
+static UNEDITED: Mutex<Unedited> =
+    Mutex::new(Unedited { installed: Vec::new(), targets: Vec::new() });
+
+impl Unedited {
+    fn of(workspaces: &[ProjectWorkspace]) -> Unedited {
+        let mut unedited = Unedited::default();
+        for workspace in workspaces {
+            let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind else { continue };
+            unedited.targets.push(PathBuf::from(cargo.target_directory().to_string()));
+            for package in cargo.packages().filter(|it| !cargo[*it].is_local) {
+                let manifest = PathBuf::from(cargo[package].manifest.to_string());
+                let registry = manifest
+                    .ancestors()
+                    .find(|it| it.file_name().is_some_and(|name| name == "registry"));
+                if let Some(registry) = registry
+                    && !unedited.installed.iter().any(|it| it == registry)
+                {
+                    unedited.installed.push(registry.to_owned());
+                }
+            }
+        }
+        unedited
+    }
+}
+
 impl WatchedFile {
     /// Whether the file is never written again: everything is watched but the sysroot, the
     /// registry, the Nix store (crates vendored by Nix, which `nix run` of the demo reads its
@@ -6545,11 +6583,12 @@ impl WatchedFile {
     /// project. What a build script wrote is written again when it runs again. Each watched
     /// file is looked at on every edit, so one too many is time on every keystroke.
     fn immutable(path: &Path) -> bool {
-        let names: Vec<&str> = path.components().filter_map(|c| c.as_os_str().to_str()).collect();
-        let of_script = cargo::script::in_out_dir(path);
+        let unedited = lock(&UNEDITED);
         path.starts_with("/nix/store")
-            || names.iter().any(|&it| matches!(it, "rustlib" | "registry"))
-            || names.contains(&"target") && !of_script
+            || path.components().any(|it| it.as_os_str() == "rustlib")
+            || unedited.installed.iter().any(|it| path.starts_with(it))
+            || unedited.targets.iter().any(|it| path.starts_with(it))
+                && !cargo::script::in_out_dir(path)
     }
 
     /// `path` is what the file is known as, `on_disk` where it is read from.
@@ -11576,6 +11615,33 @@ mod user {
             "ld: cannot find -lmissing | collect2: error: ld returned 1"
         );
         assert_eq!(last_lines("", 2), "");
+    }
+
+    #[test]
+    fn package_sources_can_be_named_like_installed_sources_and_build_outputs() {
+        let ws = std::env::temp_dir().join("watch-paths");
+        let before = std::mem::replace(
+            &mut *lock(&UNEDITED),
+            Unedited {
+                installed: vec![ws.join(".cargo/registry")],
+                targets: vec![ws.join("custom-output")],
+            },
+        );
+        for source in [
+            "src/registry/rule_set.rs",
+            "src/target/opcode.rs",
+            "custom-output/debug/build/pkg-hash/out/generated.rs",
+        ] {
+            assert!(!WatchedFile::immutable(&ws.join(source)), "{source}");
+        }
+        for cached in [
+            ".cargo/registry/src/index/pkg/src/lib.rs",
+            "toolchain/lib/rustlib/src/rust/library/core/src/lib.rs",
+            "custom-output/debug/deps/old.rs",
+        ] {
+            assert!(WatchedFile::immutable(&ws.join(cached)), "{cached}");
+        }
+        *lock(&UNEDITED) = before;
     }
 
     #[test]
