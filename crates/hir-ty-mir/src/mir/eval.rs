@@ -42,6 +42,7 @@ use crate::{
     CallableDefId, ComplexMemoryMap, InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate,
     consteval::{self, ConstEvalError, try_const_usize},
     db::{AnonConstId, GeneralConstId, HirDatabase, InternedClosureId},
+    drop::{DropGlue, has_drop_glue},
     infer::PointerCast,
     layout::{Layout, LayoutError, RustcEnumVariantIdx, RustcFieldIdx},
     method_resolution::{is_dyn_method, lookup_impl_const},
@@ -235,6 +236,8 @@ pub struct Evaluator<'db> {
     /// Where a promoted temporary of a body (`&[1, 2]`) is: in the heap, as its borrow
     /// outlives the call, once for every call of the body.
     promoted: FxHashMap<(usize, LocalId), Address>,
+    /// Whether dropping a value of a type does anything ([`Self::has_drop_glue`]).
+    drop_glue: FxHashMap<Ty<'db>, bool>,
     /// Where the value of a constant operand is, once read: the program never writes it, so
     /// every use of the constant reads the same copy.
     constants: FxHashMap<Either<Const<'db>, Allocation<'db>>, Interval>,
@@ -579,6 +582,7 @@ impl<'db> Evaluator<'db> {
             heap_blocks: BTreeMap::new(),
             free_blocks: FxHashMap::default(),
             promoted: FxHashMap::default(),
+            drop_glue: FxHashMap::default(),
             constants: FxHashMap::default(),
             code_stack: vec![],
             running: None,
@@ -3905,6 +3909,10 @@ impl<'db> Evaluator<'db> {
         self.run_drop_glue_deep(ty, locals, addr, &metadata, span)
     }
 
+    /// Drops the value of type `ty` at `addr`, as rustc's `drop_in_place::<ty>`: its `Drop`
+    /// impl, then its parts in order (a struct's or tuple's fields, a closure's captures, the
+    /// fields of the variant an enum holds, an array's or slice's elements). A `Box` drops what
+    /// it points to before its `Drop` frees it.
     fn run_drop_glue_deep(
         &mut self,
         ty: Ty<'db>,
@@ -3913,12 +3921,109 @@ impl<'db> Evaluator<'db> {
         metadata: &[u8],
         span: MirSpan,
     ) -> Result<'db, ()> {
-        let Some(drop_fn) = self.lang_items().Drop_drop else {
-            // in some tests we don't have drop trait in minicore, and
-            // we can ignore drop in them.
+        if self.lang_items().Drop_drop.is_none() || !self.has_drop_glue(ty) {
             return Ok(());
-        };
+        }
+        match ty.kind() {
+            TyKind::Adt(adt_def, subst) => {
+                let id = adt_def.def_id();
+                if let AdtId::StructId(s) = id
+                    && StructSignature::of(self.db, s).flags.contains(StructFlags::IS_MANUALLY_DROP)
+                {
+                    return Ok(());
+                }
+                let layout = self.layout_adt(id, subst)?;
+                if adt_def.is_box() {
+                    let AdtId::StructId(s) = id else { not_supported!("a box that is not a struct") };
+                    let field_types = self.db.field_types(s.into());
+                    let Some((_, pointer)) = field_types.iter().next() else {
+                        not_supported!("a box with no pointer");
+                    };
+                    let pointer = pointer.ty().instantiate(self.interner(), subst).skip_norm_wip();
+                    let size = self.size_of_sized(pointer, locals, "pointer of a box")?;
+                    let offset = layout.fields.offset(0).bytes_usize();
+                    let bytes = self.read_memory(addr.offset(offset), size)?.to_vec();
+                    let (data, contents_metadata) = bytes.split_at(self.ptr_size());
+                    self.run_drop_glue_deep(
+                        subst.type_at(0),
+                        locals,
+                        Address::from_bytes(data)?,
+                        contents_metadata,
+                        span,
+                    )?;
+                }
+                self.call_drop_impl(ty, locals, addr, span)?;
+                let bytes;
+                let (variant, layout): (VariantId, Cow<'_, Layout>) = match id {
+                    AdtId::StructId(s) => (s.into(), Cow::Borrowed(&*layout)),
+                    AdtId::UnionId(_) => return Ok(()),
+                    AdtId::EnumId(e) => {
+                        bytes = self.read_memory(addr, layout.size.bytes_usize())?.to_vec();
+                        match detect_variant_from_bytes(
+                            &layout,
+                            self.db,
+                            self.target_data_layout,
+                            &bytes,
+                            e,
+                        ) {
+                            Some((variant, layout)) => (variant.into(), layout),
+                            None => return Ok(()),
+                        }
+                    }
+                };
+                let field_types = self.db.field_types(variant);
+                for (field, _) in variant.fields(self.db).fields().iter() {
+                    let offset =
+                        layout.fields.offset(u32::from(field.into_raw()) as usize).bytes_usize();
+                    let ty = field_types[field].ty().instantiate(self.interner(), subst).skip_norm_wip();
+                    self.run_drop_glue_deep(ty, locals, addr.offset(offset), &[], span)?;
+                }
+            }
+            TyKind::Tuple(fields) => self.drop_fields(ty, fields.iter(), locals, addr, span)?,
+            TyKind::Closure(_, args) => {
+                let upvars = args.as_closure().tupled_upvars_ty();
+                self.drop_fields(ty, upvars.tuple_fields().iter(), locals, addr, span)?;
+            }
+            TyKind::Array(inner, len) => {
+                let Some(len) = try_const_usize(self.db, len) else {
+                    not_supported!("dropping an array of no evaluated length");
+                };
+                self.drop_elements(inner, len as usize, locals, addr, span)?;
+            }
+            TyKind::Slice(inner) => {
+                let len = from_bytes!(usize, metadata);
+                self.drop_elements(inner, len, locals, addr, span)?;
+            }
+            TyKind::Dynamic(..) => {
+                if !metadata.is_empty() {
+                    let concrete_ty = self.vtable_map.ty_of_bytes(metadata)?;
+                    self.run_drop_glue_deep(concrete_ty, locals, addr, &[], span)?;
+                }
+            }
+            _ => (),
+        }
+        Ok(())
+    }
 
+    /// Whether dropping a value of `ty` does anything, once per type.
+    fn has_drop_glue(&mut self, ty: Ty<'db>) -> bool {
+        if let Some(&it) = self.drop_glue.get(&ty) {
+            return it;
+        }
+        let it = has_drop_glue(&self.infcx, ty, self.param_env.param_env) != DropGlue::None;
+        self.drop_glue.insert(ty, it);
+        it
+    }
+
+    /// `<ty as Drop>::drop` on the value at `addr`, if `ty` has a `Drop` impl.
+    fn call_drop_impl(
+        &mut self,
+        ty: Ty<'db>,
+        locals: &Locals<'db>,
+        addr: Address,
+        span: MirSpan,
+    ) -> Result<'db, ()> {
+        let Some(drop_fn) = self.lang_items().Drop_drop else { return Ok(()) };
         let generic_args = GenericArgs::new_from_slice(&[ty.into()]);
         let (drop_impl, drop_args) = self.db.lookup_impl_method(
             ParamEnvAndCrate { param_env: self.param_env.param_env, krate: self.crate_id },
@@ -3944,74 +4049,42 @@ impl<'db> Evaluator<'db> {
                 None,
             )?;
         }
-        match ty.kind() {
-            TyKind::Adt(adt_def, subst) => {
-                let id = adt_def.def_id();
-                match id {
-                    AdtId::StructId(s) => {
-                        let data = StructSignature::of(self.db, s);
-                        if data.flags.contains(StructFlags::IS_MANUALLY_DROP) {
-                            return Ok(());
-                        }
-                        let layout = self.layout_adt(id, subst)?;
-                        let variant_fields = s.fields(self.db);
-                        match variant_fields.shape {
-                            FieldsShape::Record | FieldsShape::Tuple => {
-                                let field_types = self.db.field_types(s.into());
-                                for (field, _) in variant_fields.fields().iter() {
-                                    let offset = layout
-                                        .fields
-                                        .offset(u32::from(field.into_raw()) as usize)
-                                        .bytes_usize();
-                                    let addr = addr.offset(offset);
-                                    let ty = field_types[field]
-                                        .ty()
-                                        .instantiate(self.interner(), subst)
-                                        .skip_norm_wip();
-                                    self.run_drop_glue_deep(ty, locals, addr, &[], span)?;
-                                }
-                            }
-                            FieldsShape::Unit => (),
-                        }
-                    }
-                    AdtId::UnionId(_) => (), // union fields don't need drop
-                    AdtId::EnumId(_) => (),
-                }
-            }
-            TyKind::Dynamic(..) => {
-                if !metadata.is_empty() {
-                    let concrete_ty = self.vtable_map.ty_of_bytes(metadata)?;
-                    self.run_drop_glue_deep(concrete_ty, locals, addr, &[], span)?;
-                }
-            }
-            TyKind::Bool
-            | TyKind::Char
-            | TyKind::Int(_)
-            | TyKind::Uint(_)
-            | TyKind::Float(_)
-            | TyKind::Tuple(_)
-            | TyKind::Array(_, _)
-            | TyKind::Slice(_)
-            | TyKind::RawPtr(_, _)
-            | TyKind::Ref(_, _, _)
-            | TyKind::Alias(..)
-            | TyKind::FnDef(_, _)
-            | TyKind::Str
-            | TyKind::Never
-            | TyKind::Closure(_, _)
-            | TyKind::Coroutine(_, _)
-            | TyKind::CoroutineClosure(..)
-            | TyKind::CoroutineWitness(_, _)
-            | TyKind::Foreign(_)
-            | TyKind::Error(_)
-            | TyKind::Param(_)
-            | TyKind::Placeholder(_)
-            | TyKind::FnPtr(..)
-            | TyKind::Bound(..)
-            | TyKind::Infer(..)
-            | TyKind::Pat(..)
-            | TyKind::UnsafeBinder(..) => (),
-        };
+        Ok(())
+    }
+
+    /// Drops the fields of the tuple or closure `ty` at `addr`, of types `fields`, in order.
+    fn drop_fields(
+        &mut self,
+        ty: Ty<'db>,
+        fields: impl Iterator<Item = Ty<'db>>,
+        locals: &Locals<'db>,
+        addr: Address,
+        span: MirSpan,
+    ) -> Result<'db, ()> {
+        let layout = self.layout(ty)?;
+        for (i, field) in fields.enumerate() {
+            let offset = layout.fields.offset(i).bytes_usize();
+            self.run_drop_glue_deep(field, locals, addr.offset(offset), &[], span)?;
+        }
+        Ok(())
+    }
+
+    /// Drops `len` elements of type `inner` from `addr` on, first to last.
+    fn drop_elements(
+        &mut self,
+        inner: Ty<'db>,
+        len: usize,
+        locals: &Locals<'db>,
+        addr: Address,
+        span: MirSpan,
+    ) -> Result<'db, ()> {
+        if !self.has_drop_glue(inner) {
+            return Ok(());
+        }
+        let size = self.size_of_sized(inner, locals, "element to drop")?;
+        for i in 0..len {
+            self.run_drop_glue_deep(inner, locals, addr.offset(i * size), &[], span)?;
+        }
         Ok(())
     }
 

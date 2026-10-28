@@ -368,6 +368,65 @@ fn main() {
 }
 
 #[test]
+fn drop_glue_of_closures_tuples_arrays_and_enums() {
+    // `Vec::extend_trusted` writes the length back in the `Drop` of a guard the closure it
+    // passes to `for_each` captures: a closure's captures are dropped with it.
+    check_pass(
+        r#"
+//- minicore: drop, add, option, cell, builtin_impls, fn
+
+use core::cell::Cell;
+
+fn should_not_reach() {
+    _ // FIXME: replace this function with panic when that works
+}
+
+struct X<'a>(&'a Cell<i32>);
+impl<'a> Drop for X<'a> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1)
+    }
+}
+
+fn twice<F: FnMut()>(mut f: F) {
+    f();
+    f();
+}
+
+fn main() {
+    let s = Cell::new(0);
+    let x = X(&s);
+    twice(move || {
+        let _ = &x;
+    });
+    if s.get() != 1 {
+        should_not_reach();
+    }
+    {
+        let _tuple = (X(&s), 5, X(&s));
+    }
+    if s.get() != 3 {
+        should_not_reach();
+    }
+    {
+        let _array = [X(&s), X(&s), X(&s)];
+    }
+    if s.get() != 6 {
+        should_not_reach();
+    }
+    {
+        let _some = Some(X(&s));
+        let _none: Option<X<'_>> = None;
+    }
+    if s.get() != 7 {
+        should_not_reach();
+    }
+}
+"#,
+    );
+}
+
+#[test]
 fn drop_in_place() {
     check_pass(
         r#"
