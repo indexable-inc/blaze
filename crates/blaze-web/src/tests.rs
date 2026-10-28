@@ -210,8 +210,13 @@ fn the_world_is_read_over_flecs_rest_and_never_written() {
     assert_eq!(answer.code, 200);
     let body = String::from_utf8(answer.body).unwrap();
     assert!(body.contains("anim::scene::render") && body.contains(name), "{body}");
-    let answer = world.rest("GET", "/query?expr=(Calls,*)").unwrap();
-    assert_eq!(answer.code, 200, "{}", String::from_utf8_lossy(&answer.body));
+    // `render` calls `push`: their modules call one another, and `render` has it as callee.
+    let answer = world.rest("GET", "/query?expr=Module,(Calls,*)").unwrap();
+    let body = String::from_utf8_lossy(&answer.body);
+    assert!(answer.code == 200 && body.contains("scene") && body.contains("vec"), "{body}");
+    let answer = world.rest("GET", "/query?expr=Callees").unwrap();
+    let body = String::from_utf8_lossy(&answer.body);
+    assert!(answer.code == 200 && body.contains("\"values\":[[\"#"), "{body}");
     assert_eq!(world.rest("PUT", "/entity/made").unwrap().code, 403);
     assert_eq!(world.rest("DELETE", "/entity/flecs").unwrap().code, 403);
     // The modules of a function's path are entities under its crate.

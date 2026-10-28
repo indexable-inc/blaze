@@ -52,7 +52,8 @@ pub enum Event {
     Critical { path: Vec<u32> },
     /// Functions put in object `object` of the process's builds, as they were put in it. An
     /// object is `whole`, all of the program, or a patch of the last whole one with what an
-    /// edit compiled again. A function is in one record of an object.
+    /// edit compiled again. A function is in one record of an object. The daemon sends these
+    /// to no command: a cold build's are some megabytes.
     Functions { object: u32, whole: bool, functions: Vec<Function> },
 }
 

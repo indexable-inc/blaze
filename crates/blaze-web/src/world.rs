@@ -7,7 +7,11 @@
 //!   function of, `Crate`, named as the crate, and under a crate its modules, `Module`, named as
 //!   the module, one in another as in the crate;
 //! - a function: [`Function`], unnamed, in (`ChildOf`) the module its path names, or the crate
-//!   when it names none, and `(Calls, function)` for each function it calls.
+//!   when it names none, and `Callees`, the functions it calls;
+//! - `(Calls, module)` on a module one of whose functions calls one of that module's, and
+//!   `(Calls, crate)` so on a crate. A call that is gone stays until the program is written
+//!   again. Calls of functions are not pairs: anim's 150 000 would hold 266 MB as pairs that
+//!   fragment and 1.9 GB as pairs that do not, against a few as vectors.
 //!
 //! One thread has the world: [`World`] is not `Send`.
 
@@ -26,9 +30,10 @@ type Entity = ecs::ecs_entity_t;
 const KINDS: &str = "
 struct Workspace(root: string, build: u64)
 struct Function(key: u64, name: string, how: u8, ns: u64, build: u64)
+vector Callees(entity)
 Crate {}
 Module {}
-Calls { Relationship\n DontFragment }
+Calls { Relationship }
 ";
 
 /// A workspace, as Flecs has it (its layout is [`KINDS`]'s).
@@ -64,6 +69,7 @@ pub struct World {
     rest: *mut ecs::ecs_http_server_t,
     workspace: Entity,
     function: Entity,
+    callees: Entity,
     krate: Entity,
     module: Entity,
     calls: Entity,
@@ -75,21 +81,32 @@ pub struct Program {
     entity: Entity,
     build: u64,
     crates: Vec<String>,
+    /// Each crate's entity, by its index in `crates`.
+    crates_of: Vec<Entity>,
     crate_of: FxHashMap<String, (u32, Entity)>,
     modules: FxHashMap<(Entity, String), Entity>,
-    /// Each function's entity and crate, in the snapshot's order.
-    nodes: Vec<(Entity, u32)>,
+    /// Each function, in the snapshot's order.
+    nodes: Vec<Node>,
     by_key: FxHashMap<u64, u32>,
     /// The nodes of each object of the build under way, by their ids in it.
     ids: FxHashMap<u32, FxHashMap<u32, u32>>,
     /// The nodes each node calls.
     out: Vec<Vec<u32>>,
     edges: usize,
+    /// The modules (or crates) and crates with `(Calls, the other)`.
+    calls: rustc_hash::FxHashSet<(Entity, Entity)>,
     /// Calls of the build's objects to ids none of its records has named yet: the object,
     /// the node that calls and the id. One to code of another is never named.
     unresolved: Vec<(u32, u32, u32)>,
     /// The records of the last build, but for its functions.
     records: Vec<Record>,
+}
+
+struct Node {
+    entity: Entity,
+    krate: u32,
+    /// The module it is in, or its crate.
+    module: Entity,
 }
 
 /// What Flecs's REST answered.
@@ -125,6 +142,7 @@ impl World {
                 rest,
                 workspace: named(c"Workspace"),
                 function: named(c"Function"),
+                callees: named(c"Callees"),
                 krate: named(c"Crate"),
                 module: named(c"Module"),
                 calls: named(c"Calls"),
@@ -140,6 +158,7 @@ impl World {
             entity,
             build: 0,
             crates: Vec::new(),
+            crates_of: Vec::new(),
             crate_of: FxHashMap::default(),
             modules: FxHashMap::default(),
             nodes: Vec::new(),
@@ -147,6 +166,7 @@ impl World {
             ids: FxHashMap::default(),
             out: Vec::new(),
             edges: 0,
+            calls: Default::default(),
             unresolved: Vec::new(),
             records: Vec::new(),
         }
@@ -235,13 +255,13 @@ impl World {
             text(&mut out, krate.as_bytes());
         }
         out.extend((program.nodes.len() as u32).to_le_bytes());
-        for &(entity, krate) in &program.nodes {
+        for node in &program.nodes {
             // SAFETY: the world's thread; every node has a Function.
             let function = unsafe {
-                &*ecs::ecs_get_id(self.world, entity, self.function).cast::<Function>()
+                &*ecs::ecs_get_id(self.world, node.entity, self.function).cast::<Function>()
             };
             out.extend(function.key.to_le_bytes());
-            out.extend(krate.to_le_bytes());
+            out.extend(node.krate.to_le_bytes());
             out.push(function.how);
             out.extend(function.ns.to_le_bytes());
             out.extend(function.build.to_le_bytes());
@@ -282,12 +302,14 @@ impl World {
         unsafe { ecs::ecs_delete(self.world, program.entity) };
         program.entity = self.workspace_of(&program.root, program.build);
         program.crates.clear();
+        program.crates_of.clear();
         program.crate_of.clear();
         program.modules.clear();
         program.nodes.clear();
         program.by_key.clear();
         program.out.clear();
         program.edges = 0;
+        program.calls.clear();
         program.unresolved.clear();
     }
 
@@ -302,11 +324,8 @@ impl World {
             let (krate, in_crate) = self.crate_of(program, &function.krate);
             let at = match program.by_key.get(&function.key) {
                 Some(&at) => {
-                    let entity = program.nodes[at as usize].0;
                     // What it calls is said again below.
-                    // SAFETY: the world's thread.
-                    unsafe { ecs::ecs_remove_id(self.world, entity, pair(self.calls, wildcard())) };
-                    program.nodes[at as usize].1 = krate;
+                    program.nodes[at as usize].krate = krate;
                     program.edges -= program.out[at as usize].len();
                     program.out[at as usize].clear();
                     at
@@ -318,7 +337,7 @@ impl World {
                     // SAFETY: as above.
                     unsafe { ecs::ecs_add_id(self.world, entity, pair(child_of(), parent)) };
                     let at = program.nodes.len() as u32;
-                    program.nodes.push((entity, krate));
+                    program.nodes.push(Node { entity, krate, module: parent });
                     program.out.push(Vec::new());
                     program.by_key.insert(function.key, at);
                     at
@@ -333,7 +352,7 @@ impl World {
             let name = CString::new(function.name.replace('\0', "")).unwrap_or_default();
             let value =
                 Function { key: function.key, name: name.as_ptr(), how, ns, build: program.build };
-            self.set(program.nodes[at as usize].0, self.function, &value);
+            self.set(program.nodes[at as usize].entity, self.function, &value);
             program.ids.entry(object).or_default().insert(function.id, at);
             placed.push(at);
         }
@@ -357,15 +376,35 @@ impl World {
                 None => true,
             }
         });
+        let mut changed: Vec<u32> = placed;
         for (from, to) in calls {
             let out = &mut program.out[from as usize];
-            if !out.contains(&to) {
-                out.push(to);
-                program.edges += 1;
-                let (from, to) = (program.nodes[from as usize].0, program.nodes[to as usize].0);
-                // SAFETY: the world's thread.
-                unsafe { ecs::ecs_add_id(self.world, from, pair(self.calls, to)) };
+            if out.contains(&to) {
+                continue;
             }
+            out.push(to);
+            program.edges += 1;
+            changed.push(from);
+            let (from, to) = (&program.nodes[from as usize], &program.nodes[to as usize]);
+            let crates = (program.crates_of[from.krate as usize], program.crates_of[to.krate as usize]);
+            for (from, to) in [(from.module, to.module), crates] {
+                if from != to && program.calls.insert((from, to)) {
+                    // SAFETY: the world's thread.
+                    unsafe { ecs::ecs_add_id(self.world, from, pair(self.calls, to)) };
+                }
+            }
+        }
+        changed.sort_unstable();
+        changed.dedup();
+        for at in changed {
+            let mut callees: Vec<Entity> =
+                program.out[at as usize].iter().map(|&to| program.nodes[to as usize].entity).collect();
+            let vector = ecs::ecs_vec_t {
+                array: callees.as_mut_ptr().cast::<c_void>(),
+                count: callees.len() as i32,
+                size: callees.capacity() as i32,
+            };
+            self.set(program.nodes[at as usize].entity, self.callees, &vector);
         }
     }
 
@@ -376,6 +415,7 @@ impl World {
         let entity = self.named(program.entity, name, self.krate);
         let it = (program.crates.len() as u32, entity);
         program.crates.push(name.to_owned());
+        program.crates_of.push(entity);
         program.crate_of.insert(name.to_owned(), it);
         it
     }
@@ -506,11 +546,6 @@ fn pair(relationship: Entity, target: Entity) -> ecs::ecs_id_t {
 fn child_of() -> Entity {
     // SAFETY: a constant Flecs sets once, before any world.
     unsafe { ecs::EcsChildOf }
-}
-
-fn wildcard() -> Entity {
-    // SAFETY: as `child_of`.
-    unsafe { ecs::EcsWildcard }
 }
 
 fn text(out: &mut Vec<u8>, text: &[u8]) {

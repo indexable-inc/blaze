@@ -50,12 +50,15 @@ The daemon keeps the program of each of the 16 workspaces built last in a
 | workspace | `Workspace { root, build }`, unnamed                                       |
 | crate     | `Crate`, named as the crate, `(ChildOf, workspace)`                         |
 | module    | `Module`, named as the module, `(ChildOf, crate)` or of the module it is in |
-| function  | `Function { key, name, how, ns, build }`, unnamed, `(ChildOf, module)`, `(Calls, function)` for each it calls |
+| function  | `Function { key, name, how, ns, build }`, unnamed, `(ChildOf, module)`, `Callees`: the functions it calls |
 
 A function is in the module its path names: its name without generic arguments
 (`<alloc::vec::Vec<u8>>::push` is `alloc::vec::Vec::push`), the segments after its crate's
-that begin with a lowercase letter. `Calls` does not fragment (`DontFragment`): a function's
-calls do not make a table of their own. Every view of the page is a query of this world, and
+that begin with a lowercase letter (a function with none is in its crate). A module one of
+whose functions calls one of another's has `(Calls, that module)`, and a crate so
+`(Calls, that crate)`; such a pair stays until the program is written again. The calls of
+functions are a vector, not pairs: anim's 150 000 as pairs would hold 266 MB (1.9 GB as pairs
+that do not fragment). Every view of the page is a query of this world, and
 so can be any other (`/flecs/` below).
 
 ## The wire
@@ -87,8 +90,8 @@ What the page sends is ignored but for a close.
 
 `/flecs/` passes the rest of the path, with its query, to Flecs's REST
 ([its API](https://www.flecs.dev/flecs/md_docs_2FlecsRemoteApi.html)), which answers on the
-world's thread: `/flecs/query?expr=Function` is every function, `/flecs/query?expr=(Calls,*)`
-every call. Only `GET` is let through, and the REST server is made read only besides
+world's thread: `/flecs/query?expr=Function` is every function, `/flecs/query?expr=Module,(Calls,*)` what each
+module calls. Only `GET` is let through, and the REST server is made read only besides
 (`glue_rest_new`), so a page or a query never changes the world. Flecs's own port is never
 opened: the REST is behind the token and the checks above like the rest of the page.
 
