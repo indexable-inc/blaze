@@ -220,8 +220,8 @@ virtual-hosted addressing, IAM errors and role credentials are untested.
 `push` sends the packs the manifest lacks and adds them to it. `pull` fetches the packs the
 manifest lists that are not in the local store, as many as fit under `BLAZE_CACHE_MAX`.
 A manifest only grows, by what each build adds, and one build reads a part of it, so a push
-also adds to the project's hot list, a line for each pack of the manifest: the hour a build
-that pushed last read or wrote it, or that none did in the last three days. A push adds what
+also adds to the project's hot list, a line for each pack of the manifest: the hour of the
+last push whose builds read or wrote it, or that none did in the last three days. A push adds what
 the builds on its machine used and takes out nothing another push's builds used, so a
 daemon's push of an edit that read three packs leaves the rest. A pull fetches the packs the
 hot list says were used and those it does not name yet, and says how many it left; a key a

@@ -741,8 +741,8 @@ impl Manifest {
 /// pull fetches, rather than every pack the project ever listed. The manifest only grows, by
 /// what each build adds, and one build reads a part of it. It is a signed list of its own,
 /// `manifests/<project>.hot`: after [`Hot::HEADER`], a line for each pack of the manifest a
-/// push knew of, with the hour since 1970 a build that pushed last read or wrote it, or `-`
-/// when none did in [`HOT_FOR`]. Each push adds to it what its builds used and leaves the
+/// push knew of, with the hour since 1970 of the last push whose builds read or wrote it, or
+/// `-` when none did in [`HOT_FOR`]. Each push adds to it what its builds used and leaves the
 /// rest, so a push that used little (a daemon's, or one of several jobs') takes nothing out.
 /// A pull fetches the packs it says were used and those it does not name: ones listed since,
 /// by a push that wrote no line of them. A pack it names that the manifest does not list is
@@ -842,8 +842,10 @@ fn this_hour() -> anyhow::Result<u64> {
 
 /// The file in a store's directory that names each pack a pull or a build fetched into it,
 /// with the time the pack had once it was in (nanoseconds since 1970). The store sets the
-/// time of a pack it reads, for its collection, so a pack whose time is still that one was
-/// fetched and not read since: a push tells what the builds here used by it.
+/// time of a pack it reads, for its collection, so a pack whose time is still one of these
+/// was fetched and not read since: a push tells what the builds here used by it. Any of
+/// them, not only its own: a pack the store made of small ones takes the time of the last
+/// used of them, so one made of fetched packs nobody read has a time noted here.
 const FETCHED: &str = "remote-fetched";
 
 /// Notes in [`FETCHED`] that `pack` was fetched into the store.
@@ -853,30 +855,34 @@ fn note_fetched(store: &Path, pack: &Digest) -> anyhow::Result<()> {
     let at = std::fs::metadata(&path).and_then(|it| it.modified());
     let at = at.with_context(|| format!("the time of {}", path.display()))?;
     let nanos = at.duration_since(SystemTime::UNIX_EPOCH)?.as_nanos();
-    let noted = File::options().create(true).append(true).open(store.join(FETCHED));
+    let mut options = File::options();
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let noted = options.create(true).append(true).open(store.join(FETCHED));
     // One write of one line: lines of several fetches at a time are not mixed.
     let noted = noted.and_then(|mut it| it.write_all(format!("{pack} {nanos}\n").as_bytes()));
     noted.with_context(|| format!("noting the fetch of {pack}.pack in {}", store.display()))
 }
 
-/// The times [`note_fetched`] noted, the last of each pack. A line a stopped process left
-/// cut short is passed over: its pack then counts as used, as one fetched and read would.
-fn fetched_at(store: &Path) -> anyhow::Result<FxHashMap<Digest, u128>> {
+/// The times [`note_fetched`] noted. A line a stopped process left cut short is passed
+/// over: its pack then counts as used, as one fetched and read would.
+fn fetched_at(store: &Path) -> anyhow::Result<rustc_hash::FxHashSet<u128>> {
     let path = store.join(FETCHED);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FxHashMap::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
         Err(e) => return Err(e).with_context(|| path.display().to_string()),
     };
     let lines = text.lines().filter_map(|line| {
         let (pack, nanos) = line.split_once(' ')?;
-        Some((Digest::parse(pack)?, nanos.parse().ok()?))
+        Digest::parse(pack)?;
+        nanos.parse().ok()
     });
     Ok(lines.collect())
 }
 
 /// The sealed packs of the store the builds here read or wrote in the last [`HOT_FOR`]: each
-/// whose time is that recent, but for one fetched and not read since.
+/// whose time is that recent, but for one fetched and not read since ([`FETCHED`]).
 fn used_packs(store: &Path, local: &BTreeSet<Digest>) -> anyhow::Result<BTreeSet<Digest>> {
     let fetched = fetched_at(store)?;
     let since = SystemTime::now() - HOT_FOR;
@@ -890,7 +896,7 @@ fn used_packs(store: &Path, local: &BTreeSet<Digest>) -> anyhow::Result<BTreeSet
             Err(e) => return Err(e).with_context(|| path.display().to_string()),
         };
         let nanos = at.duration_since(SystemTime::UNIX_EPOCH)?.as_nanos();
-        if at > since && fetched.get(pack) != Some(&nanos) {
+        if at > since && !fetched.contains(&nanos) {
             used.insert(*pack);
         }
     }
@@ -1021,8 +1027,17 @@ pub async fn push(store: &Path, remote: &Remote, project: &str) -> anyhow::Resul
         remote.extend_list(&Manifest::at(project), extend).await?;
     }
     let mut said = format!("{} packs added to `{project}`, {bytes} bytes sent", sent.0.len());
-    said += &push_hot(store, remote, project, &listed, &sent).await?;
-    Tally { failed, ..Tally::default() }.settle(said, &remote.traffic)
+    // A list that cannot be added to fails the push after the packs that failed are named.
+    let hot = push_hot(store, remote, project, &listed, &sent).await;
+    if let Ok(hot) = &hot {
+        said += hot;
+    }
+    match (Tally { failed, ..Tally::default() }.settle(said, &remote.traffic), hot) {
+        (Ok(said), Ok(_)) => Ok(said),
+        (Ok(_), Err(e)) => Err(e),
+        (Err(e), Ok(_)) => Err(e),
+        (Err(e), Err(hot)) => Err(e.context(format!("and the hot list was not added to: {hot:#}"))),
+    }
 }
 
 /// Adds what the builds here used, of what the manifest now lists, to the project's [`Hot`]
