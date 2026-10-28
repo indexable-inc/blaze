@@ -1,0 +1,31 @@
+# The repository's Python, as one uv workspace: scripts run with `uv run --frozen` from the
+# lock beside this file, on the Python `.python-version` pins. Shared helpers are its members
+# (python/*). The older scripts of harness/ and .github/scripts/ move here when next changed.
+[project]
+name = "blaze-scripts"
+version = "0"
+requires-python = ">=3.13"
+dependencies = ["typed-input"]
+
+[dependency-groups]
+dev = ["ruff>=0.14", "pyright[nodejs]>=1.1.400"]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["python/*"]
+
+[tool.uv.sources]
+typed-input = { workspace = true }
+
+# What ruff and pyright check (blaze.yaml's scripts job): the scripts that are in the workspace.
+[tool.ruff]
+target-version = "py313"
+line-length = 110
+include = [".github/scripts/downstream.py", "python/**/*.py"]
+
+[tool.pyright]
+include = [".github/scripts/downstream.py", "python"]
+pythonVersion = "3.13"
+typeCheckingMode = "strict"
