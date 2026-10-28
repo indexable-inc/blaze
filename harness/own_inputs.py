@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Own-path regressions adapted from Astral #37, #51, #52, #83 and #87.
+"""Own-path regressions adapted from Astral #35, #37, #51, #52, #83 and #87.
 
 uv run harness/own_inputs.py '{"blaze":"/path/to/blaze"}'
 Only blaze compiles the fixtures. Generated macro inputs change with the same
 description and store, and lazy callbacks must preserve identity and current code.
 An attribute macro also exercises anonymous-constant statics and an inlined
 method's local TypeId, the own-path analogue of Astral #73's symbol recovery.
+Crate-level cfg and cfg_attr must each leave an empty libtest harness (#1323).
 """
 
 import asyncio
@@ -41,6 +42,8 @@ async def command(inp: Input, root: Path, step: str, *args: str) -> str:
         "CARGO_TARGET_DIR": str(root / "target"),
         "BLAZE_CACHE": str(root / "store"),
         "BLAZE_PROC_MACRO_WASM": "1" if inp.mode == "wasm" else "0",
+        # Empty test roots must execute libtest rather than be considered cached.
+        "BLAZE_TESTS": "all",
     }
     process = await asyncio.create_subprocess_exec(
         *argv, cwd=root, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -152,6 +155,50 @@ fn main() {
         await command(inp, root, "stop callback fixture", "stop")
 
 
+async def cfg_roots(inp: Input, root: Path) -> None:
+    # These roots need the candidate's fix, so they belong here rather than in
+    # release smoke, which exercises the compiler published before this change.
+    write(root, {
+        "Cargo.toml": '[package]\nname="cfg-roots"\nversion="0.1.0"\nedition="2024"\n'
+        '[workspace]\n',
+        "src/main.rs": "fn main() {}\n",
+        "tests/cfg_disabled.rs": '''//! A disabled crate still gets an empty libtest harness (#1323, Astral #35).
+#![cfg(any())]
+
+#[test]
+fn disabled_test() {
+    panic!("a test from a cfg-disabled crate ran");
+}
+''',
+        "tests/cfg_attr_disabled.rs": '''//! A second disabled target joins the same worker, with its cfg supplied by cfg_attr.
+#![cfg_attr(all(), cfg(any()))]
+
+#[test]
+fn disabled_test() {
+    panic!("a test from a cfg_attr-disabled crate ran");
+}
+''',
+    })
+    try:
+        for target in ("cfg_disabled", "cfg_attr_disabled"):
+            step = f"empty cfg-root harness {target}"
+            actual = await command(inp, root, step, "test", "--test", target)
+            lines = actual.splitlines()
+            summary = (
+                "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"
+            )
+            if lines.count("running 0 tests") != 1 or sum(
+                line.startswith(summary) for line in lines
+            ) != 1:
+                raise RuntimeError(
+                    f"{step}: blaze test --test {target} exited 0 but printed {actual!r}, "
+                    "expected one successful empty harness"
+                )
+            print(f"right: {step}: 0 tests", flush=True)
+    finally:
+        await command(inp, root, "stop cfg-root fixture", "stop")
+
+
 async def main(inp: Input) -> None:
     if inp.timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
@@ -159,6 +206,7 @@ async def main(inp: Input) -> None:
         async with asyncio.TaskGroup() as tasks:
             tasks.create_task(generated(inp, Path(work) / "macro"))
             tasks.create_task(callbacks(inp, Path(work) / "callbacks"))
+            tasks.create_task(cfg_roots(inp, Path(work) / "cfg-roots"))
 
 
 if __name__ == "__main__":
