@@ -9114,12 +9114,16 @@ fn run_holding(
                 _ if again.as_ref() != Some(key) => {
                     eprintln!("manifest: not kept, the build loaded files its key was made without")
                 }
-                _ => match manifest::keep(&db, &args, key, &cold.wrote) {
-                    Ok(bytes) => eprintln!(
-                        "manifest: kept, {} files, {bytes} bytes ({:.1?})",
-                        cold.wrote.len(),
-                        start.elapsed()
-                    ),
+                _ => match manifest::keeping(&db, &args, key, &cold.wrote) {
+                    Ok(keeping) => {
+                        let (files, read) = (cold.wrote.len(), start.elapsed());
+                        keeping.settle(move |bytes, took| {
+                            eprintln!(
+                                "manifest: kept, {files} files, {bytes} bytes ({read:.1?} \
+                                 read, {took:.1?} kept beside what came next)"
+                            )
+                        });
+                    }
                     Err(why) => eprintln!("manifest: not kept: {why}"),
                 },
             }
