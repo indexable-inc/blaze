@@ -1,4 +1,4 @@
-# blaze's linker: one patch engine, two outputs
+# Patching: one engine, two outputs
 
 blaze stops linking with `cc`, `lld`, `ld64` and `link.exe`. A program's executable is made by
 blaze's own engine. The engine keeps a lasting layout of the program: where each function,
@@ -157,6 +157,11 @@ The engine takes the entries themselves: a function's bytes, its relocations aga
 names, its unwind rows and its line rows. Nothing is written as an object and read back.
 `split.rs` goes away when ELF is taken over.
 
+Stage 1 is the exception: it reads codegen's object, not the store's entries. Its oracle is lld,
+and lld can only link files, so the two must read the same bytes for the comparison to mean
+anything. A cold layout also has no room behind each piece until stage 4, which is what reading
+entries one by one buys. Reading entries comes with the lasting layout.
+
 Some inputs are files and stay files. The engine reads them with `object` and adds their
 sections to the layout like any function:
 
@@ -170,7 +175,7 @@ their versions, Mach-O `.tbd` text stubs and dylibs, PE import libraries and `ra
 
 An input the engine can't handle stops the build with an error naming it:
 
-    blaze: libfoo.a(bar.o): relocation R_X86_64_GOTPC32_TLSDESC at .text+0x1c4 is not supported by blaze's linker (docs/linker.md)
+    blaze: libfoo.a(bar.o): relocation R_X86_64_GOTPC32_TLSDESC at .text+0x1c4 is not supported by blaze's patching (docs/patching.md)
 
 The C toolchain stays a source of files, not a linker. Its start files, `libgcc_s`/`libgcc.a`,
 and libc and its linker scripts (`libc.so` on glibc is a text `GROUP(...)` script) are found
@@ -387,20 +392,23 @@ as in the lld-linked program of the same functions.
 
 ### Where it lives and what it reuses
 
-A new crate, `crates/blaze-link`, outside the front end (rule semantics-in-front-end: codegen and
-linking stay out of `hir-*`). It holds the layout, the planner, resolution, relocations per
-architecture, and one writer per format.
+In `crates/blaze-splice`, the patcher, outside the front end (rule semantics-in-front-end:
+codegen and patching stay out of `hir-*`). There is no separate linker crate: the image output
+is a patch onto an image file, so it sits beside the process output and shares its relocation,
+stub and unwind code. `blaze-splice/src/image.rs` holds the layout, resolution and the request
+of `blaze-engine patch-image`; `image/write.rs` writes the ELF image. One writer per format
+comes as the engine takes each one.
 
-- `blaze-splice` becomes the process output on top of it. Its format code (`macho.rs`, `pe.rs`,
-  `wasm.rs`, `debug.rs`, `lasting.rs`, `sha256.rs`) moves into `blaze-link` as the engine takes
-  each format. What stays in `blaze-splice` is writing into a process.
+- The process output stays as it is, and its ELF code moves onto the image's layout in stage 4.
+  The format code (`macho.rs`, `pe.rs`, `wasm.rs`, `debug.rs`, `lasting.rs`, `sha256.rs`) is
+  shared by both outputs.
 - `blaze-engine/src/link.rs` keeps what it knows that is not `cc`'s: the native libraries in
   rustc's order (`native`, `asked_by_script`, `lib_of`), `raw-dylib`, the wasm start files. It
   passes them to the engine as inputs, not argv. Its `cc` lines are deleted target by target.
 - `object` reads every input format and writes low-level ELF and PE. `gimli` writes DWARF.
 - `libwild` (Rust, MIT/Apache) is the most complete open ELF linker. Its handling of archive
   semantics, symbol versions, TLS relaxations, IFUNC and copy relocations can be forked into
-  `blaze-link` where it is better than writing it again; its writer is not built for patching,
+  `blaze-splice` where it is better than writing it again; its writer is not built for patching,
   so the layout and planner stay blaze's. `linker-diff`, wild's tool for comparing two linkers'
   outputs symbol by symbol, is the starting point of the differential check below.
 
@@ -472,7 +480,7 @@ image output.
 
 | # | Stage | What it wins (**unverified** until measured) |
 |---|---|---|
-| 1 | **First PR.** `crates/blaze-link`: a cold ELF image for x86-64 and AArch64 Linux from empty layout, enough for hello over blaze's std: the store's functions in, glibc dynamically with versions, crt files, PIE, `.eh_frame_hdr`, TLS, build ID, `RELATIVE` relocations. A harness (`harness/linker.py`) links hello both ways, runs both and compares as in check 1. No product path uses it yet, so nothing can fall back to `cc` | Nothing in CI yet. Hello linked by the engine in no more than lld's 0.16 s |
+| 1 | **First PR.** `blaze-splice`'s image output (`blaze-engine patch-image`): a cold ELF image for x86-64 and AArch64 Linux, patched onto an empty layout, enough for hello over blaze's std: codegen's objects in (not the store's entries, [above](#inputs-functions-from-the-store-not-object-files)), glibc dynamically with versions, crt files, PIE, `.eh_frame_hdr`, TLS, build ID, `RELATIVE` relocations. `harness/coldimage.py` makes hello both ways, with the engine and with lld, runs both and compares as in check 1. No product path uses it yet, so nothing can fall back to `cc` | Nothing in CI yet. Hello patched by the engine in no more than lld's 0.16 s |
 | 2 | ELF complete: archives and native libraries, linker scripts of system libraries, reachability and stand-ins, DWARF, shared outputs (`cdylib`, proc macros), copy relocations, IFUNC. Differential on the `allblaze.py` programs, ripgrep, nushell and the native-library crates | Faster than lld on ripgrep (0.25 s today, **read** in no-rustc.md), with std no longer split and parsed again |
 | 3 | **ELF takeover.** `link.rs`'s ELF `cc` path and `split.rs` deleted in one change | ELF builds run no linker process |
 | 4 | Lasting layout and image patching on ELF; the splice's ELF code moves onto the engine as the process output; an edit patches the process and the image together | A body edit's "refuse and link" from 28 ms to under 3 ([roadmap](roadmap.md#11-delivery-and-order), workstream 5); a test binary relinked after an edit in time proportional to the edit |
@@ -483,4 +491,4 @@ image output.
 | 9 | Tiered code through the engine's process output: a patch-table slot per tiered function, on-stack replacement for hot loops; store entries carry their inline sets and `harness/keys.py` edits an inlined callee across crates | Hot functions at LLVM speed in a live program without a rebuild; release images unchanged |
 
 The first pull request is stage 1. It is small enough to review, it is checked against today's
-output from the start, and it puts the crate where every later stage builds.
+output from the start, and it puts the image output where every later stage builds.
