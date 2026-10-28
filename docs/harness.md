@@ -117,7 +117,7 @@ with reasons. The daemon's log says `backend: llvm -O2 fast emit` when LLVM is i
 | `wasmabi.py [target ...]` | That the wasm type of every `extern "C"` function blaze defines or imports in `harness/wasmabi` is that of rustc's object of it, for wasm32-unknown-unknown and wasm32-wasip1: an aggregate of one scalar (wasm-bindgen's `WasmRet<u32>`) goes as that scalar, a union or anything else in memory |
 | `answers.py` | That blaze's own answers to rustc's questions (`-vV`, `--print cfg`, cargo's probe of file names, `target-spec-json`) are rustc's, byte for byte, on every target blaze has them of; `--write` regenerates them from the pinned rustc ([no-rustc.md](no-rustc.md), step B) |
 | `scripts.py [name ...]` | Build scripts run by `crates/blaze-build-script` against the pinned nightly's cargo's runs of them, over the applications of `apps/apps.json` and `harness/scripts/` (openssl-sys, zstd-sys, libz-sys, libgit2-sys, ring, rustix and the scripts that read their metadata): for each run, the environment blaze computes against the one cargo gave, blaze's reading of cargo's output against cargo's own, and a run by blaze against cargo's. `--json` writes every difference ([no-rustc.md](no-rustc.md), step I) |
-| `bscache.py record [project ...]`, `bscache.py report` | What each build script of the projects of `bench.py` reaches in the sandbox: `record` runs `cargo check --compile-time-deps` through `blaze-rustc`, so every script runs under `blaze-engine build-script` in the sandbox, and collects the sandbox's records; `report` classes each line as one a hermetic sandbox allows (the package, OUT_DIR, the toolchain, the C compiler and pkg-config) or would deny (network, writes outside OUT_DIR, other executables, other reads) and writes the list (`tools/bench/results/2026-10-27-bscache/`). Needs the network |
+| `bscache.py record [project ...]`, `bscache.py report` | What each build script of the projects of `bench.py` reaches in the sandbox: `record` runs `cargo check --compile-time-deps` through `blaze-rustc`, so every script runs under `blaze-engine build-script` in the sandbox, and collects the sandbox's records; `report` classes each line as one a hermetic sandbox allows (the package, OUT_DIR, the toolchain, the C compiler and pkg-config) or would deny (network, writes outside OUT_DIR, other executables, other reads) and writes the list (`bench/results/2026-10-27-bscache/`). Needs the network |
 | `toolchain_pins.py` | That the sha256 and size of each file of blaze's own Rust (`cargo/toolchain/pins.txt`) are what the release's manifest at static.rust-lang.org says, for every host blaze ships for; `--write` regenerates them when blaze moves to another release ([cargo.md](cargo.md)). Needs the network |
 | `nightly_features.py '{"dry_run": true}'` | Not a check: keeps the GitHub issue tree of the pinned nightly's unstable features (#967), so every `#![feature(..)]` blaze has to accept is tracked. Each language feature of rustc_feature's `unstable.rs` at library/UPSTREAM's commit is an issue labelled `nightly-feature` under a group of at most 100 sub-issues; the library features (the `#[unstable]` and `#[rustc_const_unstable]` attributes of the sysroot crates in library/) are one issue, #969, for what blaze has to do for all of them (`'{"library": true}'` makes one each). A rerun creates only what is missing (by a hidden marker in each body), links what is not under its group, and comments on and closes the issue of a feature stabilized or removed since. `'{}'` makes the changes, paced under GitHub's limits. Needs `gh` |
 | `norustc.py` | How often rustc and rustdoc run when `harness/norustc/fixture` is built, edited, tested, doctested and checked with `blaze`, through a copy of the toolchain that logs every run; a count above `norustc/baseline.json` fails ([no-rustc.md](no-rustc.md), step A). `--record` lowers the baseline |
@@ -137,7 +137,7 @@ with reasons. The daemon's log says `backend: llvm -O2 fast emit` when LLVM is i
 | `backends.py` | One program compiled by each code producer: counts, time per function, and what LLVM left to Cranelift |
 | `lints_ui.py <rust checkout>` | The lints rust-analyzer finds at the level a source denies them, against rustc's UI tests that `deny` or `forbid` one: for each lint, the errors (lint and line) blaze reports that rustc does too (right), that rustc does not (wrong) and that only rustc reports (missed). A lint blaze fails builds with (`DENIED` in main.rs) has none wrong; one in a macro's expansion is not counted, as it fails no build. It scores against the pinned nightly's rustc; `--toolchain nightly-YYYY-MM-DD` against another. `lints_ui.py harness/lints_probes` scores the units written for the lints with few UI tests, one for each place a lint applies. `--deny LINT` scores one lint on every UI test, each read with `#![deny(LINT)]` first, for a lint few tests deny (`unused_mut`) |
 | `borrowck_ui.py <rust checkout>` | The borrow checker ([borrowck.md](borrowck.md)) against rustc's borrow-check UI tests: each unit passes when blaze reports the errors (code and line) the pinned nightly rustc reports, under Polonius and NLL. `--min-pass N` fails below N Polonius passes; a panic, or an error on a unit rustc accepts, fails it too |
-| `consteval_ui.py CONFIG` | The const evaluator against rustc's `tests/ui/consts` and `tests/ui/const-generics` at the pinned nightly's commit. Each revision of a test is a unit: blaze evaluates its free constants and statics and the constants of its inherent impls (`blaze-engine consteval`), and the unit passes when the ones that fail are the ones rustc's `error[E0080]`s name (none, for a pass test). The run-pass tests also go through `uitest.py`. Units rustc's verdict cannot be compared with (an auxiliary crate, a `-Z` flag, another error, a generic or anonymous constant) are counted out of scope with a reason. Writes `summary.md`, with every difference by kind, and `units.json` to `out`. `min_evaluation` and `min_run_pass` are the floors the train holds; a panic fails it too. Results: `tools/bench/results/*-consteval/` |
+| `consteval_ui.py CONFIG` | The const evaluator against rustc's `tests/ui/consts` and `tests/ui/const-generics` at the pinned nightly's commit. Each revision of a test is a unit: blaze evaluates its free constants and statics and the constants of its inherent impls (`blaze-engine consteval`), and the unit passes when the ones that fail are the ones rustc's `error[E0080]`s name (none, for a pass test). The run-pass tests also go through `uitest.py`. Units rustc's verdict cannot be compared with (an auxiliary crate, a `-Z` flag, another error, a generic or anonymous constant) are counted out of scope with a reason. Writes `summary.md`, with every difference by kind, and `units.json` to `out`. `min_evaluation` and `min_run_pass` are the floors the train holds; a panic fails it too. Results: `bench/results/*-consteval/` |
 | `check_apps.py [name ...]` | `blaze check` against `cargo check` on the applications of `apps/apps.json` (cloned and prepared as `borrowck_apps.py` does) and the corpus: both run `check --workspace --all-targets --message-format=json`, into target directories and daemon homes of their own, and the errors and warnings of the workspace's files are compared by file, line and code or lint. An error only blaze reports (invented: it fails a build rustc accepts) or only rustc does (missed) fails it; missed warnings are counted, as the checker writes errors only. Needs `blaze-proc-macro-srv` beside blaze (`.github/scripts/build_release.py --server-beside`); a cargo job compiles a build script with blaze in 1 to 2.5 GB, so a 16 GB VM takes `CARGO_BUILD_JOBS=4` |
 | `scoreboard.py` | Runs the targets in `targets.json` and fails when behaviour differs or coverage drops below the committed `scoreboard.json` |
 | `mirparity.py <workspace> --crate <name> [--level N] [--rustc-level 1\|2]` | blaze's MIR (`blaze-engine mir`, at `BLAZE_MIR_OPT` level N) against rustc's `-Zunpretty=mir`, function by function: the share that match in shape, statement counts, statements and types, and the most frequent differences. Not a gate: the numbers are in [research/mir-gap.md](research/mir-gap.md) |
@@ -368,7 +368,21 @@ for each platform, each on a machine of its own kind.
 | `blaze.yaml` (`warm`) | push to main | the same on Linux x86-64, AArch64 and macOS, every test, then a push of the store for the runs after it; and on Linux x86-64 the std cases of the smoke corpus (`harness/smoke.py`, [release.md](release.md#the-smoke-corpus): `blaze run` and `blaze test`, dev and `--release`) with the blaze blaze built, 17 to 30 min until [#899](https://github.com/indexable-inc/blaze/issues/899) (74 s with rustc's) | |
 | `fmt.yaml` | push to main | `cargo fmt --all`, and a commit `fmt` when it changed a file | 2 min |
 | `train.yaml` | push to main, by hand | everything below, then a release or the train's issue | about 45 min |
-| `blaze.yaml` | docs or site only | the two scripts | 1 min |
+| `blaze.yaml` | a change the build and the unit tests do not read | the two scripts | 1 min |
+
+The build and the unit tests run only for a change that touches a file they read; any other
+change runs the two scripts alone. `.github/scripts/gate_changes.py` (the `changes` job) names
+those files, and why each: the crates (`crates/`, with their test data, the LLVM pin
+`crates/hir-ty-codegen/llvm.json` and the toolchain's `pins.txt`), the vendored crates
+(`vendor/`), `Cargo.toml`, `Cargo.lock`, `.cargo/`, `.rustfmt.toml` and `.clippy.toml`, the
+pinned nightly (`harness/toolchain`), `harness/unittests.py`, the flake (`flake.nix`,
+`flake.lock`), the release of blaze that builds blaze (`.github/blaze-version`, `install.sh`),
+`blaze.yaml`, `blaze-platform.yaml` and the actions they use (`toolchain`, `blaze`,
+`blaze-remote`, `rust-tests`); on a push to main, the smoke corpus too (`harness/smoke.py`,
+`harness/smoke/`), which the `warm` tier runs. It names what is code rather than what is not,
+so a new directory of documents, benches or harnesses runs no build; a list of files that
+cannot be had (a run by hand, a comparison of 300 files or more, GitHub refusing) counts as
+code. When the build or the unit tests start reading a new file, add it there.
 
 A change reaches main through a **pull request** alone
 ([contributing.md](contributing.md#landing-a-change)), merged directly once `ci` passes on it;
@@ -397,7 +411,7 @@ starts rustc, rustdoc or cargo ([no-rustc.md](no-rustc.md)).
 runs it on a branch, without the release or the issue). On every push to main it never
 finished and was red for reasons the merge gate (`ci`) does not share, so releases are cut by
 hand until it runs on pushes again: `gh workflow run release-cut.yaml` runs the train's release
-job alone on main (the release commit, then pgo.yaml tags it and release.yaml builds it). One train runs at a time: a
+job alone on main (a tag on main's HEAD, and release.yaml on it). One train runs at a time: a
 push while it runs waits, and a newer push replaces the one waiting, so the train always runs
 on the newest commit of main once the one before it is done. It does not cancel the running
 train: with a merge every few minutes, a train of 45 would never end.
@@ -431,20 +445,18 @@ it.
 
 Versions are dated and chosen by nobody: `0.YYYYMMDD.N`, N counting the releases of that day
 (UTC) from 0 (0.20261026.0, then 0.20261026.1), which is semver, as cargo and crates.io need.
-`blaze --version` says the commit too, `blaze 0.20261026.0 (fb82b09)`: crates/blaze-engine's build.rs
-takes it from `BLAZE_GIT_SHA` (release.yaml and the flake set it) or the checkout's HEAD.
+`blaze --version` says the commit and its date too, `blaze 0.20261026.0 (fb82b09 2026-10-26)`, and a
+build of the tree `blaze 0.0.0-dev (fb82b09)`: crates/blaze-engine's build.rs takes the release from
+`BLAZE_RELEASE` (release.yaml sets it on a tag) and the commit from `BLAZE_GIT_SHA` and
+`BLAZE_GIT_DATE` (release.yaml and the flake set them) or the checkout's HEAD. The version is
+never committed to main (Cargo.toml stays `0.0.0`), so a release changes no crate's identity
+and no build of main misses the store after one ([release.md](release.md#versions)).
 
 The job `train` is the train's verdict: every job but the bench. When it is green and
-main has changes since the last release, the job `release` (`.github/scripts/train_release.py
-prepare`) makes one commit on main, `release: v0.YYYYMMDD.N [skip ci]`: the workspace version
-of today's next release, a CHANGELOG.md section with what `[Unreleased]` had and the title of each change merged
-since, and Cargo.lock and `tools/nix/units` for the new version. A release is built against PGO
-profiles of its own crates (`build_release.py --strict`), and the version is in every crate's
-hash, so the job then runs `pgo.yaml`, whose pin job tags `v0.YYYYMMDD.N` on the commit that pins the
-new profiles (`train_release.py tag`) and runs `release.yaml` on the tag. While a release waits
-for its profiles, the trains after it release nothing; if the pgo run fails, the next train's
-`release` job fails and says so. The last release is the newest tag `v*`, or before the first,
-the commit that added the workspace version's CHANGELOG.md section. The bots' own commits
+main has changes since the last release, the job `release` (`.github/scripts/train_release.py`)
+tags main's commit `v0.YYYYMMDD.N`, today's next release, through the API and runs `release.yaml`
+on the tag. No commit goes to main. The last release is the newest dated tag on main's history.
+The bots' own commits
 (`fmt`, `pgo: ...`, `release: ...`) are not changes to release.
 
 When the train is red, or its release failed, the job `train issue`
@@ -499,7 +511,7 @@ repository variable `BENCH_RUNNERS` names it ([benchmarks.md](benchmarks.md#the-
 `claims.yaml` (all of rustc's `tests/ui`, both backends, six hours, and the scoreboard),
 `fuzz.yaml` (a long differential fuzz run), `bench-bun.yaml` and `live-latency.yaml` keep
 schedules of their own: each takes hours or a dedicated machine, and the train would wait on
-them. On a pull request that changes the flake, `tools/nix/` or the dependencies, `nix-live.yaml`
+them. On a pull request that changes the flake, `nix/` or the dependencies, `nix-live.yaml`
 checks only the unit graphs. The flake's `dist` passes `--nix` to `build_release.py`, which
 then checks that every binary loads through a `/nix/store` loader instead of the glibc 2.34
 floor of a shipped release. `live-*.yaml` run on their own branches. None of them is part of `ci`. `site.yaml` deploys the
@@ -508,4 +520,4 @@ site, and `release.yaml` builds releases from tags, each target through
 [reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md)), the recipe the flake's `dist` runs too.
 `pgo.yaml` trains the profiles it uses, for each release the train makes, by hand, and on
 pushes to main that change Cargo.lock, a manifest or the toolchain, and pins them in
-`tools/pgo/profiles.json`.
+`pgo/profiles.json`.

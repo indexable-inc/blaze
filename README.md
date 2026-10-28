@@ -29,7 +29,7 @@ rustup already has that same nightly). Rather use crates.io or Nix?
 [Other ways to install](docs/install.md).
 
 That installs **stable**: a release that passed the heavy tests (real projects on macOS and
-Linux: cargo, zed, servo, bun, NVIDIA Dynamo, fff and fframes each build, build again after an
+Linux: cargo, zed, servo, bun, NVIDIA Dynamo, fff, fframes and flox each build, build again after an
 edit faster than with cargo, and pass their tests). **Canary** is the newest release, out as soon as it is built and promoted to stable
 unchanged once it passes them ([release.md](docs/release.md)):
 

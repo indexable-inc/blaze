@@ -312,6 +312,23 @@ PROJECTS = {
         ),
         test=["-p", "fframes", "-p", "fframes-media", "-p", "webvtt-parser", "-p", "fframes-media-dir-macro"],
     ),
+    # The environment manager built on Nix: its CLI over the SDK, the manifest and the catalog
+    # client. Its crates read Nix store paths at compile time, which floxprep.py takes from its
+    # flake: measured only when named.
+    "flox": dict(
+        repo="flox/flox", tag="v1.19.2", rev="87d931382dc5c53f32af662c9611c6a58d669952",
+        prepare="floxprep", env=dict(FLOX_DISABLE_METRICS="true"),
+        build=["-p", "flox", "--bin", "flox"], run=["--version"],
+        edits=dict(
+            body=body("cli/flox/src/main.rs", "fn main() -> ExitCode {"),
+            # Defined in the manifest crate, called from the CLI's `upgrade`.
+            signature=parameter("cli/flox-manifest/src/parsed/v1_10_0/package_descriptor.rs", "package_identifier", "&str", "cli/**/*.rs"),
+            leaf=body("cli/flox-core/src/floxhub.rs", "    pub fn api_url_str(&self) -> String {"),
+            generic=[("cli/flox-rust-sdk/src/utils/mod.rs", "    let mut serialized = serde_json::to_string_pretty(value)?;",
+                      "    let _bench_edit = 1u32;\n    let mut serialized = serde_json::to_string_pretty(value)?;")],
+        ),
+        test=["-p", "flox-core", "-p", "flox-config", "--features", "flox-core/tests"],
+    ),
     # A game: built, not run (it opens a window). Its own code is small; the engine is ~400 crates.
     "bevy": dict(
         repo="bevyengine/bevy", tag="v0.20.0", rev="b3bdd75becaffe9a16677cf5bae5bd6d198f052b",

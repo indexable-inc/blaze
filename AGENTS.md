@@ -4,7 +4,8 @@
 How to build, test and change blaze, including its rust-analyzer-derived front end (crates/hir-ty,
 hir-def, syntax, parser and the rest): docs/contributing.md. What the harnesses check:
 docs/harness.md. Rules live in tools/agents/rules.ts (edit there, then `bun tools/agents/rules.ts
---write` for AGENTS.md).
+--write` for AGENTS.md). No CLAUDE.md: Claude Code reads AGENTS.md. Skills: .agents/skills/
+(.claude/skills links there).
 
 1. **no-rustc**: blaze never runs rustc. It compiles everything itself: no function, crate, standard
    library, build script, proc macro, check, test, doctest or link step is handed to rustc, rustdoc
@@ -148,3 +149,36 @@ docs/harness.md. Rules live in tools/agents/rules.ts (edit there, then `bun tool
     --no-pgo, --server, --server-beside, ...), are untyped, and an agent or a workflow has to guess
     their combinations; one JSON value is checkable, diffable and the same from a workflow, a person
     or another script.
+
+## Code Review Rules
+
+These guide Codex code review on pull requests. They add to the rustc comparison harnesses and a
+maintainer's approval; they replace neither.
+
+### Compiler correctness
+
+- Flag any change that can make a program built by blaze behave differently from the same program
+  built by the pinned nightly rustc (`harness/toolchain`): layout, ABI, drop order, overflow and
+  panic behavior, const eval, trait and method resolution, MIR passes, borrow checking, linking.
+  Safe path: port rustc's rule and add a differential test against rustc. The one allowed difference
+  is sandboxing build scripts and proc macros.
+- Flag a fallback: a path that, when blaze can't do something, quietly takes another route (rustc or
+  cargo, rustc's copy of a function or static, a whole rebuild in place of a refused patch, a slower
+  backend, an older cached result). Safe path: stop with an error that names what and where.
+- Flag a cache key, code-identity hash or live-patch check that misses an input the output depends
+  on (source, cfg, features, target, toolchain, layout of a type it uses), so stale code can be
+  reused or a patch applied after a layout or ABI change.
+- Flag unsafe code in the loader, the splice and the live runtime whose soundness rests on an
+  unchecked assumption (alignment, lifetime of patched code, aliasing, thread safety of a swap),
+  unless a comment states the invariant and where it is upheld.
+
+### Security
+
+- Flag anything that runs user code (build scripts, proc macros, tests in the sandboxed-tests
+  experiment) outside the sandbox by default, or widens what the sandbox allows (writes outside
+  `OUT_DIR`, network, new syscalls or paths), unless it goes through one of the documented opt-outs.
+- Flag the store, remote cache or daemon trusting bytes it did not verify: an artifact used without
+  checking its content hash, archive or path entries that can escape their directory, a socket or
+  HTTP endpoint reachable by other users, or CBOR from the network decoded without size limits.
+- Flag secrets (tokens, keys) written to logs, CI output, artifacts or the store, and workflows that
+  expose secrets to code from forked pull requests.

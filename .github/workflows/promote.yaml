@@ -6,9 +6,9 @@ name: promote
 # itself. Against the archives the release published, installed with install.sh --version as a
 # user installs them, on macOS (Apple silicon) and Linux (x86-64, ARM64): install checks, the
 # whole smoke corpus (harness/smoke.py), and the train (train.yaml, every tier) on the tag. Each
-# application of the corpus's `apps` group (cargo, zed, servo, bun, dynamo, fff, fframes) has two
-# jobs of its own per platform: `works` (dev and release builds run, its tests pass under `blaze
-# test`) and `speed`
+# application of the corpus's `apps` group (cargo, zed, servo, bun, dynamo, fff, fframes, flox) has
+# two jobs of its own per platform: `works` (dev and release builds run, its tests pass under
+# `blaze test`) and `speed`
 # (bench.py: cold, no-op, every edit and the tests faster than cargo on the same runner, nothing
 # otherwise than cargo's, and nothing more than 25% worse than the stable release's numbers, an
 # asset of it). All green: the same release is marked stable and Latest, with a line in its notes
@@ -191,8 +191,9 @@ jobs:
             read -ra packages <<< "$(python3 -I harness/smoke.py brew "$RUNNER_TEMP/app.json")"
             if [ "${#packages[@]}" -gt 0 ]; then brew install --quiet "${packages[@]}"; fi
           fi
-      # bun's own build of its C and C++ (harness/bunprep.py) needs what this dev shell has.
-      - if: matrix.app == 'bun'
+      # bun's own build of its C and C++ (harness/bunprep.py) needs what this dev shell has;
+      # flox's environment comes from its flake (harness/floxprep.py).
+      - if: matrix.app == 'bun' || matrix.app == 'flox'
         uses: DeterminateSystems/nix-installer-action@v23
       - name: the shell ${{ matrix.app }} builds in
         run: |
