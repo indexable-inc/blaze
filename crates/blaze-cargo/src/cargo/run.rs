@@ -262,6 +262,17 @@ pub fn tests(
         };
         let sandbox = identity.as_deref().ok_or(why_outside.as_str());
         let outside = if sandboxed_here { &opt_out.tests } else { &no_test };
+        let options = &test_options[test.package_dir.as_path()];
+        let per_test = match per_test(asked, test, options, one_process) {
+            Ok(it) => it,
+            Err(why) => {
+                say::error(&why);
+                return Ok(FAILED);
+            }
+        };
+        // A test's pass in a process of its own is not one among others' threads: a global
+        // another test set can decide it.
+        let run = if per_test { format!("{run}+per-test") } else { run.clone() };
         let pick = affected::pick(asked, state, test, results.as_mut(), &run, sandbox, outside);
         let no_flaky = BTreeSet::new();
         if why_only {
@@ -301,14 +312,6 @@ pub fn tests(
                 picked = Some(names.as_slice());
             }
         }
-        let options = &test_options[test.package_dir.as_path()];
-        let per_test = match per_test(asked, test, options, one_process) {
-            Ok(it) => it,
-            Err(why) => {
-                say::error(&why);
-                return Ok(FAILED);
-            }
-        };
         if !per_test {
             say::status(asked.flags.quiet, "Running", &running);
         }
@@ -526,7 +529,7 @@ fn per_test(
     Ok(true)
 }
 
-/// What [`each_in_a_process`] adds to of the command's run.
+/// What [`each_in_a_process`] adds to the command's run.
 #[cfg(unix)]
 struct Each<'a, 'b> {
     asked: &'a Invocation,

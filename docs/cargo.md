@@ -168,11 +168,62 @@ built by blaze with no cargo, rustc or rustdoc (below).
 
 `run` then runs the program and `test` runs the test executables the way cargo does: the
 same working directory, the variables cargo sets, cargo's `Running` lines and the same exit
-status, outside any sandbox, as cargo runs it, unless the workspace opts into sandboxed tests.
+status, outside any sandbox, as cargo runs it, unless the workspace opts into sandboxed tests,
+but with each test in a process of its own, as cargo nextest runs them
+([below](#each-test-runs-in-a-process-of-its-own)).
 A hermetic test, one whose code reaches nothing outside the program and nothing blaze can't
 see into, is skipped while it has passed with the code it reaches as it is now; every other
 test runs every time ([below](#tests-are-hermetic-or-say-why-not)). `BLAZE_TESTS=all` runs
 every test.
+
+### Each test runs in a process of its own
+
+`blaze test` runs every test of a harness blaze writes (each test executable with
+`harness = true`, cargo's default) in a process of its own, as cargo nextest does, so a test
+that crashes the process, calls `exit`, leaks a thread or sets a global can't take others down
+or change how they end ([#1443](https://github.com/indexable-inc/blaze/issues/1443)). It costs
+no launch per test: each executable starts once, in its sandbox when it has one, as a fork
+server. The harness's `main` sees it is one before any test runs, lists its tests as libtest's
+filters pick them from the command's arguments, and runs none itself; for each test blaze
+hands it a file for the test's output and it forks a copy-on-write child that runs that one
+test with libtest and exits. One scheduler runs the tests of every executable of the command
+at once, on as many cores as the machine has (`--test-threads` or `RUST_TEST_THREADS` say
+otherwise), and prints each executable's results as cargo does once its last test ends, with
+the output of each failing test (and of every test with `--nocapture` or `--show-output`)
+kept to itself. `--no-fail-fast` goes on after a failure; without it no test starts after the
+first failure, as with cargo. Under `BLAZE_TESTS=affected` each test's pass is kept as before.
+
+A package whose tests need to share one process (a global one test sets and another reads, a
+logger set up once, a test that counts the process's threads) runs them as libtest's threads in
+its manifest, and `BLAZE_TEST_PROCESSES=one` does so for every test of a command:
+
+```toml
+[package.metadata.blaze.tests]
+threads = true      # libtest's threads in one process, as `cargo test` runs them
+timeout = 60        # seconds a test may take before it is killed and fails
+```
+
+Any other key there is an error. `BLAZE_TEST_TIMEOUT=<seconds>` gives every test of the command
+a time limit, over the manifest's; there is none by default. A test past its limit is killed
+(`SIGKILL`) and fails with `timed out after <n>s`.
+
+What does not run this way is an error that says so and how to run the tests as threads, never
+a quiet switch to threads: a harness flag the fork server does not take yet (`--format json`,
+`--logfile`, `--bench`, `--shuffle`, `--report-time`; it takes the filters, `--exact`, `--skip`,
+`--ignored`, `--include-ignored`, `--exclude-should-panic`, `--test-threads`, `--nocapture`,
+`--show-output`, `--color`, `-q` and `--format pretty|terse`), and a platform other than Linux
+and macOS. A test executable with `harness = false` and `--list` run as they always did.
+
+The fork server never starts a thread, so its fork copies one thread and is sound on Linux and
+macOS alike; macOS's rule against forking a process that has threads (libdispatch,
+CoreFoundation and Objective-C are not safe in such a child) does not apply. A static
+constructor that starts a thread before `main` makes the server stop before any test with an
+error naming the thread count (`/proc/self/task` on Linux, `pthread_is_threaded_np` on macOS).
+A child is free to start threads; libtest starts one for its test, as it does under cargo. The
+server's code is in the harness blaze writes (`crates/blaze-engine/src/test_harness.rs`), the
+scheduler in `crates/blaze-cargo/src/cargo/forked/`. Its macOS side (the
+`pthread_is_threaded_np` check, the BSD socket and signal constants) is written but has not yet
+run on a Mac: it is Linux that is measured below.
 
 ### Sandboxed tests (an experiment, opt-in)
 
@@ -195,8 +246,9 @@ whatever the workspace says ([below](#build-scripts-and-proc-macros-run-in-a-san
 proc macros run as WebAssembly.
 
 In a workspace that opts in, every test executable `blaze test` runs, under `all` and
-`affected` alike, runs in a sandbox of its own, with libtest's threads inside it as cargo would
-run them. In it the machine's files are read-only; the workspace, the target directory and
+`affected` alike, runs in a sandbox of its own: its fork server and every test's process inside
+it ([above](#each-test-runs-in-a-process-of-its-own)), or libtest's threads under `threads =
+true`. In it the machine's files are read-only; the workspace, the target directory and
 cargo's home (`CARGO_HOME`, `~/.cargo`) are as they are, but what a test writes there is kept
 to the run and gone when it ends (every cargo takes its locks in its home and records there
 what it used, so a test that runs cargo, as trybuild's do, writes it); `/tmp`,
