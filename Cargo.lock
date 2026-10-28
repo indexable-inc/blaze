@@ -738,6 +738,7 @@ dependencies = [
  "blaze-ui",
  "blaze-units",
  "blaze-wasi",
+ "blaze-web",
  "cargo-platform",
  "cargo-util-schemas",
  "cargo_metadata",
@@ -1180,6 +1181,17 @@ dependencies = [
  "anyhow",
  "wasmtime",
  "wasmtime-wasi",
+]
+
+[[package]]
+name = "blaze-web"
+version = "0.20261028.3"
+dependencies = [
+ "base64",
+ "blaze-protocol",
+ "getrandom 0.3.4",
+ "rustc-hash 2.1.2",
+ "sha1 0.10.7",
 ]
 
 [[package]]
