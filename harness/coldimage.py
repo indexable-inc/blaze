@@ -158,8 +158,8 @@ def request_of(collect2: list[str], machine: str, output: str) -> tuple[dict, li
             z = next(args)
             if z not in Z_SAID_ANYWAY:
                 raise Failed(f"collect2's line: `-z {z}`, which coldimage.py does not know the meaning of")
-        elif arg == "-m":
-            emulation = next(args)
+        elif arg.startswith("-m"):
+            emulation = arg[2:] or next(args)
             if emulation != EMULATIONS[machine]:
                 raise Failed(f"collect2's line: `-m {emulation}` for an image of {machine}")
         elif arg == "-dynamic-linker":

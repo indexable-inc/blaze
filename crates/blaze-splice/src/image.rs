@@ -506,9 +506,18 @@ impl<'a> Link<'a> {
                     let symbols = archive.symbols().with_context(|| {
                         format!("{}: reading the archive's symbol index", file.name)
                     })?;
-                    let symbols = symbols.with_context(|| {
-                        format!("{}: an archive without a symbol index", file.name)
-                    })?;
+                    let Some(symbols) = symbols else {
+                        // An archive of no members has no index: glibc's `libutil.a`,
+                        // `libdl.a`, `librt.a` and `libpthread.a` since 2.34, which the
+                        // line still names. One with members is read through its index.
+                        ensure!(
+                            archive.members().next().is_none(),
+                            "{}: an archive with members and no symbol index, which blaze's \
+                             patching does not read yet (docs/patching.md)",
+                            file.name
+                        );
+                        return Ok(());
+                    };
                     for symbol in symbols {
                         let symbol = symbol.with_context(|| format!("{}: its index", file.name))?;
                         let name = std::str::from_utf8(symbol.name())
