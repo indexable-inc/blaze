@@ -4,8 +4,10 @@
  * platform-independent build outputs (`uv run --script renderer/build.py`, or fetched with renderer/fetch.py).
  *
  * 1. Runs content/*.flecs under Flecs (flecs/flecs-doc.wasm, gen/tree.ts) to bake what the renderer leaves to TS:
- *    highlighted code (highlight.js) and the bench widget, by entity path.
- * 2. site-snapshot.wasm runs the same scripts with the baked HTML set and returns the snapshot.
+ *    highlighted code (highlight.js) and lessons' glyphs (gen/glyphs.ts), by entity path; and to write the scripts the content asks for: a BenchHistory
+ *    names a directory of benchmark history, which gen/bench/ turns into charts under it, as Flecs script.
+ * 2. site-snapshot.wasm runs the same scripts, then the generated ones, with the baked HTML set, and returns the
+ *    snapshot.
  * 3. site.wasm loads it and renders every page without comments, anonymous, into dist/; it also lists the pages and
  *    the discussable blocks.
  *    Narration (audio/README.md): it asks site.wasm for each page's spoken lines (`.gen/spoken.json`, what
@@ -13,13 +15,15 @@
  *    audio files are at hand (.audio/files/, or served from R2 when SITE_AUDIO_REMOTE=1), gets `Audio {manifest}` in a
  *    second snapshot, and the renderer adds the player; its manifest and files are copied to dist/audio/. Any other
  *    page simply has no player, so the build never needs audio.
- * 4. Bundles client/*.ts, concatenates styles/, copies static/. For the worker, under .gen/:
+ * 4. Bundles client/*.ts, concatenates styles/, copies static/, puts the chat translator's ONNX Runtime in dist/ort/
+ *    (`ortFiles`) and the anonymous readers' animals in dist/animals/<hash>.svg (`animalSprite`). For the worker, under .gen/:
  *
  *      site.wasm, site.cbor   the renderer and the snapshot (worker/renderer.ts)
  *      pages.json             every page: [{url, file, doc, discussable}] (what the worker routes)
  *      discussable.json       doc -> title and each block's text (what comments may attach to)
  *      build.json             {hash} of the module, the snapshot and the client scripts (part of the cache key), and
- *                             {assets}, of the client scripts' and styles' sources (client/nav.ts, worker/http.ts)
+ *                             {assets}, of the client scripts' and styles' sources (client/nav.ts, worker/http.ts),
+ *                             and {at}, when it was built (worker/presence.ts tells an old Durable Object by it)
  *      spoken.json            every page's spoken lines and their hash (the input of audio/generate.py)
  *      site.json              {origin, base}: where the site is served (`Served` on `site` in content/site.flecs)
  *
@@ -32,10 +36,13 @@
  *   bun gen/build.ts --watch   # again on every change under content/, gen/, client/, styles/
  */
 import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, watch, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Site, snapshot, type Page, type SnapshotInput, type SpokenLine } from '../worker/site-wasm';
-import { benchHistory } from './bench';
+import { ANIMALS, ROBOT, sprite, symbolId } from './animals';
+import { benchScript } from './bench';
+import { glyphSvg } from './glyphs';
 import { highlight } from './highlight';
 import { dedent, load, prose, type Node } from './tree';
 
@@ -73,6 +80,21 @@ function spokenHash(lines: SpokenLine[]): string {
 
 /** The page's entity path: `/rfcs/capabilities` is `site.rfcs.capabilities`, `/` is `site.index`. */
 const entityOf = (p: Page) => `site.${p.doc.replaceAll('/', '.')}`;
+
+/**
+ * The scripts the content asks the build to write, run after it: for each `BenchHistory {dir}`, the charts of the
+ * benchmark history in `dir` (from the repo root, or BENCH_HISTORY when set) under that entity (gen/bench/).
+ */
+function generated(all: Map<string, Node>): { name: string; code: string }[] {
+	const out: { name: string; code: string }[] = [];
+	for (const n of all.values()) {
+		const h = n.values.get('BenchHistory');
+		if (!h) continue;
+		const dir = process.env.BENCH_HISTORY ? path.resolve(process.env.BENCH_HISTORY) : path.join(root, '..', String(h.dir ?? ''));
+		out.push({ name: `${n.path} (generated)`, code: benchScript(dir, n.path) });
+	}
+	return out;
+}
 
 /**
  * Which pages can have the player: those whose manifest matches their spoken lines and whose files are available.
@@ -114,8 +136,8 @@ const STYLES = ['fonts.css', 'tokens.css', 'doc-code.css', 'base.css', 'site.css
 type Baked = SnapshotInput['bakes'];
 
 /**
- * What the renderer leaves to TS: highlighting (Code and Command, set as `Highlighted {html}`) and widgets that read
- * the build's files (BenchHistory, set as `Baked {html}`). By entity path.
+ * What the renderer leaves to TS: highlighting (Code and Command, set as `Highlighted {html}`) and each lesson's
+ * glyph (gen/glyphs.ts, set as the lesson page's `Baked {html}`). By entity path.
  */
 function bake(all: Map<string, Node>): Baked {
 	const baked: Baked = {};
@@ -128,7 +150,14 @@ function bake(all: Map<string, Node>): Baked {
 		}
 		const cmd = n.values.get('Command');
 		if (cmd) (baked[n.path] ??= {}).highlighted = highlight(prose(String(cmd.text ?? '')), 'bash');
-		if (n.tags.has('BenchHistory')) (baked[n.path] ??= {}).baked = benchHistory();
+		const lesson = n.values.get('Lesson');
+		if (lesson) {
+			try {
+				(baked[n.path] ??= {}).baked = glyphSvg(String(lesson.glyph ?? ''));
+			} catch (e) {
+				throw new Error(`${n.path}: ${(e as Error).message}`);
+			}
+		}
 	}
 	return baked;
 }
@@ -206,6 +235,44 @@ function searchIndex(pages: Page[], html: Map<string, string>, tree: Map<string,
 
 const xmlEsc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+/**
+ * The WebGPU ONNX Runtime the chat translator runs on (client/translate-worker.ts), from the onnxruntime-web that
+ * @huggingface/transformers bundles: its loader as `<hash>.mjs` and its wasm (about 27 MB) in ORT_PART-sized pieces
+ * `<hash>.<i>.wasm`, since Workers serves no static file over 25 MiB. The worker fetches the pieces and joins them.
+ * Named by content, so a browser keeps them until onnxruntime-web changes.
+ */
+const ORT_PART = 16 * 1024 * 1024;
+function ortFiles(): { mjs: string; parts: string[] } {
+	const ort = path.dirname(createRequire(createRequire(path.join(root, 'package.json')).resolve('@huggingface/transformers')).resolve('onnxruntime-web/package.json'));
+	const out = path.join(dist, 'ort');
+	rmSync(out, { recursive: true, force: true });
+	mkdirSync(out, { recursive: true });
+	const mjs = readFileSync(path.join(ort, 'dist', 'ort-wasm-simd-threaded.asyncify.mjs'));
+	const wasm = readFileSync(path.join(ort, 'dist', 'ort-wasm-simd-threaded.asyncify.wasm'));
+	const id = createHash('sha256').update(mjs).update(wasm).digest('hex').slice(0, 16);
+	writeFileSync(path.join(out, `${id}.mjs`), mjs);
+	const parts: string[] = [];
+	for (let at = 0; at < wasm.length; at += ORT_PART) {
+		const name = `${id}.${parts.length}.wasm`;
+		writeFileSync(path.join(out, name), wasm.subarray(at, at + ORT_PART));
+		parts.push(name);
+	}
+	return { mjs: `${id}.mjs`, parts };
+}
+
+/**
+ * The anonymous readers' animals (gen/animals.ts) as one sprite, dist/animals/<hash>.svg, named by its content so a
+ * browser may keep it; what the client gets as `BLAZE_ANIMALS` (client/lib/presence.ts): the sprite's path under the
+ * base, the names, in order, and the robot's symbol (a bot's face).
+ */
+function animalSprite(): { sprite: string; names: string[]; robot: string } {
+	const svg = sprite();
+	const name = `animals/${createHash('sha256').update(svg).digest('hex').slice(0, 16)}.svg`;
+	rmSync(path.join(dist, 'animals'), { recursive: true, force: true });
+	write(path.join(dist, name), svg);
+	return { sprite: name, names: ANIMALS.map((a) => a.name), robot: symbolId(ROBOT.name) };
+}
+
 function write(file: string, data: string | Uint8Array) {
 	mkdirSync(path.dirname(file), { recursive: true });
 	writeFileSync(file, data);
@@ -216,7 +283,7 @@ async function build() {
 	const files = scripts();
 	const tree = await load(content, files.map((f) => path.join(content, f)), ['site', 'refs', 'nav']);
 	const input: SnapshotInput = {
-		scripts: files.map((name) => ({ name, code: readFileSync(path.join(content, name), 'utf8') })),
+		scripts: [...files.map((name) => ({ name, code: readFileSync(path.join(content, name), 'utf8') })), ...generated(tree)],
 		bakes: bake(tree),
 	};
 	let snap = snapshot(wasmModule('site-snapshot.wasm'), input);
@@ -240,21 +307,23 @@ async function build() {
 	const client = readdirSync(path.join(root, 'client')).filter((f) => f.endsWith('.ts')).map((f) => path.join(root, 'client', f));
 	// What the pages run and look with: the client router swaps in a page only when its build had the same (nav.ts).
 	const assetsHash = createHash('sha256');
-	for (const dir of ['client', 'styles', 'gen/bench']) {
+	for (const dir of ['client', 'styles']) {
 		for (const f of (readdirSync(path.join(root, dir), { recursive: true }) as string[]).sort()) {
 			const file = path.join(root, dir, f);
 			if (statSync(file).isFile()) assetsHash.update(`${dir}/${f}`).update(readFileSync(file));
 		}
 	}
+	const animals = animalSprite();
+	assetsHash.update(animals.sprite);
 	const assets = assetsHash.digest('hex').slice(0, 16);
-	// `root` keeps the output flat (dist/js/<name>.js): bench.ts imports from gen/, which would otherwise widen it to site/.
+	// `root` keeps the output flat (dist/js/<name>.js).
 	const bundled = await Bun.build({
 		entrypoints: client,
 		root: path.join(root, 'client'),
 		outdir: path.join(dist, 'js'),
 		minify: true,
 		target: 'browser',
-		define: { BLAZE_ASSETS: JSON.stringify(assets) },
+		define: { BLAZE_ASSETS: JSON.stringify(assets), BLAZE_ORT: JSON.stringify(ortFiles()), BLAZE_ANIMALS: JSON.stringify(animals) },
 	});
 	if (!bundled.success) throw new AggregateError(bundled.logs, 'client bundle failed');
 
@@ -285,7 +354,7 @@ async function build() {
 	const hash = createHash('sha256');
 	for (const f of ['site.cbor', 'site.wasm']) hash.update(f).update(readFileSync(path.join(gen, f)));
 	for (const f of readdirSync(path.join(dist, 'js')).sort()) hash.update(f).update(readFileSync(path.join(dist, 'js', f)));
-	write(path.join(gen, 'build.json'), JSON.stringify({ hash: hash.digest('hex').slice(0, 16), assets }));
+	write(path.join(gen, 'build.json'), JSON.stringify({ hash: hash.digest('hex').slice(0, 16), assets, at: Date.now() }));
 	const narrated = Object.keys(audio).length ? `, ${Object.keys(audio).length} with audio` : '';
 	console.log(`built ${pages.length} pages${narrated} (snapshot ${snap.length} bytes) in ${Math.round(performance.now() - t0)} ms`);
 }

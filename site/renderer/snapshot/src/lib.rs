@@ -1,5 +1,5 @@
 //! The content scripts to a snapshot, for gen/build.ts under Bun: the scripts run in Flecs (compiled into this
-//! module for wasm32-unknown-unknown), the build's baked HTML is set on its entities, and the world comes back as the
+//! module for wasm32-unknown-unknown), what the build baked (highlighted code, drawings, narration) is set on its entities, and the world comes back as the
 //! flecs-snapshot DAG-CBOR document `site_load` reads. Build time only; the worker's module (`site-wasm`) has no Flecs.
 //!
 //! ```text
@@ -9,7 +9,7 @@
 //! ```
 //!
 //! The input is JSON: `{scripts: [{name, code}], bakes: {<entity path>: {highlighted?, baked?, audio?}}}`, the scripts in run
-//! order (schema.flecs, refs.flecs, then the rest by path).
+//! order (schema.flecs, refs.flecs, then the rest by path, then what the build generates).
 
 use std::collections::BTreeMap;
 

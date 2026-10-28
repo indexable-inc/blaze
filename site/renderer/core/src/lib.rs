@@ -7,9 +7,11 @@
 //! - `snapshot`: a world from a flecs-snapshot DAG-CBOR document, which is what hosts load.
 //! - `scripts` (feature `scripts`, native): the content scripts run in Flecs and snapshotted.
 //! - `render`, `inline`, `comments`: render/render.ts, widgets.ts, inline.ts and comments.ts.
+//! - `chart`: the charts (`RowChart`, `LineChart`) as HTML rows and inline SVG, and the `Picker`'s buttons.
 //! - `side`, `icons`: the sidebar every page carries (sections, rows, the pager, the outline) and its icons.
 //! - `spoken`: a page's spoken version (the narration's lines), derived from its blocks or written with `Say`.
 
+pub mod chart;
 pub mod comments;
 pub mod icons;
 pub mod inline;
@@ -93,8 +95,9 @@ impl Site {
         self.pages.iter().find(|p| p.url == url)
     }
 
+    /// The page takes comments: block by block (`Discussable`), or on the page as a whole (every page not `Quiet`).
     pub fn is_discussable(&self, page: &Page) -> bool {
-        self.world.get(page.node).has_tag("Discussable")
+        crate::render::talks(self.world.get(page.node))
     }
 
     /// The spoken lines of the page at `url` (`spoken.rs`), in order.

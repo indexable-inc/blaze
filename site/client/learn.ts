@@ -1,5 +1,5 @@
 /**
- * The course (the lessons at /learn/<slug> and the map on the home page; Lesson, Step, Quiz, Tap and Figure in content/schema.flecs, rendered by the
+ * The course (the lessons at /learn/<slug> and the path on the home page; Lesson, Step, Quiz, Tap and Figure in content/schema.flecs, rendered by the
  * renderer's render.rs). Without JS a lesson is one page of steps under each other, each question with its answer in
  * a fold. This script turns it into the lesson player, one step at a time:
  *
@@ -11,8 +11,9 @@
  *   the answer;
  * - keys: Enter is the big button, the arrows step back and forward, 1 to 9 pick a choice, Escape is the course.
  *
- * On the home page it lights the course map (`ol.course`) with the reader's progress, points the Start button at the
- * next lesson, and adds the mastery meter: one cell per question, solid when it was right the first time.
+ * On the home page it lights the course path (`.course`, render.rs `course`) with the reader's progress: each lesson's
+ * node and its mastery cells (one per question, solid when it was right the first time), the trail between the nodes
+ * filled as far as the reader has come, Start or Continue on the next lesson, and the big button pointed at it.
  *
  * Progress stays in this browser (client/lib/progress.ts, localStorage `blaze.learn`): per lesson the step to come back to, the furthest
  * step seen, whether it is finished, and each question's tries. Storage can be missing or refuse writes (private
@@ -188,6 +189,9 @@ function player(main: HTMLElement, signal: AbortSignal): () => void {
 	const cover = el('section', 'step lp-cover');
 	cover.innerHTML = `<p class="lp-eyebrow">Lesson ${main.dataset.n ?? ''}</p><h2></h2><p class="lp-line"></p><p class="lp-meta"></p><ol class="lp-map" aria-label="Steps"></ol>`;
 	cover.querySelector('h2')!.textContent = title;
+	// The lesson's glyph (render.rs puts it above the page's title), as on its node on the course path.
+	const glyph = main.querySelector('.head .lesson-glyph');
+	if (glyph) cover.prepend(glyph.cloneNode(true));
 	cover.querySelector('.lp-line')!.textContent = main.dataset.line ?? '';
 	const minutes = Math.max(1, Math.ceil((n * 20) / 60));
 	cover.querySelector('.lp-meta')!.textContent = `${n} steps · ${minutes} min${quizCount ? ` · ${quizCount} questions` : ''}`;
@@ -369,7 +373,7 @@ function player(main: HTMLElement, signal: AbortSignal): () => void {
 			a.href = main.dataset.next;
 			next.append(a, '. Or go back to the ');
 		} else next.append('That was the last lesson. Back to the ');
-		const c = el('a', '', 'course map');
+		const c = el('a', '', 'course');
 		c.href = course;
 		next.append(c, '.');
 	}
@@ -481,18 +485,34 @@ function player(main: HTMLElement, signal: AbortSignal): () => void {
 	};
 }
 
-/** The course map (on the home page): each lesson's node lit with the reader's progress, the mastery meter, the Start or Continue button, and Reset progress. */
-function courseMap(list: HTMLOListElement, signal: AbortSignal): () => void {
-	const nodes = [...list.querySelectorAll<HTMLLIElement>('li.node')];
-	const go = list.parentElement?.querySelector<HTMLAnchorElement>('.course-go a') ?? null;
-	const meter = el('div', 'mastery');
-	meter.innerHTML = `<div class="m-head"><span class="m-t">Mastery</span><span class="m-n"></span></div><div class="m-cells" role="img"></div><p class="m-sub"></p>`;
-	list.before(meter);
-	const reset = el('button', 'm-reset', 'Reset progress');
+const SVG = 'http://www.w3.org/2000/svg';
+
+function svgEl<K extends keyof SVGElementTagNameMap>(tag: K, attrs: Record<string, string> = {}): SVGElementTagNameMap[K] {
+	const e = document.createElementNS(SVG, tag);
+	for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+	return e;
+}
+
+/**
+ * The course path (on the home page): each lesson's node lit with the reader's progress (its state, the ring for how
+ * far in, its mastery cells), the next one marked with its Start or Continue, the trail drawn between the nodes and
+ * filled as far as the reader has come, the counts and Reset progress under the big button, which points at the next
+ * lesson.
+ */
+function coursePath(course: HTMLElement, signal: AbortSignal): () => void {
+	const list = course.querySelector<HTMLOListElement>('ol.path')!;
+	const nodes = [...list.querySelectorAll<HTMLLIElement>(':scope > li.node')];
+	const end = course.querySelector<HTMLElement>('.path-end');
+	const go = course.querySelector<HTMLAnchorElement>('.course-go');
+
+	const stats = el('p', 'course-stats');
+	stats.innerHTML = '<span class="c-done"></span><span class="c-first"></span>';
+	const reset = el('button', 'c-reset', 'Reset progress');
 	reset.type = 'button';
-	const dims = list.parentElement?.querySelectorAll('.dim');
-	(dims?.[dims.length - 1] ?? list).after(reset);
+	stats.append(reset);
+	(go?.parentElement ?? course).append(stats);
 	let armed: ReturnType<typeof setTimeout> | null = null;
+	let cleared: ReturnType<typeof setTimeout> | null = null;
 	reset.addEventListener('click', () => {
 		if (!armed) {
 			reset.textContent = 'Tap again to clear all progress';
@@ -504,7 +524,11 @@ function courseMap(list: HTMLOListElement, signal: AbortSignal): () => void {
 		store({ v: 1, lessons: {} });
 		paint();
 		reset.textContent = 'Progress cleared';
-		setTimeout(() => (reset.textContent = 'Reset progress'), 2000);
+		reset.hidden = false;
+		cleared = setTimeout(() => {
+			reset.textContent = 'Reset progress';
+			paint();
+		}, 2000);
 	});
 	function disarm() {
 		if (armed) clearTimeout(armed);
@@ -513,73 +537,147 @@ function courseMap(list: HTMLOListElement, signal: AbortSignal): () => void {
 		delete reset.dataset.armed;
 	}
 
+	// Each lesson's mastery cells, under its meta line; the way on, for the next one.
+	const cells = nodes.map((li) => {
+		const qs = el('span', 'qs');
+		qs.setAttribute('role', 'img');
+		li.querySelector('.body')!.append(qs);
+		return qs;
+	});
+	const goPill = el('span', 'go');
+
+	// The trail: one curve from each disc to the next (the last to the end), a dotted track and its fill, the fill
+	// revealed by a mask as far as the lesson it leaves from has come.
+	const trail = svgEl('svg', { class: 'trail', 'aria-hidden': 'true' });
+	course.prepend(trail);
+	course.dataset.drawn = '';
+	const pins = [...nodes.map((li) => li.querySelector<HTMLElement>('.pin')!), ...(end ? [end.querySelector<HTMLElement>('.pin')!] : [])];
+	const segments = pins.slice(1).map((_, i) => {
+		const reveal = svgEl('path', { pathLength: '1' });
+		const mask = svgEl('mask', { id: `trail-${i}`, maskUnits: 'userSpaceOnUse' });
+		mask.append(reveal);
+		const track = svgEl('path', { class: 'track' });
+		const fill = svgEl('path', { class: 'fill', mask: `url(#trail-${i})` });
+		trail.append(mask, track, fill);
+		return { reveal, track, fill };
+	});
+	let fills = segments.map(() => 0);
+
+	function draw() {
+		const box = course.getBoundingClientRect();
+		trail.setAttribute('width', String(box.width));
+		trail.setAttribute('height', String(box.height));
+		const at = pins.map((p) => {
+			const r = p.getBoundingClientRect();
+			return [r.left - box.left + r.width / 2, r.top - box.top + r.height / 2] as const;
+		});
+		segments.forEach((s, i) => {
+			const [x0, y0] = at[i]!;
+			const [x1, y1] = at[i + 1]!;
+			const k = (y1 - y0) / 2;
+			const d = `M${x0} ${y0}C${x0} ${y0 + k} ${x1} ${y1 - k} ${x1} ${y1}`;
+			for (const p of [s.reveal, s.track, s.fill]) p.setAttribute('d', d);
+		});
+	}
+
+	function fillTrail() {
+		segments.forEach((s, i) => s.reveal.style.setProperty('stroke-dashoffset', String(1 - fills[i]!)));
+	}
+
 	function paint() {
 		const saved = load();
 		let first = 0;
 		let total = 0;
 		let done = 0;
 		let next: HTMLLIElement | null = null;
-		const cells = meter.querySelector('.m-cells')!;
-		cells.replaceChildren();
-		for (const li of nodes) {
-			const name = li.dataset.lesson!;
-			const p = saved.lessons[name];
+		const at: number[] = [];
+		for (const [i, li] of nodes.entries()) {
+			const p = saved.lessons[li.dataset.lesson!];
 			const steps = Number(li.dataset.steps ?? 1);
 			const qs = (li.dataset.quizzes ?? '').split(' ').filter(Boolean);
-			const group = el('span', 'm-group');
-			for (const id of qs) {
-				const pass = p?.pass?.[id];
-				const c = el('i');
-				c.dataset.state = pass?.right ? (pass.tries === 1 ? 'first' : 'later') : '';
-				group.append(c);
-			}
-			cells.append(group);
-			first += firstTime(p, qs);
-			total += qs.length;
 			const state = stateOf(p, qs);
+			const right = firstTime(p, qs);
+			first += right;
+			total += qs.length;
 			if (p?.done) done++;
+			const far = p?.done ? 1 : Math.min(1, (p?.seen ?? 0) / steps);
+			at.push(far);
 			li.dataset.state = state;
-			li.style.setProperty('--p', String(p?.done ? 1 : Math.min(1, (p?.seen ?? 0) / steps)));
-			li.querySelector('.go')?.remove();
+			li.style.setProperty('--p', String(far));
+			cells[i]!.replaceChildren(
+				...qs.map((id) => {
+					const pass = p?.pass?.[id];
+					const c = el('i');
+					c.dataset.state = pass?.right ? (pass.tries === 1 ? 'first' : 'later') : '';
+					return c;
+				}),
+			);
+			cells[i]!.hidden = qs.length === 0;
+			cells[i]!.setAttribute('aria-label', `${right} of ${qs.length} questions right the first time`);
 			if (!next && state !== 'done' && state !== 'mastered') next = li;
-			const a = li.querySelector('a');
-			a?.setAttribute('aria-label', `${li.querySelector('.t')?.textContent ?? ''}, ${stateWords[state]}`);
+			const title = li.querySelector('.body .t')?.textContent ?? '';
+			const doing = state === 'doing' ? `, step ${Math.min(steps, p?.seen ?? 0)} of ${steps}` : '';
+			li.querySelector('a')?.setAttribute('aria-label', `Lesson ${i + 1}: ${title}, ${stateWords[state]}${doing}`);
 		}
 		for (const li of nodes) li.toggleAttribute('data-next', li === next);
 		const up: HTMLLIElement | null = next;
-		up?.querySelector('.body')?.append(el('span', 'go', up.dataset.state === 'doing' ? 'Continue' : 'Start'));
+		goPill.textContent = up?.dataset.state === 'doing' ? 'Continue' : 'Start';
+		if (up) up.querySelector('.body')!.append(goPill);
+		else goPill.remove();
+		// The trail from a node fills as far as its lesson has come; from the last, to the end, once it is done.
+		fills = segments.map((_, i) => at[i] ?? 0);
+		fillTrail();
+
+		const all = done === nodes.length;
+		if (all) course.dataset.all = first === total ? 'mastered' : 'done';
+		else delete course.dataset.all;
+		if (end) {
+			end.querySelector('.t')!.textContent = all ? 'Course complete' : 'The end of the course';
+			end.querySelector('.l')!.textContent = all
+				? first === total
+					? `Every question right the first time. You know how blaze builds.`
+					: `${first} of ${total} questions right the first time. Review a lesson to fill in the rest.`
+				: `After lesson ${nodes.length}, you know how blaze builds.`;
+		}
+
 		// The big button: the next lesson to start or finish, or a way back in once all are done.
 		const target = up ?? nodes[0];
 		const a = target?.querySelector('a');
-		if (go && a) {
+		if (go && a && target) {
 			const n = nodes.indexOf(target) + 1;
 			go.href = a.href;
 			go.querySelector('.k')!.textContent = !up ? 'Review the course' : up.dataset.state === 'doing' ? `Continue lesson ${n}` : `Start lesson ${n}`;
-			go.querySelector('.t')!.textContent = target.querySelector('.t')?.textContent ?? '';
+			const title = target.querySelector('.body .t')?.textContent ?? '';
+			go.querySelector('.t')!.textContent = up ? title : `From lesson 1: ${title}`;
 		}
-		meter.querySelector('.m-n')!.textContent = `${first} of ${total}`;
-		cells.setAttribute('aria-label', `${first} of ${total} questions right the first time`);
-		meter.querySelector('.m-sub')!.textContent =
-			done === nodes.length
-				? `All ${nodes.length} lessons done.${first < total ? ' Review a lesson to fill in the rest.' : ''}`
-				: `${done} of ${nodes.length} lessons done. A cell fills in when you get its question right the first time.`;
+		stats.querySelector('.c-done')!.innerHTML = `<b>${done}/${nodes.length}</b> lessons done`;
+		stats.querySelector('.c-first')!.innerHTML = `<b>${first}/${total}</b> questions right the first time`;
 		reset.hidden = Object.keys(saved.lessons).length === 0 && reset.textContent === 'Reset progress';
 	}
 
 	paint();
+	draw();
+	const ro = new ResizeObserver(draw);
+	ro.observe(course);
 	addEventListener('storage', (e) => e.key === KEY && paint(), { signal });
 	return () => {
+		ro.disconnect();
 		if (armed) clearTimeout(armed);
-		meter.remove();
-		reset.remove();
+		if (cleared) clearTimeout(cleared);
+		stats.remove();
+		trail.remove();
+		goPill.remove();
+		for (const c of cells) c.remove();
+		delete course.dataset.drawn;
+		delete course.dataset.all;
 	};
 }
 
 onPage((signal) => {
 	const main = document.querySelector<HTMLElement>('main.lesson[data-lesson]');
 	if (main && !main.hasAttribute('data-on')) return player(main, signal);
-	const list = document.querySelector<HTMLOListElement>('ol.course');
-	if (list) return courseMap(list, signal);
+	const course = document.querySelector<HTMLElement>('.course:has(> ol.path)');
+	if (course) return coursePath(course, signal);
 	// A figure outside a lesson (none yet), drawn all the same.
 	const figs = [...document.querySelectorAll<HTMLElement>('figure.diagram:not([data-drawn])')].map((f) => mount(f, false));
 	return () => figs.forEach((d) => d?.stop());

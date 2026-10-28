@@ -82,7 +82,8 @@ jobs:
     # A store blaze's release has not compiled into yet: 49 min on Linux x86-64, and over an
     # hour on macOS's 7 GB runner (the 16-minute step of 4-cpu Linux had not ended at 48). Long
     # enough for that one run to finish and push, which the runs after it then pull.
-    timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 90 }}
+    # Room after the test step's own limit for main's push, which keeps what was compiled.
+    timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 170 }}
     # The remote's write token and signing key, for the push of blaze.yaml's runs on main alone
     # (the train, on main too, pushes nothing). A called workflow sees a secret only when its
     # caller passes it, environment secrets too: blaze.yaml calls this with `secrets: inherit`.
@@ -109,7 +110,11 @@ jobs:
         with:
           job: tests
       # `blaze test`, in the flake's dev shell for its C toolchain; cargo's on Windows.
+      # A limit of its own, under the job's: a cold store's tests ran past the job's 90 minutes
+      # on 2026-10-28, which cancelled the push after them, so no run after it found them
+      # compiled. Run out here, the step fails and main's push still runs.
       - if: env.BLAZE == 'true'
+        timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 220 || 150 }}
         run: nix develop --command $PYTHON harness/unittests.py
       - if: env.BLAZE != 'true'
         run: $PYTHON harness/unittests.py --cargo

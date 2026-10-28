@@ -171,7 +171,7 @@ fn short() -> &'static str {
 
 /// [`found`], else blaze's own copy, made in `~/.blaze/library` once: copied from the checkout
 /// this blaze was built in while it has the same library, else downloaded from the release this
-/// blaze is (its version's tag when it was not built by the release workflow). `Err` says what
+/// blaze is (the tag of its version, `v0.YYYYMMDD.N`). `Err` says what
 /// failed and what to do.
 pub fn fetch() -> Result<Library, String> {
     if let Ok(found) = found() {
@@ -182,14 +182,13 @@ pub fn fetch() -> Result<Library, String> {
          home directory: `BLAZE_HOME` names where to keep it"
             .to_owned()
     })?;
-    let tag = option_env!("BLAZE_RELEASE")
-        .filter(|it| !it.is_empty())
-        .map_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")), str::to_owned);
     let given = std::env::var("BLAZE_LIBRARY_FROM").ok().filter(|it| !it.is_empty());
     let from = match (Library::ours_at(checkout()), given) {
         (Some(_), _) => checkout().to_string_lossy().into_owned(),
         (None, Some(given)) => given,
-        (None, None) => format!("{RELEASES}/{tag}"),
+        // The release this blaze is: its version, which only the engine's build.rs knows
+        // (`BLAZE_RELEASE`), so that no release changes this crate.
+        (None, None) => format!("{RELEASES}/v{}", crate::engine::get().version),
     };
     let fetched = fetch_into(&dir, &from, digest()).map_err(|e| {
         format!(

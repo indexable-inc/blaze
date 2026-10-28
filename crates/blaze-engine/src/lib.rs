@@ -7703,14 +7703,17 @@ pub fn main() -> anyhow::Result<()> {
     if std::env::args_os().nth(1).is_some_and(|it| it == sandbox::COMMAND) {
         sandbox::command(std::env::args_os().skip(2));
     }
-    // Before anything that could start a thread: it sets the environment.
-    cargo::toolchain::library::publish();
     blaze_cargo::engine::set(blaze_cargo::engine::Engine {
         doc: doc::command,
         stand_ins: link::stand_ins,
         pin: versions::pin,
         why_this_one: versions::why_this_one,
+        version: pin::OURS,
+        version_line: env!("BLAZE_VERSION_LINE"),
     });
+    // Before anything that could start a thread: it sets the environment. After the engine
+    // is handed over: a library downloaded is the release's, which the engine's version names.
+    cargo::toolchain::library::publish();
     trace::began();
     renamed::refuse_old_settings();
     if let Some(sources) = option_env!("BLAZE_SOURCES") {

@@ -5,7 +5,7 @@ site {
   learn {
     hermetic : Page {
       Narrow
-      Lesson: {4, "Same inputs, same output, whatever else is on the machine."}
+      Lesson: {4, "Same inputs, same output, whatever else is on the machine.", "sealed"}
       Title: {"Hermetic builds"}
       Description: {"Lesson 4: what a hermetic build is, and how blaze names the work it keeps."}
       Intro: {"[warm] Lesson four. Hermetic builds: what it means for a build to be sealed, and why that matters."}

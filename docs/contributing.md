@@ -30,7 +30,12 @@ you send them, including fixes you find here and want to upstream.
     demo/                     small projects the harnesses and the scoreboard build
     docs/                     these documents
     docs/reports/             working reports, one per piece of work, as written at the time
-    SECURITY.md               what to know before sharing a store, and how to report a problem
+    tools/                    what builds, releases and measures blaze: agents/ (the agent rules
+                              AGENTS.md is generated from), nix/ (the flake's unit graphs), pgo/
+                              (the pinned PGO profiles), bench/ (recorded results), remote-cache/
+                              (the cache gateway Worker)
+    licenses/                 NOTICE and the license texts of code blaze includes
+    .github/SECURITY.md       what to know before sharing a store, and how to report a problem
     crates/hir-def/, hir-ty/, syntax/, parser/, ...
                               the front end: crates derived from rust-analyzer (below)
     crates/hir-ty-borrowck/   the borrow checker, a crate next to hir-ty (borrowck.md)
@@ -266,7 +271,7 @@ remove the worktree and the local branch
 
 `cargo build --release` is the build to work with: the harnesses, the gate and CI use it, and
 it rebuilds quickly after a change. What users get is one other build: the `dist` profile
-(thin LTO) optimized with the PGO profile `pgo/profiles.json` pins, built by
+(thin LTO) optimized with the PGO profile `tools/pgo/profiles.json` pins, built by
 `.github/scripts/build_release.py`. The release workflow runs that script, and the flake's
 `dist` runs it inside its derivation with the same profile fetched by its sha256.
 `cargo install --profile dist` builds the same profile without PGO, from the release after 0.1.0.
@@ -274,7 +279,7 @@ it rebuilds quickly after a change. What users get is one other build: the `dist
 
 The PGO profiles are trained by the `pgo` workflow, one per target on the runner its release
 is built on; it uploads them to the `pgo-profiles` release and commits their names and hashes
-to `pgo/profiles.json`. It runs by itself when Cargo.lock, a manifest or `harness/toolchain`
+to `tools/pgo/profiles.json`. It runs by itself when Cargo.lock, a manifest or `harness/toolchain`
 changes on main: a profile finds each function by its symbol, which carries a hash of the
 whole graph of crates, so after such a change the old one finds almost nothing (the build
 warns, and a release refuses). A profile trained on older code of the same crates still

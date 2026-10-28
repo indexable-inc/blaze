@@ -242,6 +242,37 @@ fn stringify_expand(
     ExpandResult::ok(expanded)
 }
 
+/// Formats the binary operators and paths in the expression reported by a failed assertion.
+/// `stringify!` instead preserves the token spacing supplied by the caller.
+fn assert_condition(tokens: &str, edition: Edition) -> String {
+    use syntax::{SyntaxKind, T};
+
+    let expr = syntax::ast::Expr::parse(tokens, edition).syntax_node();
+    let mut out = String::new();
+    let mut whitespace = false;
+    let mut after_operator = false;
+    let mut after_separator = false;
+    for token in expr.descendants_with_tokens().filter_map(|it| it.into_token()) {
+        if token.kind() == SyntaxKind::WHITESPACE {
+            whitespace = true;
+            continue;
+        }
+        let parent = token.parent().map(|it| it.kind());
+        let operator = parent == Some(SyntaxKind::BIN_EXPR);
+        let separator = token.kind() == T![::] && parent == Some(SyntaxKind::PATH);
+        if !out.is_empty()
+            && (operator || after_operator || (whitespace && !separator && !after_separator))
+        {
+            out.push(' ');
+        }
+        out.push_str(token.text());
+        whitespace = false;
+        after_operator = operator;
+        after_separator = separator;
+    }
+    out
+}
+
 fn assert_expand(
     db: &dyn SourceDatabase,
     id: MacroCallId,
@@ -265,14 +296,13 @@ fn assert_expand(
     let panic_args = rest.iter();
     let mac = if rest.is_empty() {
         // Without a message of its own, the assertion reports the condition.
-        let message = format!(
-            "assertion failed: {}",
-            ::tt::stringify(
-                cond.value,
-                &|span, text| source_joined(db, span, text),
-                through_proc_macro(db, id),
-            )
+        let tokens = ::tt::stringify(
+            cond.value,
+            &|span, text| source_joined(db, span, text),
+            through_proc_macro(db, id),
         );
+        let message =
+            format!("assertion failed: {}", assert_condition(&tokens, span.ctx.edition(db)));
         quote! {call_site_span => #dollar_crate::panicking::panic(#message) }
     } else if use_panic_2021(db, span) {
         quote! {call_site_span => #dollar_crate::panic::panic_2021!(# #panic_args) }
@@ -1130,4 +1160,17 @@ fn pattern_type_expand(
     tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Invisible);
     let pound = mk_pound(call_site);
     ExpandResult::ok(quote! {call_site => builtin #pound pattern_type ( #tt ) })
+}
+
+#[cfg(test)]
+mod assert_condition_tests {
+    use super::{Edition, assert_condition};
+
+    #[test]
+    fn formats_the_asserted_expression() {
+        assert_eq!(
+            assert_condition(r#"value<= Self :: MAX && "A :: B".is_empty()"#, Edition::CURRENT),
+            r#"value <= Self::MAX && "A :: B".is_empty()"#,
+        );
+    }
 }

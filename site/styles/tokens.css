@@ -37,6 +37,15 @@
 	--danger: #ff7168;
 	--ok: #4cc27a;
 
+	/* Chart series (renderer core chart.rs): a Subject's slot N is --series-N in every chart. 1 to 3 are orange, blue
+	   and aqua, checked with the dataviz palette validator against --bg in each scheme, all pairs (lightness band,
+	   chroma, colour-blind and normal-vision separation, 3:1 contrast). 4 is a neutral grey for an "everything else"
+	   reference; it is never drawn beside 3 (it fails against aqua) and passes against 1 and 2. */
+	--series-1: #d95926;
+	--series-2: #3987e5;
+	--series-3: #199e70;
+	--series-4: #7f7e82;
+
 	/* Inline code in the docs (Blocks.svelte, dark). Also the diagrams' "changed / rebuilt" ink. */
 	--doc-code-ink: #ff7369;
 	/* Code blocks' plain text. */
@@ -66,5 +75,9 @@
 		--danger: #c4332a;
 		--ok: #2b8a4f;
 		--doc-code-ink: #eb5757;
+		--series-1: #d4561f;
+		--series-2: #2a78d6;
+		--series-3: #138f63;
+		--series-4: #82817d;
 	}
 }

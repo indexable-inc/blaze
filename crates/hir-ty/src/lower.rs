@@ -1894,10 +1894,7 @@ impl InternedOpaqueTyId<'_> {
 
 impl SelfAndAssocBounds {
     #[inline]
-    pub(crate) fn return_type_impl_traits(
-        db: &dyn HirDatabase,
-        def: FunctionId,
-    ) -> &[SelfAndAssocBounds] {
+    pub fn return_type_impl_traits(db: &dyn HirDatabase, def: FunctionId) -> &[SelfAndAssocBounds] {
         &fn_sig_for_fn(db, def).value.impl_traits
     }
 

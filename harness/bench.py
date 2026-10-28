@@ -245,6 +245,40 @@ PROJECTS = {
         ),
         test=["-p", "servo-url"],
     ),
+    # Astral's Python package manager, 92 crates of its own; what astral-experiments/blaze
+    # tested its fork on. On main 7f4e04dcc8 its cold build fails: getrandom's
+    # `getrandom_inner` in the wasm proc macro `const-random-macro` is
+    # `UnresolvedMethod("map_err")`.
+    "uv": dict(
+        repo="astral-sh/uv", tag="0.13.6", rev="329bf9448afd9f9088d14a4d57fbc61eb454f117",
+        build=["-p", "uv", "--bin", "uv"], run=["--version"], named=True,
+        edits=dict(
+            body=body("crates/uv/src/lib.rs", "pub async fn run(cli: Cli, global_initialization: GlobalInitialization) -> Result<ExitStatus> {"),
+            leaf=body("crates/uv-normalize/src/package_name.rs", "    pub fn as_str(&self) -> &str {"),
+            generic=body("crates/uv-fs/src/path.rs", "pub fn normalize_path<'path>(path: impl Into<Cow<'path, Path>>) -> Cow<'path, Path> {"),
+        ),
+        test=["-p", "uv-normalize", "-p", "uv-pep440"],
+    ),
+    # Astral's Python linter and its type checker share one workspace, built a binary each.
+    "ruff": dict(
+        repo="astral-sh/ruff", tag="0.17.3", rev="ba65abf8ba7bfbcc059f7fb9712be5ba9cab6abc",
+        build=["-p", "ruff", "--bin", "ruff"], run=["--version"], named=True,
+        edits=dict(
+            body=body("crates/ruff/src/main.rs", "fn main() -> ExitCode {"),
+            leaf=body("crates/ruff_text_size/src/range.rs", "    pub const fn len(self) -> TextSize {"),
+            generic=body("crates/ruff_python_ast/src/visitor.rs", "pub fn walk_stmt<'a, V: Visitor<'a> + ?Sized>(visitor: &mut V, stmt: &'a Stmt) {"),
+        ),
+        test=["-p", "ruff_text_size", "-p", "ruff_python_parser"],
+    ),
+    "ty": dict(
+        repo="astral-sh/ruff", tag="0.17.3", rev="ba65abf8ba7bfbcc059f7fb9712be5ba9cab6abc",
+        build=["-p", "ty", "--bin", "ty"], run=["--version"], named=True,
+        edits=dict(
+            body=body("crates/ty_python_semantic/src/types.rs", "pub fn check_types(db: &dyn Db, file: ProgramFile<'_>) -> Vec<Diagnostic> {"),
+            leaf=body("crates/ruff_text_size/src/range.rs", "    pub const fn len(self) -> TextSize {"),
+        ),
+        test=["-p", "ty_python_semantic", "--lib"],
+    ),
     # 1.25M lines of Rust in 103 crates, with the C and C++ of a JavaScript runtime (bun's port
     # from Zig, docs/research/bun.md). Its own build makes the C and C++ once per revision
     # (bunprep.py), and its pinned nightly builds the Rust. Measured only when named.
@@ -267,7 +301,7 @@ PROJECTS = {
     # router and the mocker, without a GPU (CUDA is loaded at run time, NIXL is nixl-sys's
     # stubs). Its build scripts need protoc and libclang. cargo builds with the project's pin
     # (rust-toolchain.toml), as its users do: blaze's nightly does not compile dynamo-llm
-    # (E0277 in block_manager, bench/results/2026-10-27-dynamo).
+    # (E0277 in block_manager, tools/bench/results/2026-10-27-dynamo).
     "dynamo": dict(
         repo="ai-dynamo/dynamo", tag="v1.6.1", rev="0d9c24a8bf6db13c1a1223cf15fcbee9140d1ac3",
         env=dict(RUSTUP_TOOLCHAIN="1.96.1"), named=True,
@@ -277,6 +311,57 @@ PROJECTS = {
             leaf=body("lib/tokens/src/lib.rs", "    pub fn remaining(&self) -> usize {"),
         ),
         test=["-p", "dynamo-tokens"],
+    ),
+    # A file finder (formerly fff.nvim): its MCP server, over the search core, the grep and the
+    # query parser. The run is its health check, which prints the paths it is given as given.
+    "fff": dict(
+        repo="dmtrKovalenko/fff", tag="v0.11.0", rev="95fd777c2529fc7b4d7572dabff64cc07268f2c5",
+        build=["-p", "fff-mcp", "--bin", "fff-mcp"],
+        run=["--healthcheck", "--frecency-db", "target/bench-fff/frecency", "--history-db", "target/bench-fff/history",
+             "--log-file", "target/bench-fff/fff.log", "crates"],
+        edits=dict(
+            body=body("crates/fff-mcp/src/main.rs", "fn resolve_defaults(args: &mut Args) {"),
+            # Defined in the query parser, called from the core, the server and the Neovim binding.
+            signature=parameter("crates/fff-query-parser/src/parser.rs", "grep_text", "String", "crates/**/*.rs"),
+            leaf=body("crates/fff-grep/src/matcher.rs", "    pub fn len(&self) -> usize {"),
+            # Instantiated for each ParserConfig (the file picker's, grep's, the default).
+            generic=body("crates/fff-query-parser/src/parser.rs",
+                         "fn parse_token<'a, C: ParserConfig>(token: &'a str, config: &C) -> Option<Constraint<'a>> {"),
+        ),
+        test=["-p", "fff-query-parser", "-p", "fff-grep", "-p", "fff-search"],
+    ),
+    # A video rendering framework: its hello-world example's renderer, over FFmpeg (a prebuilt
+    # static one ffmpeg-sys-fframes downloads) and Skia. The run is one frame by the CPU
+    # backend. Its build scripts need nasm and libclang: measured only when named.
+    "fframes": dict(
+        repo="dmtrKovalenko/fframes", tag="v1.3.0", rev="69174f0187b5d8e92329246898f70250b59f08f2", named=True,
+        build=["-p", "hello-world-example", "--bin", "hello_world_example_bin"],
+        run=["--renderer", "cpu", "svg", "1s"],
+        edits=dict(
+            body=body("examples/hello-world/src/main.rs", "fn main() -> ExitCode {"),
+            # fframes-media is below fframes and its media proc macro.
+            leaf=body("fframes-media/src/audio.rs", "    pub fn duration_in_seconds(&self) -> f32 {"),
+            generic=body("fframes/src/fframes_context.rs",
+                         "    pub fn get_scene_info<T: crate::Scene>(&self, scene: &T) -> Option<&crate::SceneInfo> {"),
+        ),
+        test=["-p", "fframes", "-p", "fframes-media", "-p", "webvtt-parser", "-p", "fframes-media-dir-macro"],
+    ),
+    # The environment manager built on Nix: its CLI over the SDK, the manifest and the catalog
+    # client. Its crates read Nix store paths at compile time, which floxprep.py takes from its
+    # flake: measured only when named.
+    "flox": dict(
+        repo="flox/flox", tag="v1.19.2", rev="87d931382dc5c53f32af662c9611c6a58d669952",
+        prepare="floxprep", env=dict(FLOX_DISABLE_METRICS="true"),
+        build=["-p", "flox", "--bin", "flox"], run=["--version"],
+        edits=dict(
+            body=body("cli/flox/src/main.rs", "fn main() -> ExitCode {"),
+            # Defined in the manifest crate, called from the CLI's `upgrade`.
+            signature=parameter("cli/flox-manifest/src/parsed/v1_10_0/package_descriptor.rs", "package_identifier", "&str", "cli/**/*.rs"),
+            leaf=body("cli/flox-core/src/floxhub.rs", "    pub fn api_url_str(&self) -> String {"),
+            generic=[("cli/flox-rust-sdk/src/utils/mod.rs", "    let mut serialized = serde_json::to_string_pretty(value)?;",
+                      "    let _bench_edit = 1u32;\n    let mut serialized = serde_json::to_string_pretty(value)?;")],
+        ),
+        test=["-p", "flox-core", "-p", "flox-config", "--features", "flox-core/tests"],
     ),
     # A game: built, not run (it opens a window). Its own code is small; the engine is ~400 crates.
     "bevy": dict(

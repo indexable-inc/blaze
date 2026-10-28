@@ -707,11 +707,22 @@ impl Worker {
         // worker was started on is built already, and is asked for too: what the worker then
         // compiles again by itself, for the first edit to be a patch, is part of warming up.
         // A program the worker does not build is cargo's, and the others are still its own:
-        // the checkout failed to load only when it builds none.
+        // the checkout failed to load only when it builds none. The programs are asked for
+        // all at once, as `sync` does: the worker builds them side by side, so their links
+        // overlap, where one after another each waited for the link of the one before.
+        let asked: Vec<anyhow::Result<Result<String, NotBuilt>>> = std::thread::scope(|scope| {
+            let asking: Vec<_> = checkout
+                .programs
+                .iter()
+                .map(|plan| scope.spawn(|| self.ask(checkout, plan)))
+                .collect();
+            let panicked = || Err(anyhow::anyhow!("asking the worker panicked"));
+            asking.into_iter().map(|it| it.join().unwrap_or_else(|_| panicked())).collect()
+        });
         let mut not_built = None;
         let mut built = false;
-        for plan in &checkout.programs {
-            match self.ask(checkout, plan)? {
+        for asked in asked {
+            match asked? {
                 Ok(_) => built = true,
                 Err(NotBuilt::Error(said)) => return Ok(Some(said)),
                 Err(why) => _ = not_built.get_or_insert(why),
@@ -1190,11 +1201,12 @@ pub fn socket_in(home: &Path) -> PathBuf {
     home.join("daemon.sock")
 }
 
-/// What two processes have to agree on to talk: the version of the crate and the executable
-/// itself, so that a daemon of an older build of the same version is replaced too. The
-/// executable is told by where it is as well as by its size and time: every build in the nix
-/// store has the same time, and two builds of a small change can have the same size, but no
-/// two have the same path.
+/// What two processes have to agree on to talk: the executable itself, so that a daemon of
+/// any other build is replaced. The executable is told by where it is as well as by its size
+/// and time: every build in the nix store has the same time, and two builds of a small change
+/// can have the same size, but no two have the same path. No version of blaze's: an
+/// executable's place, size and time already tell one release from another, and the version is
+/// the engine's alone (crates/blaze-engine/build.rs).
 pub fn version() -> String {
     let executable = std::env::current_exe().and_then(std::fs::canonicalize);
     let place: String = executable.as_ref().map_or_else(
@@ -1207,7 +1219,7 @@ pub fn version() -> String {
     let built = executable.and_then(std::fs::metadata);
     let built = built.map(|it| (it.len(), it.modified().map_or(0, stamp_of)));
     let (len, written) = built.unwrap_or_default();
-    format!("{}-{place}-{len:x}-{written:x}", env!("CARGO_PKG_VERSION"))
+    format!("{place}-{len:x}-{written:x}")
 }
 
 /// `blaze-engine daemon`: serves the user's builds until it has been idle for long enough or is

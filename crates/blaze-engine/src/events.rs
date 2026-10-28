@@ -131,14 +131,8 @@ fn cold_ahead(store: Option<&blaze_store::Store>, this: &str) -> Option<String> 
         return Some(format!("there is no store ({})", blaze_cargo::cargo::daemon::no_store()));
     };
     match store.last_writer() {
-        Some(other) if other != this => {
-            let mut parts = other.split('-');
-            let release = parts.next().unwrap_or_default();
-            Some(match parts.next() {
-                Some(commit) => format!("cache keys changed since blaze {release} ({commit})"),
-                None => format!("cache keys changed since blaze {release}"),
-            })
-        }
+        // `other` is the `--version` line of the blaze that wrote last.
+        Some(other) if other != this => Some(format!("cache keys changed since {other}")),
         Some(_) => None,
         None => Some("the store is empty".to_owned()),
     }
