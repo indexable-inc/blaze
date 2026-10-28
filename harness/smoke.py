@@ -22,9 +22,7 @@ arguments of `test`) passes. A private repository is fetched with GH_TOKEN. A pr
 `env` for its builds, `seconds` for each command (default 3600), and `prepare`, a module of the
 harness whose `prepare(checkout)` gives the tree to build and the environment its builds need
 (bun: bunprep.py, its own build of its C and C++). A project's `dir` is where in the checkout its
-workspace is (codex: `codex-rs`): its runs, tests and builds start there. One with `fetches`
-has a build script that downloads a prebuilt library (codex: v8), which a user records once
-with `blaze lock --fetches` (docs/cargo.md): that runs first, as a step of its own. Its `builds` are `blaze
+workspace is (codex: `codex-rs`): its runs, tests and builds start there. Its `builds` are `blaze
 build` with `args` in that directory's `dir` (a workspace of its own, as dynamo's Python bindings
 are), each then running `then` (`{target}` is that directory's target/<profile>) to print what it
 says. `macos` holds the fields that are otherwise on macOS, and `excluded` says what the corpus
@@ -290,12 +288,6 @@ class Smoke:
                 return None
             return judge
 
-        if spec.get("fetches"):
-            self.check(f"{name} lock fetches", [self.blaze, "lock", "--fetches"], cwd, env, seconds, judged({}),
-                       f"{clone} && blaze lock --fetches", spec.get("open"))
-            if not self.results[-1]["ok"]:
-                return
-            clone = f"{clone} && blaze lock --fetches"
         for profile in self.profiles:
             p = self.profile_args(profile)
             for i, step in enumerate(spec.get("builds", [])):
