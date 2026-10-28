@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """unittests.py: the crates' own tests, with the ones known to fail named.
 
-usage: unittests.py [--cargo] [test argument ...]
+usage: unittests.py [CONFIG]
+
+CONFIG is one JSON object, inline, in a file, or `-` for standard input, `{}` when left out:
+
+    {"cargo": false, "args": ["<test argument>", ...]}
 
 Runs `blaze test --release --no-fail-fast` of CRATES (blaze tests blaze, AGENTS.md rule
-blaze-builds-blaze; `--cargo`: plain `cargo test`, on Windows, which has no release of blaze to
-test with yet), one run in the root workspace, with the arguments given. A failing test that is not in OPEN fails the run, and so does a test in
+blaze-builds-blaze; `"cargo": true`: plain `cargo test`, on Windows, which has no release of
+blaze to test with yet), one run in the root workspace, with `args` after its own. Each line of
+the run is passed on as it comes, so a CI log shows a slow build while it is slow. A failing test that is not in OPEN fails the run, and so does a test in
 OPEN that passes or no longer exists: take it out; so does the cargo run failing before any of
 its tests failed. `ide-diagnostics` is the daemon's errors (its diagnostics are the verdict).
 `hir-ide` is rust-analyzer's type inference with its own tests; the ones in OPEN are what the
 fork does differently from upstream that its expectations have not caught up with.
 """
-import os, re, subprocess, sys
+import dataclasses, json, os, re, subprocess, sys, typing
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CRATES = [
@@ -76,7 +81,10 @@ def run(command, cwd, env, seen, failed):
     proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
     binary, any_failed = "?", False
     for line in proc.stdout:
+        # Flushed: a pipe's buffer (128 KiB from Python 3.14) held a whole build's lines until
+        # the tests' output filled it, so CI's log showed nothing for half an hour.
         sys.stdout.write(line)
+        sys.stdout.flush()
         line = COLOR.sub("", line)
         if m := RUNNING.match(line) or DOCTESTS.match(line):
             binary = m.group(1).replace("-", "_")
@@ -89,10 +97,41 @@ def run(command, cwd, env, seen, failed):
     return proc.wait(), any_failed
 
 
+@dataclasses.dataclass(frozen=True)
+class Config:
+    # Plain `cargo test`, where there is no release of blaze to test with (Windows).
+    cargo: bool = False
+    # Passed after the command's own arguments.
+    args: list = dataclasses.field(default_factory=list)
+
+
+def config(argv: list[str]) -> Config:
+    """The one JSON value of the command line, as a `Config`; `{}` when there is none."""
+    if len(argv) > 1:
+        sys.exit("usage: unittests.py [CONFIG], one JSON object (see the top of the file)")
+    argument = argv[0] if argv else "{}"
+    text = sys.stdin.read() if argument == "-" else open(argument).read() if os.path.isfile(argument) else argument
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as e:
+        sys.exit(f"unittests.py: the configuration is not JSON: {e}")
+    if not isinstance(value, dict):
+        sys.exit("unittests.py: the configuration is a JSON object")
+    fields = {f.name for f in dataclasses.fields(Config)}
+    hints = typing.get_type_hints(Config)
+    for key, item in value.items():
+        if key not in fields:
+            sys.exit(f"unittests.py: `{key}` is not a field of the configuration ({', '.join(sorted(fields))})")
+        if type(item) is not hints[key]:
+            sys.exit(f"unittests.py: `{key}` is a {hints[key].__name__}, not {json.dumps(item)}")
+    if not all(isinstance(it, str) for it in value.get("args", [])):
+        sys.exit("unittests.py: `args` is a list of strings")
+    return Config(**value)
+
+
 def main():
-    args = sys.argv[1:]
-    plain = args[:1] == ["--cargo"]
-    args = args[plain:]
+    cfg = config(sys.argv[1:])
+    plain, args = cfg.cargo, cfg.args
     command = [*(["cargo"] if plain else ["blaze"]), "test", "--release", "--no-fail-fast", *(f"-p{c}" for c in CRATES), *args]
     open_ = OPEN if plain else OPEN | OPEN_BLAZE
     # Under CI rust-analyzer's slow tests run, and mark that they did in the target directory.
