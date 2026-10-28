@@ -5,7 +5,7 @@ site {
   learn {
     macros : Page {
       Narrow
-      Lesson: {3, "Why running them as sandboxed WebAssembly makes their output cacheable."}
+      Lesson: {3, "Why running them as sandboxed WebAssembly makes their output cacheable.", "sandbox"}
       Title: {"Proc macros"}
       Description: {"Lesson 3: what proc macros are, and why blaze runs them as sandboxed WebAssembly."}
       Intro: {"[warm] Lesson three. Proc macros: little programs that run in the middle of your build, and why blaze puts them in a box."}

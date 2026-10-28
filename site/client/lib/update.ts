@@ -8,15 +8,16 @@
  *   so client/nav.ts fetches the page in view again and swaps it in where it is (`blaze:refresh`).
  *
  * Either waits for a moment that loses the reader nothing: not while they type in a field with text in it, play the
- * narration, or drag; a hidden tab goes at once (unless it is playing). Until then a pop-up says an update is ready,
- * with a button to take it now. Just before, every script that owns state puts it in sessionStorage (`blaze:save`,
- * client/lib/page.ts): the page's scroll, the chat's (client/lib/chat.ts `save`), comment drafts (client/comments.ts),
+ * narration, or drag; a hidden tab goes at once (unless it is playing). Until then a line in the feed
+ * (client/lib/feed.ts) says an update is ready, with a button to take it now. Just before, every script that owns state puts it in sessionStorage (`blaze:save`,
+ * client/lib/page.ts): the page's scroll, the feed input's (client/lib/chat.ts `save`), comment drafts (client/comments.ts),
  * the narration's place (client/listen.ts). After the load each takes its part back once, and this clears the rest.
  *
  * After a reload whose assets still differ (a CDN behind), it doesn't reload again for LOOP_MS.
  */
 
 import * as chat from './chat';
+import * as feed from './feed';
 import { KEPT, REFRESH, REFRESHED, SAVE, kept } from './page';
 
 /** The hash of the client scripts and styles this bundle was built with (gen/build.ts, Bun.build `define`). */
@@ -41,7 +42,7 @@ let poll: ReturnType<typeof setInterval> | undefined;
 let dragging = false;
 
 // What was saved before the reload that loaded this page: the chat takes its part now; the page's scroll and the
-// "updated" pop-up wait for the load and the first frame.
+// "updated" line wait for the load and the first frame.
 const back = kept<{ scroll?: number }>('page');
 {
 	const c = kept<chat.Kept>('chat');
@@ -151,7 +152,7 @@ function attempt(force = false): void {
 	dispatchEvent(new Event(REFRESH));
 }
 
-/** Nothing waits any more: the pop-up and the poll go. */
+/** Nothing waits any more: the feed's line and the poll go. */
 function settle(): void {
 	want = null;
 	hideReady?.();
@@ -173,14 +174,14 @@ function save(): void {
 
 /** An update is waiting on the reader: say so, with a way to take it now, and look again every few seconds. */
 function ready(): void {
-	hideReady ??= chat.notice('A new version of the site is ready', 'It loads when you pause; your drafts and place are kept.', {
+	hideReady ??= feed.notice('A new version of the site is ready', 'It loads when you pause; your drafts and place are kept.', {
 		action: { label: want?.kind === 'refresh' ? 'Update now' : 'Reload now', run: () => attempt(true) },
 	});
 	poll ??= setInterval(() => attempt(), POLL_MS);
 }
 
 function done(): void {
-	chat.notice('Site updated', 'You are reading the latest version.', { ms: DONE_MS });
+	feed.notice('Site updated', 'You are reading the latest version.', { ms: DONE_MS });
 }
 
 // Hiding the tab is the moment to go; otherwise the poll looks. Not on blur or pointerup: those come just before a

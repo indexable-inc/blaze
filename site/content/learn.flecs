@@ -1,4 +1,4 @@
-// /learn: the lessons' parent (content/learn/*.flecs are /learn/<slug>). The course map itself is on the home page
+// /learn: the lessons' parent (content/learn/*.flecs are /learn/<slug>). The course path itself is on the home page
 // (site.flecs, `Course map { (Lessons, site.learn) }`), and the worker answers /learn with a 301 to / (worker/index.ts);
 // this page is what a host without the worker serves there. Each lesson is a page under site.learn with
 // Lesson {order, line}, made of Steps, one idea per screen, with questions woven in; client/learn.ts turns it into one

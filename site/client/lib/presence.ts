@@ -4,34 +4,37 @@
  * is hidden; what comes back is everyone on the site, drawn three places:
  *
  * - the top line of the pane (`.topline`, made here, outside `.grid` so a swap keeps it; on a phone it sits in the
- *   phone bar instead): the page's discussion
- *   (its comment count, a jump to it) on a page that has one, the faces on this page (click: everyone on the site
- *   and where), the chat (client/lib/chat.ts, which rides this socket), and the reader: their GitHub avatar and login
- *   with Sign out, or Sign in with GitHub;
+ *   phone bar instead): Chat, which opens the feed's history and input as T does (client/lib/feed.ts; the chat itself
+ *   is client/lib/chat.ts, which rides this socket), the faces on this page (click: everyone on the site and where),
+ *   and the reader: their GitHub avatar and login with Sign out, or Sign in with GitHub;
  * - the sidebar: a small stack of faces on each page's row that someone else is reading, and when one of them says
  *   something in the chat, a speech bubble out of their face for a few seconds (`speak`);
  * - comments: when someone posts or deletes one, the worker says so here, and client/comments.ts refreshes the
  *   threads of that doc if it is the page shown;
  * - the page itself: the pointers of the others on it, and where on it each is reading (client/lib/cursors.ts, which
- *   rides this socket too).
+ *   rides this socket too), and what they type in the chat's input (T), live by their pointer;
+ * - the feed at the bottom left (client/lib/feed.ts): who joined the site and who left it.
  *
  * The socket also says which build of the site is live (a `build` frame on every connect): client/lib/update.ts takes
  * a new one in, a reload or a swap in place.
  *
  * Without JS, or with the socket down, the page is as it was.
  *
- * Signed-in people are their GitHub avatar; anonymous ones a GitHub-style identicon of the key the worker gives them
- * (a hash, new every day). Someone whose tab is hidden is drawn faded ("away").
+ * Signed-in people are their GitHub avatar. Anonymous ones are named and drawn from the key the worker gives them (a
+ * hash, new every day): "Quiet Otter", and an otter's face (gen/animals.ts, compiled into one sprite by gen/build.ts)
+ * in their hue, the colour of their cursor too (client/lib/cursors.ts). Someone whose tab is hidden is drawn faded
+ * ("away").
  */
 
 import { tipOn } from './tip';
 import * as chat from './chat';
 import * as cursors from './cursors';
+import * as feed from './feed';
 import * as update from './update';
-import { COMMENTS, LEAVE, PAGE, THREADS, onPage } from './page';
+import { COMMENTS, LEAVE, PAGE, onPage } from './page';
 
 type Who = { key: string; login: string | null; avatar: string | null };
-type Person = Who & { country: string | null; since?: number; pages: { path: string; away: boolean }[] };
+type Person = Who & { country: string | null; since?: number; devices?: string[]; pages: { path: string; away: boolean }[] };
 type You = Who & { signIn: boolean };
 
 /** The site's base (`/blaze/`), from the stylesheet the renderer linked as `<base>/site.css`. */
@@ -44,6 +47,13 @@ const BASE = (() => {
 })();
 const SVG = 'http://www.w3.org/2000/svg';
 const ROW_FACES = 3;
+/** Only someone whose visit began this recently is new (a reload or a reconnect keeps their start: worker/presence.ts). */
+const ARRIVAL_MS = 20_000;
+const ARRIVAL_GAP_MS = 4000;
+/** Someone is gone once they have been off the list this long: a reload, a move between pages, a reconnect come back sooner. */
+const LEAVE_MS = 8000;
+const SETTLE_MS = 15_000;
+let connectedAt = 0;
 const BAR_FACES = 5;
 
 let you: You | null = null;
@@ -67,15 +77,11 @@ const ADJECTIVES = [
 	'Happy', 'Jolly', 'Kind', 'Lucky', 'Merry', 'Mighty', 'Nimble', 'Quiet', 'Rapid', 'Rusty', 'Shiny', 'Sleepy',
 	'Snappy', 'Sunny', 'Swift', 'Tidy', 'Witty', 'Zesty', 'Plucky', 'Cozy',
 ];
-const ANIMALS = [
-	'Otter', 'Fox', 'Panda', 'Koala', 'Falcon', 'Badger', 'Heron', 'Lynx', 'Moose', 'Owl', 'Penguin', 'Rabbit', 'Raven',
-	'Seal', 'Sparrow', 'Tiger', 'Turtle', 'Walrus', 'Whale', 'Wombat', 'Yak', 'Zebra', 'Crab', 'Gecko', 'Hedgehog',
-	'Lemur', 'Llama', 'Narwhal', 'Octopus', 'Puffin', 'Squid', 'Crane',
-];
-const anonName = (key: string) => {
-	const n = parseInt(key.slice(1, 7), 16) || 0;
-	return `${ADJECTIVES[n % ADJECTIVES.length]} ${ANIMALS[Math.floor(n / ADJECTIVES.length) % ANIMALS.length]}`;
-};
+/** The animals (gen/animals.ts, the one table of names and faces) and the sprite they are drawn in, from gen/build.ts. */
+declare const BLAZE_ANIMALS: { sprite: string; names: string[] };
+const ANIMALS = BLAZE_ANIMALS.names;
+const anonAnimal = (key: string) => ANIMALS[Math.floor((parseInt(key.slice(1, 7), 16) || 0) / ADJECTIVES.length) % ANIMALS.length];
+const anonName = (key: string) => `${ADJECTIVES[(parseInt(key.slice(1, 7), 16) || 0) % ADJECTIVES.length]} ${anonAnimal(key)}`;
 const name = (w: Who) => (w.login ? `@${w.login}` : anonName(w.key));
 const awayOn = (p: Person, path: string) => p.pages.filter((x) => x.path === path).every((x) => x.away);
 
@@ -86,27 +92,14 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls = '', text = ''):
 	return e;
 }
 
-/** GitHub's identicon: a 5x5 grid mirrored left to right, cells and hue from the key. */
-function identicon(key: string): SVGSVGElement {
-	const hex = key.slice(1).padEnd(12, '0');
-	const nib = [...hex].map((c) => parseInt(c, 16) || 0);
+/** An anonymous reader's animal, from the sprite (its symbols are `animal-<name>`, gen/animals.ts `symbolId`). */
+function animalFace(key: string): SVGSVGElement {
 	const svg = document.createElementNS(SVG, 'svg');
-	svg.setAttribute('viewBox', '-0.5 -0.5 6 6');
+	svg.setAttribute('viewBox', '0 0 32 32');
 	svg.setAttribute('aria-hidden', 'true');
-	const hue = ((nib[0] << 4) | nib[1]) * (360 / 256);
-	svg.style.setProperty('--id-ink', `hsl(${hue.toFixed(0)} 55% 58%)`);
-	for (let y = 0; y < 5; y++)
-		for (let x = 0; x < 3; x++) {
-			if ((nib[(y * 3 + x) % 12] + y) % 2 === 0) continue;
-			for (const cx of x === 2 ? [2] : [x, 4 - x]) {
-				const r = document.createElementNS(SVG, 'rect');
-				r.setAttribute('x', String(cx));
-				r.setAttribute('y', String(y));
-				r.setAttribute('width', '1');
-				r.setAttribute('height', '1');
-				svg.append(r);
-			}
-		}
+	const use = document.createElementNS(SVG, 'use');
+	use.setAttribute('href', `${BASE}${BLAZE_ANIMALS.sprite}#animal-${anonAnimal(key).toLowerCase()}`);
+	svg.append(use);
 	return svg;
 }
 
@@ -121,7 +114,12 @@ function face(w: Who, away = false): HTMLElement {
 		img.referrerPolicy = 'no-referrer';
 		img.loading = 'lazy';
 		f.append(img);
-	} else f.append(identicon(w.key));
+	} else {
+		// The hue cursors.ts's `hueOf` gives the same key, so their face and their pointer match.
+		f.classList.add('animal');
+		f.style.setProperty('--h', ((parseInt(w.key.slice(1, 3), 16) || 0) * (360 / 256)).toFixed(0));
+		f.append(animalFace(w.key));
+	}
 	return f;
 }
 
@@ -138,16 +136,108 @@ function titleOf(path: string): string {
 	return a?.title || a?.dataset.tip || a?.textContent?.trim() || path;
 }
 
+/** Who was here at the last list, null before the first: a key new since then, who came just now, gets a line. */
+let known: Map<string, Person> | null = null;
+let lastArrival = 0;
+let lastLeave = 0;
+/** Who went missing from the list, and when they are taken as gone (LEAVE_MS later). */
+const missing = new Map<string, { p: Person; timer: ReturnType<typeof setTimeout> }>();
+
+/** "Merry Tiger joined on Charter", "@ana left (was on Install)", in the feed (not when muted: client/lib/feed.ts). */
+function line(kind: 'join' | 'leave', p: Person, more: number): void {
+	const page = p.pages[0]?.path;
+	feed.push({
+		kind,
+		face: face(p),
+		who: `${name(p)}${more ? ` and ${more} more` : ''}`,
+		text: kind === 'join' ? `joined ${page ? `on ${titleOf(page)}` : 'the site'}` : `left${page ? ` (was on ${titleOf(page)})` : ''}`,
+		href: page ? href(page) : undefined,
+	});
+}
+
+/**
+ * Who came and who went, against the last list. Right after this tab (re)connects everyone else is new to it, and after
+ * a deploy everyone reconnects at once: none of either then. A crowd at once is one line, not a stack.
+ */
+function announce(): void {
+	const now = Date.now();
+	const settling = known === null || now - connectedAt < SETTLE_MS;
+	const here = new Map(people.map((p) => [p.key, p]));
+	const fresh = settling ? [] : people.filter((p) => !known!.has(p.key) && !missing.has(p.key) && p.key !== you?.key && now - (p.since ?? 0) < ARRIVAL_MS);
+	// Back within LEAVE_MS (a reload, a reconnect): never gone.
+	for (const [k, m] of missing) {
+		if (!here.has(k)) continue;
+		clearTimeout(m.timer);
+		missing.delete(k);
+	}
+	// Gone from a list cut short (more online than it carries) may only be out of it.
+	if (!settling && known && people.length >= total) {
+		for (const [k, p] of known) {
+			if (here.has(k) || k === you?.key || missing.has(k)) continue;
+			missing.set(k, { p, timer: setTimeout(() => left(k), LEAVE_MS) });
+		}
+	}
+	known = here;
+	if (!fresh.length || now - lastArrival < ARRIVAL_GAP_MS) return;
+	lastArrival = now;
+	line('join', fresh[0], fresh.length - 1);
+}
+
+/** Still off the list LEAVE_MS after they went: gone, said with the others who went with them. */
+function left(key: string): void {
+	const m = missing.get(key);
+	missing.delete(key);
+	if (!m || people.some((p) => p.key === key) || Date.now() - connectedAt < SETTLE_MS) return;
+	const now = Date.now();
+	if (now - lastLeave < ARRIVAL_GAP_MS) return;
+	lastLeave = now;
+	// Whoever else is gone by now goes in the same line.
+	const with_ = [...missing.entries()].filter(([k]) => !people.some((p) => p.key === k));
+	for (const [k, x] of with_) {
+		clearTimeout(x.timer);
+		missing.delete(k);
+	}
+	line('leave', m.p, with_.length);
+}
+
 // ---- The top line -------------------------------------------------------------------------------------------------
 
 const bar = el('div', 'topline');
-bar.setAttribute('aria-label', 'Discussion and who is here');
-const discussSlot = el('span', 'tl-discuss');
+bar.setAttribute('aria-label', 'Chat and who is here');
 const hereSlot = el('span', 'tl-here');
 const meSlot = el('span', 'tl-me');
-const chatSlot = el('span', 'tl-chatslot');
-chatSlot.append(chat.button);
-bar.append(discussSlot, el('span', 'tl-gap'), hereSlot, chatSlot, meSlot);
+// Chat: the feed's history and input (client/lib/feed.ts), as T opens them.
+const chatBtn = el('button', 'tl-btn tl-chat');
+chatBtn.type = 'button';
+chatBtn.append(el('span', 'tl-bubble'), el('span', 'tl-label', 'Chat'));
+tipOn(chatBtn, feed.hint() ? 'Chat with everyone on the site (T)' : 'Chat with everyone on the site');
+chatBtn.addEventListener('click', () => feed.open());
+// Shut the sidebar for more room to read (a wide screen's; a phone's is a drawer already). Remembered per browser.
+const SIDE_SHUT = 'blaze.side.shut';
+const sideBtn = el('button', 'tl-btn tl-side');
+sideBtn.type = 'button';
+sideBtn.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="2"/><path d="M6.5 3v10"/></svg>';
+function shutSide(shut: boolean, keep = true): void {
+	document.body.classList.toggle('side-shut', shut);
+	sideBtn.setAttribute('aria-pressed', String(shut));
+	tipOn(sideBtn, shut ? 'Show the sidebar' : 'Hide the sidebar');
+	if (!keep) return;
+	try {
+		if (shut) localStorage.setItem(SIDE_SHUT, '1');
+		else localStorage.removeItem(SIDE_SHUT);
+	} catch {
+		// Storage refused: shut for this page only.
+	}
+}
+let wasShut = false;
+try {
+	wasShut = localStorage.getItem(SIDE_SHUT) === '1';
+} catch {
+	// Storage refused: open.
+}
+shutSide(wasShut, false);
+sideBtn.addEventListener('click', () => shutSide(!document.body.classList.contains('side-shut')));
+bar.append(sideBtn, chatBtn, el('span', 'tl-gap'), hereSlot, meSlot);
 const list = el('div', 'tl-list');
 list.hidden = true;
 list.id = 'who-is-here';
@@ -170,19 +260,6 @@ function closeList(): void {
 	hereSlot.querySelector('button')?.setAttribute('aria-expanded', 'false');
 }
 
-/** The page's discussion: its comments, counted from the threads the page was rendered with. */
-function drawDiscuss(): void {
-	discussSlot.replaceChildren();
-	if (!document.querySelector('main #discussion')) return;
-	const n = document.querySelectorAll('main .c-item').length;
-	const a = el('a', 'tl-btn');
-	a.href = '#discussion';
-	tipOn(a, n === 0 ? 'Discuss this page' : `${n} comment${n === 1 ? '' : 's'} on this page`);
-	a.append(el('span', 'tl-bubble'), el('span', 'tl-label', n === 0 ? 'Discuss' : n === 1 ? 'comment' : 'comments'));
-	if (n > 0) a.insertBefore(el('span', 'tl-n', String(n)), a.lastChild);
-	discussSlot.append(a);
-}
-
 function drawHere(): void {
 	const path = sitePath();
 	const on = people.filter((p) => p.pages.some((x) => x.path === path));
@@ -193,7 +270,7 @@ function drawHere(): void {
 	b.setAttribute('aria-expanded', String(!list.hidden));
 	b.setAttribute('aria-controls', list.id);
 	b.append(el('span', 'tl-dot'), stack(on, BAR_FACES, path), el('span', 'tl-count', on.length <= 1 ? `${total} online` : `${on.length} here`));
-	tipOn(b, `${on.length} on this page, ${total} on the site`);
+	tipOn(b, `${on.length} on this page, ${total} on the site${feed.hint() ? '. Press T or Enter to chat' : ''}`);
 	b.addEventListener('click', (e) => {
 		e.stopPropagation();
 		if (!list.hidden) return closeList();
@@ -221,6 +298,27 @@ function flag(cc: string): HTMLElement {
 	return f;
 }
 
+/** What they read on, as a small outline: each kind of device they have a tab on. */
+const DEVICES: Record<string, [string, string]> = {
+	computer: ['On a computer', '<rect x="3" y="3.5" width="10" height="7" rx="1"/><path d="M1.5 12.5h13"/>'],
+	phone: ['On a phone', '<rect x="5" y="1.5" width="6" height="13" rx="1.5"/><path d="M7.3 12.5h1.4"/>'],
+	tablet: ['On a tablet', '<rect x="3" y="1.5" width="10" height="13" rx="1.5"/><path d="M7.3 12.5h1.4"/>'],
+};
+function devices(p: Person): HTMLElement | null {
+	const kinds = (p.devices ?? []).filter((d) => DEVICES[d]);
+	if (!kinds.length) return null;
+	const s = el('span', 'devices');
+	for (const d of kinds) {
+		const [label, paths] = DEVICES[d];
+		const i = el('span', 'device');
+		i.innerHTML = `<svg viewBox="0 0 16 16" aria-hidden="true">${paths}</svg>`;
+		tipOn(i, label);
+		i.setAttribute('aria-label', label);
+		s.append(i);
+	}
+	return s;
+}
+
 /** How long since `t`, short: now, 5m, 2h, 3d. */
 function ago(t: number): string {
 	const m = Math.floor((Date.now() - t) / 60_000);
@@ -235,46 +333,62 @@ function drawList(): void {
 	const flip = cursors.toggle();
 	if (flip) head.append(flip);
 	list.replaceChildren(head);
+	// Here now first, then those with every tab in the background; you lead your group, the rest by who came first.
+	const active = (p: Person) => p.pages.some((x) => !x.away);
+	const order = (p: Person) => (active(p) ? 0 : 2) + (p.key === you?.key ? 0 : 1);
+	const sorted = [...people].sort((a, b) => order(a) - order(b) || (a.since ?? 0) - (b.since ?? 0));
 	const ul = el('ul');
-	for (const p of people) {
-		const li = el('li');
-		const who = p.login ? el('a', 'who', name(p)) : el('span', 'who', name(p));
+	let awayHead = false;
+	for (const p of sorted) {
+		const on = active(p);
+		if (!on && !awayHead && sorted.some(active)) {
+			ul.append(el('li', 'tl-sub', 'In the background'));
+			awayHead = true;
+		}
+		const li = el('li', on ? '' : 'away');
+		const av = el('span', 'tl-av');
+		const dot = el('span', on ? 'dot on' : 'dot');
+		tipOn(dot, on ? 'Here now' : 'Every tab in the background');
+		av.append(face(p, !on), dot);
+		// The name (a GitHub link for the signed in, without the @: the list is of people, not handles), then where they
+		// are and how long they have been here, on a quieter line.
+		const top = el('span', 'tl-name');
+		const who = p.login ? el('a', 'who', p.login) : el('span', 'who', name(p));
 		if (who instanceof HTMLAnchorElement) {
 			who.href = `https://github.com/${encodeURIComponent(p.login!)}`;
 			who.rel = 'nofollow noopener';
 		}
-		// The dot: green while a tab of theirs is in front of them, hollow while every one is in the background.
-		const active = p.pages.some((x) => !x.away);
-		const av = el('span', 'tl-av');
-		const dot = el('span', active ? 'dot on' : 'dot');
-		tipOn(dot, active ? 'Here now' : 'Tab in the background');
-		av.append(face(p, !active), dot);
-		li.append(av, who);
-		if (p.country) li.append(flag(p.country));
-		if (p.key === you?.key) li.append(el('span', 'tag', 'you'));
-		// The page in front of them, the rest of their tabs as +N (named in its tooltip).
-		const where = el('span', 'where');
+		top.append(who);
+		if (p.key === you?.key) top.append(el('span', 'tag', 'you'));
+		if (p.country) top.append(flag(p.country));
+		const meta = el('span', 'tl-meta');
 		const [front, ...rest] = p.pages;
 		if (front) {
-			const a = el('a', front.away ? 'away' : '', titleOf(front.path));
+			const a = el('a', 'where', titleOf(front.path));
 			a.href = href(front.path);
-			where.append(a);
+			meta.append(a);
 		}
 		if (rest.length) {
 			const more = el('span', 'more', `+${rest.length}`);
 			tipOn(more, rest.map((x) => titleOf(x.path)).join(', '));
-			where.append(more);
+			meta.append(more);
 		}
-		li.append(where);
+		const dev = devices(p);
+		if (dev) meta.append(dev);
 		if (p.since) {
 			const t = el('span', 'for', ago(p.since));
 			tipOn(t, `On the site since ${new Date(p.since).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`);
-			li.append(t);
+			meta.append(t);
 		}
+		const body = el('span', 'tl-body');
+		body.append(top, meta);
+		li.append(av, body);
 		ul.append(li);
 	}
-	if (people.length < total) ul.append(el('li', 'tl-head', `and ${total - people.length} more`));
+	if (people.length < total) ul.append(el('li', 'tl-sub', `and ${total - people.length} more`));
 	list.append(ul);
+	const hint = feed.hint();
+	if (hint) list.append(hint);
 }
 
 function drawMe(): void {
@@ -328,8 +442,9 @@ function drawSide(): void {
 	const byPath = new Map<string, Person[]>();
 	for (const p of people) {
 		if (p.key === you?.key) continue;
-		// One face a person, on the page in front of them (the presence object sends that page first).
-		const pg = p.pages[0];
+		// One face a person, on the page they have in front of them (the presence object sends that page first), and
+		// only while they are there: someone whose every tab is in the background shows on no page.
+		const pg = p.pages.find((x) => !x.away);
 		if (!pg) continue;
 		const l = byPath.get(pg.path) ?? [];
 		l.push(p);
@@ -398,7 +513,6 @@ function draw(): void {
 		people.filter((p) => p.key !== you?.key && p.pages.some((x) => x.path === path)).map((p) => ({ key: p.key, login: p.login, avatar: p.avatar, away: awayOn(p, path) })),
 	);
 	mount();
-	drawDiscuss();
 	drawHere();
 	drawMe();
 	drawList();
@@ -420,6 +534,7 @@ function connect(): void {
 	const s = new WebSocket(url);
 	ws = s;
 	s.addEventListener('open', () => {
+		connectedAt = Date.now();
 		retry = 1000;
 		cursors.reset();
 		send();
@@ -449,7 +564,7 @@ function connect(): void {
 			const h = m as { people?: Person[]; total?: number };
 			people = Array.isArray(h.people) ? h.people : [];
 			total = typeof h.total === 'number' ? h.total : people.length;
-			chat.setOnline(total);
+			announce();
 			chat.setPeople(people);
 		} else return;
 		draw();
@@ -479,7 +594,6 @@ document.addEventListener('visibilitychange', () => {
 	connect();
 });
 addEventListener(PAGE, send);
-addEventListener(THREADS, drawDiscuss);
 document.addEventListener('keydown', (e) => {
 	if (e.key === 'Escape') closeList();
 });
@@ -488,7 +602,7 @@ document.addEventListener('click', (e) => {
 });
 
 const out = (m: object) => ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify(m));
-chat.setup({ send: out, base: BASE, face, speak });
+chat.setup({ send: out, base: BASE, face, speak, live: cursors.say });
 cursors.setup({ send: out, face, name });
 onPage(() => {
 	closeList();

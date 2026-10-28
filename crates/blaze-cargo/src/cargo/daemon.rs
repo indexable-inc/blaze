@@ -707,11 +707,22 @@ impl Worker {
         // worker was started on is built already, and is asked for too: what the worker then
         // compiles again by itself, for the first edit to be a patch, is part of warming up.
         // A program the worker does not build is cargo's, and the others are still its own:
-        // the checkout failed to load only when it builds none.
+        // the checkout failed to load only when it builds none. The programs are asked for
+        // all at once, as `sync` does: the worker builds them side by side, so their links
+        // overlap, where one after another each waited for the link of the one before.
+        let asked: Vec<anyhow::Result<Result<String, NotBuilt>>> = std::thread::scope(|scope| {
+            let asking: Vec<_> = checkout
+                .programs
+                .iter()
+                .map(|plan| scope.spawn(|| self.ask(checkout, plan)))
+                .collect();
+            let panicked = || Err(anyhow::anyhow!("asking the worker panicked"));
+            asking.into_iter().map(|it| it.join().unwrap_or_else(|_| panicked())).collect()
+        });
         let mut not_built = None;
         let mut built = false;
-        for plan in &checkout.programs {
-            match self.ask(checkout, plan)? {
+        for asked in asked {
+            match asked? {
                 Ok(_) => built = true,
                 Err(NotBuilt::Error(said)) => return Ok(Some(said)),
                 Err(why) => _ = not_built.get_or_insert(why),

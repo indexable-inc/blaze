@@ -8,8 +8,8 @@ headers, and the browser scripts.
 ## Architecture: Rust core, TS host
 
 ```
-content/*.flecs ─┬─ gen/tree.ts (flecs-doc.wasm) ── bake: highlight.js, bench widget ──┐
-                 └───────────────────────────────── site-snapshot.wasm ◀────────────────┘
+content/*.flecs ─┬─ gen/tree.ts (flecs-doc.wasm) ── bake: highlight.js; generated: bench charts ──┐
+                 └──────────────────────────────────────────── site-snapshot.wasm ◀────────────────┘
                                                             │ snapshot (.gen/site.cbor)
                                                             ▼
                  gen/build.ts ── site.wasm ──▶ dist/*.html (every page, no comments)
@@ -21,7 +21,8 @@ content/*.flecs ─┬─ gen/tree.ts (flecs-doc.wasm) ── bake: highlight.js
   `site.wasm` (the renderer) and `site-snapshot.wasm` (the content scripts run in Flecs, compiled in, to the snapshot;
   build time only). Both are platform-independent build outputs, never checked in.
 - `gen/build.ts`: the build, under Bun, with no native code. It runs the scripts under `flecs/flecs-doc.wasm` to bake
-  what the renderer leaves to TS (highlighted code, the bench widget), gets the snapshot from `site-snapshot.wasm`,
+  what the renderer leaves to TS (highlighted code) and to write the scripts the content asks for (the benchmark
+  charts, `gen/bench/`), gets the snapshot from `site-snapshot.wasm`,
   renders every page with `site.wasm` into `dist/`, bundles `client/*.ts`, concatenates `styles/` and copies `static/`.
   For the worker it writes `.gen/`: `site.wasm`, `site.cbor` (the snapshot), `pages.json`, `discussable.json` and
   `build.json` (a hash of the module, the snapshot and the client scripts).
@@ -37,13 +38,13 @@ content/*.flecs ─┬─ gen/tree.ts (flecs-doc.wasm) ── bake: highlight.js
   `(InGroup, nav.x)`; `renderer/core/src/side.rs` draws the sidebar, crumb, pager and outline from them, in the ix
   docs' layout.
 - `client/`: browser scripts (the sidebar's folds, drawer, search over `dist/search.json` and outline in `side.ts`;
-  comment enhancements, the signup form, /bench, copy buttons). `nav.ts` is the client router: a click on a link to
+  comment enhancements, the signup form, the charts' tooltips, copy buttons). `nav.ts` is the client router: a click on a link to
   another page fetches it (fetched ahead on hover) and swaps only the page column, the head's tags and the sidebar's
   open row, without a load, as the ix docs move between pages; anything unexpected falls back to a plain load. Each
   page script sets itself up through `client/lib/page.ts` `onPage`, again after every swap and undone before the
   next.
 
-The flecs skill (`.claude/skills/flecs/`) has the script syntax and its traps.
+The flecs skill (`.agents/skills/flecs/`) has the script syntax and its traps.
 
 ### The wasm modules: build outputs, fetched
 
@@ -116,10 +117,17 @@ details, and the steps for serving the files from R2.
 
 ## Benchmark history (`/bench`)
 
-Prerendered from `docs/benchmarks/history/*.jsonl` at the repo root, one line per benchmark run, appended by CI with
-`harness/benchhistory.py` (its docstring describes a line). `gen/bench/index.ts` reads the files when the site is
-built, so a new line shows after the next deploy; the `site` workflow deploys on a
-change under `docs/benchmarks/`. Lines are grouped by machine, and the charts keep each machine's last 120 runs.
+Built from `docs/benchmarks/history/*.jsonl` at the repo root, one line per benchmark run, appended by CI with
+`harness/benchhistory.py` (its docstring describes a line). `content/bench.flecs` names the directory with
+`BenchHistory history(dir: ...)`; at build time `gen/bench/` reads it and writes a Flecs script of Sections, Pickers
+and charts (`RowChart`, `LineChart`, `Charts`, schema in `content/schema.flecs`) under that entity, which runs after the
+content. The renderer draws them in `renderer/core/src/chart.rs`, coloured by `--series-N` (`styles/tokens.css`), each
+with its numbers in a table under it. A row chart is one row per project or edit with its values written beside it: bars
+on a linear axis from zero, or dots on a shared log axis (1-2-5 ticks) when the values span orders of magnitude, with the
+speedup over the baseline. A line chart is inline SVG on a linear or log axis; with one run so far it shows that run as
+numbers instead of a lone dot. `client/chart.ts` adds only the line charts' hover tooltip, and the pickers (platform,
+backend, project, machine) are labelled radio buttons that work without JS. A new line shows after the next deploy; the `site` workflow deploys on a change under
+`docs/benchmarks/`. Lines are grouped by machine, and the charts over time keep each machine's last 60 runs.
 
 To look at the page with other data, point `BENCH_HISTORY` at a directory of `.jsonl` files:
 `BENCH_HISTORY=/tmp/history bun run build`.
@@ -145,30 +153,49 @@ to `env.ASSETS`, which serves `dist/` (built by `bun gen/build.ts`, laid out wit
 - `presence.ts`: `/api/presence`, a WebSocket to the `Presence` Durable Object (one, named `site`, hibernating), which
   knows who is on which page. Signed-in readers are their GitHub login; anonymous ones get a key that is an HMAC of
   their IP and user agent under a random key the object makes each UTC day and deletes the next, so a name lasts a day
-  and no IP is kept. `client/lib/presence.ts` (loaded by `side.ts`, so on every page) draws the pane's top line: the
-  page's discussion with its comment count, the faces on this page (click for everyone and where), and the reader's
-  GitHub login with Sign out, or Sign in with GitHub; and faces on the sidebar rows others are reading.
+  and no IP is kept. `client/lib/presence.ts` (loaded by `side.ts`, so on every page) draws the pane's top line:
+  Chat (opens the feed's history and input, as T does), the faces on this page (click for everyone and where), and the
+  reader's GitHub login with Sign out, or Sign in with GitHub; and faces on the sidebar rows others are reading.
   On the page itself (`client/lib/cursors.ts`) the others there show as live pointers (desktop only; "Hide cursors"
-  in the who-is-here list turns them off) and as bands on a rail at the right edge where each is reading (click a
-  face to go there). Positions are anchors in the text (a block index and a fraction of it, x a fraction of `main`'s
-  width), so different window sizes line up; the object passes them only to the other tabs on the same page, rate
+  in the who-is-here list turns them off) and as faces on a rail at the right edge where each one's pointer is in the
+  article (click a face to go there). A pointer is sent as what it is on (`client/lib/anchor.ts`): in the
+  article a block and the character in it, elsewhere a region (the sidebar, the top line, "On this page") and
+  the link or button in it, with fractions of that thing's box; so it lands on the same thing whatever
+  each reader's window and layout, and a reader without that thing on screen (sidebar shut) doesn't draw
+  it; the object passes them only to the other tabs on the same page, rate
   limited per person, and never stores them.
-  The same object holds the site's chat (`client/lib/chat.ts`, a panel at the right): its last 500 messages in the
-  object's SQLite, readable by anyone, written by signed-in readers (5 per 15 s, 120 an hour, replies counted), taken
-  back by their author or a `COMMENT_ADMINS` id. Messages have Slack-style threads, one level deep (a `parent` column):
-  the list shows top-level messages with a line for their replies (faces, count, last reply), and a thread opens over
-  the list, or as a column beside it in full screen; taking back a message takes its thread, and pruning never leaves
-  a reply without its message. Replies make no bubbles, pop-ups or badge count unless they mention the reader. Both
-  composers complete `@login` from people online and recent authors; a message that mentions the reader is marked,
-  and while the chat is shut it pops up (even muted) and counts. Comment writes (`comments.ts`) tell the object too,
-  and open pages refresh their comment threads.
+  Everything passing shows in one overlay feed at the bottom left of the page, like Minecraft's chat
+  (`client/lib/feed.ts`): chat messages, who joined ("Merry Tiger joined on Charter") and who left (someone off the
+  who-is-here list for 8 s, so a reload or a reconnect is no leave; neither in the 15 s after a connect or a deploy),
+  mentions, a refused message and the site's own word (a new version, the translator's download). A line fades
+  after 10 s (not while the pointer is on the feed); a chat line opens the feed's history at it, a join or a leave
+  the page they were on. Mute (in the hint under the input) keeps chat, joins and leaves out of it, never what is for
+  the reader.
+  T (or Enter, for Vimium users; on a phone the feed's button; anywhere the top line's Chat) opens the feed's history
+  over its one input: as it is typed the others on the page see the line by the reader's pointer (`say-live`, same
+  budget, never stored), as a bubble under the pointer or out of the face on the rail; Enter sends it to the chat
+  (signed in) and the bubble stays where it was a while; an anonymous reader's is only that bubble, not kept, and the
+  hint under the input offers Sign in with GitHub. Esc closes it and keeps the draft.
+  The feed is the chat's only view (`client/lib/chat.ts`); the same object holds the chat: its last 500 messages in
+  the object's SQLite, readable by anyone, written by signed-in readers (5 per 15 s, 120 an hour), taken back by their
+  author or a `COMMENT_ADMINS` id. A tab gets the last 80 on connect and keeps every one that comes after (up to
+  500), all in the feed's history, which scrolls back through them. Authors and admins edit messages (↑ in the empty
+  input edits your last one, or the pencil on the line in the open history; Enter saves, Esc gives the draft back;
+  `edited_at`, the same rules as a new message) and take them back (the ×). The input completes `@login` from people
+  online and recent authors; a message that mentions the reader is marked and shows in the feed even muted. Who is
+  writing shows over the input ("ana is typing"). Someone else's message in another language is translated on the
+  reader's computer where it can be (`client/lib/translate.ts`, after the reader chatted or pressed a line's
+  Translate), and says so. The chat is flat: the object still has the threads (a `parent` column, `broadcast` for a
+  reply also sent to the chat) and reactions (a `reactions` table) that an earlier side panel used; the feed shows a
+  reply only when it was also sent to the chat or mentions the reader, and no reactions. Comment writes
+  (`comments.ts`) tell the object too, and open pages refresh their comment threads.
   On every connect the object also sends the live build (`.gen/build.json`), and a deploy's code sends it to every
   open socket the first time it wakes (a deploy keeps hibernated sockets open), so each open tab hears of a new
   version as soon as anyone on the site moves (`client/lib/update.ts`). New scripts or styles
   reload the tab; new content alone is fetched again and swapped in place by the router. Either waits until the
-  reader isn't typing, playing the narration or dragging (a hidden tab goes at once), with an "update ready" pop-up
-  and a button meanwhile, then says "Site updated". Drafts (chat and comments), the open thread, full screen, scroll
-  positions and the narration's place go through sessionStorage and come back; a reload that still gets the old
+  reader isn't typing, playing the narration or dragging (a hidden tab goes at once), with an "update ready" line in
+  the feed and a button meanwhile, then says "Site updated". Drafts (the feed's input and whether it was open, and
+  comments), an edit in progress, scroll positions and the narration's place go through sessionStorage and come back; a reload that still gets the old
   assets doesn't retry for a minute.
 - `updates.ts`: the `/updates` form.
 - `http.ts`: cookies, origin check, `next` validation, tokens. `env.ts`: the `Env` type.

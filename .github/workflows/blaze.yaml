@@ -9,8 +9,8 @@
 #       `harness/imports.py` and `harness/rustcsites.py`. No `cargo fmt --check`: fmt.yaml
 #       formats main after each push instead.
 #   push to main: the build and the unit tests on Linux x86-64, Linux AArch64 and macOS, which
-#       write the caches every other run reads. They are not cancelled by the next push, as the
-#       train is, so the caches are written for every commit.
+#       write the caches every other run reads. One runs at a time: the next push waits, and a
+#       newer one replaces it, so each run ends and writes the caches as of its commit.
 #
 # A change runs the build and the unit tests only when it touches a file they read: the crates,
 # the vendored crates, the workspace's manifest, lock file, cargo config, .rustfmt.toml and
@@ -33,10 +33,13 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # A pull request's newer push cancels its run before. Every push to main and every entry of
-  # the merge queue runs to the end in a group of its own: with a merge every few minutes, one
-  # group for main replaced each waiting run with the next, and main had almost no finished run.
-  group: blaze-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  # A pull request's newer push cancels its run before. Main runs one push at a time: a push
+  # while one runs waits, and a newer push replaces the one waiting, never the one running, so
+  # each run ends and covers every merge up to its commit. A group of its own per push stacked
+  # up a full three-platform run per merge (17 at once on 2026-10-28, each waiting on macOS
+  # runners) and none of them got runners in time. A merge-queue entry or a run by hand is
+  # still a group of its own.
+  group: blaze-${{ github.event_name == 'push' && 'main' || format('{0}-{1}', github.event_name, github.event_name == 'pull_request' && github.ref || github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:

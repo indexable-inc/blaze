@@ -157,7 +157,7 @@ pub fn build(world: &World, pages: &[Page]) -> Result<Vec<Group>, String> {
             .iter_mut()
             .find(|(path, _)| path == section)
             .ok_or_else(|| format!("{}: (InGroup, {section}) is not a section of nav", e.path))?;
-        // The page holding the course map is followed by its lessons, numbered in course order.
+        // The page holding the course path is followed by its lessons, numbered in course order.
         let mut lessons = Vec::new();
         if let Some(c) = world.course_in(p.node) {
             for (i, l) in world.lessons(world.course_source(c)?).into_iter().enumerate() {

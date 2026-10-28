@@ -9,7 +9,7 @@
  *   /charter, /rfcs/*   discussable pages, rendered with their comments (pages.ts); other paths there are assets
  *   /audio/*   narration files, from R2 when bound, with Range support (audio.ts)
  *   /          the home page (the course), or install.sh for a client that doesn't ask for HTML (curl, wget)
- *   /learn     a 301 to /: the course map is the home page; the lessons stay at /learn/<slug>
+ *   /learn     a 301 to /: the course path is the home page; the lessons stay at /learn/<slug>
  *
  * Anything else is dist/ (built by `bun gen/build.ts`) through the ASSETS binding, with the headers `assetHeaders`
  * adds (Workers does not apply a `_headers` file to what a worker returns).

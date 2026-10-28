@@ -165,6 +165,7 @@ writes them again.
 | `programs.py` | Two programs of one workspace built by one daemon. With `BLAZE_ALONE=1` rustc builds stand-ins for the workspace's crates and the daemon compiles every function of both programs, `main` too: under LLVM an edit of what both use has to reach each ([#63](https://github.com/indexable-inc/blaze/issues/63)) |
 | `worktrees.py` | Several checkouts of one workspace built by one daemon, edited independently |
 | `includes.py` | Edits to a file only `include!` names |
+| `staticcallbacks.py` | A `LazyLock` static whose initializer calls an `#[inline(always)]` helper of a dependency: an edit of a sibling of the helper, then of the helper itself, under one daemon, each printing what cargo's build prints (astral-experiments/blaze#83, #87) |
 | `latelisted.py` | What a file named by `include!` through a build script's variable declares is listed in its crate though the daemon reads the file only once the names are resolved, as bun's generated bindings are: an edit that adds a function then patches a few functions, not every one the file declares |
 | `rustsrc.py` | A toolchain without `rust-src` is turned down, saying how to install it |
 | `splices.py` | Edits that are hard on the splice: thread-locals, statics, vtables, function pointers, closures, panics, foreign calls. Counts how each step was linked |
@@ -365,7 +366,7 @@ for each platform, each on a machine of its own kind.
 | Workflow | Event | What runs | Wall time |
 |---|---|---|---|
 | `blaze.yaml` (`gate`) | pull request | on Linux x86-64: blaze builds blaze (`blaze build`) and tests it (`harness/unittests.py`, `blaze test`, only the tests the change reached), from the newest release and the store main pushed to blaze's remote; `harness/imports.py`, `harness/rustcsites.py` | 49 min on a store the release has not compiled into |
-| `blaze.yaml` (`warm`) | push to main | the same on Linux x86-64, AArch64 and macOS, every test, then a push of the store for the runs after it; and on Linux x86-64 the std cases of the smoke corpus (`harness/smoke.py`, [release.md](release.md#the-smoke-corpus): `blaze run` and `blaze test`, dev and `--release`) with the blaze blaze built, 17 to 30 min until [#899](https://github.com/indexable-inc/blaze/issues/899) (74 s with rustc's) | |
+| `blaze.yaml` (`warm`) | push to main | the same on Linux x86-64, AArch64 and macOS, every test, then a push of the store for the runs after it. Its `linux x64 / build` passing is what cuts a canary (`canary.yaml`); the whole run green, unit tests on every platform, is what stable needs besides the promotion gate ([release.md](release.md)). And on Linux x86-64 the std cases of the smoke corpus (`harness/smoke.py`, [release.md](release.md#the-smoke-corpus): `blaze run` and `blaze test`, dev and `--release`) with the blaze blaze built, 17 to 30 min until [#899](https://github.com/indexable-inc/blaze/issues/899) (74 s with rustc's) | |
 | `fmt.yaml` | push to main | `cargo fmt --all`, and a commit `fmt` when it changed a file | 2 min |
 | `train.yaml` | push to main, by hand | everything below, then a release or the train's issue | about 45 min |
 | `blaze.yaml` | a change the build and the unit tests do not read | the two scripts | 1 min |
