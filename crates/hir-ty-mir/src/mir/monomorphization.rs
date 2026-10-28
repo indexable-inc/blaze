@@ -196,8 +196,9 @@ impl<'db> Filler<'db> {
         *t = t.as_ref().try_fold_with(self)?.store();
         if references_non_lt_error(&t.as_ref()) {
             Err(MirLowerError::NotSupported(format!(
-                "monomorphization resulted in errors: {:?}",
-                t.as_ref()
+                "monomorphization resulted in errors: {:?} (last const error: {})",
+                t.as_ref(),
+                hir_ty::LAST_CONST_ERROR.lock().unwrap()
             )))
         } else {
             Ok(())
@@ -209,8 +210,9 @@ impl<'db> Filler<'db> {
         *t = t.as_ref().try_fold_with(self)?.store();
         if references_non_lt_error(&t.as_ref()) {
             Err(MirLowerError::NotSupported(format!(
-                "monomorphization resulted in errors: {:?}",
-                t.as_ref()
+                "monomorphization resulted in errors: {:?} (last const error: {})",
+                t.as_ref(),
+                hir_ty::LAST_CONST_ERROR.lock().unwrap()
             )))
         } else {
             Ok(())
@@ -222,8 +224,9 @@ impl<'db> Filler<'db> {
         *t = t.as_ref().try_fold_with(self)?.store();
         if references_non_lt_error(&t.as_ref()) {
             Err(MirLowerError::NotSupported(format!(
-                "monomorphization resulted in errors: {:?}",
-                t.as_ref()
+                "monomorphization resulted in errors: {:?} (last const error: {})",
+                t.as_ref(),
+                hir_ty::LAST_CONST_ERROR.lock().unwrap()
             )))
         } else {
             Ok(())

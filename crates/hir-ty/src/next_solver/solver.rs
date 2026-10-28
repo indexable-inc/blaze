@@ -338,7 +338,10 @@ impl<'db> SolverDelegate for SolverContext<'db> {
                 ParamEnvAndCrate { param_env, krate: self.interner.expect_crate() },
             ),
             // FIXME: Not all evaluation errors should return an error const, rustc returns None on `EvaluateConstErr::{HasGenericsOrInfers, InvalidConstParamTy}`.
-            Err(_) => Const::new_error(self.interner, ErrorGuaranteed),
+            Err(e) => {
+                *crate::LAST_CONST_ERROR.lock().unwrap() = format!("{:?}: {e:?}", uv.def.0);
+                Const::new_error(self.interner, ErrorGuaranteed)
+            }
         };
         Some(konst)
     }

@@ -700,3 +700,6 @@ pub fn setup_tracing() -> Option<tracing::subscriber::DefaultGuard> {
     let subscriber = Registry::default().with(filter).with(layer);
     Some(tracing::subscriber::set_default(subscriber))
 }
+
+/// Debug only (bisect draft): the last failed const evaluation of the solver.
+pub static LAST_CONST_ERROR: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
