@@ -723,6 +723,7 @@ dependencies = [
  "blaze-build-script",
  "blaze-cache",
  "blaze-fmt",
+ "blaze-graph",
  "blaze-in-place",
  "blaze-lints",
  "blaze-live",
