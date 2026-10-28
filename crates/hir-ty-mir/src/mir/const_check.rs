@@ -7,7 +7,7 @@
 //! checks after `SimplifyCfg::Initial` and skips cleanup blocks), and of the calls only at
 //! those the source writes, to a function known whatever the generic arguments are: a call of
 //! a trait's method may be to a `const` impl, which rustc decides by its const conditions,
-//! and is left alone, as an intrinsic is.
+//! and is left alone. An intrinsic not declared `const` is refused as rustc refuses it.
 
 use hir_def::{
     CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup,
@@ -176,6 +176,16 @@ pub fn const_check<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> ConstCh
                 if !called || is_const_callable(db, callee) {
                     continue;
                 }
+                // rustc's `IntrinsicNonConst`, which it checks before any other rule of calls.
+                if FunctionSignature::is_intrinsic(db, callee) {
+                    let name = FunctionSignature::of(db, callee).name.as_str().to_owned();
+                    report(
+                        "",
+                        terminator.span,
+                        format!("cannot call non-const intrinsic `{name}` in {}", kind.plural()),
+                    );
+                    continue;
+                }
                 let (descr, path) = described(db, def, callee);
                 report(
                     "E0015",
@@ -203,11 +213,10 @@ fn not_const_checked(db: &dyn HirDatabase, func: FunctionId) -> bool {
 
 /// Whether a call of `func` in a const context is one rustc does not refuse as a call of a
 /// function that is not `const`: it is `const`, or a method of a trait or of an `impl` of one
-/// (conditionally const), or an intrinsic (checked by rustc by the intrinsic's own rules).
+/// (conditionally const). An intrinsic is callable only when it is declared `const`, as the
+/// nightly declares the ones const eval runs (`atomic_load`, `transmute`, `size_of`, ..).
 fn is_const_callable(db: &dyn HirDatabase, func: FunctionId) -> bool {
-    FunctionSignature::of(db, func).is_const()
-        || of_a_trait(db, func)
-        || FunctionSignature::is_intrinsic(db, func)
+    FunctionSignature::of(db, func).is_const() || of_a_trait(db, func)
 }
 
 /// How rustc's message names the function called: `function`, `method` or `associated

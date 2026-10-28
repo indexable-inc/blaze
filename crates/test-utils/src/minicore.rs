@@ -517,12 +517,12 @@ pub mod mem {
 
     // region:transmute
     #[rustc_intrinsic]
-    pub fn transmute<Src, Dst>(src: Src) -> Dst;
+    pub const fn transmute<Src, Dst>(src: Src) -> Dst;
     // endregion:transmute
 
     // region:size_of
     #[rustc_intrinsic]
-    pub fn size_of<T>() -> usize;
+    pub const fn size_of<T>() -> usize;
     // endregion:size_of
 
     // region:discriminant
