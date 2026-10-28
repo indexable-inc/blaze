@@ -11,6 +11,9 @@ on:
       rounds:
         description: old release, new release
         default: "0.20261028.9 0.20261028.10"
+      script:
+        description: probe/<script> to run
+        default: measure.sh
 
 jobs:
   fuzz:
@@ -46,7 +49,8 @@ jobs:
           [ -f "$RUNNER_TEMP/blaze-engine" ] && export ENGINE="$RUNNER_TEMP/blaze-engine"
           unset BLAZE_CACHE
           nproc; free -g
-          OUT="$RUNNER_TEMP/probe/out" bash probe/measure.sh
+          export REL=$NEW
+          OUT="$RUNNER_TEMP/probe/out" bash probe/${{ inputs.script }}
       - if: always()
         uses: actions/upload-artifact@v4
         with:
