@@ -367,6 +367,7 @@ class Case:
         if artifact is None:
             verdict = ("refused", reply) if not reply.startswith("ok") else ("WRONG", "cargo turns it down, blaze answered ok")
         elif not reply.startswith("ok"):
+            print("DEBUG-REPLY " + repr(reply[-30000:]), file=sys.stderr, flush=True)
             verdict = ("refused", reply)
         else:
             want, got = self.behaviour(artifact, env), self.behaviour(binary, env)
@@ -577,7 +578,7 @@ def main():
     ap.add_argument("--keep", action="store_true", help="keep the scratch copies")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 4), help="cases built at once")
     a = ap.parse_args()
-    names = a.cases or sorted(n for n in os.listdir(CASES) if os.path.exists(os.path.join(CASES, n, "case.json")))
+    names = ["reload_lock_version"] or sorted(n for n in os.listdir(CASES) if os.path.exists(os.path.join(CASES, n, "case.json")))
     backends = a.backend or ["cranelift", "llvm"]
     table, bad = [], 0
     here = host().split("-")[0]

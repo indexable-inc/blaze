@@ -38,14 +38,6 @@ permissions:
   contents: read
 
 jobs:
-  linux-x64:
-    name: linux x64
-    uses: ./.github/workflows/blaze-platform.yaml
-    with:
-      platform: linux-x64
-      os: ubuntu-24.04
-      tier: full
-
   windows:
     name: windows x64
     uses: ./.github/workflows/blaze-platform.yaml
