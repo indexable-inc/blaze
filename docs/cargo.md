@@ -1152,7 +1152,7 @@ run of a build script ([above](#build-scripts-under-wasi-an-experiment-off-by-de
 `BLAZE_TESTS` is read by each `blaze test` alone and is not part of which build it
 is: `affected` runs the tests that have not passed as they are now, by the passes the store
 keeps ([above](#running-only-the-tests-that-have-not-passed)), `verify` runs those too and
-checks that they pass again, `all` every test. The default is `all`. `BLAZE_TESTS_FROM` names
+checks that they pass again, `all` every test. The default is `affected`. `BLAZE_TESTS_FROM` names
 where the passes a command keeps came from, for the summary of a command that finds them.
 `BLAZE_SANDBOX=off` runs every test outside the sandbox
 ([above](#sandboxed-tests-an-experiment-opt-in)), and `BLAZE_TEST_ENV` names more variables a test
