@@ -1,0 +1,43 @@
+# Throwaway (branch release-armfeat-gen-1028 only, never merged): answers.py --write on each host
+# for release-armfeat-1028, merged as toolchain-bump.yaml's pull request job merges them.
+name: answers gen (tmp)
+on:
+  push:
+    branches: [release-armfeat-gen-1028]
+permissions:
+  contents: read
+jobs:
+  answers:
+    name: answers (${{ matrix.platform }})
+    strategy:
+      matrix:
+        include:
+          - { platform: linux-x64, os: ubuntu-24.04 }
+          - { platform: linux-arm64, os: ubuntu-24.04-arm }
+          - { platform: macos-arm64, os: macos-15 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+      - run: python3 harness/answers.py --write && cp crates/blaze-cargo/src/answers/rustc.json "$RUNNER_TEMP/rustc-${{ matrix.platform }}.json"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: answers-${{ matrix.platform }}
+          path: ${{ runner.temp }}/rustc-${{ matrix.platform }}.json
+          retention-days: 3
+  merged:
+    needs: answers
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: answers-*
+          path: ${{ runner.temp }}/answers
+          merge-multiple: true
+      - run: python3 .github/scripts/toolchain_bump_ci.py answers "$RUNNER_TEMP"/answers/rustc-*.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rustc-json
+          path: crates/blaze-cargo/src/answers/rustc.json
