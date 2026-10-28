@@ -112,6 +112,7 @@ const EVENT = {
   Node: { id: u32, kind: unit(NODE_KINDS, "NodeKind"), name: text, deps: array(u32) },
   Moved: { id: u32, state: nodeState },
   Critical: { path: array(u32) },
+  Cores: { busy: u32, of: u32 },
   Functions: { object: u32, whole: bool, functions: array(fn) },
 };
 

@@ -1,5 +1,5 @@
 // The main view: every function a point, every call a line, laid out and drawn on the GPU by
-// cosmos.gl. Colour is the crate (dim when unchanged or from the store), size the compile time.
+// cosmos.gl. Colour is the crate (dim when the build shown did not compile it), size the compile time.
 import { Graph } from "./vendor/cosmos.js";
 import { hierarchicalLayout } from "./layout.js";
 import { crateColor } from "./palette.js";
@@ -83,6 +83,7 @@ export class MainView {
   load() {
     const m = this.model;
     this.lay = hierarchicalLayout(m.n, m.group, m.modules.length, m.moduleCrate, m.crates.length, SPACE);
+    this.packedFor = m.n;
     this.positions = this.lay.pos;
     this.restyleAll(false);
     this.graph.setPointPositions(this.positions);
@@ -98,7 +99,7 @@ export class MainView {
   baseColor(i, out, at) {
     const m = this.model;
     const c = this.palette[m.krate[i]];
-    const lit = m.how[i] === HOW_COMPILED || m.how[i] === HOW_UNIT;
+    const lit = (m.how[i] === HOW_COMPILED || m.how[i] === HOW_UNIT) && m.nodeBuild[i] === m.current;
     const k = lit ? 1 : DIM;
     out[at] = c[0] * k;
     out[at + 1] = c[1] * k;
@@ -124,6 +125,13 @@ export class MainView {
   // New nodes from a Functions record: each starts at its module's centre, or its crate's for a new module.
   addNodes(added, newEdges) {
     const m = this.model;
+    // The packing is of the program as it was: one grown by a quarter since (a cold build's,
+    // which starts from nothing) is packed again.
+    if (m.n > 1.25 * this.packedFor + 64) {
+      this.load();
+      this.fit();
+      return;
+    }
     const old = this.graph.getPointPositionsArray();
     const pos = new Float32Array(2 * m.n);
     pos.set(old.subarray(0, Math.min(old.length, pos.length)));

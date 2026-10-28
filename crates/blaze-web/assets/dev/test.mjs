@@ -4,7 +4,8 @@ import assert from "node:assert/strict";
 import { decode, decodeSequence, CborError } from "../cbor.js";
 import { parseSnapshot, SnapshotError } from "../snapshot.js";
 import { parseRecord, RecordError } from "../records.js";
-import { moduleOf, splitPath } from "../names.js";
+import { lastName, moduleOf, splitPath } from "../names.js";
+import { analyseEdit } from "../edit.js";
 import { Model } from "../model.js";
 
 let passed = 0;
@@ -105,10 +106,11 @@ test("records: every variant", () => {
     { Crate: { name: "anim", state: "Built", fns: { total: 3, done: 3, kept: 1 } } },
     { Rebuilt: { name: "anim::f", krate: "anim", cause: { Edited: { file: "src/lib.rs" } } } },
     { Rebuilt: { name: "anim::g", krate: "anim", cause: "Signature" } },
+    { Progress: { step: "Codegen", done: 3, total: 9, longest: null } }, { Cache: { cache: { found: 1, fetched: 0, compiled: 2, cold: null } } },
     { Unlisted: { count: 4 } }, { Refused: { name: "x", why: "y" } }, { Said: { level: "Warning", text: "t" } },
     { Finished: { ok: true, summary: { took_ns: 5, crates: 1, fns: { total: 1, done: 1, kept: 0 }, rebuilt: [["anim::f", "Body"]], more: 0, error: null, cache: null, slowest: [{ step: "Codegen", of: "anim", took_ns: 5 }] } } },
     { Node: { id: 1, kind: "Codegen", name: "anim", deps: [0] } }, { Moved: { id: 1, state: { Cached: { remote: false } } } },
-    { Moved: { id: 1, state: "Running" } }, { Critical: { path: [0, 1] } },
+    { Moved: { id: 1, state: "Running" } }, { Critical: { path: [0, 1] } }, { Cores: { busy: 790, of: 8 } },
     { Functions: { object: 0, whole: true, functions: [{ id: 0, key: 2n ** 63n, krate: "anim", name: "anim::f", calls: [1], how: { Compiled: { ns: 7 } } }] } },
     "LoadWorkspace",
   ];
@@ -144,6 +146,25 @@ for (const [name, krate, want] of [
   ["anim::Mesh::{impl#2}::build", "anim", "anim::Mesh"],
 ]) test(`names: ${name}`, () => assert.equal(moduleOf(name, krate), want));
 test("names: split keeps generics", () => assert.deepEqual(splitPath("a::<b::c>::d"), ["a", "<b::c>", "d"]));
+for (const [name, want] of [
+  ["anim::main", "main"],
+  ["<alloc::vec::Vec<T>>::push", "push"],
+  ["<wgpu::Texture as core::ops::drop::Drop>::drop", "drop"],
+  ["core::ptr::drop_in_place::<anim::Thing>", "drop_in_place"],
+  ["anim::main::{closure#0}", "{closure#0}"],
+  ["main", "main"],
+]) test(`names: own name of ${name}`, () => assert.equal(lastName(name), want));
+
+test("edit: a Rebuilt is found by its crate and own name, among what the build compiled", () => {
+  const m = new Model(parseSnapshot(snap()));
+  m.mergeFns(5, [
+    { id: 0, key: 10, krate: "anim", name: "anim::main", calls: [], how: { type: "Compiled", ns: 5 } },
+    { id: 1, key: 21, krate: "anim", name: "anim::main::{closure#0}", calls: [0], how: { type: "Compiled", ns: 5 } },
+  ], 11);
+  const a = analyseEdit(m, [{ name: "main", krate: "anim", cause: { type: "Edited", file: "src/main.rs" } }], 11);
+  assert.equal(a.entries[0].node, m.names.indexOf("anim::main"));
+  assert.deepEqual(a.roots, [m.names.indexOf("anim::main")]);
+});
 
 test("model: Functions merges by key, resolves calls across records, adds nodes", () => {
   const m = new Model(parseSnapshot(snap()));

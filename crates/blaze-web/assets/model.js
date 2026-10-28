@@ -16,6 +16,8 @@ export class Model {
   constructor(snap) {
     this.root = snap.root;
     this.build = snap.build;
+    // The build the page shows: what it did not compile is drawn as cached.
+    this.current = snap.build;
     this.crates = snap.crates.slice();
     this.crateIndex = new Map(this.crates.map((c, i) => [c, i]));
     this.n = snap.n;

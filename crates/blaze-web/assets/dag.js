@@ -30,11 +30,24 @@ export class CrateDag {
     this.dirty = true;
   }
 
-  invalidate() { this.dirty = true; }
+  // A cold build adds functions in hundreds of records: what is shown is drawn again at most
+  // once a second.
+  invalidate() {
+    this.dirty = true;
+    if (this.visible && !this.timer) {
+      this.timer = setTimeout(() => {
+        this.timer = 0;
+        if (this.visible) this.show();
+      }, 1000);
+    }
+  }
 
   show() {
+    this.visible = true;
     if (this.dirty) this.render();
   }
+
+  hide() { this.visible = false; }
 
   // Which drawn unit each function falls in.
   units() {

@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>blaze</title>
+<!-- No icon: a browser asks for /favicon.ico without the token otherwise, and is refused. -->
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="style.css">
 <script type="module" src="app.js"></script>
 </head>
@@ -26,7 +28,7 @@
     </div>
     <div id="legend">
       <span><i class="lg compiled"></i>compiled</span>
-      <span><i class="lg dim"></i>unchanged or stored</span>
+      <span><i class="lg dim"></i>not compiled this build</span>
       <span><i class="lg glow"></i>just compiled</span>
       <span>size: compile time</span>
     </div>

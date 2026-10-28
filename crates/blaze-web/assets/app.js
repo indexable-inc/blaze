@@ -143,7 +143,9 @@ function onRecord(r) {
       state.unlisted = 0;
       state.analysis = null;
       state.litThisBuild = 0;
+      state.model.current = ev.build;
       state.view.clearSpread();
+      state.view.restyleAll();
       timeline.reset(ev);
       break;
     case "Functions": {
@@ -245,7 +247,7 @@ function showTab(name) {
   }
   if (name === "time") treemap.show(); else treemap.hide();
   if (name === "phases") timeline.show(); else timeline.hide();
-  if (name === "crates" && state.model) dag.show();
+  if (name === "crates" && state.model) dag.show(); else dag.hide();
 }
 
 function splitter() {

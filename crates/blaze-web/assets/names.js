@@ -89,6 +89,17 @@ export function moduleOf(name, krate) {
   return segs.slice(0, -1).join("::");
 }
 
+// A function's own name, as a Rebuilt record says it: `<alloc::vec::Vec<T>>::push` is `push`,
+// `core::ptr::drop_in_place::<anim::Thing>` is `drop_in_place`. A closure, which no Rebuilt
+// names, is its `{closure#0}`, so that it is not taken for the function it is in.
+export function lastName(name) {
+  const parts = splitPath(name);
+  while (parts.length > 1 && parts[parts.length - 1].startsWith("<")) parts.pop();
+  const last = parts[parts.length - 1];
+  const lt = last.startsWith("{") ? -1 : last.indexOf("<");
+  return lt > 0 ? last.slice(0, lt) : last;
+}
+
 // The last named segment, for a short label.
 export function shortName(name) {
   const parts = splitPath(name);

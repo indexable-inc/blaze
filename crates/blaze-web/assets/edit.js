@@ -2,21 +2,23 @@
 // function it was reached from through the calls, each with its cause.
 import { causeText } from "./records.js";
 import { crateColor, css } from "./palette.js";
-import { shortName } from "./names.js";
+import { lastName, shortName } from "./names.js";
 import { el, fmtCount, fmtNs } from "./ui.js";
 
-// Rebuilt names a function by crate and name. A name two functions share is settled by the one
-// this build compiled (its nodeBuild); one still shared is shown as such, not picked.
+// Rebuilt names a function by crate and its own name (`main`, not `anim::main`). A name two
+// functions share is settled by the one this build compiled (its nodeBuild); one still shared is
+// shown as such, not picked.
 export function analyseEdit(model, rebuilt, build) {
   const byName = new Map();
-  const wanted = new Set(rebuilt.map((r) => r.krate + "\u0000" + r.name));
+  const key = (krate, name) => krate + "\u0000" + lastName(name);
+  const wanted = new Set(rebuilt.map((r) => key(r.krate, r.name)));
   for (let i = 0; i < model.n; i++) {
-    const k = model.crates[model.krate[i]] + "\u0000" + model.names[i];
+    const k = key(model.crates[model.krate[i]], model.names[i]);
     if (!wanted.has(k)) continue;
     (byName.get(k) ?? byName.set(k, []).get(k)).push(i);
   }
   const entries = rebuilt.map((r) => {
-    let nodes = byName.get(r.krate + "\u0000" + r.name) ?? [];
+    let nodes = byName.get(key(r.krate, r.name)) ?? [];
     if (nodes.length > 1) {
       const thisBuild = nodes.filter((i) => model.nodeBuild[i] === build);
       if (thisBuild.length) nodes = thisBuild;
