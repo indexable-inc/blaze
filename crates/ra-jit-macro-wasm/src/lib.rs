@@ -78,11 +78,45 @@ const DOMAIN: &str = "ra-jit wasm proc-macro expansion 1";
 /// The most memory one instance may have.
 const MEMORY: usize = 4 << 30;
 
-fn engine() -> &'static Engine {
-    static ENGINE: OnceLock<Engine> = OnceLock::new();
-    ENGINE.get_or_init(|| {
+/// The compiler of a module's machine code.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Tier {
+    /// Winch: about a sixth of Cranelift's compile, for code 4 to 6 times slower. What a build
+    /// compiles a module with: most modules expand a few times a build.
+    Quick,
+    /// Cranelift, for a module that expands often ([`UPGRADE_AT`]).
+    Fast,
+}
+
+impl fmt::Display for Tier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Tier::Quick => "Winch",
+            Tier::Fast => "Cranelift",
+        })
+    }
+}
+
+/// The expansions a process runs with a module's [`Tier::Quick`] code before it compiles the
+/// module with Cranelift, on a thread of its own, and expands with that once it is done.
+/// Expansions the store had are not counted: a warm build compiles nothing.
+const UPGRADE_AT: u32 = 32;
+
+fn engine(tier: Tier) -> &'static Engine {
+    static QUICK: OnceLock<Engine> = OnceLock::new();
+    static FAST: OnceLock<Engine> = OnceLock::new();
+    let cell = match tier {
+        Tier::Quick => &QUICK,
+        Tier::Fast => &FAST,
+    };
+    cell.get_or_init(|| {
         let mut config = Config::new();
-        config.cranelift_nan_canonicalization(true);
+        match tier {
+            // Winch does not canonicalize NaNs: a NaN's bits may differ between the tiers,
+            // which no macro's tokens can show (a float literal is never a NaN).
+            Tier::Quick => _ = config.strategy(wasmtime::Strategy::Winch),
+            Tier::Fast => _ = config.cranelift_nan_canonicalization(true),
+        }
         config.parallel_compilation(true);
         Engine::new(&config).expect("Wasmtime's configuration for proc macros")
     })
@@ -509,7 +543,8 @@ pub struct Wasm {
     /// source are not the same bytes; its digest otherwise.
     identity: [u8; 32],
     pre: InstancePre<State>,
-    /// How long Cranelift took to compile it.
+    tier: Tier,
+    /// How long its compile took.
     pub compiled_in: Duration,
     /// Whether the store has its machine code.
     kept: std::sync::atomic::AtomicBool,
@@ -547,13 +582,32 @@ pub struct Ran {
 }
 
 impl Wasm {
-    /// The module at `path`, compiled once a process, and its machine code kept beside it and
-    /// in `store` under [`code_key`], which says the host it is for: unlike the module, the
-    /// code is for one kind of host.
-    pub fn at(path: &Path, store: Option<&ra_jit_store::Store>) -> Result<Arc<Wasm>, String> {
+    /// The module at `path`, compiled by Cranelift once a process (by Winch if `quick`), and
+    /// its machine code kept beside it and in `store` under [`code_key`], which says the host
+    /// it is for: unlike the module, the code is for one kind of host.
+    pub fn at(
+        path: &Path,
+        store: Option<&ra_jit_store::Store>,
+        quick: bool,
+    ) -> Result<Arc<Wasm>, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let known = Known { digest: keyed::sha256(&bytes), identity: None };
-        Wasm::known(path, known, Some(&bytes), store)
+        let tier = if quick { Tier::Quick } else { Tier::Fast };
+        Wasm::known(path, known, Some(&bytes), store, tier)
+    }
+
+    /// The module with the best code there is of it, beside it or in `store`: Cranelift's,
+    /// else Winch's, compiled by Winch if neither is.
+    fn best(
+        path: &Path,
+        known: Known,
+        bytes: Option<&[u8]>,
+        store: Option<&ra_jit_store::Store>,
+    ) -> Result<Arc<Wasm>, String> {
+        let key = code_key(&known.digest, Tier::Fast);
+        let fast = code_file(path, &key).is_file() || store.is_some_and(|it| it.has_lasting(&key));
+        let tier = if fast { Tier::Fast } else { Tier::Quick };
+        Wasm::known(path, known, bytes, store, tier)
     }
 
     /// As [`Wasm::at`], of a module whose digest is known: its bytes are read only if its
@@ -563,15 +617,17 @@ impl Wasm {
         known: Known,
         bytes: Option<&[u8]>,
         store: Option<&ra_jit_store::Store>,
+        tier: Tier,
     ) -> Result<Arc<Wasm>, String> {
         // A module being compiled (`prepare_soon`) is waited for, not compiled again.
         type Once = Arc<OnceLock<Result<Arc<Wasm>, String>>>;
-        static COMPILED: Mutex<Option<FxHashMap<[u8; 32], Once>>> = Mutex::new(None);
+        static COMPILED: Mutex<Option<FxHashMap<([u8; 32], Tier), Once>>> = Mutex::new(None);
         let once = {
             let mut compiled = COMPILED.lock().unwrap();
-            compiled.get_or_insert_default().entry(known.digest).or_default().clone()
+            compiled.get_or_insert_default().entry((known.digest, tier)).or_default().clone()
         };
-        let compiled = once.get_or_init(|| Wasm::compile(path, known, bytes, store).map(Arc::new));
+        let compiled =
+            once.get_or_init(|| Wasm::compile(path, known, bytes, store, tier).map(Arc::new));
         let wasm = compiled.clone()?;
         wasm.keep_code(store);
         Ok(wasm)
@@ -582,49 +638,53 @@ impl Wasm {
         Known { digest, identity }: Known,
         given: Option<&[u8]>,
         store: Option<&ra_jit_store::Store>,
+        tier: Tier,
     ) -> Result<Wasm, String> {
         let start = Instant::now();
         let failed = |e: wasmtime::Error| format!("{}: {e:#}", path.display());
         let read = std::cell::OnceCell::new();
         let bytes = || module_bytes(path, &digest, given, &read);
-        let key = code_key(&digest);
+        let key = code_key(&digest, tier);
         let file = code_file(path, &key);
+        let engine = engine(tier);
         let stats = std::env::var_os("RA_JIT_STATS").is_some();
         // SAFETY: the file beside the module and what the store has under the key are what
         // `serialize` wrote for this key, the store's checked against its checksum when read;
         // Wasmtime refuses code of another version, configuration or CPU.
-        let beside = unsafe { Module::deserialize_file(engine(), &file) }.ok();
+        let beside = unsafe { Module::deserialize_file(engine, &file) }.ok();
         let (module, was_kept) = match beside {
             // Written beside it by the process that compiled it, which kept it in the store.
             Some(module) => (module, true),
             None => match store
                 .and_then(|it| it.get_lasting(&key))
-                .and_then(|it| unsafe { Module::deserialize(engine(), &it) }.ok().map(|m| (m, it)))
+                .and_then(|it| unsafe { Module::deserialize(engine, &it) }.ok().map(|m| (m, it)))
             {
                 Some((module, code)) => {
                     write_whole(&file, &code);
                     (module, true)
                 }
                 None => {
-                    let module = Module::new(engine(), bytes()?).map_err(failed)?;
-                    if stats {
-                        eprintln!(
-                            "blaze: Cranelift compiled the proc-macro module {} in {:.1?}",
-                            path.display(),
-                            start.elapsed()
-                        );
-                    }
+                    let module = Module::new(engine, bytes()?).map_err(failed)?;
+                    let compiled = start.elapsed();
                     let code = module.serialize().map_err(failed)?;
                     write_whole(&file, &code);
                     if let Some(store) = store {
                         store.insert_lasting(&key, &code);
-                        store.flush();
+                        KEPT.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if stats {
+                        eprintln!(
+                            "blaze: {tier} compiled the proc-macro module {} in {compiled:.1?}, \
+                             kept in {:.1?}",
+                            path.display(),
+                            start.elapsed() - compiled
+                        );
                     }
                     (module, store.is_some())
                 }
             },
         };
-        let mut linker = Linker::new(engine());
+        let mut linker = Linker::new(engine);
         wasi::add(&mut linker).map_err(failed)?;
         add_host(&mut linker).map_err(failed)?;
         wasi::rest(&mut linker, &module).map_err(failed)?;
@@ -635,7 +695,7 @@ impl Wasm {
         };
         let compiled_in = start.elapsed();
         let kept = was_kept.into();
-        let wasm = Wasm { path: path.to_owned(), digest, identity, pre, compiled_in, kept };
+        let wasm = Wasm { path: path.to_owned(), digest, identity, pre, tier, compiled_in, kept };
         wasm.keep_code(store);
         Ok(wasm)
     }
@@ -649,8 +709,8 @@ impl Wasm {
             return;
         }
         if let Ok(code) = self.pre.module().serialize() {
-            store.insert_lasting(&code_key(&self.digest), &code);
-            store.flush();
+            store.insert_lasting(&code_key(&self.digest, self.tier), &code);
+            KEPT.store(true, Ordering::Relaxed);
             if std::env::var_os("RA_JIT_STATS").is_some() {
                 eprintln!("blaze: the store keeps the machine code of {}", self.path.display());
             }
@@ -674,7 +734,7 @@ impl Wasm {
 
     /// What its list export says: a line per macro, kind, name and helpers by tabs.
     fn list(&self) -> Result<String, String> {
-        let mut store = Store::new(engine(), State::empty());
+        let mut store = Store::new(self.pre.module().engine(), State::empty());
         store.limiter(|state| &mut state.limits);
         let instance = self.instance(&mut store).map_err(|e| format!("{e:#}"))?;
         let list = instance
@@ -802,7 +862,7 @@ impl Wasm {
         state.files = wasi::Files::new(root);
         state.env = env;
         state.db = db;
-        let mut store = Store::new(engine(), state);
+        let mut store = Store::new(self.pre.module().engine(), state);
         store.limiter(|state| &mut state.limits);
         let system = |e: wasmtime::Error| ProcMacroExpansionError::System(format!("{e:#}"));
         let instance = self.instance(&mut store).map_err(system)?;
@@ -844,7 +904,7 @@ impl Wasm {
 /// and what Wasmtime says code must match to load (its version, its configuration, the
 /// target and the CPU features it compiled for), and nothing of the checkout, the build of
 /// ra-jit or the toolchain, so every checkout and every host of the same kind shares it.
-fn code_key(digest: &[u8; 32]) -> [u8; 32] {
+fn code_key(digest: &[u8; 32], tier: Tier) -> [u8; 32] {
     use std::hash::Hash as _;
     struct Fields<'a>(&'a mut keyed::Key);
     impl std::hash::Hasher for Fields<'_> {
@@ -857,7 +917,7 @@ fn code_key(digest: &[u8; 32]) -> [u8; 32] {
     }
     let mut key = keyed::Key::new("wasmtime machine code of a proc-macro module 2");
     key.field(digest).field(std::env::consts::ARCH.as_bytes());
-    engine().precompile_compatibility_hash().hash(&mut Fields(&mut key));
+    engine(tier).precompile_compatibility_hash().hash(&mut Fields(&mut key));
     key.done()
 }
 
@@ -879,21 +939,32 @@ fn write_whole(path: &Path, bytes: &[u8]) {
     }
 }
 
+/// Whether the list beside the module at `path` is of it and some machine code of it is beside
+/// it: then a load compiles nothing.
+fn prepared(path: &Path) -> bool {
+    listing(path).is_some_and(|(known, _)| {
+        [Tier::Fast, Tier::Quick]
+            .into_iter()
+            .any(|tier| code_file(path, &code_key(&known.digest, tier)).is_file())
+    })
+}
+
 /// Readies the module at `path` for the processes that expand with it, in the build that
-/// made it: compiles it with Cranelift (or finds its machine code in `store`), keeps the code
+/// made it: compiles it with Winch (or finds its machine code in `store`), keeps the code
 /// beside it and in `store`, and writes the list of its macros beside it, so that a load
 /// compiles nothing and reads the list without running it.
 pub fn prepare(path: &Path, store: Option<&ra_jit_store::Store>) -> Result<(), String> {
     let start = Instant::now();
-    if let Some((known, _)) = listing(path)
-        && code_file(path, &code_key(&known.digest)).is_file()
-    {
+    if prepared(path) {
         return Ok(());
     }
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let known = Known { digest: keyed::sha256(&bytes), identity: None };
-    let wasm = Wasm::known(path, known, Some(&bytes), store)?;
+    let wasm = Wasm::best(path, known, Some(&bytes), store)?;
     list(path, &wasm, &wasm.list()?);
+    if let Some(store) = store {
+        store.flush();
+    }
     if std::env::var_os("RA_JIT_STATS").is_some() {
         eprintln!(
             "blaze: the proc-macro module {} ready in {:.1?}",
@@ -911,9 +982,7 @@ pub fn prepare_soon(
     path: &Path,
     store: Option<&'static ra_jit_store::Store>,
 ) -> Result<(), String> {
-    if let Some((known, _)) = listing(path)
-        && code_file(path, &code_key(&known.digest)).is_file()
-    {
+    if prepared(path) {
         return Ok(());
     }
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -925,7 +994,7 @@ pub fn prepare_soon(
     let known = Known { digest, identity: Some(identity) };
     std::thread::spawn(move || {
         let start = Instant::now();
-        let done = Wasm::known(&path, known, Some(&bytes), store);
+        let done = Wasm::best(&path, known, Some(&bytes), store);
         if std::env::var_os("RA_JIT_STATS").is_some() {
             let how = done.map_or_else(|e| format!("failed: {e}"), |_| "ready".to_owned());
             eprintln!(
@@ -1202,15 +1271,45 @@ struct Lazy {
     path: PathBuf,
     known: Known,
     compiled: OnceLock<Result<Arc<Wasm>, String>>,
+    /// Its Cranelift code, once its Winch code ran [`UPGRADE_AT`] expansions and it compiled.
+    fast: Arc<OnceLock<Arc<Wasm>>>,
+    ran: std::sync::atomic::AtomicU32,
 }
 
 impl Lazy {
+    fn new(path: &Path, known: Known) -> Lazy {
+        Lazy {
+            path: path.to_owned(),
+            known,
+            compiled: OnceLock::new(),
+            fast: Arc::default(),
+            ran: 0.into(),
+        }
+    }
+
     fn get(&self) -> Result<&Arc<Wasm>, String> {
+        if let Some(fast) = self.fast.get() {
+            return Ok(fast);
+        }
         let compiled =
-            self.compiled.get_or_init(|| Wasm::known(&self.path, self.known, None, store()));
+            self.compiled.get_or_init(|| Wasm::best(&self.path, self.known, None, store()));
         let wasm = compiled.as_ref().map_err(Clone::clone)?;
         wasm.keep_code(store());
         Ok(wasm)
+    }
+
+    /// Counts an expansion `wasm` ran, and starts its Cranelift compile at [`UPGRADE_AT`].
+    fn ran(&self, wasm: &Wasm) {
+        use std::sync::atomic::Ordering;
+        if wasm.tier == Tier::Fast || self.ran.fetch_add(1, Ordering::Relaxed) + 1 != UPGRADE_AT {
+            return;
+        }
+        let (path, known, fast) = (self.path.clone(), self.known, self.fast.clone());
+        std::thread::spawn(move || {
+            if let Ok(wasm) = Wasm::known(&path, known, None, store(), Tier::Fast) {
+                _ = fast.set(wasm);
+            }
+        });
     }
 }
 
@@ -1229,11 +1328,12 @@ impl fmt::Debug for Expander {
     }
 }
 
-/// Whether an expansion was kept since [`flush`].
+/// Whether an expansion or a module's machine code was kept since [`flush`]. Neither flushes the
+/// store itself: a flush takes the store's writer from the build's other units.
 static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Writes out the expansions kept since the last call, for the next process to find: the
-/// store holds what is added in memory until it is flushed.
+/// Writes out the expansions and machine code kept since the last call, for the next process to
+/// find: the store holds what is added in memory until it is flushed.
 pub fn flush() {
     if KEPT.swap(false, std::sync::atomic::Ordering::Relaxed)
         && let Some(store) = store()
@@ -1265,7 +1365,13 @@ impl ProcMacroExpander for Expander {
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
         let call = Call { subtree, attrs, env, def_site, call_site, mixed_site };
         match self.wasm.get() {
-            Ok(wasm) => wasm.expand(self.index, &self.listed, Some(db), &call, store()).output,
+            Ok(wasm) => {
+                let ran = wasm.expand(self.index, &self.listed, Some(db), &call, store());
+                if !ran.found {
+                    self.wasm.ran(wasm);
+                }
+                ran.output
+            }
             Err(e) => Err(ProcMacroExpansionError::System(e)),
         }
     }
@@ -1293,15 +1399,16 @@ pub fn load(path: &AbsPath) -> ProcMacroLoadResult {
     };
     let path: &Path = path.as_ref();
     let (lazy, text) = match listing(path) {
-        Some((known, text)) => {
-            (Lazy { path: path.to_owned(), known, compiled: OnceLock::new() }, text)
-        }
+        Some((known, text)) => (Lazy::new(path, known), text),
         None => {
-            let wasm = Wasm::at(path, store()).map_err(failed)?;
+            let bytes =
+                std::fs::read(path).map_err(|e| failed(format!("{}: {e}", path.display())))?;
+            let known = Known { digest: keyed::sha256(&bytes), identity: None };
+            let wasm = Wasm::best(path, known, Some(&bytes), store()).map_err(failed)?;
             let text = wasm.list().map_err(failed)?;
             list(path, &wasm, &text);
             let known = Known { digest: wasm.digest, identity: Some(wasm.identity) };
-            let lazy = Lazy { path: path.to_owned(), known, compiled: OnceLock::new() };
+            let lazy = Lazy::new(path, known);
             _ = lazy.compiled.set(Ok(wasm));
             (lazy, text)
         }
@@ -1412,8 +1519,9 @@ mod tests {
         assert_eq!(known.digest, keyed::sha256(&module));
         // Waits for the compile `prepare_soon` started, which keeps the code beside the module
         // and in the store, under a key of no path.
-        Wasm::known(&path, known, None, Some(store)).unwrap();
-        let key = code_key(&known.digest);
+        let wasm = Wasm::best(&path, known, None, Some(store)).unwrap();
+        assert_eq!(wasm.tier, Tier::Quick, "a build compiles with Winch");
+        let key = code_key(&known.digest, Tier::Quick);
         assert!(code_file(&path, &key).is_file());
         store.seal();
         assert!(store.get_lasting(&key).is_some());

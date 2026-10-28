@@ -18,7 +18,7 @@ ra-ap-rustc_lexer.workspace = true
 rustc-hash.workspace = true
 sha2 = "0.10"
 # The version whose Cranelift is the one hir-ty-codegen compiles with (`cranelift-codegen` 0.136).
-wasmtime = { version = "49", default-features = false, features = ["cranelift", "parallel-compilation", "runtime", "std"] }
+wasmtime = { version = "49", default-features = false, features = ["cranelift", "parallel-compilation", "runtime", "std", "winch"] }
 
 base-db.workspace = true
 hir-expand.workspace = true

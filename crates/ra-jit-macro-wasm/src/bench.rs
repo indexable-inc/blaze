@@ -5,13 +5,14 @@
 //! ```text
 //! ra-jit proc-macro-wasm <module.wasm> --macro <name> --input <file> [--attr <text>]
 //!     [--package <dir>] [--native <library> --server <proc-macro-srv>] [--runs <n>]
-//!     [--store <dir>]
+//!     [--store <dir>] [--quick]
 //! ```
 //!
-//! What it prints, a line each, in milliseconds: the module's compile by Cranelift, its first
-//! expansion (a fresh instance, as every expansion is) and the median of `--runs` more; with
-//! `--store`, the first expansion, kept, and the median of finding it kept; with `--native`,
-//! the server's start and load of the library, its first expansion and the median of more.
+//! What it prints, a line each, in milliseconds: the module's compile by Cranelift (by Winch
+//! with `--quick`), its first expansion (a fresh instance, as every expansion is) and the
+//! median of `--runs` more; with `--store`, the first expansion, kept, and the median of
+//! finding it kept; with `--native`, the server's start and load of the library, its first
+//! expansion and the median of more.
 
 use std::{
     path::{Path, PathBuf},
@@ -37,6 +38,7 @@ struct Args {
     server: Option<PathBuf>,
     runs: usize,
     store: Option<PathBuf>,
+    quick: bool,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -51,6 +53,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         server: None,
         runs: 20,
         store: None,
+        quick: false,
     };
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
@@ -63,6 +66,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--server" => parsed.server = Some(value()?.into()),
             "--runs" => parsed.runs = value()?.parse().map_err(|_| "--runs takes a number")?,
             "--store" => parsed.store = Some(value()?.into()),
+            "--quick" => parsed.quick = true,
             _ => return Err(format!("unexpected argument {arg}")),
         }
     }
@@ -125,7 +129,7 @@ pub fn command(args: impl Iterator<Item = String>) -> Result<(), String> {
     ra_jit_store::compiles_against("ra-jit proc-macro-wasm");
     let code = args.store.as_deref().map(ra_jit_store::Store::open_at).transpose();
     let code = code.map_err(|e| e.to_string())?;
-    let wasm = Wasm::at(&args.module, code.as_ref())?;
+    let wasm = Wasm::at(&args.module, code.as_ref(), args.quick)?;
     println!("wasm compile: {}", ms(wasm.compiled_in));
     if let Some(code) = code {
         code.flush();
