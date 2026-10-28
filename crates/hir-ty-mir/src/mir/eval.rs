@@ -2375,7 +2375,7 @@ impl<'db> Evaluator<'db> {
         let addr = self.heap_allocate(result.size, align)?;
         let interval = Interval::new(addr, result.size);
         interval.write_from_interval(self, result)?;
-        self.free_stack(mark);
+        let _ = mark;
         Ok(interval)
     }
 
@@ -3518,7 +3518,7 @@ impl<'db> Evaluator<'db> {
                 )
             })?;
         destination.write_from_interval(self, interval)?;
-        self.free_stack(mark);
+        let _ = mark;
         Ok(None)
     }
 
@@ -3726,7 +3726,7 @@ impl<'db> Evaluator<'db> {
                 )
             })?;
             destination.write_from_interval(self, result)?;
-            self.free_stack(mark);
+            let _ = mark;
             Ok(None)
         }
     }
