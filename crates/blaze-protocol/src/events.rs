@@ -50,6 +50,42 @@ pub enum Event {
     /// What held the build up: each node of it is the one the next waited for last, from the
     /// first to the one that finished last.
     Critical { path: Vec<u32> },
+    /// Functions put in object `object` of the process's builds, as they were put in it: the
+    /// first build of a program writes all of it, a build of an edit only what it compiled
+    /// again. A function is in one record of an object.
+    Fns { object: u32, fns: Vec<Function> },
+}
+
+/// A function or instance of the program a build writes: what the build page draws.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Function {
+    /// Its number in its object, which the `calls` of the object's others name it by.
+    pub id: u32,
+    /// Which function it is, the same in every build of the process that writes it: the
+    /// functions of an edit are matched by it to those of the build before.
+    pub key: u64,
+    /// The crate it is written in, or for code of no function (drop glue, a shim) the one
+    /// it is compiled for.
+    pub krate: String,
+    /// How a backtrace names it: its path, `<T as Trait>::method`, `{closure#0}`.
+    pub name: String,
+    /// The functions of the object it calls, by `id`. One it calls that is in no record of
+    /// the object is code of another (rustc's, the base an edit patches).
+    pub calls: Vec<u32>,
+    pub how: How,
+}
+
+/// Where the code of a [`Function`] came from.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum How {
+    /// Compiled by this build, in `ns` of a thread's time.
+    Compiled { ns: u64 },
+    /// Compiled by this build with the others of its unit, by LLVM: no time of its own.
+    Unit,
+    /// What an earlier build of the process compiled, unchanged since.
+    Unchanged,
+    /// Taken from the store.
+    Stored,
 }
 
 /// What a node of the build's graph does (docs/driver.md, "The graph").

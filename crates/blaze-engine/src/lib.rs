@@ -19,6 +19,7 @@ mod content;
 mod doc;
 mod doctest;
 mod events;
+mod fns;
 mod frozen;
 mod inputs;
 mod link;
@@ -8681,6 +8682,7 @@ fn run_holding(
 
     if let Some(socket) = &args.socket {
         events::said_beside(socket);
+        fns::said();
     }
     events::at(events::Step::LoadWorkspace, None);
     let start = Instant::now();
@@ -8969,6 +8971,7 @@ fn run_holding(
                 cold
             }
             None => {
+                fns::building();
                 let _compiling = events::compiling(&shown_crate(&db, &args));
                 let mut cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
                 // An `include!` in a body is first seen when the body is compiled.
@@ -10863,6 +10866,7 @@ impl Program {
         }
         let &Edit { start, age, settled, read, apply, changed } = edit;
         let named = shown_crate(db, args);
+        fns::building();
         let compiling = events::compiling(&named);
         listed.building(args.crates().filter_map(|it| crates_named(db, it, args).ok()).flatten());
         // Another checkout's files are not this program's to be refused for.
