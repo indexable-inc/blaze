@@ -1042,7 +1042,7 @@ impl<'db> Evaluator<'db> {
                     if self.limits_frames {
                         self.stack_depth_limit += 1;
                     }
-                    self.free_stack(my_stack_frame.prev_stack_ptr);
+                    let _ = my_stack_frame.prev_stack_ptr;
                     current_block_idx = bb;
                 }
             }
