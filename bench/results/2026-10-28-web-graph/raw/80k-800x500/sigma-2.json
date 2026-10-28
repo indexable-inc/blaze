@@ -1,0 +1,158 @@
+{
+ "arm": "sigma",
+ "run": 2,
+ "setup": {
+  "prep": {
+   "fetchMs": 15.099999999627471,
+   "parseMs": 71.20000000018626,
+   "layoutMs": 71.29999999981374,
+   "nodes": 80000,
+   "edges": 300000,
+   "modules": 7071
+  },
+  "graphologyMs": 778.8999999999069,
+  "firstFrameMs": 2904.6999999997206,
+  "renderer": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (LLVM 10.0.0) (0x0000C0DE)), SwiftShader driver)"
+ },
+ "settle": {
+  "definition": "ForceAtlas2 (Barnes-Hut, inferred settings) until mean step per iteration < 0.0005 of the layout diagonal",
+  "stepSettledMs": 69574.79999999981,
+  "stepSettledIterations": 137,
+  "iterations": 137,
+  "iterationMedianMs": 436.29999999981374,
+  "capped": false,
+  "lastStepRatio": 0.0004962135044989092,
+  "settings": {
+   "linLogMode": false,
+   "outboundAttractionDistribution": false,
+   "adjustSizes": false,
+   "edgeWeightInfluence": 1,
+   "barnesHutTheta": 0.5,
+   "barnesHutOptimize": true,
+   "strongGravityMode": true,
+   "gravity": 0.05,
+   "scalingRatio": 10,
+   "slowDown": 12.289781913656018
+  },
+  "trace": [
+   [
+    13763,
+    10,
+    0.008614
+   ],
+   [
+    17988,
+    20,
+    0.005226
+   ],
+   [
+    22420,
+    30,
+    0.003373
+   ],
+   [
+    26804,
+    40,
+    0.002286
+   ],
+   [
+    31148,
+    50,
+    0.001655
+   ],
+   [
+    35517,
+    60,
+    0.001287
+   ],
+   [
+    39898,
+    70,
+    0.001078
+   ],
+   [
+    44317,
+    80,
+    0.0009272
+   ],
+   [
+    48726,
+    90,
+    0.0008263
+   ],
+   [
+    53143,
+    100,
+    0.0007285
+   ],
+   [
+    57563,
+    110,
+    0.0006634
+   ],
+   [
+    61998,
+    120,
+    0.0005983
+   ],
+   [
+    66440,
+    130,
+    0.0005356
+   ]
+  ]
+ },
+ "memory_after_settle": {
+  "usedJSHeapMB": 512.9218187332153,
+  "totalJSHeapMB": 613.4188394546509
+ },
+ "rss_after_settle_mb": 1767.765625,
+ "panzoom": {
+  "frames": 4,
+  "seconds": 11.169399999999907,
+  "fps": 0.3581212956828508,
+  "p50ms": 5558.399999999907,
+  "p95ms": 5602.100000000093,
+  "maxMs": 5602.100000000093,
+  "rendererRafCalls": 4,
+  "rendererRafMsPerCall": 0.2750000001396984
+ },
+ "live": {
+  "frames": 2,
+  "seconds": 11.091,
+  "fps": 0.1803263907672888,
+  "p50ms": 5669.200000000186,
+  "p95ms": 5669.200000000186,
+  "maxMs": 5669.200000000186,
+  "rendererRafCalls": 1,
+  "rendererRafMsPerCall": 98.20000000018626,
+  "updates": 110,
+  "updateMeanMs": 3.0090909090485765
+ },
+ "live_moving": {
+  "frames": 2,
+  "seconds": 11.137199999999721,
+  "fps": 0.1795783500341244,
+  "p50ms": 5664.299999999814,
+  "p95ms": 5664.299999999814,
+  "maxMs": 5664.299999999814,
+  "rendererRafCalls": 2,
+  "rendererRafMsPerCall": 89.29999999981374,
+  "updates": 110,
+  "updateMeanMs": 2.8500000001100654
+ },
+ "sim_only": null,
+ "memory_end": {
+  "usedJSHeapMB": 408.94958305358887,
+  "totalJSHeapMB": 471.43683433532715
+ },
+ "rss_end_mb": 1627.3359375,
+ "problems": {
+  "violations": [],
+  "errors": []
+ },
+ "console": [
+  "error: Failed to load resource: the server responded with a status of 404 (File not found)"
+ ],
+ "wall_s": 134.7075550556183
+}
