@@ -708,7 +708,6 @@ fn a_grown_block_keeps_its_bytes() {
 }
 
 #[test]
-#[ignore = "frames are not freed yet (FREES_FRAMES in mir/eval.rs)"]
 fn stack_frames_are_freed() {
     // 2 GiB of locals in all, of 1 MiB a call.
     check_number(
@@ -955,6 +954,22 @@ fn signed_integer_log_in_a_type_alias() {
         "#
         ),
         20,
+    );
+}
+
+#[test]
+fn inline_const_compared_by_reference() {
+    // `x <= const { .. }` borrows both sides for `PartialOrd::le`: the constant is the block's
+    // value, not a reference to a local of its own frame, which is gone once it returns.
+    check_number(
+        r#"
+        //- minicore: ord, copy
+        const fn small(x: u32) -> u32 {
+            if x <= const { 3u32 } { 1 } else { 2 }
+        }
+        const GOAL: u32 = small(5) * 10 + small(2);
+        "#,
+        21,
     );
 }
 
