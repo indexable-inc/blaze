@@ -1,0 +1,51 @@
+# TEMPORARY, removed before #1434 merges: harness/coldimage.py on x86-64 and AArch64 Linux, as
+# the build job of blaze-platform.yaml builds blaze. Once it passes it moves to harness/ci.py.
+name: coldimage (temporary)
+on:
+  pull_request:
+    paths: ["crates/blaze-splice/**", "harness/coldimage.py", ".github/workflows/coldimage.yaml"]
+
+concurrency:
+  group: coldimage-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  coldimage:
+    name: coldimage (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: build
+      - id: blaze
+        uses: ./.github/actions/blaze
+        with:
+          job: build
+      - run: nix develop --command blaze build -p blaze-engine --release --features llvm --locked
+      - run: blaze stop
+      # Outside the dev shell: hello links against the runner's C runtime and glibc, with its cc.
+      - name: harness/coldimage.py
+        run: python3 harness/coldimage.py "{\"blaze\": \"$PWD/target/release/blaze\", \"work\": \"$RUNNER_TEMP/coldimage\"}"
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coldimage-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/coldimage/*.json
+            ${{ runner.temp }}/coldimage/hello-*
+          retention-days: 3

@@ -396,17 +396,18 @@ impl<'a> Plan<'_, 'a> {
                 self.frames[f].kept = true;
                 let cie = self.frames[f].cie.unwrap_or(f);
                 self.frames[cie].kept = true;
+                let mut targets: Vec<To> = Vec::new();
                 for which in [f, cie] {
                     let Frame { start, len, .. } = self.frames[which];
-                    let targets: Vec<To> = sec
-                        .relocs
-                        .iter()
-                        .filter(|it| it.offset >= start && it.offset < start + len)
-                        .map(|it| it.to)
-                        .collect();
-                    for to in targets {
-                        self.reached(to, &mut work);
-                    }
+                    targets.extend(
+                        sec.relocs
+                            .iter()
+                            .filter(|it| it.offset >= start && it.offset < start + len)
+                            .map(|it| it.to),
+                    );
+                }
+                for to in targets {
+                    self.reached(to, &mut work);
                 }
             }
             if work.is_empty() {
@@ -1160,9 +1161,10 @@ impl<'a> Plan<'_, 'a> {
     ) -> anyhow::Result<()> {
         let machine = self.link.machine;
         let at = place as usize;
+        let len = bytes.len();
         let field = |kind: Field| -> anyhow::Result<std::ops::Range<usize>> {
             let range = at..at + kind.len();
-            ensure!(range.end <= bytes.len(), "a relocation past the image");
+            ensure!(range.end <= len, "a relocation past the image");
             Ok(range)
         };
         let fill = |bytes: &mut [u8], f: Field, to: u64| -> anyhow::Result<()> {
@@ -1388,9 +1390,9 @@ impl<'a> Plan<'_, 'a> {
             self.load_relocations
         );
         // `.rela.dyn`: the relative ones first, which `DT_RELACOUNT` counts.
-        let relative = machine.relative();
-        load.sort_by_key(|it| (it.1 != relative, it.0));
-        let relative_count = load.iter().filter(|it| it.1 == relative).count();
+        let relative_type = machine.relative();
+        load.sort_by_key(|it| (it.1 != relative_type, it.0));
+        let relative_count = load.iter().filter(|it| it.1 == relative_type).count();
         let rela = self.out(Synth::RelaDyn).context("no .rela.dyn")?.address as usize;
         for (index, &(offset, r_type, symbol, addend)) in load.iter().enumerate() {
             let at = rela + index * 24;
