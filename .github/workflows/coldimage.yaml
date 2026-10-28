@@ -40,7 +40,8 @@ jobs:
       - run: blaze stop
       # Outside the dev shell: hello links against the runner's C runtime and glibc, with its cc.
       - name: harness/coldimage.py
-        run: python3 harness/coldimage.py "{\"blaze\": \"$PWD/target/release/blaze\", \"work\": \"$RUNNER_TEMP/coldimage\"}"
+        run: |
+          python3 harness/coldimage.py "{\"blaze\": \"$PWD/target/release/blaze\", \"work\": \"$RUNNER_TEMP/coldimage\"}"
       - if: always()
         uses: actions/upload-artifact@v7
         with:
