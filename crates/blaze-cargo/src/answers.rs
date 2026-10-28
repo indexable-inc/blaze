@@ -322,9 +322,9 @@ mod tests {
         assert_eq!(spec["arch"], "wasm32");
         assert!(spec["data-layout"].as_str().is_some_and(|it| it.starts_with("e-m:e-p:32:32")));
         assert!(spec_of("x86_64-unknown-linux-gnu", Some("13.0")).is_ok());
-        // An Apple target's spec says the deployment target, which blaze has not recorded.
-        assert!(spec_of("aarch64-apple-darwin", Some("13.0")).is_err());
-        assert!(spec_of("aarch64-apple-darwin", None).is_ok());
+        // An Apple target's spec names no deployment target: rustc prints the same with one.
+        let apple = |deployment| spec_of("aarch64-apple-darwin", deployment).unwrap().stdout;
+        assert_eq!(apple(Some("13.0")), apple(None));
     }
 
     #[test]
