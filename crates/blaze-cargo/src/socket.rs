@@ -106,17 +106,26 @@ impl Served {
 
                 // The address fits, but the one it is made at first does not. It is made in
                 // the same directory through a short name, so the rename stays atomic.
-                let target = std::path::absolute(&made_in)?;
                 let tmp = Path::new("/tmp");
-                not_swapped_under(tmp)?;
                 let nonce = getrandom::u64().map_err(|e| io::Error::other(e.to_string()))?;
                 let short = tmp.join(format!(".blaze-{nonce:016x}"));
-                std::fs::DirBuilder::new().mode(0o700).create(&short)?;
-                let alias = short.join("d");
-                let bound =
-                    symlink(target, &alias).and_then(|()| UnixListener::bind(alias.join("s")));
-                let _ = std::fs::remove_dir_all(short);
-                bound?
+                let through = || -> io::Result<UnixListener> {
+                    let target = std::path::absolute(&made_in)?;
+                    not_swapped_under(tmp)?;
+                    std::fs::DirBuilder::new().mode(0o700).create(&short)?;
+                    let alias = short.join("d");
+                    let bound =
+                        symlink(target, &alias).and_then(|()| UnixListener::bind(alias.join("s")));
+                    let _ = std::fs::remove_dir_all(&short);
+                    bound
+                };
+                through().map_err(|error| {
+                    let (socket, short) = (socket.display(), short.display());
+                    io::Error::new(
+                        error.kind(),
+                        format!("binding {socket} through {short}: {error}"),
+                    )
+                })?
             }
         };
         #[cfg(windows)]

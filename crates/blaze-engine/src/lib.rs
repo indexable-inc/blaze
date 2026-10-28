@@ -6542,10 +6542,11 @@ enum Loaded {
     New,
 }
 
-/// The registry directories the loaded workspaces' dependencies were installed in, and the
-/// target directories of those workspaces: what [`WatchedFile::immutable`] does not watch.
-/// They are the directories themselves, not their names, since a package can have modules of
-/// its own in a directory named `registry` or `target`.
+/// The registry directories the loaded workspaces' dependencies were installed in, their
+/// sysroots' sources, and the target directories of those workspaces: what
+/// [`WatchedFile::immutable`] does not watch. They are the directories themselves, not their
+/// names, since a package can have modules of its own in a directory named `registry`,
+/// `rustlib` or `target`.
 #[derive(Default)]
 struct Unedited {
     installed: Vec<PathBuf>,
@@ -6558,19 +6559,31 @@ static UNEDITED: Mutex<Unedited> =
 impl Unedited {
     fn of(workspaces: &[ProjectWorkspace]) -> Unedited {
         let mut unedited = Unedited::default();
+        let install = |installed: &mut Vec<PathBuf>, dir: PathBuf| {
+            if !installed.contains(&dir) {
+                installed.push(dir);
+            }
+        };
         for workspace in workspaces {
-            let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind else { continue };
-            unedited.targets.push(PathBuf::from(cargo.target_directory().to_string()));
-            for package in cargo.packages().filter(|it| !cargo[*it].is_local) {
-                let manifest = PathBuf::from(cargo[package].manifest.to_string());
-                let registry = manifest
-                    .ancestors()
-                    .find(|it| it.file_name().is_some_and(|name| name == "registry"));
-                if let Some(registry) = registry
-                    && !unedited.installed.iter().any(|it| it == registry)
-                {
-                    unedited.installed.push(registry.to_owned());
+            // Only the library's sources: the sysroot itself can be `/usr`, with projects below.
+            if let Some(library) = workspace.sysroot.rust_lib_src_root() {
+                install(&mut unedited.installed, PathBuf::from(library.to_string()));
+            }
+            // The sysroot's own dependencies are among the roots too, not only the workspace's.
+            for root in workspace.to_roots().into_iter().filter(|it| !it.is_local) {
+                for dir in root.include.iter().map(|it| PathBuf::from(it.to_string())) {
+                    // A registry by its layout, `<home>/registry/src/<index>/<package>`: a
+                    // directory only named `registry` above a vendored package can be the
+                    // project's own.
+                    let Some(home) = cargo::hermetic::cargo_home_of(&dir) else { continue };
+                    let registry = home.join("registry");
+                    if dir.starts_with(&registry) {
+                        install(&mut unedited.installed, registry);
+                    }
                 }
+            }
+            if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind {
+                unedited.targets.push(PathBuf::from(cargo.target_directory().to_string()));
             }
         }
         unedited
@@ -6586,7 +6599,6 @@ impl WatchedFile {
     fn immutable(path: &Path) -> bool {
         let unedited = lock(&UNEDITED);
         path.starts_with("/nix/store")
-            || path.components().any(|it| it.as_os_str() == "rustlib")
             || unedited.installed.iter().any(|it| path.starts_with(it))
             || unedited.targets.iter().any(|it| path.starts_with(it))
                 && !cargo::script::in_out_dir(path)
@@ -10679,10 +10691,10 @@ impl Program {
                     as_compiled.get(inside).is_some_and(|was| **was == **text)
                 }
                 // No timestamp is a file taken for a changed one, which rustc did not read.
-                None => {
-                    let built = built?;
-                    file.mtime.is_some_and(|written| written <= built)
-                }
+                None => match file.mtime {
+                    Some(written) => written <= built?,
+                    None => false,
+                },
             })
         };
         let unread: Vec<vfs::FileId> = files
@@ -11632,12 +11644,16 @@ mod user {
         let before = std::mem::replace(
             &mut *lock(&UNEDITED),
             Unedited {
-                installed: vec![ws.join(".cargo/registry")],
+                installed: vec![
+                    ws.join(".cargo/registry"),
+                    ws.join("toolchain/lib/rustlib/src/rust/library"),
+                ],
                 targets: vec![ws.join("custom-output")],
             },
         );
         for source in [
             "src/registry/rule_set.rs",
+            "src/rustlib/mod.rs",
             "src/target/opcode.rs",
             "custom-output/debug/build/pkg-hash/out/generated.rs",
         ] {
