@@ -32,11 +32,22 @@ jobs:
       - uses: ./.github/actions/toolchain
         with:
           llvm: build
+      # The build of blaze, kept between this workflow's runs while its sources are the same:
+      # a change to the harness alone runs in minutes.
+      - id: built
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/release/blaze
+            target/release/blaze-engine
+            target/release/blaze-rustc
+          key: coldimage-${{ matrix.os }}-${{ hashFiles('crates/**', 'Cargo.lock', 'Cargo.toml', '.github/blaze-version') }}
       - id: blaze
         uses: ./.github/actions/blaze
         with:
           job: build
-      - run: nix develop --command blaze build -p blaze-engine --release --features llvm --locked
+      - if: steps.built.outputs.cache-hit != 'true'
+        run: nix develop --command blaze build -p blaze-engine --release --features llvm --locked
       - run: blaze stop
       # Outside the dev shell: hello links against the runner's C runtime and glibc, with its cc.
       - name: harness/coldimage.py
