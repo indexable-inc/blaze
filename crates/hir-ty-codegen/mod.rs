@@ -3062,9 +3062,10 @@ fn root_code(db: &dyn HirDatabase, func: FunctionId, tier: bool) -> Result<Produ
     }
     let signature = FunctionSignature::of(db, func);
     let (abi, variadic) = (signature.abi, signature.is_varargs());
+    let body = body_for_abi(abi, Cow::Borrowed(body))?;
     let args = GenericArgs::new_from_slice(&[]).store();
     let checked = crate_checks_overflow(db, func.krate(db)).unwrap_or(false);
-    compile_as(db, env, Some(body), track_caller(db, func), checked, tier, |fx| {
+    compile_as(db, env, Some(&*body), track_caller(db, func), checked, tier, |fx| {
         fx.abi = abi;
         fx.variadic = variadic;
         fx.args = Some(args);
@@ -3534,7 +3535,23 @@ fn instance_body<'db>(
         | InstanceDef::FnPointerShim
         | InstanceDef::ReifyShim { .. } => unsupported!("the body of a shim"),
     };
-    body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))
+    let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+    match instance.def {
+        InstanceDef::Fn(func) => body_for_abi(FunctionSignature::of(db, func).abi, body),
+        _ => Ok(body),
+    }
+}
+
+/// The body as its native entry point receives its arguments: the final tuple of an
+/// `extern "rust-call"` function arrives one field at a time, as rustc passes it.
+fn body_for_abi<'db>(
+    abi: ExternAbi,
+    mut body: Cow<'db, MirBody<'db>>,
+) -> Result<Cow<'db, MirBody<'db>>> {
+    if abi == ExternAbi::RustCall && !body.to_mut().spread_rust_call_tuple() {
+        unsupported!("the last parameter of a rust-call function is not a tuple");
+    }
+    Ok(body)
 }
 
 /// The types a body takes and returns, which is all its callers have to know about it. Asked
@@ -12254,7 +12271,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return self.reified(fn_ty, false);
         }
         let sig = self.interner.instantiate_bound_regions_with_erased(fn_ty.fn_sig(self.interner));
-        let abi = self.fn_abi(sig.abi(), sig.output(), sig.inputs().iter().copied())?;
+        let inputs = Self::abi_inputs(sig.abi(), sig.inputs())?;
+        let abi = self.fn_abi(sig.abi(), sig.output(), inputs.iter().copied())?;
         let mut sig = self.signature(&abi.args, abi.ret);
         self.declare_variadic(callee, &mut sig)?;
         self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &sig)
@@ -13338,6 +13356,53 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok((pair, ty))
     }
 
+    /// Appends the addresses of the fields of the tuple at `tuple`, in declaration order: the
+    /// arguments a `rust-call` passes for it.
+    fn spread_tuple(
+        &mut self,
+        args: &mut Vec<(Value, Ty<'db>)>,
+        tuple: Value,
+        ty: Ty<'db>,
+    ) -> Result<()> {
+        let TyKind::Tuple(fields) = ty.kind() else {
+            unsupported!("the final argument of a rust-call is {ty:?}, not a tuple");
+        };
+        let layout = self.layout(ty)?;
+        args.extend(fields.iter().enumerate().map(|(i, field)| {
+            let offset = layout.fields.offset(i).bytes() as i64;
+            (self.builder.ins().iadd_imm(tuple, offset), field)
+        }));
+        Ok(())
+    }
+
+    /// Puts arguments received one by one back in the tuple of type `ty` a body uses them as.
+    fn pack_call_tuple(&mut self, ty: Ty<'db>, values: &[(Value, Ty<'db>)]) -> Result<Value> {
+        let layout = self.layout(ty)?;
+        let tuple = self.stack_slot(&layout);
+        for (i, &(src, field_ty)) in values.iter().enumerate() {
+            let size = self.layout(field_ty)?.size;
+            let offset = layout.fields.offset(i).bytes() as i64;
+            let field = self.builder.ins().iadd_imm(tuple, offset);
+            self.copy(field, src, size);
+        }
+        Ok(tuple)
+    }
+
+    /// The types a function with this signature is passed, one by one: the final tuple of a
+    /// `rust-call` signature is one argument per field, as its compiled body takes them.
+    fn abi_inputs<'a>(abi: ExternAbi, inputs: &'a [Ty<'db>]) -> Result<Cow<'a, [Ty<'db>]>> {
+        if abi != ExternAbi::RustCall {
+            return Ok(Cow::Borrowed(inputs));
+        }
+        let Some((&last, prefix)) = inputs.split_last() else {
+            unsupported!("a rust-call signature without its tuple");
+        };
+        let TyKind::Tuple(fields) = last.kind() else {
+            unsupported!("a rust-call signature whose last parameter is {last:?}, not a tuple");
+        };
+        Ok(Cow::Owned(prefix.iter().copied().chain(fields.iter()).collect()))
+    }
+
     /// `Fn::call`, `FnMut::call_mut` or `FnOnce::call_once`. For a call expression MIR passes
     /// the callee first and then the arguments one by one, not as a tuple.
     fn call_fn_trait(
@@ -13375,12 +13440,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let mut values = vec![(thin, thin_ty)];
                 let tuple_ty = method_args.type_at(1);
                 match (&self.operands(rest)?[..], tuple_ty.kind()) {
-                    (&[(tuple, ty)], TyKind::Tuple(fields)) if ty == tuple_ty => {
-                        let layout = self.layout(tuple_ty)?;
-                        values.extend(fields.iter().enumerate().map(|(i, field)| {
-                            let offset = layout.fields.offset(i).bytes() as i64;
-                            (self.builder.ins().iadd_imm(tuple, offset), field)
-                        }));
+                    (&[(tuple, ty)], TyKind::Tuple(_)) if ty == tuple_ty => {
+                        self.spread_tuple(&mut values, tuple, ty)?;
                     }
                     (rest, _) => values.extend_from_slice(rest),
                 }
@@ -13393,18 +13454,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         // A call written as `f.call_mut(args)` does pass the tuple, which the callee takes
         // apart all the same.
         let tuple_ty = method_args.type_at(1);
-        if let (&[(tuple, ty)], TyKind::Tuple(fields)) = (&values[..], tuple_ty.kind())
+        if let (&[(tuple, ty)], TyKind::Tuple(_)) = (&values[..], tuple_ty.kind())
             && ty == tuple_ty
         {
-            let layout = self.layout(tuple_ty)?;
-            values = fields
-                .iter()
-                .enumerate()
-                .map(|(i, field)| {
-                    let offset = layout.fields.offset(i).bytes() as i64;
-                    (self.builder.ins().iadd_imm(tuple, offset), field)
-                })
-                .collect();
+            values.clear();
+            self.spread_tuple(&mut values, tuple, ty)?;
         }
         // The innermost reference to the callee and the address it is stored at.
         let mut by_ref = None;
@@ -13510,14 +13564,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             // A type with its own `Fn` impls, which take the arguments as a tuple.
             TyKind::Adt(..) | TyKind::Ref(..) => {
-                let layout = self.layout(tuple_ty)?;
-                let tuple = self.stack_slot(&layout);
-                for (i, &(src, ty)) in values.iter().enumerate() {
-                    let size = self.layout(ty)?.size;
-                    let offset = layout.fields.offset(i).bytes() as i64;
-                    let field = self.builder.ins().iadd_imm(tuple, offset);
-                    self.copy(field, src, size);
-                }
+                let tuple = self.pack_call_tuple(tuple_ty, &values)?;
                 let [by_shared, by_mut, _] = fn_trait_methods(self.interner.lang_items())
                     .into_iter()
                     .find(|family| family.contains(&Some(method)))
@@ -13890,8 +13937,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return self.vtable_fn_method(self_ty, once);
         }
         // A type with an impl of the trait, as `Box<dyn Fn()>` and `&mut dyn FnMut()` have:
-        // the slot is called with the arguments one by one and, for `call_once`, a pointer to
-        // the receiver, where the method takes them as a tuple and the receiver by value.
+        // the slot is called with the data pointer and the arguments one by one. The method is
+        // `rust-call` and so takes the arguments one by one as well, but `call_once` takes the
+        // receiver by value, which the slot has a pointer to.
         if fn_methods.contains(&Some(func)) {
             let Some(callee_args) = self.vtable_method_args(func, trait_ref) else {
                 unsupported!("generic `Fn`-trait method in a vtable");
@@ -14020,7 +14068,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         // receiver is an argument like the rest: where it goes moves where they do.
         let abi = if receiver { ExternAbi::Rust } else { fn_sig.abi() };
         let pointer = receiver.then(|| Ty::new_imm_ptr(self.interner, Ty::new_unit(self.interner)));
-        let inputs = pointer.into_iter().chain(fn_sig.inputs().iter().copied());
+        let inputs = Self::abi_inputs(abi, fn_sig.inputs())?;
+        let inputs = pointer.into_iter().chain(inputs.iter().copied());
         let mut abi = self.fn_abi(abi, fn_sig.output(), inputs)?;
         let sig = self.signature(&abi.args, abi.ret);
         if receiver {
@@ -14044,8 +14093,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             _ => self.stack_slot(&dst_layout),
         };
         let receiver = if receiver { incoming.next() } else { None };
+        let abi = if receiver.is_some() { ExternAbi::Rust } else { fn_sig.abi() };
+        let inputs = Self::abi_inputs(abi, fn_sig.inputs())?;
         let mut values = Vec::new();
-        for (&ty, mode) in fn_sig.inputs().iter().zip(modes) {
+        for (&ty, mode) in inputs.iter().zip(modes) {
             let layout = self.layout(ty)?;
             let addr = match mode {
                 PassMode::OnStack { padded: true, .. } => {
@@ -14059,6 +14110,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             };
             self.receive(mode, &mut incoming, addr, &layout);
             values.push((addr, ty));
+        }
+        // What the callee is called with has the tuple, which the call spreads again.
+        if abi == ExternAbi::RustCall {
+            let (&tuple, prefix) =
+                fn_sig.inputs().split_last().expect("abi_inputs checked the tuple");
+            let addr = self.pack_call_tuple(tuple, &values[prefix.len()..])?;
+            values.truncate(prefix.len());
+            values.push((addr, tuple));
         }
         match ty.kind() {
             TyKind::FnDef(def, generic_args) => match def.0 {
@@ -14280,24 +14339,24 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// What the vtable slot for an `Fn`-trait method written for a type, whose body is
     /// `body`, is called with: the data pointer of the object, then the arguments one by one,
-    /// as every call through an `Fn`-trait vtable passes them. The method takes them as the
-    /// tuple this also gives.
+    /// as every call through an `Fn`-trait vtable passes them. The method is `rust-call`, so
+    /// its body takes the arguments one by one too, after the receiver; this also gives the
+    /// tuple they make, which a call of the method is handed.
     fn spread_shim_abi(&self, body: &BodyTypes) -> Result<(Ty<'db>, FnAbi)> {
-        let [_, tuple] = &body.params[..] else {
-            unsupported!("an `Fn`-trait method that takes other than a receiver and a tuple");
+        let Some((_, fields)) = body.params.split_first() else {
+            unsupported!("an `Fn`-trait method without a receiver");
         };
-        let tuple = tuple.as_ref();
-        let TyKind::Tuple(fields) = tuple.kind() else {
-            unsupported!("an `Fn`-trait method that takes {tuple:?}, not a tuple");
-        };
+        let fields: Vec<Ty<'db>> = fields.iter().map(|it| it.as_ref()).collect();
+        let tuple = Ty::new_tup(self.interner, &fields);
         let thin = Ty::new_imm_ptr(self.interner, Ty::new_unit(self.interner));
-        let inputs = std::iter::once(thin).chain(fields.iter());
+        let inputs = std::iter::once(thin).chain(fields);
         Ok((tuple, self.fn_abi(ExternAbi::Rust, body.returned.as_ref(), inputs)?))
     }
 
     /// The body of a `VtableShim` for `func`, the `Fn`-trait method `method` written for a
-    /// type: puts the arguments it is handed one by one back in the tuple `func` takes, and
-    /// hands `func` the receiver, which for `call_once` it has a pointer to.
+    /// type: puts the arguments it is handed one by one in the tuple a call of `func` is
+    /// written with, which the call spreads again, and hands `func` the receiver, which for
+    /// `call_once` it has a pointer to.
     fn spread_shim(
         &mut self,
         func: FunctionId,
@@ -14776,6 +14835,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             Callee::Instance(..) => ExternAbi::Rust,
             Callee::Pointer(_, abi, _) => abi,
+        };
+        // The final tuple of a `rust-call` is passed one field at a time.
+        let spread;
+        let args = if abi == ExternAbi::RustCall {
+            let Some((&(tuple, ty), fixed)) = args.split_last() else {
+                unsupported!("a rust-call without its tuple");
+            };
+            let mut values = fixed.to_vec();
+            self.spread_tuple(&mut values, tuple, ty)?;
+            spread = values;
+            &spread[..]
+        } else {
+            args
         };
         let FnAbi { ret: ret_mode, args: arg_modes } =
             self.fn_abi(abi, dst_ty, args.iter().map(|&(_, ty)| ty))?;
