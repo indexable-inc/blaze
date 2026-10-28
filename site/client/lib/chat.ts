@@ -37,7 +37,7 @@ let speak: (key: string, login: string, text: string | null) => void = () => {};
 let messages: Msg[] = [];
 let unread = 0;
 /** Translations by message id: being made, made, or not to be made. */
-type Tr = { s: 'pending'; from: string } | { s: 'done'; from: string; text: string; original: boolean } | { s: 'none' };
+type Tr = { s: 'ask'; from: string } | { s: 'pending'; from: string } | { s: 'done'; from: string; text: string; original: boolean } | { s: 'none' };
 const translations = new Map<number, Tr>();
 /** Who is writing now, by key, until when. */
 const typing = new Map<string, { who: Who; until: number; timer: ReturnType<typeof setTimeout> }>();
@@ -234,6 +234,14 @@ function text(m: Msg): HTMLElement[] {
 	const t = translations.get(m.id);
 	if (!t || t.s === 'none') return [body(m.text)];
 	const note = el('p', 'chat-tr');
+	if (t.s === 'ask') {
+		const go = el('button', '', 'Translate');
+		go.type = 'button';
+		go.title = 'Downloads the translator once (about 1.2 GB), then translates on this computer';
+		go.addEventListener('click', () => tr.allow());
+		note.append(`${tr.languageName(t.from)} · `, go, el('span', 'chat-tr-size', ' (1.2 GB, once)'));
+		return [body(m.text), note];
+	}
 	if (t.s === 'pending') {
 		note.classList.add('pending');
 		note.append(pendingText(t.from));
@@ -284,6 +292,11 @@ async function translateOne(m: Msg): Promise<void> {
 	translations.set(m.id, { s: 'none' });
 	const from = await tr.needs(m.text);
 	if (!from) return;
+	if (await tr.mustAsk()) {
+		translations.set(m.id, { s: 'ask', from });
+		redraw(m);
+		return;
+	}
 	translations.set(m.id, { s: 'pending', from });
 	redraw(m);
 	const out = await tr.translate(m.text);
@@ -404,6 +417,7 @@ function drawFoot(): void {
 			const text = ta.value.trim();
 			if (!text) return;
 			send({ t: 'say', text });
+			tr.allow();
 			sentTyping = 0;
 			ta.value = '';
 			grow();
@@ -449,6 +463,14 @@ export function setup(opts: {
 	full.addEventListener('click', () => setFull(!document.body.classList.contains('chat-full')));
 	typingRow.hidden = true;
 	tr.setup(base);
+	// Agreed (a Translate button, or the reader's first message): translate every message that was waiting on it.
+	tr.onAllow(() => {
+		for (const m of messages) {
+			if (translations.get(m.id)?.s !== 'ask') continue;
+			translations.delete(m.id);
+			void translateOne(m);
+		}
+	});
 	tr.watch((s) => {
 		trState = s;
 		if (s.s === 'failed' || (s.s === 'idle' && tr.off())) for (const [id, t] of translations) if (t.s === 'pending') translations.set(id, { s: 'none' });

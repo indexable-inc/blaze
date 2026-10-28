@@ -13,11 +13,10 @@
  *      {t: "ready"}  {t: "done", id, text}  {t: "error", id?, message}
  */
 import { env, pipeline, type TextGenerationPipeline } from '@huggingface/transformers';
+import { MODEL, REVISION } from './lib/hymt';
 
 declare const BLAZE_ORT: { mjs: string; parts: string[] };
 
-const MODEL = 'onnx-community/HY-MT1.5-1.8B-ONNX';
-const REVISION = '2f11819b25de08cecd344735cdfa5136ade41a67';
 const ORT_CACHE = 'blaze-ort';
 
 type In = { t: 'load'; dtype: 'q4f16' | 'q4' } | { t: 'run'; id: number; text: string; to: string };

@@ -2,12 +2,15 @@
  * Chat messages in another language than the reader's, translated in the browser (client/translate-worker.ts runs
  * HY-MT1.5-1.8B on WebGPU). Only on a computer: a phone or tablet, a browser without WebGPU, a slow or metered
  * connection, little memory or little free storage never downloads the model. Nothing downloads until a message
- * needs translating, and then once: the model and the runtime stay in Cache Storage.
+ * needs translating and the reader has chatted (sent a message) or asked (a message's Translate button), and then
+ * once: the model and the runtime stay in Cache Storage, and once there it translates without asking.
  *
  * A message's language comes from the browser's LanguageDetector when it has one (Chrome), else from its script
  * (Han, kana, Hangul, Cyrillic, Arabic, ...), so without the detector Latin-script languages go untranslated.
  * `localStorage['blaze.translate'] = 'off'` turns it off; the progress line's Stop does that.
  */
+
+import { modelFile } from './hymt';
 
 const OFF_KEY = 'blaze.translate';
 /** Free storage the model needs, with room to spare. */
@@ -192,6 +195,32 @@ export async function needs(text: string): Promise<string | null> {
 	if (!(await capable) || off()) return null;
 	const from = await detect(text);
 	return from && from !== target ? from : null;
+}
+
+let allowed = false;
+
+/** The reader chatted or asked: downloading the model is fine now. Lasts this page; once cached it no longer asks. */
+export function allow(): void {
+	allowed = true;
+	for (const l of allowListeners) l();
+}
+const allowListeners = new Set<() => void>();
+export function onAllow(l: () => void): void {
+	allowListeners.add(l);
+}
+
+/** Whether translating would start a download the reader has not agreed to: true until they do or the model is cached. */
+export async function mustAsk(): Promise<boolean> {
+	if (allowed || worker) return false;
+	const dtype = await capable;
+	if (!dtype) return false;
+	try {
+		const cache = await caches.open('transformers-cache');
+		if (await cache.match(modelFile(`onnx/model_${dtype}.onnx_data`))) return false;
+	} catch {
+		// No Cache Storage: ask.
+	}
+	return true;
 }
 
 /** `text` in the reader's language, or null when it could not be translated. Starts the translator on first use. */
