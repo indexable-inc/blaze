@@ -17,7 +17,7 @@ out, rounds = sys.argv[1], int(sys.argv[2])
 at = sys.argv.index("--")
 arms = dict(it.split("=", 1) for it in sys.argv[3:at])
 projects = dict(it.split("=", 1) for it in sys.argv[at + 1:])
-work = os.path.join(out, "work")
+work = os.environ.get("COLD_WORK") or os.path.join(out, "work")
 os.makedirs(work, exist_ok=True)
 
 LINES = {
