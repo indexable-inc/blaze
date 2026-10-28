@@ -1,0 +1,38 @@
+[package]
+name = "anim"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.23.1"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+cpal = "0.18.2"
+crossterm = "0.29.0"
+flate2 = "1.1.10"
+libc = "0.2.191"
+pollster = "1.0.1"
+svgtypes = "0.16.1"
+taffy = "0.15.0"
+tiny-skia = "0.12.0"
+
+# Haptics, the refresh rate and the screenshot the ix intro shatters are
+# macOS only, and the glass renders through Metal there; elsewhere those
+# parts are skipped and wgpu uses the platform's own GPU API.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSHapticFeedback", "NSScreen", "std"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFData", "CFCGTypes"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGImage", "CGDataProvider", "CGDirectDisplay"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSError"] }
+objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-core-foundation", "objc2-core-graphics", "SCScreenshotManager", "SCShareableContent", "SCStream"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["metal", "wgsl"] }
+
+[target.'cfg(not(any(target_os = "macos", windows)))'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["vulkan", "wgsl"] }
+
+[target.'cfg(windows)'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["dx12", "wgsl"] }
+
+[workspace]
+members = [".", "nuna"]

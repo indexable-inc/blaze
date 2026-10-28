@@ -1,0 +1,21 @@
+[package]
+name = "nuna"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.23.1"
+cosmic-text = "0.19.0"
+crossterm = "0.29.0"
+flecs_ecs = "0.2.2"
+flate2 = "1.1.10"
+libc = "0.2.191"
+nu-cli = "0.116.1"
+nu-cmd-lang = "0.116.1"
+nu-command = "0.116.1"
+nu-engine = "0.116.1"
+nu-parser = "0.116.1"
+nu-protocol = "0.116.1"
+nu-utils = "0.116.1"
+taffy = "0.15.0"
+tiny-skia = "0.12.0"

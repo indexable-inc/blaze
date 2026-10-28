@@ -1,21 +1,15 @@
-# A long differential fuzz run every night: generated programs built by rustc and by blaze
-# under both producers, outputs compared. The seed is the run number, so every night covers
-# new programs and a failing night can be repeated with `fuzz.py run --seed N`.
+# Probe branch of lane relax-images (blaze #1295, #1299): not for merging. Measures the anim
+# stand-in's warm load and the worker's memory with two releases.
 name: fuzz
 on:
-  schedule:
-    - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
       seed:
-        description: seed (defaults to the run number)
+        description: unused
         required: false
       rounds:
-        description: programs to generate
-        default: "200"
-
-env:
-  CARGO_INCREMENTAL: 0
+        description: old release, new release, engine artifact run id (optional)
+        default: "0.20261028.9 0.20261028.10"
 
 jobs:
   fuzz:
@@ -23,26 +17,22 @@ jobs:
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
-        with:
-          llvm: build
-      # cargo, with no cache, as release.yaml builds blaze: a fuzzer's reach is its speed, and
-      # the blaze that blaze builds runs about ten times slower until it inlines one function
-      # into another (https://github.com/indexable-inc/blaze/issues/899).
-      - run: nix develop --command cargo build -p blaze-engine --release --features llvm --locked
-      - name: Fuzz
-        working-directory: harness
+      - run: sudo apt-get update -q && sudo apt-get install -yq libasound2-dev pkg-config
+      - name: measure
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          export BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine"
-          python3 fuzz/fuzz.py run --seed "${{ inputs.seed || github.run_number }}" \
-            --rounds "${{ inputs.rounds || '200' }}" --backends cranelift,llvm \
-            --out "$RUNNER_TEMP/fuzz-out" || status=$?
-          python3 fuzz/fuzz.py report "$RUNNER_TEMP/fuzz-out" | tee -a "$GITHUB_STEP_SUMMARY"
-          exit "${status:-0}"
-      - uses: actions/upload-artifact@v7
-        if: always()
+          set -- ${{ inputs.rounds }}
+          export OLD=$1 NEW=$2
+          if [ -n "${3:-}" ]; then
+            gh run download "$3" -n blaze-linux-x86_64 -D "$RUNNER_TEMP/engine"
+            export ENGINE=$(find "$RUNNER_TEMP/engine" -name blaze-engine -type f | head -1)
+            chmod +x "$ENGINE"
+          fi
+          nproc; free -g
+          OUT="$RUNNER_TEMP/probe/out" bash probe/measure.sh
+      - if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: fuzz-${{ github.run_number }}
-          path: |
-            ${{ runner.temp }}/fuzz-out
-            harness/fuzz/found
+          name: probe
+          path: ${{ runner.temp }}/probe/out
