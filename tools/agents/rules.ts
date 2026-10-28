@@ -1,15 +1,12 @@
 // blaze's rules for agents: the one source. `info` is the rule an agent must follow, short and
-// imperative; `reason` is why (Andrew's words, dates, history), kept for people and for AGENTS.md
-// but not put into an agent's context.
+// imperative; `reason` is why (Andrew's words, dates, history). Both go into AGENTS.md, which Claude
+// Code, Codex and Cursor read at the start of every session.
 //
-//   bun tools/agents/rules.ts            header and numbered rules, no reasons: what Claude's SessionStart
-//                                  hook (.claude/settings.json) puts into every session
-//   bun tools/agents/rules.ts --reasons  the same with each rule's reason
-//   bun tools/agents/rules.ts --write    regenerate AGENTS.md (read by Codex and other tools)
+//   bun tools/agents/rules.ts --write    regenerate AGENTS.md
 //   bun tools/agents/rules.ts --check    fail if AGENTS.md is not what --write would write (CI, fmt job)
 //
 // AGENTS.md also carries `reviewRules`, the "## Code Review Rules" section Codex code review reads
-// on every pull request; it is not in the SessionStart hook's output.
+// on every pull request.
 //
 // A rule's identity is its `id` (kebab case, never reused or renamed lightly); its number is only
 // its position in the printed list and moves when a rule is inserted.
@@ -27,7 +24,7 @@ type Rule = {
 
 const header = `# blaze
 
-How to build, test and change blaze, including its rust-analyzer-derived front end (crates/hir-ty, hir-def, syntax, parser and the rest): docs/contributing.md. What the harnesses check: docs/harness.md. Rules live in tools/agents/rules.ts (edit there, then \`bun tools/agents/rules.ts --write\` for AGENTS.md).`;
+How to build, test and change blaze, including its rust-analyzer-derived front end (crates/hir-ty, hir-def, syntax, parser and the rest): docs/contributing.md. What the harnesses check: docs/harness.md. Rules live in tools/agents/rules.ts (edit there, then \`bun tools/agents/rules.ts --write\` for AGENTS.md). No CLAUDE.md: Claude Code reads AGENTS.md. Skills: .agents/skills/ (.claude/skills links there).`;
 
 export const rules = [
 	{
@@ -145,16 +142,6 @@ These guide Codex code review on pull requests. They add to the rustc comparison
 - Flag the store, remote cache or daemon trusting bytes it did not verify: an artifact used without checking its content hash, archive or path entries that can escape their directory, a socket or HTTP endpoint reachable by other users, or CBOR from the network decoded without size limits.
 - Flag secrets (tokens, keys) written to logs, CI output, artifacts or the store, and workflows that expose secrets to code from forked pull requests.`;
 
-/** What the SessionStart hook prints: header, then `N. id: info (see link)`, with `reason` only on request. */
-export function render(withReasons: boolean): string {
-	const lines = rules.map((rule: Rule, i) => {
-		const see = rule.link === undefined ? "" : ` (see ${rule.link})`;
-		const why = withReasons && rule.reason !== undefined ? `\n   Why: ${rule.reason}` : "";
-		return `${i + 1}. ${rule.id}: ${rule.info}${see}${why}`;
-	});
-	return `${header}\n\n${lines.join("\n")}\n`;
-}
-
 /** Hard-wraps `text` at `width` columns, continuation lines indented by `indent`. */
 function wrap(text: string, width: number, indent: string): string {
 	const out: string[] = [];
@@ -191,27 +178,14 @@ export function agentsMd(): string {
 	return `${note}\n${header.split("\n").map((line) => wrap(line, 100, "")).join("\n")}\n\n${items.join("\n")}\n\n${review}\n`;
 }
 
-// Claude Code replaces a hook's stdout past this many characters with a 2,000-character preview.
-const hookLimit = 10_000;
 const agentsPath = `${import.meta.dir}/../../AGENTS.md`;
 const [flag, ...rest] = process.argv.slice(2);
-if (rest.length > 0) throw new Error(`tools/agents/rules.ts: one flag at most, got ${process.argv.slice(2).join(" ")}`);
+if (flag === undefined || rest.length > 0) throw new Error(`tools/agents/rules.ts: one flag, --write or --check, got ${process.argv.slice(2).join(" ")}`);
 switch (flag) {
-	case undefined:
-		process.stdout.write(render(false));
-		break;
-	case "--reasons":
-		process.stdout.write(render(true));
-		break;
 	case "--write":
 		await Bun.write(agentsPath, agentsMd());
 		break;
 	case "--check": {
-		const printed = render(false).length;
-		if (printed > hookLimit) {
-			console.error(`tools/agents/rules.ts prints ${printed} characters; Claude Code cuts SessionStart output past ${hookLimit}`);
-			process.exit(1);
-		}
 		if ((await Bun.file(agentsPath).text()) !== agentsMd()) {
 			console.error("AGENTS.md is stale: run `bun tools/agents/rules.ts --write` and commit it");
 			process.exit(1);
@@ -219,5 +193,5 @@ switch (flag) {
 		break;
 	}
 	default:
-		throw new Error(`tools/agents/rules.ts: unknown flag ${flag} (none, --reasons, --write or --check)`);
+		throw new Error(`tools/agents/rules.ts: unknown flag ${flag} (--write or --check)`);
 }

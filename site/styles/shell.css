@@ -179,6 +179,7 @@ body.chat-open .toc { display: none; }
 	.hero { padding-top: 28px; }
 	.pager { flex-direction: column; }
 	.doc .pager a { max-width: none; }
+	.pager .next { margin-left: 0; }
 }
 @media (prefers-reduced-motion: reduce) {
 	.side, .sechead .chev, .fold > .caret .icon, .navlist .glide-hov { transition: none; }
@@ -212,6 +213,15 @@ html.nav-wait, html.nav-wait * { cursor: progress; }
 .tl-btn:hover, .tl-btn[aria-expanded='true'] { color: var(--ink-1); background: var(--s-tint); }
 .tl-btn svg { width: 14px; height: 14px; fill: currentColor; }
 .tl-discuss .tl-btn { color: var(--ink-1); }
+/* The sidebar shut (client/lib/presence.ts): its column folds to nothing, the page takes the room. */
+.tl-side { width: 30px; padding: 0; justify-content: center; }
+.tl-side svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.4; }
+.tl-side[aria-pressed='true'] svg path { stroke-dasharray: 2 1.6; }
+.frame { transition: grid-template-columns 0.22s cubic-bezier(0.2, 0.7, 0.3, 1); }
+body.side-shut .frame { grid-template-columns: 0 minmax(0, 1fr); padding-left: clamp(8px, 1vw, 14px); gap: 0; }
+body.side-shut .frame > .side { visibility: hidden; overflow: hidden; padding: 0; }
+body.side-shut.chat-full .chat { left: clamp(8px, 1vw, 14px); }
+@media (prefers-reduced-motion: reduce) { .frame { transition: none; } }
 /* The discussion at the left, everything else at the right. */
 .topline > .tl-gap { display: block; flex: 1; }
 .tl-bubble { flex: none; width: 14px; height: 12px; border: 1.5px solid currentColor; border-radius: 4px 4px 4px 1px; }
@@ -251,8 +261,11 @@ html.nav-wait, html.nav-wait * { cursor: progress; }
 .faces .face + .face { margin-left: -6px; }
 .face { display: inline-grid; place-items: center; flex: none; width: 20px; height: 20px; overflow: hidden; border-radius: 50%; background: var(--bg-4); box-shadow: 0 0 0 2px var(--bg); transition: opacity 0.2s; }
 .face img, .face svg { width: 100%; height: 100%; }
-.face svg { padding: 2px; background: var(--bg-3); }
-.face svg rect { fill: var(--id-ink); }
+/* An anonymous reader's animal (gen/animals.ts, drawn from dist/animals.<hash>.svg): its tone slots from their hue `--h`. */
+.face.animal { --a-bg: hsl(var(--h) 30% 25%); --a1: hsl(var(--h) 55% 62%); --a2: hsl(var(--h) 40% 39%); --a3: hsl(var(--h) 75% 88%); --a-ink: hsl(var(--h) 45% 11%); background: var(--a-bg); }
+@media (prefers-color-scheme: light) {
+	.face.animal { --a-bg: hsl(var(--h) 55% 82%); --a1: hsl(var(--h) 50% 57%); --a2: hsl(var(--h) 42% 34%); --a3: hsl(var(--h) 70% 97%); --a-ink: hsl(var(--h) 45% 14%); }
+}
 .face.away { opacity: 0.45; }
 .face.more { width: auto; min-width: 20px; padding: 0 4px; border-radius: 10px; color: var(--ink-3); font-size: 10.5px; }
 .navlist .row > .faces { margin-left: auto; }
@@ -265,6 +278,7 @@ main .discussion { scroll-margin-top: 64px; }
 	.mbar .tl-btn { height: 32px; padding: 0 9px; }
 	.mbar .tl-label, .mbar .tl-count, .mbar .tl-quiet, .mbar .tl-user > span:last-child { display: none; }
 	.mbar .tl-n { margin: 0; }
+	.mbar .tl-side { display: none; } /* The sidebar is the menu's drawer here. */
 	.mbar .tl-here .faces .face:nth-child(n + 3) { display: none; }
 	.mbar .tl-list { position: fixed; top: 52px; right: 8px; }
 }
@@ -298,6 +312,9 @@ main .discussion { scroll-margin-top: 64px; }
 .chat-mute.on { color: var(--ink-1); }
 /* Full screen: over the whole content pane, beside the sidebar (the frame's grid, above). */
 body.chat-full .chat { left: calc(var(--side-w) + 4px); width: auto; box-shadow: inset 0 0 0 1px var(--line-2); }
+/* Full screen, the chat takes the page's place: the page under it neither shows at its edges nor scrolls. */
+body.chat-full .frame > .pane, body.chat-full .cursors { visibility: hidden; }
+html:has(body.chat-full) { overflow: hidden; }
 body.chat-full .chat > .resizer { display: none; }
 body.chat-full .chat-list, body.chat-full .chat-foot, body.chat-full .chat-typing { width: 100%; max-width: 860px; margin-inline: auto; }
 @media (max-width: 800px) { .chat-full { display: none; } }
@@ -321,6 +338,10 @@ body.chat-full .chat-list, body.chat-full .chat-foot, body.chat-full .chat-typin
 /* Pop-ups for messages while the chat is shut, at the bottom right. */
 .chat-toasts { position: fixed; z-index: 46; right: clamp(8px, 1vw, 14px); bottom: 14px; display: flex; flex-direction: column; gap: 8px; width: min(340px, calc(100vw - 24px)); pointer-events: none; }
 .chat-toast { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border: 0; border-radius: 14px; background: var(--pop-bg); box-shadow: var(--pop-ring), 0 12px 32px rgb(0 0 0 / 0.3); color: var(--ink-2); font: inherit; font-size: 13px; line-height: 1.4; text-align: left; cursor: pointer; pointer-events: auto; animation: toast-in 0.2s ease-out; }
+a.chat-toast { text-decoration: none; }
+.tl-list .devices { display: inline-flex; gap: 2px; color: var(--ink-3); }
+.tl-list .device { display: inline-grid; width: 14px; height: 14px; }
+.tl-list .device svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 1.3; stroke-linecap: round; }
 .chat-toast:hover { background: var(--bg-3); }
 .chat-toast .face { width: 26px; height: 26px; }
 .chat-toast-words { min-width: 0; }
@@ -345,32 +366,41 @@ body.chat-full .chat-list, body.chat-full .chat-foot, body.chat-full .chat-typin
 .chat-when { color: var(--ink-4); font-size: 11.5px; }
 .chat-text { margin: 0 0 0 28px; color: var(--ink-2); font-size: 13.5px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
 .chat-text a { color: var(--ink-1); }
-/* A message's actions (reply in thread, delete): a small bar at its top right while it is hovered. */
-.chat-acts { position: absolute; top: 2px; right: 8px; display: flex; gap: 2px; padding: 2px; border-radius: 8px; background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line-2); opacity: 0; }
-.chat-msg:hover > .chat-acts, .chat-acts:focus-within { opacity: 1; }
+/* A message's actions (quick reactions, reply in thread, edit, delete): a small bar at its top right while it is
+   hovered, over the line above as in Slack so the name and time stay readable (not the first row's: it would be cut). */
+.chat-acts { position: absolute; z-index: 1; top: -13px; right: 8px; pointer-events: none; display: flex; gap: 2px; padding: 2px; border-radius: 8px; background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line-2); opacity: 0; }
+.chat-msg:hover > .chat-acts, .chat-acts:focus-within { opacity: 1; pointer-events: auto; }
+.chat-list > .chat-msg:first-child > .chat-acts { top: 2px; }
 /* No hover on a touch screen: a tap on a message shows its actions (client/lib/chat.ts), instead of a row of icons on every line. */
 @media (hover: none) {
 	.chat-acts { visibility: hidden; }
-	.chat-msg.acts-open > .chat-acts { visibility: visible; opacity: 1; }
+	.chat-msg.acts-open > .chat-acts { visibility: visible; opacity: 1; pointer-events: auto; }
 }
 .chat-act { display: grid; place-items: center; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 6px; background: none; color: var(--ink-3); font-size: 15px; line-height: 1; cursor: pointer; }
 .chat-act:hover { color: var(--ink-1); background: var(--s-tint); }
 .chat-act svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 .chat-del:hover { color: var(--danger); }
-/* Under a message with replies: the latest repliers, how many, when the last came. Opens the thread. */
-.chat-replies { display: flex; align-items: center; gap: 7px; max-width: calc(100% - 22px); margin: 3px 0 2px 22px; padding: 3px 8px 3px 6px; border: 0; border-radius: 8px; background: none; color: var(--ink-3); font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
-.chat-replies:hover { background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line-2); }
-.chat-replies b { color: var(--ink-1); font-weight: 500; }
+/* Under a message with replies: the latest repliers, how many, when the last came; the whole line lights up on hover
+   (or keyboard focus) and the time gives way to "View thread". Unseen replies in the reader's threads: bold, a dot. */
+.chat-replies { display: flex; align-items: center; gap: 7px; width: calc(100% - 22px); margin: 3px 0 2px 22px; padding: 3px 8px 3px 6px; border: 0; border-radius: 8px; background: none; color: var(--ink-3); font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
+.chat-replies:hover, .chat-replies:focus-visible { background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line-2); outline: none; }
+.chat-replies b { display: inline-flex; align-items: center; gap: 5px; color: var(--ink-1); font-weight: 500; white-space: nowrap; }
+.chat-replies.unread b { font-weight: 700; }
+.chat-replies-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--doc-code-ink); }
 .chat-replies-faces { display: inline-flex; }
 .chat-replies-faces .face { width: 18px; height: 18px; box-shadow: 0 0 0 1.5px var(--bg-2); }
 .chat-replies-faces .face + .face { margin-left: -4px; }
-.chat-replies-when { color: var(--ink-4); white-space: nowrap; }
+.chat-replies-when, .chat-replies-view { overflow: hidden; color: var(--ink-4); white-space: nowrap; text-overflow: ellipsis; }
+.chat-replies-view { display: none; color: var(--ink-3); }
+.chat-replies:hover .chat-replies-when, .chat-replies:focus-visible .chat-replies-when { display: none; }
+.chat-replies:hover .chat-replies-view, .chat-replies:focus-visible .chat-replies-view { display: inline; }
 /* The open thread: over the list and composer, or in full screen a column at the right, like Slack's. */
 .chat-thread { position: absolute; inset: 0; z-index: 6; display: flex; flex-direction: column; border-radius: inherit; background: var(--bg-2); box-shadow: inset 0 0 0 1px var(--line-2); }
 .chat-thread[hidden] { display: none; }
 .chat-thread .chat-head { padding-left: 8px; }
 .chat-thread .chat-title { flex: 1; }
-.chat-thread-n { display: flex; align-items: center; gap: 10px; margin: 8px 16px 4px; color: var(--ink-3); font-size: 12px; }
+/* Between the thread's message and its replies: how many, and a rule. */
+.chat-thread-n { display: flex; align-items: center; gap: 10px; margin: 10px 16px 6px; color: var(--ink-3); font-size: 12px; white-space: nowrap; }
 .chat-thread-n::after { content: ''; flex: 1; border-top: 1px solid var(--line); }
 body.chat-full .chat.threaded { padding-right: var(--thread-w); }
 body.chat-full .chat-thread { left: auto; width: var(--thread-w); border-radius: 0 16px 16px 0; }
@@ -383,8 +413,50 @@ body.chat-full .chat-back { order: 1; }
 .chat-msg.mention { background: color-mix(in srgb, var(--doc-code-ink) 7%, transparent); box-shadow: inset 2px 0 0 var(--doc-code-ink); }
 .chat-msg.mention:hover { background: color-mix(in srgb, var(--doc-code-ink) 11%, transparent); }
 .chat-toast.mention { box-shadow: inset 2px 0 0 var(--doc-code-ink), inset 0 0 0 1px var(--line-2), 0 12px 32px rgb(0 0 0 / 0.3); }
+.chat-toast.yours { box-shadow: inset 2px 0 0 var(--ink-3), inset 0 0 0 1px var(--line-2), 0 12px 32px rgb(0 0 0 / 0.3); }
 /* The mention pop-up, above its composer: logins that fit what follows the `@`. */
 .chat-compose { position: relative; }
+
+/* A reply also sent to the chat: in the list, a line naming its thread over it; in the thread, a word under it. */
+.chat-ctx { display: flex; gap: 4px; max-width: 100%; margin: 0 0 3px 28px; padding: 0; border: 0; background: none; color: var(--ink-3); font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
+.chat-ctx > span { flex: none; }
+.chat-ctx .chat-ctx-text { flex: 1 1 auto; min-width: 0; overflow: hidden; color: var(--ink-2); white-space: nowrap; text-overflow: ellipsis; }
+.chat-ctx:hover .chat-ctx-text { color: var(--ink-1); text-decoration: underline; }
+.chat-also { margin: 2px 0 0 28px; color: var(--ink-4); font-size: 11.5px; }
+/* The reply composer's "Also send to chat": a small box of our own under the field. */
+.chat-also-to { display: inline-flex; align-items: center; gap: 7px; margin: 7px 0 0 10px; color: var(--ink-3); font-size: 12px; cursor: pointer; user-select: none; }
+.chat-also-to:hover { color: var(--ink-1); }
+.chat-also-to input { appearance: none; display: grid; place-items: center; flex: none; width: 14px; height: 14px; margin: 0; padding: 0; border-radius: 4px; background: none; box-shadow: inset 0 0 0 1.5px var(--ink-4); cursor: pointer; transition: background-color 0.12s, box-shadow 0.12s; }
+.chat-also-to:hover input:not(:checked) { box-shadow: inset 0 0 0 1.5px var(--ink-2); }
+.chat-also-to input::after { content: ''; width: 7px; height: 4px; margin-top: -2px; border: solid var(--bg); border-width: 0 0 1.75px 1.75px; transform: rotate(-45deg); opacity: 0; }
+.chat-also-to input:checked { background: var(--ink-1); box-shadow: none; }
+.chat-also-to input:checked::after { opacity: 1; }
+.chat-also-to input:focus-visible { outline: 2px solid var(--line-2); outline-offset: 2px; }
+
+/* Reactions (client/lib/chat.ts REACTS): our own icons. A chip each under the message, the reader's own marked. */
+.chat-reacts { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0 2px 28px; }
+.chat-react { display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 7px 0 5px; border: 0; border-radius: 11px; background: var(--s-tint); box-shadow: inset 0 0 0 1px var(--line); color: var(--ink-2); font: inherit; font-size: 11.5px; font-variant-numeric: tabular-nums; cursor: pointer; }
+.chat-react svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
+.chat-react:hover { box-shadow: inset 0 0 0 1px var(--ink-4); color: var(--ink-1); }
+.chat-react.mine { background: color-mix(in srgb, var(--doc-code-ink) 13%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--doc-code-ink) 55%, transparent); color: var(--ink-1); }
+.chat-react.mine svg { color: var(--doc-code-ink); }
+.chat-react[aria-disabled='true'] { cursor: default; }
+.chat-react[aria-disabled='true']:hover { box-shadow: inset 0 0 0 1px var(--line); color: var(--ink-2); }
+@media (prefers-reduced-motion: no-preference) { .chat-react.mine svg { animation: react-in 0.22s ease-out; } }
+@keyframes react-in { from { transform: scale(0.6); } 60% { transform: scale(1.18); } }
+/* The quick-react row at the head of a message's actions, set off from the rest by a rule. */
+.chat-quick { display: flex; gap: 2px; }
+.chat-quick:not(:last-child) { margin-right: 2px; padding-right: 3px; box-shadow: inset -1px 0 0 var(--line-2); }
+.chat-quick .chat-act[aria-pressed='true'] { color: var(--doc-code-ink); background: color-mix(in srgb, var(--doc-code-ink) 13%, transparent); }
+
+/* Edited: a word after the text, the time in its tooltip; a message being edited holds a field in its text's place. */
+.chat-edited { color: var(--ink-4); font-size: 11px; white-space: nowrap; cursor: default; }
+.chat-msg.editing, .chat-msg.editing:hover { background: color-mix(in srgb, var(--ink-1) 4%, transparent); }
+.chat-edit { margin: 2px 0 2px 28px; }
+.chat-edit .chat-form { padding: 4px 12px; border-radius: 12px; background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line-2), 0 0 0 3px var(--s-tint); }
+.chat-edit-hint { margin: 4px 0 0 2px; color: var(--ink-4); font-size: 11.5px; }
+.chat-edit-hint button { padding: 0; border: 0; background: none; color: var(--ink-2); font: inherit; cursor: pointer; }
+.chat-edit-hint button:hover { color: var(--ink-1); text-decoration: underline; }
 .chat-pop { position: absolute; z-index: 3; left: 0; right: 0; bottom: 100%; margin: 0 0 6px; padding: 4px; list-style: none; border-radius: 12px; background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line-2), 0 12px 32px rgb(0 0 0 / 0.3); }
 .chat-pop[hidden] { display: none; }
 .chat-pop li { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 8px; color: var(--ink-2); font-size: 13px; cursor: pointer; }
@@ -447,14 +519,55 @@ body.chat-full .chat-back { order: 1; }
 .cursor svg { width: 16px; height: 20px; flex: none; fill: var(--c); stroke: var(--bg); stroke-width: 1.2; stroke-linejoin: round; filter: drop-shadow(0 1px 2px rgb(0 0 0 / 0.3)); }
 .cursor-chip { display: inline-flex; align-items: center; gap: 4px; margin: 14px 0 0 -4px; padding: 2px 7px 2px 2px; border-radius: 10px; background: var(--c); color: #fff; font-size: 11px; font-weight: 500; line-height: 16px; white-space: nowrap; box-shadow: 0 2px 8px rgb(0 0 0 / 0.2); }
 .cursor-chip .face { width: 16px; height: 16px; box-shadow: none; }
+/* A line said by the pointer (T; client/lib/cursors.ts), in its sayer's colour (--c): the reader's own composer, fixed
+   beside their pointer (or at the window's foot), and the others' as bubbles under their name, or out of their face on
+   the rail while their pointer is off this screen. A caret blinks while they write; a sent one fades after a while. */
+.say-live { position: fixed; z-index: 46; display: flex; align-items: center; gap: 8px; padding: 4px 6px 4px 10px; border-radius: 4px 14px 14px 14px; background: var(--pop-bg); box-shadow: var(--pop-ring), inset 0 0 0 1.5px var(--c), 0 10px 28px rgb(0 0 0 / 0.28); animation: say-live-in 0.15s ease-out; transition: opacity 0.3s; }
+.say-live[hidden] { display: none; }
+.say-live > .face { flex: none; width: 20px; height: 20px; margin-left: -4px; box-shadow: none; }
+.say-live.at-foot { left: 50%; bottom: 28px; transform: translateX(-50%); border-radius: 14px; }
+.say-live input, .say-live input:focus { field-sizing: content; width: auto; min-width: 24ch; max-width: min(420px, calc(100vw - 72px)); height: 24px; padding: 0; border: 0; border-radius: 0; background: none; box-shadow: none; color: var(--ink-1); font: inherit; font-size: 13.5px; outline: none; }
+.say-live input::placeholder { color: var(--ink-4); }
+.say-live.sent kbd { visibility: hidden; }
+.say-live.out { opacity: 0; }
+.say-live kbd, .tl-hint kbd { padding: 0 5px; border-radius: 5px; box-shadow: inset 0 0 0 1px var(--line-2); font-family: var(--font-mono); font-size: 11px; line-height: 17px; color: var(--ink-3); }
+.cursor-say { position: absolute; top: 38px; left: 12px; width: max-content; max-width: 260px; padding: 5px 10px; border-radius: 4px 12px 12px 12px; background: var(--pop-bg); box-shadow: var(--pop-ring), inset 0 0 0 1.5px var(--c), 0 8px 24px rgb(0 0 0 / 0.25); color: var(--ink-1); font-size: 12.5px; line-height: 1.35; white-space: normal; overflow-wrap: anywhere; pointer-events: none; animation: say-live-in 0.15s ease-out; transition: opacity 0.3s; }
+.cursor-say.flip { left: 8px; transform: translateX(-100%); border-radius: 12px 4px 12px 12px; }
+.cursor-say.on-rail { top: -4px; left: auto; right: 30px; border-radius: 12px 4px 12px 12px; }
+.cursor-say.live::after { content: ""; display: inline-block; width: 1.5px; height: 1.05em; margin-left: 1px; vertical-align: -2px; background: var(--c); animation: say-caret 1s steps(1) infinite; }
+.cursor-say.out { opacity: 0; }
+@keyframes say-live-in { from { opacity: 0; } }
+@keyframes say-caret { 50% { opacity: 0; } }
+.tl-list .tl-hint { margin: 8px 4px 0; padding-top: 8px; border-top: 1px solid var(--line); color: var(--ink-3); font-size: 12px; }
+@media (prefers-reduced-motion: reduce) { .say-live, .cursor-say, .cursor-say.live::after { animation: none; transition: none; } }
 /* Where each is reading: a thin rail at the right edge, the page's length top to bottom, a band in their colour for
-   each viewport with their face on it (a button: it scrolls there), and a faint band for the reader's own. */
-.reading { position: fixed; z-index: 14; top: 0; right: 0; bottom: 0; width: 6px; pointer-events: none; }
+   each viewport with their face on it (a button: it scrolls there), and a faint band for the reader's own. Beside a
+   chat it sits at the page's right edge, clear of the chat's resize handle; over a full-screen or phone chat it goes.
+   Above the sticky top line (a scrollbar runs the window's height), under the chat, the drawer and pop-ups. */
+.reading { position: fixed; z-index: 16; top: 6px; right: 0; bottom: 10px; width: 6px; pointer-events: none; user-select: none; -webkit-user-select: none; }
 .reading[hidden] { display: none; }
+.reading-others, .reading-track { position: absolute; inset: 0; }
 .reading-me, .reading-band { position: absolute; right: 1px; width: 4px; min-height: 4px; border-radius: 2px; }
 .reading-me { background: color-mix(in srgb, var(--ink-1) 10%, transparent); }
 .reading-band { background: color-mix(in srgb, var(--c) 55%, transparent); }
-.reading-face { position: absolute; top: 0; right: 6px; display: grid; padding: 0; border: 0; border-radius: 50%; background: none; cursor: pointer; pointer-events: auto; }
+.reading-face { position: absolute; z-index: 1; top: 0; right: 6px; display: grid; padding: 0; border: 0; border-radius: 50%; background: none; cursor: pointer; pointer-events: auto; }
 .reading-face .face { width: 18px; height: 18px; box-shadow: 0 0 0 2px var(--c); }
 .reading-face:hover .face { opacity: 1; transform: scale(1.15); }
-@media (min-width: 1280px) { body.chat-open .reading { right: calc(var(--chat-w) + 2 * clamp(8px, 1vw, 14px)); } }
+@media (min-width: 801px) { body.chat-open .reading { right: calc(var(--chat-w) + 2 * clamp(8px, 1vw, 14px)); } }
+@media (max-width: 800px) { body.chat-open .reading { display: none; } }
+body.chat-full .reading { display: none; }
+/* On a desk the rail is the page's scrollbar (client/lib/cursors.ts, the same media query), so the browser's goes:
+   one scrollbar, inside the page rather than beyond the chat. A wider track to aim at; the thumb dims while the page
+   rests and brightens as it scrolls, under the pointer and while dragged. Inner scroll areas keep their own. */
+@media (hover: hover) and (pointer: fine) {
+	html { scrollbar-width: none; }
+	html::-webkit-scrollbar { display: none; }
+	.reading.bar { width: 12px; pointer-events: auto; }
+	.reading.bar :is(.reading-me, .reading-band) { right: 3px; width: 5px; border-radius: 3px; transition: width 0.15s, right 0.15s, background-color 0.3s; }
+	.reading.bar .reading-me { background: color-mix(in srgb, var(--ink-1) 12%, transparent); }
+	.reading.bar.live .reading-me { background: color-mix(in srgb, var(--ink-1) 28%, transparent); transition-duration: 0.15s, 0.15s, 0.1s; }
+	.reading.bar:hover .reading-me { background: color-mix(in srgb, var(--ink-1) 36%, transparent); }
+	.reading.bar.drag .reading-me { background: color-mix(in srgb, var(--ink-1) 46%, transparent); }
+	.reading.bar:is(:hover, .drag) :is(.reading-me, .reading-band) { right: 2px; width: 8px; border-radius: 4px; }
+}
+@media (prefers-reduced-motion: reduce) { .reading-me, .reading-band { transition: none !important; } }

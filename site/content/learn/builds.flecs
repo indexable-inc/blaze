@@ -67,8 +67,8 @@ site {
       }
 
       Step same("Same commands") {
-        Say: {"You still type cargo's commands, with blaze in front: blaze build, blaze run, blaze test. blaze build, run and test don't run rustc at all: blaze compiles the code itself. Plain cargo build, after blaze enable, still runs rustc for some crates, for now. On a two-hundred-crate workspace, an edit in the crate everything uses took six seconds with cargo, and six tenths of a second with blaze. That was measured once, by hand."}
-        P commands("You still type cargo's commands, with blaze in front: `blaze build`, `blaze run`, `blaze test`. These don't run `rustc`: blaze compiles the code itself. (Plain `cargo build` after `blaze enable` still runs `rustc` for some crates, for now.)")
+        Say: {"You still type cargo's commands, with blaze in place of cargo: blaze build, blaze run, blaze test. blaze build, run and test don't run rustc at all: blaze compiles the code itself. Plain cargo build, after blaze enable, still runs rustc for some crates, for now. On a two-hundred-crate workspace, an edit in the crate everything uses took six seconds with cargo, and six tenths of a second with blaze. That was measured once, by hand."}
+        P commands("You still type cargo's commands, with `blaze` in place of `cargo`: `blaze build`, `blaze run`, `blaze test`. These don't run `rustc`: blaze compiles the code itself. (Plain `cargo build` after `blaze enable` still runs `rustc` for some crates, for now.)")
         Dim number("On a 200-crate workspace, an edit in the crate everything uses took 6.33 s with cargo and 0.60 s with blaze (measured once, by hand; [more runs](/bench)).")
       }
 

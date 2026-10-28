@@ -4,7 +4,8 @@
 How to build, test and change blaze, including its rust-analyzer-derived front end (crates/hir-ty,
 hir-def, syntax, parser and the rest): docs/contributing.md. What the harnesses check:
 docs/harness.md. Rules live in tools/agents/rules.ts (edit there, then `bun tools/agents/rules.ts
---write` for AGENTS.md).
+--write` for AGENTS.md). No CLAUDE.md: Claude Code reads AGENTS.md. Skills: .agents/skills/
+(.claude/skills links there).
 
 1. **no-rustc**: blaze never runs rustc. It compiles everything itself: no function, crate, standard
    library, build script, proc macro, check, test, doctest or link step is handed to rustc, rustdoc

@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""canary.py: a canary of every green main, cut by a tag on main's own commit (docs/release.md).
+"""canary.py: a canary of every built main, cut by a tag on main's own commit (docs/release.md).
 
-    canary.py cut '{"push": false, "min_minutes": 30}'
-        the newest commit of main (first parents, since the newest release) that passed the
-        merge gate (its `ci` check, from the push run on main), when it has changes since that
-        release beyond the bots' own and the docs: the tag v0.YYYYMMDD.N on that commit, made
-        through the API, and release.yaml dispatched on it.
-        Nothing when a release was published less than `min_minutes` ago or release.yaml is
-        running: the next green main, or the hourly run, cuts it then. Without `push`, what it
-        would tag is shown and nothing leaves the checkout.
+    canary.py cut '{"push": false, "min_minutes": 30, "wait": "<sha>", "wait_minutes": 90}'
+        the newest commit of main (first parents, since the newest release) that main's merge
+        gate built: the job `linux x64 / build` of blaze.yaml's run on the push of that commit
+        passed. Not the whole run: no unit tests, no other platform (stable waits for those,
+        promote.py tested). When it has changes since that release beyond the bots' own and
+        the docs: the tag v0.YYYYMMDD.N on that commit, made through the API, and release.yaml
+        dispatched on it.
+        With `wait` (canary.yaml on a push to main passes the pushed commit), it first waits
+        for the newest commit of main that has a build to finish it, at most `wait_minutes`,
+        so the cut comes as soon as that build is done; a build still running then is an error
+        naming it. Nothing when a release was published less than `min_minutes` ago or
+        release.yaml is running: the next push, or the hourly run, cuts it then. Without
+        `push`, what it would tag is shown and nothing leaves the checkout.
     canary.py notes '{"tag": "v0.YYYYMMDD.N", "notes": "<file>"}'
         release.yaml's notes job: the release notes, CHANGELOG.md's [Unreleased] lines added since
         the previous release and the title of each change merged since then, and the step output
@@ -23,14 +28,14 @@
         release changes no crate's identity and no build of main misses blaze's store.
 
 No commit goes to main, so a cut never races a merge, and a canary is the bytes of a commit
-that passed the gate, as it is. train_release.py's numbering counts every tag, as `cut`'s does,
+that main's gate built, as it is. train_release.py's numbering counts every tag, as `cut`'s does,
 so the two never take the same version, and `cut` cuts nothing while release-cut.yaml runs.
 
 The JSON is inline, a file's path, or `-` for stdin. Needs git (a checkout of main with its
 history and tags) and gh (GH_TOKEN with contents: write and actions: write for `cut` with
 `push`). Python 3.11+, stdlib.
 """
-import asyncio, datetime, json, os, re, subprocess, sys, typing
+import asyncio, datetime, json, os, re, subprocess, sys, time, typing
 from dataclasses import dataclass, fields
 from pathlib import Path
 
@@ -45,14 +50,25 @@ DOCS = re.compile(r"^(docs/|site/|tools/agents/|tools/bench/results/)|\.md$")
 # `0.0.0-dev`); `stamp` writes a release's into a checkout.
 TREE_VERSION = "0.0.0"
 WORKSPACE_VERSION = re.compile(r'(\[workspace\.package\]\nversion = ")([^"]+)"')
-# How many of main's newest commits `cut` looks through for a green one.
+# How many of main's newest commits `cut` looks through for a built one.
 LOOK_BACK = 40
+# The merge gate, and the job of its run on a push to main that a canary needs to have passed.
+GATE = ".github/workflows/blaze.yaml"
+BUILD = "linux x64 / build"
+# How often a wait asks again.
+POLL_SECS = 60
+# How long a pushed commit's gate run may take to appear before the push counts as having none.
+RUN_GRACE_SECS = 300
+STARTED = time.monotonic()
 
 
 @dataclass(frozen=True)
 class Cut:
     push: bool = False
     min_minutes: int = 30
+    # A commit of main just pushed (canary.yaml on a push), or empty: no waiting.
+    wait: str = ""
+    wait_minutes: int = 90
 
 
 @dataclass(frozen=True)
@@ -126,23 +142,69 @@ def previous(rev, but=None):
     return found if DATED.fullmatch(found or "") else None
 
 
-def green(sha):
-    checks = json.loads(run("gh", "api", f"repos/{REPO}/commits/{sha}/check-runs?check_name=ci&per_page=20"))
-    return any((c["status"], c["conclusion"]) == ("completed", "success") for c in checks["check_runs"])
+def gate_run(sha):
+    """The merge gate's run (blaze.yaml) on the push of `sha` to main, or None. A re-run keeps
+    its id; the newest run is taken if there are several."""
+    found = json.loads(run("gh", "api", f"repos/{REPO}/actions/runs?head_sha={sha}&event=push&branch=main&per_page=20"))
+    runs = [r for r in found["workflow_runs"] if r["path"] == GATE]
+    return max(runs, key=lambda r: r["id"]) if runs else None
+
+
+def build(sha, pushed=False):
+    """Where main's build of `sha` is: "built" (`linux x64 / build` passed), "failed",
+    "building", or "none" (the gate builds nothing for it: a change to nothing the build reads,
+    or no gate run, which a commit pushed by a workflow's own token has). With `pushed`, `sha`
+    was just pushed and its run may not be there yet: no run is "building" for the first
+    `RUN_GRACE_SECS` of the wait, and "none" after."""
+    gate = gate_run(sha)
+    if gate is None:
+        return ("building" if pushed and time.monotonic() < STARTED + RUN_GRACE_SECS else "none"), None
+    jobs = {j["name"]: j for j in json.loads(run("gh", "api", f"repos/{REPO}/actions/runs/{gate['id']}/jobs?filter=latest&per_page=100"))["jobs"]}
+    if job := jobs.get(BUILD):
+        if job["status"] != "completed":
+            return "building", gate
+        return ("built" if job["conclusion"] == "success" else "failed"), gate
+    # A skipped `linux x64` (blaze.yaml's call of blaze-platform.yaml) has no jobs of its own.
+    if gate["status"] == "completed" or jobs.get("linux x64", {}).get("status") == "completed":
+        return "none", gate
+    return "building", gate
+
+
+def wait_for_build(since, pushed, minutes):
+    """Until the newest of `since` (main's commits, newest first) that has a build has finished
+    it: what the cut then takes is the newest build of main, not one older because the newest
+    was a minute short. At most `minutes`, then an error naming the build."""
+    deadline = time.monotonic() + minutes * 60
+    while True:
+        for sha in since:
+            state, gate = build(sha, pushed=sha == pushed)
+            if state != "none":
+                break
+        else:
+            return
+        if state != "building":
+            return
+        where = gate["html_url"] if gate else "its run has not started"
+        if time.monotonic() >= deadline:
+            sys.exit(f"canary.py: main's build of {sha[:10]} ({BUILD}) has not finished after {minutes} min: {where}")
+        print(f"waiting for main's build of {sha[:10]} ({where})", flush=True)
+        time.sleep(POLL_SECS)
 
 
 def cut(args):
     import train_release
     main = run("git", "rev-parse", "origin/main")
     base = previous(main)
-    # Main moves every few minutes and its gate takes longer than that, so HEAD is seldom green
-    # yet: the canary is the newest commit since the last release whose gate is.
+    # Main moves every few minutes and its build takes longer than that, so HEAD is seldom
+    # built yet: the canary is the newest commit since the last release that main's gate built.
     since = run("git", "rev-list", "--first-parent", "--max-count", str(LOOK_BACK), f"{base}..{main}" if base else main).split()
     if not since:
         return summary(f"main {main[:10]} is {base} already")
-    head = next((sha for sha in since if green(sha)), None)
+    if args.wait:
+        wait_for_build(since, args.wait, args.wait_minutes)
+    head = next((sha for sha in since if build(sha)[0] == "built"), None)
     if head is None:
-        return summary(f"none of main's {len(since)} newest commits since {base} has a green `ci` yet; no canary")
+        return summary(f"none of main's {len(since)} newest commits since {base} has passed `{BUILD}` yet; no canary")
     if base:
         files = run("git", "diff", "--name-only", f"{base}..{head}").split()
         if not any(not DOCS.search(f) for f in files):
@@ -155,7 +217,7 @@ def cut(args):
         # release.yaml on a branch builds and releases nothing: only a tag's run is a release.
         if busy := [r["headBranch"] for r in running if r["status"] in ("queued", "in_progress", "waiting", "pending", "requested")
                     and (workflow == "release-cut.yaml" or DATED.fullmatch(r["headBranch"]))]:
-            return summary(f"{workflow} is {doing} ({', '.join(busy)}); the next green main or the hourly run cuts the canary")
+            return summary(f"{workflow} is {doing} ({', '.join(busy)}); the next push to main or the hourly run cuts the canary")
     releases = json.loads(run("gh", "release", "list", "-R", REPO, "-L", "10", "--json", "tagName,createdAt"))
     dated = [r for r in releases if DATED.fullmatch(r["tagName"])]
     if dated:

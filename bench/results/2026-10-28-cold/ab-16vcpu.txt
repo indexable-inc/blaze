@@ -1,0 +1,57 @@
+### /root/cf/abdisk/summary
+1 ripgrep tstep 13.90 | Took 13.8s: building build scripts and proc macros 6.05s, compiling the standard library of build scripts 2.48s, compiling functions 2.35s
+1 ripgrep tstep2 10.61 | Took 10.5s: building build scripts and proc macros 4.10s, compiling functions 2.31s, compiling the standard library of build scripts 1.89s
+2 ripgrep tstep 12.84 | Took 12.8s: building build scripts and proc macros 4.64s, compiling the standard library of build scripts 2.40s, compiling functions 2.33s
+2 ripgrep tstep2 12.37 | Took 12.3s: building build scripts and proc macros 5.49s, compiling functions 2.30s, compiling the standard library of build scripts 1.76s
+3 ripgrep tstep 14.16 | Took 14.1s: building build scripts and proc macros 5.93s, compiling the standard library of build scripts 2.56s, compiling functions 2.30s
+3 ripgrep tstep2 13.84 | Took 13.8s: building build scripts and proc macros 6.00s, compiling the standard library of build scripts 2.64s, compiling functions 2.36s
+4 ripgrep tstep 11.26 | Took 11.2s: building build scripts and proc macros 4.02s, compiling functions 2.54s, compiling the standard library of build scripts 2.39s
+4 ripgrep tstep2 11.90 | Took 11.8s: building build scripts and proc macros 4.46s, compiling functions 2.30s, storing the manifest 2.21s
+
+### /root/cf/abtmp/summary
+1 ripgrep tstep 10.80 | Took 10.7s: building build scripts and proc macros 4.56s, compiling the standard library of build scripts 2.38s, compiling functions 2.29s
+1 ripgrep tstep2 10.10 | Took 10.0s: building build scripts and proc macros 5.33s, compiling functions 2.34s, compiling the standard library of build scripts 0.83s
+1 anim tstep 35.95 | Took 35.8s: building build scripts and proc macros 17.0s, loading workspace 7.02s, compiling functions 6.02s
+1 anim tstep2 32.99 | Took 32.8s: building build scripts and proc macros 16.4s, loading workspace 6.95s, compiling functions 5.59s
+2 ripgrep tstep 11.16 | Took 11.1s: building build scripts and proc macros 4.90s, compiling the standard library of build scripts 2.35s, compiling functions 2.34s
+2 ripgrep tstep2 10.54 | Took 10.5s: building build scripts and proc macros 5.79s, compiling functions 2.23s, compiling the standard library of build scripts 0.96s
+2 anim tstep 36.07 | Took 35.9s: building build scripts and proc macros 17.6s, loading workspace 6.89s, compiling functions 5.60s
+2 anim tstep2 33.86 | Took 33.7s: building build scripts and proc macros 16.9s, loading workspace 7.04s, compiling functions 5.64s
+3 ripgrep tstep 11.95 | Took 11.5s: building build scripts and proc macros 5.30s, compiling the standard library of build scripts 2.35s, compiling functions 2.33s
+3 ripgrep tstep2 10.30 | Took 10.2s: building build scripts and proc macros 5.33s, compiling functions 2.36s, compiling the standard library of build scripts 0.99s
+
+### /root/cf/ab3/summary
+1 ripgrep tstep2 9.98 | Took 9.94s: building build scripts and proc macros 5.14s, compiling functions 2.32s, compiling the standard library of build scripts 0.89s
+1 ripgrep tstep3 8.23 | Took 8.19s: building build scripts and proc macros 3.41s, compiling functions 2.28s, compiling the standard library of build scripts 0.95s
+1 anim tstep2 33.26 | Took 33.1s: building build scripts and proc macros 16.3s, loading workspace 6.97s, compiling functions 5.59s
+1 anim tstep3 30.23 | Took 30.1s: building build scripts and proc macros 13.3s, loading workspace 7.09s, compiling functions 5.63s
+2 ripgrep tstep2 9.91 | Took 9.88s: building build scripts and proc macros 4.96s, compiling functions 2.36s, compiling the standard library of build scripts 0.94s
+2 ripgrep tstep3 9.12 | Took 9.09s: building build scripts and proc macros 3.94s, compiling functions 2.33s, compiling the standard library of build scripts 0.91s
+2 anim tstep2 35.62 | Took 35.4s: building build scripts and proc macros 18.7s, loading workspace 6.99s, compiling functions 5.58s
+2 anim tstep3 30.91 | Took 30.7s: building build scripts and proc macros 14.2s, loading workspace 6.95s, compiling functions 5.63s
+3 ripgrep tstep2 10.90 | Took 10.8s: building build scripts and proc macros 6.09s, compiling functions 2.30s, compiling the standard library of build scripts 0.90s
+3 ripgrep tstep3 9.12 | Took 9.09s: building build scripts and proc macros 4.31s, compiling functions 2.29s, compiling the standard library of build scripts 0.94s
+
+### /root/cf/ab4/summary
+1 ripgrep tstep3 7.54 | Took 7.50s: building build scripts and proc macros 2.76s, compiling functions 2.33s, compiling the standard library of build scripts 0.86s
+1 ripgrep tstep4 8.78 | Took 8.74s: building build scripts and proc macros 3.86s, compiling functions 2.33s, compiling the standard library of build scripts 0.97s
+1 anim tstep3 31.07 | Took 30.9s: building build scripts and proc macros 14.2s, loading workspace 6.96s, compiling functions 5.54s
+1 anim tstep4 31.64 | Took 31.5s: building build scripts and proc macros 14.3s, loading workspace 6.98s, compiling functions 5.59s
+2 ripgrep tstep3 8.64 | Took 7.90s: building build scripts and proc macros 2.94s, compiling functions 2.32s, compiling the standard library of build scripts 1.03s
+2 ripgrep tstep4 10.09 | Took 9.41s: building build scripts and proc macros 4.53s, compiling functions 2.32s, compiling the standard library of build scripts 0.99s
+2 anim tstep3 29.48 | Took 29.3s: building build scripts and proc macros 12.7s, loading workspace 7.03s, compiling functions 5.57s
+2 anim tstep4 28.79 | Took 28.6s: building build scripts and proc macros 12.0s, loading workspace 6.87s, compiling functions 5.66s
+3 ripgrep tstep3 8.64 | Took 8.59s: building build scripts and proc macros 3.67s, compiling functions 2.38s, compiling the standard library of build scripts 0.96s
+3 ripgrep tstep4 9.38 | Took 9.34s: building build scripts and proc macros 3.64s, compiling functions 2.32s, compiling the standard library of build scripts 1.46s
+
+### /root/cf/ab5/summary
+1 ripgrep tstep3 8.29 | Took 8.26s: building build scripts and proc macros 3.39s, compiling functions 2.35s, compiling the standard library of build scripts 0.91s
+1 ripgrep tstep5 7.41 | Took 7.36s: building build scripts and proc macros 2.61s, compiling functions 2.30s, compiling the standard library of build scripts 0.92s
+1 anim tstep3 31.75 | Took 31.6s: building build scripts and proc macros 14.7s, loading workspace 6.98s, compiling functions 5.58s
+1 anim tstep5 30.42 | Took 30.2s: building build scripts and proc macros 13.5s, loading workspace 7.06s, compiling functions 5.59s
+2 ripgrep tstep3 8.58 | Took 8.55s: building build scripts and proc macros 3.70s, compiling functions 2.35s, compiling the standard library of build scripts 0.95s
+2 ripgrep tstep5 8.46 | Took 8.43s: building build scripts and proc macros 3.08s, compiling functions 2.32s, compiling the standard library of build scripts 0.93s
+2 anim tstep3 28.90 | Took 28.7s: building build scripts and proc macros 12.2s, loading workspace 6.96s, compiling functions 5.51s
+2 anim tstep5 31.16 | Took 31.0s: building build scripts and proc macros 13.9s, loading workspace 6.94s, compiling functions 5.53s
+3 ripgrep tstep3 8.23 | Took 7.77s: building build scripts and proc macros 2.96s, compiling functions 2.34s, compiling the standard library of build scripts 0.91s
+3 ripgrep tstep5 8.73 | Took 8.18s: building build scripts and proc macros 3.41s, compiling functions 2.31s, compiling the standard library of build scripts 0.93s

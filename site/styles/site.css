@@ -66,32 +66,73 @@ img + .c-btn { position: static; display: block; margin: -1.2em 0 1.2em auto; }
 	.c-btn { position: static; margin-left: 0.5em; opacity: 0.55; vertical-align: 0.1em; }
 	.codeblock > .c-btn, .ref > .c-btn { position: absolute; }
 }
-.c-thread { margin: -0.4em 0 1.3em; padding: 12px 16px; border-radius: 12px; background: var(--code-bg); box-shadow: inset 0 0 0 1px var(--line); font-size: 14.5px; line-height: 1.6; color: var(--ink-2); font-weight: 400; letter-spacing: 0; }
+/* A block's thread opens as a card under it; the page's own (`.c-page`, the Discussion section) sits on the page.
+   Both are a column of faces joined by a thread line, then the composer: the chat's (shell.css .chat-form), the
+   reader's face beside it once client/comments.ts has set it up (.c-ready). */
+.c-thread { --av: 24px; margin: -0.4em 0 1.3em; padding: 12px 16px 14px; border-radius: 14px; background: var(--code-bg); box-shadow: inset 0 0 0 1px var(--line); font-size: 14.5px; line-height: 1.55; color: var(--ink-2); font-weight: 400; letter-spacing: 0; }
 li > .c-thread { margin: 0.5em 0 0.8em; }
 .c-thread[hidden] { display: none; }
-.discussion .c-thread { margin-top: 0.6em; }
-.c-item { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 4px 10px; padding: 8px 0; border-bottom: 1px solid var(--line); scroll-margin: 80px; }
-.c-item:last-child { border-bottom: 0; }
-.c-item.c-target { margin: 0 -8px; padding: 8px; border-radius: 8px; background: var(--s-tint); }
-.c-item > img, .doc .c-item > img { width: 24px; height: 24px; margin: 2px 0 0; border-radius: 50%; box-shadow: none; background: var(--line); }
-.c-head { font-size: 13px; color: var(--ink-3); }
-.c-head a { color: var(--ink-1); font-weight: 600; text-decoration: none; }
+.c-thread.c-page { --av: 32px; margin: 0; padding: 0; border-radius: 0; background: none; box-shadow: none; font-size: 15px; }
+@media (max-width: 560px) { .c-thread.c-page { --av: 28px; } .c-item, .c-form.c-ready { column-gap: 10px; } }
+.doc .discussion > h2 { display: flex; align-items: center; gap: 10px; margin-bottom: 0.25em; font-size: 20px; }
+.discussion > h2 .c-count { padding: 1px 8px; border-radius: 999px; background: var(--s-tint); color: var(--ink-3); font-size: 13px; font-weight: 500; letter-spacing: 0; font-variant-numeric: tabular-nums; }
+.doc .discussion > p.dim { margin-bottom: 1.4em; font-size: 14px; }
+
+.c-item { position: relative; display: grid; grid-template-columns: var(--av) minmax(0, 1fr); gap: 0 12px; padding: 6px 0 14px; scroll-margin: 80px; }
+.c-item:not(:last-child)::before { content: ""; position: absolute; left: calc(var(--av) / 2 - 1px); top: calc(var(--av) + 12px); bottom: 0; width: 2px; border-radius: 1px; background: var(--line); }
+.c-item.c-target, .c-item.c-new { border-radius: 6px; }
+.c-item.c-target { background: var(--s-tint); box-shadow: 0 0 0 8px var(--s-tint); }
+.c-item > img, .doc .c-item > img { width: var(--av); height: var(--av); margin: 0; border-radius: 50%; box-shadow: none; background: var(--bg-4); }
+.c-main { min-width: 0; }
+.c-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 6px; min-height: calc(var(--av) - 2px); padding-top: calc((var(--av) - 22px) / 2); font-size: 13px; line-height: 1.6; color: var(--ink-4); }
+.doc .c-head a { color: var(--ink-1); font-weight: 600; text-decoration: none; }
 .doc .c-head a.c-when { color: var(--ink-3); font-weight: 400; }
-.c-head a:hover { text-decoration: underline; }
-.c-quote { margin: 2px 0 4px; padding-left: 10px; border-left: 2px solid var(--line-2); color: var(--ink-3); font-size: 13px; white-space: pre-line; }
-.c-body { color: var(--ink-1); }
+.c-head a:hover, .doc .c-head a.c-when:hover { text-decoration: underline; text-decoration-color: currentColor; }
+.c-quote { margin: 2px 0 6px; padding-left: 10px; border-left: 2px solid var(--line-2); color: var(--ink-3); font-size: 13px; white-space: pre-line; }
+.c-body { margin-top: 1px; color: var(--ink-1); overflow-wrap: anywhere; }
 .c-body p { margin: 0 0 0.6em; }
 .c-body p:last-child { margin: 0; }
 .c-body code { font-family: var(--font-mono); font-size: 0.9em; }
-.c-del { margin-left: 8px; padding: 0 6px; background: none; color: var(--ink-4); font-size: 12px; }
-.c-del:hover, .c-del:focus-visible { color: var(--danger); }
-.c-list:not(:empty) + .c-form { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
-.c-form form { display: flex; flex-direction: column; gap: 8px; }
-.c-form textarea { font-size: 14px; background: var(--bg); }
-.c-form .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; color: var(--ink-3); }
+.c-delform { margin-left: auto; }
+.c-thread .c-del { padding: 0 6px; border-radius: 6px; background: none; color: var(--ink-4); font-size: 12px; line-height: 1.6; opacity: 0; transition: opacity 0.12s; }
+.c-item:hover .c-del, .c-del:focus-visible { opacity: 1; }
+.c-thread .c-del:hover, .c-del:focus-visible { background: var(--s-tint); color: var(--danger); }
+@media (hover: none) { .c-thread .c-del { opacity: 1; } }
+
+.c-list:not(:empty) + .c-form { margin-top: 2px; }
+.c-form.c-ready { display: grid; grid-template-columns: var(--av) minmax(0, 1fr); gap: 0 12px; align-items: start; }
+.c-me { display: block; width: var(--av); height: var(--av); margin-top: calc((38px - var(--av)) / 2); border-radius: 50%; background: var(--bg-4); overflow: hidden; }
+.c-anon { display: block; width: 60%; height: 60%; margin: 20%; fill: none; stroke: var(--ink-4); stroke-width: 1.4; stroke-linecap: round; }
+.c-me img, .doc .c-me img { display: block; width: 100%; height: 100%; margin: 0; border-radius: 0; box-shadow: none; }
+.c-form form.c-compose { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 0 6px; padding: 5px 5px 5px 14px; border-radius: 19px; background: var(--bg-4); box-shadow: inset 0 0 0 1px transparent; transition: box-shadow 0.15s, background-color 0.15s; }
+.c-thread:not(.c-page) .c-form form.c-compose { background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line); }
+.c-form form.c-compose:focus-within { background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line-2), 0 0 0 3px var(--s-tint); }
+.c-compose textarea, .c-compose textarea:focus { flex: 1; width: auto; min-width: 0; min-height: 28px; max-height: 50vh; padding: 4px 0; border: 0; border-radius: 0; box-shadow: none; background: none; color: var(--ink-1); font: inherit; font-size: 14.5px; line-height: 1.4; resize: none; outline: none; }
+.c-compose:focus-within textarea, .c-compose.c-has textarea { min-height: calc(3 * 1.4em + 8px); }
+.c-compose textarea::placeholder { color: var(--ink-4); }
+/* Not the sidebar's .row (shell.css). */
+.c-compose .row { position: static; z-index: auto; display: flex; align-items: center; gap: 8px; height: auto; padding: 0; border-radius: 0; font-size: 13px; color: var(--ink-3); }
+.c-compose .error { order: 3; flex-basis: 100%; padding: 2px 0 4px; font-size: 13px; }
+/* Without JS: the signed-in line and a Post button under the field. With it the top bar says who is signed in. */
+main:not(.c-live) .c-compose .row { flex-basis: 100%; justify-content: space-between; padding: 4px 0 0; }
+main.c-live .c-compose .row > span { display: none; }
 .c-form button.c-signout { padding: 0; background: none; color: var(--ink-3); font-size: 13px; text-decoration: underline; }
 .c-form button.c-signout:hover { background: none; color: var(--ink-1); }
 .c-form button:disabled { opacity: 0.6; cursor: default; }
+.c-kbd { display: none; font: inherit; font-size: 11.5px; color: var(--ink-4); letter-spacing: 0.02em; }
+.c-compose.c-has .c-kbd { display: inline; }
+@media (hover: none) { .c-compose.c-has .c-kbd { display: none; } }
+.c-form button.c-send { display: grid; place-items: center; width: 28px; height: 28px; padding: 0; border-radius: 50%; background: var(--ink-1); color: var(--bg); transition: opacity 0.12s, background-color 0.12s; }
+.c-form button.c-send:hover { background: var(--g-12); }
+.c-form button.c-send:disabled { opacity: 1; background: transparent; color: var(--ink-4); }
+.c-compose.c-busy button.c-send { background: var(--ink-3); color: var(--bg); animation: c-busy 1s ease-in-out infinite alternate; }
+@keyframes c-busy { to { opacity: 0.45; } }
+.c-arrow { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.c-form p.c-signin { margin: 0; }
+.doc .c-signin a { display: flex; align-items: center; gap: 10px; min-height: 38px; padding: 0 16px; border-radius: 19px; background: var(--bg-4); color: var(--ink-2); font-size: 14px; font-weight: 500; text-decoration: none; transition: background-color 0.15s, color 0.15s, box-shadow 0.15s; }
+.c-thread:not(.c-page) .c-signin a { background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line); }
+.doc .c-signin a:hover, .doc .c-signin a:focus-visible { background: var(--bg-3); color: var(--ink-1); box-shadow: inset 0 0 0 1px var(--line-2); outline: none; }
+.c-gh { flex: none; width: 16px; height: 16px; fill: currentColor; }
 .c-form .error { font-size: 13.5px; }
 .c-empty { margin: 0; color: var(--ink-3); font-size: 13.5px; }
 
@@ -189,5 +230,5 @@ li > .say-btn:has(+ .c-btn) { left: -102px; }
 
 /* A comment that arrived while the page was open (client/comments.ts refresh). */
 .c-item.c-new { animation: c-new 2.4s ease-out; }
-@keyframes c-new { from { background: color-mix(in srgb, var(--ok) 14%, transparent); } to { background: transparent; } }
+@keyframes c-new { from { background: color-mix(in srgb, var(--ok) 14%, transparent); box-shadow: 0 0 0 8px color-mix(in srgb, var(--ok) 14%, transparent); } to { background: transparent; box-shadow: 0 0 0 8px transparent; } }
 @media (prefers-reduced-motion: reduce) { .c-item.c-new { animation: none; } }

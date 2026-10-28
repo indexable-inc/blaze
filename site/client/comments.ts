@@ -12,6 +12,11 @@
  *
  * Nothing here builds HTML from strings: text goes in with textContent, markup comes parsed from the worker's page.
  *
+ * - each form gets the chat's composer (styles/site.css): the reader's face beside one rounded field, a round send
+ *   button that wakes once there is text (Cmd/Ctrl+Enter posts), and no "Signed in as" line, since the top bar shows
+ *   who is signed in and signs out; signed out, the form is one "Sign in with GitHub to comment" button;
+ * - the Discussion heading carries the page's comment count.
+ *
  * Before a site update reloads or swaps the page (client/lib/update.ts), the comments being written and the threads
  * open are saved, by doc and block, and put back when the page sets up again.
  *
@@ -41,6 +46,74 @@ async function errorOf(res: Response): Promise<string> {
 		// not JSON
 	}
 	return res.status === 401 ? 'Sign in to comment.' : res.status === 429 ? 'Too many comments; try again in a minute.' : `Request failed (${res.status}).`;
+}
+
+const SVG = 'http://www.w3.org/2000/svg';
+const MAC = /Mac|iPhone|iPad/.test(navigator.platform);
+
+function icon(d: string, cls: string): SVGSVGElement {
+	const svg = document.createElementNS(SVG, 'svg');
+	svg.setAttribute('viewBox', '0 0 16 16');
+	svg.setAttribute('aria-hidden', 'true');
+	svg.setAttribute('class', cls);
+	const p = document.createElementNS(SVG, 'path');
+	p.setAttribute('d', d);
+	svg.append(p);
+	return svg;
+}
+const ARROW = 'M8 13V3M3.5 7.5 8 3l4.5 4.5';
+const PERSON = 'M8 8.2a2.7 2.7 0 1 0 0-5.4 2.7 2.7 0 0 0 0 5.4ZM3 13.6c.7-2.2 2.7-3.6 5-3.6s4.3 1.4 5 3.6';
+const GITHUB =
+	'M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z';
+
+/** The send button wakes when there is something to post. */
+function sync(form: HTMLFormElement) {
+	const has = !!form.querySelector('textarea')?.value.trim();
+	form.classList.toggle('c-has', has);
+	const go = form.querySelector<HTMLButtonElement>('button.c-send');
+	if (go && !form.classList.contains('c-busy')) go.disabled = !has;
+}
+
+/**
+ * Turns the renderer's forms under `root` into the composer (see the top). The renderer's markup stays the no-JS
+ * fallback: the login is read from its "Signed in as" line, which styles/site.css hides once `main.c-live`.
+ */
+function enhance(root: ParentNode) {
+	for (const f of root.querySelectorAll<HTMLElement>('.c-form')) {
+		if (f.classList.contains('c-ready')) continue;
+		const me = el('span', 'c-me');
+		const form = f.querySelector<HTMLFormElement>('form.c-compose');
+		const signIn = f.querySelector<HTMLAnchorElement>('p.c-empty > a[href*="/auth/github"]');
+		if (form) {
+			const login = /Signed in as ([A-Za-z0-9-]+)/.exec(form.querySelector('.row > span')?.textContent ?? '')?.[1];
+			if (login) {
+				const img = el('img');
+				img.src = `https://github.com/${encodeURIComponent(login)}.png?size=64`;
+				img.alt = '';
+				img.referrerPolicy = 'no-referrer';
+				me.append(img);
+			}
+			const ta = form.querySelector('textarea');
+			if (ta) ta.placeholder = 'Add a comment…';
+			const go = form.querySelector<HTMLButtonElement>('button[type=submit]:not([form])');
+			if (go) {
+				go.classList.add('c-send');
+				go.replaceChildren(icon(ARROW, 'c-arrow'));
+				go.setAttribute('aria-label', 'Post');
+				go.dataset.tip = `Post (${MAC ? '⌘' : 'Ctrl'}+Enter)`;
+				go.before(el('kbd', 'c-kbd', MAC ? '⌘↵' : 'Ctrl ↵'));
+			}
+			sync(form);
+		} else if (signIn) {
+			me.append(icon(PERSON, 'c-anon'));
+			const p = signIn.parentElement!;
+			signIn.replaceChildren(icon(GITHUB, 'c-gh'), el('span', '', 'Sign in with GitHub to comment'));
+			p.className = 'c-signin';
+			p.replaceChildren(signIn);
+		} else continue; // comments are not set up: the renderer's line stays as it is
+		f.prepend(me);
+		f.classList.add('c-ready');
+	}
 }
 
 const RTF = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
@@ -74,6 +147,17 @@ function start(main: HTMLElement, signal: AbortSignal) {
 	const threadOf = (id: string) => document.getElementById(id) as HTMLElement | null;
 	const buttonOf = (threadId: string) => main.querySelector<HTMLAnchorElement>(`.c-btn[aria-controls="${CSS.escape(threadId)}"]`);
 
+	/** "Discussion 3": the page's comment count beside the section's heading. */
+	function count() {
+		const h = main.querySelector('section.discussion > h2');
+		if (!h) return;
+		const n = threadOf(PAGE_THREAD)?.querySelectorAll('.c-item').length ?? 0;
+		let c = h.querySelector<HTMLElement>('.c-count');
+		if (!n) return c?.remove();
+		if (!c) h.append((c = el('span', 'c-count')));
+		c.textContent = String(n);
+	}
+
 	function setOpen(thread: HTMLElement, open: boolean) {
 		thread.hidden = !open;
 		buttonOf(thread.id)?.setAttribute('aria-expanded', String(open));
@@ -96,7 +180,9 @@ function start(main: HTMLElement, signal: AbortSignal) {
 		const oldButton = buttonOf(threadId);
 		const thread = document.adoptNode(next);
 		relativeTimes(thread);
+		enhance(thread);
 		old.replaceWith(thread);
+		count();
 		if (nextButton && oldButton) {
 			const b = document.adoptNode(nextButton);
 			b.setAttribute('role', 'button');
@@ -135,6 +221,7 @@ function start(main: HTMLElement, signal: AbortSignal) {
 				oldButton.replaceWith(b);
 			}
 		}
+		count();
 		dispatchEvent(new Event(THREADS));
 	}
 
@@ -153,7 +240,7 @@ function start(main: HTMLElement, signal: AbortSignal) {
 		const body = String(data.get('body') ?? '').trim();
 		if (!ta || !button || !thread || !body || button.disabled) return;
 		button.disabled = true;
-		button.textContent = 'Posting…';
+		form.classList.add('c-busy');
 		if (err) err.hidden = true;
 		try {
 			// The form's action is the API's URL under the site's base (the renderer writes it).
@@ -173,7 +260,8 @@ function start(main: HTMLElement, signal: AbortSignal) {
 				err.hidden = false;
 			}
 			button.disabled = false;
-			button.textContent = 'Post';
+			form.classList.remove('c-busy');
+			sync(form);
 		}
 	}
 
@@ -224,6 +312,8 @@ function start(main: HTMLElement, signal: AbortSignal) {
 	for (const b of main.querySelectorAll<HTMLAnchorElement>('.c-btn')) b.setAttribute('role', 'button');
 	for (const t of main.querySelectorAll<HTMLElement>('.c-thread')) setOpen(t, t.id === PAGE_THREAD);
 	relativeTimes(main);
+	enhance(main);
+	count();
 
 	main.addEventListener('click', (e) => {
 		const b = e.target instanceof Element ? e.target.closest<HTMLAnchorElement>('.c-btn') : null;
@@ -253,6 +343,10 @@ function start(main: HTMLElement, signal: AbortSignal) {
 		e.preventDefault();
 		void post(f);
 	}, { signal });
+	main.addEventListener('input', (e) => {
+		const f = e.target instanceof HTMLTextAreaElement ? e.target.closest<HTMLFormElement>('form.c-compose') : null;
+		if (f) sync(f);
+	}, { signal });
 	window.addEventListener('hashchange', followHash, { signal });
 	const blockOf = (f: HTMLFormElement) => (f.elements.namedItem('block') as HTMLInputElement | null)?.value ?? '';
 	window.addEventListener(SAVE, (e) => {
@@ -276,6 +370,7 @@ function start(main: HTMLElement, signal: AbortSignal) {
 			const t = f.closest<HTMLElement>('.c-thread');
 			if (!v || !ta) continue;
 			ta.value = v;
+			sync(f);
 			if (t) setOpen(t, true);
 		}
 	}

@@ -13,8 +13,8 @@
  *    audio files are at hand (.audio/files/, or served from R2 when SITE_AUDIO_REMOTE=1), gets `Audio {manifest}` in a
  *    second snapshot, and the renderer adds the player; its manifest and files are copied to dist/audio/. Any other
  *    page simply has no player, so the build never needs audio.
- * 4. Bundles client/*.ts, concatenates styles/, copies static/, and puts the chat translator's ONNX Runtime in dist/ort/
- *    (`ortFiles`). For the worker, under .gen/:
+ * 4. Bundles client/*.ts, concatenates styles/, copies static/, puts the chat translator's ONNX Runtime in dist/ort/
+ *    (`ortFiles`) and the anonymous readers' animals in dist/animals/<hash>.svg (`animalSprite`). For the worker, under .gen/:
  *
  *      site.wasm, site.cbor   the renderer and the snapshot (worker/renderer.ts)
  *      pages.json             every page: [{url, file, doc, discussable}] (what the worker routes)
@@ -38,6 +38,7 @@ import { createRequire } from 'node:module';
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, watch, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Site, snapshot, type Page, type SnapshotInput, type SpokenLine } from '../worker/site-wasm';
+import { ANIMALS, sprite } from './animals';
 import { benchHistory } from './bench';
 import { highlight } from './highlight';
 import { dedent, load, prose, type Node } from './tree';
@@ -234,6 +235,19 @@ function ortFiles(): { mjs: string; parts: string[] } {
 	return { mjs: `${id}.mjs`, parts };
 }
 
+/**
+ * The anonymous readers' animals (gen/animals.ts) as one sprite, dist/animals/<hash>.svg, named by its content so a
+ * browser may keep it; what the client gets as `BLAZE_ANIMALS` (client/lib/presence.ts): the sprite's path under the
+ * base and the names, in order.
+ */
+function animalSprite(): { sprite: string; names: string[] } {
+	const svg = sprite();
+	const name = `animals/${createHash('sha256').update(svg).digest('hex').slice(0, 16)}.svg`;
+	rmSync(path.join(dist, 'animals'), { recursive: true, force: true });
+	write(path.join(dist, name), svg);
+	return { sprite: name, names: ANIMALS.map((a) => a.name) };
+}
+
 function write(file: string, data: string | Uint8Array) {
 	mkdirSync(path.dirname(file), { recursive: true });
 	writeFileSync(file, data);
@@ -274,6 +288,8 @@ async function build() {
 			if (statSync(file).isFile()) assetsHash.update(`${dir}/${f}`).update(readFileSync(file));
 		}
 	}
+	const animals = animalSprite();
+	assetsHash.update(animals.sprite);
 	const assets = assetsHash.digest('hex').slice(0, 16);
 	// `root` keeps the output flat (dist/js/<name>.js): bench.ts imports from gen/, which would otherwise widen it to site/.
 	const bundled = await Bun.build({
@@ -282,7 +298,7 @@ async function build() {
 		outdir: path.join(dist, 'js'),
 		minify: true,
 		target: 'browser',
-		define: { BLAZE_ASSETS: JSON.stringify(assets), BLAZE_ORT: JSON.stringify(ortFiles()) },
+		define: { BLAZE_ASSETS: JSON.stringify(assets), BLAZE_ORT: JSON.stringify(ortFiles()), BLAZE_ANIMALS: JSON.stringify(animals) },
 	});
 	if (!bundled.success) throw new AggregateError(bundled.logs, 'client bundle failed');
 

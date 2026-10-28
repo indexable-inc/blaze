@@ -43,7 +43,7 @@ content/*.flecs ─┬─ gen/tree.ts (flecs-doc.wasm) ── bake: highlight.js
   page script sets itself up through `client/lib/page.ts` `onPage`, again after every swap and undone before the
   next.
 
-The flecs skill (`.claude/skills/flecs/`) has the script syntax and its traps.
+The flecs skill (`.agents/skills/flecs/`) has the script syntax and its traps.
 
 ### The wasm modules: build outputs, fetched
 
@@ -152,22 +152,30 @@ to `env.ASSETS`, which serves `dist/` (built by `bun gen/build.ts`, laid out wit
   in the who-is-here list turns them off) and as bands on a rail at the right edge where each is reading (click a
   face to go there). Positions are anchors in the text (a block index and a fraction of it, x a fraction of `main`'s
   width), so different window sizes line up; the object passes them only to the other tabs on the same page, rate
-  limited per person, and never stores them.
+  limited per person, and never stores them. On a desk T (or Enter, for Vimium users) opens a one-line composer where the reader's pointer is, which stays there (Figma's
+  cursor chat): the others on the page see the line as it is typed (`say-live`, same budget, never stored), as a bubble
+  under the pointer or out of the face on the rail; Enter sends it, and a signed-in reader's goes to the chat as well.
   The same object holds the site's chat (`client/lib/chat.ts`, a panel at the right): its last 500 messages in the
   object's SQLite, readable by anyone, written by signed-in readers (5 per 15 s, 120 an hour, replies counted), taken
   back by their author or a `COMMENT_ADMINS` id. Messages have Slack-style threads, one level deep (a `parent` column):
   the list shows top-level messages with a line for their replies (faces, count, last reply), and a thread opens over
   the list, or as a column beside it in full screen; taking back a message takes its thread, and pruning never leaves
-  a reply without its message. Replies make no bubbles, pop-ups or badge count unless they mention the reader. Both
-  composers complete `@login` from people online and recent authors; a message that mentions the reader is marked,
-  and while the chat is shut it pops up (even muted) and counts. Comment writes (`comments.ts`) tell the object too,
-  and open pages refresh their comment threads.
+  a reply without its message. Replies make no bubbles, pop-ups or badge count unless they mention the reader or come
+  in a thread the reader started or replied in; those pop up even muted, and the thread's line counts "N new replies"
+  (the last reply seen per thread is kept in localStorage; the object tells each signed-in tab its threads on
+  connect, `mine`). A reply can also be sent to the chat (a `broadcast` column): it stays in its thread and shows in
+  the list too, under "replied to a thread". Reactions are a small set of our own line icons (not emoji), kept in a
+  `reactions (message_id, key, kind)` table, signed-in only, rate limited, gone with their message. Authors and
+  admins edit messages in place (`edited_at`, the same rules as a new message; ↑ in an empty composer edits your
+  last one). Both composers complete `@login` from people online and recent authors; a message that mentions the
+  reader is marked, and while the chat is shut it pops up (even muted) and counts. Comment writes (`comments.ts`) tell
+  the object too, and open pages refresh their comment threads.
   On every connect the object also sends the live build (`.gen/build.json`), and a deploy's code sends it to every
   open socket the first time it wakes (a deploy keeps hibernated sockets open), so each open tab hears of a new
   version as soon as anyone on the site moves (`client/lib/update.ts`). New scripts or styles
   reload the tab; new content alone is fetched again and swapped in place by the router. Either waits until the
   reader isn't typing, playing the narration or dragging (a hidden tab goes at once), with an "update ready" pop-up
-  and a button meanwhile, then says "Site updated". Drafts (chat and comments), the open thread, full screen, scroll
+  and a button meanwhile, then says "Site updated". Drafts (chat and comments), the open thread, an edit in progress, full screen, scroll
   positions and the narration's place go through sessionStorage and come back; a reload that still gets the old
   assets doesn't retry for a minute.
 - `updates.ts`: the `/updates` form.
