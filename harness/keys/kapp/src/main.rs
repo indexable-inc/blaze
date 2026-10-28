@@ -14,6 +14,7 @@ fn main() {
     println!("scaled {}", klib::scaled(5));
     println!("shape {}", klib::shape());
     println!("described {}", klib::described());
+    println!("identity {}", klib::identity());
     println!("checks of the library {:?}", klib::checks(255));
     println!("checks of the program {:?}", checks(255));
 }
