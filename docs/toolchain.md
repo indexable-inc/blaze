@@ -126,16 +126,13 @@ from here (the next step of #402), it compiles the nightly's `rust-src`, whose f
   read from the nightly's channel manifest (`harness/library.py import` wrote it).
 - It is not a member of blaze's workspace: no fmt, clippy or test of blaze's reads it, and
   `.gitattributes` keeps upstream's bytes.
-- `python3 harness/library.py check '{}'` holds it to upstream: every file is the nightly's,
-  byte for byte, but those `library/PATCHES.md` names.
 - The daily bump moves it with the pin as a merge (`harness/library.py merge`): upstream's
   changes from the old nightly to the new one are applied three-way, so blaze's own changes
   are kept. A conflict stops the bump, names the files and opens the bump's issue.
 
-To change the standard library, edit it under `library/` and say what and why in
-`library/PATCHES.md` in the same commit, naming each file in backticks as
-`` `library/<path>` ``. There are no changes yet: with `library/` unpatched, blaze must behave
-exactly as with the nightly's own `rust-src`.
+To change the standard library, edit it under `library/` and commit. Nothing checks it against
+upstream file by file: the integration tests (smoke, the rustc comparison harnesses, real
+crates) are what hold blaze's behaviour to the nightly's.
 
 ## How far behind it gets, and how long a bump takes
 
