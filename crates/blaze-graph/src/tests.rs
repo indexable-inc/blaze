@@ -436,7 +436,8 @@ fn the_executor_adds_what_work_finds_and_fails_on_a_panic() {
     let mut machine = Machine::new(Config { io: 2, work: 2, keep_going: true }).unwrap();
     let mut trace = Vec::new();
     let mut records = Vec::new();
-    let ok = drive(
+    let drove = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drive(
         &mut machine,
         vec![spec(0, NodeKind::Manifest, &[], Pool::Io, 1)],
         &|id| {
@@ -452,9 +453,12 @@ fn the_executor_adds_what_work_finds_and_fails_on_a_panic() {
         },
         &mut |record| records.push(record.clone()),
         Some(&mut trace),
-    )
-    .unwrap();
-    assert!(!ok);
+        )
+    }));
+    // The panic goes on once the build is over, and the build says the node failed.
+    let panic = drove.err().expect("the work's panic reaches the caller");
+    assert_eq!(panic.downcast_ref::<&str>(), Some(&"no def map"));
+    assert!(matches!(records.last().map(|it| &it.event), Some(Event::Critical { .. })));
     let mut ran = ran.into_inner().unwrap();
     ran.sort();
     assert_eq!(ran, [0, 1, 2]);
