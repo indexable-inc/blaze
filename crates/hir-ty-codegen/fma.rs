@@ -353,7 +353,7 @@ impl<'db> FunctionCx<'_, 'db> {
         {
             return Ok(false);
         }
-        if !self.has_fma(func, 0)? {
+        if !self.has_fma(func)? {
             return Ok(false);
         }
         let name = FunctionSignature::of(self.cg.db, func).name.as_str().to_owned();
@@ -1175,7 +1175,7 @@ impl<'db> FunctionCx<'_, 'db> {
                 let inlined =
                     self.rustc_inlines(Some(func), callee).map_err(|e| format!("{e:?}"))?;
                 if inlined != Some(false)
-                    && self.has_fma(callee, 1).map_err(|e| format!("{e:?}"))?
+                    && self.has_fma(callee).map_err(|e| format!("{e:?}"))?
                 {
                     return Err(format!("its call of `{name}` may have one"));
                 }
@@ -1286,204 +1286,12 @@ impl<'db> FunctionCx<'_, 'db> {
         caller: Option<FunctionId>,
         callee: FunctionId,
     ) -> Result<Option<bool>> {
-        self.rustc_inlines_at(caller, callee, 0)
-    }
-
-    fn rustc_inlines_at(
-        &mut self,
-        caller: Option<FunctionId>,
-        callee: FunctionId,
-        depth: u32,
-    ) -> Result<Option<bool>> {
-        let db = self.cg.db;
-        let Some(caller) = caller else { return Ok(Some(false)) };
-        if !caller.krate(db).data(db).origin.is_lang() {
-            return Ok(Some(false));
-        }
-        let flags = AttrFlags::query(db, callee.into());
-        if flags.contains(AttrFlags::INLINE_NEVER) {
-            return Ok(Some(false));
-        }
-        let (mine, theirs) = (
-            AttrFlags::target_feature_list(db, caller),
-            AttrFlags::target_feature_list(db, callee),
-        );
-        if mine != theirs {
-            let (enabled, enabled_there) = (
-                hir_ty::TargetFeatures::from_fn(db, caller),
-                hir_ty::TargetFeatures::from_fn(db, callee),
-            );
-            let differ = mine.iter().any(|it| !enabled_there.enables(it.as_str()))
-                || theirs.iter().any(|it| !enabled.enables(it.as_str()));
-            return Ok(if differ { Some(false) } else { None });
-        }
-        // Not generic, so only what is `#[inline]` is inlined across crates and within one.
-        if !flags.intersects(AttrFlags::IS_INLINE | AttrFlags::RUSTC_FORCE_INLINE) {
-            return Ok(None);
-        }
-        let Ok((body, _)) = root_body(db, callee) else { return Ok(None) };
-        let Ok((caller_body, _)) = root_body(db, caller) else { return Ok(None) };
-        // A caller that is `#[inline]` and only forwards has the lowest threshold, 30: one of
-        // two calls is not one.
-        let calls = |body: &MirBody<'_>| {
-            body.basic_blocks
-                .iter()
-                .filter(|(_, it)| {
-                    matches!(
-                        it.terminator.as_ref().map(|t| &t.kind),
-                        Some(TerminatorKind::Call { .. })
-                    )
-                })
-                .count()
-        };
-        let threshold = if AttrFlags::query(db, caller.into()).contains(AttrFlags::IS_INLINE)
-            && calls(caller_body) < 2
-        {
-            30
-        } else {
-            100
-        };
-        let cost = self.inline_cost(callee, body, depth)?;
-        Ok(cost.is_some_and(|it| it <= threshold).then_some(true))
-    }
-
-    /// At least what rustc's `CostChecker` counts of `func`'s optimized MIR, from `body`, its
-    /// MIR here; `None` where that is not known. The optimizations take statements out and
-    /// put none in but for what the inliner puts in, counted here as the body of each callee
-    /// it may inline with what passes its arguments, and for SROA's splitting of an aggregate
-    /// whose fields are used, which a body without projections has none of. A callee that is
-    /// `#[rustc_nounwind]` has its unwinding made unreachable (`AbortUnwindingCalls`), and the
-    /// cleanup only that reaches is gone.
-    fn inline_cost(
-        &mut self,
-        func: FunctionId,
-        body: &MirBody<'db>,
-        depth: u32,
-    ) -> Result<Option<usize>> {
-        let db = self.cg.db;
-        if depth > 4 {
-            return Ok(None);
-        }
-        let operand_projected = |op: &Operand| match &op.kind {
-            OperandKind::Copy(place) | OperandKind::Move(place) => {
-                !place.projection.as_slice().is_empty()
-            }
-            _ => false,
-        };
-        let mut reached = FxHashSet::default();
-        let mut work = vec![body.start_block];
-        while let Some(id) = work.pop() {
-            if !reached.insert(id) {
-                continue;
-            }
-            let Some(terminator) = &body.basic_blocks[id].terminator else { return Ok(None) };
-            work.extend(terminator.kind.successors());
-            if let TerminatorKind::Call { func: callee, .. } = &terminator.kind
-                && callee_of(callee).is_some_and(|(f, _)| AttrFlags::is_rustc_nounwind(db, f))
-            {
-                continue;
-            }
-            work.extend(terminator.kind.unwind());
-        }
-        let mut cost = 0;
-        for (id, data) in body.basic_blocks.iter() {
-            if !reached.contains(&id) {
-                continue;
-            }
-            for statement in &data.statements {
-                match &statement.kind {
-                    StatementKind::Assign(place, rvalue) => {
-                        let reads_projected = match rvalue {
-                            Rvalue::Use(op) | Rvalue::Repeat(op, _) | Rvalue::Cast(_, op, _) => {
-                                operand_projected(op)
-                            }
-                            Rvalue::UnaryOp(_, op) => operand_projected(op),
-                            Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
-                                operand_projected(a) || operand_projected(b)
-                            }
-                            Rvalue::Aggregate(_, ops) => ops.iter().any(operand_projected),
-                            _ => true,
-                        };
-                        if !place.projection.as_slice().is_empty() || reads_projected {
-                            return Ok(None);
-                        }
-                        cost += 5;
-                    }
-                    StatementKind::StorageLive(_)
-                    | StatementKind::StorageDead(_)
-                    | StatementKind::FakeRead(_)
-                    | StatementKind::Nop => {}
-                    _ => return Ok(None),
-                }
-            }
-            let kind = &data.terminator.as_ref().expect("a reached block's end").kind;
-            cost += match kind {
-                TerminatorKind::Call { func: callee, args, cleanup, .. } => {
-                    if args.iter().any(operand_projected) {
-                        return Ok(None);
-                    }
-                    let Some((callee, _)) = callee_of(callee) else { return Ok(None) };
-                    let unwinds = cleanup.is_some() && !AttrFlags::is_rustc_nounwind(db, callee);
-                    let pad = if unwinds { 50 } else { 0 };
-                    if FunctionSignature::is_intrinsic(db, callee) {
-                        5 + pad
-                    } else if self.rustc_inlines_at(Some(func), callee, depth + 1)? == Some(false) {
-                        25 + pad
-                    } else {
-                        let Ok((inner, _)) = root_body(db, callee) else { return Ok(None) };
-                        let Some(inner) = self.inline_cost(callee, inner, depth + 1)? else {
-                            return Ok(None);
-                        };
-                        (25 + pad).max(inner + 5 * (args.len() + 1))
-                    }
-                }
-                TerminatorKind::Goto { .. }
-                | TerminatorKind::Return
-                | TerminatorKind::Unreachable => 0,
-                TerminatorKind::SwitchInt { .. } => 5,
-                TerminatorKind::Assert { .. } | TerminatorKind::Drop { .. } => 75,
-                TerminatorKind::UnwindResume => 45,
-                _ => return Ok(None),
-            };
-        }
-        Ok(Some(cost))
+        rustc_inlines_at(self.cg.db, caller, callee, 0)
     }
 
     /// Whether `func`'s body has an fma, or a call rustc may inline that has one.
-    fn has_fma(&mut self, func: FunctionId, depth: u32) -> Result<bool> {
-        let db = self.cg.db;
-        if depth > 4 {
-            return Ok(true);
-        }
-        let Ok((body, _)) = root_body(db, func) else { return Ok(false) };
-        for (_, data) in body.basic_blocks.iter() {
-            let Some(TerminatorKind::Call { func: callee, .. }) =
-                data.terminator.as_ref().map(|it| &it.kind)
-            else {
-                continue;
-            };
-            let Some((callee, _)) = callee_of(callee) else { continue };
-            if FunctionSignature::is_intrinsic(db, callee) {
-                let name = FunctionSignature::of(db, callee).name.as_str();
-                if matches!(
-                    name,
-                    "simd_fma"
-                        | "simd_relaxed_fma"
-                        | "fma"
-                        | "fmaf32"
-                        | "fmaf64"
-                        | "fmuladdf32"
-                        | "fmuladdf64"
-                ) {
-                    return Ok(true);
-                }
-            } else if self.rustc_inlines(Some(func), callee)? != Some(false)
-                && self.has_fma(callee, depth + 1)?
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+    fn has_fma(&mut self, func: FunctionId) -> Result<bool> {
+        Ok(reaches_fma(self.cg.db, func))
     }
 
     /// `func`'s body as a wrapper of one `simd_fma` of its parameters, some negated.
@@ -1579,4 +1387,198 @@ impl<'db> FunctionCx<'_, 'db> {
         }
         Ok(found.filter(|_| returns && result.contains(&return_slot())))
     }
+}
+
+fn rustc_inlines_at(
+    db: &dyn HirDatabase,
+    caller: Option<FunctionId>,
+    callee: FunctionId,
+    depth: u32,
+) -> Result<Option<bool>> {
+    let Some(caller) = caller else { return Ok(Some(false)) };
+    if !caller.krate(db).data(db).origin.is_lang() {
+        return Ok(Some(false));
+    }
+    let flags = AttrFlags::query(db, callee.into());
+    if flags.contains(AttrFlags::INLINE_NEVER) {
+        return Ok(Some(false));
+    }
+    let (mine, theirs) = (
+        AttrFlags::target_feature_list(db, caller),
+        AttrFlags::target_feature_list(db, callee),
+    );
+    if mine != theirs {
+        let (enabled, enabled_there) = (
+            hir_ty::TargetFeatures::from_fn(db, caller),
+            hir_ty::TargetFeatures::from_fn(db, callee),
+        );
+        let differ = mine.iter().any(|it| !enabled_there.enables(it.as_str()))
+            || theirs.iter().any(|it| !enabled.enables(it.as_str()));
+        return Ok(if differ { Some(false) } else { None });
+    }
+    // Not generic, so only what is `#[inline]` is inlined across crates and within one.
+    if !flags.intersects(AttrFlags::IS_INLINE | AttrFlags::RUSTC_FORCE_INLINE) {
+        return Ok(None);
+    }
+    let Ok((body, _)) = root_body(db, callee) else { return Ok(None) };
+    let Ok((caller_body, _)) = root_body(db, caller) else { return Ok(None) };
+    // A caller that is `#[inline]` and only forwards has the lowest threshold, 30: one of
+    // two calls is not one.
+    let calls = |body: &MirBody<'_>| {
+        body.basic_blocks
+            .iter()
+            .filter(|(_, it)| {
+                matches!(
+                    it.terminator.as_ref().map(|t| &t.kind),
+                    Some(TerminatorKind::Call { .. })
+                )
+            })
+            .count()
+    };
+    let threshold = if AttrFlags::query(db, caller.into()).contains(AttrFlags::IS_INLINE)
+        && calls(caller_body) < 2
+    {
+        30
+    } else {
+        100
+    };
+    let cost = inline_cost(db, callee, body, depth)?;
+    Ok(cost.is_some_and(|it| it <= threshold).then_some(true))
+}
+
+/// At least what rustc's `CostChecker` counts of `func`'s optimized MIR, from `body`, its
+/// MIR here; `None` where that is not known. The optimizations take statements out and
+/// put none in but for what the inliner puts in, counted here as the body of each callee
+/// it may inline with what passes its arguments, and for SROA's splitting of an aggregate
+/// whose fields are used, which a body without projections has none of. A callee that is
+/// `#[rustc_nounwind]` has its unwinding made unreachable (`AbortUnwindingCalls`), and the
+/// cleanup only that reaches is gone.
+fn inline_cost<'db>(
+    db: &'db dyn HirDatabase,
+    func: FunctionId,
+    body: &MirBody<'db>,
+    depth: u32,
+) -> Result<Option<usize>> {
+    if depth > 4 {
+        return Ok(None);
+    }
+    let operand_projected = |op: &Operand| match &op.kind {
+        OperandKind::Copy(place) | OperandKind::Move(place) => {
+            !place.projection.as_slice().is_empty()
+        }
+        _ => false,
+    };
+    let mut reached = FxHashSet::default();
+    let mut work = vec![body.start_block];
+    while let Some(id) = work.pop() {
+        if !reached.insert(id) {
+            continue;
+        }
+        let Some(terminator) = &body.basic_blocks[id].terminator else { return Ok(None) };
+        work.extend(terminator.kind.successors());
+        if let TerminatorKind::Call { func: callee, .. } = &terminator.kind
+            && callee_of(callee).is_some_and(|(f, _)| AttrFlags::is_rustc_nounwind(db, f))
+        {
+            continue;
+        }
+        work.extend(terminator.kind.unwind());
+    }
+    let mut cost = 0;
+    for (id, data) in body.basic_blocks.iter() {
+        if !reached.contains(&id) {
+            continue;
+        }
+        for statement in &data.statements {
+            match &statement.kind {
+                StatementKind::Assign(place, rvalue) => {
+                    let reads_projected = match rvalue {
+                        Rvalue::Use(op) | Rvalue::Repeat(op, _) | Rvalue::Cast(_, op, _) => {
+                            operand_projected(op)
+                        }
+                        Rvalue::UnaryOp(_, op) => operand_projected(op),
+                        Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
+                            operand_projected(a) || operand_projected(b)
+                        }
+                        Rvalue::Aggregate(_, ops) => ops.iter().any(operand_projected),
+                        _ => true,
+                    };
+                    if !place.projection.as_slice().is_empty() || reads_projected {
+                        return Ok(None);
+                    }
+                    cost += 5;
+                }
+                StatementKind::StorageLive(_)
+                | StatementKind::StorageDead(_)
+                | StatementKind::FakeRead(_)
+                | StatementKind::Nop => {}
+                _ => return Ok(None),
+            }
+        }
+        let kind = &data.terminator.as_ref().expect("a reached block's end").kind;
+        cost += match kind {
+            TerminatorKind::Call { func: callee, args, cleanup, .. } => {
+                if args.iter().any(operand_projected) {
+                    return Ok(None);
+                }
+                let Some((callee, _)) = callee_of(callee) else { return Ok(None) };
+                let unwinds = cleanup.is_some() && !AttrFlags::is_rustc_nounwind(db, callee);
+                let pad = if unwinds { 50 } else { 0 };
+                if FunctionSignature::is_intrinsic(db, callee) {
+                    5 + pad
+                } else if rustc_inlines_at(db, Some(func), callee, depth + 1)? == Some(false) {
+                    25 + pad
+                } else {
+                    let Ok((inner, _)) = root_body(db, callee) else { return Ok(None) };
+                    let Some(inner) = inline_cost(db, callee, inner, depth + 1)? else {
+                        return Ok(None);
+                    };
+                    (25 + pad).max(inner + 5 * (args.len() + 1))
+                }
+            }
+            TerminatorKind::Goto { .. }
+            | TerminatorKind::Return
+            | TerminatorKind::Unreachable => 0,
+            TerminatorKind::SwitchInt { .. } => 5,
+            TerminatorKind::Assert { .. } | TerminatorKind::Drop { .. } => 75,
+            TerminatorKind::UnwindResume => 45,
+            _ => return Ok(None),
+        };
+    }
+    Ok(Some(cost))
+}
+
+/// Whether `func`'s body has an fma, or a call rustc may inline that has one, at any depth: a
+/// call of no fma that rustc inlines however deep puts none into its caller. A cycle of calls
+/// starts as having none and is iterated to its fixpoint.
+#[salsa::tracked(returns(copy), cycle_initial = |_, _, _| false)]
+fn reaches_fma(db: &dyn HirDatabase, func: FunctionId) -> bool {
+    let Ok((body, _)) = root_body(db, func) else { return false };
+    for (_, data) in body.basic_blocks.iter() {
+        let Some(TerminatorKind::Call { func: callee, .. }) =
+            data.terminator.as_ref().map(|it| &it.kind)
+        else {
+            continue;
+        };
+        let Some((callee, _)) = callee_of(callee) else { continue };
+        if FunctionSignature::is_intrinsic(db, callee) {
+            let name = FunctionSignature::of(db, callee).name.as_str();
+            if matches!(
+                name,
+                "simd_fma"
+                    | "simd_relaxed_fma"
+                    | "fma"
+                    | "fmaf32"
+                    | "fmaf64"
+                    | "fmuladdf32"
+                    | "fmuladdf64"
+            ) {
+                return true;
+            }
+        } else if !rustc_inlines_at(db, Some(func), callee, 0).is_ok_and(|it| it == Some(false))
+            && reaches_fma(db, callee)
+        {
+            return true;
+        }
+    }
+    false
 }
