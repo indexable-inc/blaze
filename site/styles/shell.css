@@ -250,3 +250,50 @@ main .discussion { scroll-margin-top: 64px; }
 	.mbar .tl-here .faces .face:nth-child(n + 3) { display: none; }
 	.mbar .tl-list { position: fixed; top: 52px; right: 8px; }
 }
+
+/* The chat (client/lib/chat.ts): a panel at the right, over the page; on a wide screen the page makes room for it. */
+.tl-chat-icon { flex: none; width: 15px; height: 11px; border: 1.5px solid currentColor; border-radius: 3px; position: relative; }
+.tl-chat-icon::after { content: ''; position: absolute; left: 2px; bottom: -4px; width: 5px; height: 5px; border-left: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; background: var(--bg); transform: skewY(-35deg); }
+.tl-badge { min-width: 17px; height: 17px; padding: 0 5px; border-radius: 9px; background: var(--doc-code-ink); color: #fff; font-size: 10.5px; font-weight: 600; line-height: 17px; text-align: center; }
+.tl-badge[hidden] { display: none; }
+.chat { position: fixed; z-index: 35; top: 6px; right: clamp(8px, 1vw, 14px); bottom: 10px; display: flex; flex-direction: column; width: 340px; border-radius: 16px; background: var(--bg-2); box-shadow: inset 0 0 0 1px var(--line-2), 0 20px 60px rgb(0 0 0 / 0.3); }
+.chat[hidden] { display: none; }
+@media (min-width: 1280px) {
+	body.chat-open .frame { padding-right: calc(340px + 2 * clamp(8px, 1vw, 14px)); }
+	body.chat-open .chat { box-shadow: inset 0 0 0 1px var(--line-2); }
+}
+.chat-head { display: flex; align-items: center; gap: 8px; padding: 12px 10px 10px 16px; border-bottom: 1px solid var(--line); }
+.chat-title { font-weight: 600; color: var(--ink-1); }
+.chat-online { flex: 1; color: var(--ink-3); font-size: 12.5px; }
+.chat-x { width: 28px; height: 28px; border: 0; border-radius: 8px; background: none; color: var(--ink-3); font-size: 20px; line-height: 1; cursor: pointer; }
+.chat-x:hover { background: var(--s-tint); color: var(--ink-1); }
+.chat-list { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 8px 0 10px; }
+.chat-msg { position: relative; padding: 6px 36px 2px 16px; }
+.chat-msg.grouped { padding-top: 0; }
+.chat-msg:hover { background: var(--s-tint); }
+.chat-who { display: flex; align-items: center; gap: 8px; margin-bottom: 2px; font-size: 13px; }
+.chat-who .face { width: 20px; height: 20px; }
+.chat-name { color: var(--ink-1); font-weight: 500; text-decoration: none; }
+.chat-name:hover { text-decoration: underline; }
+.chat-when { color: var(--ink-4); font-size: 11.5px; }
+.chat-text { margin: 0 0 0 28px; color: var(--ink-2); font-size: 13.5px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+.chat-text a { color: var(--ink-1); }
+.chat-del { position: absolute; top: 4px; right: 8px; width: 22px; height: 22px; border: 0; border-radius: 6px; background: none; color: var(--ink-4); font-size: 15px; line-height: 1; cursor: pointer; opacity: 0; }
+.chat-msg:hover .chat-del, .chat-del:focus-visible { opacity: 1; }
+.chat-del:hover { color: var(--danger); background: var(--s-tint); }
+.chat-empty { margin: 0; padding: 14px 16px; color: var(--ink-3); font-size: 13px; }
+.chat-jump { align-self: center; margin: -40px 0 8px; padding: 4px 12px; border: 0; border-radius: 14px; background: var(--ink-1); color: var(--bg); font: inherit; font-size: 12px; cursor: pointer; position: relative; }
+.chat-jump[hidden] { display: none; }
+.chat-foot { padding: 10px; border-top: 1px solid var(--line); }
+.chat-form { display: flex; align-items: flex-end; gap: 8px; }
+.chat-form textarea { flex: 1; min-height: 36px; max-height: 140px; padding: 8px 10px; border: 0; border-radius: 10px; box-shadow: inset 0 0 0 1px var(--line-2); background: var(--bg); color: var(--ink-1); font: inherit; font-size: 13.5px; line-height: 1.4; resize: none; }
+.chat-form textarea:focus { outline: none; box-shadow: inset 0 0 0 1px var(--ink-3); }
+.chat-send { height: 36px; padding: 0 14px; border: 0; border-radius: 10px; background: var(--ink-1); color: var(--bg); font: inherit; font-size: 13px; font-weight: 500; cursor: pointer; }
+.chat-err { margin: 0 0 8px; color: var(--danger); font-size: 12.5px; }
+.chat-err[hidden] { display: none; }
+.chat-signin { display: block; padding: 9px; border-radius: 10px; box-shadow: inset 0 0 0 1px var(--line-2); color: var(--ink-1); font-size: 13.5px; text-align: center; text-decoration: none; }
+.chat-signin:hover { background: var(--s-tint); }
+@media (max-width: 800px) {
+	.chat { inset: 0; z-index: 50; width: auto; border-radius: 0; }
+	.mbar .tl-chat { padding: 0 9px; }
+}

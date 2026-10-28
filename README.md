@@ -149,6 +149,8 @@ blaze stands on the shoulders of giants. Thank you to the people who built:
 - [object](https://github.com/gimli-rs/object), for reading and writing executables
 - [Rust](https://github.com/rust-lang/rust) and its compiler crates
 - [rustd](https://github.com/DioxusLabs/rustd) (DioxusLabs), whose code blaze includes
+- [Makepad](https://github.com/makepad/makepad), whose live-coding work inspired much of blaze, and
+  its JIT [relax](https://github.com/makepad/makepad/tree/work/libs/relax), behind `makepad run`
 
 None of these projects endorses blaze.
 

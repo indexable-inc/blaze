@@ -6,7 +6,8 @@
  * - the top line of the pane (`.topline`, made here, outside `.grid` so a swap keeps it; on a phone it sits in the
  *   phone bar instead): the page's discussion
  *   (its comment count, a jump to it) on a page that has one, the faces on this page (click: everyone on the site
- *   and where), and the reader: their GitHub avatar and login with Sign out, or Sign in with GitHub;
+ *   and where), the chat (client/lib/chat.ts, which rides this socket), and the reader: their GitHub avatar and login
+ *   with Sign out, or Sign in with GitHub;
  * - the sidebar: a small stack of faces on each page's row that someone else is reading;
  * - comments: when someone posts or deletes one, the worker says so here, and client/comments.ts refreshes the
  *   threads of that doc if it is the page shown.
@@ -17,6 +18,7 @@
  * (a hash, new every day). Someone whose tab is hidden is drawn faded ("away").
  */
 
+import * as chat from './chat';
 import { COMMENTS, PAGE, THREADS, onPage } from './page';
 
 type Who = { key: string; login: string | null; avatar: string | null };
@@ -115,7 +117,9 @@ bar.setAttribute('aria-label', 'Discussion and who is here');
 const discussSlot = el('span', 'tl-discuss');
 const hereSlot = el('span', 'tl-here');
 const meSlot = el('span', 'tl-me');
-bar.append(discussSlot, el('span', 'tl-gap'), hereSlot, meSlot);
+const chatSlot = el('span', 'tl-chatslot');
+chatSlot.append(chat.button);
+bar.append(discussSlot, el('span', 'tl-gap'), hereSlot, chatSlot, meSlot);
 const list = el('div', 'tl-list');
 list.hidden = true;
 list.id = 'who-is-here';
@@ -300,16 +304,21 @@ function connect(): void {
 		}
 		if (typeof m !== 'object' || m === null) return;
 		const msg = m as { t?: unknown };
+		if (chat.message(msg)) return;
 		if (msg.t === 'comments') {
 			const doc = (m as { doc?: unknown }).doc;
 			if (typeof doc === 'string') dispatchEvent(new CustomEvent(COMMENTS, { detail: doc }));
 			return;
 		}
-		if (msg.t === 'you') you = m as You;
+		if (msg.t === 'you') {
+			you = m as You;
+			chat.setYou(you);
+		}
 		else if (msg.t === 'here') {
 			const h = m as { people?: Person[]; total?: number };
 			people = Array.isArray(h.people) ? h.people : [];
 			total = typeof h.total === 'number' ? h.total : people.length;
+			chat.setOnline(total);
 		} else return;
 		draw();
 	});
@@ -340,6 +349,7 @@ document.addEventListener('click', (e) => {
 	if (!(e.target instanceof Node && list.contains(e.target))) closeList();
 });
 
+chat.setup({ send: (m) => ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify(m)), base: BASE, face });
 onPage(() => {
 	closeList();
 	draw();

@@ -13,15 +13,24 @@
  *   server -> client  {t: "you", key, login, avatar, signIn}       once, on connect
  *                     {t: "here", people: [{key, login, avatar, pages: [{path, away}]}]}   on every change
  *                     {t: "comments", doc}                      a comment on that doc was posted or deleted
+ *                     {t: "chat", messages: [Msg]}              the chat's last CHAT_SHOWN messages, once, on connect
+ *                     {t: "msg", m: Msg} / {t: "unsay", id}     a chat message said, or taken back
+ *                     {t: "error", text}                        why the tab's last chat message was refused
  *   client -> server  {t: "at", path, away}                       the page the tab shows (a site path) and whether
  *                                                                  it is hidden; unknown paths count as no page
+ *                     {t: "say", text} / {t: "unsay", id}       chat: signed-in readers only; taking back is for
+ *                                                                  the author or a COMMENT_ADMINS id
+ *
+ * Msg is {id, key, login, avatar, text, at}. The chat is everyone on the site, kept in the object's SQLite (the last
+ * CHAT_KEPT messages); anyone can read it, only signed-in readers can talk, at most RATE_SHORT per 15 s and RATE_LONG
+ * per hour each.
  *
  * A visitor with several tabs is one person with several pages. Broadcasts are coalesced (BROADCAST_MS). The
  * comment routes (worker/comments.ts) call `announce` after each write, so open pages refresh their threads live.
  */
 import { DurableObject } from 'cloudflare:workers';
 import pagesJson from '../.gen/pages.json';
-import { currentUser, hasSessionCookie } from './auth';
+import { currentUser, hasSessionCookie, isAdmin } from './auth';
 import type { Env } from './env';
 import { json, plain, sameOrigin } from './http';
 
@@ -29,10 +38,16 @@ const PATHS = new Set<string>(pagesJson.map((p) => p.url));
 const BROADCAST_MS = 300;
 const MAX_SOCKETS = 4000;
 const MAX_TABS = 16;
-const MAX_FRAME = 1024;
+const MAX_FRAME = 4096;
+const CHAT_MAX = 500;
+const CHAT_SHOWN = 80;
+const CHAT_KEPT = 500;
+const RATE_SHORT = 5;
+const RATE_LONG = 120;
 const MAX_PEOPLE = 300;
 
-type Who = { key: string; login: string | null; avatar: string | null };
+type Who = { key: string; login: string | null; avatar: string | null; admin?: boolean };
+type Msg = { id: number; key: string; login: string; avatar: string | null; text: string; at: string };
 /** Kept on each socket (`serializeAttachment`), so it survives hibernation. */
 type Tab = Who & { path: string | null; away: boolean };
 type Person = Who & { pages: { path: string; away: boolean }[] };
@@ -44,7 +59,7 @@ export async function handlePresence(request: Request, env: Env): Promise<Respon
 	if (!sameOrigin(request)) return plain('Cross-site request refused.', 403);
 	const user = hasSessionCookie(request) ? await currentUser(request, env) : null;
 	const headers = new Headers({ upgrade: 'websocket' });
-	if (user) headers.set('x-presence-who', JSON.stringify({ key: `u${user.id}`, login: user.login, avatar: avatarOf(user.avatar_url) }));
+	if (user) headers.set('x-presence-who', JSON.stringify({ key: `u${user.id}`, login: user.login, avatar: avatarOf(user.avatar_url), admin: isAdmin(env, user) }));
 	headers.set('x-presence-ip', request.headers.get('cf-connecting-ip') ?? '');
 	headers.set('x-presence-ua', (request.headers.get('user-agent') ?? '').slice(0, 512));
 	headers.set('x-presence-signin', env.GITHUB_CLIENT_ID ? '1' : '');
@@ -69,18 +84,20 @@ const avatarOf = (url: string | null): string | null =>
 export class Presence extends DurableObject<Env> {
 	private pending: ReturnType<typeof setTimeout> | null = null;
 	private salt: { day: string; key: CryptoKey } | null = null;
+	/** Each talker's recent message times (ms), for the rate limit. Lost on hibernation, which only forgives. */
+	private said = new Map<string, number[]>();
+
+	constructor(ctx: DurableObjectState, env: Env) {
+		super(ctx, env);
+		ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS chat (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL, login TEXT NOT NULL, avatar TEXT,
+			text TEXT NOT NULL, at TEXT NOT NULL)`);
+	}
 
 	override async fetch(request: Request): Promise<Response> {
 		if (request.method === 'POST' && new URL(request.url).pathname === '/comments') {
 			const { doc } = await request.json<{ doc: string }>();
-			const out = JSON.stringify({ t: 'comments', doc });
-			for (const ws of this.open()) {
-				try {
-					ws.send(out);
-				} catch {
-					// Closing.
-				}
-			}
+			this.broadcast(JSON.stringify({ t: 'comments', doc }));
 			return new Response(null, { status: 204 });
 		}
 		if (this.ctx.getWebSockets().length >= MAX_SOCKETS) return json({ error: 'Too many visitors right now.' }, 503);
@@ -94,21 +111,24 @@ export class Presence extends DurableObject<Env> {
 		this.ctx.acceptWebSocket(server, [who.key]);
 		const tab: Tab = { ...who, path: null, away: false };
 		server.serializeAttachment(tab);
-		server.send(JSON.stringify({ t: 'you', key: who.key, login: who.login, avatar: who.avatar, signIn: request.headers.get('x-presence-signin') === '1' }));
+		server.send(JSON.stringify({ t: 'you', key: who.key, login: who.login, avatar: who.avatar, admin: !!who.admin, signIn: request.headers.get('x-presence-signin') === '1' }));
 		server.send(this.snapshot());
+		server.send(JSON.stringify({ t: 'chat', messages: this.history() }));
 		return new Response(null, { status: 101, webSocket: client });
 	}
 
 	override webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
 		if (typeof message !== 'string' || message.length > MAX_FRAME) return ws.close(1009, 'Too big.');
-		let m: { t?: unknown; path?: unknown; away?: unknown };
+		let m: { t?: unknown; path?: unknown; away?: unknown; text?: unknown; id?: unknown };
 		try {
 			m = JSON.parse(message) as typeof m;
 		} catch {
 			return ws.close(1003, 'Not JSON.');
 		}
-		if (m.t !== 'at') return;
 		const tab = ws.deserializeAttachment() as Tab;
+		if (m.t === 'say') return this.say(ws, tab, m.text);
+		if (m.t === 'unsay') return this.unsay(ws, tab, m.id);
+		if (m.t !== 'at') return;
 		const path = typeof m.path === 'string' && PATHS.has(m.path) ? m.path : null;
 		const away = m.away === true;
 		if (tab.path === path && tab.away === away) return;
@@ -129,17 +149,56 @@ export class Presence extends DurableObject<Env> {
 		this.schedule();
 	}
 
+	private say(ws: WebSocket, tab: Tab, raw: unknown): void {
+		const refuse = (text: string) => ws.send(JSON.stringify({ t: 'error', text }));
+		if (!tab.login) return refuse('Sign in with GitHub to chat.');
+		const text = typeof raw === 'string' ? raw.trim() : '';
+		if (text.length < 1 || text.length > CHAT_MAX) return refuse(`A message is 1 to ${CHAT_MAX} characters.`);
+		const now = Date.now();
+		const times = (this.said.get(tab.key) ?? []).filter((t) => now - t < 3_600_000);
+		if (times.filter((t) => now - t < 15_000).length >= RATE_SHORT || times.length >= RATE_LONG) return refuse('Slow down a little.');
+		times.push(now);
+		this.said.set(tab.key, times);
+		const at = new Date(now).toISOString();
+		const row = this.ctx.storage.sql
+			.exec<{ id: number }>('INSERT INTO chat (key, login, avatar, text, at) VALUES (?, ?, ?, ?, ?) RETURNING id', tab.key, tab.login, tab.avatar, text, at)
+			.one();
+		this.ctx.storage.sql.exec('DELETE FROM chat WHERE id <= ?', row.id - CHAT_KEPT);
+		const m: Msg = { id: row.id, key: tab.key, login: tab.login, avatar: tab.avatar, text, at };
+		this.broadcast(JSON.stringify({ t: 'msg', m }));
+	}
+
+	private unsay(ws: WebSocket, tab: Tab, id: unknown): void {
+		if (typeof id !== 'number' || !Number.isSafeInteger(id) || !tab.login) return;
+		const row = this.ctx.storage.sql.exec<{ key: string }>('SELECT key FROM chat WHERE id = ?', id).toArray()[0];
+		if (!row) return;
+		if (row.key !== tab.key && !tab.admin) return ws.send(JSON.stringify({ t: 'error', text: 'Not your message.' }));
+		this.ctx.storage.sql.exec('DELETE FROM chat WHERE id = ?', id);
+		this.broadcast(JSON.stringify({ t: 'unsay', id }));
+	}
+
+	/** The last CHAT_SHOWN messages, oldest first. */
+	private history(): Msg[] {
+		return this.ctx.storage.sql
+			.exec<Msg>('SELECT id, key, login, avatar, text, at FROM chat ORDER BY id DESC LIMIT ?', CHAT_SHOWN)
+			.toArray()
+			.reverse();
+	}
+
+	private broadcast(out: string): void {
+		for (const ws of this.open()) {
+			try {
+				ws.send(out);
+			} catch {
+				// Closing.
+			}
+		}
+	}
+
 	private schedule(): void {
 		this.pending ??= setTimeout(() => {
 			this.pending = null;
-			const out = this.snapshot();
-			for (const ws of this.open()) {
-				try {
-					ws.send(out);
-				} catch {
-					// Closing: its close handler broadcasts again.
-				}
-			}
+			this.broadcast(this.snapshot());
 		}, BROADCAST_MS);
 	}
 
