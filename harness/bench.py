@@ -13,7 +13,9 @@ result with the machine, the commit and the date, for benchreport.py's runtime t
 Each project is one pinned checkout (cloned into `BLAZE_PROJECTS` as blaze_cli.py does, and
 copied; the clone is never written to). A project with `prepare` (bun) is copied from the tree
 that module's `prepare` makes beside the clone, and is measured only when named, as is one with
-`named` (dynamo, whose build needs protoc and libclang). Under each
+`named` (dynamo, whose build needs protoc and libclang; codex, which needs libcap). A project
+with `dir` is built in that directory of its checkout (codex: codex-rs), and its edits are
+paths in it. Under each
 backend, with a store, a daemon and a home of its own, and plain cargo building the same source
 into a target directory of its own outside the checkout (under `--reference`, which lets the two be on different disks, or `WORK/reference`):
   cold       `blaze build` from nothing, then the wait until the daemon has the
@@ -277,6 +279,22 @@ PROJECTS = {
             leaf=body("lib/tokens/src/lib.rs", "    pub fn remaining(&self) -> usize {"),
         ),
         test=["-p", "dynamo-tokens"],
+    ),
+    # OpenAI's Codex CLI: its Rust workspace is codex-rs (`dir`), 162 crates, most of them under
+    # the `codex` binary. cargo builds with its pin (rust-toolchain.toml, 1.99.1), as its users do.
+    # Needs libcap (its Linux sandbox) and ALSA; measured only when named.
+    "codex": dict(
+        repo="openai/codex", tag="rust-v0.165.0", rev="360319d8dee62d87e2d59fc0c21805d79519cfed",
+        dir="codex-rs", env=dict(RUSTUP_TOOLCHAIN="1.99.1"), named=True,
+        build=["-p", "codex-cli", "--bin", "codex"], run=["--version"],
+        edits=dict(
+            body=body("cli/src/main.rs", "fn main() -> anyhow::Result<()> {"),
+            # codex-protocol, which most crates of the workspace depend on.
+            leaf=body("protocol/src/protocol.rs", "pub fn strip_user_message_prefix(text: &str) -> &str {"),
+            # AbsolutePathBuf::join, which the workspace calls at many types of path.
+            generic=body("utils/absolute-path/src/lib.rs", "    pub fn join<P: AsRef<Path>>(&self, path: P) -> Self {"),
+        ),
+        test=["-p", "codex-apply-patch", "-p", "codex-protocol", "-p", "codex-execpolicy", "-p", "codex-features"],
     ),
     # A game: built, not run (it opens a window). Its own code is small; the engine is ~400 crates.
     "bevy": dict(
