@@ -102,18 +102,3 @@ fn a_real_file_evaluates_as_compiled() {
     check(include_str!("../../../../cfg/src/cfg_expr.rs"));
     check(include_str!("../../../../span/src/lib.rs"));
 }
-
-#[test]
-fn probe_a() {
-    check_number("const GOAL: u128 = (1 << 61) - 1;", (1i128 << 61) - 1);
-}
-
-#[test]
-fn probe_b() {
-    check_number("const P: u128 = (1 << 61) - 1;\nconst fn m(h: u64) -> u64 { ((h as u128 * 3 + 1) % P) as u64 }\nconst GOAL: u64 = m(5);", 16);
-}
-
-#[test]
-fn probe_c() {
-    check_number("const GOAL: u128 = 1 << 61;", 1i128 << 61);
-}
