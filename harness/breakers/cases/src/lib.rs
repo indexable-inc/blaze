@@ -205,4 +205,5 @@ cases![
     attr_on_prefix_expr,
     type_id_lifetime_constant,
     caller_through_track_caller,
+    c_abi_projection,
 ];

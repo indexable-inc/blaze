@@ -8547,7 +8547,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         ret: Ty<'db>,
         args: impl IntoIterator<Item = Ty<'db>>,
     ) -> Result<FnAbi> {
-        let args: Vec<Ty<'db>> = args.into_iter().collect();
+        // A signature can still say a type as a projection (`<CGRect as ConvertReturn<()>>::Inner`),
+        // which the classifiers below match on by kind.
+        let ret = self.normalize(ret);
+        let args: Vec<Ty<'db>> = args.into_iter().map(|ty| self.normalize(ty)).collect();
         if !abi.is_rustic_abi() {
             for &ty in args.iter().chain([&ret]) {
                 if self.scalable(ty)?.is_some() {
@@ -8938,6 +8941,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         offset: u64,
         leaves: &mut Vec<(u64, Scalar)>,
     ) -> Result<()> {
+        let ty = self.normalize(ty);
         let layout = self.layout(ty)?;
         if layout.is_zst() {
             return Ok(());
@@ -9017,6 +9021,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// values of no size, and fills its size: rustc's homogeneous aggregate of one unit. A
     /// union is none, as rustc has it.
     fn lone_scalar(&self, ty: Ty<'db>) -> Result<Option<Scalar>> {
+        let ty = self.normalize(ty);
         let layout = self.layout(ty)?;
         let size = layout.size;
         let fits = |scalar: Option<Scalar>| scalar.filter(|it| it.size(self.dl()) == size);
@@ -9100,6 +9105,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// `TyAndLayout::pass_indirectly_in_non_rustic_abis`, which looks through transparent
     /// wrappers for a struct marked `#[rustc_pass_indirectly_in_non_rustic_abis]`.
     fn decays_in_c(&self, ty: Ty<'db>) -> Result<bool> {
+        let ty = self.normalize(ty);
         let TyKind::Adt(def, subst) = ty.kind() else { return Ok(false) };
         let AdtId::StructId(id) = def.def_id() else { return Ok(false) };
         // rustc makes the attribute do nothing on a 1-ZST, whose wrappers it cannot peel.
@@ -9190,6 +9196,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         offset: u64,
         classes: &mut [Option<RegClass>; 2],
     ) -> Result<bool> {
+        let ty = self.normalize(ty);
         let layout = self.layout(ty)?;
         if layout.is_zst() {
             return Ok(true);
