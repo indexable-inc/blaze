@@ -114,6 +114,7 @@ pub use fncache::{Call, Found, Kind as ReachKind, Reach, tests_reach};
 mod fragment;
 mod home;
 mod later;
+mod memo;
 pub use home::body_file;
 #[cfg(feature = "llvm")]
 mod imports;
@@ -1203,6 +1204,7 @@ impl CodegenUnit {
                         }
                     });
                 }
+                memo::report();
                 let total = COMPILED.load(std::sync::atomic::Ordering::Relaxed);
                 let compiled_now = total - std::mem::replace(counted, total);
                 *stats = BuildStats {
@@ -5099,18 +5101,29 @@ fn inline(ctx: &mut cranelift_codegen::Context, inlined: &[ir::Function]) -> Res
     Ok(())
 }
 
-/// The store as Cranelift asks for it: one of these per function compiled.
-struct IncrementalCache(&'static store::Store);
+/// What Cranelift made, as it asks for it: [`memo`] of this process, then the store. One of
+/// these per function compiled.
+struct IncrementalCache {
+    store: Option<&'static store::Store>,
+    started: std::time::Instant,
+    found: std::cell::OnceCell<std::sync::Arc<[u8]>>,
+}
 
 impl cranelift_codegen::incremental_cache::CacheKvStore for IncrementalCache {
     fn get(&self, key: &[u8]) -> Option<Cow<'_, [u8]>> {
         let key = <&[u8; store::KEY]>::try_from(key).ok()?;
-        self.0.lookup(key).map(Cow::Owned)
+        if let Some(value) = memo::get(key) {
+            return Some(Cow::Borrowed(self.found.get_or_init(|| value)));
+        }
+        self.store?.lookup(key).map(Cow::Owned)
     }
 
     fn insert(&mut self, key: &[u8], val: Vec<u8>) {
         if let Ok(key) = <&[u8; store::KEY]>::try_from(key) {
-            self.0.insert(key, &val);
+            if let Some(store) = self.store {
+                store.insert(key, &val);
+            }
+            memo::insert(key, val, self.started.elapsed());
         }
     }
 }
@@ -5135,13 +5148,13 @@ fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
         isa = &**target_with_frame_pointer()?;
     }
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        match store::Store::global() {
-            Some(store) => ctx
-                .compile_with_cache(isa, &mut IncrementalCache(store), &mut Default::default())
-                .map(drop),
-            None => ctx.compile(isa, &mut Default::default()).map(drop),
-        }
-        .map_err(|e| format!("{:?}", e.inner))?;
+        let mut cache = IncrementalCache {
+            store: store::Store::global(),
+            started: std::time::Instant::now(),
+            found: Default::default(),
+        };
+        ctx.compile_with_cache(isa, &mut cache, &mut Default::default())
+            .map_err(|e| format!("{:?}", e.inner))?;
         backend::Tally::global().passes();
         let Some(compiled) = ctx.compiled_code() else {
             return Err("no compiled code".to_owned());
