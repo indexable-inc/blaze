@@ -3959,7 +3959,12 @@ fn harnesses<'a>(
                 test_harness::module(db, krate, functions, &name)
             });
             let module = module.map(|it| it.text).unwrap_or_default();
-            let wanted = format!("{}{module}", test_harness::without(&text));
+            // rustc empties a crate whose root's `#![cfg(...)]` is false, its crate attributes
+            // too, and then writes its harness: such a root is the harness alone, with no tests,
+            // or the `#![cfg]` would leave the program without the harness's `main` too.
+            let configured_out = hir::attach_db(db, || krate.is_configured_out(db));
+            let kept = if configured_out { "" } else { test_harness::without(&text) };
+            let wanted = format!("{kept}{module}");
             if *text != *wanted {
                 texts.push((file, wanted));
             }

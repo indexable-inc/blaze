@@ -9,6 +9,10 @@ since the release before and the title of each change merged since.
 
 ## [Unreleased]
 
+### Added
+
+- `blaze lock --fetches` hands fframes its downloads: `ffmpeg-sys-fframes` its prebuilt FFmpeg (`FFMPEG_BINARIES_CACHE`), or, for a feature set none was made for, FFmpeg's source as the git repository its build script clones (git's `insteadOf`, through `GIT_CONFIG_COUNT`); `skia-bindings` its prebuilt Skia (`SKIA_BINARIES_URL`, a `file://` address). It takes a build's `-p`, `--workspace`, `--exclude` and `--tests`, recording the downloads for the features that build resolves, and keeps the entries of other feature sets: a download that depends on features was refused to every build whose features were not the whole workspace's (#1349).
+
 ### Changed
 
 - Releases: a canary is cut as soon as main's Linux x86-64 build of a commit passes, without waiting for the unit tests; stable now also needs main's merge gate on that commit green, with the unit tests run and passed on Linux x86-64, Linux ARM64 and macOS (docs/release.md).
