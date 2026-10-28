@@ -34,14 +34,6 @@ runs:
         if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
           sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
         fi
-    # blaze's own copy of the Rust it builds with (the release's pins.txt: rustc, cargo, rust-std
-    # and rust-src, checked by their sha256 as blaze downloads them), from the Actions cache by
-    # the release, which is what pins it. Main alone writes it, as the other caches here.
-    - id: toolchain
-      uses: actions/cache/restore@v6
-      with:
-        path: ~/.blaze/toolchains
-        key: blaze-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/blaze-version') }}
     # The release .github/blaze-version names, not the newest canary: a store is of one release,
     # and canaries come every 40 minutes, sooner than a cold run (about an hour) ends and pushes,
     # so with the newest every run would be cold. A pull request that changes the file moves
@@ -53,7 +45,7 @@ runs:
         JOB: ${{ inputs.job }}
       run: |
         # Without --no-toolchain: install.sh has blaze fetch its toolchain now (`blaze toolchain`),
-        # or find the cache's copy, rather than at the first build.
+        # as a user's install does, rather than at the first build.
         sh install.sh --version "$(cat .github/blaze-version)" --verbose
         said=$(blaze-engine --version)
         version=$(echo "$said" | awk '$1 == "blaze" { print $2 }')
@@ -65,22 +57,14 @@ runs:
         # for one job, so nothing needs collecting.
         echo "BLAZE_CACHE_MAX=off" >> "$GITHUB_ENV"
         echo "project=blaze-$RUNNER_OS-$RUNNER_ARCH-$JOB-$version" | tee -a "$GITHUB_OUTPUT"
-    - if: steps.toolchain.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || github.head_ref == 'nonix-gate')
-      uses: actions/cache/save@v6
-      with:
-        path: ~/.blaze/toolchains
-        key: ${{ steps.toolchain.outputs.cache-primary-key }}
-    # The pinned LLVM: the archive the llvm workflow built for this host, checked against
-    # llvm.json's sha256 by llvm.py and unpacked, from the Actions cache by that pin. Nothing
-    # else is an LLVM for the build: crates/hir-ty-codegen/build.rs refuses any prefix that is
-    # not this one. It is installed below /usr/local/lib, a system directory of libraries,
-    # because llvm-sys's build script names its `lib` to the linker and a build script in
-    # blaze's sandbox may name only its own directories, the system's and the Nix store
-    # (crates/blaze-cargo/src/cargo/directives.rs, SYSTEM). The directory is the same in every
-    # run, so the build scripts that read LLVM_SYS_231_PREFIX are given the same value and the
-    # store's runs of them are found.
+    # The pinned LLVM, as a contributor outside Nix gets it (docs/contributing.md, "LLVM for
+    # `--features llvm`"): llvm.py fetches the archive llvm.json names for this host, checks its
+    # sha256 and unpacks it; crates/hir-ty-codegen/build.rs refuses any other prefix. Below
+    # /usr/local/lib because llvm-sys's build script names the prefix's `lib` to the linker, and a
+    # build script in blaze's sandbox may name only system directories of libraries
+    # (crates/blaze-cargo/src/cargo/directives.rs, SYSTEM). The same directory every run, so the
+    # store's runs of the build scripts that read LLVM_SYS_231_PREFIX are found.
     - name: LLVM (the pin)
-      id: llvm
       if: inputs.llvm == 'true'
       shell: bash
       run: |
@@ -92,27 +76,8 @@ runs:
         esac
         sudo mkdir -p /usr/local/lib/blaze-llvm
         sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
-        echo "triple=$triple" >> "$GITHUB_OUTPUT"
-        echo "dir=/usr/local/lib/blaze-llvm/$triple" >> "$GITHUB_OUTPUT"
-    - id: llvm-cache
-      if: inputs.llvm == 'true'
-      uses: actions/cache/restore@v6
-      with:
-        path: ${{ steps.llvm.outputs.dir }}
-        key: llvm-${{ hashFiles('crates/hir-ty-codegen/llvm.json') }}-${{ steps.llvm.outputs.triple }}
-    - if: inputs.llvm == 'true'
-      shell: bash
-      env:
-        TRIPLE: ${{ steps.llvm.outputs.triple }}
-        DIR: ${{ steps.llvm.outputs.dir }}
-      run: |
-        python3 .github/scripts/llvm.py fetch --target "$TRIPLE" --dir "$DIR"
-        echo "LLVM_SYS_231_PREFIX=$DIR" >> "$GITHUB_ENV"
-    - if: inputs.llvm == 'true' && steps.llvm-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || github.head_ref == 'nonix-gate')
-      uses: actions/cache/save@v6
-      with:
-        path: ${{ steps.llvm.outputs.dir }}
-        key: ${{ steps.llvm-cache.outputs.cache-primary-key }}
+        python3 .github/scripts/llvm.py fetch --target "$triple" --dir "/usr/local/lib/blaze-llvm/$triple"
+        echo "LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/$triple" >> "$GITHUB_ENV"
     # A cold store (a new release, or a project main has not pushed yet) builds blaze in about
     # 28 GB, more than a hosted runner's 16 (rcache, #664): swap lets that run finish, slowly,
     # where it would be killed, and the warm runs after it never touch it.

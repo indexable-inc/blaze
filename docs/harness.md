@@ -385,17 +385,17 @@ cannot be had (a run by hand, a comparison of 300 files or more, GitHub refusing
 code. When the build or the unit tests start reading a new file, add it there.
 
 The build and the unit tests of the `gate` and `warm` tiers install no rustup and no Nix: a
-checkout, then `.github/actions/blaze`, which installs the release of blaze with its own Rust
-(install.sh fetching the release's pinned `rustc`, `cargo`, `rust-std` and `rust-src` into
-`~/.blaze/toolchains`, [self-contained.md](self-contained.md#blazes-own-toolchain-the-stopgap)),
-and for the build the pinned LLVM (`.github/scripts/llvm.py fetch` into
-`/usr/local/lib/blaze-llvm`, checked against `crates/hir-ty-codegen/llvm.json`'s sha256, as
-`LLVM_SYS_231_PREFIX`), both from the Actions cache keyed by their pins and written by main.
-`/usr/local/lib` because a build script in blaze's sandbox may name only system directories of
-libraries to the linker, and llvm-sys's names the prefix's `lib`. The C compiler, linker and
-libc are the runner's (gcc and glibc 2.39 on Ubuntu 24.04, Xcode's clang on macOS), so what the
-build and the tests link runs on the runner; the train's tiers still build with cargo in the
-flake's dev shell, against its glibc, and their harness jobs install Nix for that.
+checkout, then `.github/actions/blaze`, which installs the release of blaze as a user does, with
+install.sh fetching its own Rust (the release's pinned `rustc`, `cargo`, `rust-std` and
+`rust-src`, into `~/.blaze/toolchains`,
+[self-contained.md](self-contained.md#blazes-own-toolchain-the-stopgap)), and for the build the
+pinned LLVM as a contributor outside Nix gets it
+([contributing.md](contributing.md#llvm-for---features-llvm)): `.github/scripts/llvm.py fetch`
+into `/usr/local/lib/blaze-llvm/<triple>`, checked against `crates/hir-ty-codegen/llvm.json`'s
+sha256, as `LLVM_SYS_231_PREFIX`. Neither is cached by CI. The C compiler, linker and libc are
+the runner's (gcc and glibc 2.39 on Ubuntu 24.04, Xcode's clang on macOS), so what the build and
+the tests link runs on the runner; the train's tiers still build with cargo in the flake's dev
+shell, against its glibc, and their harness jobs install Nix for that.
 
 A change reaches main through a **pull request** alone
 ([contributing.md](contributing.md#landing-a-change)), merged directly once `ci` passes on it;
