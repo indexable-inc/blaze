@@ -1,3 +1,7 @@
+---
+status: current
+summary: The build page blaze ui serves: every function of the build drawn live on the GPU, from a Flecs world of the program.
+---
 # The build page
 
 `blaze ui` prints the address of a page the daemon serves on 127.0.0.1 and opens it: the build
