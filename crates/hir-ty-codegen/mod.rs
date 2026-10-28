@@ -15621,26 +15621,49 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 // factors the other way round, which decides which of two NaNs comes out; a
                 // vector of one lane is the scalar's `fmadd`, in order.
                 let swapped = self.cg.target.arch == Arch::Aarch64 && count > 1;
-                // x86-64's LLVM makes `simd_relaxed_fma` (`llvm.fmuladd`) of a CPU without FMA
-                // a multiply and then an add (`mulps`, `addps`), rounded twice.
-                let unfused = name == "simd_relaxed_fma" && self.cg.target.arch == Arch::X86_64;
-                let lanes: Vec<Value> = (0..count)
-                    .map(|i| {
-                        let offset = (i * lane.ty.bytes() as u64) as i32;
+                // Whole vectors of 16 bytes, or one of 8, so that LLVM's SLP vectorizer, which
+                // joins lanes of scalar fmas into a vector fma with the factors in their order
+                // and so picks the other NaN, has nothing to join.
+                let bytes = count * u64::from(lane.ty.bytes());
+                let chunk = match bytes {
+                    8 => 8,
+                    _ if bytes % 16 == 0 => 16,
+                    _ => 0,
+                };
+                if swapped && matches!(lane.ty, types::F32 | types::F64) && chunk != 0 {
+                    let vector = lane.ty.by((chunk / u64::from(lane.ty.bytes())) as u32);
+                    let vector = vector.expect("8 or 16 bytes of lanes");
+                    for at in (0..bytes).step_by(chunk as usize) {
+                        let at = at as i32;
                         let [x, y, z] =
-                            [a, b, c].map(|v| self.builder.ins().load(lane.ty, MEM, v, offset));
-                        if unfused {
-                            let product = self.builder.ins().fmul(x, y);
-                            self.builder.ins().fadd(product, z)
-                        } else if swapped {
-                            self.builder.ins().fma(y, x, z)
-                        } else {
-                            self.builder.ins().fma(x, y, z)
-                        }
-                    })
-                    .collect();
-                for (i, value) in lanes.into_iter().enumerate() {
-                    self.builder.ins().store(MEM, value, dst, i as i32 * lane.ty.bytes() as i32);
+                            [a, b, c].map(|v| self.builder.ins().load(vector, MEM, v, at));
+                        let value = self.builder.ins().fma(y, x, z);
+                        self.builder.ins().store(MEM, value, dst, at);
+                    }
+                } else {
+                    // x86-64's LLVM makes `simd_relaxed_fma` (`llvm.fmuladd`) of a CPU without
+                    // FMA a multiply and then an add (`mulps`, `addps`), rounded twice.
+                    let unfused =
+                        name == "simd_relaxed_fma" && self.cg.target.arch == Arch::X86_64;
+                    let lanes: Vec<Value> = (0..count)
+                        .map(|i| {
+                            let offset = (i * lane.ty.bytes() as u64) as i32;
+                            let [x, y, z] = [a, b, c]
+                                .map(|v| self.builder.ins().load(lane.ty, MEM, v, offset));
+                            if unfused {
+                                let product = self.builder.ins().fmul(x, y);
+                                self.builder.ins().fadd(product, z)
+                            } else if swapped {
+                                self.builder.ins().fma(y, x, z)
+                            } else {
+                                self.builder.ins().fma(x, y, z)
+                            }
+                        })
+                        .collect();
+                    for (i, value) in lanes.into_iter().enumerate() {
+                        let offset = i as i32 * lane.ty.bytes() as i32;
+                        self.builder.ins().store(MEM, value, dst, offset);
+                    }
                 }
             }
             ("simd_extract", [vector, index]) => {
