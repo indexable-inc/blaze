@@ -730,6 +730,7 @@ dependencies = [
  "blaze-manifest",
  "blaze-metadata",
  "blaze-new",
+ "blaze-profile",
  "blaze-protocol",
  "blaze-registry",
  "blaze-resolve",
@@ -825,6 +826,7 @@ dependencies = [
  "blaze-lints",
  "blaze-live",
  "blaze-macro-wasm",
+ "blaze-profile",
  "blaze-protocol",
  "blaze-splice",
  "blaze-store",
@@ -871,6 +873,7 @@ dependencies = [
  "toml",
  "toml_edit",
  "toolchain",
+ "tracing",
  "triomphe",
  "uds_windows",
  "url",
@@ -986,6 +989,7 @@ dependencies = [
  "salsa",
  "sha2 0.10.9",
  "span",
+ "tracing",
  "tt",
  "wasmtime",
 ]
@@ -1039,6 +1043,18 @@ dependencies = [
  "glob",
  "pathdiff",
  "toml_edit",
+]
+
+[[package]]
+name = "blaze-profile"
+version = "0.20261028.9"
+dependencies = [
+ "libc",
+ "rustc-hash 2.1.2",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -2560,6 +2576,7 @@ version = "0.20261028.9"
 dependencies = [
  "base-db",
  "blaze-fuzz",
+ "blaze-profile",
  "blaze-store",
  "cfg",
  "cranelift-codegen",

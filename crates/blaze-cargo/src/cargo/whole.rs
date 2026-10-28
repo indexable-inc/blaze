@@ -460,10 +460,18 @@ fn turned_down(program: &Program, said: &crate::errors::Said) -> String {
 /// builds them again on what it has loaded when asked next. `Ok` names the programs, by
 /// index, the daemon built rather than found up to date; `Err` says why not.
 fn whole(cwd: &Path, checkout: &Checkout, programs: &[Program]) -> Result<Vec<usize>, Unbuilt> {
+    let asking_at = Instant::now();
     let reply = client::ask(Request::Build(super::asking(checkout)), Start::IfMissing)
         .map_err(|it| format!("{it:#}"))?;
+    crate::trace::note("client↔daemon", crate::trace::CLIENT, asking_at);
     let built = match reply {
-        Some(Reply::Synced { programs, .. }) => programs,
+        Some(Reply::Synced { programs, spans }) => {
+            crate::trace::note_all(spans);
+            for line in programs.iter().flatten() {
+                crate::trace::note_all(crate::trace::split(line).1);
+            }
+            programs
+        }
         Some(Reply::Cold { reason }) => return Err(not_loaded(cwd, checkout, &reason).into()),
         None => return Err(client::why_none().into()),
         Some(other) => return Err(format!("the daemon answered {other:?}").into()),
@@ -590,6 +598,7 @@ fn checkout(
         sources: manifests.chain(sources).collect(),
         env,
         scripts: None,
+        profile: None,
     }
 }
 

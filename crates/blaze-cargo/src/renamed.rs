@@ -15,12 +15,19 @@ pub fn refuse_old_settings() {
     let mut old: Vec<String> = std::env::vars_os()
         .filter_map(|(name, _)| name.to_str().filter(|it| it.starts_with(OLD)).map(str::to_owned))
         .collect();
-    if old.is_empty() {
+    let traced = std::env::var_os("BLAZE_TRACE").is_some();
+    if old.is_empty() && !traced {
         return;
     }
     old.sort();
     for name in &old {
         eprintln!("{name} was renamed BLAZE_{}", &name[OLD.len()..]);
+    }
+    if traced {
+        eprintln!(
+            "BLAZE_TRACE is gone: BLAZE_PROFILE=<dir> writes the whole build's profile, its \
+             Chrome trace as <dir>/trace.json"
+        );
     }
     std::process::exit(1);
 }

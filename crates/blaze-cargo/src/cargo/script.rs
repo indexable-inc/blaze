@@ -448,7 +448,7 @@ pub const UNREAD: [&str; 13] = [
     "TMPDIR",
     sandboxed::VAR,
     "BLAZE_CACHE",
-    "BLAZE_TRACE",
+    "BLAZE_PROFILE",
     "BLAZE_STATS",
     "BLAZE_HOME",
     keyed::CHECK,

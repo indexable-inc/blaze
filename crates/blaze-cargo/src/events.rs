@@ -47,6 +47,12 @@ static AT: Mutex<Option<(Step, Option<String>)>> = Mutex::new(None);
 /// Says the process is at `step`, of `of` when it is of one crate or program, and done
 /// with the one before.
 pub fn at(step: Step, of: Option<&str>) {
+    if crate::trace::on() {
+        crate::trace::step(Some(match of {
+            Some(of) => format!("{step:?} {of}"),
+            None => format!("{step:?}"),
+        }));
+    }
     let of = of.map(str::to_owned);
     match crate::lock(&AT).replace((step, of.clone())) {
         Some((step, of)) => say(Event::Ended { step, of }),
@@ -71,6 +77,7 @@ pub fn within<T>(step: Step, of: Option<&str>, work: impl FnOnce() -> T) -> T {
 
 /// Says the process is done with its step: it waits to be asked.
 pub fn idle() {
+    crate::trace::step(None);
     if let Some((step, of)) = crate::lock(&AT).take() {
         say(Event::Ended { step, of });
     }

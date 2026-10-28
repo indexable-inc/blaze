@@ -394,6 +394,10 @@ pub struct Checkout {
     /// built, which a worker loads the checkout with.
     #[serde(default)]
     pub scripts: Option<PathBuf>,
+    /// Where the client asked the profile of the build to go ([`crate::trace::VAR`]): the
+    /// worker records one from then on, and one it starts records its load too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<PathBuf>,
 }
 
 impl Checkout {
@@ -559,6 +563,9 @@ impl Worker {
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
         started.extend(config.builds_env());
+        if let Some(profile) = checkout.profile.as_ref().and_then(|it| it.to_str()) {
+            started.insert(crate::trace::VAR.to_owned(), profile.to_owned());
+        }
         let told = spare.and_then(|it| it.told(&args, &started, &checkout.root));
         let child = match told {
             Some(spare) => {
@@ -759,6 +766,9 @@ impl Worker {
         let mut env = requests_env(&checkout.config);
         for (name, value) in &checkout.env {
             env.set(name, value);
+        }
+        if let Some(profile) = checkout.profile.as_ref().and_then(|it| it.to_str()) {
+            env.set(crate::trace::VAR, profile);
         }
         stream.write_all(checkout.sync_line(plan).as_bytes()).with_context(failed)?;
         stream

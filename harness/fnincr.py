@@ -5,8 +5,8 @@ usage: fnincr.py [--fns N] [--files K] [--rounds R] [--keep LOG]
        fnincr.py --workspace DIR --package P --crate C --file F --edit NAME OLD NEW [--edit ...]
 
 Generates the workspace of `genbig.py` (N functions, default 500, in K files, default 1),
-starts the daemon on it in watch mode with salsa's execution counts on (`RUSTD_TRACE`,
-`BLAZE_TRACE`), and makes each edit below R times, each followed by its undo. For every edit
+starts the daemon on it in watch mode with salsa's execution counts on (`RUSTD_TRACE`),
+and makes each edit below R times, each followed by its undo. For every edit
 it prints how often the queries that matter ran (lowering a body, inference, MIR, the place of
 a panic), how many functions were compiled again, the time the daemon took to take the change
 in, and the time to the binary. The undo is timed too but not printed. Medians over the rounds.
@@ -18,7 +18,7 @@ import argparse, os, re, statistics, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
-os.environ.update(BLAZE_STATS="1", RUSTD_TRACE="1", BLAZE_TRACE="1")
+os.environ.update(BLAZE_STATS="1", RUSTD_TRACE="1")
 sys.path.insert(0, HERE)
 from difftest import Fixture, BLAZE, sysroot_rlibs
 import genbig

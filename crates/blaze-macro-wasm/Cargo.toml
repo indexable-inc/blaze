@@ -14,6 +14,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+tracing.workspace = true
 ra-ap-rustc_lexer.workspace = true
 rustc-hash.workspace = true
 sha2 = "0.10"
