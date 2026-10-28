@@ -24,11 +24,14 @@
 //! covers it all: a reader checks the root, then each run and shard against the hash it was
 //! named by, then the shape [`Run::parse`] and [`Shard::parse`] check. What it is told is a
 //! pack that holds a key's first bytes. That pack still has to be in the manifest, and the
-//! key in the pack once it is fetched: an index names candidates, and never a value.
+//! key in the pack once it is fetched: an index names candidates, and never a value. A run
+//! does not say the format of its packs; the manifest does, and a reader fetches only those
+//! it lists of the format it reads.
 //!
 //! An entry keeps 6 bytes of a key. With 20 million entries, the chance that a key no pack
 //! holds matches one is 20e6 / 2^48, about 7e-8 a lookup: a fetch of a pack that does not
-//! have it, which the pack's own index then says.
+//! have it, which the pack's own index then says. Every pack that holds a key has its entry,
+//! so a key is found as long as one pack the manifest lists holds it.
 
 use std::fmt::Write as _;
 
@@ -184,14 +187,27 @@ impl Run {
     }
 
     /// The packs of this run whose entries in `shard` match `key`: those that may hold it.
+    /// A shard of another run names none.
     pub fn holders<'a>(
         &'a self,
         shard: &'a Shard,
         key: &[u8; KEY],
     ) -> impl Iterator<Item = &'a Hash> {
         let entry = entry_of(key, self.prefix);
-        shard.holding(entry).map(|pack| &self.packs[pack as usize])
+        shard.holding(entry).filter_map(|pack| self.packs.get(pack as usize))
     }
+
+    /// The most bytes the shard in `slot` can be, so a reader asks for no more.
+    pub fn shard_max(&self, slot: usize) -> u64 {
+        let entries = self.shards.get(slot).copied().flatten().map_or(0, |it| it.1);
+        (SHARD_HEAD + self.packs.len() * GROUP) as u64 + u64::from(entries) * u64::from(self.prefix)
+    }
+}
+
+/// The most bytes a run of `packs` can be, as its root's line says: so a reader asks for no
+/// more.
+pub fn run_max(packs: u32) -> u64 {
+    (RUN_HEAD + (RUN_SHARD << BITS_MAX)) as u64 + u64::from(packs) * 32
 }
 
 /// One shard of a run, parsed.
@@ -284,8 +300,6 @@ pub struct Builder {
     prefix: u8,
     packs: Vec<Hash>,
     ids: FxHashMap<Hash, u32>,
-    /// How many entries each pack was given, to choose between packs with one entry.
-    counts: Vec<u64>,
     entries: Vec<(u64, u32)>,
 }
 
@@ -304,7 +318,6 @@ impl Default for Builder {
             prefix: PREFIX,
             packs: Vec::new(),
             ids: FxHashMap::default(),
-            counts: Vec::new(),
             entries: Vec::new(),
         }
     }
@@ -314,7 +327,6 @@ impl Builder {
     fn id(&mut self, pack: &Hash) -> u32 {
         *self.ids.entry(*pack).or_insert_with(|| {
             self.packs.push(*pack);
-            self.counts.push(0);
             self.packs.len() as u32 - 1
         })
     }
@@ -322,9 +334,7 @@ impl Builder {
     /// Covers `pack`, which holds `keys` (all of them, as its list of keys has them).
     pub fn add_pack<'a>(&mut self, pack: &Hash, keys: impl IntoIterator<Item = &'a [u8; KEY]>) {
         let id = self.id(pack);
-        let before = self.entries.len();
         self.entries.extend(keys.into_iter().map(|key| (entry_of(key, PREFIX), id)));
-        self.counts[id as usize] += (self.entries.len() - before) as u64;
     }
 
     /// Takes in what `run` covers whose pack `keep` says is still listed, with the entries of
@@ -340,48 +350,46 @@ impl Builder {
             run.packs.iter().map(|pack| keep(pack).then(|| self.id(pack))).collect();
         for shard in shards {
             for (entry, pack) in shard.all() {
-                if let Some(id) = ids[pack as usize] {
-                    self.entries.push((entry, id));
-                    self.counts[id as usize] += 1;
+                if let Some(Some(id)) = ids.get(pack as usize) {
+                    self.entries.push((entry, *id));
                 }
             }
         }
     }
 
-    /// How many entries were added, before one entry held by several packs is kept once.
+    /// Whether `pack` is covered: added, or of a run added and kept.
+    pub fn covers(&self, pack: &Hash) -> bool {
+        self.ids.contains_key(pack)
+    }
+
+    /// How many entries were added, before an entry added twice for one pack is kept once.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.packs.is_empty()
+        self.entries.is_empty()
     }
 
-    /// The run, cut into shards of about [`SHARD_TARGET`] bytes. An entry several packs
-    /// hold is kept for the one with the most entries, which a collection of the remote
-    /// keeps the longest (it takes out the packs whose keys are all in others, the smallest
-    /// first), and of those the one whose hash is lowest.
+    /// The run, cut into shards of about [`SHARD_TARGET`] bytes. Every pack that holds a key
+    /// keeps its entry: a collection of the remote may take out any one of them.
     pub fn finish(self) -> Built {
-        let Builder { prefix, packs, counts, mut entries, .. } = self;
+        let Builder { prefix, packs, entries: mut placed, .. } = self;
         let mut order: Vec<u32> = (0..packs.len() as u32).collect();
         order.sort_by_key(|it| packs[*it as usize]);
         let mut place = vec![0u32; packs.len()];
         for (at, id) in order.iter().enumerate() {
             place[*id as usize] = at as u32;
         }
-        let rank = |id: u32| (std::cmp::Reverse(counts[id as usize]), place[id as usize]);
-        for entry in &mut entries {
-            entry.0 = truncated(entry.0, prefix);
+        for entry in &mut placed {
+            *entry = (truncated(entry.0, prefix), place[entry.1 as usize]);
         }
-        entries.sort_unstable_by_key(|(entry, id)| (*entry, rank(*id)));
-        entries.dedup_by_key(|it| it.0);
+        placed.sort_unstable();
+        placed.dedup();
         let bits = (0..=BITS_MAX)
-            .find(|bits| (entries.len() as u64 * u64::from(prefix)) >> bits <= SHARD_TARGET)
+            .find(|bits| (placed.len() as u64 * u64::from(prefix)) >> bits <= SHARD_TARGET)
             .unwrap_or(BITS_MAX);
         // By slot, then by pack, then by entry: each slot's groups in the order written.
-        let mut placed: Vec<(u64, u32)> =
-            entries.iter().map(|(entry, id)| (*entry, place[*id as usize])).collect();
-        drop(entries);
         placed.sort_unstable_by_key(|(entry, pack)| (slot_of(*entry, bits), *pack, *entry));
         let mut run = Vec::with_capacity(RUN_HEAD + packs.len() * 32 + (RUN_SHARD << bits));
         run.extend_from_slice(RUN_MAGIC);
@@ -585,15 +593,24 @@ mod tests {
     }
 
     #[test]
-    fn a_key_two_packs_hold_is_kept_for_the_larger() {
+    fn a_key_two_packs_hold_is_found_in_both() {
         let keys: Vec<_> = (0..100).map(key).collect();
         let mut builder = Builder::default();
         builder.add_pack(&pack(1), &keys[..10]);
         builder.add_pack(&pack(2), &keys);
+        // A pack indexed twice, as two machines pushing at once do, is in the run once.
+        builder.add_pack(&pack(1), &keys[..10]);
         let (run, shards) = opened(&builder.finish());
-        assert_eq!(run.entries(), 100);
-        assert!(keys.iter().all(|key| holders(&run, &shards, key) == vec![pack(2)]));
-        assert_eq!(run.packs(), &[pack(1), pack(2)], "both are covered");
+        assert_eq!(run.entries(), 110);
+        for (at, key) in keys.iter().enumerate() {
+            let want = if at < 10 { vec![pack(1), pack(2)] } else { vec![pack(2)] };
+            assert_eq!(holders(&run, &shards, key), want);
+        }
+        // Once the larger is taken out, the smaller still has its keys.
+        let mut merged = Builder::default();
+        merged.add_run(&run, shards.values(), |it| *it != pack(2));
+        let (run, shards) = opened(&merged.finish());
+        assert!(keys[..10].iter().all(|key| holders(&run, &shards, key) == vec![pack(1)]));
     }
 
     #[test]
@@ -667,6 +684,11 @@ mod tests {
         let built = builder.finish();
         let run = Run::parse(&built.run).unwrap();
         let (slot, _) = run.shards().next().unwrap();
+        assert!(built.run.len() as u64 <= run_max(2));
+        for (slot, hash) in run.shards() {
+            let shard = built.shards.iter().find(|it| Sha256::digest(it)[..] == hash[..]).unwrap();
+            assert!(shard.len() as u64 <= run.shard_max(slot));
+        }
         for bytes in changed(&built.run, 5000) {
             if let Ok(run) = Run::parse(&bytes) {
                 _ = run.entries();

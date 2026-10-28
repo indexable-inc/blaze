@@ -1216,6 +1216,10 @@ pub fn project_name(given: Option<String>) -> anyhow::Result<String> {
     if project.is_empty() || project.contains(['/', '\\']) || project.starts_with('.') {
         bail!("`{project}` is not the name of a project");
     }
+    // The gateway names a project in at most 128 bytes, and its index in as many.
+    if project.len() + index::SUFFIX.len() > 128 {
+        bail!("`{project}` is not the name of a project: it is longer than 122 bytes");
+    }
     if project.ends_with(index::SUFFIX) {
         bail!(
             "`{project}` is not the name of a project: `{}` names the index of one",
@@ -1985,21 +1989,22 @@ pub mod tests {
         blaze_store::compiles_against("remote index test");
         let (remote, dir) = unsigned("index", 1 << 30);
         let mut packs = BTreeMap::new();
-        let mut push_from = |name: &str, first: u32, count: u32| {
-            let at = dir.join(name);
-            let store = blaze_store::Store::open_at(&at).unwrap();
-            for n in first..first + count {
-                for key in 0..200u32 {
-                    let key: [u8; 32] =
-                        Digest::of(&(n * 1000 + key).to_le_bytes()).bytes().to_owned();
-                    store.insert(&key, &key[..8]);
+        let push_from =
+            |packs: &mut BTreeMap<Digest, Vec<[u8; 32]>>, name: &str, first: u32, count: u32| {
+                let at = dir.join(name);
+                let store = blaze_store::Store::open_at(&at).unwrap();
+                for n in first..first + count {
+                    for key in 0..200u32 {
+                        let key: [u8; 32] =
+                            Digest::of(&(n * 1000 + key).to_le_bytes()).bytes().to_owned();
+                        store.insert(&key, &key[..8]);
+                    }
+                    store.seal();
                 }
-                store.seal();
-            }
-            drop(store);
-            packs.extend(keys_by_pack(&at));
-            wait(push(&at, &remote, "default")).unwrap()
-        };
+                drop(store);
+                packs.extend(keys_by_pack(&at));
+                wait(push(&at, &remote, "default")).unwrap()
+            };
         let found_all = |packs: &BTreeMap<Digest, Vec<[u8; 32]>>| {
             for (pack, keys) in packs {
                 for key in keys {
@@ -2010,21 +2015,21 @@ pub mod tests {
             let absent = Digest::of(b"no pack holds this").bytes().to_owned();
             assert!(wait(index::holders(&remote, "default", &absent)).unwrap().is_empty());
         };
-        let said = push_from("a", 0, 3);
+        let said = push_from(&mut packs, "a", 0, 3);
         assert!(said.contains("3 packs indexed"), "{said}");
         found_all(&packs);
         // A push of nothing new writes nothing.
-        let said = push_from("a", 0, 0);
+        let said = push_from(&mut packs, "a", 0, 0);
         assert!(said.contains("nothing to add"), "{said}");
         // An index taken away (or never written, by a blaze from before it) is made again
         // from the key lists of the packs that are not here.
         std::fs::remove_file(dir.join(index::root_at("default"))).unwrap();
-        let said = push_from("b", 3, 1);
+        let said = push_from(&mut packs, "b", 3, 1);
         assert!(said.contains("4 packs indexed"), "{said}");
         found_all(&packs);
         // Pushes of one pack each are merged into few runs.
         for n in 0..8 {
-            let said = push_from(&format!("c{n}"), 10 + n, 1);
+            let said = push_from(&mut packs, &format!("c{n}"), 10 + n, 1);
             assert!(said.contains("1 packs indexed"), "{said}");
         }
         found_all(&packs);
@@ -2039,6 +2044,8 @@ pub mod tests {
     fn a_project_is_not_named_as_an_index_is() {
         assert!(project_name(Some("blaze.index".to_owned())).is_err());
         assert!(project_name(Some("blaze.indexed".to_owned())).is_ok());
+        assert!(project_name(Some("p".repeat(122))).is_ok());
+        assert!(project_name(Some("p".repeat(123))).is_err());
     }
 
     #[test]

@@ -12,11 +12,14 @@
 //! with nothing under it. Runs of about one size are merged into one, without the packs the
 //! manifest no longer lists. Two machines that push at once each add their run: a pack both
 //! index is in two runs, which is harmless and gone at the next merge.
+//!
+//! A run covers packs of any format: a push leaves in the runs other builds wrote what the
+//! manifest lists, and indexes only packs of the format it reads. A listed pack whose keys
+//! cannot be read is not indexed and the push fails naming it, as every later push does
+//! until its key list is mended or the pack is taken out of the manifest: a pack the index
+//! does not cover is one no miss finds.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
-};
+use std::{collections::BTreeSet, path::Path};
 
 use anyhow::{Context, bail};
 use blaze_store::{
@@ -42,11 +45,11 @@ pub fn object(hash: &Hash) -> String {
 }
 
 /// The bytes of the run or shard `hash` names, or why there are none to use: not there,
-/// not what the hash says, or more than one object may be. A failure to reach the remote
-/// is an error.
-async fn read(remote: &Remote, hash: &Hash) -> anyhow::Result<Result<Vec<u8>, String>> {
+/// not what the hash says, or more than the `most` it can be. A failure to reach the
+/// remote is an error.
+async fn read(remote: &Remote, hash: &Hash, most: u64) -> anyhow::Result<Result<Vec<u8>, String>> {
     let name = object(hash);
-    let read = match remote.read_small(&name, remote.object_max()).await {
+    let read = match remote.read_small(&name, most.min(remote.object_max())).await {
         Ok(read) => read,
         Err(e) if e.is::<super::TooLong>() => return Ok(Err(format!("{e:#}"))),
         Err(e) => return Err(e),
@@ -60,11 +63,17 @@ async fn read(remote: &Remote, hash: &Hash) -> anyhow::Result<Result<Vec<u8>, St
     Ok(Ok(bytes))
 }
 
-/// The run `hash` names, or why it cannot be used.
-pub async fn run(remote: &Remote, hash: &Hash) -> anyhow::Result<Result<Run, String>> {
-    Ok(read(remote, hash)
-        .await?
-        .and_then(|bytes| Run::parse(&bytes).map_err(|why| format!("{} {why}", object(hash)))))
+/// The run a root's line names, or why it cannot be used.
+pub async fn run(remote: &Remote, named: &Named) -> anyhow::Result<Result<Run, String>> {
+    let hash = &named.run;
+    let read = read(remote, hash, format::run_max(named.packs)).await?;
+    Ok(read.and_then(|bytes| {
+        let run = Run::parse(&bytes).map_err(|why| format!("{} {why}", object(hash)))?;
+        match run.packs().len() == named.packs as usize {
+            true => Ok(run),
+            false => Err(format!("{} is not of the packs its root says", object(hash))),
+        }
+    }))
 }
 
 /// The shard in `slot` of `run`, or why it cannot be used.
@@ -74,7 +83,7 @@ pub async fn shard(
     slot: usize,
     hash: &Hash,
 ) -> anyhow::Result<Result<Shard, String>> {
-    Ok(read(remote, hash).await?.and_then(|bytes| {
+    Ok(read(remote, hash, run.shard_max(slot)).await?.and_then(|bytes| {
         Shard::parse(&bytes, run, slot).map_err(|why| format!("{} {why}", object(hash)))
     }))
 }
@@ -101,6 +110,33 @@ async fn keys(
     Ok(keys)
 }
 
+/// Adds the keys of `packs` to `builder`, and says how many it added: a pack whose keys
+/// cannot be read is in `failed` instead.
+async fn index_packs(
+    store: &Path,
+    remote: &Remote,
+    here: &BTreeSet<Digest>,
+    packs: Vec<(Digest, Listed)>,
+    builder: &mut Builder,
+    failed: &mut Vec<anyhow::Error>,
+) -> usize {
+    let mut keys = stream::iter(packs.into_iter().map(|(pack, listed)| async move {
+        (pack, keys(store, remote, here.contains(&pack), pack, listed).await)
+    }))
+    .buffer_unordered(remote.jobs());
+    let mut indexed = 0;
+    while let Some((pack, keys)) = keys.next().await {
+        match keys {
+            Ok(keys) => {
+                builder.add_pack(pack.bytes(), keys.as_chunks::<32>().0);
+                indexed += 1;
+            }
+            Err(e) => failed.push(e.context(format!("{pack}.pack is not indexed"))),
+        }
+    }
+    indexed
+}
+
 /// Indexes what the manifest of `project` lists and the index does not cover, and merges
 /// runs that are due: see the module. Says what it did, with the packs it could not index,
 /// which the next push tries again.
@@ -110,24 +146,32 @@ pub async fn update(
     project: &str,
     here: &BTreeSet<Digest>,
 ) -> anyhow::Result<(String, Vec<anyhow::Error>)> {
-    let manifest = Manifest::fetch_to_extend(remote, project).await?.unwrap_or_default();
-    let listed: BTreeMap<Digest, Listed> =
-        manifest.0.into_iter().filter(|(_, it)| it.format == STORE_FORMAT).collect();
-    let is_listed = |pack: &Hash| listed.contains_key(&Digest::from(*pack));
+    // The root before the manifest: every pack a run of it covers was listed before the run
+    // was written, so it is in the manifest read after, unless a collection took it out.
     let name = root_at(project);
-    let root = match remote.read_list_to_extend(&name).await {
-        Ok(lines) => Root::parse(&lines.unwrap_or_default()),
-        Err(e) if e.is::<super::Unremembered>() => return Err(e),
-        // Written anew, as `extend_list` writes a list this machine would not sign under.
-        Err(e) => {
-            eprintln!("remote: {e:#}: every pack is indexed as if there were no index");
-            Root::default()
+    let root = match remote.read_small(&name, super::LIST_MAX).await? {
+        None => Root::default(),
+        Some((bytes, _)) => {
+            let text = String::from_utf8_lossy(&bytes);
+            match remote.trust.open_to_extend(&name, &text) {
+                Ok(opened) => Root::parse(opened.lines),
+                // Written anew, as `extend_list` writes a list this machine would not sign
+                // under.
+                Err(e) => {
+                    eprintln!("remote: {e:#}: every pack is indexed as if there were no index");
+                    Root::default()
+                }
+            }
         }
     };
-    let read =
-        stream::iter(root.runs.iter().map(|named| async move {
-            anyhow::Ok((named.clone(), run(remote, &named.run).await?))
-        }));
+    let manifest = Manifest::fetch_to_extend(remote, project).await?.unwrap_or_default();
+    let listed = manifest.0;
+    let is_listed = |pack: &Hash| listed.contains_key(&Digest::from(*pack));
+    let read = stream::iter(
+        root.runs
+            .iter()
+            .map(|named| async move { anyhow::Ok((named.clone(), run(remote, named).await?)) }),
+    );
     let read: Vec<_> = read.buffered(remote.jobs()).try_collect().await?;
     let (mut kept, mut replaced) = (Vec::new(), BTreeSet::new());
     for (named, run) in read {
@@ -144,25 +188,20 @@ pub async fn update(
             }
         }
     }
-    let covered: BTreeSet<Hash> =
-        kept.iter().flat_map(|(_, run)| run.packs().iter().copied()).collect();
-    let uncovered = listed.iter().filter(|(pack, _)| !covered.contains(pack.bytes()));
-    let mut keys = stream::iter(uncovered.map(|(pack, listed)| {
-        let (pack, listed) = (*pack, *listed);
-        async move { (pack, keys(store, remote, here.contains(&pack), pack, listed).await) }
-    }))
-    .buffer_unordered(remote.jobs());
-    let (mut builder, mut failed, mut indexed) = (Builder::default(), Vec::new(), 0);
-    while let Some((pack, keys)) = keys.next().await {
-        match keys {
-            Ok(keys) => {
-                builder.add_pack(pack.bytes(), keys.as_chunks::<32>().0);
-                indexed += 1;
-            }
-            Err(e) => failed.push(e.context(format!("{pack}.pack is not indexed"))),
-        }
-    }
-    drop(keys);
+    let covered = |kept: &[(Named, Run)], skip: &BTreeSet<Hash>| -> BTreeSet<Hash> {
+        let runs = kept.iter().filter(|(named, _)| !skip.contains(&named.run));
+        runs.flat_map(|(_, run)| run.packs().iter().copied()).collect()
+    };
+    let to_index = |covered: &BTreeSet<Hash>| -> Vec<(Digest, Listed)> {
+        let ours = listed.iter().filter(|(_, it)| it.format == STORE_FORMAT);
+        ours.filter(|(pack, _)| !covered.contains(pack.bytes()))
+            .map(|(pack, it)| (*pack, *it))
+            .collect()
+    };
+    let mut builder = Builder::default();
+    let mut failed = Vec::new();
+    let new = to_index(&covered(&kept, &BTreeSet::new()));
+    let mut indexed = index_packs(store, remote, here, new, &mut builder, &mut failed).await;
     let mut sizes: Vec<u64> = kept.iter().map(|(named, _)| named.entries).collect();
     if indexed != 0 {
         sizes.push(builder.len() as u64);
@@ -173,6 +212,7 @@ pub async fn update(
     if indexed == 0 && merged.len() < 2 {
         merged.clear();
     }
+    let mut broken = false;
     for &at in &merged {
         let (named, run) = &kept[at];
         let shards =
@@ -182,14 +222,22 @@ pub async fn update(
         let shards: Vec<_> = shards.buffered(remote.jobs()).try_collect().await?;
         match shards.into_iter().collect::<Result<Vec<_>, _>>() {
             Ok(shards) => builder.add_run(run, &shards, is_listed),
-            // Its packs are left out of the merge and the index, and the next push indexes
-            // them again.
-            Err(why) => eprintln!(
-                "remote: the index of `{project}` names a shard that cannot be used ({why}): \
-                 its run is taken out, and what it covered is indexed again"
-            ),
+            Err(why) => {
+                eprintln!(
+                    "remote: the index of `{project}` names a shard that cannot be used ({why}): \
+                     its run is taken out, and what it covered is indexed again"
+                );
+                broken = true;
+            }
         }
         replaced.insert(named.run);
+    }
+    // What a run taken out covered, and no run left covers, from the key lists.
+    if broken {
+        let merging: BTreeSet<Hash> = merged.iter().map(|at| kept[*at].0.run).collect();
+        let again = to_index(&covered(&kept, &merging));
+        let again = again.into_iter().filter(|(pack, _)| !builder.covers(pack.bytes())).collect();
+        indexed += index_packs(store, remote, here, again, &mut builder, &mut failed).await;
     }
     let made = match (indexed, merged.len()) {
         (0, 0) => None,
@@ -245,7 +293,7 @@ pub async fn named(remote: &Remote, lines: &str) -> anyhow::Result<Vec<String>> 
     let mut named = Vec::new();
     for listed in Root::parse(lines).runs {
         named.push(object(&listed.run));
-        if let Ok(run) = run(remote, &listed.run).await? {
+        if let Ok(run) = run(remote, &listed).await? {
             named.extend(run.shards().map(|(_, hash)| object(&hash)));
         }
     }
@@ -265,7 +313,7 @@ pub async fn holders(
     let lines = remote.read_list(&root_at(project)).await?.unwrap_or_default();
     let mut holders = Vec::new();
     for listed in Root::parse(&lines).runs {
-        let run = run(remote, &listed.run).await?.map_err(anyhow::Error::msg)?;
+        let run = run(remote, &listed).await?.map_err(anyhow::Error::msg)?;
         let slot = run.slot(key);
         let Some(hash) = run.shard(slot) else { continue };
         let shard = shard(remote, &run, slot, &hash).await?.map_err(anyhow::Error::msg)?;
