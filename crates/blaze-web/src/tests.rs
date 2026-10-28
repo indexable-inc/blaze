@@ -185,8 +185,9 @@ fn an_edit_is_merged_into_the_program_by_key() {
     world.apply(&mut program, 2, &began(2, "/w"));
     let patch = fns(1, false, vec![function(0, 11, "render", &[5], How::Compiled { ns: 9 })]);
     assert_eq!(world.apply(&mut program, 2, &patch), Applied::Told);
-    let read = read(&world.snapshot(&program));
-    assert_eq!(read, [("main".into(), 0, vec!["render".into()]), ("render".into(), 0, vec![])]);
+    let snapshot = read(&world.snapshot(&program));
+    let main = ("main".into(), 0, vec!["render".into()]);
+    assert_eq!(snapshot, [main, ("render".into(), 0, vec![])]);
     // A build that writes the program again starts it again.
     world.apply(&mut program, 3, &began(3, "/w"));
     let again = fns(2, true, vec![function(0, 12, "main", &[], How::Unchanged)]);
