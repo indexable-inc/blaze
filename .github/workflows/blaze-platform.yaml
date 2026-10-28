@@ -120,7 +120,7 @@ jobs:
       # compiled. Run out here, the step fails and main's push still runs.
       - if: env.BLAZE == 'true'
         timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 220 || 150 }}
-        run: nix develop --command $PYTHON harness/unittests.py
+        run: nix develop --command $PYTHON harness/unittests.py --events json
       - if: env.BLAZE != 'true'
         run: $PYTHON harness/unittests.py --cargo
       # What was compiled, and each test that passed, for the runs after this one; a run whose
