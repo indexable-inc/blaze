@@ -139,8 +139,8 @@ fn unresolved(db: &RootDatabase, file: vfs::FileId) -> Option<String> {
     })
 }
 
-/// A target of the workspace a check diagnoses: its root file, its kind and, of a library,
-/// whether it is checked as its unit tests, which are a crate of their own.
+/// A target of the workspace a check diagnoses: its root file, its kind and, of a library or
+/// a binary, whether it is checked as its unit tests, which are a crate of their own.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Picked {
     root: PathBuf,
@@ -150,8 +150,10 @@ struct Picked {
 
 impl Picked {
     fn of(root: PathBuf, kind: TargetKind, test: bool) -> Picked {
-        // Every other target is one crate, with `cfg(test)` or not as the load has it.
-        let test = test && kind == TargetKind::Lib { is_proc_macro: false };
+        // A library and a binary have their unit tests as a crate of their own (cargo's
+        // `checked_as_test`); every other target is one crate, with `cfg(test)` or not as the
+        // load has it.
+        let test = test && matches!(kind, TargetKind::Lib { is_proc_macro: false } | TargetKind::Bin);
         Picked { root, kind, test }
     }
 }

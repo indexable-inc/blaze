@@ -302,6 +302,21 @@ pub struct WorkerConfig {
     /// Whether its programs are built whole, with nothing of rustc's ([`Plan::whole`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub whole: bool,
+    /// What a whole build of tests tells its integration tests and benchmarks of where it
+    /// puts things. It is in the crates' environment from the load on, so it picks the worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests_told: Option<TestsTold>,
+}
+
+/// Where a whole build of `cargo test`'s tests puts what cargo tells an integration test or
+/// a benchmark of: the directory of the programs, which it is told the binaries of its
+/// package in as `CARGO_BIN_EXE_<name>`, and the directory it may write in,
+/// `CARGO_TARGET_TMPDIR`. Each from the root of the checkout when it is in it, as
+/// [`WorkerConfig::project`] is: the same build in a worktree is loaded by the same worker.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TestsTold {
+    pub executables: PathBuf,
+    pub scratch: PathBuf,
 }
 
 impl WorkerConfig {
@@ -332,6 +347,10 @@ impl WorkerConfig {
         }
         if self.selection.dev_deps {
             args.push("--dev-deps".into());
+        }
+        if let Some(told) = &self.tests_told {
+            args.extend(["--executables".into(), root.join(&told.executables).into()]);
+            args.extend(["--scratch".into(), root.join(&told.scratch).into()]);
         }
         // Where the build was asked, from the root of the checkout when it is in it.
         if let Some(asked_in) = &self.selection.asked_in {
@@ -424,8 +443,9 @@ impl Checkout {
             true => ("shared", String::new()),
             false => ("", plan.patch.display().to_string()),
         };
+        let unit_test = if plan.unit_test { super::plan::UNIT_TEST } else { "" };
         let mut line = format!(
-            "sync\t{}\t{}\t{}\t{patch}\t{}\t{splice}\t{exe}\t{shared}",
+            "sync\t{}\t{}\t{}\t{patch}\t{}\t{splice}\t{exe}\t{shared}\t{unit_test}",
             self.project().display(),
             crates,
             plan.object.display(),
@@ -536,6 +556,9 @@ impl Worker {
         }
         if first.shared {
             args.push("--shared".into());
+        }
+        if first.unit_test {
+            args.push("--unit-test".into());
         }
         // In a file: a program of many crates has more of them than fit the command line
         // of a process on Windows.
