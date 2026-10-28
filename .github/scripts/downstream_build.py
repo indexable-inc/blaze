@@ -52,6 +52,13 @@ def append_output(path: str, text: str) -> None:
         output.write(text)
 
 
+def failure_messages(group: BaseExceptionGroup[Failed]) -> str:
+    return "\n".join(
+        failure_messages(error) if isinstance(error, BaseExceptionGroup) else str(error)
+        for error in group.exceptions
+    )
+
+
 async def api(repository: str, endpoint: str) -> object:
     route = f"repos/{repository}" + (f"/{endpoint}" if endpoint else "")
     argv = ["gh", "api", route]
@@ -186,7 +193,7 @@ def main() -> None:
     try:
         asyncio.run(validate(parse(Build, sys.argv[1], SCRIPT)))
     except* Failed as group:
-        fail(SCRIPT, "\n".join(str(e) for e in group.exceptions))
+        fail(SCRIPT, failure_messages(group))
 
 
 if __name__ == "__main__":
