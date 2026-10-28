@@ -8938,6 +8938,9 @@ fn run_holding(
     let sysroot = checkouts.loaded.workspaces().first().and_then(|it| it.sysroot.root());
     let _ = SYSROOT.set(sysroot.map(|it| AsRef::<Path>::as_ref(it).to_owned()));
     let from_manifest;
+    // Whether the store has the program as this build compiled it from cold: a worker
+    // started now would load it from there.
+    let mut kept = false;
     let cold = {
         if let Some(unit) = std_unit(&db, &table, &args, &listed)? {
             args.prebuilt = Some(unit);
@@ -9116,11 +9119,14 @@ fn run_holding(
                     eprintln!("manifest: not kept, the build loaded files its key was made without")
                 }
                 _ => match manifest::keep(&db, &args, key, &cold.wrote) {
-                    Ok(bytes) => eprintln!(
-                        "manifest: kept, {} files, {bytes} bytes ({:.1?})",
-                        cold.wrote.len(),
-                        start.elapsed()
-                    ),
+                    Ok(bytes) => {
+                        kept = true;
+                        eprintln!(
+                            "manifest: kept, {} files, {bytes} bytes ({:.1?})",
+                            cold.wrote.len(),
+                            start.elapsed()
+                        )
+                    }
                     Err(why) => eprintln!("manifest: not kept: {why}"),
                 },
             }
@@ -9282,6 +9288,18 @@ fn run_holding(
         builds.unasked.push(0);
     } else if programs[0].dehydrate() {
         builds.unasked.push(0);
+    } else if kept
+        && let Some(socket) = &programs[0].args.socket
+        && let Some(store) = blaze_store::Store::global()
+    {
+        // Once the store has it all, the daemon starts a worker from it in this one's place,
+        // which holds what a warm start holds (`Daemon::settle`).
+        let settles = cargo::daemon::settles_beside(socket);
+        store.settle_with(move || {
+            if let Err(why) = std::fs::write(&settles, b"") {
+                eprintln!("{}: {why}", settles.display());
+            }
+        });
     }
     // How many times running each checkout that is read as a loaded one has been long to turn
     // to or from.
