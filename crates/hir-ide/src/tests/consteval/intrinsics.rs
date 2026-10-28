@@ -756,6 +756,24 @@ fn a_constant_read_again_is_not_copied_again() {
 }
 
 #[test]
+fn a_promoted_borrow_of_a_constant() {
+    // `&B` is promoted: `B` is copied from the heap to the heap, past the end of the stack.
+    check_number(
+        r#"
+        struct Big([u8; 4096]);
+        impl Big {
+            const fn last(&self) -> u8 {
+                self.0[4095]
+            }
+        }
+        const B: Big = Big([7; 4096]);
+        const GOAL: u8 = B.last() + B.last();
+        "#,
+        14,
+    );
+}
+
+#[test]
 fn a_promoted_temporary_outlives_its_call() {
     check_number(
         r#"

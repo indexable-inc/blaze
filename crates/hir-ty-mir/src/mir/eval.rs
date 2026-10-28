@@ -2528,7 +2528,7 @@ impl<'db> Evaluator<'db> {
                 self.stack.copy_within(src..src + r.size, dst)
             }
             (Heap(dst), Heap(src)) => {
-                if self.stack.len() < src + r.size || self.stack.len() < dst + r.size {
+                if self.heap.len() < src + r.size || self.heap.len() < dst + r.size {
                     return Err(oob());
                 }
                 self.heap.copy_within(src..src + r.size, dst)
