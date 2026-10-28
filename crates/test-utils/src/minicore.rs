@@ -1618,6 +1618,17 @@ pub mod option {
     // endregion:copy
 
     impl<T> Option<T> {
+        pub const fn is_some(&self) -> bool {
+            match self {
+                Some(_) => true,
+                None => false,
+            }
+        }
+
+        pub const fn is_none(&self) -> bool {
+            !self.is_some()
+        }
+
         pub const fn unwrap(self) -> T {
             match self {
                 Some(val) => val,
