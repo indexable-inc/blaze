@@ -1,5 +1,16 @@
-// /bench: the benchmark history. The tables and charts are the BenchHistory widget (gen/bench/), drawn from
-// docs/benchmarks/history at build time.
+// /bench: the benchmark history. `history` names the history (docs/benchmarks/history, one line per run, appended by
+// CI); the build turns it into Sections of charts under it (gen/bench/), and the renderer draws them.
+
+// What the charts compare. A subject keeps its colour (--series-<slot>, styles/tokens.css) in every chart.
+subjects {
+  blaze { Subject: {label: "blaze", slot: 1, dashed: false} }
+  cargo { Subject: {label: "cargo", slot: 2, dashed: false} }
+  warm { Subject: {label: "blaze, a second checkout", slot: 3, dashed: false} }
+  setup { Subject: {label: "cargo, fastest other setup", slot: 4, dashed: false} }
+  median { Subject: {label: "median edit", slot: 1, dashed: false} }
+  p90 { Subject: {label: "90th percentile", slot: 1, dashed: true} }
+}
+
 site {
   bench : Page {
     Wide
@@ -9,13 +20,13 @@ site {
     (InGroup, nav.reference)
     Description: {"blaze's build and live-edit benchmarks over every run, next to plain cargo on the same machine."}
     Intro: {"[calm] This is blaze's benchmark history: every measured run, next to plain cargo."}
-    Outro: {"[warm] The charts and tables are on the page; pick a project and a platform to see its runs. Thanks for listening."}
+    Outro: {"[warm] The charts are on the page, with every number in a table under each one; pick a platform, a backend or a machine to see its runs. Thanks for listening."}
 
     Lede lede("How long blaze takes to build after an edit, next to plain cargo on the same machine, on real projects at pinned commits ([how it is measured](https://github.com/indexable-inc/blaze/blob/main/docs/benchmarks.md)), and how soon a live edit runs. Each platform, macOS arm64, Linux aarch64 and Linux x86-64, is measured on a machine of its own, so compare its numbers with each other, not with another platform's. It updates after every push to main and every night.") {
       Say: {"[matter-of-fact] Here's what's measured: how long blaze takes to build after an edit, next to plain cargo on the same machine, on real projects pinned at fixed commits, and how soon a live edit runs. [short pause] Each platform, macOS on Apple silicon, Linux on ARM, and Linux on x86, has a machine of its own, so compare a platform's numbers with each other, not across platforms. It updates after every push to main, and every night."}
     }
 
-    BenchHistory charts
+    BenchHistory history(dir: "docs/benchmarks/history")
 
     Section regressions(title: "Regressions") {
       Say: {"[serious] And regressions. Each run is compared with the runs before it on the same machine, and a number that climbs above its noise band opens an issue on GitHub, labelled bench regression. The raw data is in the repo, one line per run."}

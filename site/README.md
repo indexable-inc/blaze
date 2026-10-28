@@ -8,8 +8,8 @@ headers, and the browser scripts.
 ## Architecture: Rust core, TS host
 
 ```
-content/*.flecs ─┬─ gen/tree.ts (flecs-doc.wasm) ── bake: highlight.js, bench widget ──┐
-                 └───────────────────────────────── site-snapshot.wasm ◀────────────────┘
+content/*.flecs ─┬─ gen/tree.ts (flecs-doc.wasm) ── bake: highlight.js; generated: bench charts ──┐
+                 └──────────────────────────────────────────── site-snapshot.wasm ◀────────────────┘
                                                             │ snapshot (.gen/site.cbor)
                                                             ▼
                  gen/build.ts ── site.wasm ──▶ dist/*.html (every page, no comments)
@@ -21,7 +21,8 @@ content/*.flecs ─┬─ gen/tree.ts (flecs-doc.wasm) ── bake: highlight.js
   `site.wasm` (the renderer) and `site-snapshot.wasm` (the content scripts run in Flecs, compiled in, to the snapshot;
   build time only). Both are platform-independent build outputs, never checked in.
 - `gen/build.ts`: the build, under Bun, with no native code. It runs the scripts under `flecs/flecs-doc.wasm` to bake
-  what the renderer leaves to TS (highlighted code, the bench widget), gets the snapshot from `site-snapshot.wasm`,
+  what the renderer leaves to TS (highlighted code) and to write the scripts the content asks for (the benchmark
+  charts, `gen/bench/`), gets the snapshot from `site-snapshot.wasm`,
   renders every page with `site.wasm` into `dist/`, bundles `client/*.ts`, concatenates `styles/` and copies `static/`.
   For the worker it writes `.gen/`: `site.wasm`, `site.cbor` (the snapshot), `pages.json`, `discussable.json` and
   `build.json` (a hash of the module, the snapshot and the client scripts).
@@ -37,7 +38,7 @@ content/*.flecs ─┬─ gen/tree.ts (flecs-doc.wasm) ── bake: highlight.js
   `(InGroup, nav.x)`; `renderer/core/src/side.rs` draws the sidebar, crumb, pager and outline from them, in the ix
   docs' layout.
 - `client/`: browser scripts (the sidebar's folds, drawer, search over `dist/search.json` and outline in `side.ts`;
-  comment enhancements, the signup form, /bench, copy buttons). `nav.ts` is the client router: a click on a link to
+  comment enhancements, the signup form, the charts' tooltips, copy buttons). `nav.ts` is the client router: a click on a link to
   another page fetches it (fetched ahead on hover) and swaps only the page column, the head's tags and the sidebar's
   open row, without a load, as the ix docs move between pages; anything unexpected falls back to a plain load. Each
   page script sets itself up through `client/lib/page.ts` `onPage`, again after every swap and undone before the
@@ -116,10 +117,17 @@ details, and the steps for serving the files from R2.
 
 ## Benchmark history (`/bench`)
 
-Prerendered from `docs/benchmarks/history/*.jsonl` at the repo root, one line per benchmark run, appended by CI with
-`harness/benchhistory.py` (its docstring describes a line). `gen/bench/index.ts` reads the files when the site is
-built, so a new line shows after the next deploy; the `site` workflow deploys on a
-change under `docs/benchmarks/`. Lines are grouped by machine, and the charts keep each machine's last 120 runs.
+Built from `docs/benchmarks/history/*.jsonl` at the repo root, one line per benchmark run, appended by CI with
+`harness/benchhistory.py` (its docstring describes a line). `content/bench.flecs` names the directory with
+`BenchHistory history(dir: ...)`; at build time `gen/bench/` reads it and writes a Flecs script of Sections, Pickers
+and charts (`RowChart`, `LineChart`, `Charts`, schema in `content/schema.flecs`) under that entity, which runs after the
+content. The renderer draws them in `renderer/core/src/chart.rs`, coloured by `--series-N` (`styles/tokens.css`), each
+with its numbers in a table under it. A row chart is one row per project or edit with its values written beside it: bars
+on a linear axis from zero, or dots on a shared log axis (1-2-5 ticks) when the values span orders of magnitude, with the
+speedup over the baseline. A line chart is inline SVG on a linear or log axis; with one run so far it shows that run as
+numbers instead of a lone dot. `client/chart.ts` adds only the line charts' hover tooltip, and the pickers (platform,
+backend, project, machine) are labelled radio buttons that work without JS. A new line shows after the next deploy; the `site` workflow deploys on a change under
+`docs/benchmarks/`. Lines are grouped by machine, and the charts over time keep each machine's last 60 runs.
 
 To look at the page with other data, point `BENCH_HISTORY` at a directory of `.jsonl` files:
 `BENCH_HISTORY=/tmp/history bun run build`.
@@ -145,7 +153,16 @@ to `env.ASSETS`, which serves `dist/` (built by `bun gen/build.ts`, laid out wit
 - `presence.ts`: `/api/presence`, a WebSocket to the `Presence` Durable Object (one, named `site`, hibernating), which
   knows who is on which page. Signed-in readers are their GitHub login; anonymous ones get a key that is an HMAC of
   their IP and user agent under a random key the object makes each UTC day and deletes the next, so a name lasts a day
-  and no IP is kept. `client/lib/presence.ts` (loaded by `side.ts`, so on every page) draws the pane's top line:
+  and no IP is kept. Crawlers and other automation are welcome (nothing is blocked or challenged, and nothing in
+  `robots.txt` or the headers turns them away) but show as what they are: `worker/bots.ts` decides at the upgrade,
+  in the worker, from Cloudflare's `request.cf.verifiedBotCategory` (a verified bot's category), `request.cf.botManagement`
+  (`verifiedBot`, a score under 30: real only with Enterprise Bot Management; ix.dev is on the Free plan, where it
+  holds fixed dummy values that never count) and the user agent (well-known crawlers by name, anything calling itself
+  a bot, crawler or spider, HTTP libraries, and headless browsers: HeadlessChrome, so a Playwright test that wants a
+  person sets a user agent without it). A bot is named for the crawler ("Googlebot", else "A crawler") and drawn as
+  the sprite's robot (`ROBOT` in `gen/animals.ts`), listed under "Crawlers" in the who-is-here list, left out of
+  "N online", and gets no join or leave line; the object refuses it pointers, live lines, typing and chat. A
+  signed-in reader is never a bot. `client/lib/presence.ts` (loaded by `side.ts`, so on every page) draws the pane's top line:
   Chat (opens the feed's history and input, as T does), the faces on this page (click for everyone and where), and the
   reader's GitHub login with Sign out, or Sign in with GitHub; and faces on the sidebar rows others are reading.
   On the page itself (`client/lib/cursors.ts`) the others there show as live pointers (desktop only; "Hide cursors"

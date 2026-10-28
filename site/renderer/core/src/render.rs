@@ -268,7 +268,7 @@ fn status(e: &Entity) -> String {
 const REFERENCES: &str = "<!--references-->";
 
 /// The tags that render through a widget (render/widgets.ts), in the order the TS object lists them.
-const WIDGETS: [&str; 5] = ["RfcIndex", "References", "SignupForm", "BenchHistory", "Course"];
+const WIDGETS: [&str; 4] = ["RfcIndex", "References", "SignupForm", "Course"];
 
 const SIGNUP_FORM: &str = r#"<form method="POST" class="signup">
 <input type="hidden" name="ref" value="" />
@@ -315,14 +315,6 @@ fn widget(tag: &str, n: Id, ctx: &mut Ctx) -> Result<String, String> {
         "SignupForm" => {
             ctx.script("updates");
             Ok(SIGNUP_FORM.replace("{home}", &esc(&ctx.s.served.href("/"))))
-        }
-        "BenchHistory" => {
-            ctx.script("bench");
-            // gen/bench/ (TS, at build time) renders the charts; the build stores the HTML as the node's Baked value.
-            match ctx.e(n).value("Baked").and_then(|v| v.get("html")) {
-                Some(crate::world::Scalar::Str(h)) => Ok(h.clone()),
-                _ => Err(format!("{}: not baked (run the build)", ctx.e(n).path)),
-            }
         }
         "Course" => course(n, ctx),
         _ => unreachable!("WIDGETS lists the tags"),
@@ -475,6 +467,47 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
     if e.has("Quiz") {
         return quiz(n, ctx);
     }
+    for comp in ["RowChart", "LineChart"] {
+        if let Some(v) = e.value(comp) {
+            let note = prose(&field(Some(v), "note"));
+            let path = e.path.clone();
+            if comp == "LineChart" {
+                // The run under the pointer (client/chart.ts); the chart reads whole without it.
+                ctx.script("chart");
+            }
+            let note = ctx.inline(&note, &path)?;
+            let id = ctx.block_id(n);
+            let html = if comp == "RowChart" {
+                crate::chart::row_chart(ctx.s.world, n, &id, &note)?
+            } else {
+                crate::chart::line_chart(ctx.s.world, n, &id, &note)?
+            };
+            return Ok(html);
+        }
+    }
+    if e.has_tag("Charts") {
+        return Ok(format!("<div class=\"charts\">\n{}\n</div>", children(n, ctx)?));
+    }
+    if e.has("Picker") {
+        // Radio buttons and one panel per Pick; styles/site.css shows the checked one's.
+        let picks: Vec<Id> = e.children.clone();
+        for &p in &picks {
+            if !ctx.e(p).has("Pick") {
+                return Err(format!("{}: a Picker's children are Picks", ctx.e(p).path));
+            }
+        }
+        let id = ctx.block_id(n);
+        let buttons = crate::chart::picker_buttons(ctx.s.world, n, &id, &picks)?;
+        let mut panels = String::new();
+        for p in picks {
+            panels += &format!("<div class=\"panel\">\n{}\n</div>", children(p, ctx)?);
+        }
+        return Ok(format!("<div class=\"picker\">{buttons}{panels}</div>"));
+    }
+    if e.has("BenchHistory") {
+        // Filled by the build from the benchmark history (gen/bench/).
+        return Ok(format!("<div class=\"bench\">\n{}\n</div>", children(n, ctx)?));
+    }
     if let Some(v) = e.value("Tap") {
         // Tap the parts of a diagram: client/learn.ts draws the piece with its parts as buttons and checks the picks
         // against `right`. Without JS the answer is in the fold.
@@ -589,7 +622,9 @@ pub fn lesson_parts(world: &World, lesson: Id) -> (usize, Vec<String>) {
 fn glyph(ctx: &Ctx, lesson: Id) -> Result<String, String> {
     match ctx.e(lesson).value("Baked").and_then(|v| v.get("html")) {
         Some(crate::world::Scalar::Str(h)) if !h.is_empty() => Ok(h.clone()),
-        _ => Err(format!("{}: the lesson's glyph is not baked (run the build)", ctx.e(lesson).path)),
+        _ => {
+            Err(format!("{}: the lesson's glyph is not baked (run the build)", ctx.e(lesson).path))
+        }
     }
 }
 

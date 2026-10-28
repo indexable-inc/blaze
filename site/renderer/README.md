@@ -7,7 +7,7 @@ module. TS is the host: the build's bake step, routing, auth, D1, the cache and 
 
 ```
 content/*.flecs ──▶ site-snapshot.wasm (Flecs inside) ──▶ snapshot (.gen/site.cbor) ──▶ site.wasm ──▶ HTML
-   gen/build.ts bake: highlight.js, bench widget ──┘                                       ▲
+   gen/build.ts bake: highlight.js; bench charts ──┘                                       ▲
                                               comments (CBOR) + viewer (CBOR) ─────────────┘
 ```
 
@@ -85,13 +85,17 @@ instance and makes a new one on the next request.
 `site-snapshot.wasm`: `snap_new`, `snap_alloc`, `snap_free`, `snap_build(h, input, len)` (0 with the snapshot, or 1 with
 the error), `snap_output_ptr`, `snap_output_len`, `snap_drop`. The input is JSON
 `{scripts: [{name, code}], bakes: {<entity path>: {highlighted?, baked?, audio?}}}`, the scripts in run order (`schema.flecs`,
-`refs.flecs`, then the rest by path).
+`refs.flecs`, then the rest by path, then the ones the build generated, such as the benchmark charts).
 
-## Highlighting and the bench stay in TS, embedded as-is
+## Highlighting and glyphs stay in TS, embedded as-is; charts are content
 
-`gen/build.ts` pre-renders highlighted code (highlight.js) and the BenchHistory widget, by entity path, and the
-snapshot step sets that HTML on the entities as `Highlighted {html}` (Code, Command) and `Baked {html}` (BenchHistory).
-The core embeds it unchanged, so the core has no highlighter and the CSS is unchanged.
+`gen/build.ts` pre-renders highlighted code (highlight.js) and each lesson's glyph (gen/glyphs.ts), by entity path,
+and the snapshot step sets that HTML on the entities as `Highlighted {html}` (Code, Command) and `Baked {html}` (a
+lesson page). The core embeds it unchanged, so the core has no highlighter.
+
+Charts are elements like any other (`RowChart`, `LineChart`, `Charts`, `Picker` in `content/schema.flecs`), drawn by
+`core/src/chart.rs` as HTML rows and inline SVG with a table of their numbers. The benchmark page's are written by the build from the
+history files (`gen/bench/`) as a Flecs script that runs after the content.
 
 ## wasi:http host
 

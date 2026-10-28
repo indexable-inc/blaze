@@ -157,8 +157,11 @@ macros are still built and run as the daemon's load does (`target/rust-analyzer`
 `test` builds whole what cargo would test: each member's library, binaries and integration
 tests with `test = true`, the examples built beside them to see that they compile, and the
 binaries an integration test runs (`CARGO_BIN_EXE_<name>`), or what `--lib`, `--bin`,
-`--example` and one `--test` name. A worker that loads the workspace with `cfg(test)` builds
-the unit tests, one that loads it without builds the rest; a test's executable is
+`--example` and one `--test` name. One worker loads the workspace once, as `cargo test`
+builds it, and builds them all: each library and binary twice, without `cfg(test)` and as its
+unit tests with it, the integration tests with `cfg(test)`, and the examples without. Only an
+integration test or a benchmark is told `CARGO_BIN_EXE_<name>` of its package's binaries and
+`CARGO_TARGET_TMPDIR`, in its crate's own environment, as cargo tells them; a test's executable is
 `target/debug/deps/<name>-<kind>`. A unit test with `harness = false`, several `--test`s and
 the other target flags fail the build and say so. The doc tests come after, each example
 built by blaze with no cargo, rustc or rustdoc (below).
@@ -1027,8 +1030,8 @@ A new worktree still starts with a cargo build, because it has a target director
 own. What it saves is the daemon's side: the worktree joins the worker that is already
 loaded instead of loading the workspace again. With a ripgrep checkout loaded, the first
 `blaze build` in a new worktree of it was cargo's and took 16 s, the worktree showed
-as ready under the same worker, and the first edit there was built by the daemon in 0.4 s. A `blaze test` can use
-two workers, because unit tests are built with `cfg(test)` and integration tests without.
+as ready under the same worker, and the first edit there was built by the daemon in 0.4 s. A `blaze test` uses
+one worker: its unit tests and its integration tests are crates of one load.
 
 `blaze status` shows the daemon, its workers and their log files:
 

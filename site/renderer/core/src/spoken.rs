@@ -11,8 +11,9 @@
 //!   read: their label is for screen readers, and the paragraphs beside them say the same in words;
 //! - a lesson's Step is its title, then its blocks; a Quiz or Tap is "Question: " and its prompt (an author marks
 //!   question steps Silent); the course path reads each lesson's number and title;
-//! - Code and Command blocks are skipped, citations are never read, References, the signup form and the bench widget
-//!   are skipped, and the RFC index reads each RFC's number and title.
+//! - Code and Command blocks are skipped, citations are never read, References, the signup form, charts, Pickers and
+//!   the benchmark history (BenchHistory) are skipped (a `Say` on the section around a chart tells what it shows),
+//!   and the RFC index reads each RFC's number and title.
 //!
 //! An author overrides any block's line with `Say: {"..."}` (Drama 3 directions such as `[warm]` allowed). On a
 //! container (Section, Issue, Goal, Step, Li, Ul, Ol) the `Say` stands for its whole subtree: its children are not read, so one
@@ -190,7 +191,7 @@ fn derive(n: Id, ctx: &mut Ctx) -> Result<Option<String>, String> {
         }
         return Ok(Some(items.join(" ")));
     }
-    if ["References", "SignupForm", "BenchHistory"].iter().any(|t| e.has_tag(t)) {
+    if ["References", "SignupForm"].iter().any(|t| e.has_tag(t)) || e.has("BenchHistory") {
         return Ok(None);
     }
     for comp in ["Lede", "P", "Dim", "Li"] {

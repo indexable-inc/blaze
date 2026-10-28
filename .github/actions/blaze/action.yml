@@ -1,16 +1,23 @@
 # blaze to build and test blaze with (AGENTS.md rule blaze-builds-blaze): the release
-# .github/blaze-version names, installed by install.sh into ~/.cargo/bin, and blaze's store, the
-# one cache, pulled from the shared remote (.github/actions/blaze-remote) that main's runs push
-# to after their tests. The
-# remote's project is the job's, the platform's and the release's: what one release of blaze
+# .github/blaze-version names, installed by install.sh into ~/.cargo/bin with the Rust it builds
+# with (its own toolchain, ~/.blaze/toolchains, docs/self-contained.md: no rustup), and blaze's
+# store, the one cache, pulled from the shared remote (.github/actions/blaze-remote) that main's
+# runs push to after their tests. With `llvm: true`, also the LLVM blaze pins
+# (crates/hir-ty-codegen/llvm.json), fetched by its sha256 and named by LLVM_SYS_231_PREFIX, for
+# a build of the `llvm` feature. No Nix: the C compiler and linker are the runner's own (gcc and
+# glibc on Ubuntu, Xcode's clang on macOS), so what the build links runs on the runner as it is.
+# The remote's project is the job's, the platform's and the release's: what one release of blaze
 # compiled is no use to the next, and a project's manifest only grows, so each release starts
 # one of its own.
 name: blaze
-description: the release of blaze .github/blaze-version names, and the store main's runs pushed
+description: the release of blaze .github/blaze-version names, its toolchain, and the store main's runs pushed
 inputs:
   job:
     description: the job whose store this is (build, tests)
     required: true
+  llvm:
+    description: also the pinned LLVM, as LLVM_SYS_231_PREFIX (true or false)
+    default: "false"
 outputs:
   project:
     description: the remote's project of this job's store, for the push after it
@@ -18,6 +25,15 @@ outputs:
 runs:
   using: composite
   steps:
+    # `blaze test` runs every test in a sandbox made of namespaces a user makes, which
+    # Ubuntu's AppArmor keeps users from making unless told otherwise.
+    - name: user namespaces
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+          sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+        fi
     # The release .github/blaze-version names, not the newest canary: a store is of one release,
     # and canaries come every 40 minutes, sooner than a cold run (about an hour) ends and pushes,
     # so with the newest every run would be cold. A pull request that changes the file moves
@@ -28,7 +44,9 @@ runs:
       env:
         JOB: ${{ inputs.job }}
       run: |
-        sh install.sh --version "$(cat .github/blaze-version)" --no-toolchain --verbose
+        # Without --no-toolchain: install.sh has blaze fetch its toolchain now (`blaze toolchain`),
+        # as a user's install does, rather than at the first build.
+        sh install.sh --version "$(cat .github/blaze-version)" --verbose
         said=$(blaze-engine --version)
         version=$(echo "$said" | awk '$1 == "blaze" { print $2 }')
         [ -n "$version" ] || { echo "::error::blaze-engine --version said no version: $said"; exit 1; }
@@ -39,6 +57,27 @@ runs:
         # for one job, so nothing needs collecting.
         echo "BLAZE_CACHE_MAX=off" >> "$GITHUB_ENV"
         echo "project=blaze-$RUNNER_OS-$RUNNER_ARCH-$JOB-$version" | tee -a "$GITHUB_OUTPUT"
+    # The pinned LLVM, as a contributor outside Nix gets it (docs/contributing.md, "LLVM for
+    # `--features llvm`"): llvm.py fetches the archive llvm.json names for this host, checks its
+    # sha256 and unpacks it; crates/hir-ty-codegen/build.rs refuses any other prefix. Below
+    # /usr/local/lib because llvm-sys's build script names the prefix's `lib` to the linker, and a
+    # build script in blaze's sandbox may name only system directories of libraries
+    # (crates/blaze-cargo/src/cargo/directives.rs, SYSTEM). The same directory every run, so the
+    # store's runs of the build scripts that read LLVM_SYS_231_PREFIX are found.
+    - name: LLVM (the pin)
+      if: inputs.llvm == 'true'
+      shell: bash
+      run: |
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64) triple=x86_64-unknown-linux-gnu ;;
+          Linux-ARM64) triple=aarch64-unknown-linux-gnu ;;
+          macOS-ARM64) triple=aarch64-apple-darwin ;;
+          *) echo "::error::crates/hir-ty-codegen/llvm.json has no LLVM for $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
+        esac
+        sudo mkdir -p /usr/local/lib/blaze-llvm
+        sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
+        python3 .github/scripts/llvm.py fetch --target "$triple" --dir "/usr/local/lib/blaze-llvm/$triple"
+        echo "LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/$triple" >> "$GITHUB_ENV"
     # A cold store (a new release, or a project main has not pushed yet) builds blaze in about
     # 28 GB, more than a hosted runner's 16 (rcache, #664): swap lets that run finish, slowly,
     # where it would be killed, and the warm runs after it never touch it.

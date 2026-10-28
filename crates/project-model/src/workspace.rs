@@ -33,7 +33,7 @@ use crate::{
     },
     env::{
         cargo_config_env, inject_cargo_env, inject_cargo_executables_env, inject_cargo_package_env,
-        inject_rustc_tool_env,
+        inject_cargo_scratch_env, inject_rustc_tool_env,
     },
     project_json::{Crate, CrateArrayIdx},
     sysroot::RustLibSrcWorkspace,
@@ -501,6 +501,7 @@ impl ProjectWorkspace {
             anyhow::bail!("{error}");
         }
         cargo.set_executables(config.executables.clone());
+        cargo.set_scratch(config.scratch.clone());
         if let Ok(Some(loaded_sysroot)) = &loaded_sysroot {
             tracing::info!(src_root = ?sysroot.rust_lib_src_root(), root = %loaded_sysroot, "Loaded sysroot");
         }
@@ -1363,9 +1364,10 @@ fn cargo_to_crate_graph(
     let mut pkg_crates = FxHashMap::default();
     let mut const_macro_crates = FxHashMap::default();
     let workspace_proc_macro_cwd = Arc::new(cargo.workspace_root().to_path_buf());
-    // As cargo builds them, the unit tests of a library are a crate of their own, its root
-    // file with `cfg(test)` and its dev-dependencies, which nothing depends on; every other
-    // crate links the library built without them. Each such crate, by the library's.
+    // As cargo builds them for `cargo test`, the unit tests of a library or a binary are a
+    // crate of their own, its root file with `cfg(test)` and its dev-dependencies, which
+    // nothing depends on; every other crate links the library built without them, and an
+    // integration test runs the binary built without them. Each such crate, by the target's.
     let unit_tests_apart = set_test && sysroot_as_built() && !cargo.is_sysroot();
     let mut unit_tests: FxHashSet<CrateBuilderId> = FxHashSet::default();
 
@@ -1415,7 +1417,7 @@ fn cargo_to_crate_graph(
                 // https://github.com/rust-lang/rust-analyzer/issues/11300
                 continue;
             }
-            let &TargetData { ref name, kind, ref root, .. } = &cargo[tgt];
+            let &TargetData { ref name, kind, ref root, tested, .. } = &cargo[tgt];
 
             let Some(file_id) = load(root) else { continue };
 
@@ -1470,11 +1472,21 @@ fn cargo_to_crate_graph(
                 }
                 crate_id
             };
-            // A proc macro is loaded by the server, not linked, so its cfg is no other crate's.
+            // A library and a binary are built without `cfg(test)`, which is what the others
+            // link and what an integration test runs, and their unit tests apart. A proc macro
+            // is loaded by the server, not linked, so its cfg is no other crate's.
             let apart = unit_tests_apart
                 && pkg_data.is_local
-                && matches!(kind, TargetKind::Lib { is_proc_macro: false });
-            let crate_id = match apart {
+                && matches!(kind, TargetKind::Lib { is_proc_macro: false } | TargetKind::Bin);
+            // Of `cargo test`, cargo builds a build script, and an example that is not tests
+            // (`test = true`), as `cargo build` does, without `cfg(test)`.
+            let untested = unit_tests_apart
+                && pkg_data.is_local
+                && match kind {
+                    TargetKind::Example => !tested,
+                    kind => kind == TargetKind::BuildScript,
+                };
+            let crate_id = match apart || untested {
                 true => add(crate_graph, proc_macros, options(false)),
                 false => {
                     // Cargo builds a test target, and nothing else of the package, as a test.
@@ -1502,11 +1514,14 @@ fn cargo_to_crate_graph(
             // Add sysroot deps first so that a lib target named `core` etc. can overwrite them.
             public_deps.add_to_crate_graph(crate_graph, from);
 
-            // Add dep edge of all targets to the package's lib target
+            // Add dep edge of all targets to the package's lib target. A library's unit tests
+            // are the library and do not link it; a binary's do, as the binary does.
+            let library_tests =
+                unit_tests.contains(&from) && matches!(kind, TargetKind::Lib { .. });
             if let Some((to, name)) = lib_tgt.clone()
                 && to != from
                 && kind != TargetKind::BuildScript
-                && !unit_tests.contains(&from)
+                && !library_tests
             {
                 // (build script can not depend on its library target)
 
@@ -1602,11 +1617,12 @@ fn cargo_to_crate_graph(
                 {
                     continue;
                 }
-                // Those are its unit tests' alone.
+                // Those are its unit tests' alone: cargo builds a library or a binary that is
+                // not a test without them.
                 if dep.kind == DepKind::Dev
                     && unit_tests_apart
                     && cargo[pkg].is_local
-                    && matches!(kind, TargetKind::Lib { is_proc_macro: false })
+                    && matches!(kind, TargetKind::Lib { is_proc_macro: false } | TargetKind::Bin)
                     && !unit_tests.contains(&from)
                 {
                     continue;
@@ -1888,6 +1904,7 @@ fn add_target_crate_root(
     inject_rustc_tool_env(&mut env, cargo_crate_name, kind);
     if matches!(kind, TargetKind::Test | TargetKind::Bench) {
         inject_cargo_executables_env(&mut env, cargo, pkg);
+        inject_cargo_scratch_env(&mut env, cargo);
     }
 
     if let Some(envs) = build_data.map(|(it, _)| &it.envs) {

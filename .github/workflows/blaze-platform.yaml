@@ -106,21 +106,21 @@ jobs:
           git config --global core.autocrlf false
           echo CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT=false >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
-        with:
-          llvm: ${{ env.BLAZE == 'true' && 'build' || 'none' }}
+      # With blaze, no rustup and no Nix: blaze brings its own Rust (.github/actions/blaze), and
+      # the C compiler and linker are the runner's. cargo's on Windows, with rustup's nightly.
+      - if: env.BLAZE != 'true'
+        uses: ./.github/actions/toolchain
       - if: env.BLAZE == 'true'
         id: blaze
         uses: ./.github/actions/blaze
         with:
           job: tests
-      # `blaze test`, in the flake's dev shell for its C toolchain; cargo's on Windows.
       # A limit of its own, under the job's: a cold store's tests ran past the job's 90 minutes
       # on 2026-10-28, which cancelled the push after them, so no run after it found them
       # compiled. Run out here, the step fails and main's push still runs.
       - if: env.BLAZE == 'true'
         timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 220 || 150 }}
-        run: nix develop --command $PYTHON harness/unittests.py --events json
+        run: $PYTHON harness/unittests.py --events json
       - if: env.BLAZE != 'true'
         run: $PYTHON harness/unittests.py --cargo
       # What was compiled, and each test that passed, for the runs after this one; a run whose
@@ -171,20 +171,26 @@ jobs:
           git config --global core.autocrlf false
           echo CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT=false >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
+      # cargo's build (the train's tiers, Windows): rustup's nightly, and the flake's dev shell
+      # with the pinned LLVM.
+      - if: env.BLAZE != 'true'
+        uses: ./.github/actions/toolchain
         with:
           llvm: build
+      # blaze's build (the gate, main): no rustup and no Nix. blaze brings its own Rust and the
+      # pinned LLVM (LLVM_SYS_231_PREFIX, fetched by its sha256), and the C compiler, linker and
+      # libc are the runner's.
       - if: env.BLAZE == 'true'
         id: blaze
         uses: ./.github/actions/blaze
         with:
           job: build
-      # In the flake's dev shell, against the LLVM it pins. On Windows, which has no Nix, the
-      # build is against the static C runtime, and names libraries of the SDK that the linker is
-      # not otherwise shown.
+          llvm: true
+      # Against the LLVM blaze pins. On Windows, which has no Nix, the build is against the static
+      # C runtime, and names libraries of the SDK that the linker is not otherwise shown.
       - name: blaze build -p blaze-engine --release --features llvm
         if: env.BLAZE == 'true'
-        run: nix develop --command blaze build -p blaze-engine --release --features llvm --locked
+        run: blaze build -p blaze-engine --release --features llvm --locked
       - name: cargo build -p blaze-engine --release --features llvm
         if: env.BLAZE != 'true'
         run: |
@@ -219,7 +225,7 @@ jobs:
           BLAZE_STD_FROM: 'off'
           RUST_BACKTRACE: '0'
         run: |
-          nix develop --command "$PWD/target/release/blaze-engine" cargo build --manifest-path vendor/proc-macro-srv/Cargo.toml -p proc-macro-srv-cli --bin rust-analyzer-proc-macro-srv --release --locked
+          "$PWD/target/release/blaze-engine" cargo build --manifest-path vendor/proc-macro-srv/Cargo.toml -p proc-macro-srv-cli --bin rust-analyzer-proc-macro-srv --release --locked
           cp "$CARGO_TARGET_DIR/release/rust-analyzer-proc-macro-srv" target/release/blaze-proc-macro-srv
           RUST_ANALYZER_INTERNALS_DO_NOT_USE=1 target/release/blaze-proc-macro-srv --version
       # The binaries run each other from next to themselves (`blaze enable` links `cargo fmt`

@@ -295,10 +295,15 @@ and pinned by its sha256 in `crates/hir-ty-codegen/llvm.json`. The flake's dev s
 
     nix develop -c cargo build -p blaze-engine --release --features llvm
 
-Outside the shell, fetch the same archive and point the build at it:
+Outside the shell, fetch the same archive and point the build at it, as CI's merge gate does
+(`.github/actions/blaze`). It goes below `/usr/local/lib`: llvm-sys's build script names the
+prefix's `lib` to the linker, and a build script in blaze's sandbox may name only a system
+directory of libraries (`crates/blaze-cargo/src/cargo/directives.rs`, `SYSTEM`), so `blaze
+build` refuses a prefix in your home directory.
 
-    python3 .github/scripts/llvm.py fetch --target <triple> --dir ~/.cache/blaze-llvm
-    LLVM_SYS_231_PREFIX=~/.cache/blaze-llvm cargo build -p blaze-engine --release --features llvm
+    sudo mkdir -p /usr/local/lib/blaze-llvm && sudo chown "$USER" /usr/local/lib/blaze-llvm
+    python3 .github/scripts/llvm.py fetch --target <triple> --dir /usr/local/lib/blaze-llvm/<triple>
+    LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/<triple> blaze build -p blaze-engine --release --features llvm
 
 `build.rs` checks the prefix's `blaze-llvm.json` against the pin and stops otherwise: neither
 Homebrew's LLVM nor a distribution's is a source. LLVM is linked in statically, and on Linux so
