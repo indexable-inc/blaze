@@ -24,7 +24,7 @@ site {
     Description: {"A Rust build with cargo's commands that rebuilds an edit in milliseconds, and a short course on how it works: five lessons, one idea per screen, with questions as you go."}
 
     Lede lede("Rebuild Rust in milliseconds, with the same commands as cargo.") {
-      Say: {"[curious] Here's the idea. You type the same commands as cargo, with blaze in front, and an edit is rebuilt in milliseconds."}
+      Say: {"[curious] Here's the idea. You type blaze wherever you'd type cargo, and an edit is rebuilt in milliseconds."}
     }
     Command install("curl -fsSL https://ix.dev/blaze | sh") {
       Silent
