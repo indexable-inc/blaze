@@ -185,19 +185,54 @@ def unreleased(changelog):
     return rest[: end.start() if end else len(rest)].strip()
 
 
+def sections(body):
+    """[Unreleased]'s body as {heading: lines}, the lines before any `### ` heading under ""."""
+    found, heading = {}, ""
+    for line in body.splitlines():
+        if line.startswith("### "):
+            heading = line
+            found.setdefault(heading, [])
+        elif line.strip():
+            found.setdefault(heading, []).append(line)
+    return found
+
+
 def added(now, then):
-    """The lines of `now` that `then` does not have, in `now`'s order: what [Unreleased] gained
-    since the previous release. [Unreleased] is never emptied by a release (no release commits
-    to main), so each release's notes are what was added to it since the one before."""
-    had = set(then.splitlines())
-    return "\n".join(line for line in now.splitlines() if line not in had).strip()
+    """What [Unreleased] gained since the previous release: per `### ` heading, the lines of
+    `now` that the same heading of `then` does not have, under their heading. [Unreleased] is
+    never emptied by a release (no release commits to main), so each release's notes are what
+    was added to it since the one before."""
+    before = sections(then)
+    out = []
+    for heading, lines in sections(now).items():
+        had = set(before.get(heading, []))
+        if new := [line for line in lines if line not in had]:
+            out += ([heading, ""] if heading else []) + new + [""]
+    return "\n".join(out).strip()
 
 
-def lock_stamped(text, old, new):
-    """Cargo.lock with the workspace's own packages (no `source`) at `old` moved to `new`."""
+def inheriting():
+    """The names of the workspace's crates whose version is the workspace's
+    (`version.workspace = true`): the ones `stamp` moves. A path crate with its own version
+    (`0.0.0` for most of the front end's) keeps it."""
+    import tomllib
+    names = set()
+    for manifest in ROOT.glob("crates/*/Cargo.toml"):
+        package = tomllib.loads(manifest.read_text()).get("package", {})
+        if package.get("version") == {"workspace": True}:
+            names.add(package["name"])
+    if not names:
+        sys.exit("canary.py: no crate under crates/ has `version.workspace = true`")
+    return names
+
+
+def lock_stamped(text, old, new, names):
+    """Cargo.lock with the workspace's own packages (no `source`) named in `names` at `old`
+    moved to `new`."""
     blocks = text.split("\n[[package]]\n")
     for i, block in enumerate(blocks[1:], 1):
-        if not re.search(r"^source = ", block, re.M):
+        name = re.search(r'^name = "([^"]+)"$', block, re.M)
+        if not re.search(r"^source = ", block, re.M) and name and name[1] in names:
             blocks[i] = re.sub(rf'^version = "{re.escape(old)}"$', f'version = "{new}"', block, count=1, flags=re.M)
     return "\n[[package]]\n".join(blocks)
 
@@ -249,7 +284,7 @@ def stamp(args):
     text = manifest.read_text()
     manifest.write_text(text[:found.start(2)] + new + text[found.end(2):])
     lock = ROOT / "Cargo.lock"
-    lock.write_text(lock_stamped(lock.read_text(), TREE_VERSION, new))
+    lock.write_text(lock_stamped(lock.read_text(), TREE_VERSION, new, inheriting()))
     print(f"stamped {new} over {TREE_VERSION} in this checkout's Cargo.toml and Cargo.lock", flush=True)
 
 
