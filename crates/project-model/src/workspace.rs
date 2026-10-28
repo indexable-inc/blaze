@@ -1417,7 +1417,7 @@ fn cargo_to_crate_graph(
                 // https://github.com/rust-lang/rust-analyzer/issues/11300
                 continue;
             }
-            let &TargetData { ref name, kind, ref root, .. } = &cargo[tgt];
+            let &TargetData { ref name, kind, ref root, tested, .. } = &cargo[tgt];
 
             let Some(file_id) = load(root) else { continue };
 
@@ -1478,11 +1478,14 @@ fn cargo_to_crate_graph(
             let apart = unit_tests_apart
                 && pkg_data.is_local
                 && matches!(kind, TargetKind::Lib { is_proc_macro: false } | TargetKind::Bin);
-            // Of `cargo test`, cargo builds an example and a build script as `cargo build`
-            // does, without `cfg(test)`.
+            // Of `cargo test`, cargo builds a build script, and an example that is not tests
+            // (`test = true`), as `cargo build` does, without `cfg(test)`.
             let untested = unit_tests_apart
                 && pkg_data.is_local
-                && matches!(kind, TargetKind::Example | TargetKind::BuildScript);
+                && match kind {
+                    TargetKind::Example => !tested,
+                    kind => kind == TargetKind::BuildScript,
+                };
             let crate_id = match apart || untested {
                 true => add(crate_graph, proc_macros, options(false)),
                 false => {

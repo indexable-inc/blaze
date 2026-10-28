@@ -386,6 +386,9 @@ pub struct TargetData {
     pub kind: TargetKind,
     /// Required features of the target without which it won't build
     pub required_features: Vec<String>,
+    /// Whether `cargo test` builds it as tests (`test = true`), which an example is only when
+    /// its manifest says so.
+    pub tested: bool,
 }
 
 fn convert_target_kind(kinds: &[cargo_metadata::TargetKind]) -> TargetKind {
@@ -632,8 +635,9 @@ impl CargoWorkspace {
             requires_rustc_private |= pkg_data.metadata.rustc_private;
             pkg_by_id.insert(id, pkg);
             for meta_tgt in meta_targets {
-                let cargo_metadata::Target { name, kind, required_features, src_path, .. } =
-                    meta_tgt;
+                let cargo_metadata::Target {
+                    name, kind, required_features, src_path, test: tested, ..
+                } = meta_tgt;
                 let kind = convert_target_kind(&kind);
                 let tgt = targets.alloc(TargetData {
                     package: pkg,
@@ -651,6 +655,7 @@ impl CargoWorkspace {
                     },
                     kind,
                     required_features,
+                    tested,
                 });
                 pkg_data.targets.push(tgt);
             }

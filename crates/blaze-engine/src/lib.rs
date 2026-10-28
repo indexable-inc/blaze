@@ -2732,11 +2732,7 @@ impl Checkouts {
         let ProjectWorkspaceKind::Cargo { cargo, .. } = &self.loaded.workspaces()[at].kind else {
             return Vec::new();
         };
-        let root = &self.roots[at].1;
-        let told = [cargo.executables(), cargo.scratch()]
-            .into_iter()
-            .flatten()
-            .any(|it| AsRef::<Path>::as_ref(it).starts_with(root));
+        let told = self.tells_places(at);
         cargo
             .packages()
             .filter(|&it| cargo[it].is_member)
@@ -2748,6 +2744,20 @@ impl Checkouts {
                 (dir, kinds().any(|it| it.is_proc_macro()), told && tests)
             })
             .collect()
+    }
+
+    /// Whether the integration tests and benchmarks of the checkout at `at` are told places in
+    /// it (`CARGO_BIN_EXE_<name>`, `CARGO_TARGET_TMPDIR` in its target directory), which those
+    /// of another checkout are told in that one.
+    fn tells_places(&self, at: usize) -> bool {
+        let ProjectWorkspaceKind::Cargo { cargo, .. } = &self.loaded.workspaces()[at].kind else {
+            return false;
+        };
+        let root = &self.roots[at].1;
+        [cargo.executables(), cargo.scratch()]
+            .into_iter()
+            .flatten()
+            .any(|it| AsRef::<Path>::as_ref(it).starts_with(root))
     }
 
     /// The packages of the checkout at `over` whose files are not those of the loaded one at
@@ -2833,8 +2843,11 @@ impl Checkouts {
         if overlay == Overlay::Never {
             return None;
         }
-        // One that shares packages with another has those where the other is.
-        let whole = self.roots.iter().zip(&self.splits).filter(|it| it.1.is_none()).map(|it| it.0);
+        // One that shares packages with another has those where the other is. Not one whose
+        // tests are told places in it: read over another, they would be told the other's.
+        let whole = (0..self.roots.len())
+            .filter(|&at| self.splits[at].is_none() && !self.tells_places(at))
+            .map(|at| &self.roots[at]);
         whole.into_iter().find_map(|(loaded, base)| {
             let inside = loaded.strip_prefix(base).ok()?;
             let mut over = project.clone();
@@ -6859,7 +6872,13 @@ impl Target {
     }
 
     fn is(&self, args: &Args) -> bool {
-        self.krate == args.krate && self.out == args.out
+        self.of_crate(args) && self.out == args.out
+    }
+
+    /// Whether `args` builds the crate this program does: a binary and its unit tests are two
+    /// programs of one root file.
+    fn of_crate(&self, args: &Args) -> bool {
+        self.krate == args.krate && self.unit_test == args.unit_test
     }
 
     /// The daemon's arguments, were it started for this program.
@@ -9625,7 +9644,7 @@ fn run_holding(
                         }
                         // The checkouts read as one share its programs.
                         (Some(target), Some(view)) if shared => programs.iter().position(|it| {
-                            it.args.krate == target.krate && it.args.checkout == view.base
+                            target.of_crate(&it.args) && it.args.checkout == view.base
                         }),
                         (Some(_), _) => None,
                         (None, _) => Some(0),

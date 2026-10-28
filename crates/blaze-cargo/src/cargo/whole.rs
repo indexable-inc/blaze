@@ -182,7 +182,7 @@ pub fn test(asked: &Invocation) -> anyhow::Result<i32> {
         let libraries: Vec<&Program> = programs.iter().filter(|it| it.kind == Kind::Lib).collect();
         return doc_tests(asked, &cwd, metadata.workspace_root.as_std_path(), &libraries);
     }
-    let unit = |it: &Program| it.test && it.kind != Kind::Test;
+    let unit = |it: &Program| it.test && matches!(it.kind, Kind::Lib | Kind::Bin);
     if let Some(it) = programs.iter().find(|it| unit(it) && !it.harness) {
         let why = "without libtest's harness (`harness = false`) yet";
         say::error(&format!("blaze does not build the unit tests of `{}` {why}", it.name));
@@ -258,7 +258,10 @@ pub fn test(asked: &Invocation) -> anyhow::Result<i32> {
     super::affected::ask(&state);
     for (plan, program) in checkout.programs.iter().zip(&programs) {
         let tests = plan.object.with_file_name(super::plan::TESTS);
-        match program.kind == Kind::Test && program.harness {
+        // An integration test, or an example that is tests (`test = true`), which cargo
+        // builds with `--test`: the load has it with `cfg(test)`.
+        let harnessed = matches!(program.kind, Kind::Test | Kind::Example) && program.test;
+        match harnessed && program.harness {
             true => std::fs::write(&tests, "")?,
             false => _ = std::fs::remove_file(&tests),
         }
@@ -547,7 +550,7 @@ fn checkout(
             link_cmd: String::new(),
             symbol_files: Vec::new(),
             // A library's or a binary's unit tests: an integration test is its own target.
-            unit_test: program.test && program.kind != Kind::Test,
+            unit_test: program.test && matches!(program.kind, Kind::Lib | Kind::Bin),
             linked_as_built: Vec::new(),
             copies: Vec::new(),
             package: None,
