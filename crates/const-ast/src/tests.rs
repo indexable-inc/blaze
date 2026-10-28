@@ -15,7 +15,7 @@ use std::{
 
 use syntax::{
     AstNode, Edition, FlatTree, SourceFile as AstFile, SyntaxKind, SyntaxNode,
-    ast::{self, HasAttrs, HasGenericParams, HasModuleItem, HasName, HasTypeBounds, HasVisibility},
+    ast::{self, HasAttrs, HasGenericArgs, HasGenericParams, HasModuleItem, HasName, HasTypeBounds, HasVisibility},
 };
 
 use crate::*;
