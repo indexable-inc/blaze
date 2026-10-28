@@ -1,4 +1,4 @@
-//! The gateway client against an in-process fake of API v0 (worker/remote-cache/API-v0.md)
+//! The gateway client against an in-process fake of API v0 (tools/remote-cache/API-v0.md)
 //! that keeps its rules: the one 404, 401 and 403, 412 on a condition, 422 on a hash, 413,
 //! ranges and 416, uploads in parts, and the 429 and 5xx it is told to answer with.
 

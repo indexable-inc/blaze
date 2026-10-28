@@ -2,15 +2,69 @@
 
 All notable changes to blaze are written here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions after 0.1.0 are dated,
-`0.YYYYMMDD.N` with N counting the releases of that day from 0, and the release train writes
-each one's section: what `[Unreleased]` had, and the title of each change merged since
-(docs/harness.md, "CI").
+`0.YYYYMMDD.N` with N counting the releases of that day from 0. Up to 0.20261028.9 the release
+train wrote each one's section here; since then no release commits to main (docs/release.md,
+"Versions"), and a release's notes, in its GitHub release, are the lines `[Unreleased]` gained
+since the release before and the title of each change merged since.
 
 ## [Unreleased]
 
 ### Added
 
 - promote.yaml: OpenAI's Codex CLI (rust-v0.165.0, its codex-rs workspace) in the gate to stable; smoke.py and bench.py take a project's `dir`, the workspace's place in its checkout.
+
+## [0.20261028.9] - 2026-10-28
+
+### Merged
+
+- canary.yaml: a canary of every green main, by a tag on main's own commit (no release commit racing merges); release.yaml stamps the tag's version into its checkout; one promote gate at a time, the newest canary first (#953)
+- docs/driver.md: the build driver as a sans-IO build graph (design note) (#955)
+- install.sh: the archive's folder check as an if (shellcheck SC2015) (#954)
+- vectors in the Win64 C ABI; corpus const_traits builds without nightly (#945)
+- promote.yaml: the one-gate-at-a-time group is main's runs only, so a dispatch on a branch (a check of the gate) never holds a canary up (#958)
+- a workspace the daemon could not load names the functions blaze could not compile (#905)
+- const macros stage 0: derive expanded by the const evaluator (#915)
+- answers test asks a spec every host agrees on (Windows tests) (#957)
+- blaze-graph: the build driver's graph as a state machine that does no IO, its executor and replayable traces (docs/driver.md step 1) (#956)
+- canary.py cut: the newest commit of main whose ci is green (HEAD is seldom green yet: main moves faster than its gate), and a release.yaml run on a branch does not hold a cut (#962)
+- const macros: the const-macros key loads a file as the package's macro crate, behind experimental = ["const-macros"] (#959)
+- canary.py stamp runs on Python 3.10: release.yaml's ubuntu-22.04 builds of the first canary v0.20261028.4 failed on 'No module named tomllib' (#966)
+- NVIDIA Dynamo in the stable gate: smoke.json entry (workspace, Python bindings built and imported, CPU-only mocker server, tests, excluded list with why), bench.py dynamo against cargo on its pinned 1.96.1 (#965)
+- blaze test: the walk after an edit keeps what it found (#901); memchr's dispatch keeps tests hermetic (#910)
+- harness/nightly_features.py: one issue per unstable language feature of the pinned nightly, under a sub-issue tree (#1025)
+- const eval: every call of a constant's evaluation counts against the crate's recursion limit, as in rustc (#862) (#961)
+- install.sh and the site's install page: drop the rename's 'blaze run is the same' leftovers; the page explains canary and stable and --channel canary (#1247)
+- docs: const macros' status, stage 0's limits, measured numbers, and Graph::map with a const fn (#1251)
+- consteval: the train holds main's 727 of 767 evaluation and 222 of 222 run-pass (#862) (#1248)
+- The merge gate builds and tests blaze with blaze, from blaze's R2 store; no sccache or rust-cache (#896)
+- No rust-cache in any workflow: blaze where it tests, cargo with no cache where the binary is a tool (#899) (#1253)
+- build UI round 2: the live view is the build's crate graph, every step named with counts, a slow build says why (#1249)
+- harness: constmacros.py, a const derive through blaze run (cold, warm, edit, experiment off) (#1250)
+- answers test asks aarch64-unknown-linux-musl, a spec every host agrees on (Windows tests) (#1254)
+- splices.py shows what a wrong output printed (x64 llvm core-4 thread-local rows, train 40669942920) (#1252)
+- a build script's kept run is found from any checkout, CI or remote (it was kept for its own checkout alone) (#1255)
+- blaze-ui: a header, a line of every step, and what held the build up (#1257)
+- A build script's rustc probe reads std's frozen def maps from the store (#1262)
+- bench/results: #830's sessions against #918 on bat and just (#908) (#1256)
+- blaze: how busy the cores are, live and per step, and cold from the start (#1263)
+- main pushes blaze's store (secrets: inherit; the train pushes nothing), and the gate's blaze is pinned in .github/blaze-version (#1264)
+- Build UI piece 3a: piped output says only what took time; blaze status is the live view (#1267)
+- blaze_cli.py counts the tests blaze test kept the pass of (#836) as cargo's (#1266)
+- experience.py: a second or more at no named step is a P1 rough edge (#1268)
+- Build UI piece 3c: a function count that adds up; a Took line that fits (#1270)
+- Build UI piece 3d: blaze why lists where the time went, as the live view names it (#1271)
+- The borrow checker's trait solver answers no constraint of an error region it reads nothing of (#1273)
+- const heap: freed memory is reused, stack frames are freed, and a Box or Vec may not be in a constant's value (#920)
+- Build UI piece 3b: the functions slow to compile, under their crate as they go, five at the end, all in blaze why (#1274)
+- the build scripts' standard library is made of the shipped one, fetched before the load (#1280)
+- blaze-remote says blaze-engine's exit status when a pull or push fails (#1278)
+- blaze tags its target directory as cargo does, so a no-change blaze test reruns no build script and relinks nothing (#83) (#1285)
+- bench: ci built and tested with blaze, before and after (#1281)
+- a build script's sandbox has the store readable below /tmp (#1283)
+- blaze cache push|pull: a reset from the remote is an error, not a silent exit 141 (#1282)
+- docs/cargo.md: the BLAZE_TESTS table said the default is all; it is affected (affected::on treats anything but all as on, and the tests section already says so). Refs #227. (#1289)
+- the codegen says every function it puts in the program as Event::Functions records, for the build page (#1272)
+- const eval: stop freeing a frame's stack on return (P0 hotfix for #920). Before: smoke (std) on a warm run of #920's code fails every case, hashmap included: <u8 as Display>::fmt and the rest have 'layout of [MaybeUninit<u8>; {const error}]' (core's MAX.ilog10() + 1), and the bisect drafts #946-948 put it on frame freeing. After: the stack is kept as before #920 (FREES_FRAMES = false), the heap's reuse and the constant cache stay; stack_frames_are_freed is ignored until the read of a returned frame is found. (#1287)
 
 ## [0.20261028.3] - 2026-10-28
 
@@ -2877,7 +2931,8 @@ The first release.
 - No borrow checker: keep running `cargo check`.
 - Changing a struct the running program uses asks for a restart.
 
-[Unreleased]: https://github.com/indexable-inc/blaze/compare/v0.20261028.3...HEAD
+[Unreleased]: https://github.com/indexable-inc/blaze/compare/v0.20261028.9...HEAD
+[0.20261028.9]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261028.9
 [0.20261028.3]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261028.3
 [0.20261028.2]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261028.2
 [0.20261028.1]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261028.1

@@ -121,12 +121,49 @@
         }
       }
     },
+    "fff": {
+      "group": "apps",
+      "repo": "dmtrKovalenko/fff",
+      "rev": "95fd777c2529fc7b4d7572dabff64cc07268f2c5",
+      "note": "v0.11.0 (formerly fff.nvim). Its default features (the `ripgrep` walker and glob matcher, pure Rust) need no Zig, which its CI's `zlob` feature does. The program is its MCP server, fff-mcp: the version, and its health check of a directory of its own. Its tests are those of fff-search and the crates below it, as its CI's (which leaves out the Neovim and Python bindings); they watch the file system, so they need inotify or FSEvents, not a GPU or the network.",
+      "seconds": 3600,
+      "runs": [
+        { "select": ["-p", "fff-mcp", "--bin", "fff-mcp"], "args": ["--version"], "contains": "fff-mcp 0.11.0" },
+        { "select": ["-p", "fff-mcp", "--bin", "fff-mcp"],
+          "args": ["--healthcheck", "--frecency-db", "{work}/frecency", "--history-db", "{work}/history", "--log-file", "{work}/fff.log", "{work}"],
+          "contains": "All checks passed." }
+      ],
+      "test": ["-p", "fff-query-parser", "-p", "fff-grep", "-p", "fff-search"],
+      "excluded": {
+        "the `zlob` feature (its CI's and release's glob matcher)": "Zig compiles it; the runners have no Zig",
+        "fff-nvim, fff-python, fff-c": "bindings for LuaJIT, CPython and C that its CI does not test with cargo either (Lua, Python and C suites of their own)"
+      }
+    },
+    "fframes": {
+      "group": "apps",
+      "repo": "dmtrKovalenko/fframes",
+      "rev": "69174f0187b5d8e92329246898f70250b59f08f2",
+      "note": "v1.3.0, a video rendering framework. System libraries from its README and CI (main.yml): the codecs FFmpeg links, nasm and libclang for ffmpeg-sys-fframes, fontconfig. Its build scripts download a prebuilt static FFmpeg (ffmpeg-sys-fframes) and Skia (skia-bindings) from GitHub. The program is its hello-world example's renderer: the timeline, and one frame rendered to PNG by the CPU backend. Its tests are its CI's on Windows, the crates that need no GPU.",
+      "apt": ["clang", "libasound2-dev", "libclang-dev", "libfontconfig1-dev", "libopus-dev", "libvpx-dev", "libx264-dev", "libx265-dev",
+              "nasm", "ninja-build", "pkg-config", "yasm"],
+      "brew": ["nasm", "ninja", "opus", "pkg-config", "x264", "x265"],
+      "seconds": 7200,
+      "runs": [
+        { "select": ["-p", "hello-world-example", "--bin", "hello_world_example_bin"], "args": ["timeline"], "contains": "1920x1080 @ 30 fps, 900 frames (30.00s)" },
+        { "select": ["-p", "hello-world-example", "--bin", "hello_world_example_bin"], "args": ["--renderer", "cpu", "frame", "1s", "-o", "{work}/frames"],
+          "file": "{work}/frames/1s.png", "starts": "\u0089PNG" }
+      ],
+      "test": ["-p", "fframes", "-p", "fframes-media", "-p", "webvtt-parser", "-p", "fframes-media-dir-macro"],
+      "excluded": {
+        "e2e (the frames of every example against snapshots), the Skia GPU renderer, the native player": "they need Vulkan or Metal and a display, or odiff from npm"
+      }
+    },
     "codex": {
       "group": "apps",
       "repo": "openai/codex",
       "rev": "360319d8dee62d87e2d59fc0c21805d79519cfed",
       "dir": "codex-rs",
-      "note": "OpenAI's Codex CLI, rust-v0.165.0: its Rust workspace is codex-rs, pinned to Rust 1.99.1 (rust-toolchain.toml), which bench.py's cargo builds with. System libraries from its rust-ci-full.yml (libcap for the Linux sandbox, ALSA for voice) and OpenSSL, which hosted runners have. The v8 crate's build script downloads its prebuilt static library from GitHub. `--version` needs no API key or network. Its tests are the unit and integration tests of crates that need neither a model, a network nor credentials.",
+      "note": "OpenAI's Codex CLI, rust-v0.165.0: its Rust workspace is codex-rs, pinned to Rust 1.99.1 (rust-toolchain.toml), which bench.py's cargo builds with. System libraries from its rust-ci-full.yml (libcap for the Linux sandbox, ALSA for voice) and OpenSSL, which hosted runners have. Only the codex binary is built: v8, which codex-code-mode-runtime builds against V8 archives of codex's own (#1369), is not below it. `--version` needs no API key or network. Its tests are the unit and integration tests of crates that need neither a model, a network nor credentials.",
       "apt": ["build-essential", "libasound2-dev", "libcap-dev", "libssl-dev", "pkg-config"],
       "seconds": 18000,
       "runs": [{ "select": ["-p", "codex-cli", "--bin", "codex"], "args": ["--version"], "stdout": "codex-cli 0.165.0\n" }],

@@ -15,7 +15,7 @@
 //! - `rustc-env`: not a variable cargo or rustc gives a crate itself ([`given_by_cargo`]).
 //!
 //! What counting these rules over the bench corpus found (590 scripts,
-//! `bench/results/2026-10-27-bscache/directives.md`) decided their edges: no
+//! `tools/bench/results/2026-10-27-bscache/directives.md`) decided their edges: no
 //! `rustc-link-search` outside those directories, `-pthread` and an rpath into the Nix store
 //! the only link arguments outside the list, and `CARGO_COMMIT_HASH` (cargo's own build) the
 //! only `CARGO_*` a script set, which cargo never sets for a crate.
