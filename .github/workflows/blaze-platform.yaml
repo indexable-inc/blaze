@@ -115,7 +115,30 @@ jobs:
       # compiled. Run out here, the step fails and main's push still runs.
       - if: env.BLAZE == 'true'
         timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 220 || 150 }}
+        env:
+          BLAZE_STATS: "1"
+          PYTHONUNBUFFERED: "1"
         run: $PYTHON harness/unittests.py
+      # DIAGNOSTIC (not to land): the daemon's and workers' logs, for where the link time goes.
+      - if: always() && env.BLAZE == 'true'
+        run: |
+          set +e
+          for d in "${XDG_RUNTIME_DIR:-/nonexistent}/blaze" "$HOME/.cache/blaze"; do
+            [ -d "$d" ] || continue
+            tar -czf "$RUNNER_TEMP/blaze-logs.tgz" -C "$d" --exclude='*.o' --exclude='*.pack' --exclude='store' . 2>/dev/null
+            find "$d" -name log -o -name '*.log' | while read -r log; do
+              echo "::group::$log ($(wc -l < "$log") lines)"
+              grep -nE 'link|stats:|cold:|check:|warm-up|load|edit-to-binary|took|reach|timeline|in [0-9.]+m?s' "$log" | cut -c1-400 | head -n 800
+              echo "-- tail"; tail -n 40 "$log" | cut -c1-400
+              echo "::endgroup::"
+            done
+          done
+          ls -la "$RUNNER_TEMP/blaze-logs.tgz"
+      - if: always() && env.BLAZE == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: blaze-logs-${{ inputs.platform }}
+          path: ${{ runner.temp }}/blaze-logs.tgz
       - if: env.BLAZE != 'true'
         run: $PYTHON harness/unittests.py --cargo
       # What was compiled, and each test that passed, for the runs after this one; a run whose
