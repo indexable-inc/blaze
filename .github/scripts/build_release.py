@@ -43,7 +43,13 @@ training session by ending the daemon, after which each worker sees its input cl
 by itself. The `cc` crate passes `-Cprofile-generate`/`-Cprofile-use` on to the C compiler;
 on macOS Apple clang's profile format is not rustc's LLVM's and the instrumented blaze
 crashes at start (rust-lang/rust#163640), so the C code (mimalloc, ring) is built without
-them. macOS and Linux; stdlib only.
+them. macOS, Linux and Windows (x86-64 MSVC); stdlib only.
+
+On Windows the build links the C runtime statically (`+crt-static`), as the pinned LLVM is built
+(/MT), and names the Windows SDK's libraries, which the linker is not otherwise shown, as CI's
+build of blaze does (blaze-platform.yaml). Its flags go in `CARGO_ENCODED_RUSTFLAGS`, since the
+SDK's path has spaces. A shipped `.exe` is refused when it imports LLVM or the Visual C++ runtime,
+which a machine that downloads it may not have.
 
 With `--server` the blaze just built builds blaze's proc-macro server (`vendor/proc-macro-srv`,
 docs/no-rustc.md step J1) into DIR as `blaze-proc-macro-srv`, the server that expands with the
@@ -51,7 +57,6 @@ proc-macro libraries blaze links, found beside blaze (`BLAZE_PROC_MACRO_SERVER=1
 built whole by blaze (`--exe`), over the standard library blaze compiles, so it speaks the
 bridge of the libraries that blaze compiles; its own serde derives are expanded by the
 toolchain's server with rustc's libraries, as blaze's own executable may be built with rustc.
-Not on Windows, whose release blaze does not build yet.
 
 On Linux every binary in DIR, the server's included, is refused when it asks for a glibc newer
 than `GLIBC` (RHEL 9's; Debian 12 and Ubuntu 22.04 have newer): the release builds on the
@@ -91,6 +96,8 @@ MIN_COUNT = 1_000_000_000
 SERVER = ROOT / "vendor" / "proc-macro-srv"
 SERVER_CRATE = "rust_analyzer_proc_macro_srv"
 SERVER_BIN = "blaze-proc-macro-srv"
+# What an executable's name ends with on this machine.
+EXE = ".exe" if sys.platform == "win32" else ""
 # What LLVM says of a function whose control flow changed since the profile was trained.
 STALE = re.compile(r"function control flow change detected \(hash mismatch\)")
 # The hash rustc gives the crate blaze-engine, in each of its symbols. Cargo derives it from the
@@ -107,7 +114,10 @@ GLIBC_VERSION = re.compile(rb"GLIBC_(\d+)\.(\d+)(?:\.\d+)?\x00")
 # The LLVM the `llvm` feature links (crates/hir-ty-codegen/build.rs), and the libraries no
 # shipped binary may load: LLVM is linked in, and on Linux libstdc++ with it.
 LLVM_PREFIX = "LLVM_SYS_231_PREFIX"
-NOT_LOADED = {"linux": re.compile(r"libLLVM|libstdc\+\+|libc\+\+"), "darwin": re.compile(r"libLLVM")}
+NOT_LOADED = {"linux": re.compile(r"libLLVM|libstdc\+\+|libc\+\+"), "darwin": re.compile(r"libLLVM"),
+              "windows": re.compile(r"(?i)^(llvm|vcruntime|msvcp|concrt)")}
+# Where the Windows SDK keeps the libraries of each of its versions.
+WINDOWS_SDK = Path("C:/Program Files (x86)/Windows Kits/10/Lib")
 
 
 def run(argv, **kwargs):
@@ -136,10 +146,23 @@ def recipe(target, rustflags, cflags, features=None, llvm="<LLVM_SYS_231_PREFIX>
     triple = target.replace("-", "_")
     env = {"RUSTUP_TOOLCHAIN": TOOLCHAIN, "RUSTFLAGS": rustflags, "RUSTC_WRAPPER": "", "RUSTC_WORKSPACE_WRAPPER": "",
            "CARGO_INCREMENTAL": "0", LLVM_PREFIX: str(llvm)}
+    if target.endswith("-windows-msvc"):
+        flags = ["-C", "target-feature=+crt-static", "-L", f"native={windows_sdk()}", *filter(None, [rustflags])]
+        del env["RUSTFLAGS"]
+        env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(flags)
     for name in ("CFLAGS", "CXXFLAGS"):
         env[f"{name}_{triple}"] = " ".join(filter(None, [os.environ.get(f"{name}_{triple}"), cflags]))
     return env, ["cargo", "build", "-p", "blaze-engine", "--profile", "dist", "--locked", "--target", target,
                  "--features", ",".join(["llvm", *filter(None, [features])])]
+
+
+def windows_sdk():
+    """The x64 libraries of the newest Windows SDK installed."""
+    found = sorted(WINDOWS_SDK.glob("*/um/x64"), key=lambda p: [int(n) for n in re.findall(r"\d+", p.parts[-3])])
+    if not found:
+        sys.exit(f"error: build_release: no Windows SDK in {WINDOWS_SDK}: blaze links against its libraries. "
+                 "Visual Studio's installer adds it (the Windows 10 or 11 SDK)")
+    return found[-1]
 
 
 def llvm_prefix(target):
@@ -301,7 +324,7 @@ def pin(dirs):
 def proc_macro_server(blaze, out):
     """blaze's proc-macro server, built and linked by `blaze` into `out`, from a store of its
     own; the path of the executable."""
-    exe = out / SERVER_BIN
+    exe = out / (SERVER_BIN + EXE)
     with tempfile.TemporaryDirectory(prefix="blaze-server-") as work:
         env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_CACHE=str(Path(work) / "store"),
                    BLAZE_STD_FROM="off", RUST_BACKTRACE="0")
@@ -337,22 +360,71 @@ def check_glibc(out):
     print(f"build_release: the binaries in {out} ask for glibc {shown} or older", flush=True)
 
 
+def pe_imports(binary):
+    """The DLLs a PE32+ executable imports, the delay-loaded ones included, or None for a file that
+    is not one."""
+    data = binary.read_bytes()
+    if data[:2] != b"MZ":
+        return None
+    (pe,) = struct.unpack_from("<I", data, 0x3c)
+    if data[pe:pe + 4] != b"PE\0\0" or struct.unpack_from("<H", data, pe + 24)[0] != 0x20b:
+        return None
+    (count,) = struct.unpack_from("<H", data, pe + 6)
+    (optional_size,) = struct.unpack_from("<H", data, pe + 20)
+    optional = pe + 24
+    # Each section's address, size in memory and offset in the file.
+    sections = []
+    for index in range(count):
+        size, address, _, raw = struct.unpack_from("<IIII", data, optional + optional_size + 40 * index + 8)
+        sections.append((address, size, raw))
+
+    def offset(rva):
+        for address, size, raw in sections:
+            if address <= rva < address + size:
+                return rva - address + raw
+        sys.exit(f"error: build_release: {binary} has an address {rva:#x} in no section")
+
+    dlls = []
+    # The import directory (entry 1: 20-byte descriptors, the name's address at 12) and the
+    # delay-load one (entry 13: 32-byte descriptors, the name's at 4), each ended by zeros.
+    for entry, size, at in ((1, 20, 12), (13, 32, 4)):
+        (rva,) = struct.unpack_from("<I", data, optional + 112 + 8 * entry)
+        if not rva:
+            continue
+        descriptor = offset(rva)
+        while any(data[descriptor:descriptor + size]):
+            start = offset(struct.unpack_from("<I", data, descriptor + at)[0])
+            dlls.append(data[start:data.index(b"\0", start)].decode())
+            descriptor += size
+    return dlls
+
+
 def check_loads(out):
     """Refuses the build when a binary in `out` loads a library `NOT_LOADED` names."""
-    system = "darwin" if sys.platform == "darwin" else "linux"
+    system = {"darwin": "darwin", "win32": "windows"}.get(sys.platform, "linux")
     wrong = []
     for binary in sorted(out.iterdir()):
-        if not binary.is_file() or binary.read_bytes()[:4] not in (b"\x7fELF", b"\xcf\xfa\xed\xfe"):
+        if not binary.is_file():
             continue
-        argv = ["otool", "-L", binary] if system == "darwin" else ["readelf", "-d", binary]
-        shown = subprocess.run(argv, capture_output=True, text=True, check=True).stdout
-        lines = shown.splitlines()[1:] if system == "darwin" else [l for l in shown.splitlines() if "(NEEDED)" in l]
-        wrong += [f"{binary.name}: {line.strip()}" for line in lines if NOT_LOADED[system].search(line)]
+        if system == "windows":
+            if binary.suffix != ".exe":
+                continue
+            lines = pe_imports(binary)
+            if lines is None:
+                sys.exit(f"error: build_release: {binary} is not a 64-bit Windows executable")
+        elif binary.read_bytes()[:4] not in (b"\x7fELF", b"\xcf\xfa\xed\xfe"):
+            continue
+        else:
+            argv = ["otool", "-L", binary] if system == "darwin" else ["readelf", "-d", binary]
+            shown = subprocess.run(argv, capture_output=True, text=True, check=True).stdout
+            lines = shown.splitlines()[1:] if system == "darwin" else [l for l in shown.splitlines() if "(NEEDED)" in l]
+        wrong += [f"{binary.name}: {line.strip()}" for line in lines if NOT_LOADED[system].search(line.strip())]
     if wrong:
         sys.exit(f"error: build_release: a shipped binary loads what a user's machine lacks: {'; '.join(wrong)}. "
-                 "LLVM and, on Linux, libstdc++ are linked in statically (crates/hir-ty-codegen/build.rs)")
-    print(f"build_release: the binaries in {out} load no libLLVM" + ("" if system == "darwin" else " or C++ runtime"),
-          flush=True)
+                 "LLVM and, on Linux, libstdc++ are linked in statically (crates/hir-ty-codegen/build.rs), and on "
+                 "Windows the C runtime (+crt-static)")
+    shown = {"darwin": "", "linux": " or C++ runtime", "windows": " or Visual C++ runtime"}[system]
+    print(f"build_release: the binaries in {out} load no libLLVM{shown}", flush=True)
 
 
 def interpreter(binary):
@@ -392,7 +464,7 @@ def ship(args, binaries):
     for binary in binaries:
         shutil.copy2(binary, args.out / binary.name)
     if args.server:
-        proc_macro_server(args.out / "blaze-engine", args.out)
+        proc_macro_server(args.out / ("blaze-engine" + EXE), args.out)
     check_loads(args.out)
     if "linux" in args.target:
         check_nix(args.out) if args.nix else check_glibc(args.out)
