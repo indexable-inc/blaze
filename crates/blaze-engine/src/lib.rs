@@ -5772,8 +5772,9 @@ fn run_link(cmd: &str, binary: Option<&Path>, start: Instant, note: &str) -> any
     }
     let linked = linked?;
     let status = linked.status;
-    let said = String::from_utf8_lossy(&linked.stderr).into_owned();
-    eprint!("{}{said}", String::from_utf8_lossy(&linked.stdout));
+    // `link.exe` says what failed on its standard output.
+    let said = [&linked.stdout, &linked.stderr].map(|it| String::from_utf8_lossy(it)).concat();
+    eprint!("{said}");
     eprintln!("link: {:.1?} ({status}{note})", start.elapsed());
     if !status.success() {
         return Err(LinkFailed { status, said }.into());
