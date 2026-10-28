@@ -4,6 +4,7 @@
     "threads": { "group": "std", "tests": 2 },
     "thread_local": { "group": "std", "tests": 2 },
     "statics": { "group": "std", "tests": 2 },
+    "configured_out": { "group": "std", "tests": 1 },
     "envfs": { "group": "std", "tests": 2, "args": ["one", "two words"], "env": { "SMOKE_VAR": "smoke" } },
     "tokio_echo": { "group": "crates", "tests": 1 },
     "serde_json": { "group": "crates", "tests": 2 },
