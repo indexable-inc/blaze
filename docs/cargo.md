@@ -1046,6 +1046,17 @@ second, over that, the daemon stops the worker asked longest ago, and the next b
 workspace is cargo's while a worker loads it again. A worker that is answering or loading is
 never stopped, nor is the one asked last, nor any while a program takes live edits.
 
+A worker whose first build compiled from cold holds about twice what one started from the
+store holds: 4.4 GB against 2.3 GB for a 94-crate program, and 5.2 GB against 2.2 GB once
+edited, whose edits it also built in 1.9 s against 0.23 s, expanding again the macros it did
+not yet know to keep no state
+([#1299](https://github.com/indexable-inc/blaze/issues/1299)). Once the store has all that
+build kept, the worker writes `settles` beside its socket; after it has gone 10 s unasked,
+and while no program takes live edits, the daemon lets it go and starts a worker from the
+store in its place, which keeps the old one's log as `log.cold`. A build asked meanwhile
+waits for the new worker as for any that loads. A worker of several checkouts is not
+swapped.
+
 A client and a daemon built from different sources do not talk to each other. A daemon that
 gets a build request from another version stops its workers and exits, and the client
 starts its own.
