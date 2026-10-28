@@ -3,15 +3,18 @@
 //!
 //! What it holds:
 //!
-//! - a workspace: [`Workspace`], unnamed; under it (`ChildOf`) each crate the build put a
-//!   function of, `Crate`, named as the crate, and under a crate its modules, `Module`, named as
+//! - a workspace: [`Workspace`], unnamed; in it (Flecs's `Parent`) each crate the build put a
+//!   function of, `Crate`, named as the crate, and in a crate its modules, `Module`, named as
 //!   the module, one in another as in the crate;
-//! - a function: [`Function`], unnamed, in (`ChildOf`) the module its path names, or the crate
-//!   when it names none, and `Callees`, the functions it calls;
-//! - `(Calls, module)` on a module one of whose functions calls one of that module's, and
-//!   `(Calls, crate)` so on a crate. A call that is gone stays until the program is written
-//!   again. Calls of functions are not pairs: anim's 150 000 would hold 266 MB as pairs that
-//!   fragment and 1.9 GB as pairs that do not, against a few as vectors.
+//! - a function: [`Function`], unnamed, in the module its path is in ([`module_path`]: a
+//!   type's path is a module here, as on the page), or the crate when it is in none, and
+//!   `Callees`, the functions it calls;
+//! - a module's `Callees`, the other modules its functions call, and `(Calls, crate)` on a
+//!   crate one of whose functions calls one of that crate's. A call that is gone stays until
+//!   the program is written again. Only crates' calls are pairs: anim's 150 000 calls of
+//!   functions would hold 266 MB as pairs that fragment and 1.9 GB as pairs that do not, and
+//!   with its 20 000 calls of modules as pairs and `ChildOf` for `Parent`, the daemon held
+//!   318 MB after anim's build and two edits, against 163 MB.
 //!
 //! One thread has the world: [`World`] is not `Send`.
 
@@ -54,6 +57,12 @@ struct Function {
     build: u64,
 }
 
+/// Flecs's `EcsParent`.
+#[repr(C)]
+struct Parent {
+    value: Entity,
+}
+
 /// What a record did to a program.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Applied {
@@ -93,8 +102,10 @@ pub struct Program {
     /// The nodes each node calls.
     out: Vec<Vec<u32>>,
     edges: usize,
-    /// The modules (or crates) and crates with `(Calls, the other)`.
+    /// The modules that call one another, and the crates.
     calls: rustc_hash::FxHashSet<(Entity, Entity)>,
+    /// The modules each module calls, as its `Callees`.
+    module_calls: FxHashMap<Entity, Vec<Entity>>,
     /// Calls of the build's objects to ids none of its records has named yet: the object,
     /// the node that calls and the id. One to code of another is never named.
     unresolved: Vec<(u32, u32, u32)>,
@@ -167,6 +178,7 @@ impl World {
             out: Vec::new(),
             edges: 0,
             calls: Default::default(),
+            module_calls: FxHashMap::default(),
             unresolved: Vec::new(),
             records: Vec::new(),
         }
@@ -310,6 +322,7 @@ impl World {
         program.out.clear();
         program.edges = 0;
         program.calls.clear();
+        program.module_calls.clear();
         program.unresolved.clear();
     }
 
@@ -334,8 +347,7 @@ impl World {
                     let parent = self.module_of(program, in_crate, &function.krate, &function.name);
                     // SAFETY: the world's thread.
                     let entity = unsafe { ecs::ecs_new(self.world) };
-                    // SAFETY: as above.
-                    unsafe { ecs::ecs_add_id(self.world, entity, pair(child_of(), parent)) };
+                    self.set_parent(entity, parent);
                     let at = program.nodes.len() as u32;
                     program.nodes.push(Node { entity, krate, module: parent });
                     program.out.push(Vec::new());
@@ -377,6 +389,7 @@ impl World {
             }
         });
         let mut changed: Vec<u32> = placed;
+        let mut changed_modules = Vec::new();
         for (from, to) in calls {
             let out = &mut program.out[from as usize];
             if out.contains(&to) {
@@ -387,25 +400,39 @@ impl World {
             changed.push(from);
             let (from, to) = (&program.nodes[from as usize], &program.nodes[to as usize]);
             let crates = (program.crates_of[from.krate as usize], program.crates_of[to.krate as usize]);
-            for (from, to) in [(from.module, to.module), crates] {
-                if from != to && program.calls.insert((from, to)) {
-                    // SAFETY: the world's thread.
-                    unsafe { ecs::ecs_add_id(self.world, from, pair(self.calls, to)) };
-                }
+            // A function at its crate's root is in no module: its calls are its crate's alone.
+            let in_modules = from.module != crates.0 && to.module != crates.1;
+            if in_modules && from.module != to.module && program.calls.insert((from.module, to.module)) {
+                program.module_calls.entry(from.module).or_default().push(to.module);
+                changed_modules.push(from.module);
+            }
+            if crates.0 != crates.1 && program.calls.insert(crates) {
+                // SAFETY: the world's thread.
+                unsafe { ecs::ecs_add_id(self.world, crates.0, pair(self.calls, crates.1)) };
             }
         }
         changed.sort_unstable();
         changed.dedup();
         for at in changed {
-            let mut callees: Vec<Entity> =
+            let callees: Vec<Entity> =
                 program.out[at as usize].iter().map(|&to| program.nodes[to as usize].entity).collect();
-            let vector = ecs::ecs_vec_t {
-                array: callees.as_mut_ptr().cast::<c_void>(),
-                count: callees.len() as i32,
-                size: callees.capacity() as i32,
-            };
-            self.set(program.nodes[at as usize].entity, self.callees, &vector);
+            self.set_callees(program.nodes[at as usize].entity, callees);
         }
+        changed_modules.sort_unstable();
+        changed_modules.dedup();
+        for module in changed_modules {
+            let callees = program.module_calls[&module].clone();
+            self.set_callees(module, callees);
+        }
+    }
+
+    fn set_callees(&mut self, entity: Entity, mut callees: Vec<Entity>) {
+        let vector = ecs::ecs_vec_t {
+            array: callees.as_mut_ptr().cast::<c_void>(),
+            count: callees.len() as i32,
+            size: callees.capacity() as i32,
+        };
+        self.set(entity, self.callees, &vector);
     }
 
     fn crate_of(&mut self, program: &mut Program, name: &str) -> (u32, Entity) {
@@ -420,19 +447,13 @@ impl World {
         it
     }
 
-    /// The module a function's path names in its crate: the segments of its path before its
-    /// own, from the crate's on, that are a module's (begin with a lowercase letter).
+    /// The module a function is in ([`module_path`]), under its crate, from the crate's name on.
     fn module_of(&mut self, program: &mut Program, mut at: Entity, krate: &str, name: &str) -> Entity {
-        let path = path_of(name);
-        let mut segments: Vec<&str> = path.split("::").collect();
-        segments.pop();
+        let mut segments = module_path(name);
         if segments.first() == Some(&krate) {
             segments.remove(0);
         }
         for segment in segments {
-            if !segment.starts_with(|c: char| c.is_ascii_lowercase()) {
-                break;
-            }
             let key = (at, segment.to_owned());
             at = match program.modules.get(&key) {
                 Some(&it) => it,
@@ -448,14 +469,24 @@ impl World {
 
     fn named(&mut self, parent: Entity, name: &str, kind: Entity) -> Entity {
         let name = CString::new(name.replace('\0', "")).unwrap_or_default();
-        // SAFETY: the world's thread, a NUL-terminated name Flecs copies.
+        // SAFETY: the world's thread.
+        let entity = unsafe { ecs::ecs_new(self.world) };
+        self.set_parent(entity, parent);
+        // SAFETY: as above, and a NUL-terminated name Flecs copies.
         unsafe {
-            let entity = ecs::ecs_new(self.world);
-            ecs::ecs_add_id(self.world, entity, pair(child_of(), parent));
             ecs::ecs_set_name(self.world, entity, name.as_ptr());
             ecs::ecs_add_id(self.world, entity, kind);
-            entity
         }
+        entity
+    }
+
+    /// Puts `entity` in `parent` with Flecs's `Parent`, a `ChildOf` that does not fragment:
+    /// with `(ChildOf, module)` the functions of each module are a table of their own, and anim
+    /// has 5 000 modules.
+    fn set_parent(&mut self, entity: Entity, parent: Entity) {
+        // SAFETY: a constant Flecs sets once, before any world.
+        let id = unsafe { ecs::FLECS_IDEcsParentID_ };
+        self.set(entity, id, &Parent { value: parent });
     }
 
     /// Sets `value` as the component `id` of `entity`: Flecs copies it, its strings too.
@@ -505,47 +536,124 @@ impl Program {
     }
 }
 
-/// A function's path as a backtrace names it, without its generic arguments, and `<T>::f` as
-/// `T::f`: `<alloc::vec::Vec<u8>>::push` is `alloc::vec::Vec::push`.
-pub fn path_of(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
+/// The path a function is in, from how a backtrace names it: its path but its last segment,
+/// without generic arguments or closures, and of a method of `<T as Trait>` or `<T>`, `T`'s
+/// path. As the page's `moduleOf` (assets/names.js), so the world's modules are the page's:
+///
+/// ```text
+/// anim::scene::render                                  anim::scene
+/// anim::main::{closure#0}                              anim
+/// core::ptr::drop_in_place::<anim::Thing>              core::ptr
+/// <alloc::vec::Vec<T> as core::ops::drop::Drop>::drop  alloc::vec::Vec
+/// <&[u8] as core::fmt::Debug>::fmt                     (none: a slice has no path)
+/// ```
+pub fn module_path(name: &str) -> Vec<&str> {
+    if name.starts_with('<') {
+        return match closing(name, 0) {
+            Some(end) => self_path(&name[1..end]),
+            None => Vec::new(),
+        };
+    }
+    let mut segments = segments(name);
+    segments.pop();
+    segments
+}
+
+/// `name` split at each `::` outside `<>`, `()`, `[]` and `{}`.
+fn split_path(name: &str) -> Vec<&str> {
+    let (mut out, mut depth, mut start, mut last) = (Vec::new(), 0usize, 0, '\0');
     let mut chars = name.char_indices().peekable();
     while let Some((at, c)) = chars.next() {
-        if c != '<' || at == 0 {
-            out.push(c);
-            continue;
+        match c {
+            '<' | '(' | '[' | '{' => depth += 1,
+            '>' if last != '-' => depth = depth.saturating_sub(1),
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 && chars.peek().is_some_and(|&(_, next)| next == ':') => {
+                out.push(&name[start..at]);
+                chars.next();
+                start = at + 2;
+            }
+            _ => {}
         }
-        if out.ends_with("::") {
-            out.truncate(out.len() - 2);
-        }
-        let mut depth = 1;
-        for (_, c) in chars.by_ref() {
-            depth += match c {
-                '<' => 1,
-                '>' => -1,
-                _ => 0,
-            };
+        last = c;
+    }
+    out.push(&name[start..]);
+    out
+}
+
+/// The byte of the `>` that closes the `<` at `open`.
+fn closing(name: &str, open: usize) -> Option<usize> {
+    let (mut depth, mut last) = (0usize, '\0');
+    for (at, c) in name[open..].char_indices() {
+        if c == '<' {
+            depth += 1;
+        } else if c == '>' && last != '-' {
+            depth = depth.checked_sub(1)?;
             if depth == 0 {
-                break;
+                return Some(open + at);
             }
         }
+        last = c;
     }
-    if let Some(rest) = out.strip_prefix('<')
-        && let Some(end) = rest.find(">::")
-        && !rest[..end].contains(" as ")
-    {
-        return format!("{}{}", &rest[..end], &rest[end + 1..]);
+    None
+}
+
+/// The path of `T` in `T as Trait`, or of `T`.
+fn self_path(inner: &str) -> Vec<&str> {
+    let (mut depth, mut last) = (0usize, '\0');
+    for (at, c) in inner.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' if last != '-' => depth = depth.saturating_sub(1),
+            ')' | ']' => depth = depth.saturating_sub(1),
+            ' ' if depth == 0 && inner[at..].starts_with(" as ") => return type_path(&inner[..at]),
+            _ => {}
+        }
+        last = c;
     }
-    out
+    type_path(inner)
+}
+
+/// A type's path without its generic arguments, or none for a type that has none: a reference
+/// or pointer is its pointee's, a slice, tuple or `fn` pointer has none.
+fn type_path(ty: &str) -> Vec<&str> {
+    let mut ty = ty.trim();
+    loop {
+        let before = ty;
+        for prefix in ["&mut ", "&", "*const ", "*mut ", "dyn "] {
+            ty = ty.strip_prefix(prefix).unwrap_or(ty).trim_start();
+        }
+        if let Some(rest) = ty.strip_prefix('\'') {
+            ty = rest.split_once(' ').map_or(ty, |(_, rest)| rest.trim_start());
+        }
+        if ty == before {
+            break;
+        }
+    }
+    if ty.starts_with('<') {
+        return match closing(ty, 0) {
+            Some(end) => self_path(&ty[1..end]),
+            None => Vec::new(),
+        };
+    }
+    let fn_pointer = ty.starts_with("fn(") || ty.starts_with("unsafe ") || ty.starts_with("extern ");
+    if fn_pointer || !ty.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+        return Vec::new();
+    }
+    segments(ty)
+}
+
+/// The named segments of a path: no `::<…>`, generic arguments or `{closure#0}`.
+fn segments(path: &str) -> Vec<&str> {
+    split_path(path)
+        .into_iter()
+        .filter(|it| !it.is_empty() && !it.starts_with('<') && !it.starts_with('{'))
+        .map(|it| it.find('<').map_or(it, |lt| &it[..lt]))
+        .collect()
 }
 
 fn pair(relationship: Entity, target: Entity) -> ecs::ecs_id_t {
     ecs::ECS_PAIR | ((relationship & 0xFFFF_FFFF) << 32) | (target & 0xFFFF_FFFF)
-}
-
-fn child_of() -> Entity {
-    // SAFETY: a constant Flecs sets once, before any world.
-    unsafe { ecs::EcsChildOf }
 }
 
 fn text(out: &mut Vec<u8>, text: &[u8]) {

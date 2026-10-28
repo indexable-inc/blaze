@@ -5,7 +5,7 @@ use blaze_protocol::events::{Event, Function, How, Record};
 use crate::{
     Graphs, Next,
     http::{self, Frame, Refused, Request, Route, Site},
-    world::{Applied, World, path_of},
+    world::{Applied, World, module_path},
 };
 
 fn site() -> Site {
@@ -204,38 +204,61 @@ fn the_world_is_read_over_flecs_rest_and_never_written() {
     world.apply(&mut program, 1, &began(1, "/w"));
     let name = "<alloc::vec::Vec<u8>>::push";
     let cold = fns(0, true, vec![function(0, 10, "anim::scene::render", &[1], How::Compiled { ns: 5 }),
-                                 function(1, 11, name, &[], How::Stored)]);
+                                 function(1, 11, name, &[], How::Stored),
+                                 function(2, 12, "anim::main", &[0], How::Compiled { ns: 7 })]);
     world.apply(&mut program, 1, &cold);
+    // `main` is at its crate's root, in no module: its call is of no module, and of no other crate.
+    let answer = world.rest("GET", "/query?expr=Crate,(Calls,*)").unwrap();
+    let body = String::from_utf8_lossy(&answer.body);
+    assert!(answer.code == 200 && body.contains(r#""results":[]"#), "{body}");
     let answer = world.rest("GET", "/query?expr=Function").unwrap();
     assert_eq!(answer.code, 200);
     let body = String::from_utf8(answer.body).unwrap();
     assert!(body.contains("anim::scene::render") && body.contains(name), "{body}");
-    // `render` calls `push`: their modules call one another, and `render` has it as callee.
-    let answer = world.rest("GET", "/query?expr=Module,(Calls,*)").unwrap();
+    // `render` calls `push`: `render` has it as callee, and `scene` has `Vec`.
+    let answer = world.rest("GET", "/query?expr=Module,Callees").unwrap();
     let body = String::from_utf8_lossy(&answer.body);
-    assert!(answer.code == 200 && body.contains("scene") && body.contains("vec"), "{body}");
-    let answer = world.rest("GET", "/query?expr=Callees").unwrap();
+    assert!(answer.code == 200 && body.contains("\"name\":\"scene\"") && body.contains("vec.Vec"), "{body}");
+    let answer = world.rest("GET", "/query?expr=Function,Callees").unwrap();
     let body = String::from_utf8_lossy(&answer.body);
-    assert!(answer.code == 200 && body.contains("\"values\":[[\"#"), "{body}");
+    let render = r##""name":"anim::scene::render", "how":0, "ns":5, "build":1}, ["#"##;
+    assert!(answer.code == 200 && body.contains(render), "{body}");
     assert_eq!(world.rest("PUT", "/entity/made").unwrap().code, 403);
     assert_eq!(world.rest("DELETE", "/entity/flecs").unwrap().code, 403);
     // The modules of a function's path are entities under its crate.
     let answer = world.rest("GET", "/query?expr=Module").unwrap();
     let body = String::from_utf8(answer.body).unwrap();
-    assert!(body.contains("scene"), "{body}");
+    assert!(body.contains("\"name\":\"scene\"") && body.contains("\"parent\":\"#"), "{body}");
+    // What is in a program goes with it.
+    world.forget(program);
+    for kind in ["Function", "Module", "Crate"] {
+        let answer = world.rest("GET", &format!("/query?expr={kind}")).unwrap();
+        let body = String::from_utf8_lossy(&answer.body);
+        assert!(body.contains(r#""results":[]"#), "{kind}: {body}");
+    }
 }
 
 #[test]
-fn a_path_is_a_name_without_its_generic_arguments() {
-    assert_eq!(path_of("<alloc::vec::Vec<u8>>::push"), "alloc::vec::Vec::push");
-    assert_eq!(path_of("core::ptr::drop_in_place::<anim::Scene>"), "core::ptr::drop_in_place");
-    assert_eq!(
-        path_of("<wgpu::Texture as core::ops::drop::Drop>::drop"),
-        "<wgpu::Texture as core::ops::drop::Drop>::drop"
-    );
-    assert_eq!(path_of("<[u8] as core::ops::Index<core::ops::Range<usize>>>::index"),
-               "<[u8] as core::ops::Index>::index");
-    assert_eq!(path_of("anim::main::{closure#0}"), "anim::main::{closure#0}");
+fn a_function_is_in_the_path_the_page_groups_it_by() {
+    let cases = [
+        ("anim::scene::render", "anim::scene"),
+        ("anim::main::{closure#0}", "anim"),
+        ("core::ptr::drop_in_place::<anim::Thing>", "core::ptr"),
+        ("<alloc::vec::Vec<T> as core::ops::drop::Drop>::drop", "alloc::vec::Vec"),
+        ("<alloc::vec::Vec<u8>>::push", "alloc::vec::Vec"),
+        ("<anim::Mesh>::new", "anim::Mesh"),
+        ("anim::Mesh::{impl#2}::build", "anim::Mesh"),
+        ("<<anim::A as anim::T>::Out as core::fmt::Debug>::fmt", "anim::A"),
+        ("<(A, B) as core::clone::Clone>::clone", ""),
+        ("<&mut wgpu::Device as core::fmt::Debug>::fmt", "wgpu::Device"),
+        ("<&[u8] as core::fmt::Debug>::fmt", ""),
+        ("<fn() -> u8 as core::fmt::Debug>::fmt", ""),
+        ("<[u8] as core::ops::Index<core::ops::Range<usize>>>::index", ""),
+        ("main", ""),
+    ];
+    for (name, path) in cases {
+        assert_eq!(module_path(name).join("::"), path, "{name}");
+    }
 }
 
 fn message(next: Next) -> Vec<u8> {
