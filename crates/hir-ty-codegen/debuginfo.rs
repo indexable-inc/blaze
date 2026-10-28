@@ -650,7 +650,9 @@ impl Dwarf {
             LineString::String(b"<blaze>".to_vec()),
             None,
         );
-        let producer = self.text(concat!("blaze ", env!("CARGO_PKG_VERSION")).as_bytes());
+        // No version: the release blaze is is told only to the engine, so that a release changes
+        // no crate below it (crates/blaze-engine/build.rs).
+        let producer = self.text(b"blaze");
         let name = self.text(b"<blaze>");
         let directory = self.text(&self.directory.clone());
         let unit = &mut self.dwarf.unit;

@@ -1,4 +1,4 @@
-# blaze building its own tree, cargo vs blaze, and moving blaze's store through the gateway. bench/remote-cache/selfbuild/README.md says how.
+# blaze building its own tree, cargo vs blaze, and moving blaze's store through the gateway. tools/bench/remote-cache/selfbuild/README.md says how.
 # machine: vm16a = ix arm64, 4 cpus, 16 GB committed; vm32 = ix arm64, 4 cpus, 32 GB committed; vm16b = ix arm64, 16 cpus, 16 GB, each run pinned to cpus 0-3.
 # blaze: the commit whose blaze (cargo-built, --features llvm) ran, which is also the tree built. fdc1c53f15 carries one local commit: build-script-env = ["LLVM_SYS_231_PREFIX"] in Cargo.toml.
 # job build = cargo [blaze] build -p blaze-engine --release --features llvm; test = the unit tests of harness/unittests.py's crates (rc 101 of the fork's run = its known failures).

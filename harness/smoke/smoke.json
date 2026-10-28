@@ -120,6 +120,43 @@
           "dynamo-llm's default feature block-manager, and so `--workspace`": "NIXL, NUMA and O_DIRECT code that dynamo builds on Linux only (its AGENTS.md: dynamo-llm with --no-default-features on macOS)"
         }
       }
+    },
+    "fff": {
+      "group": "apps",
+      "repo": "dmtrKovalenko/fff",
+      "rev": "95fd777c2529fc7b4d7572dabff64cc07268f2c5",
+      "note": "v0.11.0 (formerly fff.nvim). Its default features (the `ripgrep` walker and glob matcher, pure Rust) need no Zig, which its CI's `zlob` feature does. The program is its MCP server, fff-mcp: the version, and its health check of a directory of its own. Its tests are those of fff-search and the crates below it, as its CI's (which leaves out the Neovim and Python bindings); they watch the file system, so they need inotify or FSEvents, not a GPU or the network.",
+      "seconds": 3600,
+      "runs": [
+        { "select": ["-p", "fff-mcp", "--bin", "fff-mcp"], "args": ["--version"], "contains": "fff-mcp 0.11.0" },
+        { "select": ["-p", "fff-mcp", "--bin", "fff-mcp"],
+          "args": ["--healthcheck", "--frecency-db", "{work}/frecency", "--history-db", "{work}/history", "--log-file", "{work}/fff.log", "{work}"],
+          "contains": "All checks passed." }
+      ],
+      "test": ["-p", "fff-query-parser", "-p", "fff-grep", "-p", "fff-search"],
+      "excluded": {
+        "the `zlob` feature (its CI's and release's glob matcher)": "Zig compiles it; the runners have no Zig",
+        "fff-nvim, fff-python, fff-c": "bindings for LuaJIT, CPython and C that its CI does not test with cargo either (Lua, Python and C suites of their own)"
+      }
+    },
+    "fframes": {
+      "group": "apps",
+      "repo": "dmtrKovalenko/fframes",
+      "rev": "69174f0187b5d8e92329246898f70250b59f08f2",
+      "note": "v1.3.0, a video rendering framework. System libraries from its README and CI (main.yml): the codecs FFmpeg links, nasm and libclang for ffmpeg-sys-fframes, fontconfig. Its build scripts download a prebuilt static FFmpeg (ffmpeg-sys-fframes) and Skia (skia-bindings) from GitHub. The program is its hello-world example's renderer: the timeline, and one frame rendered to PNG by the CPU backend. Its tests are its CI's on Windows, the crates that need no GPU.",
+      "apt": ["clang", "libasound2-dev", "libclang-dev", "libfontconfig1-dev", "libopus-dev", "libvpx-dev", "libx264-dev", "libx265-dev",
+              "nasm", "ninja-build", "pkg-config", "yasm"],
+      "brew": ["nasm", "ninja", "opus", "pkg-config", "x264", "x265"],
+      "seconds": 7200,
+      "runs": [
+        { "select": ["-p", "hello-world-example", "--bin", "hello_world_example_bin"], "args": ["timeline"], "contains": "1920x1080 @ 30 fps, 900 frames (30.00s)" },
+        { "select": ["-p", "hello-world-example", "--bin", "hello_world_example_bin"], "args": ["--renderer", "cpu", "frame", "1s", "-o", "{work}/frames"],
+          "file": "{work}/frames/1s.png", "starts": "\u0089PNG" }
+      ],
+      "test": ["-p", "fframes", "-p", "fframes-media", "-p", "webvtt-parser", "-p", "fframes-media-dir-macro"],
+      "excluded": {
+        "e2e (the frames of every example against snapshots), the Skia GPU renderer, the native player": "they need Vulkan or Metal and a display, or odiff from npm"
+      }
     }
   }
 }

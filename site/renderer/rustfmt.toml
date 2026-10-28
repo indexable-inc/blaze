@@ -1,4 +1,4 @@
-# As blaze's (rustfmt.toml at the repo root).
+# As blaze's (.rustfmt.toml at the repo root).
 edition = "2024"
 reorder_modules = true
 use_small_heuristics = "Max"

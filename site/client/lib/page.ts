@@ -25,6 +25,33 @@ export const COMMENTS = 'blaze:comments';
 /** Fired on window by client/comments.ts after it swapped threads in, so the comment count can be redrawn. */
 export const THREADS = 'blaze:threads';
 
+/**
+ * A new version of the site is going in (client/lib/update.ts): fired on window just before a reload or an in-place
+ * refresh, as a CustomEvent whose detail is a plain object. Each script that owns state worth keeping (a draft, a
+ * position) adds it under its own name, JSON-safe; the object waits in sessionStorage under KEPT, and the script
+ * takes its part back with `kept` when it sets up again.
+ */
+export const SAVE = 'blaze:save';
+export const KEPT = 'blaze.update.v1';
+/** Fired on window by client/lib/update.ts: fetch this page again, bypassing the prefetch cache, and swap it in. */
+export const REFRESH = 'blaze:refresh';
+/** Fired on window by client/nav.ts after a REFRESH (a CustomEvent, detail: whether the page was swapped in). */
+export const REFRESHED = 'blaze:refreshed';
+/** How long a saved state is good for: a reload that takes longer than this, or failed, starts clean. */
+const KEPT_MS = 120_000;
+
+/** The part `name` of the state saved before the last update, if one is waiting (client/lib/update.ts clears it). */
+export function kept<T>(name: string): T | undefined {
+	try {
+		const raw = sessionStorage.getItem(KEPT);
+		const v: unknown = raw === null ? null : JSON.parse(raw);
+		if (!v || typeof v !== 'object' || !('at' in v) || typeof v.at !== 'number' || Date.now() - v.at > KEPT_MS) return undefined;
+		return (v as Record<string, unknown>)[name] as T | undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 export function onPage(init: (signal: AbortSignal) => Teardown | void): void {
 	let stop: Teardown | null = null;
 	const run = () => {

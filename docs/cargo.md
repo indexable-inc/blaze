@@ -25,7 +25,7 @@ have to be installed side by side, with `blaze-rustc`. The [installer](../instal
 From the release after 0.1.0, `--profile dist` builds the profile a release is built with, less
 the PGO a release adds ([reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md)); 0.1.0 has no such
 profile and fails with it. From a checkout, the release's own recipe builds all of it, with the profile
-[pgo/profiles.json](../pgo/profiles.json) pins:
+[tools/pgo/profiles.json](../tools/pgo/profiles.json) pins:
 
     python3 .github/scripts/build_release.py --target $(rustc +"$(cat harness/toolchain)" -vV | sed -n 's/^host: //p') --out shipped
     cp shipped/* ~/.cargo/bin/
@@ -411,7 +411,7 @@ itself (`CARGO_PKG_*`, `CARGO_MANIFEST_DIR`, `OUT_DIR`, `RUSTC*`, ...); what car
 build scripts (`CARGO_CFG_*`, `CARGO_FEATURE_*`, `CARGO_ENCODED_RUSTFLAGS`) it may forward, as
 rav1e's does. Anything
 else fails the build, naming the script and each line. Over the bench corpus's 587 runs the
-rules refuse none (`bench/results/2026-10-27-bscache/directives.md`).
+rules refuse none (`tools/bench/results/2026-10-27-bscache/directives.md`).
 
 and, for a package of the workspace, in its own manifest:
 
@@ -501,7 +501,7 @@ A failed run says what it was given and what it lacked: a library (the `system-d
 add), a write outside `OUT_DIR` (the way out), a variable. Over the bench corpus 425 of 434
 runs succeed in their closure, 24 of them with libraries of the table, and every one is a
 store hit on the same machine and from another's store pulled from the remote, at the same
-checkout path (`bench/results/2026-10-27-bscache/closure.md`). A script cargo's rustc compiled
+checkout path (`tools/bench/results/2026-10-27-bscache/closure.md`). A script cargo's rustc compiled
 is keyed by its bytes, which name `CARGO_HOME`, so another checkout path misses it yet.
 `BLAZE_KEY_TRACE=<dir>` writes each key's fields to `<dir>/<key>.txt`, to see what two
 machines' keys differ in.
@@ -773,7 +773,7 @@ projects it is not yet faster than running every test, whose tests are short: th
 tests' hashes on a fresh daemon takes 0.94 s for axum and 0.45 s for just, down from 6.2 s and
 7.6 s before dependencies were hashed by name, and the run takes 13.5 s against 11.9 s for every
 test (axum) and 32.3 s against 28.8 s (just;
-[the numbers](../bench/results/2026-10-27-testcache/README.md)).
+[the numbers](../tools/bench/results/2026-10-27-testcache/README.md)).
 
 `-v`, `-q` and `--color` only change what cargo prints, and are the same build to the daemon.
 
