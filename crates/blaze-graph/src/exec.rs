@@ -73,12 +73,14 @@ where
                 let (rx, done_tx, first_panic) = (rx.clone(), done_tx.clone(), &first_panic);
                 scope.spawn(move || {
                     for id in rx {
-                        let did = catch_unwind(AssertUnwindSafe(|| work(id))).unwrap_or_else(|panic| {
-                            let did = Did::failed(panicked(&*panic));
-                            let mut first = first_panic.lock().unwrap_or_else(PoisonError::into_inner);
-                            first.get_or_insert(panic);
-                            did
-                        });
+                        let did =
+                            catch_unwind(AssertUnwindSafe(|| work(id))).unwrap_or_else(|panic| {
+                                let did = Did::failed(panicked(&*panic));
+                                let mut first =
+                                    first_panic.lock().unwrap_or_else(PoisonError::into_inner);
+                                first.get_or_insert(panic);
+                                did
+                            });
                         if done_tx.send((id, did, now())).is_err() {
                             return;
                         }

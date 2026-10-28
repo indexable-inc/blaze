@@ -438,21 +438,21 @@ fn the_executor_adds_what_work_finds_and_fails_on_a_panic() {
     let mut records = Vec::new();
     let drove = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         drive(
-        &mut machine,
-        vec![spec(0, NodeKind::Manifest, &[], Pool::Io, 1)],
-        &|id| {
-            ran.lock().unwrap().push(id.0);
-            match id.0 {
-                0 => Did {
-                    outcome: Outcome::Built,
-                    added: vec![work(1, &[0], 1), work(2, &[0], 1), work(3, &[1, 2], 1)],
-                },
-                2 => panic!("no def map"),
-                _ => Did::built(),
-            }
-        },
-        &mut |record| records.push(record.clone()),
-        Some(&mut trace),
+            &mut machine,
+            vec![spec(0, NodeKind::Manifest, &[], Pool::Io, 1)],
+            &|id| {
+                ran.lock().unwrap().push(id.0);
+                match id.0 {
+                    0 => Did {
+                        outcome: Outcome::Built,
+                        added: vec![work(1, &[0], 1), work(2, &[0], 1), work(3, &[1, 2], 1)],
+                    },
+                    2 => panic!("no def map"),
+                    _ => Did::built(),
+                }
+            },
+            &mut |record| records.push(record.clone()),
+            Some(&mut trace),
         )
     }));
     // The panic goes on once the build is over, and the build says the node failed.

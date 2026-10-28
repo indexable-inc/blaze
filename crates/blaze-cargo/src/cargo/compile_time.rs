@@ -439,7 +439,8 @@ impl<'a> Driver<'a> {
             crate::events::say(record.event.clone());
         };
         let ok = exec::drive(&mut machine, nodes, &work, &mut said, None)?;
-        if let Some(error) = failed.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
+        if let Some(error) = failed.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
             return Err(error);
         }
         match (ok, first_why) {
