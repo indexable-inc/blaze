@@ -21,7 +21,7 @@ This document covers:
 - Andrew's four questions, answered;
 - what exists elsewhere, briefly, as background;
 - why one engine can serve both outputs, and what differs between them;
-- the design, piece by piece;
+- the design, piece by piece, including inlining and tiered code;
 - where base images come from in CI;
 - how the engine is proven right;
 - the stages, starting with the first pull request.
@@ -311,6 +311,71 @@ its own large piece: until the engine writes one, a debug build on Windows stays
 before the takeover. An image without debug info when it was asked for would be a quiet
 difference.
 
+### Inlining, LTO and the JIT
+
+A patch is correct only if it replaces every placed function whose bytes depend on what
+changed. When `g` is inlined into `f`, an edit to `g` changes `f`'s code too, and the patch has
+to carry `f`. So the identity the engine compares has to cover what was inlined into a function,
+and not only its own source.
+
+What `hir-ty-codegen` does today (**read**, 2026-10-28):
+
+- **The identity the patch planner compares is the code itself.** A function's serial is
+  `print_of` its compiled code (`root_serial`, `instance_serial` in `hir-ty-codegen/mod.rs`): a
+  128-bit stable hash of the machine code, relocations and requests that `compiled_instance`
+  produced. Inlined bodies come from `inlinable`, a salsa query marked `no_eq`. When `g`'s
+  inlinable body is computed again, every `compiled_instance` that read it is computed again, and
+  `f`'s print changes exactly when its bytes do. The planner (`patch.rs`, `Mark`) puts in the
+  patch every function whose mark differs from the base. **Sound**: what was inlined is in the
+  bytes, and the bytes are what is hashed. It is also precise: a callee that was not inlined
+  changes only its own print.
+- **The LLVM backend imports callees across crates** as `available_externally` bodies, ThinLTO
+  style (`imports.rs`). The imported IR is read through the same queries, so the same argument
+  holds: the caller's emitted code, and with it its print, follows what was imported.
+- **Tiered code** (`tier.rs`) keeps, with each level-2 or level-3 body, the print of the level-1
+  code of the function and of every function built into it. An edit to any of them demotes the
+  function to level 1 in that same build (`Tiers::take_demoted`). **Sound**, by the same rule.
+- **The disk store's key is not the code print.** It is the stable name: path, generic
+  arguments, crate ([cache.md](cache.md#what-is-stored-and-under-what-key)). That is sound only
+  because naming is coarse. A crate of the checkout is named by a hash of its source, and an edit
+  renames every crate of the checkout that depends on it, so an entry can't hold a stale inlined
+  body from the checkout. A dependency is named by its version and cargo's metadata, which don't
+  change without its source changing. A generic dependency function instantiated with a checkout
+  type carries that type's crate name. This is correct and over-invalidates. It is not a
+  per-function identity of what was inlined.
+
+What the engine needs, then:
+
+- **It patches by print, never by name.** For each placed function, the layout records the print
+  of the bytes placed. A function is rewritten when its print changes. Inlining, imports and
+  tiering are then covered without the engine knowing about them.
+- **Inline sets travel with the print.** The store keeps, per entry, the prints of what was
+  inlined or imported into it (tier.rs already records them for tiered code). That lets a shared
+  block's entry be checked, not trusted: an entry whose inline set names a print the current
+  build has another of is not used. The over-invalidation of today's key can then be loosened in
+  a later change, with `harness/keys.py` extended to edit an inlined callee in another crate.
+- **Cross-module LTO at link time is not the engine's job.** All optimisation happens in
+  codegen, per function or per unit, before the engine sees code. The engine places bytes and
+  fixes references. It does no code folding (ICF) and no LTO, which keeps "what changed" equal to
+  "what codegen produced anew".
+
+**Tiered compilation in live mode** (a later stage, on top of what `tier.rs` does today). A
+program running under `blaze-live` starts on level-1 Cranelift code. The daemon samples it and
+recompiles hot functions at LLVM `-O3`, then with PGO from counters. It patches them into the
+**process output only**, through the same engine with the process rules. Tiered code never goes
+into an image file. It depends on a profile, so it can't be keyed or reproduced, and the image on
+disk keeps the level-1 code of the last edit. Later work for that stage: a patch table slot per
+tiered function, so that promotion and demotion are one store each, and on-stack replacement for
+hot loops that never return. Neither is designed here.
+
+**Release and shipped images stay deterministic and match rustc.** A release build, and any
+image published as a base for others, is a cold layout from an empty image, compiled at the
+profile's optimisation level by codegen. It holds no tiered code, no patched history and no
+shared block. The same inputs give the same bytes on every machine. Its behaviour is held to
+rustc's build of the same program by the differential harnesses
+([proving it right](#proving-it-right)). Only dev and test images are patched in place, and only
+running processes get tiered code.
+
 ### Debug info
 
 The store holds each function's line rows and variable places (`FunctionDebug`). The engine
@@ -415,6 +480,7 @@ image output.
 | 6 | Mach-O arm64, with signing and entitlements; takeover deletes the ld64 path | macOS builds with no `ld` or `codesign` |
 | 7 | wasm; takeover deletes `rust-lld` for wasm, and with it blaze's last need for `rust-lld` ([self-contained.md](self-contained.md)) | The toolchain ships no lld |
 | 8 | PE/COFF with PDB; takeover deletes `link.exe` and `lib.exe` | Windows builds without the MSVC linker |
+| 9 | Tiered code through the engine's process output: a patch-table slot per tiered function, on-stack replacement for hot loops; store entries carry their inline sets and `harness/keys.py` edits an inlined callee across crates | Hot functions at LLVM speed in a live program without a rebuild; release images unchanged |
 
 The first pull request is stage 1. It is small enough to review, it is checked against today's
 output from the start, and it puts the crate where every later stage builds.

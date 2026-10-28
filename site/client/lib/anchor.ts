@@ -1,7 +1,7 @@
 /**
  * Where a pointer is, in terms every reader shares (client/lib/cursors.ts sends and draws the others' pointers with
  * it): what the pointer is on, not where in the window, so it lands on the same thing for each reader whatever their
- * window size and layout (the sidebar shut, the chat open, "On this page" shown or not).
+ * window size and layout (the sidebar shut, "On this page" shown or not).
  *
  * `spotAt` turns a window point into a `Spot`, the anchor sent, and `placeOf` turns a Spot back into a point on this
  * reader's screen. A Spot is
@@ -10,19 +10,19 @@
  *   comment threads left out) and, while the pointer is on its text, the character there (its offset in the block's
  *   text); between blocks or beside the article, the block level with it. Every reader has the same blocks with the
  *   same text, so the same character is the same anchor wherever the lines wrap.
- * - in a region of the shell beside the article (REGIONS): the thing in it a reader would know (a link by its href, a
- *   chat message by its id, else the n-th button, list item, ... of the region), or the region itself.
+ * - in a region of the shell beside the article (REGIONS): the thing in it a reader would know (a link by its href,
+ *   else the n-th button, list item, ... of the region), or the region itself.
  *
  * and where on that thing, as fractions of its box. The regions are fixed or sticky: they stay put in the window while
  * the page scrolls under them, so a place in one is `fixed` (drawn in the window), and one in the article is drawn on
- * the page. A reader who has no such thing on screen (a block in a shut `<details>`, the sidebar shut, the chat
- * closed, a link scrolled out of its list) gets null: that pointer isn't on their screen.
+ * the page. A reader who has no such thing on screen (a block in a shut `<details>`, the sidebar shut, a link
+ * scrolled out of its list) gets null: that pointer isn't on their screen.
  *
  * worker/presence.ts checks a Spot the same way (`relay`): keep REGIONS' codes and KEY in step with it.
  */
 
 /** Where a pointer is: a region code (`m`, or one of REGIONS'), what in it (`key`: `b<block>` or `b<block>.<char>` in
- * the article; `a<href>`, `m<message id>`, `k<kind>.<n>`, or '' for the region itself, in a region), and x and y as
+ * the article; `a<href>`, `k<kind>.<n>`, or '' for the region itself, in a region), and x and y as
  * fractions of that thing's box. */
 export type Spot = [region: string, key: string, x: number, y: number];
 /** A Spot on this reader's screen, in window px; `fixed` when it stays put there as the page scrolls. */
@@ -32,18 +32,17 @@ export type Place = { x: number; y: number; fixed: boolean };
 const BLOCKS = 'h1, h2, h3, h4, h5, h6, p, li, pre, table, tr, figure, blockquote, dt, dd, img, details, summary';
 /**
  * The regions of the shell beside the article, by the code sent for each, innermost first: the who-is-here list
- * (inside the top line), the top line, the chat, "On this page" and the sidebar.
+ * (inside the top line), the top line, "On this page" and the sidebar.
  */
 const REGIONS: [string, string][] = [
 	['w', '.tl-list'],
 	['t', '.topline'],
-	['c', '.chat'],
 	['o', '.toc'],
 	['s', '.side'],
 ];
 /** What the article and the regions are, for whoever watches them move (client/lib/cursors.ts's ResizeObserver). */
 export const SHELL = ['main', ...REGIONS.map(([, sel]) => sel)].join(', ');
-/** A thing in a region that is neither a link nor a chat message is known by its kind and its place among the region's
+/** A thing in a region that is not a link is known by its kind and its place among the region's
  * things of that kind (`k<kind>.<n>`): the same for every reader, since the shell is. */
 const KINDS = ['button', 'summary', 'li', 'input, textarea', 'p', 'h2, h3'];
 /** What only this reader has on screen (a dialog, the feed: client/lib/feed.ts): a pointer there is on nothing the others have. */
@@ -162,14 +161,12 @@ export function spotAt(px: number, py: number, skip: Element[]): Spot | null {
 	const { hit, region, box } = at;
 	const on = (key: string, r: DOMRect): Spot => [region, key, frac(px, r.left, r.width), frac(py, r.top, r.height)];
 	if (box) {
-		// The innermost link or chat message, else the innermost thing of a kind, else the region.
+		// The innermost link, else the innermost thing of a kind, else the region.
 		let kind = -1;
 		let thing: Element | null = null;
 		for (let e: Element | null = hit; e && e !== box; e = e.parentElement) {
 			const href = e.matches('a[href]') ? e.getAttribute('href') : null;
 			if (href !== null && KEY.test(`a${href}`)) return on(`a${href}`, e.getBoundingClientRect());
-			const id = e.matches('.chat-msg') && e instanceof HTMLElement ? e.dataset.id : undefined;
-			if (id && /^\d{1,15}$/.test(id)) return on(`m${id}`, e.getBoundingClientRect());
 			if (kind < 0 && (kind = KINDS.findIndex((k) => e!.matches(k))) >= 0) thing = e;
 		}
 		if (thing) return on(`k${kind}.${[...box.querySelectorAll(KINDS[kind])].indexOf(thing)}`, thing.getBoundingClientRect());
@@ -191,7 +188,6 @@ function thingOf(box: HTMLElement, key: string): Element | null {
 	if (!key) return box;
 	const v = key.slice(1);
 	if (key[0] === 'a') return [...box.querySelectorAll('a[href]')].find((a) => a.getAttribute('href') === v && shown(a)) ?? null;
-	if (key[0] === 'm') return [...box.querySelectorAll(`.chat-msg[data-id="${CSS.escape(v)}"]`)].find(shown) ?? null;
 	const k = /^(\d+)\.(\d+)$/.exec(v);
 	return key[0] === 'k' && k && KINDS[+k[1]] ? (box.querySelectorAll(KINDS[+k[1]])[+k[2]] ?? null) : null;
 }
@@ -218,7 +214,7 @@ export function placeOf(s: Spot): Place | null {
 	const x = r.left + fx * r.width;
 	const y = r.top + fy * r.height;
 	if (x < 0 || y < 0 || x > innerWidth || y > innerHeight) return null;
-	// Inside the region, and inside whatever scrolls in it (the sidebar's list, the chat's).
+	// Inside the region, and inside whatever scrolls in it (the sidebar's list).
 	for (let a: Element | null = e.parentElement; a; a = a === box ? null : a.parentElement) {
 		const st = getComputedStyle(a);
 		if (a !== box && st.overflowX === 'visible' && st.overflowY === 'visible') continue;

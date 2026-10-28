@@ -22,8 +22,6 @@ export const LEAVE = 'blaze:leave';
 export const PAGE = 'blaze:page';
 /** Fired on window by client/lib/presence.ts when a doc's comments changed elsewhere (a CustomEvent, detail: the doc). */
 export const COMMENTS = 'blaze:comments';
-/** Fired on window by client/comments.ts after it swapped threads in, so the comment count can be redrawn. */
-export const THREADS = 'blaze:threads';
 
 /**
  * A new version of the site is going in (client/lib/update.ts): fired on window just before a reload or an in-place

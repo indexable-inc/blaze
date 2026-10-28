@@ -48,10 +48,7 @@ main.lesson[data-on] > :is(.head, .pager) { display: none; }
    out of the way. */
 main.lesson[data-on]:not(:has(> .lp-end[data-cur])) > .discussion { display: none; }
 main.lesson[data-on] > .discussion { padding-bottom: 120px; }
-body:has(main.lesson[data-on]) :is(.topline, .chat) { display: none; }
-/* With the chat gone the page's scrollbar (styles/shell.css .reading) goes back to the window's edge. */
-body.chat-open:has(main.lesson[data-on]) .reading { display: block; right: 0; }
-body.chat-open:has(main.lesson[data-on]) .reading[hidden] { display: none; }
+body:has(main.lesson[data-on]) .topline { display: none; }
 main.lesson[data-on] > section.step:not([data-cur]) { display: none; }
 main.lesson[data-on] > section.step {
 	padding: 28px 0 0;

@@ -11,10 +11,10 @@
  * only the others, while there are any.
  *
  * A pointer is sent as what it is on, so it lands on the same thing for every reader whatever their window and layout
- * (client/lib/anchor.ts): a block of the article and the character in it, or a link, a chat message, a button, ... in
- * the sidebar, the top line, the chat or "On this page". A pointer on one of those regions is drawn over the window
+ * (client/lib/anchor.ts): a block of the article and the character in it, or a link, a button, ... in the sidebar,
+ * the top line or "On this page". A pointer on one of those regions is drawn over the window
  * (`fixedLayer`), since they stay put while the page scrolls; one in the article on the page (`layer`). A reader who
- * doesn't have that thing on screen (the sidebar shut, the chat closed) doesn't see the pointer until it moves to
+ * doesn't have that thing on screen (the sidebar shut) doesn't see the pointer until it moves to
  * something they have, and only a pointer in the article has a face on the rail.
  *
  * A tab sends its pointer (a mouse or a pen; phones send none and draw none) at most every MOVE_MS while it moves,

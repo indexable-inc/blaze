@@ -10,7 +10,7 @@
  * Either waits for a moment that loses the reader nothing: not while they type in a field with text in it, play the
  * narration, or drag; a hidden tab goes at once (unless it is playing). Until then a line in the feed
  * (client/lib/feed.ts) says an update is ready, with a button to take it now. Just before, every script that owns state puts it in sessionStorage (`blaze:save`,
- * client/lib/page.ts): the page's scroll, the chat's and the feed input's (client/lib/chat.ts `save`), comment drafts (client/comments.ts),
+ * client/lib/page.ts): the page's scroll, the feed input's (client/lib/chat.ts `save`), comment drafts (client/comments.ts),
  * the narration's place (client/listen.ts). After the load each takes its part back once, and this clears the rest.
  *
  * After a reload whose assets still differ (a CDN behind), it doesn't reload again for LOOP_MS.

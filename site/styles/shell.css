@@ -7,7 +7,7 @@
 .icon { width: 16px; height: 16px; flex: none; }
 .sr { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 
-:root { --side-w: 268px; --chat-w: 340px; --thread-w: 380px; }
+:root { --side-w: 268px; }
 /* What floats over the page (tooltips, the who-is-here list, speech bubbles, the feed): one raised surface. */
 :root { --pop-bg: var(--bg-4); --pop-ring: inset 0 0 0 1px var(--line-2); }
 .frame { display: grid; grid-template-columns: var(--side-w) minmax(0, 1fr); gap: 4px; min-height: 100svh; padding: 6px clamp(8px, 1vw, 14px) 10px 0; }
@@ -156,9 +156,6 @@ main.wide { max-width: none; }
 	.grid { grid-template-columns: minmax(0, 1fr); }
 	.toc { display: none; }
 }
-/* With the chat open the article gets the room "On this page" took. */
-body.chat-open .grid { grid-template-columns: minmax(0, 1fr); }
-body.chat-open .toc { display: none; }
 
 /* A phone: the sidebar is a drawer behind Menu. */
 @media (max-width: 800px) {
@@ -212,7 +209,7 @@ html.nav-wait, html.nav-wait * { cursor: progress; }
 .tl-btn { display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 10px; border: 0; border-radius: 8px; box-shadow: inset 0 0 0 1px var(--line-2); background: none; color: var(--ink-2); font: inherit; font-size: 13px; text-decoration: none; white-space: nowrap; cursor: pointer; transition: color 0.12s, background-color 0.12s; }
 .tl-btn:hover, .tl-btn[aria-expanded='true'] { color: var(--ink-1); background: var(--s-tint); }
 .tl-btn svg { width: 14px; height: 14px; fill: currentColor; }
-.tl-discuss .tl-btn { color: var(--ink-1); }
+.tl-chat { color: var(--ink-1); }
 /* The sidebar shut (client/lib/presence.ts): its column folds to nothing, the page takes the room. */
 .tl-side { width: 30px; padding: 0; justify-content: center; }
 .tl-side svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.4; }
@@ -220,12 +217,10 @@ html.nav-wait, html.nav-wait * { cursor: progress; }
 .frame { transition: grid-template-columns 0.22s cubic-bezier(0.2, 0.7, 0.3, 1); }
 body.side-shut .frame { grid-template-columns: 0 minmax(0, 1fr); padding-left: clamp(8px, 1vw, 14px); gap: 0; }
 body.side-shut .frame > .side { visibility: hidden; overflow: hidden; padding: 0; }
-body.side-shut.chat-full .chat { left: clamp(8px, 1vw, 14px); }
 @media (prefers-reduced-motion: reduce) { .frame { transition: none; } }
-/* The discussion at the left, everything else at the right. */
+/* Chat at the left, everything else at the right. */
 .topline > .tl-gap { display: block; flex: 1; }
 .tl-bubble { flex: none; width: 14px; height: 12px; border: 1.5px solid currentColor; border-radius: 4px 4px 4px 1px; }
-.tl-n { margin-right: -3px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .tl-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 20%, transparent); }
 .tl-count { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 .tl-user { padding-left: 4px; color: var(--ink-1); }
@@ -275,62 +270,44 @@ body.side-shut.chat-full .chat { left: clamp(8px, 1vw, 14px); }
 .face.more { width: auto; min-width: 20px; padding: 0 4px; border-radius: 10px; color: var(--ink-3); font-size: 10.5px; }
 .navlist .row > .faces { margin-left: auto; }
 .navlist .row > .faces .face { width: 16px; height: 16px; box-shadow: 0 0 0 1.5px var(--bg); }
-/* The discussion the top line jumps to: clear of the sticky line. */
-main .discussion { scroll-margin-top: 64px; }
 /* A phone: the line's buttons sit in the phone bar between the logo and search, icons and numbers only. */
 @media (max-width: 800px) {
 	.mbar .topline { position: relative; top: auto; z-index: auto; flex: none; min-height: 0; margin: 0; padding: 0; gap: 6px; background: none; backdrop-filter: none; -webkit-backdrop-filter: none; border-radius: 0; }
 	.mbar .tl-btn { height: 32px; padding: 0 9px; }
 	.mbar .tl-label, .mbar .tl-count, .mbar .tl-quiet, .mbar .tl-user > span:last-child { display: none; }
-	.mbar .tl-n { margin: 0; }
 	.mbar .tl-side { display: none; } /* The sidebar is the menu's drawer here. */
 	.mbar .tl-here .faces .face:nth-child(n + 3) { display: none; }
 	.mbar .tl-list { position: fixed; top: 52px; right: 8px; }
 }
-/* A phone's width: the menu button is its icon, the Discuss link goes (the discussion is on the page below), so the bar fits. */
+/* A phone's width: the menu button is its icon, Chat goes (the feed's own button opens it there), so the bar fits. */
 @media (max-width: 480px) {
 	.mbar { gap: 6px; padding-inline: 8px; }
 	.mbar > .menubtn { padding: 0 9px; }
 	.mbar > .menubtn > span { display: none; }
 	.mbar .mbrand { min-width: 0; }
-	.mbar .tl-discuss, .mbar .tl-gap { display: none; }
+	.mbar .tl-chat, .mbar .tl-gap { display: none; }
 }
 
-/* The chat's panel (client/lib/chat.ts): at the right, over the page, once opened; on a wide screen the page makes room. */
-.tl-chat-icon { flex: none; width: 15px; height: 11px; border: 1.5px solid currentColor; border-radius: 3px; position: relative; }
-.tl-chat-icon::after { content: ''; position: absolute; left: 2px; bottom: -4px; width: 5px; height: 5px; border-left: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; background: var(--bg); transform: skewY(-35deg); }
-.tl-badge { min-width: 17px; height: 17px; padding: 0 5px; border-radius: 9px; background: var(--doc-code-ink); color: #fff; font-size: 10.5px; font-weight: 600; line-height: 17px; text-align: center; }
-.tl-badge[hidden] { display: none; }
-.chat { position: fixed; z-index: 35; top: 6px; right: clamp(8px, 1vw, 14px); bottom: 10px; display: flex; flex-direction: column; width: var(--chat-w); border-radius: 16px; background: var(--bg-2); box-shadow: inset 0 0 0 1px var(--line-2), 0 20px 60px rgb(0 0 0 / 0.3); }
-.chat[hidden] { display: none; }
-@media (min-width: 1280px) {
-	body.chat-open .frame { padding-right: calc(var(--chat-w) + 2 * clamp(8px, 1vw, 14px)); }
-	body.chat-open .chat { box-shadow: inset 0 0 0 1px var(--line-2); }
-}
-.chat-head { display: flex; align-items: center; gap: 8px; padding: 12px 10px 8px 16px; }
-.chat-title { font-weight: 600; color: var(--ink-1); }
-.chat-online { flex: 1; color: var(--ink-3); font-size: 12.5px; }
-.chat-x { width: 28px; height: 28px; border: 0; border-radius: 8px; background: none; color: var(--ink-3); font-size: 20px; line-height: 1; cursor: pointer; }
-.chat-x:hover { background: var(--s-tint); color: var(--ink-1); }
-.chat-x svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
-.chat-x { display: grid; place-items: center; padding: 0; }
-.chat-mute.on { color: var(--ink-1); }
-/* Full screen: over the whole content pane, beside the sidebar (the frame's grid, above). */
-body.chat-full .chat { left: calc(var(--side-w) + 4px); width: auto; box-shadow: inset 0 0 0 1px var(--line-2); }
-/* Full screen, the chat takes the page's place: the page under it neither shows at its edges nor scrolls. */
-body.chat-full .frame > .pane, body.chat-full .cursors:not(.cursors-fixed) { visibility: hidden; }
-html:has(body.chat-full) { overflow: hidden; }
-body.chat-full .chat > .resizer { display: none; }
-body.chat-full .chat-list, body.chat-full .chat-foot, body.chat-full .chat-typing { width: 100%; max-width: 860px; margin-inline: auto; }
-@media (max-width: 800px) { .chat-full { display: none; } }
-/* Translated messages (client/lib/translate.ts): a quiet line under the text. */
-.chat-tr { margin: 2px 0 0 28px; color: var(--ink-4); font-size: 11.5px; }
-.chat-tr button { padding: 0; border: 0; background: none; color: var(--ink-3); font: inherit; cursor: pointer; }
-.chat-tr button:hover { color: var(--ink-1); text-decoration: underline; }
-.chat-tr.pending { animation: tr-pulse 1.6s ease-in-out infinite; }
-@keyframes tr-pulse { 50% { opacity: 0.55; } }
-/* Who is writing, between the list and the composer. */
-.chat-typing { display: flex; align-items: center; gap: 7px; min-height: 22px; padding: 0 16px 4px; color: var(--ink-3); font-size: 12px; }
+.tl-list .devices { display: inline-flex; gap: 2px; color: var(--ink-4); }
+.tl-list .device { display: inline-grid; width: 13px; height: 13px; }
+.tl-list .device svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 1.3; stroke-linecap: round; }
+
+/* The chat's input, at the foot of the open feed (client/lib/chat.ts): one rounded field, the mention pop-up above it,
+   who is writing above that. Comment forms take the same field (styles/site.css). */
+.chat-compose { position: relative; }
+.chat-pop { position: absolute; z-index: 3; left: 0; right: 0; bottom: 100%; margin: 0 0 6px; padding: 4px; list-style: none; border-radius: 12px; background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line-2), 0 12px 32px rgb(0 0 0 / 0.3); }
+.chat-pop[hidden] { display: none; }
+.chat-pop li { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 8px; color: var(--ink-2); font-size: 13px; cursor: pointer; }
+.chat-pop li.on { background: var(--s-tint); color: var(--ink-1); }
+.chat-pop .face { width: 18px; height: 18px; box-shadow: none; }
+.chat-form { display: flex; align-items: flex-end; gap: 6px; padding: 5px 5px 5px 14px; border-radius: 18px; background: var(--bg-4); box-shadow: inset 0 0 0 1px transparent; transition: box-shadow 0.15s, background-color 0.15s; }
+.chat-form:focus-within { background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line-2), 0 0 0 3px var(--s-tint); }
+.chat-form textarea::placeholder { color: var(--ink-4); }
+.chat-form textarea, .chat-form textarea:focus { flex: 1; width: auto; min-height: 26px; max-height: 140px; padding: 4px 0; border: 0; border-radius: 0; box-shadow: none; background: none; color: var(--ink-1); font: inherit; font-size: 13.5px; line-height: 1.35; resize: none; outline: none; }
+.chat-send { display: grid; place-items: center; flex: none; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 50%; background: var(--ink-1); color: var(--bg); cursor: pointer; transition: opacity 0.12s, background-color 0.12s; }
+.chat-send svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.chat-send:disabled { background: transparent; color: var(--ink-4); cursor: default; }
+.chat-typing { display: flex; align-items: center; gap: 7px; min-height: 22px; padding: 0 6px 6px; color: var(--ink-3); font-size: 12px; }
 .chat-typing[hidden] { display: none; }
 .chat-typing-faces { display: inline-flex; }
 .chat-typing-faces .face { width: 18px; height: 18px; }
@@ -340,140 +317,17 @@ body.chat-full .chat-list, body.chat-full .chat-foot, body.chat-full .chat-typin
 .dots i:nth-child(2) { animation-delay: 0.15s; }
 .dots i:nth-child(3) { animation-delay: 0.3s; }
 @keyframes dot { 0%, 60%, 100% { opacity: 0.3; transform: none; } 30% { opacity: 1; transform: translateY(-2px); } }
-.tl-list .devices { display: inline-flex; gap: 2px; color: var(--ink-4); }
-.tl-list .device { display: inline-grid; width: 13px; height: 13px; }
-.tl-list .device svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 1.3; stroke-linecap: round; }
-.chat-list { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 8px 0 10px; }
-.chat-msg { position: relative; padding: 6px 36px 2px 16px; }
-.chat-msg.grouped { padding-top: 0; }
-.chat-msg:hover { background: var(--s-tint); }
-.chat-who { display: flex; align-items: center; gap: 8px; margin-bottom: 2px; font-size: 13px; }
-.chat-who .face { width: 20px; height: 20px; }
-.chat-name { color: var(--ink-1); font-weight: 500; text-decoration: none; }
-.chat-name:hover { text-decoration: underline; }
-.chat-when { color: var(--ink-4); font-size: 11.5px; }
-.chat-text { margin: 0 0 0 28px; color: var(--ink-2); font-size: 13.5px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
-.chat-text a { color: var(--ink-1); }
-/* A message's actions (quick reactions, reply in thread, edit, delete): a small bar at its top right while it is
-   hovered, over the line above as in Slack so the name and time stay readable (not the first row's: it would be cut). */
-.chat-acts { position: absolute; z-index: 1; top: -13px; right: 8px; pointer-events: none; display: flex; gap: 2px; padding: 2px; border-radius: 8px; background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line-2); opacity: 0; }
-.chat-msg:hover > .chat-acts, .chat-acts:focus-within { opacity: 1; pointer-events: auto; }
-.chat-list > .chat-msg:first-child > .chat-acts { top: 2px; }
-/* No hover on a touch screen: a tap on a message shows its actions (client/lib/chat.ts), instead of a row of icons on every line. */
-@media (hover: none) {
-	.chat-acts { visibility: hidden; }
-	.chat-msg.acts-open > .chat-acts { visibility: visible; opacity: 1; pointer-events: auto; }
-}
-.chat-act { display: grid; place-items: center; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 6px; background: none; color: var(--ink-3); font-size: 15px; line-height: 1; cursor: pointer; }
-.chat-act:hover { color: var(--ink-1); background: var(--s-tint); }
-.chat-act svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
-.chat-del:hover { color: var(--danger); }
-/* Under a message with replies: the latest repliers, how many, when the last came; the whole line lights up on hover
-   (or keyboard focus) and the time gives way to "View thread". Unseen replies in the reader's threads: bold, a dot. */
-.chat-replies { display: flex; align-items: center; gap: 7px; width: calc(100% - 22px); margin: 3px 0 2px 22px; padding: 3px 8px 3px 6px; border: 0; border-radius: 8px; background: none; color: var(--ink-3); font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
-.chat-replies:hover, .chat-replies:focus-visible { background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line-2); outline: none; }
-.chat-replies b { display: inline-flex; align-items: center; gap: 5px; color: var(--ink-1); font-weight: 500; white-space: nowrap; }
-.chat-replies.unread b { font-weight: 700; }
-.chat-replies-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--doc-code-ink); }
-.chat-replies-faces { display: inline-flex; }
-.chat-replies-faces .face { width: 18px; height: 18px; box-shadow: 0 0 0 1.5px var(--bg-2); }
-.chat-replies-faces .face + .face { margin-left: -4px; }
-.chat-replies-when, .chat-replies-view { overflow: hidden; color: var(--ink-4); white-space: nowrap; text-overflow: ellipsis; }
-.chat-replies-view { display: none; color: var(--ink-3); }
-.chat-replies:hover .chat-replies-when, .chat-replies:focus-visible .chat-replies-when { display: none; }
-.chat-replies:hover .chat-replies-view, .chat-replies:focus-visible .chat-replies-view { display: inline; }
-/* The open thread: over the list and composer, or in full screen a column at the right, like Slack's. */
-.chat-thread { position: absolute; inset: 0; z-index: 6; display: flex; flex-direction: column; border-radius: inherit; background: var(--bg-2); box-shadow: inset 0 0 0 1px var(--line-2); }
-.chat-thread[hidden] { display: none; }
-.chat-thread .chat-head { padding-left: 8px; }
-.chat-thread .chat-title { flex: 1; }
-/* Between the thread's message and its replies: how many, and a rule. */
-.chat-thread-n { display: flex; align-items: center; gap: 10px; margin: 10px 16px 6px; color: var(--ink-3); font-size: 12px; white-space: nowrap; }
-.chat-thread-n::after { content: ''; flex: 1; border-top: 1px solid var(--line); }
-body.chat-full .chat.threaded { padding-right: var(--thread-w); }
-body.chat-full .chat-thread { left: auto; width: var(--thread-w); border-radius: 0 16px 16px 0; }
-body.chat-full .chat-thread .chat-head { padding-left: 16px; }
-body.chat-full .chat-back { order: 1; }
-/* Mentions: every `@login` marked, the reader's own stronger, and a message naming the reader with a bar. */
-.chat-text .chat-at { padding: 0 2px; border-radius: 4px; background: var(--s-tint); color: var(--ink-1); font-weight: 500; text-decoration: none; }
-.chat-text .chat-at:hover { text-decoration: underline; }
-.chat-text .chat-at.me { background: color-mix(in srgb, var(--doc-code-ink) 20%, transparent); }
-.chat-msg.mention { background: color-mix(in srgb, var(--doc-code-ink) 7%, transparent); box-shadow: inset 2px 0 0 var(--doc-code-ink); }
-.chat-msg.mention:hover { background: color-mix(in srgb, var(--doc-code-ink) 11%, transparent); }
-/* The mention pop-up, above its composer: logins that fit what follows the `@`. */
-.chat-compose { position: relative; }
-
-/* A reply also sent to the chat: in the list, a line naming its thread over it; in the thread, a word under it. */
-.chat-ctx { display: flex; gap: 4px; max-width: 100%; margin: 0 0 3px 28px; padding: 0; border: 0; background: none; color: var(--ink-3); font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
-.chat-ctx > span { flex: none; }
-.chat-ctx .chat-ctx-text { flex: 1 1 auto; min-width: 0; overflow: hidden; color: var(--ink-2); white-space: nowrap; text-overflow: ellipsis; }
-.chat-ctx:hover .chat-ctx-text { color: var(--ink-1); text-decoration: underline; }
-.chat-also { margin: 2px 0 0 28px; color: var(--ink-4); font-size: 11.5px; }
-/* The reply composer's "Also send to chat": a small box of our own under the field. */
-.chat-also-to { display: inline-flex; align-items: center; gap: 7px; margin: 7px 0 0 10px; color: var(--ink-3); font-size: 12px; cursor: pointer; user-select: none; }
-.chat-also-to:hover { color: var(--ink-1); }
-.chat-also-to input { appearance: none; display: grid; place-items: center; flex: none; width: 14px; height: 14px; margin: 0; padding: 0; border-radius: 4px; background: none; box-shadow: inset 0 0 0 1.5px var(--ink-4); cursor: pointer; transition: background-color 0.12s, box-shadow 0.12s; }
-.chat-also-to:hover input:not(:checked) { box-shadow: inset 0 0 0 1.5px var(--ink-2); }
-.chat-also-to input::after { content: ''; width: 7px; height: 4px; margin-top: -2px; border: solid var(--bg); border-width: 0 0 1.75px 1.75px; transform: rotate(-45deg); opacity: 0; }
-.chat-also-to input:checked { background: var(--ink-1); box-shadow: none; }
-.chat-also-to input:checked::after { opacity: 1; }
-.chat-also-to input:focus-visible { outline: 2px solid var(--line-2); outline-offset: 2px; }
-
-/* Reactions (client/lib/chat.ts REACTS): our own icons. A chip each under the message, the reader's own marked. */
-.chat-reacts { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0 2px 28px; }
-.chat-react { display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 7px 0 5px; border: 0; border-radius: 11px; background: var(--s-tint); box-shadow: inset 0 0 0 1px var(--line); color: var(--ink-2); font: inherit; font-size: 11.5px; font-variant-numeric: tabular-nums; cursor: pointer; }
-.chat-react svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
-.chat-react:hover { box-shadow: inset 0 0 0 1px var(--ink-4); color: var(--ink-1); }
-.chat-react.mine { background: color-mix(in srgb, var(--doc-code-ink) 13%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--doc-code-ink) 55%, transparent); color: var(--ink-1); }
-.chat-react.mine svg { color: var(--doc-code-ink); }
-.chat-react[aria-disabled='true'] { cursor: default; }
-.chat-react[aria-disabled='true']:hover { box-shadow: inset 0 0 0 1px var(--line); color: var(--ink-2); }
-@media (prefers-reduced-motion: no-preference) { .chat-react.mine svg { animation: react-in 0.22s ease-out; } }
-@keyframes react-in { from { transform: scale(0.6); } 60% { transform: scale(1.18); } }
-/* The quick-react row at the head of a message's actions, set off from the rest by a rule. */
-.chat-quick { display: flex; gap: 2px; }
-.chat-quick:not(:last-child) { margin-right: 2px; padding-right: 3px; box-shadow: inset -1px 0 0 var(--line-2); }
-.chat-quick .chat-act[aria-pressed='true'] { color: var(--doc-code-ink); background: color-mix(in srgb, var(--doc-code-ink) 13%, transparent); }
-
-/* Edited: a word after the text, the time in its tooltip; a message being edited holds a field in its text's place. */
-.chat-edited { color: var(--ink-4); font-size: 11px; white-space: nowrap; cursor: default; }
-.chat-msg.editing, .chat-msg.editing:hover { background: color-mix(in srgb, var(--ink-1) 4%, transparent); }
-.chat-edit { margin: 2px 0 2px 28px; }
-.chat-edit .chat-form { padding: 4px 12px; border-radius: 12px; background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line-2), 0 0 0 3px var(--s-tint); }
-.chat-edit-hint { margin: 4px 0 0 2px; color: var(--ink-4); font-size: 11.5px; }
-.chat-edit-hint button { padding: 0; border: 0; background: none; color: var(--ink-2); font: inherit; cursor: pointer; }
-.chat-edit-hint button:hover { color: var(--ink-1); text-decoration: underline; }
-.chat-pop { position: absolute; z-index: 3; left: 0; right: 0; bottom: 100%; margin: 0 0 6px; padding: 4px; list-style: none; border-radius: 12px; background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line-2), 0 12px 32px rgb(0 0 0 / 0.3); }
-.chat-pop[hidden] { display: none; }
-.chat-pop li { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 8px; color: var(--ink-2); font-size: 13px; cursor: pointer; }
-.chat-pop li.on { background: var(--s-tint); color: var(--ink-1); }
-.chat-pop .face { width: 18px; height: 18px; box-shadow: none; }
-.chat-empty { margin: 0; padding: 14px 16px; color: var(--ink-3); font-size: 13px; }
-.chat-jump { align-self: center; margin: -40px 0 8px; padding: 4px 12px; border: 0; border-radius: 14px; background: var(--ink-1); color: var(--bg); font: inherit; font-size: 12px; cursor: pointer; position: relative; }
-.chat-jump[hidden] { display: none; }
-.chat-foot { padding: 4px 10px 10px; }
-.chat-form { display: flex; align-items: flex-end; gap: 6px; padding: 5px 5px 5px 14px; border-radius: 18px; background: var(--bg-4); box-shadow: inset 0 0 0 1px transparent; transition: box-shadow 0.15s, background-color 0.15s; }
-.chat-form:focus-within { background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line-2), 0 0 0 3px var(--s-tint); }
-.chat-form textarea::placeholder { color: var(--ink-4); }
-.chat-form textarea, .chat-form textarea:focus { flex: 1; width: auto; min-height: 26px; max-height: 140px; padding: 4px 0; border: 0; border-radius: 0; box-shadow: none; background: none; color: var(--ink-1); font: inherit; font-size: 13.5px; line-height: 1.35; resize: none; outline: none; }
-.chat-send { display: grid; place-items: center; flex: none; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 50%; background: var(--ink-1); color: var(--bg); cursor: pointer; transition: opacity 0.12s, background-color 0.12s; }
-.chat-send svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.chat-send:disabled { background: transparent; color: var(--ink-4); cursor: default; }
-.chat-err { margin: 0 0 8px; color: var(--danger); font-size: 12.5px; }
-.chat-err[hidden] { display: none; }
-.chat-signin { display: block; padding: 10px; border-radius: 18px; background: var(--bg-4); color: var(--ink-1); font-size: 13.5px; text-align: center; text-decoration: none; }
-.chat-signin:hover { background: var(--s-tint); }
-@media (max-width: 800px) {
-	.chat { inset: 0; z-index: 50; width: auto; border-radius: 0; }
-	.mbar .tl-chat { padding: 0 9px; }
-}
+/* Links and `@login`s in a chat line: a mention marked, the reader's own stronger. */
+.feed-text a { color: var(--ink-1); }
+.feed-text .chat-at { padding: 0 2px; border-radius: 4px; background: var(--s-tint); color: var(--ink-1); font-weight: 500; text-decoration: none; }
+.feed-text .chat-at:hover { text-decoration: underline; }
+.feed-text .chat-at.me { background: color-mix(in srgb, var(--doc-code-ink) 20%, transparent); }
 
 /* The feed (client/lib/feed.ts), like Minecraft's chat: passing lines at the bottom left of the page (chat, joins,
    leaves, the site's word), each on a small raised strip that fades; opened (T, or the phone's button), the history
-   scrolls over the input on one surface. Clear of the sidebar, and of the chat's panel beside it. */
+   scrolls over the input on one surface. Clear of the sidebar. */
 .feed { --feed-l: calc(var(--side-w) + 4px + 16px); position: fixed; z-index: 44; left: var(--feed-l); bottom: 16px; display: flex; flex-direction: column; align-items: flex-start; width: min(460px, calc(100vw - var(--feed-l) - 32px)); pointer-events: none; }
 body.side-shut .feed { --feed-l: calc(clamp(8px, 1vw, 14px) + 16px); }
-@media (min-width: 801px) { body.chat-open .feed { width: min(460px, calc(100vw - var(--feed-l) - var(--chat-w) - 48px)); } }
 .feed-log { width: 100%; max-height: min(50vh, 420px); overflow: hidden; overscroll-behavior: contain; }
 .feed-line { display: none; align-items: flex-start; gap: 8px; width: fit-content; max-width: 100%; margin-top: 4px; padding: 5px 10px 5px 6px; border-radius: 10px; background: color-mix(in srgb, var(--pop-bg) 88%, transparent); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); box-shadow: var(--pop-ring), 0 6px 18px rgb(0 0 0 / 0.16); color: var(--ink-2); font-size: 13px; line-height: 1.4; text-decoration: none; }
 .feed-line.fresh { display: flex; pointer-events: auto; animation: feed-in 0.18s ease-out; }
@@ -490,18 +344,26 @@ body.side-shut .feed { --feed-l: calc(clamp(8px, 1vw, 14px) + 16px); }
 .feed-leave > .face { opacity: 0.55; }
 .feed-error > svg { stroke: var(--danger); }
 .feed-error b { color: var(--danger); }
-.feed-line.go { cursor: pointer; }
-.feed-line.go:hover, .feed-line.go:focus-visible { background: var(--bg-3); outline: none; }
+.feed-line.go, .feed:not(.open) .feed-line.jump { cursor: pointer; }
+.feed-line.go:hover, .feed-line.go:focus-visible, .feed:not(.open) .feed-line.jump:hover { background: var(--bg-3); outline: none; }
 .feed-line.mention { box-shadow: inset 2px 0 0 var(--doc-code-ink), var(--pop-ring), 0 6px 18px rgb(0 0 0 / 0.16); }
-.feed-line.yours { box-shadow: inset 2px 0 0 var(--ink-3), var(--pop-ring), 0 6px 18px rgb(0 0 0 / 0.16); }
 .feed-act { flex: none; align-self: center; margin-left: 4px; padding: 3px 10px; border: 0; border-radius: 10px; background: var(--ink-1); color: var(--bg); font: inherit; font-size: 12px; cursor: pointer; }
 /* Open: every line of the history on one surface, scrollable, the input at the foot. */
 .feed.open { pointer-events: auto; padding: 6px; border-radius: 16px; background: color-mix(in srgb, var(--bg-2) 94%, transparent); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); box-shadow: inset 0 0 0 1px var(--line-2), 0 20px 50px rgb(0 0 0 / 0.3); }
 .feed.open .feed-log { overflow-y: auto; }
 .feed.open .feed-line { display: flex; width: 100%; margin-top: 0; padding: 4px 8px 4px 6px; border-radius: 8px; background: none; backdrop-filter: none; -webkit-backdrop-filter: none; box-shadow: none; opacity: 1; animation: none; }
 .feed.open .feed-line.mention { background: color-mix(in srgb, var(--doc-code-ink) 8%, transparent); box-shadow: inset 2px 0 0 var(--doc-code-ink); }
-.feed.open .feed-line.yours { box-shadow: inset 2px 0 0 var(--ink-3); }
 .feed.open .feed-line.go:hover { background: var(--s-tint); }
+/* The message being edited in the input below. */
+.feed.open .feed-line.editing { background: var(--s-tint); box-shadow: inset 2px 0 0 var(--ink-3); }
+/* A line's tools (the reader's own message: Edit, Delete; a Translate), in the open history only, on hover. */
+.feed-tools { display: none; flex: none; align-self: center; gap: 2px; margin-left: auto; padding-left: 6px; }
+.feed.open .feed-line:hover > .feed-tools, .feed.open .feed-tools:focus-within { display: flex; }
+@media (hover: none) { .feed.open .feed-tools { display: flex; } }
+.feed-tool { display: grid; place-items: center; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 6px; background: none; color: var(--ink-3); cursor: pointer; }
+.feed-tool.word { width: auto; padding: 0 6px; font: inherit; font-size: 12px; }
+.feed-tool:hover { background: var(--s-tint); color: var(--ink-1); }
+.feed-tool svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 .feed-foot { width: 100%; margin-top: 6px; }
 .feed:not(.open) .feed-foot { display: none; }
 .feed-hint { margin: 6px 6px 2px; color: var(--ink-4); font-size: 11.5px; }
@@ -513,22 +375,20 @@ body.side-shut .feed { --feed-l: calc(clamp(8px, 1vw, 14px) + 16px); }
 	.feed-opener svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linejoin: round; }
 	.feed.open .feed-opener { display: none; }
 }
-/* A phone: across the screen with 16px gutters, over the home indicator; full screen, the chat's panel covers it. */
+/* A phone: across the screen with 16px gutters, over the home indicator. */
 @media (max-width: 800px) {
 	.feed { --feed-l: 16px; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom)); width: auto; }
 	body.side-shut .feed { --feed-l: 16px; }
 	.feed-log { max-height: 45svh; }
 }
-/* The message a feed line opened, lit for a moment in the panel's list. */
-.chat-msg.lit { animation: chat-lit 1.6s ease-out; }
-@keyframes chat-lit { from { background: color-mix(in srgb, var(--doc-code-ink) 16%, transparent); } }
-@media (prefers-reduced-motion: reduce) { .feed-line.fresh, .chat-msg.lit { animation: none; } .feed-line.fading { transition: none; } }
+/* The line the history opened at (a passing line clicked), lit for a moment. */
+.feed.open .feed-line.lit { animation: feed-lit 1.6s ease-out; }
+@keyframes feed-lit { from { background: color-mix(in srgb, var(--doc-code-ink) 16%, transparent); } }
+@media (prefers-reduced-motion: reduce) { .feed-line.fresh, .feed.open .feed-line.lit { animation: none; } .feed-line.fading { transition: none; } }
 
-/* Drag handles (client/lib/resize.ts): the sidebar's right edge, the chat's left edge. */
+/* The drag handle (client/lib/resize.ts) on the sidebar's right edge. */
 .resizer { position: absolute; z-index: 5; top: 0; bottom: 0; width: 9px; cursor: col-resize; touch-action: none; }
 .side > .resizer { right: -6px; }
-/* Centred on the gap between the pane and the chat, which is the chat's right inset (above). */
-.chat > .resizer { left: calc(-0.5 * clamp(8px, 1vw, 14px) - 4.5px); }
 .resizer::after { content: ''; position: absolute; top: 50%; left: 3px; width: 3px; height: 36px; margin-top: -18px; border-radius: 2px; background: var(--line-2); opacity: 0; transition: opacity 0.15s; }
 .resizer:hover::after, .resizer:focus-visible::after, .resizing .resizer::after { opacity: 1; }
 .resizer:focus-visible { outline: none; }
@@ -550,11 +410,11 @@ body.side-shut .feed { --feed-l: calc(clamp(8px, 1vw, 14px) + 16px); }
 @keyframes say-in { from { opacity: 0; transform: scale(0.9) translateX(-6px); } }
 .face.talking { box-shadow: 0 0 0 2px var(--bg), 0 0 0 3.5px var(--ok); }
 .say-bubble.typing { padding: 9px 11px; color: var(--ink-3); }
-@media (prefers-reduced-motion: reduce) { .say-bubble, .dots i, .chat-tr.pending { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .say-bubble, .dots i { animation: none; } }
 
 /* The others on this page (client/lib/cursors.ts). Their pointers: an arrow in their colour (--c) and a chip with
    their face and name. One in the article is in a box over the whole document, so it scrolls with the page, below
-   the sticky top line, the chat and the drawer; one on the sidebar, the top line, the chat or "On this page" is in a
+   the sticky top line and the drawer; one on the sidebar, the top line or "On this page" is in a
    box over the window, above them, since they stay put as the page scrolls. Never in the way of a click. A pointer
    that rests fades. */
 .cursors { position: absolute; top: 0; left: 0; z-index: 14; width: 100%; overflow: clip; pointer-events: none; }
@@ -579,9 +439,8 @@ body.side-shut .feed { --feed-l: calc(clamp(8px, 1vw, 14px) + 16px); }
 .tl-list .tl-hint { margin: 8px 4px 0; padding-top: 8px; border-top: 1px solid var(--line); color: var(--ink-3); font-size: 12px; }
 @media (prefers-reduced-motion: reduce) { .cursor-say, .cursor-say.live::after { animation: none; transition: none; } }
 /* Where each is reading: a thin rail at the right edge, the page's length top to bottom, a band in their colour for
-   each viewport with their face on it (a button: it scrolls there), and a faint band for the reader's own. Beside a
-   chat it sits at the page's right edge, clear of the chat's resize handle; over a full-screen or phone chat it goes.
-   Above the sticky top line (a scrollbar runs the window's height), under the chat, the drawer and pop-ups. */
+   each viewport with their face on it (a button: it scrolls there), and a faint band for the reader's own. Above the
+   sticky top line (a scrollbar runs the window's height), under the drawer and pop-ups. */
 .reading { position: fixed; z-index: 16; top: 6px; right: 0; bottom: 10px; width: 6px; pointer-events: none; user-select: none; -webkit-user-select: none; }
 .reading[hidden] { display: none; }
 .reading-others, .reading-track { position: absolute; inset: 0; }
@@ -591,11 +450,8 @@ body.side-shut .feed { --feed-l: calc(clamp(8px, 1vw, 14px) + 16px); }
 .reading-face { position: absolute; z-index: 1; top: 0; right: 6px; display: grid; padding: 0; border: 0; border-radius: 50%; background: none; cursor: pointer; pointer-events: auto; }
 .reading-face .face { width: 18px; height: 18px; box-shadow: 0 0 0 2px var(--c); }
 .reading-face:hover .face { opacity: 1; transform: scale(1.15); }
-@media (min-width: 801px) { body.chat-open .reading { right: calc(var(--chat-w) + 2 * clamp(8px, 1vw, 14px)); } }
-@media (max-width: 800px) { body.chat-open .reading { display: none; } }
-body.chat-full .reading { display: none; }
 /* On a desk the rail is the page's scrollbar (client/lib/cursors.ts, the same media query), so the browser's goes:
-   one scrollbar, inside the page rather than beyond the chat. A wider track to aim at; the thumb dims while the page
+   one scrollbar. A wider track to aim at; the thumb dims while the page
    rests and brightens as it scrolls, under the pointer and while dragged. Inner scroll areas keep their own. */
 @media (hover: hover) and (pointer: fine) {
 	html { scrollbar-width: none; }
