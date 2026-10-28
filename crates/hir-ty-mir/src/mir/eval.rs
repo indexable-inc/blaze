@@ -215,6 +215,9 @@ fn size_class(size: usize) -> usize {
     size.max(8).checked_next_power_of_two().unwrap_or(usize::MAX)
 }
 
+/// Whether a frame's stack is given back when it returns ([`Evaluator::free_stack`]).
+const FREES_FRAMES: bool = false;
+
 pub struct Evaluator<'db> {
     db: &'db dyn HirDatabase,
     param_env: ParamEnvAndCrate<'db>,
@@ -1052,7 +1055,17 @@ impl<'db> Evaluator<'db> {
     /// Gives back the stack above `len`, of the frames that returned: nothing points there
     /// any more but what a dangling pointer would, as the temporaries whose borrows outlive
     /// a call are in the heap ([`Self::promoted`]).
+    ///
+    /// Not yet: with it, the standard library's integer formatting has no buffer length
+    /// (`[MaybeUninit<u8>; {const error}]`, `MAX.ilog10() + 1`), so something still reads a
+    /// returned frame.
     fn free_stack(&mut self, len: usize) {
+        if FREES_FRAMES {
+            self.truncate_stack(len);
+        }
+    }
+
+    fn truncate_stack(&mut self, len: usize) {
         self.stack.truncate(len);
         let end = Stack(len).to_usize();
         let kept = self.stack_allocations.partition_point(|it| it.start < end);

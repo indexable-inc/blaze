@@ -174,6 +174,7 @@ mod unwind;
 mod vtable;
 pub mod wasm;
 mod wasm_object;
+pub mod watch;
 mod x86;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2325,6 +2326,8 @@ struct ObjectCodegen<'a, 'db> {
     /// The root each name of a root is of, as [`ObjectCodegen::find_stored_roots`] named
     /// them; `None` for a name more than one has.
     root_names: FxHashMap<StableName, Option<FunctionId>>,
+    /// What is told of the functions put in the object, when the build is watched.
+    watch: Option<watch::Watch>,
 }
 
 /// Why an entry with a file of its own under what stands for cargo's directory is not kept.
@@ -2900,6 +2903,7 @@ fn in_source(db: &dyn HirDatabase, id: InFile<span::ErasedFileAstId>) -> bool {
 /// The code of a non-generic function.
 #[salsa::tracked(returns(ref))]
 fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<CompiledFunction> {
+    let _timer = watch::Timer::of(|| watch::Timed::Root(func));
     let _span = tracing::info_span!(target: "blaze", "compiled_root").entered();
     COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     compiles_of(func.krate(db));
@@ -3103,6 +3107,7 @@ fn compiled_instance<'db>(
     instance: Instance,
     env: StoredParamEnvAndCrate,
 ) -> Result<CompiledFunction> {
+    let _timer = watch::Timer::of(|| watch::Timed::instance(&instance, &env));
     let _span = tracing::info_span!(target: "blaze", "compiled_instance").entered();
     COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     compiles_of(env.krate);
@@ -5392,6 +5397,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             found_instances: FxHashMap::default(),
             stored_roots: FxHashMap::default(),
             root_names: FxHashMap::default(),
+            watch: watch::Watch::new(base.is_none()),
         })
     }
 
@@ -5558,10 +5564,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         {
             let id =
                 self.module.declare_function(&symbol, Linkage::Export, entry.code.signature())?;
-            if let Err(e) = self.stitch_entry(&name, id) {
-                eprintln!("entry of `{name}` does not fit: {e}");
-                cached::Entries::ban(&name);
-                self.misfit = true;
+            match self.stitch_entry(&name, id) {
+                Ok(ids) => self.placed(id, watch::Of::Root(func), &ids, watch::How::Stored),
+                Err(e) => {
+                    eprintln!("entry of `{name}` does not fit: {e}");
+                    cached::Entries::ban(&name);
+                    self.misfit = true;
+                }
             }
             return Ok(symbol);
         }
@@ -5593,6 +5602,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 return Err(e);
             }
         };
+        let kept = if unit.is_some() { watch::How::Unit } else { watch::How::Unchanged };
+        self.placed(id, watch::Of::Root(func), &ids, kept);
         let of = later::Of::Root { func, symbol: symbol.clone() };
         let mut later = later::Later::new(&self.module, id, of, compiled, ids);
         // The rows of the Cranelift code are not those of LLVM's.
@@ -5961,10 +5972,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             }
             let start = stdx::time::Instant::now();
             while let Some((name, id)) = self.found_pending.pop() {
-                if let Err(e) = self.stitch_entry(&name, id) {
-                    eprintln!("entry of `{name}` does not fit: {e}");
-                    cached::Entries::ban(&name);
-                    self.misfit = true;
+                match self.stitch_entry(&name, id) {
+                    Ok(ids) => self.placed_entry(id, &name, &ids),
+                    Err(e) => {
+                        eprintln!("entry of `{name}` does not fit: {e}");
+                        cached::Entries::ban(&name);
+                        self.misfit = true;
+                    }
                 }
             }
             self.phases.define += start.elapsed();
@@ -6241,6 +6255,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             );
         }
         let ids = self.stitch(id, compiled)?;
+        let kept = if unit.is_some() { watch::How::Unit } else { watch::How::Unchanged };
+        self.placed(id, watch::Of::Instance(instance, env), &ids, kept);
         let of = later::Of::Instance { instance: instance.clone(), env: env.clone() };
         let mut later = later::Later::new(&self.module, id, of, compiled, ids);
         later.unit_rows =
@@ -6564,7 +6580,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     /// Defines `id` as the function of an entry, and declares what the entry refers to.
-    fn stitch_entry(&mut self, name: &str, id: FuncId) -> Result<()> {
+    fn stitch_entry(&mut self, name: &str, id: FuncId) -> Result<Resolved> {
         use cached::{CachedData, CachedTarget};
         let Some(entry) = self.entries.as_ref().and_then(|it| it.get(name)) else {
             unsupported!("an entry that was in the store is not");
@@ -6638,7 +6654,28 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         self.bodies += 1;
         self.kept.found += 1;
-        Ok(())
+        Ok(ids)
+    }
+
+    /// Tells the watch of the build, if any, of `id`, which is `of` and calls `ids`.
+    fn placed(&mut self, id: FuncId, of: watch::Of<'_>, ids: &Resolved, kept: watch::How) {
+        if let Some(watch) = &mut self.watch {
+            let calls = ids.funcs.iter().map(|it| it.as_u32()).collect();
+            watch.placed(self.db, id.as_u32(), of, calls, kept);
+        }
+    }
+
+    /// The same of the function of the entry `name`.
+    fn placed_entry(&mut self, id: FuncId, name: &str, ids: &Resolved) {
+        if self.watch.is_none() {
+            return;
+        }
+        match self.found_instances.get(&id).cloned() {
+            Some((instance, env)) => {
+                self.placed(id, watch::Of::Instance(&instance, &env), ids, watch::How::Stored)
+            }
+            None => self.placed(id, watch::Of::Named(name), ids, watch::How::Stored),
+        }
     }
 
     /// Defines `id` as a compiled function, and declares everything the function refers to.

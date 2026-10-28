@@ -399,6 +399,8 @@ impl Build {
                 self.slowest.clone_from(functions);
                 Change::Nothing
             }
+            // The build page's (docs/web.md).
+            Event::Functions { .. } => Change::Nothing,
         }
     }
 

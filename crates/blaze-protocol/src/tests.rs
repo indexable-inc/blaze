@@ -451,3 +451,27 @@ fn frames_carry_one_item_each() {
     let refused = receive::<u8>(&mut sent.as_slice()).unwrap_err();
     assert!(refused.to_string().contains("more bytes than it needs"), "{refused}");
 }
+
+/// A record of the functions a build put in its program takes their names and some 100 bytes
+/// more for each (the names of the fields among them): a cold build of anim says some 80 000.
+#[test]
+fn a_record_of_functions_is_small() {
+    use crate::events::{Event, Function, How, Record};
+    let fns: Vec<Function> = (0..1000u32)
+        .map(|id| Function {
+            id,
+            key: u64::from(id).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+            krate: "anim".into(),
+            name: format!("anim::scene::render_{id}"),
+            calls: vec![id + 1, id + 2, id / 2],
+            how: if id % 3 == 0 { How::Unchanged } else { How::Compiled { ns: 125_000 } },
+        })
+        .collect();
+    let names: usize = fns.iter().map(|it| it.name.len()).sum();
+    let record =
+        Record { at_ns: 1, event: Event::Functions { object: 2, whole: true, functions: fns } };
+    let bytes = to_vec(&record).unwrap();
+    check(&bytes).unwrap();
+    assert_eq!(from_slice::<Record>(&bytes).unwrap(), record);
+    assert!(bytes.len() < names + 1000 * 128, "{} bytes for {names} of names", bytes.len());
+}

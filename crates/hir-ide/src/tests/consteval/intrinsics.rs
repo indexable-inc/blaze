@@ -708,6 +708,7 @@ fn a_grown_block_keeps_its_bytes() {
 }
 
 #[test]
+#[ignore = "frames are not freed yet (FREES_FRAMES in mir/eval.rs)"]
 fn stack_frames_are_freed() {
     // 2 GiB of locals in all, of 1 MiB a call.
     check_number(

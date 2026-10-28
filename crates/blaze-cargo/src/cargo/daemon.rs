@@ -1365,6 +1365,10 @@ struct Relayed {
 impl Relay {
     fn send(&self, relayed: &mut Relayed, event: Event, at_ns: u64) {
         let record = Record { at_ns: at_ns.saturating_sub(self.began_ns), event };
+        // The functions of a cold build are some megabytes, and nothing reads them yet.
+        if matches!(record.event, Event::Functions { .. }) {
+            return;
+        }
         relayed.build.apply(&record);
         lock(&self.watched).record(self.number, &record);
         if !relayed.gone {
