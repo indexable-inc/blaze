@@ -391,6 +391,48 @@ person runs can't break unnoticed: a script does nothing when imported (its work
 __name__ == "__main__":`). `harness/rustcsites.py` fails when blaze's code gains a place that
 starts rustc, rustdoc or cargo ([no-rustc.md](no-rustc.md)).
 
+The repository's Python is one uv workspace (`pyproject.toml`, `uv.lock`, Python 3.13 from
+`.python-version`; shared helpers such as `python/typed-input` are its members). Its scripts run
+with `uv run --frozen`, and the gate runs ruff and pyright over the ones the workspace lists
+(today `.github/scripts/downstream.py`, `harness/focused.py` and `python/`); an older script
+moves in when it is next changed. `harness/imports.py` runs in the workspace's Python too.
+
+### Named harnesses, and the projects downstream
+
+Two workflows run part of what the train does, by hand, for a change that wants an answer
+before or without the whole train. Neither releases anything or is part of `ci`.
+
+`focused.yaml` runs the harnesses it is given by name (`harness/focused.py`: a label of
+`ci.py --list`, or its start up to a space) against one build of the ref, on the platforms asked
+for, under both backends, as the train builds and runs them:
+
+    gh workflow run focused.yaml --ref <branch> -f harnesses='["anonstatics.py", "testselect.py"]'
+    uv run --frozen python harness/focused.py run '{"harnesses": ["anonstatics.py"], "backend": "llvm"}'
+
+The second line is the same in a lane's VM. A name that is no harness's, or that runs on none of
+a platform's backends, fails rather than run nothing. This is the part of Astral's per-change
+selection (astral-experiments/blaze#7, #58) that applies here: their fork had a model pick the
+suites and harnesses of each pull request, with path rules when it gave no answer. Here the gate
+is already the build and the unit tests alone, and `blaze test` picks which unit tests to run
+from what the change reached (`BLAZE_TESTS=affected`, [cargo.md](cargo.md)), which a model's
+guess or a path rule would only make less certain; so whoever makes the change names the
+harnesses, and the train still runs all of them on main.
+
+`downstream.yaml` runs ruff's (with ty) and uv's own test suites under `blaze test`, at pinned
+commits (`.github/scripts/downstream.py`, from astral-experiments/blaze#38, #41, #44 and #80):
+
+| Suite | What it checks |
+|---|---|
+| `ruff-and-ty` | ruff's workspace with every feature, one libtest thread (its language-server tests install a process-wide panic hook) |
+| `uv` | uv's workspace with its Linux test features, on the filesystems its tests ask for (a tmpfs, ext4's hardlink limit), a Secret Service keyring and the managed Pythons; one libtest thread (its native authentication tests share the credential store); the three cases that share one inline snapshot each in a process of its own; its five copy-on-write tests on a Btrfs loop image on a second runner, with the executables the first built |
+| `uv-archive-fixtures` | uv's 39 ZIP extraction cases alone |
+| `uv-lock-edit`, `ty-semantic-edit` | a diagnostic and its test's expected text edited, then the diagnostic restored: the test passes, passes, then fails printing the edited text, so an executable the edit did not reach fails it |
+
+Each has to print blaze's `Finished` line, so a run that built nothing does not pass. It tests a
+release (`-f blaze=canary`, the default, `stable` or a version), or with `-f build-run=<id>` the
+`blaze-linux-x64` build of a `focused.yaml` or train run: the way to try a branch on them before
+it lands. Build scripts and proc macros run in blaze's sandbox, as for any user.
+
 ### The release train
 
 `train.yaml` runs by hand only for now (`gh workflow run train.yaml` on main; `--ref <branch>`

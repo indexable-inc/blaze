@@ -23,9 +23,9 @@ typed-input = { workspace = true }
 [tool.ruff]
 target-version = "py313"
 line-length = 110
-include = [".github/scripts/downstream.py", "python/**/*.py"]
+include = [".github/scripts/downstream.py", "harness/focused.py", "python/**/*.py"]
 
 [tool.pyright]
-include = [".github/scripts/downstream.py", "python"]
+include = [".github/scripts/downstream.py", "harness/focused.py", "python"]
 pythonVersion = "3.13"
 typeCheckingMode = "strict"
