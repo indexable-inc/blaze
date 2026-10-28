@@ -4,10 +4,9 @@
  * is hidden; what comes back is everyone on the site, drawn three places:
  *
  * - the top line of the pane (`.topline`, made here, outside `.grid` so a swap keeps it; on a phone it sits in the
- *   phone bar instead): the page's discussion
- *   (its comment count, a jump to it) on a page that has one, the faces on this page (click: everyone on the site
- *   and where), the chat (client/lib/chat.ts, which rides this socket), and the reader: their GitHub avatar and login
- *   with Sign out, or Sign in with GitHub;
+ *   phone bar instead): Chat, which opens the feed's history and input as T does (client/lib/feed.ts; the chat itself
+ *   is client/lib/chat.ts, which rides this socket), the faces on this page (click: everyone on the site and where),
+ *   and the reader: their GitHub avatar and login with Sign out, or Sign in with GitHub;
  * - the sidebar: a small stack of faces on each page's row that someone else is reading, and when one of them says
  *   something in the chat, a speech bubble out of their face for a few seconds (`speak`);
  * - comments: when someone posts or deletes one, the worker says so here, and client/comments.ts refreshes the
@@ -32,7 +31,7 @@ import * as chat from './chat';
 import * as cursors from './cursors';
 import * as feed from './feed';
 import * as update from './update';
-import { COMMENTS, LEAVE, PAGE, THREADS, onPage } from './page';
+import { COMMENTS, LEAVE, PAGE, onPage } from './page';
 
 type Who = { key: string; login: string | null; avatar: string | null };
 type Person = Who & { country: string | null; since?: number; devices?: string[]; pages: { path: string; away: boolean }[] };
@@ -204,12 +203,15 @@ function left(key: string): void {
 // ---- The top line -------------------------------------------------------------------------------------------------
 
 const bar = el('div', 'topline');
-bar.setAttribute('aria-label', 'Discussion and who is here');
-const discussSlot = el('span', 'tl-discuss');
+bar.setAttribute('aria-label', 'Chat and who is here');
 const hereSlot = el('span', 'tl-here');
 const meSlot = el('span', 'tl-me');
-const chatSlot = el('span', 'tl-chatslot');
-chatSlot.append(chat.button);
+// Chat: the feed's history and input (client/lib/feed.ts), as T opens them.
+const chatBtn = el('button', 'tl-btn tl-chat');
+chatBtn.type = 'button';
+chatBtn.append(el('span', 'tl-bubble'), el('span', 'tl-label', 'Chat'));
+tipOn(chatBtn, feed.hint() ? 'Chat with everyone on the site (T)' : 'Chat with everyone on the site');
+chatBtn.addEventListener('click', () => feed.open());
 // Shut the sidebar for more room to read (a wide screen's; a phone's is a drawer already). Remembered per browser.
 const SIDE_SHUT = 'blaze.side.shut';
 const sideBtn = el('button', 'tl-btn tl-side');
@@ -235,7 +237,7 @@ try {
 }
 shutSide(wasShut, false);
 sideBtn.addEventListener('click', () => shutSide(!document.body.classList.contains('side-shut')));
-bar.append(sideBtn, discussSlot, el('span', 'tl-gap'), hereSlot, chatSlot, meSlot);
+bar.append(sideBtn, chatBtn, el('span', 'tl-gap'), hereSlot, meSlot);
 const list = el('div', 'tl-list');
 list.hidden = true;
 list.id = 'who-is-here';
@@ -256,19 +258,6 @@ function closeList(): void {
 	if (list.hidden) return;
 	list.hidden = true;
 	hereSlot.querySelector('button')?.setAttribute('aria-expanded', 'false');
-}
-
-/** The page's discussion: its comments, counted from the threads the page was rendered with. */
-function drawDiscuss(): void {
-	discussSlot.replaceChildren();
-	if (!document.querySelector('main #discussion')) return;
-	const n = document.querySelectorAll('main .c-item').length;
-	const a = el('a', 'tl-btn');
-	a.href = '#discussion';
-	tipOn(a, n === 0 ? 'Discuss this page' : `${n} comment${n === 1 ? '' : 's'} on this page`);
-	a.append(el('span', 'tl-bubble'), el('span', 'tl-label', n === 0 ? 'Discuss' : n === 1 ? 'comment' : 'comments'));
-	if (n > 0) a.insertBefore(el('span', 'tl-n', String(n)), a.lastChild);
-	discussSlot.append(a);
 }
 
 function drawHere(): void {
@@ -524,7 +513,6 @@ function draw(): void {
 		people.filter((p) => p.key !== you?.key && p.pages.some((x) => x.path === path)).map((p) => ({ key: p.key, login: p.login, avatar: p.avatar, away: awayOn(p, path) })),
 	);
 	mount();
-	drawDiscuss();
 	drawHere();
 	drawMe();
 	drawList();
@@ -577,7 +565,6 @@ function connect(): void {
 			people = Array.isArray(h.people) ? h.people : [];
 			total = typeof h.total === 'number' ? h.total : people.length;
 			announce();
-			chat.setOnline(total);
 			chat.setPeople(people);
 		} else return;
 		draw();
@@ -607,7 +594,6 @@ document.addEventListener('visibilitychange', () => {
 	connect();
 });
 addEventListener(PAGE, send);
-addEventListener(THREADS, drawDiscuss);
 document.addEventListener('keydown', (e) => {
 	if (e.key === 'Escape') closeList();
 });
