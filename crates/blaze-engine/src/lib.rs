@@ -2919,15 +2919,15 @@ impl Checkouts {
             workspaces.push(workspace);
         }
         let workspaces_at = start.elapsed();
+        // No macro sessions yet: a build serves the frozen def maps first, and collecting
+        // those of the crates that call stateful macros now would collect every dependency's
+        // from source, 5.4 s of a 6.3 s warm load of a 94-crate program (#1295).
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
-        let added_at = start.elapsed();
-        prepare_macro_sessions(db);
         if std::env::var_os("BLAZE_STATS").is_some() {
             eprintln!(
-                "load-us: workspaces={} files={} sessions={}",
+                "load-us: workspaces={} files={}",
                 workspaces_at.as_micros(),
-                (added_at - workspaces_at).as_micros(),
-                (start.elapsed() - added_at).as_micros()
+                (start.elapsed() - workspaces_at).as_micros()
             );
         }
         self.roots.extend(roots);
@@ -7627,6 +7627,7 @@ fn join(
 ) -> anyhow::Result<()> {
     let read_from = SystemTime::now();
     checkouts.add(&[project], db, tree.vfs())?;
+    prepare_macro_sessions(db);
     watch_loaded(db, tree, files, read_from);
     Ok(())
 }
@@ -8773,9 +8774,9 @@ fn run_holding(
     if args.run_tool {
         run_tool_std(&mut db)?;
     }
-    prepare_macro_sessions(&db);
 
     if args.out.is_dir() {
+        prepare_macro_sessions(&db);
         let texts = harnesses(&db, [&args], None);
         write_harnesses(&mut db, texts);
         return build_batch(&db, args);
