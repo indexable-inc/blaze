@@ -4876,6 +4876,9 @@ fn std_unit_at(
         exe: None,
         shared: false,
         library: true,
+        // The unit is the standard library's crates, never the program's unit tests: asked as
+        // those, `crates_called` keeps only crates with `cfg(test)`, which no crate of it has.
+        unit_test: false,
         debug,
         ..args.clone()
     };
