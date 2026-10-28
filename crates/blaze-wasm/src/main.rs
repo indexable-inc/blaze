@@ -2,7 +2,7 @@
 //! source of `core` for the page.
 //!
 //! ```text
-//! blaze-wasm bundle <sysroot>/lib/rustlib/src/rust/library core.bundle
+//! blaze-wasm bundle library core.bundle
 //! blaze-wasm build core.bundle out/ first.rs [edited.rs ...]
 //! ```
 //!

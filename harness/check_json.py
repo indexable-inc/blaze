@@ -73,6 +73,68 @@ CASES = {
     "fine": {
         "src/main.rs": ALLOW + "fn main() {\n    let _ = 1;\n}\n",
     },
+    # Borrow checks blaze got wrong in uv, ruff and ty, reduced by Charlie Marsh
+    # (astral-experiments/blaze). A trait object's outlives components include both sides of
+    # an associated type binding.
+    "dyn_associated_type_outlives": {
+        "src/main.rs": ALLOW + """trait Buffer { type Context; }
+struct Formatter<'buf, T>(&'buf mut dyn Buffer<Context = T>);
+
+fn source<'buf, 'ast>(_: Formatter<'buf, &'ast str>, text: &'ast str) -> &'buf str { text }
+fn main() {}
+""",
+    },
+    # A bound on an associated type also holds of what it normalizes to inside an aggregate.
+    "nested_projection_outlives": {
+        "src/main.rs": ALLOW + """struct State<T>(T);
+trait Buffer {
+    type Context;
+    fn state(&self) -> &State<Self::Context>;
+    fn state_mut(&mut self) -> &mut State<Self::Context>;
+}
+impl<W: Buffer<Context = C> + ?Sized, C> Buffer for &mut W {
+    type Context = C;
+    fn state(&self) -> &State<Self::Context> { (**self).state() }
+    fn state_mut(&mut self) -> &mut State<Self::Context> { (**self).state_mut() }
+}
+fn main() {}
+""",
+    },
+    # A promoted enum value is qualified by the fields of its active variant.
+    "promoted_enum_array": {
+        "src/main.rs": ALLOW + """enum Element { Token(&'static str), Owned(String) }
+const OPEN: Element = Element::Token("(");
+const ALIAS: Element = OPEN;
+fn tokens() -> &'static [Element] { &[ALIAS, Element::Token(")")] }
+fn main() { assert_eq!(tokens().len(), 2); }
+""",
+    },
+    "unpromoted_enum_array": {
+        "src/main.rs": ALLOW + """enum Element { Token, Owned(String) }
+const OWNED: Element = Element::Owned(String::new());
+fn tokens() -> &'static [Element] { &[Element::Token, OWNED] }
+fn main() {}
+""",
+    },
+    # An elided return lifetime is the borrow's, not the `'static` a trait object's supertrait
+    # implies, also for a closure's parameter; only `escape` is wrong.
+    "static_supertrait_object": {
+        "src/main.rs": ALLOW + """trait Database: 'static {
+    fn get(&self) -> &u32;
+    fn get_mut(&mut self) -> &mut u32;
+}
+fn read(db: &dyn Database) -> &u32 { db.get() }
+fn write(db: &mut dyn Database) -> &mut u32 { db.get_mut() }
+fn named<'db>(db: &'db dyn Database) -> &u32 { db.get() }
+fn through_closure<'db>(db: &'db dyn Database) -> &'db u32 {
+    (|db: &'db dyn Database| db.get())(db)
+}
+fn escape(db: &dyn Database) -> &'static u32 {
+    db.get()
+}
+fn main() {}
+""",
+    },
 }
 
 # Errors whose primary span rust-analyzer places otherwise than rustc, and why: only their

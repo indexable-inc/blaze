@@ -62,6 +62,7 @@ site {
 
   updates : Page {
     Narrow
+    Quiet
     Title: {"Tell us you use blaze"}
     Nav: {"Updates", 6}
     Icon: {"envelope"}
@@ -85,6 +86,7 @@ site {
   }
 
   "404" : Page {
+    Quiet
     Title: {"Not found"}
     P gone("Nothing here. Try the [home page](/) or [the RFCs](/rfcs).")
   }

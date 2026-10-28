@@ -12,13 +12,19 @@
  *
  * Nothing here builds HTML from strings: text goes in with textContent, markup comes parsed from the worker's page.
  *
+ * Before a site update reloads or swaps the page (client/lib/update.ts), the comments being written and the threads
+ * open are saved, by doc and block, and put back when the page sets up again.
+ *
  * Set up again on every page (client/lib/page.ts). The page the client router swapped in was fetched with the reader's
  * cookie, so its threads, forms and sign-in state are the reader's, as on a load.
  */
 
-import { onPage } from './lib/page';
+import { COMMENTS, SAVE, THREADS, kept, onPage } from './lib/page';
 
 const PAGE_THREAD = 'block-_page';
+
+/** What a site update keeps (client/lib/update.ts): drafts by block, and the threads open, for one doc. */
+type Kept = { doc: string; drafts: Record<string, string>; open: string[] };
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: string): HTMLElementTagNameMap[K] {
 	const e = document.createElement(tag);
@@ -97,6 +103,39 @@ function start(main: HTMLElement, signal: AbortSignal) {
 			oldButton.replaceWith(b);
 		}
 		setOpen(thread, true);
+		dispatchEvent(new Event(THREADS));
+	}
+
+	/**
+	 * Someone posted or deleted a comment on this page (client/lib/presence.ts relays the worker's word): every
+	 * thread's list and count button are swapped for the worker's current rendering. The forms stay, so a comment
+	 * being written is kept, and so does what is open. A comment that is new here is marked for a moment.
+	 */
+	async function refresh() {
+		const res = await fetch(location.pathname, { headers: { Accept: 'text/html' }, cache: 'no-store', credentials: 'same-origin' });
+		if (!res.ok || signal.aborted) return;
+		const fresh = new DOMParser().parseFromString(await res.text(), 'text/html');
+		if (signal.aborted) return;
+		const seen = new Set([...main.querySelectorAll('.c-item')].map((i) => i.id));
+		for (const next of fresh.querySelectorAll<HTMLElement>('.c-thread')) {
+			const old = threadOf(next.id);
+			const list = next.querySelector('.c-list');
+			const oldList = old?.querySelector('.c-list');
+			if (!old || !list || !oldList) continue;
+			const adopted = document.adoptNode(list);
+			relativeTimes(adopted);
+			for (const item of adopted.querySelectorAll('.c-item')) if (!seen.has(item.id)) item.classList.add('c-new');
+			oldList.replaceWith(adopted);
+			const nextButton = fresh.querySelector(`.c-btn[aria-controls="${CSS.escape(next.id)}"]`);
+			const oldButton = buttonOf(next.id);
+			if (nextButton && oldButton) {
+				const b = document.adoptNode(nextButton);
+				b.setAttribute('role', 'button');
+				b.setAttribute('aria-expanded', String(!old.hidden));
+				oldButton.replaceWith(b);
+			}
+		}
+		dispatchEvent(new Event(THREADS));
 	}
 
 	function mark(item: HTMLElement) {
@@ -215,6 +254,39 @@ function start(main: HTMLElement, signal: AbortSignal) {
 		void post(f);
 	}, { signal });
 	window.addEventListener('hashchange', followHash, { signal });
+	const blockOf = (f: HTMLFormElement) => (f.elements.namedItem('block') as HTMLInputElement | null)?.value ?? '';
+	window.addEventListener(SAVE, (e) => {
+		const drafts: Record<string, string> = {};
+		for (const f of main.querySelectorAll<HTMLFormElement>('form.c-compose')) {
+			const v = f.querySelector('textarea')?.value;
+			if (v?.trim()) drafts[blockOf(f)] = v;
+		}
+		const open = [...main.querySelectorAll<HTMLElement>('.c-thread')].filter((t) => !t.hidden).map((t) => t.id);
+		(e as CustomEvent<Record<string, unknown>>).detail.comments = { doc: main.dataset.doc ?? '', drafts, open } satisfies Kept;
+	}, { signal });
+	const back = kept<Kept>('comments');
+	if (back && back.doc === main.dataset.doc) {
+		for (const id of back.open ?? []) {
+			const t = threadOf(id);
+			if (t?.classList.contains('c-thread')) setOpen(t, true);
+		}
+		for (const f of main.querySelectorAll<HTMLFormElement>('form.c-compose')) {
+			const v = back.drafts?.[blockOf(f)];
+			const ta = f.querySelector('textarea');
+			const t = f.closest<HTMLElement>('.c-thread');
+			if (!v || !ta) continue;
+			ta.value = v;
+			if (t) setOpen(t, true);
+		}
+	}
+	// The worker's page cache keys on a doc version each isolate memoises for 2 s (worker/pages.ts): wait that out.
+	let pending: ReturnType<typeof setTimeout> | undefined;
+	window.addEventListener(COMMENTS, (e) => {
+		if ((e as CustomEvent<string>).detail !== main.dataset.doc) return;
+		clearTimeout(pending);
+		pending = setTimeout(() => void refresh().catch(() => {}), 2200);
+	}, { signal });
+	signal.addEventListener('abort', () => clearTimeout(pending));
 	followHash();
 }
 

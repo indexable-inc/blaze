@@ -861,21 +861,17 @@ impl<'db> DefCollector<'db> {
             })
             .collect();
 
-        // Resolve all indeterminate resolved imports again
-        // As some of the macros will expand newly import shadowing partial resolved imports
-        // FIXME: We maybe could skip this, if we handle the indeterminate imports in `resolve_imports`
-        // correctly
+        // Macro expansion can expose a new binding or change the visibility of an existing
+        // one without adding a namespace. Revisit partial imports until their bindings settle.
         let mut indeterminate_imports = std::mem::take(&mut self.indeterminate_imports);
         indeterminate_imports.retain_mut(|(directive, partially_resolved)| {
-            let partially_resolved = partially_resolved.availability();
             directive.status = self.resolve_import(directive.module_id, &directive.import);
             match directive.status {
-                PartialResolvedImport::Indeterminate(import)
-                    if partially_resolved != import.availability() =>
-                {
+                PartialResolvedImport::Indeterminate(import) if import != *partially_resolved => {
+                    *partially_resolved = import;
                     self.record_resolved_import(directive);
                     res = ReachedFixedPoint::No;
-                    false
+                    true
                 }
                 PartialResolvedImport::Resolved(_) => {
                     self.record_resolved_import(directive);
