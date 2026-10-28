@@ -161,7 +161,7 @@ pub fn serve(
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     let mut token = [0u8; 16];
-    getrandom::fill(&mut token).map_err(std::io::Error::other)?;
+    getrandom::fill(&mut token).map_err(|error| std::io::Error::other(error.to_string()))?;
     let token: String = token.iter().map(|it| format!("{it:02x}")).collect();
     let url = format!("http://127.0.0.1:{port}/{token}/");
     let site = Arc::new(http::Site { port, token, graphs });

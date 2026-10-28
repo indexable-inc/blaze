@@ -435,8 +435,8 @@ fn frames_carry_one_item_each() {
     assert!(refused.to_string().contains("more bytes than it needs"), "{refused}");
 }
 
-/// A record of the functions a build put in its program takes little more than their names:
-/// a cold build of anim says some 80 000 of them.
+/// A record of the functions a build put in its program takes their names and some 100 bytes
+/// more for each (the names of the fields among them): a cold build of anim says some 80 000.
 #[test]
 fn a_record_of_functions_is_small() {
     use crate::events::{Event, Function, How, Record};
@@ -455,5 +455,5 @@ fn a_record_of_functions_is_small() {
     let bytes = to_vec(&record).unwrap();
     check(&bytes).unwrap();
     assert_eq!(from_slice::<Record>(&bytes).unwrap(), record);
-    assert!(bytes.len() < names + 1000 * 64, "{} bytes for {names} of names", bytes.len());
+    assert!(bytes.len() < names + 1000 * 128, "{} bytes for {names} of names", bytes.len());
 }

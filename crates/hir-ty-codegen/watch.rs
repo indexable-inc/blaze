@@ -14,7 +14,7 @@ use std::{
 };
 
 use base_db::Crate;
-use hir_def::FunctionId;
+use hir_def::{FunctionId, HasModule};
 use hir_ty::db::HirDatabase;
 use rustc_hash::{FxHashMap, FxHasher};
 
