@@ -22,7 +22,7 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use super::{directives, keyed, own_script, sandboxed, script_sandbox, wasi_script};
+use super::{directives, inert_script, keyed, own_script, sandboxed, script_sandbox, wasi_script};
 #[cfg(unix)]
 use super::{hermetic, script_sandbox::InView};
 
@@ -128,8 +128,14 @@ pub fn run_as_cargo_does(
     let cwd = std::env::current_dir()?;
     let mut script = Command::new(&real);
     script.args(&args).env_remove(REAL);
+    let inert = inert_script::read(&real)?;
     // Not run by cargo: there is nowhere for it to write.
-    let Some(out_dir) = out_dir else { return become_it(&mut script) };
+    let Some(out_dir) = out_dir else {
+        if let Some(inert) = &inert {
+            return write_printed(&inert_script::run(inert, &env));
+        }
+        return become_it(&mut script);
+    };
     let run_dir = out_dir.parent().context("an OUT_DIR at the root")?.to_owned();
     let places = Places::of(&env);
     let ran = Ran { real: real.clone(), cwd: cwd.clone(), env };
@@ -154,6 +160,15 @@ pub fn run_as_cargo_does(
             declared: &declared,
         };
         let plan = script_sandbox::plan(&running)?;
+        if let Some(inert) = &inert {
+            let output = inert_script::run(inert, plan.env());
+            let unset = unset_now(&output.stdout, &ran.env, &plan, &declared);
+            if !unset.is_empty() {
+                declared.extend(unset);
+                continue;
+            }
+            return inert_ran(package, &plan, &cwd, &out_dir, output);
+        }
         // Under `wasi`, the module runs for cargo and the process ends as it did; under
         // `wasi-compare`, it runs first and what it did is set aside.
         if declared.is_empty()
@@ -327,6 +342,45 @@ pub fn run_as_cargo_does(
         }
         std::process::exit(output.status.code().unwrap_or(1))
     }
+}
+
+/// Gives cargo what the inert script of `package` printed ([`inert_script`]), worked out with
+/// what a run as `plan` says is given, as a run's output is given: one in the sandbox has what
+/// it printed checked ([`directives`]) and read nothing, which is kept for the daemon's check
+/// of it when it did not say what it reads; one outside is as it printed.
+fn inert_ran(
+    package: &str,
+    plan: &script_sandbox::Plan,
+    cwd: &Path,
+    out_dir: &Path,
+    mut output: std::process::Output,
+) -> anyhow::Result<()> {
+    let script_sandbox::Plan::Sandboxed { link_dirs, in_view, .. } = plan else {
+        script_sandbox::keep_reads(out_dir, None);
+        return write_printed(&output);
+    };
+    let directives = directives::Ran { package_dir: cwd, out_dir, link_dirs };
+    let refused = directives::refused(&output.stdout, &directives);
+    #[cfg(unix)]
+    if in_view.is_some() {
+        output.stdout = hermetic::for_cargo(&output.stdout);
+    }
+    let says = script_sandbox::says_what_it_reads(&output.stdout);
+    let reads = (in_view.is_none() && !says).then_some(&[][..]);
+    script_sandbox::keep_reads(out_dir, reads);
+    write_printed(&output)?;
+    if !refused.is_empty() {
+        eprintln!("error: {}", directives::refused_error(package, &refused));
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Writes what a run printed where it would have.
+fn write_printed(output: &std::process::Output) -> anyhow::Result<()> {
+    std::io::stdout().write_all(&output.stdout)?;
+    std::io::stderr().write_all(&output.stderr)?;
+    Ok(())
 }
 
 /// What a run that printed `stdout` said it reads and was not given

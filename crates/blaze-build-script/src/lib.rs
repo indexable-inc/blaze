@@ -12,6 +12,7 @@
 
 pub mod apply;
 pub mod env;
+pub mod inert;
 pub mod output;
 pub mod run;
 pub mod unit;

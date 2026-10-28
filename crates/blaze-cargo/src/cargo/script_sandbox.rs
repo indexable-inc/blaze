@@ -2,7 +2,8 @@
 //! linked it) and the daemon's own reruns, goes through [`run`], which runs it in the sandbox
 //! every test runs in ([`crate::sandbox`]): the machine read-only, `OUT_DIR` written for real,
 //! empty temporary directories, no network but the sandbox's own loopback, and exactly the
-//! environment cargo gave it. "Everything should by default be in sandbox" (Andrew,
+//! environment cargo gave it; a script that only prints ([`super::inert_script`]) is not run,
+//! and what it prints is worked out from that environment. "Everything should by default be in sandbox" (Andrew,
 //! 2026-10-26; [#147]).
 //!
 //! Why `OUT_DIR` alone is written: it is the one place cargo tells a script to write ("Build
@@ -532,6 +533,11 @@ fn user_cache() -> Option<PathBuf> {
 /// has a note after what it printed to stderr, naming the package, what the sandbox refused
 /// it and how to take it out; a sandbox that could not be made, why and how to fix it.
 pub fn run(script: &Script<'_>, plan: &Plan, stdin: Stdio) -> anyhow::Result<Ran> {
+    // A script that only prints is not run: what it prints is worked out from what it is given.
+    if let Some(inert) = super::inert_script::read(script.real)? {
+        let reads = matches!(plan, Plan::Sandboxed { in_view: None, .. }).then(Vec::new);
+        return Ok(Ran { output: super::inert_script::run(&inert, plan.env()), reads });
+    }
     let (spec, root_manifest, in_view) = match plan {
         Plan::Outside(why, env) => {
             if std::env::var_os("BLAZE_STATS").is_some() {

@@ -13,7 +13,7 @@ use std::{
 use anyhow::Context as _;
 
 use super::{
-    own_macro, own_script, script,
+    inert_script, own_macro, own_script, script,
     units::{Record, stamp_now},
     wasi_script,
 };
@@ -64,13 +64,14 @@ pub fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<()> {
 /// blaze. The code to end with.
 fn for_load(compiler: Command, args: &[OsString]) -> anyhow::Result<i32> {
     let own = std::env::var_os(own_macro::OWN_TARGET).is_some() && !own_macro::turned_off();
-    let unit = Unit::of(args);
-    if let Some(unit) = unit.as_ref().filter(|it| it.script) {
-        unit.for_wasi(&unit.records.join(&unit.id))?;
-    }
-    let unit = match unit {
+    let unit = match Unit::of(args) {
         Some(unit) if own => unit,
-        unit => return by_rustc(compiler, unit.as_ref()),
+        unit => {
+            if let Some(unit) = unit.as_ref().filter(|it| it.script) {
+                unit.for_wasi(&unit.records.join(&unit.id))?;
+            }
+            return by_rustc(compiler, unit.as_ref());
+        }
     };
     let record = unit.as_record(stamp_now());
     let package = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
@@ -175,14 +176,18 @@ impl Unit {
         Some(unit)
     }
 
-    /// Has blaze compile and link the build script where rustc would have, and records it.
+    /// Has blaze compile and link the build script where rustc would have, and records it;
+    /// or, for one that only prints ([`inert_script`]), write what stands for it there.
     /// `dir` is where the unit is recorded. `Err` is why blaze did not.
     fn by_blaze(&self, dir: &Path) -> Result<(), String> {
         let stamp = stamp_now();
         let copies = dir.join(stamp.to_string());
         let record = self.as_record(0);
         let exe = record.outputs().into_iter().next().ok_or("rustc names no executable")?;
-        own_script::compile(&self.args, &self.cwd, &self.source, &exe, &copies)?;
+        if !inert_script::elide(&self.args, &self.source, &exe)? {
+            self.for_wasi(dir).map_err(|it| format!("{it:#}"))?;
+            own_script::compile(&self.args, &self.cwd, &self.source, &exe, &copies)?;
+        }
         self.record(stamp, &copies).map_err(|it| format!("{it:#}"))
     }
 

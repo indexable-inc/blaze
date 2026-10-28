@@ -18,6 +18,7 @@ pub mod fetches;
 #[cfg(unix)]
 pub mod hermetic;
 pub mod home;
+pub mod inert_script;
 pub mod layout;
 pub mod messages;
 pub mod metadata;

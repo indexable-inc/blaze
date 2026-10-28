@@ -4,6 +4,9 @@
 //! - `run UNIT CARGO_ENV` runs the script as blaze runs it and prints the environment it was
 //!   given, its outputs and what cargo makes of them.
 //! - `parse UNIT CARGO_ENV OUTPUT` reads a file of a script's output as blaze reads it.
+//! - `inert SOURCE EDITION [ENV]` says whether the script of `SOURCE` is one blaze does not
+//!   compile or run ([`blaze_build_script::inert`]), and with `ENV`, the environment a run was
+//!   given, what it would print.
 //!
 //! Under any other name it stands in for a script cargo runs: the harness puts it where rustc
 //! wrote the script and the script's path in `harness-real` beside it. It writes what cargo
@@ -18,7 +21,7 @@
 use std::{collections::BTreeMap, ffi::OsString, path::Path, process::ExitCode};
 
 use blaze_build_script::{
-    Error, Unit,
+    Error, Unit, inert,
     output::{self, Context, Output, Severity},
     run::{self, Failed, Invocation},
 };
@@ -36,6 +39,14 @@ struct Ran {
 }
 
 #[derive(Serialize)]
+struct Inert {
+    inert: bool,
+    why: Option<String>,
+    stdout: Option<String>,
+    stderr: Option<String>,
+}
+
+#[derive(Serialize)]
 struct Parsed {
     output: Option<Output>,
     error: Option<String>,
@@ -50,8 +61,12 @@ fn main() -> ExitCode {
     let printed = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["run", unit, cargo_env] => ran(unit, cargo_env),
         ["parse", unit, cargo_env, output] => parsed(unit, cargo_env, output),
+        ["inert", source, edition] => inert(source, edition, None),
+        ["inert", source, edition, env] => inert(source, edition, Some(env)),
         _ => Err(Error(
-            "usage: blaze-build-script run UNIT CARGO_ENV | parse UNIT CARGO_ENV OUTPUT".to_owned(),
+            "usage: blaze-build-script run UNIT CARGO_ENV | parse UNIT CARGO_ENV OUTPUT | inert \
+             SOURCE EDITION [ENV]"
+                .to_owned(),
         )),
     };
     match printed {
@@ -177,5 +192,24 @@ fn parsed(unit: &str, cargo_env: &str, output: &str) -> Result<String, Error> {
     json(&match parsed {
         Ok(output) => Parsed { output: Some(output), error: None },
         Err(error) => Parsed { output: None, error: Some(error.0) },
+    })
+}
+
+fn inert(source: &str, edition: &str, env: Option<&str>) -> Result<String, Error> {
+    let text = std::fs::read_to_string(source).map_err(|err| Error(format!("{source}: {err}")))?;
+    let edition = edition.parse().map_err(|err| Error(format!("{err}")))?;
+    let env: Option<BTreeMap<String, String>> = env.map(read).transpose()?;
+    json(&match inert::of(&text, edition) {
+        Ok(script) => {
+            let printed = env.map(|env| script.run(|name| env.get(name).map(String::as_str)));
+            let text = |it: &[u8]| String::from_utf8_lossy(it).into_owned();
+            Inert {
+                inert: true,
+                why: None,
+                stdout: printed.as_ref().map(|it| text(&it.stdout)),
+                stderr: printed.as_ref().map(|it| text(&it.stderr)),
+            }
+        }
+        Err(why) => Inert { inert: false, why: Some(why.0), stdout: None, stderr: None },
     })
 }
