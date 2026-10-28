@@ -14,8 +14,9 @@ use std::path::{Path, PathBuf};
 /// started with it is the pinned one, and runs no other.
 pub(crate) const PINNED_BY: &str = "BLAZE_PINNED_BY";
 
-/// This blaze's version, as a pin names it.
-pub(crate) const OURS: &str = env!("CARGO_PKG_VERSION");
+/// This blaze's version, as a pin names it: a release's `0.YYYYMMDD.N`, or `0.0.0-dev` for a
+/// build of the tree, which no pin names (build.rs, from `BLAZE_RELEASE`).
+pub(crate) const OURS: &str = env!("BLAZE_VERSION");
 
 /// Where a command run with `args` in `cwd` starts looking for its workspace: the directory
 /// of `--manifest-path`, else `cwd`.

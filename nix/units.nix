@@ -118,8 +118,8 @@ let
     // lib.optionalAttrs (builtins.elem i checked.roots || u.pkg == (U (builtins.head checked.roots)).pkg) { CARGO_PRIMARY_PACKAGE = "1"; }
     // lib.optionalAttrs (p.links != null) { CARGO_MANIFEST_LINKS = p.links; }
     # `blaze-engine --version` and the daemon's log name the commit, as the flake's `daemon` does
-    # (blaze-cargo's build script reads it).
-    // lib.optionalAttrs (p.name == "blaze-cargo" && gitSha != "") { BLAZE_GIT_SHA = gitSha; };
+    # (blaze-engine's build script reads it).
+    // lib.optionalAttrs (p.name == "blaze-engine" && gitSha != "") { BLAZE_GIT_SHA = gitSha; };
 
   mk = i:
     let

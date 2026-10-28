@@ -311,7 +311,7 @@ impl Asked {
             hasher.update((it.len() as u64).to_le_bytes());
             hasher.update(it);
         };
-        add(env!("CARGO_PKG_VERSION").as_bytes());
+        add(crate::pin::OURS.as_bytes());
         for name in ["RUSTC", "RUSTUP_TOOLCHAIN"] {
             add(self.var(name).unwrap_or_default().as_bytes());
         }

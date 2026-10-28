@@ -74,6 +74,14 @@ pub(crate) fn fetch(version: &str) -> anyhow::Result<PathBuf> {
 /// `blaze pin`: this blaze's version under `[workspace.metadata.blaze]` in the workspace's
 /// root manifest, the rest of the manifest as it was.
 pub(crate) fn pin(args: &[String]) -> anyhow::Result<i32> {
+    if !pin::is_version(pin::OURS) {
+        bail!(
+            "this blaze is {}, a build of blaze's source tree and no release, so there is \
+             nothing to pin: run `blaze pin` with a release (install.sh, or `blaze-v<version>` \
+             from https://github.com/indexable-inc/blaze/releases)",
+            pin::OURS
+        );
+    }
     let cwd = std::env::current_dir()?;
     let manifest = pin::root_manifest(&pin::start(args, &cwd)).context(
         "`blaze pin` pins blaze in the workspace it is run in, and there is no Cargo.toml here \
