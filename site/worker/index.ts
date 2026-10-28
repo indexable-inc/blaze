@@ -4,7 +4,7 @@
  * path, and then, by site path:
  *
  *   /auth/*    GitHub sign-in and sign-out (auth.ts)
- *   /api/*     comments (comments.ts)
+ *   /api/*     comments (comments.ts); /api/presence, a WebSocket to who is on the site (presence.ts)
  *   /updates   the signup form (updates.ts)
  *   /charter, /rfcs/*   discussable pages, rendered with their comments (pages.ts); other paths there are assets
  *   /audio/*   narration files, from R2 when bound, with Range support (audio.ts)
@@ -21,6 +21,7 @@ import { handleComments } from './comments';
 import type { Env } from './env';
 import { assetHeaders, json, plain } from './http';
 import { handlePage } from './pages';
+import { handlePresence } from './presence';
 import { handleUpdates } from './updates';
 
 async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -29,6 +30,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 	if (p === '/updates') return handleUpdates(request, env, url);
 	if (p === '/auth' || p.startsWith('/auth/')) return handleAuth(request, env, ctx, url);
 	if (p === '/api/comments' || p.startsWith('/api/comments/')) return handleComments(request, env, url);
+	if (p === '/api/presence') return handlePresence(request, env);
 	if (p.startsWith('/api/')) return json({ error: 'Not found.' }, 404);
 	if (p.startsWith('/audio/')) return handleAudio(request, env, url);
 	if (p === '/learn' || p === '/learn/') return new Response(null, { status: 301, headers: { location: `${outer('/')}${url.search}`, 'cache-control': 'public, max-age=3600' } });
@@ -47,6 +49,8 @@ async function installer(request: Request, env: Env, url: URL): Promise<Response
 	res.headers.append('vary', 'Accept');
 	return res;
 }
+
+export { Presence } from './presence';
 
 export default {
 	async fetch(request, env, ctx) {

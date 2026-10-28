@@ -2,7 +2,7 @@ name: pgo
 
 # Trains the profiles blaze is optimized with (PGO), each on the runner its release binary is
 # built on, and pins them: the files go to the `pgo-profiles` release under names that carry
-# their sha256, and a commit to main writes those names and hashes into pgo/profiles.json, which
+# their sha256, and a commit to main writes those names and hashes into tools/pgo/profiles.json, which
 # the release workflow and the flake build with (.github/scripts/build_release.py).
 #
 # It runs by itself when what the crates are changes (Cargo.lock, a manifest, the toolchain, the
@@ -91,14 +91,14 @@ jobs:
         run: |
           gh release view pgo-profiles --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 ||
             gh release create pgo-profiles --repo "$GITHUB_REPOSITORY" --prerelease --title "PGO profiles" \
-              --notes "The profiles blaze's builds are optimized with, one file per toolchain, target and content (pgo/profiles.json pins them by sha256). Not a release of blaze."
+              --notes "The profiles blaze's builds are optimized with, one file per toolchain, target and content (tools/pgo/profiles.json pins them by sha256). Not a release of blaze."
           gh release upload pgo-profiles --repo "$GITHUB_REPOSITORY" "$RUNNER_TEMP"/pgo/*/*.profdata --clobber
       - name: Pin
         run: |
           python3 .github/scripts/build_release.py --pin "$RUNNER_TEMP"/pgo/*
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pgo/profiles.json
+          git add tools/pgo/profiles.json
           git commit -m "pgo: profiles trained at ${GITHUB_SHA::10} [skip ci]"
           for attempt in 1 2 3 4 5; do
             git pull --rebase origin main && git push origin HEAD:main && exit 0

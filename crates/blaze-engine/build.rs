@@ -9,7 +9,7 @@
 //! is not set, and the store keys by the bytes of the executable.
 //!
 //! The SHA-256 is written here rather than taken from `sha2`: a build dependency is built for
-//! the machine that builds, and `nix/units` holds one graph per target computed on Linux, where
+//! the machine that builds, and `tools/nix/units` holds one graph per target computed on Linux, where
 //! `sha2`'s `cpufeatures` needs no `libc`, which it needs on Apple's aarch64.
 
 use std::path::{Path, PathBuf};

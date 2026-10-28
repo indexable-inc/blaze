@@ -15,9 +15,14 @@
  *
  * The sidebar outlives the client router's swaps (client/nav.ts), so everything but the outline is set up once; the
  * outline is the page's own and is set up again on every page (client/lib/page.ts), and a swap closes the drawer.
+ *
+ * Every page has this script, so it also brings in who is here (client/lib/presence.ts): the top line and the faces
+ * on the rows.
  */
 
 import { PAGE, onPage } from './lib/page';
+import './lib/presence';
+import { SIDE, handle } from './lib/resize';
 import { KEY as PROGRESS, load, stateOf, stateWords } from './lib/progress';
 
 type Entry = { u: string; t: string; h: string; x: string };
@@ -347,6 +352,9 @@ folds();
 glide();
 drawer();
 search();
+// The sidebar's right edge drags its width (client/lib/resize.ts); not in the phone drawer (styles/shell.css).
+document.querySelector('.side')?.append(handle(SIDE));
+
 onPage(spy);
 
 /** Each lesson row's mark: not started, started, finished, or every question right the first time. */

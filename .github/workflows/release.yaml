@@ -85,7 +85,7 @@ jobs:
           python3 -I .github/scripts/canary.py stamp "{\"tag\": \"$GITHUB_REF_NAME\"}"
       # No build cache: release binaries come from a clean build. With the `llvm` feature, so
       # every user gets the LLVM tiers: build_release.py fetches the LLVM llvm.json pins and
-      # links it in statically, and refuses a binary that loads libLLVM or a C++ runtime. The recipe the flake's build runs too, with the profile pgo/profiles.json pins; a
+      # links it in statically, and refuses a binary that loads libLLVM or a C++ runtime. The recipe the flake's build runs too, with the profile tools/pgo/profiles.json pins; a
       # release refuses a profile trained on other crates (Cargo.lock or the toolchain moved
       # since the pgo workflow last ran). The blaze it built then builds blaze's
       # proc-macro server (`--server`), which the archive has beside it: the server that

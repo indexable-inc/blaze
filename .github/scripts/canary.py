@@ -38,7 +38,7 @@ ROOT = Path(__file__).resolve().parents[2]
 REPO = os.environ.get("GITHUB_REPOSITORY", "indexable-inc/blaze")
 DATED = re.compile(r"v0\.(\d{8})\.(0|[1-9]\d*)")
 # A change to nothing but these makes no canary: blaze is the same program.
-DOCS = re.compile(r"^(docs/|site/|agents/|bench/results/)|\.md$")
+DOCS = re.compile(r"^(docs/|site/|tools/agents/|tools/bench/results/)|\.md$")
 # release.yaml's builds run on ubuntu-22.04, whose Python (3.10) has no tomllib: `stamp` without
 # notes needs nothing newer, and train_release.py (which imports tomllib) is imported where used.
 WORKSPACE_VERSION = re.compile(r'(\[workspace\.package\]\nversion = ")([^"]+)"')

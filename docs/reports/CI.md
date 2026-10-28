@@ -133,4 +133,4 @@ platforms, and `nix-live.yaml` (not blocking until it has been green a while). I
 `core-N` by measured seconds, so that no part is longer than `wholeprogram.py` (19 minutes on
 macOS). A green train releases main when it has changes since the last release, through
 `pgo.yaml` and `release.yaml`; a red one opens or adds to one issue. The nightly schedules of
-`blaze.yaml` and `nix-live.yaml` are gone; `nix/units` was regenerated, after a week stale.
+`blaze.yaml` and `nix-live.yaml` are gone; `tools/nix/units` was regenerated, after a week stale.

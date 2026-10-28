@@ -12,7 +12,7 @@
 #       write the caches every other run reads. They are not cancelled by the next push, as the
 #       train is, so the caches are written for every commit.
 #
-# A change to nothing but documentation, the site or the agent rules (agents/) runs the script
+# A change to nothing but documentation, the site or the agent rules (tools/agents/) runs the script
 # checks alone. `ci` is the one check that says whether everything that ran passed: it is the
 # check branch rules and the merge queue require. The queue tests each pull request merged onto main and whatever is ahead
 # of it, and main moves only to what it tested.
@@ -73,7 +73,7 @@ jobs:
           while read -r file; do
             case "$file" in
               .github/workflows/blaze*.yaml|.github/actions/*) code=true;;
-              *.md|docs/*|site/*|agents/*|LICENSE*|.github/*) ;;
+              *.md|docs/*|site/*|tools/agents/*|LICENSE*|.github/*) ;;
               *) code=true;;
             esac
           done <<< "$files"
@@ -91,11 +91,11 @@ jobs:
       - run: python3 harness/imports.py
       # No new place in blaze's code starts rustc, rustdoc or cargo (docs/no-rustc.md).
       - run: python3 harness/rustcsites.py
-      # The agent rules: agents/rules.ts type-checks, and AGENTS.md is what it generates.
+      # The agent rules: tools/agents/rules.ts type-checks, and AGENTS.md is what it generates.
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile --cwd site
-      - run: site/node_modules/.bin/tsc -p agents
-      - run: bun agents/rules.ts --check
+      - run: site/node_modules/.bin/tsc -p tools/agents
+      - run: bun tools/agents/rules.ts --check
 
   linux-x64:
     name: linux x64

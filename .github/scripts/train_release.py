@@ -11,7 +11,7 @@ build.rs adds the commit).
 
 `prepare`: when main has commits since the last release, the workspace version of today's next
 release, a CHANGELOG.md section for it (what [Unreleased] had, and the title of each change merged since
-the last release), Cargo.lock and nix/units for the new version, all in one commit `release:
+the last release), Cargo.lock and tools/nix/units for the new version, all in one commit `release:
 v0.YYYYMMDD.N [skip ci]` on main; then the pgo workflow, by dispatch. A release is built against
 profiles trained on its own crates (`build_release.py --strict`), and the version is part of
 every crate's hash, so the tag waits for the profiles. Nothing to release when the commits
@@ -28,7 +28,7 @@ workspace version's CHANGELOG.md section.
 
 Without --push nothing leaves the checkout: the commit or tag is made and shown. Needs git, gh
 (GH_TOKEN with contents: write and actions: write), and for `prepare` nix (the flake's dev shell
-runs cargo and nix/unit_graph.py). Python 3.11+, stdlib.
+runs cargo and tools/nix/unit_graph.py). Python 3.11+, stdlib.
 """
 import argparse, asyncio, datetime, os, re, sys, tomllib
 from pathlib import Path
@@ -178,9 +178,9 @@ async def prepare(args):
     log.write_text(changelog(log.read_text(), new, [t for t, _ in titles], today))
     # The workspace's own entries of Cargo.lock, then the unit graphs, which hash Cargo.lock.
     await run("nix", "develop", "--command", "cargo", "update", "--workspace", step="cargo update --workspace", timeout=1800)
-    await run(sys.executable, "nix/unit_graph.py", step="nix/unit_graph.py", timeout=3600)
+    await run(sys.executable, "tools/nix/unit_graph.py", step="tools/nix/unit_graph.py", timeout=3600)
 
-    await run("git", "add", "-A", "Cargo.toml", "Cargo.lock", "CHANGELOG.md", "nix/units", step="git add")
+    await run("git", "add", "-A", "Cargo.toml", "Cargo.lock", "CHANGELOG.md", "tools/nix/units", step="git add")
     message = f"release: v{new} [skip ci]\n\n{len(titles)} changes since {base}, through {(await run('git', 'rev-parse', '--short=10', 'HEAD', step='HEAD')).strip()}."
     await run("git", "commit", "-q", "-m", message, step="git commit")
     shown = await run("git", "show", "--stat", "HEAD", step="git show")

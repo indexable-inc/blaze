@@ -111,7 +111,7 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.BLAZE_BOT_TOKEN || github.token }}
-      # cargo and nix/unit_graph.py from the flake's dev shell, as nix-live.yaml's unit graphs.
+      # cargo and tools/nix/unit_graph.py from the flake's dev shell, as nix-live.yaml's unit graphs.
       - uses: DeterminateSystems/nix-installer-action@v23
       - uses: DeterminateSystems/magic-nix-cache-action@v15
         with:
