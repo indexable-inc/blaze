@@ -1,6 +1,7 @@
 {
   "cases": {
     "hashmap": { "group": "std", "tests": 2 },
+    "const_heap": { "group": "std", "tests": 0 },
     "ce_inflate": { "group": "std", "tests": 0 },
     "ce_inflate_rt": { "group": "std", "tests": 0 },
     "ce_toml": { "group": "std", "tests": 0 },
