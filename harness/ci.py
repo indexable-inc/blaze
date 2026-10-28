@@ -143,6 +143,9 @@ HARNESSES = [
     ("store", ["storeguards.py"], {}, on("linux"), None),
     ("store", ["storetracked.py"], {}, on("linux", "macos"), 2),
     ("store", ["storebuilds.py"], {}, on("linux", "macos"), 2),
+    # Typed JSON from the Python workspace: the harness job has to run ci.py under `uv run --frozen`.
+    ("store", ["storerevisions.py", json.dumps({"blaze_bin": os.environ.get("BLAZE_BIN", "")})], {},
+     on("linux", "macos"), None),
     ("daemon", ["stress.py"], {}, EVERYWHERE, 2),
     ("daemon", ["selects.py"], {}, on("linux"), 2),
     # MinIO as one program in ~/s3tools, which CI puts there on Linux.
