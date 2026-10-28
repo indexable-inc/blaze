@@ -163,6 +163,8 @@ pub fn jobs(args: &[String]) -> usize {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     fn args(of: &[&str]) -> Vec<String> {

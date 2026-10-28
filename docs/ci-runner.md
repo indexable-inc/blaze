@@ -386,7 +386,8 @@ path-taking syscall whose supervisor, outside the sandbox, records each path and
 the test ends. blaze writes the test harness ([#88](https://github.com/indexable-inc/blaze/issues/88)),
 so the harness marks, on each thread, which test it is running, and the supervisor files each
 path under that test. Every test runs sandboxed, by default, one sandbox per test executable
-with libtest's threads inside: a launch costs about 8 ms on Linux x86-64 (9 ms recording reads),
+with its fork server inside, which forks a process for each test
+([cargo.md](cargo.md#each-test-runs-in-a-process-of-its-own)): a launch costs about 8 ms on Linux x86-64 (9 ms recording reads),
 and a 600-test library's test phase 37 ms sandboxed against 18 ms bare, where a sandbox per
 test cost ten times as much (**measured**, `harness/sandboxbench.py`;
 [cargo.md](cargo.md#sandboxed-tests-an-experiment-opt-in)). macOS has the same sandbox from Seatbelt
