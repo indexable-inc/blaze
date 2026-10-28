@@ -3,7 +3,7 @@
   "compatibility_date": "2026-10-01",
   "workers_dev": false,
   // The site is https://ix.dev/blaze/ (Served in content/site.flecs). worker/ takes every request: it redirects the old
-  // hosts, strips /blaze (worker/base.ts), handles sign-in, comments, discussable pages and the /updates form, and serves
+  // hosts, strips /blaze (worker/base.ts), handles sign-in, comments and discussable pages, and serves
   // everything else from dist/ (bun gen/build.ts) through ASSETS.
   "main": "worker/index.ts",
   // `wrangler dev` rebuilds dist/ and .gen/ when a page, style or client script changes. The renderer's wasm modules
@@ -33,9 +33,6 @@
     { "pattern": "blaze.ix.dev", "custom_domain": true }
   ],
   "vars": {
-    // Turnstile site key (public). Empty skips the widget and verification, so dev works.
-    // The secret is set with `wrangler secret put TURNSTILE_SECRET_KEY`.
-    "TURNSTILE_SITE_KEY": "",
     // GitHub OAuth App client id (public). Empty turns sign-in off. Secret: GITHUB_CLIENT_SECRET.
     "GITHUB_CLIENT_ID": "Ov23liKCekdY039uBlQf",
     // Comma-separated numeric GitHub user ids (https://api.github.com/users/<login> -> "id") that may delete any

@@ -143,7 +143,6 @@ export async function boundedBody(request: Request, max: number): Promise<Respon
 	return new Response(bytes, { headers });
 }
 
-const TURNSTILE = 'https://challenges.cloudflare.com';
 /** Where Hugging Face serves model files from: the hub, which redirects to its CDN and Xet storage hosts. */
 const HUGGING_FACE = 'https://huggingface.co https://*.huggingface.co https://*.hf.co';
 /** The chat translator's worker script, under the base. */
@@ -151,21 +150,21 @@ const TRANSLATOR = '/js/translate-worker.js';
 
 /**
  * The Content-Security-Policy of the HTML the worker serves: scripts, styles and fetches from this origin only, avatars
- * from GitHub, narration audio (media-src) from this origin, forms posting back here. `turnstile` (only /updates) also lets in the Turnstile script and its frame.
+ * from GitHub, narration audio (media-src) from this origin, forms posting back here.
  * The chat translator's worker script (client/translate-worker.ts) alone also compiles WebAssembly and fetches the model
  * from Hugging Face (`translator`; a dedicated worker runs under its own script's policy).
  * Static files get the same policy through `assetHeaders` (a `_headers` file does not apply once every request runs the
  * worker first).
  */
-export function csp({ turnstile = false, translator = false } = {}): string {
+export function csp({ translator = false } = {}): string {
 	return [
 		"default-src 'self'",
-		turnstile ? `script-src 'self' ${TURNSTILE}` : translator ? "script-src 'self' 'wasm-unsafe-eval'" : "script-src 'self'",
+		translator ? "script-src 'self' 'wasm-unsafe-eval'" : "script-src 'self'",
 		"style-src 'self'",
 		"img-src 'self' https://avatars.githubusercontent.com https://github.com",
 		translator ? `connect-src 'self' ${HUGGING_FACE}` : "connect-src 'self'",
 		"media-src 'self'",
-		turnstile ? `frame-src ${TURNSTILE}` : "frame-src 'none'",
+		"frame-src 'none'",
 		"form-action 'self'",
 		"frame-ancestors 'none'",
 		"base-uri 'none'",

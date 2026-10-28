@@ -1,0 +1,45 @@
+// Update: a build says what it does while it does it, and why each function was rebuilt; `blaze why` (#878 in
+// v0.20261028.3; the live view, slow-function lists and timings in v0.20261028.9: #1249, #1257, #1267, #1270, #1271,
+// #1274). Canary. Extends lesson 2: the functions an edit rebuilt, named.
+site {
+  updates {
+    "why-rebuilt" : Page {
+      Narrow
+      Update: {"2026-10-28", "0.20261028.3", "A build names every function it rebuilt and why, and blaze why tells you afterwards.", "why"}
+      (InTheme, themes.canary)
+      (Requires, site.learn.incremental)
+      Title: {"Why it rebuilt"}
+      Description: {"Update to lesson 2: a build names each function it rebuilt and why, and blaze why says it again later."}
+      Intro: {"[warm] An update to lesson two. You can now see which functions an edit rebuilt, and why."}
+      Outro: {"[warm] That's the update. The build names what it rebuilt and why as it ends, and blaze why tells you again whenever you ask."}
+
+      Step names("Every function, with its why") {
+        Say: {"Lesson two said blaze rebuilds one function at a time. Now a build shows you which. While it runs, it shows each step and each crate's functions, compiled and reused. And it ends with one line: how many functions it rebuilt, each with the reason, like its file was edited, or it uses what changed."}
+        P live("Lesson 2 said blaze rebuilds one function at a time. Now a build shows which: each step and each crate's functions as it goes, and one line at the end.")
+        P line("`Rebuilt 3 fns: render (src/main.rs edited), draw, tick (uses what changed); 0.21s`")
+      }
+
+      Step later("Ask afterwards") {
+        Say: {"[curious] Missed it? Run blaze why. It says what the last build that compiled anything rebuilt, and why, and where the time went. Name a function or a crate to ask about just that one."}
+        P why("Missed it? `blaze why` says what the last build that compiled anything rebuilt, why, and where the time went. `blaze why render` asks about one function; a crate's name, about that crate.")
+        P slow("A slow build says what held it up: the functions slow to compile appear under their crate as it goes, and the slowest five at the end.")
+      }
+
+      Step look("Where to look") {
+        Silent
+        Quiz q(prompt: "Your last build took longer than you expected. What tells you which functions it rebuilt, and why?") {
+          Choice quiet("Building again with `-q`.", "`-q` shows nothing at all.")
+          Choice why("`blaze why`.", "It reads the last build that compiled anything: each function it rebuilt, the reason, and where the time went.") {
+            Right
+          }
+          Choice cargo("`cargo build -v`.", "cargo sees whole crates; the function-by-function story is blaze's.")
+        }
+      }
+
+      Step source("Where it comes from") {
+        Say: {"This is on the canary channel. For a program rather than a person, events json or events cbor writes every event of the build as it happens."}
+        Dim where("In canary since v0.20261028.3 ([#878](https://github.com/indexable-inc/blaze/pull/878)); the live view of the crate graph and where the time went since v0.20261028.9 ([#1249](https://github.com/indexable-inc/blaze/pull/1249), [#1271](https://github.com/indexable-inc/blaze/pull/1271), [#1274](https://github.com/indexable-inc/blaze/pull/1274)). For a program, `--events json` or `--events cbor` writes the build's events.")
+      }
+    }
+  }
+}

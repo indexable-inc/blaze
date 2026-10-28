@@ -2,11 +2,14 @@
 
 blaze has two release channels, made of the same releases:
 
-- **canary** (opt-in): every release, as soon as it is built. A release is cut from a main whose
-  merge gate (`ci`) is green: the unit tests, the build, and the fast part of the smoke corpus
-  below. It is published as a GitHub *prerelease*.
-- **stable** (the default): a canary that then passed the heavy tests, unchanged. Promotion
-  builds nothing: the archives users get on stable are the bytes that were tested as canary.
+- **canary** (opt-in): every release, as soon as it is built. A release is cut from a commit of
+  main as soon as main's merge gate has built it on Linux x86-64 (the job `linux x64 / build`),
+  without waiting for the unit tests or the other platforms. It is published as a GitHub
+  *prerelease*.
+- **stable** (the default): a canary that then passed the heavy tests, unchanged, and whose
+  commit passed main's whole merge gate: its whole run green, with the unit tests on Linux
+  x86-64, Linux ARM64 and macOS. Promotion builds nothing: the archives users get on stable are the bytes that
+  were tested as canary.
 
 ## Versions
 
@@ -53,21 +56,27 @@ published as a full release and counts as stable.
 
 ## Cutting a canary
 
-Every green main is a canary, cheaply. `canary.yaml` runs when the merge gate's run on a push to
-main ends green (and hourly, and by hand): `.github/scripts/canary.py cut` tags the newest
-commit of main whose `ci` check is green (main moves faster than its gate, so that is seldom
-HEAD itself; it looks through main's first parents since the newest release) `v0.YYYYMMDD.N`
-through the API and dispatches `release.yaml` on the tag, when
+Every built main is a canary, cheaply. `canary.yaml` runs on each push to main (and hourly, and
+by hand): `.github/scripts/canary.py cut` waits for main's build of the push (the job `linux x64
+/ build` of the merge gate's run on it; when the push changed nothing the build reads, the
+newest commit of main that has a build), at most 90 minutes, and then tags the newest commit of
+main whose `linux x64 / build` passed (main moves faster than its build, so that is seldom HEAD
+itself; it looks through main's first parents since the newest release) `v0.YYYYMMDD.N` through
+the API and dispatches `release.yaml` on the tag. It does not wait for the unit tests, the other
+platforms (macOS often queues half an hour) or the rest of the run: stable does (below). The
+cut waits in canary.yaml, polling the job through the API, rather than being dispatched from
+the build job: that would need `actions: write` in `blaze-platform.yaml`, which pull requests
+and the train run too. It cuts when
 
 - something besides the docs (`docs/`, `site/`, `agents/`, `*.md`) and the bots' own commits
   changed from the newest release to that commit,
 - no `release-cut.yaml` is running and no `release.yaml` is building a release (a run on a
   branch is not one), and the newest release is at least 30
-  minutes old (`-f min-minutes=N` by hand). A green main inside that window is cut by the next
-  green push or the hourly run.
+  minutes old (`-f min-minutes=N` by hand). A build of main inside that window is cut by the
+  next push or the hourly run.
 
 No commit goes to main, so a cut never races a merge, and a canary is the bytes of a commit
-that passed the gate as it is. release.yaml builds it with `BLAZE_RELEASE` set to the tag, so
+main's gate built, as it is. release.yaml builds it with `BLAZE_RELEASE` set to the tag, so
 `blaze --version` and the archives' names are the tag's, and writes the notes (`canary.py
 notes`): the lines CHANGELOG.md's [Unreleased] gained since the previous release and the title
 of each change merged since then. [Unreleased] is never emptied: a release's notes are in its
@@ -102,7 +111,17 @@ published archives, installed with `install.sh --version <v>` as a user installs
   as the first, is not compared). Hosted runners are shared, so 25% is their noise and not a
   benchmark: docs/benchmarks.md's numbers come from the bench machines;
 - the train (`train.yaml`, every tier on every platform), dispatched on the tag: built from the
-  commit the archives were built from. A train on a tag releases nothing and opens no issue.
+  commit the archives were built from. A train on a tag releases nothing and opens no issue;
+- main's tests (`promote.py tested`): the merge gate's run on the push of the tag's commit to
+  main is green (the whole run: every job of it, the smoke corpus's std cases and the script
+  checks too), and its unit tests (`linux x64 / tests`, `linux arm64 / tests`, `macos arm64 /
+  tests`) ran and passed on that exact commit. The canary was cut before they finished, so the
+  job waits for the run while it is going, polling every two minutes for up to five hours, beside
+  the other jobs, which take longer. No run, a red run, a run that skipped the tests (a commit
+  that changed nothing they read, such as one `release-cut.yaml` cut at a docs-only HEAD) or one
+  still going after five hours fails the job with the commit and the run named, and the release
+  stays a canary. After re-running a flaked job of that run, `gh workflow run promote.yaml -f
+  tag=v...` tries again.
 
 When every job passes, `.github/scripts/promote.py` marks the release stable and *Latest*,
 appends to its notes the line `Promoted to stable on <date> after <run URL>`, and adds the

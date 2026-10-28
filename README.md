@@ -7,7 +7,7 @@
 
 <h3 align="center">Rebuild Rust in milliseconds.</h3>
 
-<p align="center">The same commands as cargo, with <code>blaze</code> in front.<br>Blazingly fast Rust, literally.</p>
+<p align="center">Type <code>blaze</code> wherever you'd type <code>cargo</code>.<br>Blazingly fast Rust, literally.</p>
 
 <p align="center">
   <a href="#install">Install</a> ·
@@ -116,16 +116,8 @@ from source the first time.
 
 ## Updates
 
-<p align="center">
-  <a href="https://ix.dev/blaze/updates?src=readme">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/signup-on-dark.svg">
-      <img alt="Tell us you use blaze" src="docs/brand/signup-on-light.svg" height="36">
-    </picture>
-  </a>
-</p>
-
-<p align="center">For release news: Watch → Custom → Releases on GitHub.</p>
+[What's new](https://ix.dev/blaze/updates) has every change worth knowing, each as a short lesson on the course,
+with the ones new since your last visit marked. For release news: Watch → Custom → Releases on GitHub.
 
 ## Using blaze at work?
 

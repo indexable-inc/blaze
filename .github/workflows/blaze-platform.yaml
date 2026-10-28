@@ -82,7 +82,8 @@ jobs:
     # A store blaze's release has not compiled into yet: 49 min on Linux x86-64, and over an
     # hour on macOS's 7 GB runner (the 16-minute step of 4-cpu Linux had not ended at 48). Long
     # enough for that one run to finish and push, which the runs after it then pull.
-    timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 90 }}
+    # Room after the test step's own limit for main's push, which keeps what was compiled.
+    timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 170 }}
     # The remote's write token and signing key, for the push of blaze.yaml's runs on main alone
     # (the train, on main too, pushes nothing). A called workflow sees a secret only when its
     # caller passes it, environment secrets too: blaze.yaml calls this with `secrets: inherit`.
@@ -100,17 +101,21 @@ jobs:
           git config --global core.autocrlf false
           echo CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT=false >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
-        with:
-          llvm: ${{ env.BLAZE == 'true' && 'build' || 'none' }}
+      # With blaze, no rustup and no Nix: blaze brings its own Rust (.github/actions/blaze), and
+      # the C compiler and linker are the runner's. cargo's on Windows, with rustup's nightly.
+      - if: env.BLAZE != 'true'
+        uses: ./.github/actions/toolchain
       - if: env.BLAZE == 'true'
         id: blaze
         uses: ./.github/actions/blaze
         with:
           job: tests
-      # `blaze test`, in the flake's dev shell for its C toolchain; cargo's on Windows.
+      # A limit of its own, under the job's: a cold store's tests ran past the job's 90 minutes
+      # on 2026-10-28, which cancelled the push after them, so no run after it found them
+      # compiled. Run out here, the step fails and main's push still runs.
       - if: env.BLAZE == 'true'
-        run: nix develop --command $PYTHON harness/unittests.py
+        timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 220 || 150 }}
+        run: $PYTHON harness/unittests.py
       - if: env.BLAZE != 'true'
         run: $PYTHON harness/unittests.py --cargo
       # What was compiled, and each test that passed, for the runs after this one; a run whose
@@ -155,20 +160,26 @@ jobs:
           git config --global core.autocrlf false
           echo CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT=false >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
+      # cargo's build (the train's tiers, Windows): rustup's nightly, and the flake's dev shell
+      # with the pinned LLVM.
+      - if: env.BLAZE != 'true'
+        uses: ./.github/actions/toolchain
         with:
           llvm: build
+      # blaze's build (the gate, main): no rustup and no Nix. blaze brings its own Rust and the
+      # pinned LLVM (LLVM_SYS_231_PREFIX, fetched by its sha256), and the C compiler, linker and
+      # libc are the runner's.
       - if: env.BLAZE == 'true'
         id: blaze
         uses: ./.github/actions/blaze
         with:
           job: build
-      # In the flake's dev shell, against the LLVM it pins. On Windows, which has no Nix, the
-      # build is against the static C runtime, and names libraries of the SDK that the linker is
-      # not otherwise shown.
+          llvm: true
+      # Against the LLVM blaze pins. On Windows, which has no Nix, the build is against the static
+      # C runtime, and names libraries of the SDK that the linker is not otherwise shown.
       - name: blaze build -p blaze-engine --release --features llvm
         if: env.BLAZE == 'true'
-        run: nix develop --command blaze build -p blaze-engine --release --features llvm --locked
+        run: blaze build -p blaze-engine --release --features llvm --locked
       - name: cargo build -p blaze-engine --release --features llvm
         if: env.BLAZE != 'true'
         run: |

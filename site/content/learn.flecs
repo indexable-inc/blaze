@@ -1,8 +1,25 @@
-// /learn: the lessons' parent (content/learn/*.flecs are /learn/<slug>). The course map itself is on the home page
-// (site.flecs, `Course map { (Lessons, site.learn) }`), and the worker answers /learn with a 301 to / (worker/index.ts);
-// this page is what a host without the worker serves there. Each lesson is a page under site.learn with
-// Lesson {order, line}, made of Steps, one idea per screen, with questions woven in; client/learn.ts turns it into one
-// step at a time and keeps the reader's progress in localStorage.
+// /learn: the lessons' parent (content/learn/*.flecs are /learn/<slug>). The course path itself is on the home page
+// (site.flecs, `Course map { (Lessons, site.learn); (Lessons, site.updates) }`), and the worker answers /learn with a
+// 301 to / (worker/index.ts); this page is what a host without the worker serves there. Each lesson is a page under
+// site.learn with Lesson {order, line, glyph}, made of Steps, one idea per screen, with questions woven in;
+// client/learn.ts turns it into one step at a time and keeps the reader's progress in localStorage.
+//
+// The path is a graph: each lesson and update names what comes first with (Requires, page), and sits in one theme, a
+// band of the path with its own heading (renderer core course.rs lays it out). The themes are here, so every lesson
+// and update can name its own.
+themes {
+  // The lessons, and the updates that change what they teach on the stable channel.
+  basics {
+    Theme: {"The basics", "How blaze builds, in five lessons, and what has changed since on the stable channel.", 1, "", ""}
+  }
+  // Updates to what is only in a canary release (docs/release.md: a canary of every green main, stable once it passes
+  // the stable gate) or behind `experimental = [...]` in a workspace's manifest. Dashed: it may still change.
+  canary {
+    Theme: {"Canary and experiments", "Updates on the canary channel and behind experimental flags: newer, and still settling.", 2, "canary", "Canary"}
+    Dashed
+  }
+}
+
 site {
   learn : Page {
     Narrow
@@ -11,5 +28,11 @@ site {
     P moved("The course is on the [home page](/).") {
       Silent
     }
+    // Opened here so a lesson can require one whose file runs after its own (files run in path order).
+    builds {}
+    incremental {}
+    macros {}
+    hermetic {}
+    sharing {}
   }
 }

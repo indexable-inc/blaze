@@ -13,6 +13,12 @@ name: promote
 # otherwise than cargo's, and nothing more than 25% worse than the stable release's numbers, an
 # asset of it). All green: the same release is marked stable and Latest, with a line in its notes
 # saying when and after which run, and its numbers become its assets (.github/scripts/promote.py).
+# And main's own tests: a canary is cut as soon as main's Linux x86-64 build of its commit passes
+# (canary.yaml), before the unit tests, so stable also needs the merge gate's run on the push of
+# that commit to main green, with the unit tests run and passed on Linux x86-64, Linux ARM64 and
+# macOS (`main's tests`, promote.py tested). That job waits for the run while it is still going
+# (at most five hours, beside the smoke corpus and the applications, which take longer); none,
+# a red one, or one still going after that keeps the release a canary, with an issue.
 # Any red: it stays a canary, and an issue says what failed and how to repeat it. Nothing is
 # built again: a version names the same bytes before and after.
 #
@@ -45,7 +51,7 @@ on:
       - "harness/smoke.py"
       - "harness/smoke/**"
 
-# One gate at a time: with a canary per green main, a run waiting is replaced by a newer
+# One gate at a time: with a canary per built main, a run waiting is replaced by a newer
 # canary's, so the gate tests the newest canary when it is free (an untested canary just stays
 # a canary). A pull request's runs, and a dispatch on another branch (a check of the gate
 # itself), are a group of their own, so they never hold a canary up.
@@ -243,6 +249,29 @@ jobs:
           path: /tmp/gate-out/
           if-no-files-found: ignore
 
+  # main's merge gate on the tag's commit (blaze.yaml's run on its push to main): green, with
+  # every platform's unit tests run. Waited for while it runs; a canary is cut before it ends.
+  main-tests:
+    name: main's tests
+    needs: release
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 310
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+          SHA: ${{ needs.release.outputs.sha }}
+        run: |
+          jq -n --arg tag "$TAG" --arg sha "$SHA" '{tag: $tag, sha: $sha, wait_minutes: 300}' > "$RUNNER_TEMP/tested.json"
+          python3 -I .github/scripts/promote.py tested "$RUNNER_TEMP/tested.json"
+
   # The train's every tier, on the tag: built from the tag's commit, which is what the release's
   # archives were built from. A tag's train releases nothing and opens no issue (train.yaml).
   train:
@@ -278,7 +307,7 @@ jobs:
 
   verdict:
     name: promote or file
-    needs: [release, smoke, apps, train]
+    needs: [release, smoke, apps, train, main-tests]
     if: always() && github.event_name == 'workflow_dispatch' && needs.release.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -296,15 +325,15 @@ jobs:
         with:
           path: results
       - name: promote ${{ env.TAG }}
-        if: needs.smoke.result == 'success' && needs.apps.result == 'success' && needs.train.result == 'success' && inputs.promote
+        if: needs.smoke.result == 'success' && needs.apps.result == 'success' && needs.train.result == 'success' && needs.main-tests.result == 'success' && inputs.promote
         run: |
           jq -n --arg tag "$TAG" --arg run "$RUN" '{tag: $tag, run: $run, bench: "results"}' > "$RUNNER_TEMP/promote.json"
           python3 -I .github/scripts/promote.py promote "$RUNNER_TEMP/promote.json" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: passed, not promoted
-        if: needs.smoke.result == 'success' && needs.apps.result == 'success' && !(inputs.promote && inputs.train)
+        if: needs.smoke.result == 'success' && needs.apps.result == 'success' && needs.main-tests.result == 'success' && !(inputs.promote && inputs.train)
         run: echo "$TAG passed what this run tested; a run with promote and the train marks it stable" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: an issue for what failed
-        if: needs.smoke.result != 'success' || needs.apps.result != 'success' || (inputs.train && needs.train.result != 'success')
+        if: needs.smoke.result != 'success' || needs.apps.result != 'success' || needs.main-tests.result != 'success' || (inputs.train && needs.train.result != 'success')
         env:
           FILE: ${{ inputs.promote }}
         run: |

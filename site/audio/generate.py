@@ -472,7 +472,7 @@ async def generate(a: argparse.Namespace) -> None:
             raise StepError(f"pages: no page at {', '.join(sorted(unknown))}")
         pages = [p for p in pages if p["url"] in a.pages]
     else:
-        pages = [p for p in pages if p["url"] not in ("/404", "/updates")]
+        pages = [p for p in pages if p["url"] != "/404"]
     who = identity(a.tts, a.voice)
     lex = Lexicon.load()
 
@@ -658,7 +658,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tts", type=Path, default=DEFAULT_TTS, help="the voice repo's tools/tts")
     ap.add_argument("--voice", type=Path, default=DEFAULT_VOICE, help="reference voice dir (ref.wav, ref.txt)")
-    ap.add_argument("pages", nargs="*", help="page URLs (default: every page but /404 and /updates)")
+    ap.add_argument("pages", nargs="*", help="page URLs (default: every page but /404)")
     ap.add_argument("--check", action="store_true", help="transcribe the pages' audio with Whisper and compare")
     ap.add_argument("--whisper", default="mlx-community/whisper-large-v3-turbo")
     ap.add_argument("--dry-run", action="store_true")

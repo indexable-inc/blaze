@@ -1,0 +1,27 @@
+// /updates: What's new, the changelog of the course. Every update is a short lesson under it (content/updates/*.flecs,
+// /updates/<slug>) with Update {date, version, line, glyph}: what changed in blaze, said in the lesson format, on the
+// course path next to the lesson it extends ((Requires, ...)) and in the band of its channel ((InTheme, ...)). This
+// page lists them newest first (UpdateLog, renderer core render.rs); client/learn.ts marks the ones published since
+// the reader's last visit New, and the sidebar row counts them (client/side.ts).
+// An update is a user-visible change to blaze, not to this site. Keep each one small: three to five steps, one or two
+// questions, and a closing line with its pull requests.
+site {
+  updates : Page {
+    Narrow
+    Title: {"What's new"}
+    Nav: {"What's new", -1}
+    Icon: {"sparkle"}
+    (InGroup, nav.learn)
+    Description: {"What has changed in blaze, as short lessons on the course: newest first, with the ones new since your last visit marked."}
+    Intro: {"[warm] What's new in blaze."}
+    Outro: {"[warm] That's everything so far. Each update is a few steps long, and it sits on the course path next to the lesson it builds on."}
+    Lede lede("What has changed in blaze, newest first. Each update is a short lesson that extends one on the [course](/), and sits next to it on the path.") {
+      Say: {"[warm] Here's what has changed in blaze, newest first. Each update is a short lesson, a minute or two, that extends one of the lessons on the course, and it sits right next to that lesson on the path."}
+    }
+    Dim channels("Updates tagged Canary are in canary releases or behind an experimental flag; the rest are on stable. [Install](/install) says how to pick a channel.") {
+      Say: {"The ones tagged canary are only in canary releases, or behind an experimental flag. The rest are on the stable channel. The install page says how to pick one."}
+    }
+    UpdateLog log
+    Dim kept("Which updates are new is worked out in this browser, from when you last came by. Nothing is sent anywhere.")
+  }
+}

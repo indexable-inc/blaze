@@ -25,6 +25,14 @@ refused where possible: the root manifest's `unsandboxed-build-scripts` and
 Andrew, 2026-10-24: "we want to be a superset of Rust (i.e., any existing Rust program should
 work, minus a proc macro that isn't sandboxed, which it should be tbh)."
 
+Superset runs one way. Every Rust program must work under blaze, but a program that uses a blaze
+extension (new syntax, attributes or semantics, such as const macros or
+[#1448](https://github.com/indexable-inc/blaze/issues/1448)) only has to work under blaze; it
+never has to build under rustc. An extension is opt-in, and turning it on must not change the
+behaviour of code that doesn't use it.
+
+Andrew, 2026-10-28: "we are superset and if using superset dont need rustc to compile it either."
+
 This describes where blaze is going, not where it is. Today rustc still does much of the work:
 it builds every program once before the daemon takes over, it compiles the standard library,
 the build scripts and the proc macros, it has the last word on errors, and it keeps a copy of

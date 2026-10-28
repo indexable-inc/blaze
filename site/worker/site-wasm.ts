@@ -3,7 +3,8 @@
  * build (gen/build.ts, under Bun). Neither module has imports. No Bun, Node or Workers APIs here.
  *
  * - `Site` (site.wasm): a snapshot loaded once, then one page's HTML per call.
- * - `snapshot` (site-snapshot.wasm): the content scripts and the baked HTML to the snapshot, at build time.
+ * - `snapshot` (site-snapshot.wasm): the content scripts (and those the build generates) and the baked HTML to the
+ *   snapshot, at build time.
  */
 import { encode, type Cbor } from './cbor';
 
@@ -131,7 +132,7 @@ export class Site {
 	}
 }
 
-/** The input of site-snapshot.wasm: the scripts in run order, and the baked HTML by entity path. */
+/** The input of site-snapshot.wasm: the scripts in run order, and what the build baked, by entity path. */
 export type SnapshotInput = {
 	scripts: { name: string; code: string }[];
 	/** `audio` goes on a page entity: its narration manifest's URL (the renderer then adds the player). */

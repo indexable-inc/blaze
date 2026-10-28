@@ -1,0 +1,49 @@
+// Update: wasm proc macros expand in a session per calling crate only when they keep state (#908, PR #918, after #830), in
+// v0.20261028.3. Canary. Extends lesson 3: most expansions stay kept; the few that remember are run in order.
+site {
+  updates {
+    "stateful-macros" : Page {
+      Narrow
+      Update: {"2026-10-28", "0.20261028.3", "Macros that remember things between expansions now work, and the rest stay kept.", "session"}
+      (InTheme, themes.canary)
+      (Requires, site.learn.macros)
+      Title: {"Macros that keep state"}
+      Description: {"Update to lesson 3: proc macros that keep state between expansions run in a session per crate; the rest stay kept."}
+      Intro: {"[warm] An update to lesson three. A few proc macros remember things between expansions. Here's how blaze handles them."}
+      Outro: {"[warm] That's the update. blaze watches what each expansion leaves behind: the macros that leave nothing stay kept, and the ones that remember get a session per crate."}
+
+      Step remember("Some macros remember") {
+        Say: {"Most derives are pure: same input, same output. A few keep state between expansions in a crate. Napi-rs, for one, registers each constructor it sees, and a later expansion reads that list. Expand each one in a fresh instance, and the list is lost."}
+        P pure("Most derives are pure: same input, same output. A few keep state between expansions in a crate: napi-rs registers each constructor it sees, and a later expansion reads the list.")
+        P lost("Expand each one in a fresh instance, as lesson 3 did, and that list is lost.")
+      }
+
+      Step watch("blaze watches the memory") {
+        Say: {"So blaze watches. The macro's allocator counts the bytes still in use. An expansion that leaves some behind marks its module as stateful, in blaze's store. A module that never does, like serde derive or thiserror, keeps a fresh instance per expansion, and its expansions stay kept."}
+        P count("The macro's allocator counts the bytes still in use. An expansion that leaves some behind marks its module stateful, in blaze's store.")
+        P kept("A module that never does (`serde_derive`, `thiserror`, most derives) keeps a fresh instance per expansion, and its expansions stay kept.")
+      }
+
+      Step session("A session per crate") {
+        Say: {"A stateful module expands in one session per crate that calls it, in order, so its state is there when it's read. And a module blaze hasn't seen yet expands in a session until a build has run it."}
+        P order("A stateful module expands in one session per calling crate, in order, so its state is there when it is read. A module not seen yet expands in a session until a build has run it.")
+      }
+
+      Step leftover("Bytes left behind") {
+        Silent
+        Quiz q(prompt: "A derive's expansion returns, and leaves 2 KB of memory in use. What does blaze do with that macro from then on?") {
+          Choice keep("Keeps each expansion, as it does for `serde_derive`.", "Only a module whose expansions leave nothing behind is expanded fresh and kept.")
+          Choice session("Expands it in one session per calling crate.", "Memory left behind means it may remember, so the later expansions in a crate must see it.") {
+            Right
+          }
+          Choice refuse("Refuses to build with it.", "blaze builds with it; it just can't treat each expansion on its own.")
+        }
+      }
+
+      Step source("Where it comes from") {
+        Say: {"This is on the canary channel."}
+        Dim where("In canary since v0.20261028.3 ([#918](https://github.com/indexable-inc/blaze/pull/918) for [#908](https://github.com/indexable-inc/blaze/issues/908), after [#830](https://github.com/indexable-inc/blaze/pull/830)).")
+      }
+    }
+  }
+}

@@ -10,9 +10,11 @@
 //! - an Img is its alt text ("On screen: ..."); an Art (an animated drawing) and a Figure (a lesson's diagram) are not
 //!   read: their label is for screen readers, and the paragraphs beside them say the same in words;
 //! - a lesson's Step is its title, then its blocks; a Quiz or Tap is "Question: " and its prompt (an author marks
-//!   question steps Silent); the course map reads each lesson's number and title;
-//! - Code and Command blocks are skipped, citations are never read, References, the signup form and the bench widget
-//!   are skipped, and the RFC index reads each RFC's number and title.
+//!   question steps Silent); the course path reads each theme's title and its lessons' numbers and titles and its
+//!   updates' titles, and What's new (UpdateLog) each update's title under its date;
+//! - Code and Command blocks are skipped, citations are never read, References, charts, Pickers and
+//!   the benchmark history (BenchHistory) are skipped (a `Say` on the section around a chart tells what it shows),
+//!   and the RFC index reads each RFC's number and title.
 //!
 //! An author overrides any block's line with `Say: {"..."}` (Drama 3 directions such as `[warm]` allowed). On a
 //! container (Section, Issue, Goal, Step, Li, Ul, Ol) the `Say` stands for its whole subtree: its children are not read, so one
@@ -179,18 +181,40 @@ fn derive(n: Id, ctx: &mut Ctx) -> Result<Option<String>, String> {
         return Ok(Some(items.join(" ")));
     }
     if e.has_tag("Course") {
-        let source = ctx.s.world.course_source(n)?;
+        let sources = ctx.s.world.course_sources(n)?;
+        let c = crate::course::build(ctx.s.world, &sources)?;
         let mut items = Vec::new();
-        for (i, c) in ctx.s.world.lessons(source).into_iter().enumerate() {
-            items.push(format!(
-                "Lesson {}, {}.",
-                i + 1,
-                text_of(ctx.e(c), "Title").unwrap_or_default()
-            ));
+        for (b, theme) in c.themes.iter().enumerate() {
+            items.push(format!("{}.", theme.title));
+            for node in c.nodes.iter().filter(|x| x.theme == b) {
+                let title = text_of(ctx.e(node.id), "Title").unwrap_or_default();
+                items.push(match node.kind {
+                    crate::course::Kind::Lesson(i) => format!("Lesson {i}, {title}."),
+                    crate::course::Kind::Update { .. } => format!("Update: {title}."),
+                });
+            }
         }
         return Ok(Some(items.join(" ")));
     }
-    if ["References", "SignupForm", "BenchHistory"].iter().any(|t| e.has_tag(t)) {
+    if e.has_tag("UpdateLog") {
+        // Newest first, as the page lists them: the date once, then each update's title.
+        let mut out = Vec::new();
+        for p in ctx.s.pages {
+            let Some(cw) = ctx.s.world.course_in(p.node) else { continue };
+            let c = crate::course::build(ctx.s.world, &ctx.s.world.course_sources(cw)?)?;
+            let mut day = String::new();
+            for node in c.updates_newest_first(ctx.s.world) {
+                let crate::course::Kind::Update { date, .. } = &node.kind else { continue };
+                if *date != day {
+                    out.push(format!("{}:", crate::course::date(date, true)));
+                    day = date.clone();
+                }
+                out.push(format!("{}.", text_of(ctx.e(node.id), "Title").unwrap_or_default()));
+            }
+        }
+        return Ok(Some(out.join(" ")));
+    }
+    if e.has_tag("References") || e.has("BenchHistory") {
         return Ok(None);
     }
     for comp in ["Lede", "P", "Dim", "Li"] {

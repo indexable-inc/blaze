@@ -7,10 +7,14 @@
 //! - `snapshot`: a world from a flecs-snapshot DAG-CBOR document, which is what hosts load.
 //! - `scripts` (feature `scripts`, native): the content scripts run in Flecs and snapshotted.
 //! - `render`, `inline`, `comments`: render/render.ts, widgets.ts, inline.ts and comments.ts.
+//! - `chart`: the charts (`RowChart`, `LineChart`) as HTML rows and inline SVG, and the `Picker`'s buttons.
+//! - `course`: the course path as a graph of lessons and updates, laid out in rows, columns and bands.
 //! - `side`, `icons`: the sidebar every page carries (sections, rows, the pager, the outline) and its icons.
 //! - `spoken`: a page's spoken version (the narration's lines), derived from its blocks or written with `Say`.
 
+pub mod chart;
 pub mod comments;
+pub mod course;
 pub mod icons;
 pub mod inline;
 pub mod js;

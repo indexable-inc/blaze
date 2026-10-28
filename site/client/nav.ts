@@ -27,8 +27,8 @@
  * Only left clicks with no modifier on a same-origin link under the site's base are taken: not downloads, links with
  * a target, hash links within the page (the browser scrolls), the worker's routes that act (/api, /auth) or serve
  * files (/audio), or files (`install.sh`, `search.json`). Anything that goes wrong (not 200, not HTML, a redirect out of
- * the site, a network error, a page in another frame, a page with a script from another origin, which needs its own
- * CSP: /updates with Turnstile) falls back to the browser's own navigation to the same URL. Without JS every link is
+ * the site, a network error, a page in another frame, a page with a script from another origin, which would need its
+ * own CSP) falls back to the browser's own navigation to the same URL. Without JS every link is
  * a plain link.
  */
 
@@ -96,7 +96,7 @@ async function fetchPage(url: URL, fresh = false): Promise<Got> {
 	const final = new URL(res.url);
 	if (!routable(final)) throw new Miss(`redirected to ${final.href}`);
 	const html = await res.text();
-	// Live: rendered for this request (comments, the reader, /updates' referrer), so used once and kept briefly.
+	// Live: rendered for this request (comments, the reader), so used once and kept briefly.
 	const live = /<main\b[^>]*\sdata-doc="/.test(html) || /no-store|private/.test(res.headers.get('cache-control') ?? '');
 	return { url: final.pathname + final.search, html, live };
 }

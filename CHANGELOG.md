@@ -9,6 +9,10 @@ since the release before and the title of each change merged since.
 
 ## [Unreleased]
 
+### Changed
+
+- Releases: a canary is cut as soon as main's Linux x86-64 build of a commit passes, without waiting for the unit tests; stable now also needs main's merge gate on that commit green, with the unit tests run and passed on Linux x86-64, Linux ARM64 and macOS (docs/release.md).
+
 ## [0.20261028.9] - 2026-10-28
 
 ### Merged

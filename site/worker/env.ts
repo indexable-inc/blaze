@@ -8,10 +8,6 @@ export interface Env {
 	AUDIO?: R2Bucket;
 	/** The deployed Worker version (`version_metadata`); its id is part of the anonymous page cache key. */
 	CF_VERSION: WorkerVersionMetadata;
-	/** Turnstile site key (public). Empty: no widget on /updates. */
-	TURNSTILE_SITE_KEY: string;
-	/** Secret. Unset: /updates skips the Turnstile check (dev). */
-	TURNSTILE_SECRET_KEY?: string;
 	/** GitHub OAuth App client id. Empty: sign-in is off (503) and the comment UI hides the button. */
 	GITHUB_CLIENT_ID: string;
 	/** Secret. */

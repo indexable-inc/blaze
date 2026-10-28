@@ -1,0 +1,49 @@
+// Update: build scripts' downloads pinned by sha256 (`blaze lock --fetches`, #637), on stable since v0.20261027.0
+// (CHANGELOG.md). Extends lesson 4: a sealed build script has no network, so what it would download is handed in.
+site {
+  updates {
+    "pinned-downloads" : Page {
+      Narrow
+      Update: {"2026-10-27", "0.20261027.0", "Build scripts that download now build sealed: each download is pinned by its hash and handed in.", "fetch"}
+      (InTheme, themes.basics)
+      (Requires, site.learn.hermetic)
+      Title: {"Pinned downloads"}
+      Description: {"Update to lesson 4: blaze lock --fetches pins what build scripts download, so they build with no network."}
+      Intro: {"[warm] An update to lesson four. Some build scripts download things. Here's how they build sealed now."}
+      Outro: {"[warm] That's the update. Downloads are pinned by their hash in a lock file, kept in the store, and handed to the build script, which never touches the network."}
+
+      Step download("Some build scripts download") {
+        Say: {"A few crates' build scripts download something big while they build: v8 fetches a prebuilt library, ort-sys fetches ONNX Runtime, webrtc-sys fetches WebRTC. [thoughtful] But in lesson four, a build script runs sealed, with no network. So where does the download come from?"}
+        P fetch("A few crates' build scripts download something big as they build: `v8` its prebuilt library, `ort-sys` ONNX Runtime, `webrtc-sys` WebRTC.")
+        P sealed("In lesson 4, a build script runs sealed, with no network. So where does the download come from?")
+      }
+
+      Step lock("Pinned, as Nix pins") {
+        Say: {"From a lock file. Running blaze lock with fetches downloads each one once and writes its hash into Cargo dot fetches dot lock, next to Cargo dot lock, kept by the package's name, its version, and its checksum in Cargo dot lock. The bytes themselves go into blaze's store, so a remote cache carries them too."}
+        P once("`blaze lock --fetches` downloads each one once and writes its sha256 into `Cargo.fetches.lock`, beside `Cargo.lock`, kept by the package's name, version and `Cargo.lock` checksum.")
+        P store("The bytes go into blaze's store, so a remote cache carries them too.")
+      }
+
+      Step handed("Handed in, not fetched") {
+        Say: {"Then the build, which still has no network, hands each download to its build script through the crate's own variable: rusty v8 archive for v8, ort cache dir for ort-sys. The script finds the file and downloads nothing."}
+        P var("The build, which still has no network, hands each download to its script through the crate's own variable: `RUSTY_V8_ARCHIVE` for `v8`, `ORT_CACHE_DIR` for `ort-sys`, `LK_CUSTOM_WEBRTC` for `webrtc-sys`. The script finds the file and downloads nothing.")
+      }
+
+      Step bump("A new version") {
+        Silent
+        Quiz q(prompt: "You update `v8` to a new version in `Cargo.lock`, and build. What happens?") {
+          Choice fetches("The build script downloads the new archive.", "The build has no network; that is what keeps it sealed.")
+          Choice old("blaze hands the script the old archive.", "That would quietly build with the wrong bytes.")
+          Choice stops("The build stops and names `blaze lock --fetches`.", "Entries are kept by name, version and checksum, so the new version has none. A missing or stale entry fails, naming the command that fixes it.") {
+            Right
+          }
+        }
+      }
+
+      Step source("Where it comes from") {
+        Say: {"On stable since the October twenty-seventh release. A build script that's refused the network, and that blaze has no override for, is told which variable one would set."}
+        Dim where("On stable since v0.20261027.0 ([#637](https://github.com/indexable-inc/blaze/pull/637)). A script refused the network that blaze has no override for is told which variable one would set.")
+      }
+    }
+  }
+}

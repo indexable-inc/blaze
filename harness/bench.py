@@ -245,6 +245,40 @@ PROJECTS = {
         ),
         test=["-p", "servo-url"],
     ),
+    # Astral's Python package manager, 92 crates of its own; what astral-experiments/blaze
+    # tested its fork on. On main 7f4e04dcc8 its cold build fails: getrandom's
+    # `getrandom_inner` in the wasm proc macro `const-random-macro` is
+    # `UnresolvedMethod("map_err")`.
+    "uv": dict(
+        repo="astral-sh/uv", tag="0.13.6", rev="329bf9448afd9f9088d14a4d57fbc61eb454f117",
+        build=["-p", "uv", "--bin", "uv"], run=["--version"], named=True,
+        edits=dict(
+            body=body("crates/uv/src/lib.rs", "pub async fn run(cli: Cli, global_initialization: GlobalInitialization) -> Result<ExitStatus> {"),
+            leaf=body("crates/uv-normalize/src/package_name.rs", "    pub fn as_str(&self) -> &str {"),
+            generic=body("crates/uv-fs/src/path.rs", "pub fn normalize_path<'path>(path: impl Into<Cow<'path, Path>>) -> Cow<'path, Path> {"),
+        ),
+        test=["-p", "uv-normalize", "-p", "uv-pep440"],
+    ),
+    # Astral's Python linter and its type checker share one workspace, built a binary each.
+    "ruff": dict(
+        repo="astral-sh/ruff", tag="0.17.3", rev="ba65abf8ba7bfbcc059f7fb9712be5ba9cab6abc",
+        build=["-p", "ruff", "--bin", "ruff"], run=["--version"], named=True,
+        edits=dict(
+            body=body("crates/ruff/src/main.rs", "fn main() -> ExitCode {"),
+            leaf=body("crates/ruff_text_size/src/range.rs", "    pub const fn len(self) -> TextSize {"),
+            generic=body("crates/ruff_python_ast/src/visitor.rs", "pub fn walk_stmt<'a, V: Visitor<'a> + ?Sized>(visitor: &mut V, stmt: &'a Stmt) {"),
+        ),
+        test=["-p", "ruff_text_size", "-p", "ruff_python_parser"],
+    ),
+    "ty": dict(
+        repo="astral-sh/ruff", tag="0.17.3", rev="ba65abf8ba7bfbcc059f7fb9712be5ba9cab6abc",
+        build=["-p", "ty", "--bin", "ty"], run=["--version"], named=True,
+        edits=dict(
+            body=body("crates/ty_python_semantic/src/types.rs", "pub fn check_types(db: &dyn Db, file: ProgramFile<'_>) -> Vec<Diagnostic> {"),
+            leaf=body("crates/ruff_text_size/src/range.rs", "    pub const fn len(self) -> TextSize {"),
+        ),
+        test=["-p", "ty_python_semantic", "--lib"],
+    ),
     # 1.25M lines of Rust in 103 crates, with the C and C++ of a JavaScript runtime (bun's port
     # from Zig, docs/research/bun.md). Its own build makes the C and C++ once per revision
     # (bunprep.py), and its pinned nightly builds the Rust. Measured only when named.

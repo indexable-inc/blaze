@@ -1,6 +1,6 @@
 // The site's pages. Each page is an entity under `site`; its path is its URL (site.index is /).
 // RFCs live in rfcs/, the charter in charter.flecs, /bench in bench.flecs, /install and /usage in their own files,
-// the course's lessons in learn/.
+// the course's lessons in learn/, its updates and What's new in updates.flecs and updates/.
 // The sidebar's sections are in nav.flecs; a page joins one with Nav, Icon and (InGroup, nav.<section>).
 site {
   OrderedChildren
@@ -8,6 +8,9 @@ site {
   Served: {"https://ix.dev", "/blaze"}
   // The pixel-fire wordmark (docs/brand/fire/gen.py), copied to static/brand/.
   Brand: {"/brand/blaze-dark.webp", "/brand/blaze-light.webp", 688, 368, "/brand/blaze-dark-still.webp", "/brand/blaze-light-still.webp"}
+
+  // Opened here so the course map below can name it; updates.flecs, which runs later, fills it in.
+  updates {}
 
   // The home page is the course: the logo, one line on what blaze is, the install line, then the map of lessons
   // (learn.flecs and learn/), with the speed numbers and the credits below. What blaze is for is taught by the
@@ -19,12 +22,12 @@ site {
     Icon: {"path"}
     (InGroup, nav.learn)
     Intro: {"[warm, welcoming] Hey, welcome. [short pause] This is blaze: a Rust build that keeps cargo's commands and rebuilds an edit in milliseconds. The best way in is the short course right on this page."}
-    Outro: {"[warm] So, the short version: the same commands as cargo, one line to install, and five short lessons whenever you'd like to see how it works. Thanks for listening."}
+    Outro: {"[warm] So, the short version: the same commands as cargo, one line to install, and five short lessons whenever you'd like to see how it works, with updates as blaze changes. Thanks for listening."}
     Tab: {"blaze: learn how Rust builds in milliseconds"}
     Description: {"A Rust build with cargo's commands that rebuilds an edit in milliseconds, and a short course on how it works: five lessons, one idea per screen, with questions as you go."}
 
     Lede lede("Rebuild Rust in milliseconds, with the same commands as cargo.") {
-      Say: {"[curious] Here's the idea. You type the same commands as cargo, with blaze in front, and an edit is rebuilt in milliseconds."}
+      Say: {"[curious] Here's the idea. You type blaze wherever you'd type cargo, and an edit is rebuilt in milliseconds."}
     }
     Command install("curl -fsSL https://ix.dev/blaze | sh") {
       Silent
@@ -34,12 +37,14 @@ site {
     }
 
     Section course(title: "How blaze works") {
-      Say: {"[warm] The heart of this page is a short course. Five lessons, a few minutes each, one idea per screen, and a question now and then to check it landed. You don't need to know anything about compilers; a little Rust is enough. [pause] It starts with what a build does and why an edit can still take a while. Then how blaze redoes only the functions that changed. Then proc macros, and why blaze can keep what they write. Then hermetic builds. And last, sharing that work with your team. [calm] Your progress stays in your browser, and the button at the top takes you to wherever you left off."}
+      Say: {"[warm] The heart of this page is a short course. Five lessons, a few minutes each, one idea per screen, and a question now and then to check it landed. You don't need to know anything about compilers; a little Rust is enough. [pause] It starts with what a build does and why an edit can still take a while. From there it branches: how blaze redoes only the functions that changed, and how it handles proc macros. Both lead to hermetic builds, and last, to sharing that work with your team. [calm] As blaze changes, short updates hang off the lesson they add to. The ones still on the canary channel, or behind a flag, sit in a section of their own further down. Your progress stays in your browser, the button at the top takes you to wherever you left off, and the What's new page lists every update, with the ones since your last visit marked."}
       P line("Five short lessons, a few minutes each: one idea per screen, and a question now and then to check it landed. No compiler knowledge needed; a little Rust is enough.")
+      P branches("Some lessons build on others, so the path branches. As blaze changes, updates branch off the lesson they extend; [What's new](/updates) lists them all.")
       Course map {
         (Lessons, site.learn)
+        (Lessons, site.updates)
       }
-      Dim kept("Your progress stays in this browser. Nothing is sent anywhere.")
+      Dim kept("Your progress, and when you last came by, stay in this browser. Nothing is sent anywhere.")
     }
 
     Section speed(title: "How fast") {
@@ -58,19 +63,6 @@ site {
       Dim thanks("blaze stands on the shoulders of giants. Thank you to the people who built [rust-analyzer](https://github.com/rust-lang/rust-analyzer), [Cranelift](https://cranelift.dev), [LLVM](https://llvm.org) and [inkwell](https://github.com/TheDan64/inkwell), [salsa](https://github.com/salsa-rs/salsa), [object](https://github.com/gimli-rs/object), [Rust](https://github.com/rust-lang/rust), and [rustd](https://github.com/DioxusLabs/rustd) (DioxusLabs), whose code blaze includes. None of these projects endorses blaze. Made at [ix](https://ix.dev) for den's native app. MIT or Apache-2.0. This site is [Flecs](https://github.com/SanderMertens/flecs) scripts, rendered by a Rust renderer compiled to wasm.")
       Dim open("Designed in the open: the [charter](/charter) says what blaze holds to, and [the RFCs](/rfcs) are designs still being argued about. Sign in with GitHub to comment on any paragraph.")
     }
-  }
-
-  updates : Page {
-    Narrow
-    Quiet
-    Title: {"Tell us you use blaze"}
-    Nav: {"Updates", 6}
-    Icon: {"envelope"}
-    (InGroup, nav.reference)
-    Description: {"Leave your email and why you want to use blaze."}
-    Lede lede("Leave your email and why you want it. It helps us see who uses blaze.")
-    SignupForm form
-    Dim privacy("We keep your email and answers to see who uses blaze, and may write to you about it. We don't share them.")
   }
 
   rfcs : Page {

@@ -5,7 +5,9 @@ site {
   learn {
     incremental : Page {
       Narrow
-      Lesson: {2, "Why editing a function's body is cheap, and its signature less so."}
+      Lesson: {2, "Why editing a function's body is cheap, and its signature less so.", "functions"}
+      (InTheme, themes.basics)
+      (Requires, site.learn.builds)
       Title: {"Only what changed"}
       Description: {"Lesson 2: how blaze rebuilds one function at a time, and patches it into your program."}
       Intro: {"[warm] Lesson two. blaze rebuilds one function at a time. Let's see how it knows which functions an edit touched."}

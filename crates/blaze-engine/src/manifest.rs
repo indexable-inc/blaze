@@ -188,7 +188,15 @@ pub(crate) fn key(db: &RootDatabase, args: &Args, table_is_empty: bool) -> Optio
     hasher.field(args.project.as_os_str().as_encoded_bytes());
     hasher.field(args.checkout.as_os_str().as_encoded_bytes());
     hasher.field(&path(&args.base));
-    hasher.field(&[args.shared as u8, args.cfg_test as u8, args.own_target as u8]);
+    hasher.field(&[
+        args.shared as u8,
+        args.cfg_test as u8,
+        args.own_target as u8,
+        args.unit_test as u8,
+    ]);
+    for told in [&args.executables, &args.scratch] {
+        hasher.field(told.as_ref().map(|it| it.as_str().as_bytes()).unwrap_or_default());
+    }
     hasher.field(serde_json::to_string(&args.selection).ok()?.as_bytes());
     hasher.field(format!("{:?}", args.debug).as_bytes());
     hasher.field(hir_ty_codegen::Target::selected().ok()?.triple().as_bytes());

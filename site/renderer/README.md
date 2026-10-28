@@ -7,13 +7,13 @@ module. TS is the host: the build's bake step, routing, auth, D1, the cache and 
 
 ```
 content/*.flecs ──▶ site-snapshot.wasm (Flecs inside) ──▶ snapshot (.gen/site.cbor) ──▶ site.wasm ──▶ HTML
-   gen/build.ts bake: highlight.js, bench widget ──┘                                       ▲
+   gen/build.ts bake: highlight.js; bench charts ──┘                                       ▲
                                               comments (CBOR) + viewer (CBOR) ─────────────┘
 ```
 
 | crate | what it is |
 |---|---|
-| `core` (`site-render`) | The renderer. `world.rs` is the entity store it reads, and `snapshot.rs` loads it from a flecs-snapshot DAG-CBOR document. `render.rs`, `inline.rs` and `comments.rs` are the page, inline text and thread rendering (ported from the former `render/*.ts`, byte for byte). `js.rs` holds the JS semantics the output depends on: whitespace, `String(n)`, `encodeURIComponent`, `String.replace`, UTF-16 slicing and `Date`. The core does no I/O, reads no clock and has no globals. Feature `scripts` runs the content in Flecs (`scripts.rs`). |
+| `core` (`site-render`) | The renderer. `world.rs` is the entity store it reads, and `snapshot.rs` loads it from a flecs-snapshot DAG-CBOR document. `render.rs`, `inline.rs` and `comments.rs` are the page, inline text and thread rendering; `course.rs` lays out the course path as a graph (bands, rows, columns, gutter tracks) (ported from the former `render/*.ts`, byte for byte). `js.rs` holds the JS semantics the output depends on: whitespace, `String(n)`, `encodeURIComponent`, `String.replace`, UTF-16 slicing and `Date`. The core does no I/O, reads no clock and has no globals. Feature `scripts` runs the content in Flecs (`scripts.rs`). |
 | `wasm` (`site-wasm`) | The core behind a C ABI: `site.wasm`, the worker's module and the build's renderer. No Flecs. |
 | `snapshot` (`site-snapshot`) | The content scripts and the baked HTML to a snapshot, behind a C ABI: `site-snapshot.wasm`, Flecs's C compiled in (flecs-c for wasm32-unknown-unknown). Build time only. |
 | `serve` (`site-serve`) | The whole site as a wasi:http component (wstd): pages, comments from a `CommentStore`, and the build's assets. A demo. |
@@ -85,13 +85,17 @@ instance and makes a new one on the next request.
 `site-snapshot.wasm`: `snap_new`, `snap_alloc`, `snap_free`, `snap_build(h, input, len)` (0 with the snapshot, or 1 with
 the error), `snap_output_ptr`, `snap_output_len`, `snap_drop`. The input is JSON
 `{scripts: [{name, code}], bakes: {<entity path>: {highlighted?, baked?, audio?}}}`, the scripts in run order (`schema.flecs`,
-`refs.flecs`, then the rest by path).
+`refs.flecs`, then the rest by path, then the ones the build generated, such as the benchmark charts).
 
-## Highlighting and the bench stay in TS, embedded as-is
+## Highlighting and glyphs stay in TS, embedded as-is; charts are content
 
-`gen/build.ts` pre-renders highlighted code (highlight.js) and the BenchHistory widget, by entity path, and the
-snapshot step sets that HTML on the entities as `Highlighted {html}` (Code, Command) and `Baked {html}` (BenchHistory).
-The core embeds it unchanged, so the core has no highlighter and the CSS is unchanged.
+`gen/build.ts` pre-renders highlighted code (highlight.js) and each lesson's and update's glyph (gen/glyphs.ts), by entity path,
+and the snapshot step sets that HTML on the entities as `Highlighted {html}` (Code, Command) and `Baked {html}` (a
+lesson or update page). The core embeds it unchanged, so the core has no highlighter.
+
+Charts are elements like any other (`RowChart`, `LineChart`, `Charts`, `Picker` in `content/schema.flecs`), drawn by
+`core/src/chart.rs` as HTML rows and inline SVG with a table of their numbers. The benchmark page's are written by the build from the
+history files (`gen/bench/`) as a Flecs script that runs after the content.
 
 ## wasi:http host
 

@@ -61,11 +61,25 @@ Ol { (With, flecs.core.OrderedChildren) }
 Table { (With, flecs.core.OrderedChildren) }
 Tr { (With, flecs.core.OrderedChildren) }
 
-// The course (the home page's map; renderer core render.rs, client/learn.ts). A lesson is a page under site.learn
-// (/learn/<slug>) with Lesson; its
-// children are Steps, one idea per screen. Without JS the steps are stacked and each question shows its answer in a
-// fold; client/learn.ts turns the page into one step at a time and keeps the reader's progress in localStorage.
-struct Lesson(order: i32, line: string) // a lesson page: its place on the course map, and what it teaches in one line
+// The course (the home page's path; renderer core render.rs and course.rs, client/learn.ts). A lesson is a page under
+// site.learn (/learn/<slug>) with Lesson; an update is a page under site.updates (/updates/<slug>) with Update. Both are
+// made of Steps, one idea per screen. Without JS the steps are stacked and each question shows its answer in a fold;
+// client/learn.ts turns the page into one step at a time and keeps the reader's progress in localStorage.
+// The path is a graph, not a line: a lesson or update names what to learn first with (Requires, page), and belongs to
+// one Theme, a band of the path under its own heading, with (InTheme, themes.<name>).
+// A lesson page: its order among the lessons, what it teaches in one line, and its glyph, the drawing on its node (a
+// key of gen/glyphs.ts GLYPHS; the build bakes it onto the page, and an unknown name fails the build).
+struct Lesson(order: i32, line: string, glyph: string)
+// An update: a change to blaze, taught as a short lesson that extends the lessons it requires. `date` is the day the
+// release with it came out (YYYY-MM-DD), `version` that release (0.YYYYMMDD.N), `line` what changed in one line,
+// `glyph` as a Lesson's. The changelog (UpdateLog, /updates) lists them newest first; a reader's browser marks the
+// ones published since their last visit New.
+struct Update(date: string, version: string, line: string, glyph: string)
+// A band of the course path (learn.flecs, under `themes`): its heading, its one line, its place top to bottom, its
+// accent (a class styles/learn.css colours: `theme-<accent>`, empty for the ink) and the short tag the changelog
+// shows on its updates (empty for none).
+struct Theme(title: string, line: string, order: i32, accent: string, tag: string)
+Dashed {}                               // a Theme whose trail is drawn dashed: what it teaches may still change
 struct Step(title: string)              // one screen of a lesson: a short paragraph, maybe a diagram, maybe a question
 struct Quiz(prompt: string)             // a question: its children are Choices, exactly one of them Right
 struct Choice(text: string, why: string) // an answer, and the one line the reader sees once they pick it
@@ -74,15 +88,53 @@ struct Figure(piece: string, label: string) // a diagram the reader can touch (c
 // A question answered by tapping parts of a diagram: `right` is the names of the parts to pick, comma separated (the
 // piece's node ids), `hint` what a wrong pick is told, `why` the explanation once it is right.
 struct Tap(prompt: string, piece: string, right: string, hint: string, why: string)
-Course {}                               // the course map: the Lesson pages under its (Lessons, page), or under this page, by order
+Course {}                               // the course path: the Lesson and Update pages under its (Lessons, page) targets
+UpdateLog {}                            // the changelog: every Update on the course, newest first
 Step { (With, flecs.core.OrderedChildren) }
 Quiz { (With, flecs.core.OrderedChildren) }
+
+// Charts (renderer core chart.rs): drawn by the renderer at build time as inline SVG in the site's ink and type,
+// light and dark (--series-N in styles/tokens.css), each with its numbers in a table the reader can open under it.
+// Values are in the chart's `unit`, "s", "ms" or "MB", and written as they read best (69 ms, 1.18 s, 3.53 GB). A
+// chart's `scale` is "linear" (from zero: amounts that sit close together, 6.5 s beside 6.2 s) or "log" (times that
+// differ tenfold or more, 25 ms beside 1.3 s, where a linear axis would leave the small one invisible).
+//
+// A Subject is something charts compare (blaze, cargo). Its label and colour slot are the same in every chart, so a
+// colour always means the same thing; `dashed` draws its lines dashed, for a second measure of the same subject.
+struct Subject(label: string, slot: i32, dashed: bool)
+Plots { Exclusive }                     // (Plots, subject) on a Value or a Series: whose value it is
+Baseline { Exclusive }                  // (Baseline, subject) on a RowChart: each row says how many times faster than it the row's first other value is
+// Categories compared at one moment: one Row per category, a Value per subject in it, written out beside the row.
+// Linear draws bars from zero, log draws a dot per value on a line from the fastest to the slowest.
+struct RowChart(title: string, unit: string, scale: string, note: string)
+struct Row(label: string)
+struct Value(value: f64, note: string)  // note: something to know about this one value (beside it and in the table)
+// Lines over runs: one Series per subject, x is the runs in Runs (evenly spaced, oldest first). With one run there
+// is no line yet: the chart shows each subject's value.
+struct LineChart(title: string, unit: string, scale: string, note: string)
+struct Runs(dates: string, commits: string) // on a LineChart: one ISO date and one commit per run, space separated
+// One value per run, space separated, `-` where the run has none. lo and hi, when set, are a band (fastest to slowest).
+struct Series(values: string, lo: string, hi: string)
+Charts {}                               // small multiples: its charts side by side, two to a row on a wide screen
+// One of several panels at a time: a labelled row of buttons (radio buttons, so it works without JS) over its Picks.
+// The Pick with Picked starts chosen, else the first.
+struct Picker(label: string)
+struct Pick(label: string)
+Picked {}
+RowChart { (With, flecs.core.OrderedChildren) }
+Row { (With, flecs.core.OrderedChildren) }
+LineChart { (With, flecs.core.OrderedChildren) }
+Charts { (With, flecs.core.OrderedChildren) }
+Picker { (With, flecs.core.OrderedChildren) }
+Pick { (With, flecs.core.OrderedChildren) }
 
 // Things the TS layer builds itself, placed like any block.
 RfcIndex {}                             // the list of RFCs (children of site.rfcs)
 References {}                           // every reference the page cites, in order of first use
-SignupForm {}                           // the /updates form (worker/updates.ts handles the POST)
-BenchHistory {}                         // /bench's charts, from docs/benchmarks/history
+// A container the build fills from the benchmark history in `dir` (a directory of .jsonl files, from the repo root):
+// gen/bench/ writes it as a Flecs script of Sections, Pickers and charts under this entity. Not read aloud.
+struct BenchHistory(dir: string)
+BenchHistory { (With, flecs.core.OrderedChildren) }
 
 // The spoken version (renderer core spoken.rs; audio/README.md). Each block has a line derived from it by default:
 // prose without its markup, section titles as transitions, tables read row by row, code skipped. Say replaces a
@@ -108,11 +160,13 @@ Resolved {}
 Cites {}                                // (Cites, ref): a block leans on that reference
 DependsOn {}                            // (DependsOn, page): read that page first
 InGroup { Exclusive }                   // (InGroup, nav.<section>): the page's sidebar row is in that section
-Lessons { Exclusive }                   // (Lessons, page) on a Course: the lessons it maps are that page's
+Lessons {}                              // (Lessons, page) on a Course: the lessons and updates under that page are on its path
+Requires {}                             // (Requires, page) on a lesson or update: learn that one first (an edge of the course graph)
+InTheme { Exclusive }                   // (InTheme, themes.<name>): the band of the course path a lesson or update is in
 
 // Page kinds.
 Discussable {}                          // signed-in readers comment on each block (every other page has one discussion for the whole page)
-Quiet {}                                // no discussion at all (the 404, the signup form)
+Quiet {}                                // no discussion at all (the 404)
 Narrow {}                               // a 560px column instead of 820px
 Wide {}                                 // a wide column, no outline beside it
 Hero {}                                 // the page's title is the logo, large (the home page)

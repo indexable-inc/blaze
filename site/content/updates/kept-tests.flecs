@@ -1,0 +1,49 @@
+// Update: `blaze test` keeps a hermetic test's pass by its code, with no opt-in (#836 in v0.20261028.3; #901, #910 in
+// v0.20261028.9). Canary. Extends lesson 4: sealed inputs, kept results, now for tests too.
+site {
+  updates {
+    "kept-tests" : Page {
+      Narrow
+      Update: {"2026-10-28", "0.20261028.3", "A test that reads nothing from outside its code passes once, and stays passed until that code changes.", "pass"}
+      (InTheme, themes.canary)
+      (Requires, site.learn.hermetic)
+      Title: {"Kept test passes"}
+      Description: {"Update to lesson 4: blaze test keeps a hermetic test's pass until its code changes."}
+      Intro: {"[warm] An update to lesson four. Sealed inputs mean kept results, and now that goes for tests too."}
+      Outro: {"[warm] That's the update. A test that reaches nothing outside its code runs again only when that code changes, and blaze test with why tells you about the rest."}
+
+      Step pass("A pass, kept") {
+        Say: {"Lesson four said an output can be kept when everything it depends on is sealed in. A test's pass works the same way now. Blaze test keeps a hermetic test's pass by its code, with nothing to turn on, and runs it again only when that code changes."}
+        P same("Lesson 4 said an output can be kept when all it depends on is sealed in. A test's pass now works the same way: `blaze test` keeps a hermetic test's pass by its code, with nothing to turn on.")
+        P again("It runs again only when that code changes.")
+      }
+
+      Step hermetic("What counts as hermetic") {
+        Say: {"A test is hermetic when the code it can reach touches nothing outside: no file, no environment variable, no socket, no other process, no foreign code or inline assembly, no indirect call blaze can't bound, no writable shared static. Every other test runs every time."}
+        P reach("A test is hermetic when the code it can reach touches no file, environment variable, socket, other process, foreign code, inline assembly, unbounded indirect call, writable shared static, or code blaze can't compile. Every other test runs every time.")
+      }
+
+      Step which("Which one is kept?") {
+        Silent
+        Quiz q(prompt: "Which test's pass can blaze keep?") {
+          Choice fixture("One that reads `tests/input.json`.", "It reaches a file, which can change while the code stays the same, so it runs every time.")
+          Choice env("One that reads `RUST_LOG`.", "An environment variable is an input from outside the code, so it runs every time.")
+          Choice parse("One that parses a string literal and checks the result.", "Everything it depends on is its code, so the same code gives the same result.") {
+            Right
+          }
+        }
+      }
+
+      Step why("Why not?") {
+        Say: {"[curious] Want to know why a test keeps running? Blaze test with why prints a table: each test, whether it's hermetic, and if not, what it reaches and the fewest calls that get there. To run every test anyway, set blaze tests to all."}
+        P table("`blaze test --why` prints each test, whether it is hermetic, and if not, what it reaches and the fewest calls to it. The details are in `target/blaze/tests.ndjson`.")
+        P all("To run every test anyway: `BLAZE_TESTS=all blaze test`.")
+      }
+
+      Step source("Where it comes from") {
+        Say: {"This is on the canary channel. On stable, every test still runs."}
+        Dim where("In canary since v0.20261028.3 ([#836](https://github.com/indexable-inc/blaze/pull/836)); the walk after an edit keeps what it found since v0.20261028.9 ([#901](https://github.com/indexable-inc/blaze/pull/901), [#910](https://github.com/indexable-inc/blaze/pull/910)).")
+      }
+    }
+  }
+}
