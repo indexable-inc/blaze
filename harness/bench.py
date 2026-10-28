@@ -314,8 +314,8 @@ PROJECTS = {
         ),
         test=["-p", "fframes", "-p", "fframes-media", "-p", "webvtt-parser", "-p", "fframes-media-dir-macro"],
     ),
-    # OpenAI's Codex CLI: its Rust workspace is codex-rs (`dir`), 162 crates, most of them under
-    # the `codex` binary. cargo builds with its pin (rust-toolchain.toml, 1.99.1), as its users do.
+    # OpenAI's Codex CLI: its Rust workspace is codex-rs (`dir`), 162 members; the `codex`
+    # binary is over 151 of its 167 local packages and about 1,200 packages in all. cargo builds with its pin (rust-toolchain.toml, 1.99.1), as its users do.
     # Needs libcap (its Linux sandbox) and ALSA; measured only when named.
     "codex": dict(
         repo="openai/codex", tag="rust-v0.165.0", rev="360319d8dee62d87e2d59fc0c21805d79519cfed",
