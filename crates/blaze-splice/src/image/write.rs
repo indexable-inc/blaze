@@ -598,6 +598,12 @@ impl<'a> Plan<'_, 'a> {
                     continue;
                 }
                 let writable = sec.flags & u64::from(elf::SHF_WRITE) != 0;
+                let nobits = sec.sh_type == elf::SHT_NOBITS;
+                ensure!(
+                    !nobits || sec.flags & u64::from(elf::SHF_TLS) == 0 || sec.relocs.is_empty(),
+                    "{}: relocations in a thread-local section without bytes",
+                    self.where_is(o as u32, s as u32, 0)
+                );
                 // Of `.eh_frame`, the relocations of the records that are kept.
                 let relocs: Vec<Reloc> = match frame {
                     true => self
@@ -626,6 +632,16 @@ impl<'a> Plan<'_, 'a> {
                         continue;
                     }
                     let res = self.resolve(reloc.to, from)?;
+                    // Zeroed memory holds only what the loader writes there: an address. lld
+                    // takes it so, and blaze's codegen puts a constant whose bytes are all
+                    // relocated (`.Lblaze.const.*`, the address of a static) in `.bss`.
+                    ensure!(
+                        !nobits || kind == Kind::Abs64 && !matches!(res, Res::Abs(_)),
+                        "{}: relocation {} in a section without bytes, which only the address the loader \
+                         writes can be in (docs/patching.md)",
+                        self.where_is(from.0, from.1, from.2),
+                        type_name(machine, reloc.r_type)
+                    );
                     match kind {
                         Kind::None => {}
                         Kind::Abs64 => match res {
@@ -1285,7 +1301,7 @@ impl<'a> Plan<'_, 'a> {
             }
         }
         for out_index in 0..self.outs.len() {
-            if self.outs[out_index].synth.is_some() || self.outs[out_index].sh_type == elf::SHT_NOBITS {
+            if self.outs[out_index].synth.is_some() {
                 continue;
             }
             for piece in 0..self.outs[out_index].pieces.len() {
@@ -1308,6 +1324,25 @@ impl<'a> Plan<'_, 'a> {
                     let from = (o, s, reloc.offset);
                     let res = self.resolve(reloc.to, from)?;
                     let before = load.len();
+                    if sec.sh_type == elf::SHT_NOBITS {
+                        // Only the loader writes there; the scan let in nothing else.
+                        let place = base + reloc.offset;
+                        match res {
+                            Res::Import(id) => {
+                                let r_type = match machine {
+                                    Machine::X86_64 => elf::R_X86_64_64,
+                                    Machine::Aarch64 => elf::R_AARCH64_ABS64,
+                                };
+                                load.push((place, r_type, self.import_of[&id], reloc.addend));
+                            }
+                            _ => {
+                                let value = self.address_of(res)?.wrapping_add_signed(reloc.addend);
+                                load.push((place, machine.relative(), 0, value as i64));
+                            }
+                        }
+                        load_from.insert(from);
+                        continue;
+                    }
                     self.apply(bytes, reloc, kind, base + reloc.offset, res, &mut load, from)?;
                     if load.len() > before {
                         load_from.insert(from);
