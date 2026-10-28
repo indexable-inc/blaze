@@ -796,7 +796,7 @@ root, is proven by the query too: its universes are the query's own, which the b
 in the same order and instantiates, as rustc's canonical query response. It was proven again in
 the body on every check, and one such goal of rmcp's `#[tool_router]`,
 `(Tool, fn): IntoToolRoute<_, AsyncMethodAdapter<..>>`, took nushell's `tool_router` 107 ms; it
-is 0.3 ms now. Nothing else moves (bench/results/2026-10-27-borrowck-speed-placeholders).
+is 0.3 ms now. Nothing else moves (tools/bench/results/2026-10-27-borrowck-speed-placeholders).
 
 ## Debugging
 

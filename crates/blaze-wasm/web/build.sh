@@ -1,6 +1,6 @@
 #!/bin/sh
 # Builds what the page loads into `pkg/`: the compiler as wasm32, and the source of `core`.
-# Needs the `rust-src` component. Serve this directory afterwards, with any static server:
+# `core` comes from blaze's own library/ at the repo root. Serve this directory afterwards, with any static server:
 #
 #     python3 -m http.server -d crates/blaze-wasm/web 8377
 set -eu
@@ -12,4 +12,4 @@ cargo build --release --lib --target-dir "$target" --target wasm32-unknown-unkno
 cp "$target/wasm32-unknown-unknown/release/blaze_wasm.wasm" web/pkg/
 
 cargo run --release --target-dir "$target" -- \
-    bundle "$(rustc --print sysroot)/lib/rustlib/src/rust/library" web/pkg/core.bundle
+    bundle ../../library web/pkg/core.bundle

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""scripts/rename.py: renames ra-jit to blaze throughout a checkout (#270).
+"""tools/rename.py: renames ra-jit to blaze throughout a checkout (#270).
 
-usage: python3 scripts/rename.py [--env] [--check] [--dry-run]
+usage: python3 tools/rename.py [--env] [--check] [--dry-run]
 
 Run from anywhere inside a checkout of blaze, on a branch with nothing uncommitted. It rewrites
 every tracked text file and `git mv`s every tracked path whose name says ra-jit, then prints the
 places a rule may have made two names one (an identifier the file already had). It changes
 nothing it has already changed, so a branch made before the rename runs it on itself and then
-rebases: `python3 scripts/rename.py && git commit -am 'rename.py' && git rebase origin/main`.
+rebases: `python3 tools/rename.py && git commit -am 'rename.py' && git rebase origin/main`.
 
   --env      only the settings: `RA_JIT_<NAME>` becomes `BLAZE_<NAME>`, and nothing else
   --check    changes nothing; lists what still says ra-jit or cargo blaze, and fails when anything does
@@ -37,7 +37,7 @@ import sys
 # Kept as they are: history and the map itself.
 SKIPPED = {
     "CHANGELOG.md",
-    "scripts/rename.py",
+    "tools/rename.py",
     "docs/rename.md",
     # What blaze says of the old names, which it has to name.
     "crates/ra-jit/src/renamed.rs",

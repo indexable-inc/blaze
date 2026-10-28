@@ -17,8 +17,8 @@ smoke/smoke.json names the cases and projects. A case is a directory smoke/<name
 project whose `blaze run` prints exactly smoke/<name>/expected.txt (given `args` and `env`) and
 whose `blaze test` passes `tests` tests. A project is a repository at a pinned commit (`rev`;
 `{blaze}` is --blaze-rev, by default this checkout's HEAD), whose `runs` print what they say
-(`stdout` exactly, or `contains`, or a `file` that `starts` so) and whose `blaze test` (with the
-arguments of `test`) passes. A private repository is fetched with GH_TOKEN. A project may have
+(`stdout` exactly, or `contains`, or a `file` that `starts` so, each character of it a byte)
+and whose `blaze test` (with the arguments of `test`) passes. A private repository is fetched with GH_TOKEN. A project may have
 `env` for its builds, `seconds` for each command (default 3600), and `prepare`, a module of the
 harness whose `prepare(checkout)` gives the tree to build and the environment its builds need
 (bun: bunprep.py, its own build of its C and C++). Its `builds` are `blaze build` with `args` in
@@ -310,7 +310,7 @@ class Smoke:
                         if not os.path.isfile(file):
                             return f"it wrote no {file}"
                         with open(file, "rb") as f:
-                            if not f.read(len(step["starts"])) == step["starts"].encode():
+                            if not f.read(len(step["starts"])) == step["starts"].encode("latin-1"):
                                 return f"{file} does not start with {step['starts']!r}"
                     return None
 

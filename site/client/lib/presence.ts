@@ -6,8 +6,10 @@
  * - the top line of the pane (`.topline`, made here, outside `.grid` so a swap keeps it; on a phone it sits in the
  *   phone bar instead): the page's discussion
  *   (its comment count, a jump to it) on a page that has one, the faces on this page (click: everyone on the site
- *   and where), and the reader: their GitHub avatar and login with Sign out, or Sign in with GitHub;
- * - the sidebar: a small stack of faces on each page's row that someone else is reading;
+ *   and where), the chat (client/lib/chat.ts, which rides this socket), and the reader: their GitHub avatar and login
+ *   with Sign out, or Sign in with GitHub;
+ * - the sidebar: a small stack of faces on each page's row that someone else is reading, and when one of them says
+ *   something in the chat, a speech bubble out of their face for a few seconds (`speak`);
  * - comments: when someone posts or deletes one, the worker says so here, and client/comments.ts refreshes the
  *   threads of that doc if it is the page shown.
  *
@@ -17,10 +19,12 @@
  * (a hash, new every day). Someone whose tab is hidden is drawn faded ("away").
  */
 
-import { COMMENTS, PAGE, THREADS, onPage } from './page';
+import { tipOn } from './tip';
+import * as chat from './chat';
+import { COMMENTS, LEAVE, PAGE, THREADS, onPage } from './page';
 
 type Who = { key: string; login: string | null; avatar: string | null };
-type Person = Who & { pages: { path: string; away: boolean }[] };
+type Person = Who & { country: string | null; since?: number; pages: { path: string; away: boolean }[] };
 type You = Who & { signIn: boolean };
 
 /** The site's base (`/blaze/`), from the stylesheet the renderer linked as `<base>/site.css`. */
@@ -83,7 +87,8 @@ function identicon(key: string): SVGSVGElement {
 
 function face(w: Who, away = false): HTMLElement {
 	const f = el('span', `face${away ? ' away' : ''}`);
-	f.title = away ? `${name(w)} (away)` : name(w);
+	f.dataset.key = w.key;
+	tipOn(f, away ? `${name(w)} (away)` : name(w));
 	if (w.avatar && w.avatar.startsWith('https://avatars.githubusercontent.com/')) {
 		const img = el('img');
 		img.src = `${w.avatar}${w.avatar.includes('?') ? '&' : '?'}s=48`;
@@ -105,7 +110,7 @@ function stack(list: Person[], max: number, path: string): HTMLElement {
 /** The sidebar's label for a site path, else the path. */
 function titleOf(path: string): string {
 	const a = document.querySelector<HTMLAnchorElement>(`.navlist a.row[href="${CSS.escape(href(path))}"]`);
-	return a?.title || a?.textContent?.trim() || path;
+	return a?.title || a?.dataset.tip || a?.textContent?.trim() || path;
 }
 
 // ---- The top line -------------------------------------------------------------------------------------------------
@@ -115,7 +120,9 @@ bar.setAttribute('aria-label', 'Discussion and who is here');
 const discussSlot = el('span', 'tl-discuss');
 const hereSlot = el('span', 'tl-here');
 const meSlot = el('span', 'tl-me');
-bar.append(discussSlot, el('span', 'tl-gap'), hereSlot, meSlot);
+const chatSlot = el('span', 'tl-chatslot');
+chatSlot.append(chat.button);
+bar.append(discussSlot, el('span', 'tl-gap'), hereSlot, chatSlot, meSlot);
 const list = el('div', 'tl-list');
 list.hidden = true;
 list.id = 'who-is-here';
@@ -145,7 +152,7 @@ function drawDiscuss(): void {
 	const n = document.querySelectorAll('main .c-item').length;
 	const a = el('a', 'tl-btn');
 	a.href = '#discussion';
-	a.title = n === 0 ? 'Discuss this page' : `${n} comment${n === 1 ? '' : 's'} on this page`;
+	tipOn(a, n === 0 ? 'Discuss this page' : `${n} comment${n === 1 ? '' : 's'} on this page`);
 	a.append(el('span', 'tl-bubble'), el('span', 'tl-label', n === 0 ? 'Discuss' : n === 1 ? 'comment' : 'comments'));
 	if (n > 0) a.insertBefore(el('span', 'tl-n', String(n)), a.lastChild);
 	discussSlot.append(a);
@@ -161,7 +168,7 @@ function drawHere(): void {
 	b.setAttribute('aria-expanded', String(!list.hidden));
 	b.setAttribute('aria-controls', list.id);
 	b.append(el('span', 'tl-dot'), stack(on, BAR_FACES, path), el('span', 'tl-count', on.length <= 1 ? `${total} online` : `${on.length} here`));
-	b.title = `${on.length} on this page, ${total} on the site`;
+	tipOn(b, `${on.length} on this page, ${total} on the site`);
 	b.addEventListener('click', (e) => {
 		e.stopPropagation();
 		if (!list.hidden) return closeList();
@@ -171,6 +178,31 @@ function drawHere(): void {
 	});
 	hereSlot.append(b);
 }
+
+const regions = (() => {
+	try {
+		return new Intl.DisplayNames(undefined, { type: 'region' });
+	} catch {
+		return null;
+	}
+})();
+
+/** A country's flag: its two letters as regional indicator symbols, named in a tooltip. */
+function flag(cc: string): HTMLElement {
+	const f = el('span', 'flag', String.fromCodePoint(...[...cc].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65)));
+	const n = regions?.of(cc) ?? cc;
+	tipOn(f, n);
+	f.setAttribute('aria-label', n);
+	return f;
+}
+
+/** How long since `t`, short: now, 5m, 2h, 3d. */
+function ago(t: number): string {
+	const m = Math.floor((Date.now() - t) / 60_000);
+	return m < 1 ? 'now' : m < 60 ? `${m}m` : m < 1440 ? `${Math.floor(m / 60)}h` : `${Math.floor(m / 1440)}d`;
+}
+// The times in an open list keep up on their own.
+setInterval(() => drawList(), 30_000);
 
 function drawList(): void {
 	if (list.hidden) return;
@@ -183,15 +215,34 @@ function drawList(): void {
 			who.href = `https://github.com/${encodeURIComponent(p.login!)}`;
 			who.rel = 'nofollow noopener';
 		}
-		li.append(face(p, p.pages.length > 0 && p.pages.every((x) => x.away)), who);
+		// The dot: green while a tab of theirs is in front of them, hollow while every one is in the background.
+		const active = p.pages.some((x) => !x.away);
+		const av = el('span', 'tl-av');
+		const dot = el('span', active ? 'dot on' : 'dot');
+		tipOn(dot, active ? 'Here now' : 'Tab in the background');
+		av.append(face(p, !active), dot);
+		li.append(av, who);
+		if (p.country) li.append(flag(p.country));
 		if (p.key === you?.key) li.append(el('span', 'tag', 'you'));
+		// The page in front of them, the rest of their tabs as +N (named in its tooltip).
 		const where = el('span', 'where');
-		for (const pg of p.pages) {
-			const a = el('a', pg.away ? 'away' : '', titleOf(pg.path));
-			a.href = href(pg.path);
+		const [front, ...rest] = p.pages;
+		if (front) {
+			const a = el('a', front.away ? 'away' : '', titleOf(front.path));
+			a.href = href(front.path);
 			where.append(a);
 		}
+		if (rest.length) {
+			const more = el('span', 'more', `+${rest.length}`);
+			tipOn(more, rest.map((x) => titleOf(x.path)).join(', '));
+			where.append(more);
+		}
 		li.append(where);
+		if (p.since) {
+			const t = el('span', 'for', ago(p.since));
+			tipOn(t, `On the site since ${new Date(p.since).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`);
+			li.append(t);
+		}
 		ul.append(li);
 	}
 	if (people.length < total) ul.append(el('li', 'tl-head', `and ${total - people.length} more`));
@@ -206,7 +257,7 @@ function drawMe(): void {
 		a.setAttribute('aria-label', `Signed in as ${you.login}`);
 		a.href = `https://github.com/${encodeURIComponent(you.login)}`;
 		a.rel = 'noopener';
-		a.title = 'Your GitHub profile';
+		tipOn(a, 'Your GitHub profile');
 		a.append(face(you), el('span', '', you.login));
 		const form = el('form', 'tl-out');
 		form.method = 'post';
@@ -249,20 +300,68 @@ function drawSide(): void {
 	const byPath = new Map<string, Person[]>();
 	for (const p of people) {
 		if (p.key === you?.key) continue;
-		for (const pg of p.pages) {
-			const l = byPath.get(pg.path) ?? [];
-			if (!l.includes(p)) l.push(p);
-			byPath.set(pg.path, l);
-		}
+		// One face a person, on the page in front of them (the presence object sends that page first).
+		const pg = p.pages[0];
+		if (!pg) continue;
+		const l = byPath.get(pg.path) ?? [];
+		l.push(p);
+		byPath.set(pg.path, l);
 	}
 	for (const [path, list] of byPath) {
 		const row = document.querySelector<HTMLAnchorElement>(`.navlist a.row[href="${CSS.escape(href(path))}"]`);
 		if (!row) continue;
 		const s = stack(list, ROW_FACES, path);
-		s.title = `${list.map(name).join(', ')} reading this`;
+		tipOn(s, `${list.map(name).join(', ')} reading this`);
 		row.append(s);
 	}
 }
+
+const SAY_MS = 6000;
+const TYPING_BUBBLE_MS = 3000;
+const bubbles = new Map<string, HTMLElement>();
+
+/** A bubble with `text` out of `key`'s face on the sidebar row of the page they are on, if it is in view. */
+function speak(key: string, login: string, text: string | null): void {
+	// Typing dots never cover something said that is still showing.
+	if (text === null && bubbles.get(key)?.classList.contains('said')) return;
+	bubbles.get(key)?.remove();
+	const p = people.find((x) => x.key === key);
+	// The page they are looking at first, then any other tab of theirs.
+	let at: Element | null = null;
+	for (const pg of p?.pages ?? []) {
+		const row = `.navlist a.row[href="${CSS.escape(href(pg.path))}"] > .faces`;
+		at = document.querySelector(`${row} > .face[data-key="${CSS.escape(key)}"]`) ?? document.querySelector(row);
+		if (at) break;
+	}
+	at ??= document.querySelector(`.navlist .row > .faces > .face[data-key="${CSS.escape(key)}"]`);
+	const r = at?.getBoundingClientRect();
+	if (!at || !r || r.width === 0 || r.bottom < 0 || r.top > innerHeight) return;
+	const b = el('div', text === null ? 'say-bubble typing' : 'say-bubble said');
+	b.setAttribute('aria-hidden', 'true');
+	if (text === null) {
+		const dots = el('span', 'dots');
+		dots.append(el('i'), el('i'), el('i'));
+		b.append(dots);
+	} else b.append(el('b', '', login), el('span', '', text));
+	b.style.left = `${Math.round(r.right + 10)}px`;
+	b.style.top = `${Math.round(r.top + r.height / 2 - 14)}px`;
+	document.body.append(b);
+	bubbles.set(key, b);
+	at.classList.add('talking');
+	setTimeout(() => {
+		b.classList.add('out');
+		at.classList.remove('talking');
+		setTimeout(() => {
+			b.remove();
+			if (bubbles.get(key) === b) bubbles.delete(key);
+		}, 300);
+	}, text === null ? TYPING_BUBBLE_MS : SAY_MS);
+}
+// The sidebar scrolling or the page swapping moves the faces from under a bubble: let it go.
+for (const t of ['scroll', LEAVE] as const) addEventListener(t, () => {
+	for (const b of bubbles.values()) b.remove();
+	bubbles.clear();
+}, { capture: true, passive: true });
 
 function draw(): void {
 	mount();
@@ -300,16 +399,22 @@ function connect(): void {
 		}
 		if (typeof m !== 'object' || m === null) return;
 		const msg = m as { t?: unknown };
+		if (chat.message(msg)) return;
 		if (msg.t === 'comments') {
 			const doc = (m as { doc?: unknown }).doc;
 			if (typeof doc === 'string') dispatchEvent(new CustomEvent(COMMENTS, { detail: doc }));
 			return;
 		}
-		if (msg.t === 'you') you = m as You;
+		if (msg.t === 'you') {
+			you = m as You;
+			chat.setYou(you);
+		}
 		else if (msg.t === 'here') {
 			const h = m as { people?: Person[]; total?: number };
 			people = Array.isArray(h.people) ? h.people : [];
 			total = typeof h.total === 'number' ? h.total : people.length;
+			chat.setOnline(total);
+			chat.setPeople(people);
 		} else return;
 		draw();
 	});
@@ -340,6 +445,7 @@ document.addEventListener('click', (e) => {
 	if (!(e.target instanceof Node && list.contains(e.target))) closeList();
 });
 
+chat.setup({ send: (m) => ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify(m)), base: BASE, face, speak });
 onPage(() => {
 	closeList();
 	draw();

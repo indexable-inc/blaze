@@ -38,8 +38,8 @@ CODE = (
     ".cargo/",
     # Found by blaze-fmt's and blaze-lints' search up from a directory; not known to be unread
     # by their tests.
-    "rustfmt.toml",
-    "clippy.toml",
+    ".rustfmt.toml",
+    ".clippy.toml",
     # The pinned nightly: compiled into blaze-cargo, the flake's dev shell and the toolchain action.
     "harness/toolchain",
     # The tests job runs it.

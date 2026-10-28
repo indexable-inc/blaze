@@ -142,7 +142,7 @@ The table above has the load compiling each module, one after another, and a key
 machine code that had the store's build identity in it, which changes with the first toolchain
 name a process sets: the run after a cold `--own-target` build compiled every module again
 (49.9 s). With the changes above, on the same VM, `--own-target`, the corpus, wall seconds,
-medians of alternating runs ([bench/results/2026-10-27-pmfast](../../bench/results/2026-10-27-pmfast/README.md)):
+medians of alternating runs ([tools/bench/results/2026-10-27-pmfast](../../tools/bench/results/2026-10-27-pmfast/README.md)):
 
 | arm | cold | again | edit | again |
 |---|---|---|---|---|

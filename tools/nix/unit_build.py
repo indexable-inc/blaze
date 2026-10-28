@@ -3,7 +3,7 @@
 
 Usage: unit_build.py <spec.json>
 
-The spec is written by nix/units.nix (store paths already filled in). Two kinds:
+The spec is written by tools/nix/units.nix (store paths already filled in). Two kinds:
 
 * compile: one direct `rustc` call for one cargo unit (lib, proc-macro, bin, or a
   build script). No cargo involved.
