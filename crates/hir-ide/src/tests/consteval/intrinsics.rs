@@ -740,12 +740,13 @@ fn a_constant_read_again_is_not_copied_again() {
     // 2 GiB if every read of `K` copied it to the heap.
     check_number(
         r#"
+        //- minicore: index, slice
         const K: [u32; 65536] = [3; 65536];
         const GOAL: u32 = {
             let mut i = 0;
-            let mut sum = 0;
+            let mut sum = 0u32;
             while i < 8192 {
-                sum += K[i];
+                sum = sum + K[i];
                 i += 1;
             }
             sum
@@ -760,6 +761,7 @@ fn a_promoted_borrow_of_a_constant() {
     // `&B` is promoted: `B` is copied from the heap to the heap, past the end of the stack.
     check_number(
         r#"
+        //- minicore: index, slice
         struct Big([u8; 4096]);
         impl Big {
             const fn last(&self) -> u8 {
@@ -777,6 +779,7 @@ fn a_promoted_borrow_of_a_constant() {
 fn a_promoted_temporary_outlives_its_call() {
     check_number(
         r#"
+        //- minicore: index, slice
         const fn f() -> &'static [u8; 3] {
             &[1, 2, 3]
         }
@@ -796,16 +799,89 @@ fn a_promoted_temporary_outlives_its_call() {
 }
 
 #[test]
+fn integer_formatting_buffer_lengths() {
+    // `core::fmt::num`'s: `MAX.ilog10() + 1` digits, and `MAX.ilog(BASE) + 1` in a radix.
+    check_number(
+        r#"
+        //- minicore: option, panic, assert, slice, index
+        #[rustc_intrinsic]
+        pub const unsafe fn assume(b: bool);
+        struct U64;
+        impl U64 {
+            const MAX: u64 = 18446744073709551615;
+        }
+        const fn less_than_5(val: u32) -> u32 {
+            const C1: u32 = 0b011_00000000000000000 - 10;
+            const C2: u32 = 0b100_00000000000000000 - 100;
+            const C3: u32 = 0b111_00000000000000000 - 1000;
+            const C4: u32 = 0b100_00000000000000000 - 10000;
+            (((val + C1) & (val + C2)) ^ ((val + C3) & (val + C4))) >> 17
+        }
+        const fn u64_impl(mut val: u64) -> u32 {
+            let mut log = 0;
+            if val >= 10_000_000_000 {
+                val /= 10_000_000_000;
+                log += 10;
+            }
+            if val >= 100_000 {
+                val /= 100_000;
+                log += 5;
+            }
+            log + less_than_5(val as u32)
+        }
+        const fn ilog10(val: u64) -> u32 {
+            let result = u64_impl(val);
+            unsafe { assume(result <= const { u64_impl(U64::MAX) }) };
+            result
+        }
+        const fn checked_ilog(s: u8, base: u8) -> Option<u32> {
+            if s <= 0 || base <= 1 {
+                None
+            } else if s < base {
+                Some(0)
+            } else {
+                let mut n = 1;
+                let mut r = base;
+                while r <= s / base {
+                    n += 1;
+                    r *= base;
+                }
+                Some(n)
+            }
+        }
+        const fn ilog(s: u8, base: u8) -> u32 {
+            assert!(base >= 2, "base of integer logarithm must be at least 2");
+            if let Some(log) = checked_ilog(s, base) {
+                log
+            } else {
+                panic!("argument of integer logarithm must be positive")
+            }
+        }
+        const DIG_TAB: &[u8] = b"0123456789abcdef";
+        const BASE: u8 = DIG_TAB.len() as u8;
+        const MAX_DIG_N: usize = ilog(255, BASE) as usize + 1;
+        const MAX_DEC_N: usize = ilog10(U64::MAX) as usize + 1;
+        const GOAL: usize = {
+            let a: [u8; MAX_DEC_N] = [0; MAX_DEC_N];
+            let b: [u8; MAX_DIG_N] = [0; MAX_DIG_N];
+            MAX_DEC_N * 100 + MAX_DIG_N
+        };
+        "#,
+        2002,
+    );
+}
+
+#[test]
 fn allocated_memory_may_not_be_in_the_value() {
     for value in ["__rust_alloc(4, 1)", "&*__rust_alloc(4, 1)"] {
         let ty = if value.starts_with('&') { "&u8" } else { "*const u8" };
         check_fail(
             &format!(
                 r#"
-            //- minicore: sized
-            {ALLOCATOR}
-            const GOAL: {ty} = unsafe {{ {value} }};
-            "#
+        //- minicore: sized
+        {ALLOCATOR}
+        const GOAL: {ty} = unsafe {{ {value} }};
+        "#
             ),
             |e| {
                 matches!(
@@ -885,10 +961,10 @@ fn freeing_what_was_not_allocated() {
         check_fail(
             &format!(
                 r#"
-            //- minicore: sized
-            {ALLOCATOR}
-            const GOAL: u8 = unsafe {{ {body} 0 }};
-            "#
+        //- minicore: sized
+        {ALLOCATOR}
+        const GOAL: u8 = unsafe {{ {body} 0 }};
+        "#
             ),
             |e| matches!(e, ConstEvalError::MirEvalError(MirEvalError::UndefinedBehavior(_))),
         );
