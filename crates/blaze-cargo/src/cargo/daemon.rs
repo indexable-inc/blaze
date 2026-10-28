@@ -177,6 +177,8 @@ pub enum Request {
         subscribe: Subscribe,
         follow: bool,
     },
+    /// Where the build page is (docs/web.md), its server started if it is not yet.
+    Ui,
 }
 
 impl Request {
@@ -226,6 +228,8 @@ pub enum Reply {
     /// The records of a [`Request::Watch`] that does not follow; one that does was sent them
     /// as they came.
     Watched(Vec<Record>),
+    /// Where the build page is, or why it is not served.
+    Ui(Result<String, String>),
 }
 
 /// Why the worker did not build a program.
@@ -1059,9 +1063,11 @@ struct Daemon {
     /// The checkers of the last [`Request::Check`]s, each of another build and loaded for
     /// the next check of it: a check for several targets asks one for each.
     checkers: Mutex<Vec<Checker>>,
-    asked: Mutex<Instant>,
+    asked: Arc<Mutex<Instant>>,
     watched: Arc<Mutex<Watched>>,
     relays: Arc<Relays>,
+    /// Where the build page is, once a `blaze ui` started its server ([`Request::Ui`]).
+    ui: Mutex<Option<String>>,
 }
 
 /// The records of the builds under way and of the last of each workspace, for the commands
@@ -1073,6 +1079,8 @@ struct Watched {
     builds: u64,
     watching: Vec<Watching>,
     watchers: Vec<Watcher>,
+    /// The graph of each workspace's functions, for the build page.
+    graphs: Arc<blaze_web::Graphs>,
 }
 
 struct Watching {
@@ -1117,6 +1125,7 @@ impl Watched {
 
     fn record(&mut self, build: u64, record: &Record) {
         let Some(watching) = self.watching.iter_mut().find(|it| it.build == build) else { return };
+        self.graphs.record(&watching.root, build, record.clone());
         watching.records.push(record.clone());
         let done = matches!(record.event, Event::Finished { .. });
         watching.done |= done;
@@ -1127,6 +1136,12 @@ impl Watched {
             let ours = watcher.root.as_ref().is_none_or(|it| it == root);
             !ours || watcher.to.send(record.clone()).is_ok() && !(done && watcher.root.is_some())
         });
+    }
+
+    /// The functions build `build` put in its program: the build page's alone.
+    fn functions(&mut self, build: u64, record: Record) {
+        let Some(watching) = self.watching.iter().find(|it| it.build == build) else { return };
+        self.graphs.record(&watching.root, build, record);
     }
 
     /// The build under way in the workspace `at` is in, or else its last.
@@ -1248,9 +1263,10 @@ pub fn serve() -> anyhow::Result<()> {
         spare_when,
         spares: AtomicUsize::new(0),
         checkers: Mutex::default(),
-        asked: Mutex::new(Instant::now()),
+        asked: Arc::new(Mutex::new(Instant::now())),
         watched: Arc::default(),
         relays: Arc::default(),
+        ui: Mutex::default(),
     });
     // A build starts the daemon, and is given this one.
     daemon.spare();
@@ -1365,8 +1381,9 @@ struct Relayed {
 impl Relay {
     fn send(&self, relayed: &mut Relayed, event: Event, at_ns: u64) {
         let record = Record { at_ns: at_ns.saturating_sub(self.began_ns), event };
-        // The functions of a cold build are some megabytes, and nothing reads them yet.
+        // The functions of a cold build are some megabytes: they are the build page's alone.
         if matches!(record.event, Event::Functions { .. }) {
+            lock(&self.watched).functions(self.number, record);
             return;
         }
         relayed.build.apply(&record);
@@ -1562,7 +1579,11 @@ impl Daemon {
             Request::Lint(ahead, _) => {
                 (self.home.join("checkers").join(ahead.config.id()), &ahead.root, "clippy")
             }
-            Request::Warm(_) | Request::Status | Request::Stop | Request::Watch { .. } => {
+            Request::Warm(_)
+            | Request::Status
+            | Request::Stop
+            | Request::Watch { .. }
+            | Request::Ui => {
                 return None;
             }
         };
@@ -1647,7 +1668,23 @@ impl Daemon {
             }
             Request::Stop => Reply::Stopping,
             Request::Watch { .. } => Reply::Watched(Vec::new()),
+            Request::Ui => Reply::Ui(self.ui()),
         }
+    }
+
+    /// Where the build page is, its server started the first time it is asked for.
+    fn ui(&self) -> Result<String, String> {
+        let mut ui = lock(&self.ui);
+        if let Some(url) = &*ui {
+            return Ok(url.clone());
+        }
+        let graphs = lock(&self.watched).graphs.clone();
+        let asked = self.asked.clone();
+        let asked = Arc::new(move || *lock(&asked) = Instant::now());
+        let served = blaze_web::serve(graphs, asked)
+            .map_err(|why| format!("the build page is not served: {why}"))?;
+        eprintln!("the build page is at {}", served.url);
+        Ok(ui.insert(served.url).clone())
     }
 
     fn sync(&self, checkout: &Checkout) -> Reply {

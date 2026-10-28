@@ -8,6 +8,15 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ## [Unreleased]
 
+### Added
+
+- `blaze ui` opens the build page: the daemon serves it on 127.0.0.1 under a random token,
+  starting it at the first `blaze ui` (`--no-open` prints the address alone). It draws every
+  function of the program and every call, lights up what a build compiles as it goes, and has
+  the crates, search, compile time, the build's steps and what an edit rebuilt. Its model is a
+  Flecs world of the workspace, its crates, modules and functions, which Flecs's REST answers
+  queries of, read only, under the same token (docs/web.md).
+
 ## [0.20261028.3] - 2026-10-28
 
 ### Added
