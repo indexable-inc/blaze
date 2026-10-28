@@ -571,6 +571,32 @@ sees the directories of the libraries of the loads before it started, so a works
 `/tmp` loaded later by the same daemon is not seen by it on Linux; doctests and the
 `blaze-build-script` crate's own runner (`harness/scripts.py` only) are not sandboxed.
 
+### Build scripts that only print are not compiled
+
+Many build scripts do nothing but print: `cargo::rustc-check-cfg=...`, a constant
+`cargo:rerun-if-changed=build.rs`, a `rustc-cfg` chosen by whether a variable is set. blaze
+reads such a script instead of compiling and running it, and prints what the run would have
+printed, byte for byte, for the environment the run would have been given (the sandbox's, so
+`CARGO_CFG_*`, `TARGET`, `PROFILE` and the rest as cargo sets them). Nothing runs, so there is
+nothing to sandbox; what it printed is checked as a run's is.
+
+Which scripts: no package is named. A script is read only when all of it is in a small
+grammar `blaze_build_script::inert` parses exactly (`fn main` and an optional `use std::env;`;
+`println!`, `print!`, `eprintln!` and `eprint!` of one literal; `let` of a variable's value or
+a literal; `if`/`else` on `env::var(..).is_ok()`, `var_os(..).is_some()`, `==`, `!=`,
+`.contains(..)`, `.is_empty()`, `!`, `&&` and `||`), and only when rustc, given what cargo
+would give it, could not have refused it: no `-D` or `-F` lint that is not capped (a
+dependency's are, with `--cap-lints allow`; a checkout package's `[lints]` are read as cargo
+does), no `-Z` flag, no `--extern std`. Anything else, a `mod`, an attribute, another macro,
+an `unwrap`, a raw identifier, is compiled and run as before. A script that is read stands as
+a short text file where its executable would be, with a dep-info naming its source, so an
+edit to it is seen as an edit to any script's source.
+
+`BLAZE_STATS=1` says for each script whether it was read and, if not, why
+(`blaze: the build script .../build.rs is compiled: ...`). `blaze-build-script inert SOURCE EDITION`
+says the same of one file, and `harness/scripts.py` checks every script it can read against a
+real run of it: the same output and an empty `OUT_DIR`.
+
 ### Build scripts under WASI (an experiment, off by default)
 
 A build script can instead be compiled for `wasm32-wasip1` and run under Wasmtime. Nothing
