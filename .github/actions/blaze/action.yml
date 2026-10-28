@@ -71,10 +71,14 @@ runs:
         path: ~/.blaze/toolchains
         key: ${{ steps.toolchain.outputs.cache-primary-key }}
     # The pinned LLVM: the archive the llvm workflow built for this host, checked against
-    # llvm.json's sha256 by llvm.py and unpacked, from the Actions cache by that pin. The
-    # directory is the same in every run, so the build scripts that read LLVM_SYS_231_PREFIX
-    # are given the same value and the store's runs of them are found. Nothing else is an LLVM
-    # for the build: crates/hir-ty-codegen/build.rs refuses any prefix that is not this one.
+    # llvm.json's sha256 by llvm.py and unpacked, from the Actions cache by that pin. Nothing
+    # else is an LLVM for the build: crates/hir-ty-codegen/build.rs refuses any prefix that is
+    # not this one. It is installed below /usr/local/lib, a system directory of libraries,
+    # because llvm-sys's build script names its `lib` to the linker and a build script in
+    # blaze's sandbox may name only its own directories, the system's and the Nix store
+    # (crates/blaze-cargo/src/cargo/directives.rs, SYSTEM). The directory is the same in every
+    # run, so the build scripts that read LLVM_SYS_231_PREFIX are given the same value and the
+    # store's runs of them are found.
     - name: LLVM (the pin)
       id: llvm
       if: inputs.llvm == 'true'
@@ -86,8 +90,10 @@ runs:
           macOS-ARM64) triple=aarch64-apple-darwin ;;
           *) echo "::error::crates/hir-ty-codegen/llvm.json has no LLVM for $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
         esac
+        sudo mkdir -p /usr/local/lib/blaze-llvm
+        sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
         echo "triple=$triple" >> "$GITHUB_OUTPUT"
-        echo "dir=$HOME/.cache/blaze-llvm/$triple" >> "$GITHUB_OUTPUT"
+        echo "dir=/usr/local/lib/blaze-llvm/$triple" >> "$GITHUB_OUTPUT"
     - id: llvm-cache
       if: inputs.llvm == 'true'
       uses: actions/cache/restore@v6
