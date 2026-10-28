@@ -2,7 +2,7 @@ name: pgo
 
 # Trains the profiles blaze is optimized with (PGO), each on the runner its release binary is
 # built on, and pins them: the files go to the `pgo-profiles` release under names that carry
-# their sha256, and a commit to main writes those names and hashes into pgo/profiles.json, which
+# their sha256, and a commit to main writes those names and hashes into tools/pgo/profiles.json, which
 # the release workflow and the flake build with (.github/scripts/build_release.py).
 #
 # It runs by itself when what the crates are changes (Cargo.lock, a manifest, the toolchain, the
@@ -10,17 +10,16 @@ name: pgo
 # a profile finds a function by its symbol, which carries a hash of the whole graph of crates,
 # so after such a change the old profile finds almost nothing. Run it by hand when a build says
 # that many functions changed since the profile was trained, and before a release after large
-# changes to the code. The release train runs it on each release commit it makes, and the pin
-# job then tags the release.
-# PGO is off for now: releases build with `--no-pgo` (release.yaml) and are tagged by release-cut
-# itself, so this runs by hand only. To turn it back on, restore the push trigger:
+# changes to the code. A release's version is not committed (Cargo.toml stays `0.0.0`, and the
+# release is told only to blaze-engine's build, by `BLAZE_RELEASE`), so a release does not make a
+# profile stale.
+# PGO is off for now: releases build with `--no-pgo` (release.yaml), so this runs by hand only. To turn it back on, restore the push trigger:
 #   push: { branches: [main], paths: [Cargo.lock, "**/Cargo.toml", harness/toolchain,
 #           .github/scripts/build_release.py, crates/hir-ty-codegen/llvm.json] }
 on:
   workflow_dispatch:
 
-# A push replaces the run of the push before it, never a run by hand: the release train's
-# dispatch on a release commit (train_release.py) must finish, or its tag never comes.
+# A push replaces the run of the push before it, never a run by hand.
 concurrency:
   group: pgo-${{ github.event_name }}
   cancel-in-progress: ${{ github.event_name == 'push' }}
@@ -71,12 +70,9 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
-      # To start release.yaml on a release's tag.
-      actions: write
     steps:
       - uses: actions/checkout@v7
         with:
-          # The tags and the release commits, which `train_release.py tag` looks for.
           fetch-depth: 0
           # The ruleset on main refuses a push from the workflow's own token: this one is allowed
           # past it (docs/harness.md, "CI").
@@ -91,24 +87,17 @@ jobs:
         run: |
           gh release view pgo-profiles --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 ||
             gh release create pgo-profiles --repo "$GITHUB_REPOSITORY" --prerelease --title "PGO profiles" \
-              --notes "The profiles blaze's builds are optimized with, one file per toolchain, target and content (pgo/profiles.json pins them by sha256). Not a release of blaze."
+              --notes "The profiles blaze's builds are optimized with, one file per toolchain, target and content (tools/pgo/profiles.json pins them by sha256). Not a release of blaze."
           gh release upload pgo-profiles --repo "$GITHUB_REPOSITORY" "$RUNNER_TEMP"/pgo/*/*.profdata --clobber
       - name: Pin
         run: |
           python3 .github/scripts/build_release.py --pin "$RUNNER_TEMP"/pgo/*
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pgo/profiles.json
+          git add tools/pgo/profiles.json
           git commit -m "pgo: profiles trained at ${GITHUB_SHA::10} [skip ci]"
           for attempt in 1 2 3 4 5; do
             git pull --rebase origin main && git push origin HEAD:main && exit 0
             sleep 15
           done
           exit 1
-      # A release the train made (`release: v0.YYYYMMDD.N` on main) waits for profiles of its own crates:
-      # these are they, so it is tagged here, on the commit that pins them, and release.yaml runs
-      # on the tag (.github/scripts/train_release.py).
-      - name: Tag a release that waits for these profiles
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 .github/scripts/train_release.py tag --push

@@ -452,6 +452,9 @@ impl<'db> Elaborator<'_, 'db> {
         on_unset: BasicBlockId,
         unwind: Unwind,
     ) -> BasicBlockId {
+        if on_set == on_unset {
+            return on_set;
+        }
         match self.style(path, false) {
             Style::Dead => on_unset,
             Style::Static => on_set,
@@ -737,25 +740,23 @@ impl<'db> Elaborator<'_, 'db> {
             }
         }
         if !otherwise {
-            // When every variant drops the same way, rustc reads no discriminant
-            // (`adt_switch_block`): a future would keep the enum for that read.
-            if let Some(&first) = blocks.first()
-                && blocks.iter().all(|&it| it == first)
-            {
-                return Ok(self.flag_test_block(path, first, succ, unwind));
-            }
             values.pop();
         } else if !otherwise_needs_drop {
             blocks.push(succ);
         } else {
             blocks.push(self.drop_block(place.clone(), succ, unwind));
         }
+        let last = *blocks.last().expect("an enum with a variant to drop");
+        // Include the otherwise target. Reading the discriminant when every edge leads
+        // to the same drop would keep a moved-out enum alive across a suspension point.
+        if blocks.iter().all(|&block| block == last) {
+            return Ok(self.flag_test_block(path, last, succ, unwind));
+        }
         let discr = self.new_temp(Ty::new_int(self.ctx.infcx.interner, rustc_type_ir::IntTy::I128));
         let read = Statement {
             kind: StatementKind::Assign(Place::from(discr).store(), Rvalue::Discriminant(place)),
             span: self.span,
         };
-        let last = *blocks.last().expect("an enum with a variant to drop");
         let switch = self.new_block(
             unwind,
             vec![read],
