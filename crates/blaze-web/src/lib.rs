@@ -181,18 +181,17 @@ impl State {
         if self.shown != Some(at) || self.followers.is_empty() {
             return;
         }
-        let message: Arc<[u8]> = if moved || applied == Applied::Anew {
-            match self.snapshot(at) {
-                Some(it) => it,
-                None => return,
-            }
-        } else {
-            match blaze_protocol::cbor::to_vec(record) {
-                Ok(item) => item.into(),
-                Err(_) => return,
-            }
-        };
-        self.followers.retain(|it| it.send(message.clone()));
+        let mut messages: Vec<Arc<[u8]>> = Vec::with_capacity(2);
+        if moved || applied == Applied::Anew {
+            let Some(snapshot) = self.snapshot(at) else { return };
+            messages.push(snapshot);
+        }
+        // The functions of a record that made the program anew are in its snapshot.
+        if applied != Applied::Anew {
+            let Ok(item) = blaze_protocol::cbor::to_vec(record) else { return };
+            messages.push(item.into());
+        }
+        self.followers.retain(|it| messages.iter().all(|message| it.send(message.clone())));
     }
 
     fn follow(&mut self) -> Following {

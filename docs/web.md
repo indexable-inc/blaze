@@ -76,13 +76,14 @@ messages from the server are binary:
 
 1. The first is the **snapshot** of the program of the workspace last built, in the layout
    below, gzipped (the page reads it with `DecompressionStream("gzip")`): anim's 80 000
-   functions are 37 MB of it, nearly all names, and 3 MB gzipped.
+   functions are 37 MB of it, nearly all names, and 4.3 MB gzipped.
 2. Then the records of that workspace's last build (without its `Functions`, which the snapshot
    has), and each record of every build from then on as it comes: one CBOR item of
    [`Record`](../crates/blaze-protocol/src/events.rs) per message, in the deterministic
    encoding of the socket, without the socket's length prefix.
-3. A build of another workspace, and the first record of a whole object, send a new snapshot
-   in place of the record (it is in the snapshot): the page starts over from it. A message is
+3. A build of another workspace sends a new snapshot before its `Began`, and the first record
+   of a whole object one in place of the record (its functions are in the snapshot): the page
+   starts over from it. A message is
    a snapshot when it begins with gzip's `1f 8b`, which no record does (a record is a CBOR
    map).
 

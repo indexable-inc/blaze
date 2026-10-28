@@ -268,7 +268,7 @@ fn a_page_is_sent_the_snapshot_then_each_record() {
     done();
     assert!(matches!(page.next(Duration::ZERO), Next::Nothing), "its functions are in the snapshot");
     // A record of the build is sent as it is; one of another workspace is not, until that
-    // one's build begins, which sends its program.
+    // one's build begins, which sends its program, then the Began.
     let said = Record { at_ns: 2, event: Event::Unlisted { count: 3 } };
     graphs.record(Path::new("/w"), 1, said.clone());
     assert_eq!(blaze_protocol::cbor::from_slice::<Record>(&message(page.next(wait))).unwrap(), said);
@@ -277,9 +277,13 @@ fn a_page_is_sent_the_snapshot_then_each_record() {
     assert!(matches!(page.next(Duration::ZERO), Next::Nothing));
     graphs.record(Path::new("/v"), 3, began(3, "/v"));
     assert!(read(&gunzip(message(page.next(wait)))).is_empty());
+    let began_v = blaze_protocol::cbor::from_slice::<Record>(&message(page.next(wait)));
+    assert_eq!(began_v.unwrap(), began(3, "/v"));
     // A whole object of the workspace shown sends the program anew, with the record in it.
     graphs.record(Path::new("/v"), 3, cold);
     assert_eq!(read(&gunzip(message(page.next(wait))))[0].0, "main");
+    done();
+    assert!(matches!(page.next(Duration::ZERO), Next::Nothing), "its functions are in the snapshot");
 }
 
 #[test]
