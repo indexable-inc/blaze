@@ -330,11 +330,14 @@ PROJECTS = {
         ),
         test=["-p", "fff-query-parser", "-p", "fff-grep", "-p", "fff-search"],
     ),
-    # A video rendering framework: its hello-world example's renderer, over FFmpeg (a prebuilt
-    # static one ffmpeg-sys-fframes downloads) and Skia. The run is one frame by the CPU
-    # backend. Its build scripts need nasm and libclang: measured only when named.
+    # A video rendering framework: its hello-world example's renderer, over FFmpeg and Skia,
+    # which its build scripts download (a prebuilt Skia; FFmpeg's source for the example's
+    # codecs, a prebuilt FFmpeg for the tests'): `fetches` locks them for both. The run is one
+    # frame by the CPU backend. Its build scripts need nasm and libclang: measured only when named.
     "fframes": dict(
         repo="dmtrKovalenko/fframes", tag="v1.3.0", rev="69174f0187b5d8e92329246898f70250b59f08f2", named=True,
+        fetches=[["-p", "hello-world-example"],
+                 ["--tests", "-p", "fframes", "-p", "fframes-media", "-p", "webvtt-parser", "-p", "fframes-media-dir-macro"]],
         build=["-p", "hello-world-example", "--bin", "hello_world_example_bin"],
         run=["--renderer", "cpu", "svg", "1s"],
         edits=dict(
@@ -738,6 +741,12 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
     SO_FAR[name, backend] = (phases, wrong, ours)
     build, run = spec.get("build", []), spec.get("run")
     subprocess.run(["cargo", "fetch"], cwd=ws, env=env, capture_output=True)
+    # What its build scripts download, for each feature set a build of it picks it by.
+    for selection in spec.get("fetches", []):
+        _, locked = ours.cargo("lock", "--fetches", *selection)
+        if locked.returncode != 0:
+            raise Failed(f"{name} {backend}: `blaze lock --fetches {' '.join(selection)}` failed:\n"
+                         f"{locked.stderr[-3000:]}")
 
     def others():
         """Every setup builds what plain cargo just built: its seconds by name."""
