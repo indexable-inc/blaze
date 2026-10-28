@@ -639,6 +639,8 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
     left_out = lambda at, names: [n for n in names if n in ("target", "target-ref", ".git")
                                   or ("prepare" in spec and n == "build" and os.path.samefile(at, source))]
     shutil.copytree(source, ws, symlinks=True, ignore=left_out)
+    # The checkout is copied whole; the workspace is its `dir` (codex's is codex-rs).
+    top, ws = ws, os.path.join(ws, spec["dir"]) if "dir" in spec else ws
     home = lambda label: os.path.join(work, f"home-{name}-{backend}-{label}")
     env = dict(blaze_cli.base_env(home(0)), **spec.get("env", {}), **prepared)
     env["PATH"] = os.path.dirname(blaze) + os.pathsep + env["PATH"]
@@ -799,12 +801,13 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
     # directory but the store the measured one filled: a second checkout, or a teammate's store.
     warm_store = []
     for turn in range(cold_runs):
-        other_ws = ws + "-b"
-        shutil.copytree(ws, other_ws, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref", "target-*"))
+        other_top = top + "-b"
+        shutil.copytree(top, other_top, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref", "target-*"))
+        other_ws = os.path.join(other_top, os.path.relpath(ws, top))
         second = Side(other_ws, dict(ours.env, BLAZE_HOME=home(f"{turn}b")), True)
         took_b, warm_b, _, used_b = cold_blaze(second, "store filled by another checkout", Daemon(second))
         second.cargo("stop")
-        shutil.rmtree(other_ws, ignore_errors=True)
+        shutil.rmtree(other_top, ignore_errors=True)
         shutil.rmtree(home(f"{turn}b"), ignore_errors=True)
         warm_store.append((took_b, warm_b, used_b))
         print(f"  warm store {turn + 1}/{cold_runs}  blaze {took_b:.2f}s + ready {warm_b:.2f}s  peak {used_b['peak_mb']} MB  "
