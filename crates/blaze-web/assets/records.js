@@ -87,6 +87,7 @@ const nodeState = (v, path) => enumOf(v, path, {
   Cached: { remote: bool }, Failed: { why: text }, Skipped: { because: u32 },
 });
 const cache = (v, path) => struct(v, path, { found: num, fetched: num, compiled: num, cold: option(text) });
+const slow = (v, path) => struct(v, path, { krate: text, name: text, ns: num });
 const took = (v, path) => struct(v, path, { step, of: option(text), took_ns: num });
 const summary = (v, path) => struct(v, path, {
   took_ns: num, crates: num, fns: fnsCount,
@@ -113,6 +114,8 @@ const EVENT = {
   Moved: { id: u32, state: nodeState },
   Critical: { path: array(u32) },
   Cores: { busy: u32, of: u32 },
+  Compiling: { functions: array(slow) },
+  Slowest: { functions: array(slow) },
   Functions: { object: u32, whole: bool, functions: array(fn) },
 };
 

@@ -111,6 +111,7 @@ test("records: every variant", () => {
     { Finished: { ok: true, summary: { took_ns: 5, crates: 1, fns: { total: 1, done: 1, kept: 0 }, rebuilt: [["anim::f", "Body"]], more: 0, error: null, cache: null, slowest: [{ step: "Codegen", of: "anim", took_ns: 5 }] } } },
     { Node: { id: 1, kind: "Codegen", name: "anim", deps: [0] } }, { Moved: { id: 1, state: { Cached: { remote: false } } } },
     { Moved: { id: 1, state: "Running" } }, { Critical: { path: [0, 1] } }, { Cores: { busy: 790, of: 8 } },
+    { Compiling: { functions: [{ krate: "anim", name: "anim::f", ns: 300000000 }] } }, { Slowest: { functions: [] } },
     { Functions: { object: 0, whole: true, functions: [{ id: 0, key: 2n ** 63n, krate: "anim", name: "anim::f", calls: [1], how: { Compiled: { ns: 7 } } }] } },
     "LoadWorkspace",
   ];
