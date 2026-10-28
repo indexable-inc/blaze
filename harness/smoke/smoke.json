@@ -1,6 +1,12 @@
 {
   "cases": {
     "hashmap": { "group": "std", "tests": 2 },
+    "ce_inflate": { "group": "std", "tests": 0 },
+    "ce_inflate_rt": { "group": "std", "tests": 0 },
+    "ce_toml": { "group": "std", "tests": 0 },
+    "ce_toml_rt": { "group": "std", "tests": 0 },
+    "ce_sha256": { "group": "std", "tests": 0 },
+    "ce_sha256_rt": { "group": "std", "tests": 0 },
     "threads": { "group": "std", "tests": 2 },
     "thread_local": { "group": "std", "tests": 2 },
     "statics": { "group": "std", "tests": 2 },
