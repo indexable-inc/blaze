@@ -37,6 +37,13 @@ pub(crate) struct Served {
     mode: Option<Mode>,
 }
 
+impl Served {
+    /// How many crates' def maps came from the store.
+    pub(crate) fn def_maps(&self) -> usize {
+        self.served[0].len()
+    }
+}
+
 /// The crates whose source is not all the toolchain's, registry's or checkout's: a file of
 /// each has a text of blaze's (`--run-tool`'s std), which its key has.
 static OVERLAID: Mutex<Vec<(Crate, &'static str)>> = Mutex::new(Vec::new());

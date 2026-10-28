@@ -510,7 +510,7 @@ fn overloaded_index() {
     check_number(
         r#"
     //- minicore: index
-    struct Foo;
+    struct Foo(i32, i32);
 
     impl core::ops::Index<usize> for Foo {
         type Output = i32;
@@ -526,15 +526,16 @@ fn overloaded_index() {
     impl core::ops::IndexMut<usize> for Foo {
         fn index_mut(&mut self, index: usize) -> &mut i32 {
             if index == 7 {
-                &mut 7
+                &mut self.0
             } else {
-                &mut 10
+                &mut self.1
             }
         }
     }
 
     const GOAL: i32 = {
-        (Foo[2]) + (Foo[7]) + (*&Foo[2]) + (*&Foo[7]) + (*&mut Foo[2]) + (*&mut Foo[7])
+        (Foo(7, 10)[2]) + (Foo(7, 10)[7]) + (*&Foo(7, 10)[2]) + (*&Foo(7, 10)[7])
+            + (*&mut Foo(7, 10)[2]) + (*&mut Foo(7, 10)[7])
     };
     "#,
         3417,

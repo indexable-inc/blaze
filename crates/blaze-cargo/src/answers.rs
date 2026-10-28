@@ -338,9 +338,9 @@ mod tests {
         let spec: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(spec["arch"], "wasm32");
         assert!(spec["data-layout"].as_str().is_some_and(|it| it.starts_with("e-m:e-p:32:32")));
-        // x86_64-unknown-linux-gnu's spec is that host's own (self-contained lld), so a host
-        // that was not recorded has no answer to it.
-        assert!(spec_of("aarch64-unknown-linux-gnu", Some("13.0")).is_ok());
+        // The -linux-gnu specs are each host's own (a Linux rustc links with its lld), so a host
+        // that was not recorded has no answer to them.
+        assert!(spec_of("aarch64-unknown-linux-musl", Some("13.0")).is_ok());
         // An Apple target's spec names no deployment target: it is the same under one.
         let apple = spec_of("aarch64-apple-darwin", None).expect("an answer");
         let under = spec_of("aarch64-apple-darwin", Some("13.0")).expect("an answer");

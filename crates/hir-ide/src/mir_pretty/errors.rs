@@ -202,6 +202,7 @@ impl MirEvalError<'_> {
             | MirEvalError::NotSupported(_)
             | MirEvalError::InvalidConst
             | MirEvalError::StackOverflow
+            | MirEvalError::HeapInValue { .. }
             | MirEvalError::CoerceUnsizedError(_)
             | MirEvalError::InternalError(_)
             | MirEvalError::InvalidVTableId(_) => writeln!(f, "{err:?}")?,

@@ -1,11 +1,12 @@
-# blaze to build and test blaze with (AGENTS.md rule blaze-builds-blaze): the newest release,
-# installed by install.sh into ~/.cargo/bin, and blaze's store, the one cache, pulled from the
-# shared remote (.github/actions/blaze-remote) that main's runs push to after their tests. The
+# blaze to build and test blaze with (AGENTS.md rule blaze-builds-blaze): the release
+# .github/blaze-version names, installed by install.sh into ~/.cargo/bin, and blaze's store, the
+# one cache, pulled from the shared remote (.github/actions/blaze-remote) that main's runs push
+# to after their tests. The
 # remote's project is the job's, the platform's and the release's: what one release of blaze
 # compiled is no use to the next, and a project's manifest only grows, so each release starts
 # one of its own.
 name: blaze
-description: the newest release of blaze, and the store main's runs pushed
+description: the release of blaze .github/blaze-version names, and the store main's runs pushed
 inputs:
   job:
     description: the job whose store this is (build, tests)
@@ -17,15 +18,17 @@ outputs:
 runs:
   using: composite
   steps:
-    # The canary channel, the newest release: blaze's own tree takes each release first, before
-    # it is promoted to stable for everyone else.
-    - name: blaze (the newest release)
+    # The release .github/blaze-version names, not the newest canary: a store is of one release,
+    # and canaries come every 40 minutes, sooner than a cold run (about an hour) ends and pushes,
+    # so with the newest every run would be cold. A pull request that changes the file moves
+    # the gate to that release; it and main's next run are cold once.
+    - name: blaze (the release .github/blaze-version names)
       id: install
       shell: bash
       env:
         JOB: ${{ inputs.job }}
       run: |
-        sh install.sh --channel canary --no-toolchain --verbose
+        sh install.sh --version "$(cat .github/blaze-version)" --no-toolchain --verbose
         said=$(blaze-engine --version)
         version=$(echo "$said" | awk '$1 == "blaze" { print $2 }')
         [ -n "$version" ] || { echo "::error::blaze-engine --version said no version: $said"; exit 1; }

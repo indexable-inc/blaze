@@ -1,5 +1,5 @@
 use blaze_protocol::events::{
-    Cache, Cause, CrateState, Event, Fns, NodeKind, NodeState, Record, Step, Summary,
+    Cache, Cause, CrateState, Event, Fns, NodeKind, NodeState, Record, Slow, Step, Summary,
 };
 
 use crate::{Live, Plain, summary_line, took};
@@ -19,7 +19,7 @@ fn anim(state: CrateState, done: u64, kept: u64) -> Event {
 /// compiling.
 fn cold() -> Vec<Record> {
     vec![
-        at(0, Event::Began { build: 1, command: "blaze run".into(), root: "/w/anim".into() }),
+        at(0, Event::Began { build: 1, command: "run".into(), root: "/w/anim".into() }),
         at(0, Event::Started { step: Step::LoadWorkspace, of: None }),
         at(38_300 * MS, Event::Ended { step: Step::LoadWorkspace, of: None }),
         at(38_300 * MS, Event::Started { step: Step::Resolve, of: None }),
@@ -107,11 +107,9 @@ fn a_cold_build_off_a_terminal_is_a_line_per_step() {
         "      Loaded workspace in 38.3s",
         "   Resolving names",
         "    Resolved names in 3.20s",
-        "   Compiling functions",
         "   Compiling anim",
-        "   Compiling functions (18.5s)",
+        "   Compiling functions",
         "    Compiled anim: 5351 fns compiled, 2 kept in 33.3s",
-        "     Linking anim",
         "    Compiled 5351 fns in 1 crate, 2 kept; 1m14s",
     ];
     assert_eq!(out, expected.map(|it| format!("{it}\n")).concat());
@@ -123,8 +121,20 @@ fn an_edit_says_what_it_rebuilt_and_why() {
     let out: String = edit().iter().map(|it| plain.record(it)).collect();
     assert_eq!(
         out,
-        "   Compiling functions\n   Compiling anim\n     Rebuilt 3 fns: render (body edited), draw, \
-         tick (calls render); 0.21s\n"
+        "   Compiling anim\n     Rebuilt 3 fns: render (body edited), draw, tick (calls render); \
+         0.21s\n"
+    );
+    // `blaze status` of it: the steps it did and its last line, as the live view ends.
+    let mut live = Live::new(100, false);
+    for record in edit() {
+        live.record(&record, record.at_ns);
+    }
+    assert_eq!(
+        live.snapshot(live.build().last_ns),
+        [
+            "\u{2713} codegen 0.18s",
+            "     Rebuilt 3 fns: render (body edited), draw, tick (calls render); 0.21s",
+        ]
     );
     let finished = plain.build().finished.clone().unwrap();
     assert!(summary_line(&finished, true).contains("\x1b["));
@@ -203,6 +213,8 @@ fn the_live_region_is_redrawn_in_place_and_cleared() {
     assert_eq!(
         region,
         [
+            format!("blaze run{:45}1m00s", "").as_str(),
+            "\u{2713} workspace 38.3s  \u{2713} names 3.20s  \u{25cf} codegen 18.5s",
             "   Compiling functions 18.5s \u{b7} 0/1 crates \u{b7} 1200/5353 fns",
             "            \u{2514}\u{2500} anim  1200/5353 fns  18.5s",
         ]
@@ -270,12 +282,13 @@ fn the_region_is_a_tree_of_the_crates_under_way() {
     assert_eq!(
         region,
         [
+            format!("blaze run{:105}3.00s", "").as_str(),
+            "\u{25cf} names 2/5 crates 3.00s",
             "   Resolving names 3.00s \u{b7} 2/5 crates \u{b7} longest winit",
             "             anim waiting",
             "             \u{251c}\u{2500} winit  resolving  1.50s",
             "             \u{2514}\u{2500} wgpu  resolving  1.50s",
-            "             0 done \u{b7} 2 under way \u{b7} 3 waiting \u{b7} longest chain 2.90s: anim \u{2190} \
-             wgpu \u{2190} libc \u{2190} std",
+            "             0 done \u{b7} 2 under way \u{b7} 3 waiting",
         ]
     );
 }
@@ -303,6 +316,8 @@ fn a_build_script_is_a_node_of_its_own() {
     assert_eq!(
         region,
         [
+            format!("blaze build{:103}2.00s", "").as_str(),
+            "\u{25cf} build scripts 2.00s",
             "    Building build scripts and proc macros 2.00s",
             "             anyhow build script  compiling  1.90s",
             "             1 done (1 up to date) \u{b7} 1 under way \u{b7} 0 waiting",
@@ -334,14 +349,26 @@ fn a_long_build_says_why_it_took_as_long_as_it_did() {
     ));
     build.apply(&at(17 * S, crate_is("anim", CrateState::Built, 77917)));
     let summary = build.summary(117_400 * MS, None);
-    let finished = crate::Finished { ok: true, summary, at_ns: 117_400 * MS };
+    let (chain, chain_ns, unnamed, cores) = (Vec::new(), 0, None, Vec::new());
+    let finished = crate::Finished {
+        ok: true,
+        summary,
+        at_ns: 117_400 * MS,
+        chain,
+        chain_ns,
+        unnamed,
+        cores,
+        cores_of: 0,
+        slowest: Vec::new(),
+    };
     let lines = crate::last_lines(&finished, false, true);
     assert_eq!(
         lines,
         [
             "    Compiled 77917 fns in 1 crate, 0 kept; 1m57s",
-            "        Took 1m57s: checking 14 files 1m40s, loading workspace 10.7s, compiling anim 4.20s",
+            "        Took 1m57s: check 14 files 1m40s, workspace 10.7s, codegen anim 4.20s",
             "       Cache cold: cache keys changed since blaze 0.20261027.0 (fb82b09)",
+            "             `blaze why` says more",
         ]
     );
     // A quick build says nothing more than it did.
@@ -350,16 +377,130 @@ fn a_long_build_says_why_it_took_as_long_as_it_did() {
     assert_eq!(crate::last_lines(&quick, false, true).len(), 1);
 }
 
-/// The lines that stay are those before the region: the region is its header, the crates
-/// under way and the count of those done. A test of the renderer's own text, with no color.
+/// A build that ends says what held it up, as its graph says it, and time that went by with
+/// no step named, which is a step that is missing.
+#[test]
+fn a_long_build_says_what_held_it_up_and_time_no_step_named() {
+    let mut live = Live::new(120, false);
+    let records = graphed().into_iter().chain([
+        at(2 * S, crate_is("winit", CrateState::Resolved, 0)),
+        at(2 * S, crate_is("wgpu", CrateState::Resolved, 0)),
+        at(2 * S, Event::Ended { step: Step::Resolve, of: None }),
+        at(3500 * MS, Event::Started { step: Step::Link, of: None }),
+        at(4 * S, Event::Ended { step: Step::Link, of: None }),
+        at(4 * S, Event::Critical { path: vec![10, 11, 13] }),
+        at(4 * S, Event::Finished { ok: true, summary: Summary::default() }),
+    ]);
+    let drawn: String = records.map(|it| live.record(&it, it.at_ns)).collect();
+    let end: Vec<&str> = drawn.split("\x1b[J").last().unwrap().lines().collect();
+    assert_eq!(
+        end[1..],
+        [
+            "       Chain std \u{2192} libc \u{2192} wgpu 1.90s",
+            "warning: 1.50s with no step named, after names",
+            "             `blaze why` says more",
+        ]
+    );
+    // `blaze why` lists every step, and the time at no step between them.
+    assert_eq!(
+        live.build().why_steps(4 * S),
+        ["names 2/5 crates   2.00s", "at no step         1.50s", "link               0.50s"]
+    );
+}
+
+/// How busy the worker's cores were shows as it goes, the last ten seconds a block each half
+/// second, and the end says how many cores each slow step kept busy: a step on one core of
+/// eight is why a build is slow.
+#[test]
+fn the_cores_kept_busy_show_as_it_goes_and_at_the_end() {
+    let took = crate::Took { step: Step::Std, of: None, took_ns: 4 * S };
+    let summary = Summary { took_ns: 4 * S, slowest: vec![took], ..Summary::default() };
+    let records = [
+        at(0, Event::Began { build: 1, command: "build".into(), root: "/w/rg".into() }),
+        at(0, Event::Started { step: Step::Std, of: None }),
+        at(500 * MS, Event::Cores { busy: 100, of: 8 }),
+        at(3 * S, Event::Cores { busy: 790, of: 8 }),
+    ];
+    let mut live = Live::new(120, false);
+    for record in &records {
+        live.record(record, record.at_ns);
+    }
+    let drawn = live.tick(4 * S);
+    let region: Vec<&str> = drawn.split("\x1b[J").last().unwrap().lines().collect();
+    let spark = format!(
+        "cores {:12}\u{2582}\u{2582}\u{2582}\u{2582}\u{2582}\u{2588}\u{2588}\u{2588} 7.9/8 busy",
+        ""
+    );
+    assert_eq!(region[2], spark);
+    let end = [
+        at(4 * S, Event::Ended { step: Step::Std, of: None }),
+        at(4 * S, Event::Finished { ok: true, summary }),
+    ];
+    let drawn: String = end.iter().map(|it| live.record(it, it.at_ns)).collect();
+    assert!(drawn.contains("Took 4.00s: std 4.00s (2.7/8 cores)"), "{drawn:?}");
+    assert_eq!(live.build().why_steps(4 * S), ["std   4.00s  2.7/8 cores"]);
+}
+
+/// Under each crate under way, the functions of it compiling longest so far, each over a
+/// moment; at the end the slowest five.
+#[test]
+fn the_functions_slow_to_compile_show_under_their_crate_and_at_the_end() {
+    let slow = |name: &str, ns| Slow { krate: "wgpu".into(), name: name.into(), ns };
+    let compiling = Event::Compiling {
+        functions: vec![slow("wgpu::Device::new", 300 * MS), slow("wgpu::Queue::submit", 100 * MS)],
+    };
+    let mut live = Live::new(120, false);
+    for record in graphed().into_iter().chain([at(2 * S, compiling)]) {
+        live.record(&record, record.at_ns);
+    }
+    let drawn = live.tick(3 * S);
+    let region: Vec<&str> = drawn.split("\x1b[J").last().unwrap().lines().collect();
+    assert_eq!(
+        region[4..],
+        [
+            "             \u{251c}\u{2500} winit  resolving  1.50s",
+            "             \u{2514}\u{2500} wgpu  resolving  1.50s",
+            format!("{:18}wgpu::Device::new 1.30s", "").as_str(),
+            format!("{:18}wgpu::Queue::submit 1.10s", "").as_str(),
+            "             0 done \u{b7} 2 under way \u{b7} 3 waiting",
+        ]
+    );
+    let slowest =
+        vec![slow("wgpu::Device::new", 1400 * MS), slow("wgpu::Queue::submit", 1100 * MS)];
+    let end = [
+        at(3 * S, Event::Ended { step: Step::Resolve, of: None }),
+        at(3 * S, Event::Slowest { functions: slowest }),
+        at(3 * S, Event::Finished { ok: true, summary: Summary::default() }),
+    ];
+    let drawn: String = end.iter().map(|it| live.record(it, it.at_ns)).collect();
+    let said = "     Slowest fns: wgpu::Device::new 1.40s, wgpu::Queue::submit 1.10s";
+    assert!(drawn.contains(said), "{drawn:?}"); // A name too long keeps its end, which says which function it is.
+    let name = "<regex_syntax::unicode::SimpleCaseFolder>::new";
+    assert_eq!(crate::tail(name, 24), "\u{2026}:SimpleCaseFolder>::new");
+}
+
+/// The functions done of a crate whose total is not known yet count in no `done/total`, which
+/// would read more done than there are.
+#[test]
+fn functions_with_a_total_unknown_are_a_count() {
+    let mut live = Live::new(120, false);
+    for record in [
+        at(0, Event::Started { step: Step::Codegen, of: None }),
+        at(0, anim(CrateState::Running, 1200, 0)),
+        at(0, crate_is("std", CrateState::Running, 6275)),
+    ] {
+        live.record(&record, record.at_ns);
+    }
+    let drawn = live.tick(S);
+    assert!(drawn.contains(" \u{b7} 7475 fns"), "{drawn}");
+    assert!(!drawn.contains("/5353 fns\n"), "{drawn}");
+}
+
+/// The lines that stay are those before the region: the region is its header, the steps,
+/// the crates under way and the count of those done. A test of the renderer's own text, with
+/// no color.
 fn region_len(lines: &[&str]) -> usize {
-    let header = lines.iter().rposition(|it| {
-        it.starts_with("   Compiling functions")
-            || it.starts_with("     Loading workspace ")
-            || it.starts_with("   Resolving names ")
-            || it.starts_with("     Linking anim ")
-            || it.starts_with("     Waiting ")
-    });
+    let header = lines.iter().rposition(|it| it.starts_with("blaze "));
     header.map_or(0, |at| lines.len() - at)
 }
 

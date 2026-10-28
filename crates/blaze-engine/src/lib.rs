@@ -19,6 +19,7 @@ mod content;
 mod doc;
 mod doctest;
 mod events;
+mod fns;
 mod frozen;
 mod inputs;
 mod link;
@@ -7743,10 +7744,7 @@ pub fn main() -> anyhow::Result<()> {
             println!("{}", version());
             return Ok(());
         }
-        Some("cache") => {
-            end_with_reader();
-            return remote::command(std::env::args().skip(2));
-        }
+        Some("cache") => return remote::command(std::env::args().skip(2)),
         Some("std") => return shipped::command(std::env::args().skip(2)),
         Some("version-fetch") => return versions::command(std::env::args().skip(2)),
         Some("version-resolve") => return versions::resolve_command(std::env::args().skip(2)),
@@ -8597,6 +8595,13 @@ fn run_holding(
     {
         blaze_store::compiles_against(&toolchain);
     }
+    // A build with nothing of rustc's starts from the standard library, which a release ships:
+    // fetched while the workspace loads, it is in before the names are resolved, and the
+    // standard library of the build scripts the load builds is made of it.
+    let nothing_of_rustc = !ahead && args.symbol_files.is_empty();
+    if nothing_of_rustc && args.prebuilt.is_none() && !patches_its_library(&args) {
+        shipped::fetch_ahead(emits.triple(), &args.project)?;
+    }
 
     // What other machines compiled is fetched beside the build, which never waits for it: the
     // store reads what arrived once it is in, and the build finds it from then on.
@@ -8617,8 +8622,11 @@ fn run_holding(
 
     if let Some(socket) = &args.socket {
         events::said_beside(socket);
+        fns::said();
     }
     events::at(events::Step::LoadWorkspace, None);
+    events::cache_ahead();
+    events::flights();
     let start = Instant::now();
     let selection = args.selection.clone();
     blaze_store::identify_ahead();
@@ -8672,11 +8680,6 @@ fn run_holding(
             std::thread::spawn(blaze_store::check_packs);
         }
         None => eprintln!("store: the toolchain of the library cannot be told from another"),
-    }
-    // A build with nothing of rustc's starts from the standard library, which a release ships.
-    let nothing_of_rustc = library.is_none() && args.symbol_files.is_empty();
-    if nothing_of_rustc && args.prebuilt.is_none() && !patches_its_library(&args) {
-        shipped::fetch_ahead(emits.triple(), &args.project)?;
     }
     let following_at = start.elapsed();
     let built = follow_cargo(&mut db, &mut vfs, &mut checkouts, &args, &listed)?;
@@ -8905,6 +8908,7 @@ fn run_holding(
                 cold
             }
             None => {
+                fns::building();
                 let _compiling = events::compiling(&shown_crate(&db, &args));
                 let mut cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
                 // An `include!` in a body is first seen when the body is compiled.
@@ -10799,6 +10803,8 @@ impl Program {
         }
         let &Edit { start, age, settled, read, apply, changed } = edit;
         let named = shown_crate(db, args);
+        events::flights();
+        fns::building();
         let compiling = events::compiling(&named);
         listed.building(args.crates().filter_map(|it| crates_named(db, it, args).ok()).flatten());
         // Another checkout's files are not this program's to be refused for.

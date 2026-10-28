@@ -215,7 +215,7 @@ fn a_message_is_these_bytes() {
 /// A build's record is pinned the same way.
 #[test]
 fn an_event_is_these_bytes() {
-    use crate::events::{Cause, CrateState, Event, Fns, NodeKind, Record, Step};
+    use crate::events::{Cause, CrateState, Event, Fns, NodeKind, Record, Slow, Step};
     let records = [
         Record { at_ns: 0, event: Event::Started { step: Step::LoadWorkspace, of: None } },
         Record {
@@ -247,6 +247,17 @@ fn an_event_is_these_bytes() {
             at_ns: 0,
             event: Event::Node { id: 1, kind: NodeKind::Std, name: "std".into(), deps: vec![0] },
         },
+        Record { at_ns: 0, event: Event::Cores { busy: 790, of: 8 } },
+        Record {
+            at_ns: 0,
+            event: Event::Compiling {
+                functions: vec![Slow {
+                    krate: "rg".into(),
+                    name: "rg::main".into(),
+                    ns: 300_000_000,
+                }],
+            },
+        },
     ];
     let hexes: Vec<String> = records.iter().map(|it| hex(&to_vec(it).unwrap())).collect();
     let expected = [
@@ -269,6 +280,12 @@ fn an_event_is_these_bytes() {
         // {"at_ns": 0, "event": {"Node": {"id": 1, "deps": [0], "kind": "Std", "name": "std"}}}
         "a2 6561745f6e73 00 656576656e74 a1 644e6f6465 a4 626964 01 6464657073 81 00 \
          646b696e64 63537464 646e616d65 63737464",
+        // {"at_ns": 0, "event": {"Cores": {"of": 8, "busy": 790}}}
+        "a2 6561745f6e73 00 656576656e74 a1 65436f726573 a2 626f66 08 6462757379 190316",
+        // {"at_ns": 0, "event": {"Compiling": {"functions": [{"ns": 300000000,
+        // "name": "rg::main", "krate": "rg"}]}}}
+        "a2 6561745f6e73 00 656576656e74 a1 69436f6d70696c696e67 a1 6966756e6374696f6e73 81 \
+         a3 626e73 1a11e1a300 646e616d65 6872673a3a6d61696e 656b72617465 627267",
     ];
     for ((hexed, expected), record) in hexes.iter().zip(expected).zip(&records) {
         assert_eq!(hexed, &expected.replace(' ', ""), "{record:?}");
@@ -433,4 +450,28 @@ fn frames_carry_one_item_each() {
     write_frame(&mut sent, &unhex("1817")).unwrap();
     let refused = receive::<u8>(&mut sent.as_slice()).unwrap_err();
     assert!(refused.to_string().contains("more bytes than it needs"), "{refused}");
+}
+
+/// A record of the functions a build put in its program takes their names and some 100 bytes
+/// more for each (the names of the fields among them): a cold build of anim says some 80 000.
+#[test]
+fn a_record_of_functions_is_small() {
+    use crate::events::{Event, Function, How, Record};
+    let fns: Vec<Function> = (0..1000u32)
+        .map(|id| Function {
+            id,
+            key: u64::from(id).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+            krate: "anim".into(),
+            name: format!("anim::scene::render_{id}"),
+            calls: vec![id + 1, id + 2, id / 2],
+            how: if id % 3 == 0 { How::Unchanged } else { How::Compiled { ns: 125_000 } },
+        })
+        .collect();
+    let names: usize = fns.iter().map(|it| it.name.len()).sum();
+    let record =
+        Record { at_ns: 1, event: Event::Functions { object: 2, whole: true, functions: fns } };
+    let bytes = to_vec(&record).unwrap();
+    check(&bytes).unwrap();
+    assert_eq!(from_slice::<Record>(&bytes).unwrap(), record);
+    assert!(bytes.len() < names + 1000 * 128, "{} bytes for {names} of names", bytes.len());
 }

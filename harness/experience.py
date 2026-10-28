@@ -478,6 +478,9 @@ def flow(name, spec, work, env):
         for line in (s.out + s.err).splitlines():
             if DEAD_NAMES.search(line):
                 rough.append((s.name, f"says a name blaze no longer has: {line.strip()}", "P2"))
+            # crates/blaze-ui says it at the end when the build spent UNNAMED_NS or more at no step.
+            if "with no step named" in line:
+                rough.append((s.name, f"a second or more of it is at no step: {line.strip()}", "P1"))
     for ours, theirs in pairs:
         compiled = lambda step: sorted(l.split()[1] for l in step.err.splitlines() if l.strip().startswith("Compiling "))
         if compiled(ours) and not compiled(theirs) and ours.code == 0:

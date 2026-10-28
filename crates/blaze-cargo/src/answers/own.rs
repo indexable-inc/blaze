@@ -70,8 +70,8 @@ impl Target {
     }
 
     /// The spec rustc on `host` prints: its own, or on a host not recorded (Windows) the one
-    /// every recorded host prints. A spec the hosts differ on (x86-64 Linux's, whose own rustc
-    /// links with its lld) is the build's, so not known for another host.
+    /// every recorded host prints. A spec the hosts differ on (the -linux-gnu ones, whose own
+    /// rustc links with its lld) is the build's, so not known for another host.
     fn spec_on(&self, host: &str) -> Option<&str> {
         if let Some(spec) = self.target_spec_json.get(host) {
             return Some(spec);

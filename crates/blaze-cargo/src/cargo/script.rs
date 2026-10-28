@@ -308,15 +308,8 @@ pub fn run_as_cargo_does(
         if let (Some(((store, shared), here)), Some(made), Some(mut reads)) = (keys, made, reads) {
             reads.extend(watched(&output.stdout, &cwd));
             let reads = kept_reads(reads, &real, &cwd, sysroot_of());
-            let unplaced: Option<Vec<String>> = reads
-                .iter()
-                .map(|it| String::from_utf8(places.unplace(it.as_bytes())).ok())
-                .collect();
             store.settled();
-            match made
-                .unplaced(&places)
-                .zip(unplaced.filter(|it| !it.iter().any(|it| places.marked(it.as_bytes()))))
-            {
+            match made.unplaced(&places).zip(places.unplaced_reads(&reads)) {
                 Some((made, reads)) => {
                     keyed::keep(store, &shared, &reads, &placed_now, &made.bytes())
                 }
@@ -519,10 +512,11 @@ pub fn sysroot_of() -> Option<PathBuf> {
 }
 
 /// What of `reads`, the files a run of the script `real` in `cwd` read, its kept run is kept
-/// by. A file of the script's build, the toolchain (`sysroot`) or blaze is left out: the first key has
-/// the script and the toolchain, and the store keeps nothing across builds of blaze. A
-/// directory outside the package counts only as one: a program reaches those on its way to
-/// others (git, the loader, a search on PATH).
+/// by. A file of the script's build, the toolchain (`sysroot`), blaze or its store is left out:
+/// the first key has the script and the toolchain, the store keeps nothing across builds of
+/// blaze, and what blaze as the script's rustc reads of the store (the standard library's
+/// names) is what it would make without it. A directory outside the package counts only as
+/// one: a program reaches those on its way to others (git, the loader, a search on PATH).
 fn kept_reads(
     reads: Vec<String>,
     real: &Path,
@@ -531,7 +525,8 @@ fn kept_reads(
 ) -> Vec<String> {
     let blaze = std::env::current_exe().ok().and_then(|it| Some(it.parent()?.to_owned()));
     let script = real.parent().map(Path::to_owned);
-    let apart: Vec<PathBuf> = [sysroot, blaze, script].into_iter().flatten().collect();
+    let store = super::daemon::store();
+    let apart: Vec<PathBuf> = [sysroot, blaze, script, store].into_iter().flatten().collect();
     reads
         .into_iter()
         .filter(|it| !apart.iter().any(|dir| Path::new(it).starts_with(dir)))
@@ -588,6 +583,19 @@ impl Places {
             bytes = replaced(&bytes, mark, place);
         }
         bytes
+    }
+
+    /// `reads`, a run's read set, with what stands for each place in place of it, for a run in
+    /// any checkout or target directory to be found by. `None` when a path holds what stands
+    /// for a place already, and so could not be told from one in the place.
+    fn unplaced_reads(&self, reads: &[String]) -> Option<Vec<String>> {
+        reads
+            .iter()
+            .map(|it| match self.marked(it.as_bytes()) {
+                true => None,
+                false => String::from_utf8(self.unplace(it.as_bytes())).ok(),
+            })
+            .collect()
     }
 
     /// Whether `bytes` name a place.
@@ -1214,6 +1222,15 @@ mod tests {
             key(&other_package, &other_env, Some(&other_places))
         );
         assert_ne!(key(&package, &env, None), key(&other_package, &other_env, None));
+        let read = |package: &Path, out: &Path| {
+            let reads = [package.join("read.txt"), out.join("x.rs"), PathBuf::from("/etc/hosts")];
+            reads.map(|it| it.to_str().unwrap().to_owned()).to_vec()
+        };
+        let reads = places.unplaced_reads(&read(&package, &out));
+        assert!(reads.is_some(), "a run that read its package's files is kept for every checkout");
+        assert_eq!(reads, other_places.unplaced_reads(&read(&other_package, &other_out)));
+        let marked = String::from_utf8(places.unplace(package.as_os_str().as_encoded_bytes()));
+        assert_eq!(places.unplaced_reads(&[marked.unwrap()]), None);
         let named = |out: &Path, package: &Path| Kept {
             stdout: format!(
                 "cargo:rustc-link-search=native={}\ncargo:rerun-if-changed={}\n",

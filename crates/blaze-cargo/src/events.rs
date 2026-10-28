@@ -48,8 +48,11 @@ static AT: Mutex<Option<(Step, Option<String>)>> = Mutex::new(None);
 /// with the one before.
 pub fn at(step: Step, of: Option<&str>) {
     let of = of.map(str::to_owned);
-    if let Some((step, of)) = crate::lock(&AT).replace((step, of.clone())) {
-        say(Event::Ended { step, of });
+    match crate::lock(&AT).replace((step, of.clone())) {
+        Some((step, of)) => say(Event::Ended { step, of }),
+        // At a step from waiting: how busy the process is is said from now on.
+        None if heard() => ticker().unpark(),
+        None => {}
     }
     say(Event::Started { step, of });
 }
@@ -125,11 +128,111 @@ impl Counted {
     }
 }
 
+/// How often the process says how busy it is while it is at a step ([`Event::Cores`]).
+const CORES_EVERY: Duration = Duration::from_millis(250);
+
+/// When the process's CPU time was read last, that time, and the hundredths of a core said
+/// last; none while it waits, so that what it says is of the step alone.
+static CPU: Mutex<Option<(std::time::Instant, Duration, Option<u32>)>> = Mutex::new(None);
+
+/// The CPU time the process has had, with its children's: those it waited for, and on Linux
+/// those still running and theirs (a build script, the standard library of build scripts),
+/// so that a child exiting moves its time from one to the other.
+fn cpu_time() -> Option<Duration> {
+    #[cfg(unix)]
+    {
+        let used = |who| {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+            // SAFETY: getrusage fills in the struct it is handed, and says if it did not.
+            if unsafe { libc::getrusage(who, usage.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            // SAFETY: it was filled in, and was all zeros before.
+            let usage = unsafe { usage.assume_init() };
+            let time = |it: libc::timeval| {
+                let micros = Duration::from_micros(u64::try_from(it.tv_usec).unwrap_or(0));
+                Duration::from_secs(u64::try_from(it.tv_sec).unwrap_or(0)) + micros
+            };
+            Some(time(usage.ru_utime) + time(usage.ru_stime))
+        };
+        let running = running_children_time().unwrap_or_default();
+        Some(used(libc::RUSAGE_SELF)? + used(libc::RUSAGE_CHILDREN)? + running)
+    }
+    #[cfg(not(unix))]
+    None
+}
+
+/// The CPU time of the process's children still running, and of every process under them,
+/// from `/proc`. None where the system says nothing of it.
+#[cfg(target_os = "linux")]
+fn running_children_time() -> Option<Duration> {
+    // SAFETY: sysconf reads a constant of the system.
+    let ticks =
+        u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok().filter(|it| *it > 0)?;
+    let children_of = |pid: &str| -> Vec<String> {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else { return Vec::new() };
+        let tasks = tasks
+            .flatten()
+            .filter_map(|task| std::fs::read_to_string(task.path().join("children")).ok());
+        tasks.flat_map(|it| it.split_whitespace().map(str::to_owned).collect::<Vec<_>>()).collect()
+    };
+    let mut spent = 0;
+    let mut under = children_of("self");
+    while let Some(pid) = under.pop() {
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            // utime, stime, cutime and cstime: the 14th to the 17th fields, the 12th to the
+            // 15th after the name in parentheses (proc_pid_stat(5)).
+            let fields = stat.rsplit_once(')').map_or("", |it| it.1);
+            let times = fields.split_whitespace().skip(11).take(4);
+            spent += times.filter_map(|it| it.parse::<u64>().ok()).sum::<u64>();
+        }
+        under.extend(children_of(&pid));
+    }
+    Some(
+        Duration::from_secs(spent / ticks)
+            + Duration::from_nanos(spent % ticks * 1_000_000_000 / ticks),
+    )
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn running_children_time() -> Option<Duration> {
+    None
+}
+
+/// Says how busy the process was since it last read its CPU time, once [`CORES_EVERY`] went
+/// by and when that moved by a tenth of a core: the first read only starts the count.
+fn cores() {
+    static OF: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let Some(cpu) = cpu_time() else { return };
+    let now = std::time::Instant::now();
+    let mut last = crate::lock(&CPU);
+    let said = match *last {
+        Some((at, _, _)) if now - at < CORES_EVERY => return,
+        Some((at, before, said)) => {
+            let busy = cpu.saturating_sub(before).as_secs_f64() / (now - at).as_secs_f64();
+            let busy = (busy * 100.0).round() as u32;
+            if said.is_none_or(|it| it / 10 != busy / 10) {
+                let of = *OF.get_or_init(|| {
+                    std::thread::available_parallelism().map_or(1, |it| it.get() as u32)
+                });
+                say(Event::Cores { busy, of });
+                Some(busy)
+            } else {
+                said
+            }
+        }
+        None => None,
+    };
+    *last = Some((now, cpu, said));
+}
+
 /// The counts going on, which one thread of the process says every [`COUNTED`]: a count
-/// that ends in less starts no thread of its own.
+/// that ends in less starts no thread of its own. The same thread says how busy the process
+/// is while it is at a step ([`cores`]).
 static COUNTS: Mutex<Vec<std::sync::Weak<Counted>>> = Mutex::new(Vec::new());
 
-/// The thread that says the [`COUNTS`], which waits while there are none.
+/// The thread that says the [`COUNTS`] and how busy the process is, which waits while there
+/// are none and the process is at no step.
 fn ticker() -> &'static std::thread::Thread {
     static TICKER: std::sync::OnceLock<std::thread::Thread> = std::sync::OnceLock::new();
     TICKER.get_or_init(|| {
@@ -145,9 +248,16 @@ fn ticker() -> &'static std::thread::Thread {
                         .for_each(|it| it.tick(false));
                     !counts.is_empty()
                 };
-                match any {
+                let stepping = crate::lock(&AT).is_some();
+                if stepping {
+                    cores();
+                }
+                match any || stepping {
                     true => std::thread::park_timeout(COUNTED),
-                    false => std::thread::park(),
+                    false => {
+                        *crate::lock(&CPU) = None;
+                        std::thread::park();
+                    }
                 }
             }
         });

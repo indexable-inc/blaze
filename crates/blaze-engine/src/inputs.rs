@@ -78,8 +78,10 @@ struct Script {
 }
 
 impl Script {
+    /// Whether what it reads changed, or a clean took away what it wrote: what it watches
+    /// in its package leaves out the target directory, as cargo's does.
     fn changed(&self) -> bool {
-        self.files.iter().any(Watched::changed)
+        !self.out_dir.is_dir() || self.files.iter().any(Watched::changed)
     }
 
     /// Whether the script, run again as cargo ran it, prints and writes what it did for the

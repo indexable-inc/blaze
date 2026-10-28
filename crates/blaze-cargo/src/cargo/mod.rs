@@ -55,7 +55,7 @@ pub use units::Record;
 pub fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let args: Vec<String> = args.collect();
     let asked = Asked::parse(own::subcommand_first(args));
-    if !matches!(asked, Asked::Build(_)) {
+    if !matches!(asked, Asked::Build(_) | Asked::Cache(_)) {
         crate::end_with_reader();
     }
     if let Ok(home) = daemon::home() {
@@ -164,7 +164,10 @@ command of cargo's is blaze's own, or fails saying blaze has none yet: none is h
 fn cache(args: Vec<String>) -> anyhow::Result<i32> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let stale = match args[..] {
-        [] => return list_kept(&fn_cache_dir()?).map(|()| 0),
+        [] => {
+            crate::end_with_reader();
+            return list_kept(&fn_cache_dir()?).map(|()| 0);
+        }
         ["clear"] => false,
         ["clear", "--stale"] => true,
         _ => {
@@ -444,9 +447,13 @@ fn build_here() -> anyhow::Result<String> {
         records.iter().any(|it| matches!(it.event, blaze_protocol::events::Event::Finished { .. }));
     let when = if finished { "last" } else { "under way" };
     let mut said = format!("  {command} of {} ({when}):\n", root.display());
-    let mut plain = blaze_ui::Plain::new(false);
+    // What the live view of it shows, as of its last record.
+    let mut live = blaze_ui::Live::new(100, false);
     for record in &records {
-        said.push_str(&plain.record(record));
+        live.record(record, record.at_ns);
+    }
+    for line in live.snapshot(live.build().last_ns) {
+        said.push_str(&format!("    {line}\n"));
     }
     Ok(said)
 }

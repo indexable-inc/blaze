@@ -791,6 +791,8 @@ fn planned(
     // grandparent, the `executable-path` crate, assert_cmd's `cargo_bin`) finds them only
     // from `deps`.
     let build_dir = metadata.build_directory.as_ref().map_or(target, |it| it.as_std_path());
+    super::layout::make_tagged(target);
+    super::layout::make_tagged(build_dir);
     let mut built = build_dir.to_owned();
     if let Some(triple) = &selection.target {
         built.push(triple);

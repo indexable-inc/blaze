@@ -100,6 +100,16 @@ pub(crate) fn once(project: &Path, krate: &str) -> anyhow::Result<Option<crate::
     )?;
     ide_db::base_db::set_process_env(&mut db, crate::process::own());
     crate::prepare_macro_sessions(&db);
+    // The names of the standard library are what a build resolved and the store kept: a
+    // probe's crate is a few lines, and std's names are most of what resolving it costs.
+    if let Some(toolchain) = crate::toolchain_identity(&vfs, &args.symbol_files) {
+        blaze_store::compiles_against(&toolchain);
+    }
+    let crates = crate::built_crates(&db, &args).unwrap_or_default();
+    let served = crate::frozen::serve(&mut db, &crates);
+    if std::env::var_os("BLAZE_STATS").is_some() {
+        eprintln!("probe: def maps of {} crates from the store", served.def_maps());
+    }
     let Parts { root, members, lints_capped, .. } = checkouts.parts(&args.project)?;
     let checker = Checker::new(&db, &vfs, &checkouts, &members, read_from, root, lints_capped);
     // A probe's `rust-project.json` has no cargo targets to pick from: its crates are checked.

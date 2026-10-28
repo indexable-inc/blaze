@@ -102,6 +102,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.tier != 'none'
     uses: ./.github/workflows/blaze-platform.yaml
+    # For main's push of blaze's store (the cache-writer environment's secrets).
+    secrets: inherit
     with:
       platform: linux-x64
       os: ubuntu-24.04
@@ -116,6 +118,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.tier == 'warm'
     uses: ./.github/workflows/blaze-platform.yaml
+    # For main's push of blaze's store (the cache-writer environment's secrets).
+    secrets: inherit
     with:
       platform: linux-arm64
       os: ubuntu-24.04-arm
@@ -126,6 +130,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.tier == 'warm'
     uses: ./.github/workflows/blaze-platform.yaml
+    # For main's push of blaze's store (the cache-writer environment's secrets).
+    secrets: inherit
     with:
       platform: macos-arm64
       os: macos-15

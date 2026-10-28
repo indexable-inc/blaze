@@ -168,8 +168,8 @@ MODES = {"blaze": "`blaze`"}
 
 # What cargo and `blaze` print about the build, which is not the program's output.
 # cargo's status words, then blaze's own steps' (crates/blaze-ui), right-aligned to 12 columns.
-STATUS = re.compile(r"^\s*((Compiling|Checking|Finished|Running|Downloading|Downloaded|Blocking|Waiting|Locking|Updating|Adding|Fresh|Dirty|Doc-tests)\b|blaze:|warning:)"
-                    r"|^(?=[ \w-]{12} )\s+(Loading|Loaded|Fetching|Fetched|Resolving|Resolved|Compiled|Linking|Linked|Checked|Testing|Tested|Ran|Rebuilt|Finishing|Took|Cache|Building|Built|Storing|Stored|Optimizing|Optimized) ")
+STATUS = re.compile(r"^\s*((Compiling|Checking|Finished|Running|Downloading|Downloaded|Blocking|Waiting|Locking|Updating|Adding|Fresh|Dirty|Doc-tests)\b|blaze:|warning:|`blaze why` says more$)"
+                    r"|^(?=[ \w-]{12} )\s+(Loading|Loaded|Fetching|Fetched|Resolving|Resolved|Compiled|Linking|Linked|Checked|Testing|Tested|Ran|Rebuilt|Finishing|Took|Cache|Chain|Building|Built|Storing|Stored|Optimizing|Optimized) ")
 
 
 def base_env(home):
@@ -257,7 +257,16 @@ class Side:
         return [*(["blaze"] if self.blaze else ["cargo"]), command, *args]
 
     def cargo(self, command, *args, env=None, timeout=7200):
-        return timed(self.argv(command, *args), self.ws, dict(self.env, **(env or {})), timeout)
+        """Runs it. Of `blaze test`, what ran also has `kept`: the tests blaze did not run for
+        having passed as they are now, from its `tests.ndjson`."""
+        env = dict(self.env, **(env or {}))
+        report = self.blaze and command == "test" and os.path.join(env.get("CARGO_TARGET_DIR") or os.path.join(self.ws, "target"), "blaze", "tests.ndjson")
+        if report and os.path.exists(report):
+            os.remove(report)
+        took, ran = timed(self.argv(command, *args), self.ws, env, timeout)
+        if report:
+            ran.kept = kept_passes(report)
+        return took, ran
 
     def how_built(self, stderr):
         """Whether the daemon built what the last command asked for, or why cargo did."""
@@ -310,8 +319,19 @@ def program_output(ran):
     return ran.returncode, clean(ran.stdout), clean(ran.stderr)
 
 
+def kept_passes(report):
+    """The tests a `blaze test` kept the pass of and did not run, by libtest's name, from the
+    `tests.ndjson` it wrote at `report` (docs/cargo.md)."""
+    lines = open(report, encoding="utf-8").read().splitlines() if os.path.exists(report) else []
+    return [test["name"] for test in map(json.loads, filter(None, lines)) if test.get("result") == "cached"]
+
+
 def test_results(ran):
-    """The outcome of each test and of each test executable, and the exit status."""
+    """The outcome of each test, the totals of the test executables, and the exit status.
+    `blaze test` does not run a test that passed as it is now, and lists it on stderr only
+    (#836): a test it kept (`ran.kept`, from `Side.cargo`) is one cargo ran and passed. So the
+    totals are summed over the executables, the kept passes with those run, and leave out how
+    many tests a filter took out, which is what blaze runs of each executable the rest of."""
     # A doc test in a generated file is named by its path, in a directory cargo names
     # with a hash of how it was built (`build/<package>-<hash>/out` in cargo's first layout,
     # `build/<package>/<hash>/out` in its second).
@@ -320,8 +340,11 @@ def test_results(ran):
     # another test prints lands between the two. So the names are read from the lines and
     # the failures from the list at the end, and the totals say the rest.
     failed = [name for listed in re.findall(r"^failures:\n((?:    \S.*\n)+)", names, re.M) for name in listed.split("\n")]
-    tests = collections.Counter([(name, "ran") for name in re.findall(r"^test (.+?) \.\.\. ", names, re.M)] + [(name.strip(), "FAILED") for name in failed if name])
-    totals = sorted(re.findall(r"^test result: (\w+)\. (\d+ passed; \d+ failed; \d+ ignored; \d+ measured; \d+ filtered out)", ran.stdout, re.M))
+    kept = getattr(ran, "kept", [])
+    tests = collections.Counter([(name, "ran") for name in re.findall(r"^test (.+?) \.\.\. ", names, re.M) + kept] + [(name.strip(), "FAILED") for name in failed if name])
+    ended = re.findall(r"^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; \d+ filtered out", ran.stdout, re.M)
+    passed, failing, ignored, measured = (sum(int(it[at]) for it in ended) for at in range(1, 5))
+    totals = (sum(it[0] != "ok" for it in ended), passed + len(kept), failing, ignored, measured)
     return ran.returncode, tests, totals
 
 

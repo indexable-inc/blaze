@@ -1,0 +1,6 @@
+the last `blaze build` that compiled anything took 0.11s
+  search (rg): crates/core/main.rs edited
+  steps:
+    build scripts 14/14 steps   0.07s  1.9/8 cores
+    codegen rg                  0.02s  1.9/8 cores
+  rg: 2 fns compiled, 31218 kept

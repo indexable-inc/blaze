@@ -13,7 +13,7 @@ BLAZE_SPLICE=0   link each edit in full (the same test of the full link)
 SPLICES_NO_PIE   link the daemon's binary with -no-pie
 SPLICES_SOAK=N   after the steps, N more edits of one constant, each checked by its output
 """
-import os, re, shlex, subprocess, sys, tempfile, time
+import difflib, os, re, shlex, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -547,11 +547,12 @@ def main():
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon died at {what!r}: {log_path}")
         theirs = run(built(reference, "sedge"))
+        ours = None
         if not reply.startswith("ok"):
             verdict = "REFUSED: " + reply[:60]
-        elif run(binary) != theirs:
+        elif (ours := run(binary)) != theirs:
             verdict = "DIFFERENT OUTPUT"
-        elif run(binary, {BIND_NOW: "1"}) != theirs:
+        elif (ours := run(binary, {BIND_NOW: "1"})) != theirs:
             verdict = "DIFFERENT OUTPUT BOUND AT ONCE"
         elif held and held.communicate(timeout=30)[0] != expected:
             verdict = "THE RUNNING ONE CHANGED"
@@ -564,6 +565,14 @@ def main():
         kind = how.split(":")[0] if verdict == "same" else "wrong"
         hows[how] = hows.get(how, 0) + 1
         print(f"{what:48} {verdict:16} {took:5.0f} ms  {how}", flush=True)
+        if verdict.startswith("DIFFERENT OUTPUT"):
+            # Whether the binary prints the same again, and cargo's too, tells a wrong build
+            # from a program whose output changes from run to run.
+            again = run(binary, {BIND_NOW: "1"} if verdict.endswith("AT ONCE") else None) == ours
+            print(f"    blaze's prints {'the same' if again else 'otherwise'} when run again, cargo's "
+                  f"{'the same' if run(built(reference, 'sedge')) == theirs else 'otherwise'}")
+            for line in difflib.unified_diff(theirs.splitlines(), ours.splitlines(), "cargo's", "blaze's", n=0, lineterm=""):
+                print(f"    {line}")
 
     soak = int(os.environ.get("SPLICES_SOAK", "0"))
     soak_wrong = 0

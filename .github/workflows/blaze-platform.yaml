@@ -83,8 +83,10 @@ jobs:
     # hour on macOS's 7 GB runner (the 16-minute step of 4-cpu Linux had not ended at 48). Long
     # enough for that one run to finish and push, which the runs after it then pull.
     timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 90 }}
-    # The remote's write token and signing key, for main's push alone.
-    environment: ${{ github.ref == 'refs/heads/main' && !startsWith(inputs.os, 'windows') && 'cache-writer' || '' }}
+    # The remote's write token and signing key, for the push of blaze.yaml's runs on main alone
+    # (the train, on main too, pushes nothing). A called workflow sees a secret only when its
+    # caller passes it, environment secrets too: blaze.yaml calls this with `secrets: inherit`.
+    environment: ${{ github.ref == 'refs/heads/main' && inputs.tier == 'warm' && !startsWith(inputs.os, 'windows') && 'cache-writer' || '' }}
     env:
       # A pull request runs the tests its change reached and takes the rest as passed from
       # main's store; main runs every test, which records each pass for the pull requests after
@@ -114,9 +116,9 @@ jobs:
       # What was compiled, and each test that passed, for the runs after this one; a run whose
       # tests failed pushes too, since what it compiled is no less right. The daemons end
       # first: a push sends sealed packs, and a daemon's last pack seals when it ends.
-      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && steps.blaze.outcome == 'success'
+      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && inputs.tier == 'warm' && steps.blaze.outcome == 'success'
         run: blaze stop
-      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && steps.blaze.outcome == 'success'
+      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && inputs.tier == 'warm' && steps.blaze.outcome == 'success'
         uses: ./.github/actions/blaze-remote
         with:
           mode: push
@@ -134,7 +136,7 @@ jobs:
     # As in the tests job.
     timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 90 }}
     # The remote's write token and signing key, for main's push alone.
-    environment: ${{ github.ref == 'refs/heads/main' && !startsWith(inputs.os, 'windows') && 'cache-writer' || '' }}
+    environment: ${{ github.ref == 'refs/heads/main' && inputs.tier == 'warm' && !startsWith(inputs.os, 'windows') && 'cache-writer' || '' }}
     env:
       # The `fast` and `full` tiers (the train) build with cargo, as release.yaml does: their
       # harnesses and benches time and test the blaze users get, and the code blaze compiles
@@ -177,9 +179,9 @@ jobs:
           else
             nix develop --command cargo build -p blaze-engine --release --features llvm --locked
           fi
-      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && steps.blaze.outcome == 'success'
+      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && inputs.tier == 'warm' && steps.blaze.outcome == 'success'
         run: blaze stop
-      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && steps.blaze.outcome == 'success'
+      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && inputs.tier == 'warm' && steps.blaze.outcome == 'success'
         uses: ./.github/actions/blaze-remote
         with:
           mode: push
