@@ -24,7 +24,8 @@ fn main() {
     }
     let mut tree: taffy::TaffyTree<()> = taffy::TaffyTree::new();
     let leaf = tree.new_leaf(taffy::Style::default()).unwrap();
-    tree.compute_layout(leaf, taffy::Size::MAX_CONTENT).unwrap();
+    let space = taffy::Size { width: taffy::AvailableSpace::MaxContent, height: taffy::AvailableSpace::MaxContent };
+    tree.compute_layout(leaf, space).unwrap();
     println!("{:?}", tree.layout(leaf).unwrap().size);
     let mut pixmap = tiny_skia::Pixmap::new(16, 16).unwrap();
     let mut paint = tiny_skia::Paint::default();
