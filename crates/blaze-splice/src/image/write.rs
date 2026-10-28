@@ -221,6 +221,8 @@ struct Plan<'l, 'a> {
     imports: Vec<u32>,
     import_of: FxHashMap<u32, u32>,
     load_relocations: usize,
+    /// The relocations the scan counted a load-time relocation for, by where they are.
+    load_from: FxHashSet<(u32, u32, u64)>,
     needed: Vec<u32>,
     /// (library, its version) to the index `.gnu.version` gives it.
     version_of: FxHashMap<(u32, u32), u16>,
@@ -252,6 +254,7 @@ pub(super) fn write(
         imports: Vec::new(),
         import_of: FxHashMap::default(),
         load_relocations: 0,
+        load_from: FxHashSet::default(),
         needed: Vec::new(),
         version_of: FxHashMap::default(),
         dynstr: vec![0],
@@ -638,6 +641,7 @@ impl<'a> Plan<'_, 'a> {
                                     self.import(id);
                                 }
                                 self.load_relocations += 1;
+                                self.load_from.insert(from);
                             }
                         },
                         Kind::Rel(_) => {
@@ -1268,6 +1272,7 @@ impl<'a> Plan<'_, 'a> {
         phdrs: Vec<[u64; 7]>,
     ) -> anyhow::Result<()> {
         let mut load: Vec<(u64, u32, u32, i64)> = Vec::new();
+        let mut load_from: FxHashSet<(u32, u32, u64)> = FxHashSet::default();
         // The pieces.
         for out in &self.outs {
             if out.sh_type == elf::SHT_NOBITS || out.synth.is_some() {
@@ -1302,7 +1307,11 @@ impl<'a> Plan<'_, 'a> {
                     }
                     let from = (o, s, reloc.offset);
                     let res = self.resolve(reloc.to, from)?;
+                    let before = load.len();
                     self.apply(bytes, reloc, kind, base + reloc.offset, res, &mut load, from)?;
+                    if load.len() > before {
+                        load_from.insert(from);
+                    }
                 }
             }
         }
@@ -1327,7 +1336,11 @@ impl<'a> Plan<'_, 'a> {
                 let place = eh + frame.at + (reloc.offset - frame.start);
                 let from = (frame.object, frame.section, reloc.offset);
                 let res = self.resolve(reloc.to, from)?;
+                let before = load.len();
                 self.apply(bytes, reloc, kind, place, res, &mut load, from)?;
+                if load.len() > before {
+                    load_from.insert(from);
+                }
                 if frame.cie.is_some() && reloc.offset == frame.start + 8 {
                     table.push((self.address_of(res)?.wrapping_add_signed(reloc.addend), eh + frame.at));
                 }
@@ -1377,12 +1390,21 @@ impl<'a> Plan<'_, 'a> {
                 bytes[stub as usize..stub as usize + code.len()].copy_from_slice(&code);
             }
         }
-        ensure!(
-            load.len() == self.load_relocations,
-            "{} load-time relocations, where {} were counted",
-            load.len(),
-            self.load_relocations
-        );
+        if load.len() != self.load_relocations {
+            let name = |it: &FxHashSet<(u32, u32, u64)>, of: &FxHashSet<(u32, u32, u64)>| {
+                let mut at: Vec<_> = it.difference(of).copied().collect();
+                at.sort_unstable();
+                at.iter().take(8).map(|&(o, s, offset)| self.where_is(o, s, offset)).collect::<Vec<_>>().join(", ")
+            };
+            bail!(
+                "{} load-time relocations, where {} were counted; counted and not written: [{}]; \
+                 written and not counted: [{}]",
+                load.len(),
+                self.load_relocations,
+                name(&self.load_from, &load_from),
+                name(&load_from, &self.load_from)
+            );
+        }
         // `.rela.dyn`: the relative ones first, which `DT_RELACOUNT` counts.
         let relative_type = machine.relative();
         load.sort_by_key(|it| (it.1 != relative_type, it.0));
