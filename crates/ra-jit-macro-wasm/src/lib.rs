@@ -644,6 +644,7 @@ impl Wasm {
         let failed = |e: wasmtime::Error| format!("{}: {e:#}", path.display());
         let read = std::cell::OnceCell::new();
         let bytes = || module_bytes(path, &digest, given, &read);
+        let store = store.filter(|_| keeps(tier));
         let key = code_key(&digest, tier);
         let file = code_file(path, &key);
         let engine = engine(tier);
@@ -704,7 +705,7 @@ impl Wasm {
     /// told the store the toolchain is kept once it has.
     fn keep_code(&self, store: Option<&ra_jit_store::Store>) {
         use std::sync::atomic::Ordering;
-        let Some(store) = store else { return };
+        let Some(store) = store.filter(|_| keeps(self.tier)) else { return };
         if self.kept.swap(true, Ordering::Relaxed) {
             return;
         }
@@ -898,6 +899,14 @@ impl Wasm {
         })?;
         Ok((state, output))
     }
+}
+
+/// Whether the store keeps code of `tier`. Winch's is kept beside the module only: 2 to 3 times
+/// the size of Cranelift's for a sixth of its compile, it costs a cold build more to write into
+/// the store (blocks of tens of megabytes packed while the build's units wait for the store)
+/// than to compile again.
+fn keeps(tier: Tier) -> bool {
+    tier == Tier::Fast
 }
 
 /// What the store keeps the machine code of the module of `digest` under: the module's bytes
@@ -1517,14 +1526,20 @@ mod tests {
         let (known, text) = listing(&path).expect("the list is written before the compile ends");
         assert_eq!(text, list);
         assert_eq!(known.digest, keyed::sha256(&module));
-        // Waits for the compile `prepare_soon` started, which keeps the code beside the module
-        // and in the store, under a key of no path.
+        // Waits for the compile `prepare_soon` started, by Winch, whose code is kept beside the
+        // module only.
         let wasm = Wasm::best(&path, known, None, Some(store)).unwrap();
         assert_eq!(wasm.tier, Tier::Quick, "a build compiles with Winch");
-        let key = code_key(&known.digest, Tier::Quick);
-        assert!(code_file(&path, &key).is_file());
+        let quick = code_key(&known.digest, Tier::Quick);
+        assert!(code_file(&path, &quick).is_file());
+        // Cranelift's code is kept in the store too, under a key of no path, and is then the
+        // code a load takes.
+        Wasm::known(&path, known, None, Some(store), Tier::Fast).unwrap();
         store.seal();
-        assert!(store.get_lasting(&key).is_some());
+        assert!(!store.has_lasting(&quick));
+        assert!(store.has_lasting(&code_key(&known.digest, Tier::Fast)));
+        std::fs::remove_file(code_file(&path, &code_key(&known.digest, Tier::Fast))).unwrap();
+        assert_eq!(Wasm::best(&path, known, None, Some(store)).unwrap().tier, Tier::Fast);
         // Another write of the module, even of the same bytes, is listed again.
         std::fs::write(&path, &module).unwrap();
         let later = std::time::SystemTime::now() + Duration::from_secs(5);
