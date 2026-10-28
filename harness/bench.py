@@ -15,7 +15,8 @@ copied; the clone is never written to). A project with `prepare` (bun) is copied
 that module's `prepare` makes beside the clone, and is measured only when named, as is one with
 `named` (dynamo, whose build needs protoc and libclang; codex, which needs libcap). A project
 with `dir` is built in that directory of its checkout (codex: codex-rs), and its edits are
-paths in it. Under each
+paths in it. One with `fetches` has its build scripts' downloads recorded with `blaze lock
+--fetches` before each cold build, not timed. Under each
 backend, with a store, a daemon and a home of its own, and plain cargo building the same source
 into a target directory of its own outside the checkout (under `--reference`, which lets the two be on different disks, or `WORK/reference`):
   cold       `blaze build` from nothing, then the wait until the daemon has the
@@ -282,10 +283,11 @@ PROJECTS = {
     ),
     # OpenAI's Codex CLI: its Rust workspace is codex-rs (`dir`), 162 crates, most of them under
     # the `codex` binary. cargo builds with its pin (rust-toolchain.toml, 1.99.1), as its users do.
-    # Needs libcap (its Linux sandbox) and ALSA; measured only when named.
+    # Needs libcap (its Linux sandbox) and ALSA; measured only when named. The v8 crate's
+    # build script downloads V8, which blaze hands it from `blaze lock --fetches`.
     "codex": dict(
         repo="openai/codex", tag="rust-v0.165.0", rev="360319d8dee62d87e2d59fc0c21805d79519cfed",
-        dir="codex-rs", env=dict(RUSTUP_TOOLCHAIN="1.99.1"), named=True,
+        dir="codex-rs", env=dict(RUSTUP_TOOLCHAIN="1.99.1"), named=True, fetches=True,
         build=["-p", "codex-cli", "--bin", "codex"], run=["--version"],
         edits=dict(
             body=body("cli/src/main.rs", "fn main() -> anyhow::Result<()> {"),
@@ -737,6 +739,13 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         for path in (os.path.join(ws, "target"), theirs.env["CARGO_TARGET_DIR"], store, home(turn)):
             shutil.rmtree(path, ignore_errors=True)
         ours.env.update(BLAZE_HOME=home(turn), BLAZE_CACHE=store)
+        # What its build scripts download, into the empty store as a user records it once
+        # (`blaze lock --fetches`), not timed; cargo's scripts download it in its cold build.
+        if spec.get("fetches"):
+            _, locked = ours.cargo("lock", "--fetches")
+            if locked.returncode != 0:
+                raise Failed(f"{name} {backend}: `blaze lock --fetches` failed:\n{locked.stderr[-3000:]}")
+            ours.cargo("stop")
         daemon = Daemon(ours)
         took, warm, mine, used = cold_blaze(ours, "empty store", daemon)
         said, built, peak = daemon.said(), how_built(mine.stderr), daemon.peak_mb()
