@@ -177,6 +177,12 @@ impl Loaded {
         vfs: &mut vfs::Vfs,
         db: &mut RootDatabase,
     ) -> anyhow::Result<()> {
+        let t0 = std::time::Instant::now();
+        let lap = |what: &str| {
+            if std::env::var_os("RA_JIT_STATS").is_some() {
+                eprintln!("add-lap: {what} {:.1?}", t0.elapsed());
+            }
+        };
         self.workspaces.extend(workspaces);
         let known: FxHashSet<vfs::FileId> = vfs.iter().map(|(file, _)| file).collect();
         let ws = self.workspaces.first().ok_or_else(|| anyhow::anyhow!("no workspace to load"))?;
@@ -206,6 +212,7 @@ impl Loaded {
             members.push(ids.into_values().collect::<Vec<_>>());
             proc_macros.extend(paths);
         }
+        lap("graph");
         // A library rustc compiled is expanded with what the caller has of it, if anything.
         let unlisted: Vec<listed::Compiled> = match listed::owned() {
             true => {
@@ -255,6 +262,7 @@ impl Loaded {
                 *path = own.clone();
             }
         }
+        lap("own");
         let listed: FxHashSet<AbsPathBuf> = match listed::server() {
             Some(_) => proc_macros
                 .values()
@@ -308,6 +316,7 @@ impl Loaded {
                 }));
             }
         }
+        lap("servers");
         let proc_macros = {
             fn running(
                 server: &Option<Result<ProcMacroClient, ProcMacroLoadingError>>,
@@ -362,6 +371,7 @@ impl Loaded {
             loaded.into_iter().collect()
         };
 
+        lap("macros");
         let was = self.file_sets.len();
         let mut claimed: FxHashSet<VfsPath> =
             self.file_sets.iter().flat_map(|(paths, _)| paths.iter().cloned()).collect();
@@ -393,6 +403,7 @@ impl Loaded {
             }
         }
 
+        lap("vfs");
         db.enable_proc_attr_macros();
         let mut fsc = FileSetConfig::builder();
         for (paths, _) in &self.file_sets {
