@@ -522,7 +522,8 @@ pub mod mem {
 
     // region:size_of
     #[rustc_intrinsic]
-    pub const fn size_of<T>() -> usize;
+    #[rustc_comptime]
+    pub fn size_of<T>() -> usize;
     // endregion:size_of
 
     // region:discriminant

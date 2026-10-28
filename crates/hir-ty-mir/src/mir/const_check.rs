@@ -176,7 +176,8 @@ pub fn const_check<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> ConstCh
                 if !called || is_const_callable(db, callee) {
                     continue;
                 }
-                // rustc's `IntrinsicNonConst`, which it checks before any other rule of calls.
+                // rustc's `IntrinsicNonConst`, for an intrinsic that is not `const` (nor
+                // `#[rustc_comptime]`, which `is_const_callable` accepts).
                 if FunctionSignature::is_intrinsic(db, callee) {
                     let name = FunctionSignature::of(db, callee).name.as_str().to_owned();
                     report(
@@ -213,10 +214,17 @@ fn not_const_checked(db: &dyn HirDatabase, func: FunctionId) -> bool {
 
 /// Whether a call of `func` in a const context is one rustc does not refuse as a call of a
 /// function that is not `const`: it is `const`, or a method of a trait or of an `impl` of one
-/// (conditionally const). An intrinsic is callable only when it is declared `const`, as the
-/// nightly declares the ones const eval runs (`atomic_load`, `transmute`, `size_of`, ..).
+/// (conditionally const), or `#[rustc_comptime]` (always const to rustc: `size_of`,
+/// `align_of`, `needs_drop` and the reflection intrinsics are written so). An intrinsic is
+/// otherwise callable only when it is declared `const`, as the nightly declares the others const
+/// eval runs (`atomic_load` and the rest of the atomics, `transmute`, ..).
+///
+/// A comptime function called from a `const fn` is accepted too, where rustc may refuse it: this
+/// check reports only what rustc reports.
 fn is_const_callable(db: &dyn HirDatabase, func: FunctionId) -> bool {
-    FunctionSignature::of(db, func).is_const() || of_a_trait(db, func)
+    FunctionSignature::of(db, func).is_const()
+        || of_a_trait(db, func)
+        || hir_def::attrs::AttrFlags::has_word(db, func.into(), "rustc_comptime")
 }
 
 /// How rustc's message names the function called: `function`, `method` or `associated

@@ -3485,6 +3485,7 @@ impl<'db> Evaluator<'db> {
                 args,
                 locals,
                 span,
+                None,
             ),
             _ => Err(MirEvalError::InternalError("function pointer to non function".into())),
         }
@@ -3499,6 +3500,7 @@ impl<'db> Evaluator<'db> {
         args: &[IntervalAndTy<'db>],
         locals: &Locals<'db>,
         span: MirSpan,
+        consumed: Option<Ty<'db>>,
     ) -> Result<'db, Option<StackFrame<'db>>> {
         let mir_body = super::optimize::interpreted_closure_body(
             self.db,
@@ -3507,12 +3509,14 @@ impl<'db> Evaluator<'db> {
             self.param_env.store(),
         )
         .map_err(|it| MirEvalError::MirLowerErrorForClosure(closure, it))?;
-        let closure_data =
-            if mir_body.locals[mir_body.param_locals[0]].ty.as_ref().as_reference().is_some() {
-                closure_data.addr.to_bytes().to_vec()
-            } else {
-                closure_data.get(self)?.to_owned()
-            };
+        let by_reference =
+            mir_body.locals[mir_body.param_locals[0]].ty.as_ref().as_reference().is_some();
+        let closure_addr = closure_data.addr;
+        let closure_data = if by_reference {
+            closure_addr.to_bytes().to_vec()
+        } else {
+            closure_data.get(self)?.to_owned()
+        };
         let arg_bytes = iter::once(Ok(closure_data))
             .chain(args.iter().map(|it| Ok(it.get(self)?.to_owned())))
             .collect::<Result<'db, Vec<_>>>()?;
@@ -3526,6 +3530,14 @@ impl<'db> Evaluator<'db> {
                 )
             })?;
         destination.write_from_interval(self, interval)?;
+        // A `Fn` or `FnMut` closure called by value through `FnOnce::call_once` is dropped
+        // after the call, as rustc's `ClosureOnceShim` does: nothing else owns it then. One
+        // whose body takes it by value dropped it itself.
+        if let Some(closure_ty) = consumed
+            && by_reference
+        {
+            self.run_drop_glue_deep(closure_ty, locals, closure_addr, &[], span)?;
+        }
         self.free_stack(mark);
         Ok(None)
     }
@@ -3772,15 +3784,21 @@ impl<'db> Evaluator<'db> {
             TyKind::FnPtr(..) => {
                 self.exec_fn_pointer(func_data, destination, &args[1..], locals, target_bb, span)
             }
-            TyKind::Closure(closure, subst) => self.exec_closure(
-                closure.0,
-                func_data,
-                GenericArgs::new_from_slice(subst.as_closure().parent_args()),
-                destination,
-                &args[1..],
-                locals,
-                span,
-            ),
+            TyKind::Closure(closure, subst) => {
+                let consumed = (Some(def) == self.cached_fn_once_trait_func
+                    && func_ty == func.ty)
+                    .then_some(func_ty);
+                self.exec_closure(
+                    closure.0,
+                    func_data,
+                    GenericArgs::new_from_slice(subst.as_closure().parent_args()),
+                    destination,
+                    &args[1..],
+                    locals,
+                    span,
+                    consumed,
+                )
+            }
             _ => {
                 // try to execute the manual impl of `FnTrait` for structs (nightly feature used in std)
                 let arg0 = func;
@@ -3915,6 +3933,40 @@ impl<'db> Evaluator<'db> {
         if self.lang_items().Drop_drop.is_none() || !self.has_drop_glue(ty) {
             return Ok(());
         }
+        // A field's declared type can be a projection (`Cow::Owned`'s `<B as ToOwned>::Owned`,
+        // `FlatMap`'s `Option<U::IntoIter>`), which `has_drop_glue` saw through.
+        let ty = match ty.kind() {
+            TyKind::Alias(..) => {
+                let normalized = ObligationCtxt::new(&self.infcx)
+                    .structurally_normalize_ty(
+                        &ObligationCause::dummy(),
+                        self.param_env.param_env,
+                        ty,
+                    )
+                    .map_err(|_| {
+                        MirEvalError::NotSupported(format!("dropping {ty:?}, which does not normalize"))
+                    })?;
+                if matches!(normalized.kind(), TyKind::Alias(..)) {
+                    not_supported!("dropping {ty:?}, which does not normalize");
+                }
+                normalized
+            }
+            _ => ty,
+        };
+        // One level per `Box` or field: a long list of boxes goes deep.
+        stdx::ensure_sufficient_stack(|| {
+            self.run_drop_glue_deep_normalized(ty, locals, addr, metadata, span)
+        })
+    }
+
+    fn run_drop_glue_deep_normalized(
+        &mut self,
+        ty: Ty<'db>,
+        locals: &Locals<'db>,
+        addr: Address,
+        metadata: &[u8],
+        span: MirSpan,
+    ) -> Result<'db, ()> {
         match ty.kind() {
             TyKind::Adt(adt_def, subst) => {
                 let id = adt_def.def_id();
@@ -3958,16 +4010,20 @@ impl<'db> Evaluator<'db> {
                             e,
                         ) {
                             Some((variant, layout)) => (variant.into(), layout),
-                            None => return Ok(()),
+                            None => not_supported!("dropping {ty:?}: no variant has its tag"),
                         }
                     }
                 };
                 let field_types = self.db.field_types(variant);
-                for (field, _) in variant.fields(self.db).fields().iter() {
+                let fields = variant.fields(self.db).fields();
+                let last = fields.iter().count().checked_sub(1);
+                for (index, (field, _)) in fields.iter().enumerate() {
                     let offset =
                         layout.fields.offset(u32::from(field.into_raw()) as usize).bytes_usize();
                     let ty = field_types[field].ty().instantiate(self.interner(), subst).skip_norm_wip();
-                    self.run_drop_glue_deep(ty, locals, addr.offset(offset), &[], span)?;
+                    // The metadata of an unsized struct is its last field's (`RefCell<dyn FnMut()>`).
+                    let metadata = if Some(index) == last { metadata } else { &[] };
+                    self.run_drop_glue_deep(ty, locals, addr.offset(offset), metadata, span)?;
                 }
             }
             TyKind::Tuple(fields) => self.drop_fields(ty, fields.iter(), locals, addr, span)?,
@@ -3986,12 +4042,13 @@ impl<'db> Evaluator<'db> {
                 self.drop_elements(inner, len, locals, addr, span)?;
             }
             TyKind::Dynamic(..) => {
-                if !metadata.is_empty() {
-                    let concrete_ty = self.vtable_map.ty_of_bytes(metadata)?;
-                    self.run_drop_glue_deep(concrete_ty, locals, addr, &[], span)?;
+                if metadata.is_empty() {
+                    not_supported!("dropping {ty:?} with no vtable");
                 }
+                let concrete_ty = self.vtable_map.ty_of_bytes(metadata)?;
+                self.run_drop_glue_deep(concrete_ty, locals, addr, &[], span)?;
             }
-            _ => (),
+            _ => not_supported!("drop glue of {ty:?}"),
         }
         Ok(())
     }
@@ -4023,13 +4080,14 @@ impl<'db> Evaluator<'db> {
         );
         if let Either::Left(drop_impl) = drop_impl
             && matches!(drop_impl.lookup(self.db).container, ItemContainerId::ImplId(_))
-            && let Ok(body) = super::optimize::interpreted_body(
+        {
+            let body = super::optimize::interpreted_body(
                 self.db,
                 drop_impl.into(),
                 drop_args.store(),
                 self.param_env.store(),
             )
-        {
+            .map_err(|it| MirEvalError::MirLowerError(drop_impl, it))?;
             self.exec_looked_up_function(
                 body,
                 locals,

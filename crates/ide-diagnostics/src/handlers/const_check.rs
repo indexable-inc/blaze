@@ -122,6 +122,19 @@ const C: u32 = Counter.fetch_add();
     }
 
     #[test]
+    fn comptime_intrinsics_in_constants() {
+        // core writes `size_of`, `align_of` and `needs_drop` as `#[rustc_comptime] pub fn`,
+        // which rustc calls always const.
+        check_diagnostics(
+            r#"
+//- minicore: size_of
+const S: usize = core::intrinsics::size_of::<u64>();
+static T: usize = core::intrinsics::size_of::<u32>();
+"#,
+        );
+    }
+
+    #[test]
     fn pointers_in_const_fns() {
         check_diagnostics(
             r#"
