@@ -47,6 +47,11 @@ def items(value: object, key: str) -> list[object]:
     return cast(list[object], result)
 
 
+def append_output(path: str, text: str) -> None:
+    with Path(path).open("a") as output:
+        output.write(text)
+
+
 async def api(repository: str, endpoint: str) -> object:
     route = f"repos/{repository}" + (f"/{endpoint}" if endpoint else "")
     argv = ["gh", "api", route]
@@ -171,8 +176,7 @@ async def validate(it: Build) -> None:
         )
     artifact_id = field(artifact, "id")
     require(type(artifact_id) is int and artifact_id > 0, "selected artifact has no numeric ID")
-    with Path(it.output).open("a") as output:
-        output.write(f"run-id={it.build_run}\nartifact-id={artifact_id}\n")
+    await asyncio.to_thread(append_output, it.output, f"run-id={it.build_run}\nartifact-id={artifact_id}\n")
     print(f"Validated {workflow_path} run {it.build_run}, commit {it.sha}, artifact {artifact_id}")
 
 
