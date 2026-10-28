@@ -21,7 +21,10 @@
 //! covered of this format indexed again: packs of another format wait for a push of a blaze
 //! that reads them.
 
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use anyhow::{Context, bail};
 use blaze_store::{
@@ -189,6 +192,35 @@ pub async fn update(
             }
         }
     }
+    // A shard that is gone fails every lookup of a key it would hold (`tier.rs`), and a
+    // merge reads the shards of only the runs it merges: so every push asks after the shards
+    // of the runs it keeps (one request each, without their bytes), and a run with one gone
+    // is taken out and what it covered indexed again.
+    let shards = kept.iter().enumerate().flat_map(|(at, (_, run))| {
+        run.shards().map(move |(slot, hash)| (at, slot, hash, run.shard_max(slot)))
+    });
+    let asked = stream::iter(shards.map(|(at, slot, hash, most)| async move {
+        let found = remote.found(&object(&hash)).await?;
+        let gone = !found.is_some_and(|it| it.len <= most);
+        anyhow::Ok(gone.then_some((at, slot, hash)))
+    }));
+    let gone: Vec<_> = asked.buffer_unordered(remote.jobs()).try_collect().await?;
+    let gone: BTreeMap<usize, (usize, Hash)> =
+        gone.into_iter().flatten().map(|(at, slot, hash)| (at, (slot, hash))).collect();
+    if !gone.is_empty() {
+        let mut at = 0;
+        kept.retain(|(named, _)| {
+            at += 1;
+            let Some((slot, hash)) = gone.get(&(at - 1)) else { return true };
+            eprintln!(
+                "remote: the index of `{project}` names a run whose shard {slot}, {}, is not \
+                 there: it is taken out, and what it covered is indexed again",
+                object(hash)
+            );
+            replaced.insert(named.run);
+            false
+        });
+    }
     let covered = |kept: &[(Named, Run)], skip: &BTreeSet<Hash>| -> BTreeSet<Hash> {
         let runs = kept.iter().filter(|(named, _)| !skip.contains(&named.run));
         runs.flat_map(|(_, run)| run.packs().iter().copied()).collect()
@@ -303,8 +335,8 @@ pub async fn named(remote: &Remote, lines: &str) -> anyhow::Result<Vec<String>> 
 }
 
 /// What a store that lacks `key` would fetch: the packs of the index of `project` whose
-/// entries match it, and that the manifest lists. For the tests, until the store reads
-/// through the index.
+/// entries match it, and that the manifest lists. For the tests: the reference the reading
+/// of `tier.rs` is to agree with.
 #[cfg(test)]
 pub async fn holders(
     remote: &Remote,

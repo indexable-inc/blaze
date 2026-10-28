@@ -334,16 +334,45 @@ pub fn pack_keys(name: &str, bytes: &[u8]) -> Result<Vec<[u8; KEY]>, &'static st
     Ok(Pack::verify(name, bytes)?.entries.into_iter().map(|it| it.key).collect())
 }
 
-/// Asked for a key, as it is on disk, that no sealed pack of the store has: brings the pack
-/// that has it into the store's directory, if it knows of one, and says whether it did.
-pub type FetchMissing = Box<dyn Fn(&[u8; KEY]) -> bool + Send + Sync>;
+/// Asked for a key, as it is on disk, that no sealed pack of the store has, and the packs it
+/// brought for that key already that did not hold it: brings the next pack that may hold it
+/// into the store's directory and names it, or says `None` when no pack it knows of may.
+/// An error is that it could not tell or could not bring the pack, naming what failed: the
+/// build that asked fails ([`take_failure`]), and nothing compiles the key in its place.
+pub type FetchMissing = Box<
+    dyn Fn(&[u8; KEY], &[remote_index::Hash]) -> Result<Option<remote_index::Hash>, String>
+        + Send
+        + Sync,
+>;
 
 static FETCH_MISSING: OnceLock<FetchMissing> = OnceLock::new();
+
+/// How the fetch of a missing key failed, until the build it failed takes it.
+static FAILED: Mutex<Option<String>> = Mutex::new(None);
 
 /// Has the store of this process ask `fetch` for the keys it lacks, from now on. A process
 /// has one store, and only the first call counts.
 pub fn fetch_missing_with(fetch: FetchMissing) {
     _ = FETCH_MISSING.set(fetch);
+}
+
+/// How a fetch of a key the store lacked failed since this was last asked, if one did: the
+/// build that asked for the key fails with it. Until it is taken, no key is asked for again,
+/// so a build whose remote failed ends soon and fails rather than wait on it key by key.
+pub fn take_failure() -> Option<String> {
+    FAILED.lock().unwrap_or_else(PoisonError::into_inner).take()
+}
+
+fn failed() -> bool {
+    FAILED.lock().unwrap_or_else(PoisonError::into_inner).is_some()
+}
+
+fn fail(why: String) {
+    let mut failed = FAILED.lock().unwrap_or_else(PoisonError::into_inner);
+    if failed.is_none() {
+        eprintln!("store: {why}");
+        *failed = Some(why);
+    }
 }
 
 /// Seals what the store of this process has open, however little it is, so that it can be
@@ -1966,7 +1995,8 @@ impl Store {
 
     /// Where the value of a key as it is on disk is, in a pack whose bytes are what its name
     /// says. A key no sealed pack has is asked of whoever fetches packs for this process, and
-    /// looked for again in what arrived.
+    /// looked for again in each pack that arrives, until one holds it or none is left that
+    /// may: a pack the remote's index names may not hold the key ([`remote_tier`]).
     fn place(&self, key: &[u8; KEY]) -> Option<Place> {
         let known = || {
             let mut found = self.found(key);
@@ -1981,11 +2011,34 @@ impl Store {
         if let Some(place) = known() {
             return Some(place);
         }
-        if !FETCH_MISSING.get().is_some_and(|fetch| fetch(key)) {
+        let fetch = FETCH_MISSING.get()?;
+        if failed() {
             return None;
         }
-        self.refresh();
-        known()
+        let mut tried = Vec::new();
+        loop {
+            match fetch(key, &tried) {
+                Ok(None) => return None,
+                Ok(Some(pack)) => {
+                    self.refresh();
+                    if let Some(place) = known() {
+                        return Some(place);
+                    }
+                    if tried.contains(&pack) {
+                        fail(format!(
+                            "{} was brought in twice for a key it does not hold",
+                            named(&pack)
+                        ));
+                        return None;
+                    }
+                    tried.push(pack);
+                }
+                Err(why) => {
+                    fail(why);
+                    return None;
+                }
+            }
+        }
     }
 
     /// Where the index of a sealed pack says the value of a key as it is on disk is, the pack
@@ -2442,6 +2495,7 @@ mod acl;
 pub mod bench;
 
 pub mod remote_index;
+pub mod remote_tier;
 
 /// Keeping the store to the user it is of. On Unix that is the owner and the mode of the
 /// directory and of each file. On Windows it is the owner and the access control list,

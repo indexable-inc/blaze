@@ -69,6 +69,12 @@ impl fmt::Display for Digest {
     }
 }
 
+impl fmt::Debug for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
 /// What a small object was when it was read, for a write that must not undo another's.
 pub struct Version(pub Option<String>);
 
@@ -305,13 +311,34 @@ struct Partial {
     start: Vec<u8>,
 }
 
+/// Where the file `to` is fetched into before it is whole: a file that arrives compressed is
+/// kept aside under another name than one that arrives as it is, so neither is taken for the
+/// other.
+fn partial_path(to: &Path, packed: bool) -> PathBuf {
+    let mut path = to.as_os_str().to_owned();
+    path.push(if packed { ".zst.tmp" } else { ".fetch.tmp" });
+    PathBuf::from(path)
+}
+
+/// Waits for the process that is fetching `to` (a fetch that said [`Fetched::Elsewhere`])
+/// to be done with it, whether it got it or not.
+pub async fn fetched_elsewhere(to: &Path, packed: bool) -> std::io::Result<()> {
+    let path = partial_path(to, packed);
+    let waited = tokio::task::spawn_blocking(move || {
+        match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+            // Held until the other process lets it go, and let go when it is dropped.
+            Ok(file) => file.lock(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    });
+    waited.await?
+}
+
 impl Partial {
-    /// `None` when another process holds it. A file that arrives compressed is kept aside
-    /// under another name than one that arrives as it is, so neither is taken for the other.
+    /// `None` when another process holds it.
     async fn open(to: &Path, packed: bool) -> anyhow::Result<Option<Partial>> {
-        let mut path = to.as_os_str().to_owned();
-        path.push(if packed { ".zst.tmp" } else { ".fetch.tmp" });
-        let path = PathBuf::from(path);
+        let path = partial_path(to, packed);
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         // What is fetched into a store is the store's, which no other user reads.

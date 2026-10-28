@@ -7,7 +7,7 @@
 
 use std::{
     sync::{
-        Arc, Mutex, OnceLock, RwLock,
+        Arc, Mutex, OnceLock, PoisonError, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -16,7 +16,9 @@ use std::{
 use anyhow::Context;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use super::{Digest, Lazy, Shared, collect::parse_age, push};
+use blaze_store::remote_index::Hash;
+
+use super::{Digest, Shared, Tiered, collect::parse_age, push};
 
 /// How often what the daemon compiled is sent when nothing says otherwise.
 const PUSH_EVERY: Duration = Duration::from_secs(5 * 60);
@@ -51,9 +53,9 @@ enum Step {
 /// What the store asks when it lacks a key, and what is known of the remote to answer it.
 #[derive(Default)]
 pub struct Asked {
-    /// The packs that are fetched when a key of theirs is asked for, with
-    /// `BLAZE_REMOTE_LAZY`.
-    lazy: RwLock<Option<Arc<Lazy>>>,
+    /// The remote as a tier of the store, with `BLAZE_REMOTE_LAZY`: what fetches the pack
+    /// of a key the store lacks, and waits for it.
+    tier: RwLock<Option<Arc<Tiered>>>,
     /// What the manifest hashed to when it was last pulled from.
     seen: Mutex<Option<Digest>>,
     /// Whether a build lacked a key since the manifest was last looked at.
@@ -62,10 +64,12 @@ pub struct Asked {
 }
 
 impl Asked {
-    pub fn fetch_from(&self, lazy: Lazy) {
-        if let Ok(mut now) = self.lazy.write() {
-            *now = Some(Arc::new(lazy));
-        }
+    pub fn read_through(&self, tier: Arc<Tiered>) {
+        *self.tier.write().unwrap_or_else(PoisonError::into_inner) = Some(tier);
+    }
+
+    pub fn tiered(&self) -> Option<Arc<Tiered>> {
+        self.tier.read().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     /// Whether the manifest is what it was when it was last pulled from.
@@ -79,19 +83,22 @@ impl Asked {
         std::mem::replace(&mut *seen, manifest) != manifest
     }
 
-    /// Whether the pack that holds `key` is in the store now. A key that stays lacking has
-    /// the task look at the manifest, once for all that are lacking by then.
-    pub fn fetch(&self, key: &[u8; 32]) -> bool {
-        let lazy = self.lazy.read().ok().and_then(|it| it.clone());
-        if lazy.is_some_and(|it| it.fetch(key)) {
-            return true;
+    /// The store's question of a key it lacks (`blaze_store::FetchMissing`): through the
+    /// tier, which waits for the pack or fails, with `BLAZE_REMOTE_LAZY`; otherwise the pull
+    /// brings what there is. A key that stays lacking has the task look at the manifest,
+    /// once for all that are lacking by then.
+    pub fn fetch(&self, key: &[u8; 32], tried: &[Hash]) -> Result<Option<Hash>, String> {
+        if let Some(tier) = self.tiered()
+            && let Some(pack) = tier.fetch(key, tried)?
+        {
+            return Ok(Some(pack));
         }
         if !self.lacked.swap(true, Ordering::Relaxed)
             && let Some(steps) = self.steps.get()
         {
             _ = steps.send(Step::Look);
         }
-        false
+        Ok(None)
     }
 }
 

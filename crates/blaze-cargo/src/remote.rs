@@ -8,8 +8,10 @@
 //! their bytes, the keys of each pack under the hash of those, and one manifest a project:
 //! the packs its builds were served from. A push sends the packs the manifest lacks and
 //! adds them to it; a pull fetches the ones it lists that are not here. With
-//! `BLAZE_REMOTE_LAZY` the daemon fetches the keys only, and a pack when a build first asks
-//! for a key it holds. A daemon that stays goes on in `keeper.rs`: it pulls again when a
+//! `BLAZE_REMOTE_LAZY` nothing is pulled: the remote is a tier under the store
+//! (`tier.rs`), which finds the pack of a key a build lacks through the project's key index
+//! (`index.rs`) and fetches it while the build waits. A daemon that stays goes on in
+//! `keeper.rs`: it pulls again when a
 //! build lacked something and the manifest has changed, and pushes on a schedule and when
 //! it is told to end.
 //!
@@ -32,16 +34,14 @@ pub mod index;
 pub mod keeper;
 pub mod s3;
 pub mod signed;
+pub mod tier;
 pub mod transfer;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     path::{Path, PathBuf},
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -51,7 +51,6 @@ use blaze_store::{
     parse_size, write_file_whole,
 };
 use futures_util::{StreamExt, stream};
-use rustc_hash::FxHashMap;
 use tokio::{io::AsyncSeekExt, runtime::Runtime};
 use url::Url;
 
@@ -60,6 +59,7 @@ pub use https::{Https, next as https_next};
 use s3::{S3, Written};
 use signed::{NotRewritten, Trust, Turns, Unremembered};
 use transfer::{Body, Object, TooLong, Version};
+use tier::Tiered;
 pub use transfer::{Digest, Fetched, Room, Traffic};
 
 /// How often a list is read again and written again after another machine wrote first.
@@ -1296,8 +1296,8 @@ impl Shared {
     /// The remote `spec` names, for the project `project` of the store in `store`, with its
     /// packs left there until a key of theirs is asked for: what takes a part of a project
     /// shared by all, as `blaze-engine closure materialize` takes the store paths it is asked for.
-    /// A remote that cannot be opened is an error; one that fails later is said, and what
-    /// it would have brought is missing from the store.
+    /// A remote that cannot be opened is an error; a key that cannot be had from it once it
+    /// is is missing from the store, and said.
     pub fn lazily(store: &Path, spec: &str, project: &str) -> anyhow::Result<Shared> {
         let runtime = runtime()?;
         let remote = Arc::new(runtime.block_on(Remote::open(spec, store))?);
@@ -1312,34 +1312,42 @@ impl Shared {
         })
     }
 
-    /// Fetches what the project's manifest lists, or with `BLAZE_REMOTE_LAZY` only what
-    /// tells which pack holds which key, leaving each pack to the first build that asks.
-    /// From here on the store asks this remote for the keys it lacks. An error only when
-    /// [`required`].
+    /// Fetches what the project's manifest lists, or with `BLAZE_REMOTE_LAZY` reads the
+    /// root of its key index and the runs it names, leaving each pack to the first key of
+    /// it a build asks for, which waits for it (`tier.rs`). From here on the store asks
+    /// this remote for the keys it lacks. An error only when [`required`]; with
+    /// `BLAZE_REMOTE_LAZY` a lookup that cannot be answered fails the build that made it
+    /// whatever this says.
     pub fn pull(&self) -> anyhow::Result<()> {
         // An outage during one build is over by the next, or is found again.
         self.remote.traffic.try_again();
         let start = Instant::now();
-        let done = self.runtime.block_on(async {
-            self.asked.see(self.manifest_now().await);
-            self.pull_as_set().await
+        // Lookups wait for the tier to be read rather than miss while it is.
+        let loading = self.lazy.then(|| {
+            let (tiered, held) =
+                Tiered::new(&self.store, self.remote.clone(), self.runtime.clone(), &self.project);
+            self.asked.read_through(tiered.clone());
+            (tiered, held)
         });
         let asked = self.asked.clone();
-        blaze_store::fetch_missing_with(Box::new(move |key| asked.fetch(key)));
+        blaze_store::fetch_missing_with(Box::new(move |key, tried| asked.fetch(key, tried)));
+        let done = self.runtime.block_on(async {
+            self.asked.see(self.manifest_now().await);
+            match loading {
+                Some((tiered, held)) => tiered.load(held).await,
+                None => self.pull_as_set().await,
+            }
+        });
         self.report(done, start)
     }
 
     /// A pull the way the daemon is set to pull: of every pack, or of what says where the
     /// keys are.
     async fn pull_as_set(&self) -> anyhow::Result<String> {
-        if !self.lazy {
-            return pull(&self.store, &self.remote, &self.project).await;
+        match self.asked.tiered() {
+            Some(tiered) if self.lazy => tiered.reload().await,
+            _ => pull(&self.store, &self.remote, &self.project).await,
         }
-        let lazy = Lazy::load(self).await?;
-        let said =
-            format!("{} keys in {} packs to fetch from", lazy.holder.len(), lazy.packs.len());
-        self.asked.fetch_from(lazy);
-        Ok(said)
     }
 
     /// What the project's manifest hashes to now: `None` when there is none or it cannot
@@ -1381,141 +1389,6 @@ impl Shared {
         match required() {
             true => Err(e.context("BLAZE_REMOTE_REQUIRED is set")),
             false => Ok(()),
-        }
-    }
-}
-
-/// How long a thread that compiles waits for the pack of a key it lacks, while the remote
-/// brings packs within it: a key that comes in that time is not compiled. Once one takes
-/// longer, no thread of this process waits on the remote again.
-const WAIT_AT_MOST: Duration = Duration::from_millis(250);
-
-/// A pack being fetched: whether it came, once that is known.
-#[derive(Default)]
-struct Arriving {
-    came: std::sync::Mutex<Option<bool>>,
-    known: std::sync::Condvar,
-}
-
-/// The packs of a manifest that are not here yet, and which of them holds each key.
-pub struct Lazy {
-    store: PathBuf,
-    remote: Arc<Remote>,
-    runtime: Arc<Runtime>,
-    /// Each pack and, once a key of it was asked for, its fetch.
-    packs: Vec<(Digest, Listed, OnceLock<Arc<Arriving>>)>,
-    holder: FxHashMap<[u8; 32], u32>,
-    /// Whether every pack waited for came within [`WAIT_AT_MOST`].
-    in_time: AtomicBool,
-}
-
-impl Lazy {
-    /// Fetches the keys of every pack the manifest lists that the store lacks. They are
-    /// kept in memory: the store's directory holds nothing that is not the store's.
-    async fn load(shared: &Shared) -> anyhow::Result<Lazy> {
-        let (store, remote) = (&shared.store, &shared.remote);
-        let local = local_packs(&claim(store, false).await?)?;
-        let manifest = Manifest::fetch(remote, &shared.project).await?.unwrap_or_default();
-        let (missing, _) = manifest.missing(&local);
-        // A pack the store may not hold is not one to fetch, and the keys of them all are
-        // kept in memory: no more of them than one object may be.
-        let limit = limit_for(store).map_err(anyhow::Error::msg)?.unwrap_or(u64::MAX);
-        let held = &Room::of(Some(remote.object_max));
-        let fetched = stream::iter(missing.into_iter().map(|(pack, listed)| async move {
-            if listed.size > limit {
-                bail!("{pack}.pack is listed as {} bytes, over BLAZE_CACHE_MAX", listed.size);
-            }
-            let most = listed.keys_max(remote);
-            let keys =
-                remote.read_named_by_hash(&keys_object(&listed.keys), &listed.keys, most).await?;
-            held.take(keys.len() as u64)?;
-            Ok((pack, listed, keys))
-        }))
-        .buffer_unordered(remote.traffic.jobs())
-        .collect::<Vec<_>>()
-        .await;
-        let mut lazy = Lazy {
-            store: store.clone(),
-            remote: remote.clone(),
-            runtime: shared.runtime.clone(),
-            packs: Vec::new(),
-            holder: FxHashMap::default(),
-            in_time: AtomicBool::new(true),
-        };
-        for fetched in fetched {
-            match fetched {
-                Ok((pack, listed, keys)) => lazy.add(pack, listed, &keys),
-                Err(e) if required() => return Err(e),
-                Err(e) => eprintln!("remote: {e:#}"),
-            }
-        }
-        Ok(lazy)
-    }
-
-    fn add(&mut self, pack: Digest, listed: Listed, keys: &[u8]) {
-        let at = self.packs.len() as u32;
-        self.packs.push((pack, listed, OnceLock::new()));
-        for key in keys.as_chunks::<32>().0 {
-            self.holder.entry(*key).or_insert(at);
-        }
-    }
-
-    /// Whether the pack that holds `key` is in the store now. The first key of a pack that is
-    /// asked for starts fetching it; the thread that asked waits for it [`WAIT_AT_MOST`], while
-    /// the remote keeps within that, and otherwise compiles the key rather than wait on the
-    /// network. A pack that comes later is read by the store then, and the keys asked for
-    /// after that are found.
-    fn fetch(&self, key: &[u8; 32]) -> bool {
-        let Some(&at) = self.holder.get(key) else { return false };
-        let (pack, listed, asked) = &self.packs[at as usize];
-        let mut first = false;
-        let arriving = asked.get_or_init(|| {
-            first = true;
-            Arc::default()
-        });
-        if first {
-            let (pack, listed, arriving) = (*pack, *listed, arriving.clone());
-            let (remote, store) = (self.remote.clone(), self.store.clone());
-            self.runtime.spawn(async move {
-                let came = match fetch_pack(&remote, &store, &pack, &listed).await {
-                    Ok(Fetched::Whole(bytes)) => {
-                        eprintln!("remote: {pack}.pack fetched for a build, {bytes} bytes");
-                        true
-                    }
-                    Ok(Fetched::Elsewhere) => false,
-                    // The build compiles what the pack held; with BLAZE_REMOTE_REQUIRED the
-                    // client fails it once it is over.
-                    Err(e) => {
-                        let why = format!("{e:#}");
-                        eprintln!("remote: {}", why.lines().next().unwrap_or_default());
-                        note_down(&store, &remote.place.name(), Some(&e));
-                        false
-                    }
-                };
-                *arriving.came.lock().unwrap_or_else(|it| it.into_inner()) = Some(came);
-                arriving.known.notify_all();
-                if came && let Some(store) = blaze_store::Store::global() {
-                    store.refresh();
-                }
-            });
-        }
-        if !self.in_time.load(Ordering::Relaxed) {
-            return false;
-        }
-        let came = arriving.came.lock().unwrap_or_else(|it| it.into_inner());
-        let waited = arriving.known.wait_timeout_while(came, WAIT_AT_MOST, |it| it.is_none());
-        let (came, _) = waited.unwrap_or_else(|it| it.into_inner());
-        match *came {
-            Some(came) => came,
-            None => {
-                if self.in_time.swap(false, Ordering::Relaxed) {
-                    eprintln!(
-                        "remote: a pack took over {WAIT_AT_MOST:?}: what is not here is compiled \
-                         while the packs come"
-                    );
-                }
-                false
-            }
         }
     }
 }
@@ -2047,6 +1920,77 @@ pub mod tests {
         let runs = blaze_store::remote_index::Root::parse(&root).runs;
         assert!(runs.len() < 6, "{root}");
         assert_eq!(runs.iter().map(|it| it.packs).sum::<u32>(), 12, "{root}");
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store that lacks a key fetches the pack that holds it through the index, or through
+    /// its key list when no run covers it, and a shard that is gone fails the lookup, naming
+    /// it, until a push takes its run out.
+    #[test]
+    fn a_store_reads_through_the_index() {
+        blaze_store::compiles_against("remote tier test");
+        let (remote, dir) = unsigned("tier", 1 << 30);
+        let fill = |name: &str, first: u32, count: u32| {
+            let at = dir.join(name);
+            let store = blaze_store::Store::open_at(&at).unwrap();
+            for n in first..first + count {
+                for key in 0..200u32 {
+                    let key: [u8; 32] =
+                        Digest::of(&(n * 1000 + key).to_le_bytes()).bytes().to_owned();
+                    store.insert(&key, &key[..8]);
+                }
+                store.seal();
+            }
+            drop(store);
+            wait(push(&at, &remote, "default")).unwrap();
+            keys_by_pack(&at)
+        };
+        let mut packs = fill("a", 0, 3);
+        // A pack listed by a blaze from before the index: no run covers it.
+        let root = dir.join(index::root_at("default"));
+        let indexed = std::fs::read(&root).unwrap();
+        packs.extend(fill("b", 3, 1));
+        std::fs::write(&root, &indexed).unwrap();
+        // Read as another machine reads it, which has seen no turn of the lists.
+        let tiered = |name: &str| {
+            let reader = Remote::in_dir(&dir, &dir.join(name).join("kept"), taking_unsigned(), 1 << 30);
+            let store = dir.join(name);
+            let (tiered, held) =
+                tier::Tiered::new(&store, Arc::new(reader), Arc::new(runtime().unwrap()), "default");
+            (wait(tiered.load(held)), tiered, store)
+        };
+        let (said, reader, store) = tiered("fresh");
+        let said = said.unwrap();
+        assert!(said.contains("1 of them not indexed"), "{said}");
+        wait(async {
+            for (pack, keys) in &packs {
+                for key in keys.iter().step_by(37) {
+                    let brought = tier::find(&reader, key).await.unwrap();
+                    assert_eq!(brought.last(), Some(pack), "{pack}");
+                    assert!(store.join(pack_file(pack)).exists());
+                }
+            }
+            let absent = Digest::of(b"no pack holds this").bytes().to_owned();
+            assert!(tier::find(&reader, &absent).await.unwrap().is_empty());
+        });
+        // A shard taken from under the index fails the lookup of a key it holds.
+        let lines = std::fs::read_to_string(&root).unwrap();
+        let named = &blaze_store::remote_index::Root::parse(&lines).runs[0];
+        let run = wait(index::run(&remote, named)).unwrap().unwrap();
+        let (_, shard) = run.shards().next().unwrap();
+        std::fs::remove_file(dir.join(index::object(&shard))).unwrap();
+        let (pack, keys) = packs.iter().find(|(pack, _)| run.packs().contains(pack.bytes())).unwrap();
+        let key = keys.iter().find(|key| run.shard(run.slot(key)) == Some(shard)).unwrap();
+        let (_, reader, _) = tiered("broken");
+        let e = wait(tier::find(&reader, key)).unwrap_err();
+        assert!(format!("{e:#}").contains(&index::object(&shard)), "{e:#}");
+        // The next push takes the run out and indexes its packs again: of a machine that
+        // did not see the root put back.
+        let pusher = Remote::in_dir(&dir, &dir.join("mending"), taking_unsigned(), 1 << 30);
+        let said = wait(push(&dir.join("a"), &pusher, "default")).unwrap();
+        assert!(said.contains("4 packs indexed"), "{said}");
+        let (_, reader, _) = tiered("mended");
+        assert_eq!(wait(tier::find(&reader, key)).unwrap().last(), Some(pack));
         _ = std::fs::remove_dir_all(&dir);
     }
 
