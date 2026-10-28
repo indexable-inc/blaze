@@ -111,7 +111,8 @@ InGroup { Exclusive }                   // (InGroup, nav.<section>): the page's 
 Lessons { Exclusive }                   // (Lessons, page) on a Course: the lessons it maps are that page's
 
 // Page kinds.
-Discussable {}                          // signed-in readers comment on each block
+Discussable {}                          // signed-in readers comment on each block (every other page has one discussion for the whole page)
+Quiet {}                                // no discussion at all (the 404, the signup form)
 Narrow {}                               // a 560px column instead of 820px
 Wide {}                                 // a wide column, no outline beside it
 Hero {}                                 // the page's title is the logo, large (the home page)

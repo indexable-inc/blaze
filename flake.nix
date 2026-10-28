@@ -97,7 +97,7 @@
         # The one version, from the workspace's Cargo.toml.
         version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
         # The one build of blaze, the release workflow's recipe (.github/scripts/build_release.py):
-        # the `dist` profile optimized with the profile pgo/profiles.json pins for this system,
+        # the `dist` profile optimized with the profile tools/pgo/profiles.json pins for this system,
         # fetched by its sha256. The binaries run each other from next to themselves, unwrapped.
         # `--nix`: they load nixpkgs' glibc, so the release's floor of RHEL 9's glibc is not theirs
         # (build_release.py checks that instead; release.yaml keeps the floor).
@@ -106,9 +106,9 @@
           aarch64-linux = "aarch64-unknown-linux-gnu";
           aarch64-darwin = "aarch64-apple-darwin";
         }.${system};
-        pgo = builtins.fromJSON (builtins.readFile ./pgo/profiles.json);
+        pgo = builtins.fromJSON (builtins.readFile ./tools/pgo/profiles.json);
         pgoProfile =
-          let pin = pgo.targets.${triple} or (throw "pgo/profiles.json has no profile for ${triple}: run the pgo workflow");
+          let pin = pgo.targets.${triple} or (throw "tools/pgo/profiles.json has no profile for ${triple}: run the pgo workflow");
           in pkgs.fetchurl { url = "${pgo.release}/${pin.name}"; inherit (pin) sha256; };
         dist = rustPlatform.buildRustPackage (llvmEnv // {
           pname = "blaze-dist";
@@ -163,17 +163,17 @@
         ]);
         libPath = pkgs.lib.makeLibraryPath guiLibs;
 
-        # One derivation per cargo unit (nix/units.nix, nix/units/*.json from nix/unit_graph.py):
+        # One derivation per cargo unit (tools/nix/units.nix, tools/nix/units/*.json from tools/nix/unit_graph.py):
         # editing blaze's own source rebuilds only blaze, never the crates it depends on. The
         # demo's window is built this way; `daemon-units` is blaze built this way, `release`
         # without PGO, for working on the flake: what ships is `dist`.
-        units = json: import ./nix/units.nix {
+        units = json: import ./tools/nix/units.nix {
           inherit pkgs rust guiLibs json;
           repo = ./.;
           gitSha = self.shortRev or self.dirtyShortRev or "";
         };
-        daemonUnits = units ./nix/units/daemon.json;
-        lifeUnits = units ./nix/units/life.json;
+        daemonUnits = units ./tools/nix/units/daemon.json;
+        lifeUnits = units ./tools/nix/units/life.json;
         # blaze's binaries run each other from next to themselves, found by
         # their own path: the binaries are copied together, not wrapped or linked. The toolchain
         # has to be on PATH (the launcher puts it there).
@@ -201,7 +201,7 @@
           export BLAZE_LIFE_DAEMON_BINS=${dist}/bin BLAZE_LIFE_PREBUILT=${life-bin}/bin/life
           export BLAZE_LIFE_PATH=${rust}/bin${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ":${pkgs.stdenv.cc}/bin"}
           export BLAZE_LIFE_LIBS=${libPath}
-          exec ${pkgs.python3}/bin/python3 -I ${./nix/life_launch.py} "$@"
+          exec ${pkgs.python3}/bin/python3 -I ${./tools/nix/life_launch.py} "$@"
         '';
       in {
         packages = {

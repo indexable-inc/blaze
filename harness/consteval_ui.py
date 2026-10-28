@@ -6,7 +6,7 @@ usage: consteval_ui.py CONFIG
 CONFIG is one JSON object, inline, in a file, or `-` for standard input:
 
     {"rust": "<rust checkout>", "bin": "<blaze-engine>", "work": "<dir>", "jobs": 8,
-     "out": "bench/results/<date>-consteval", "run_pass": true,
+     "out": "tools/bench/results/<date>-consteval", "run_pass": true,
      "min_evaluation": 0, "min_run_pass": 0}
 
 `rust` and `bin` are required; `bin` defaults to nothing, so a run names the blaze it scores.

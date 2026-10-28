@@ -1190,11 +1190,12 @@ pub fn socket_in(home: &Path) -> PathBuf {
     home.join("daemon.sock")
 }
 
-/// What two processes have to agree on to talk: the version of the crate and the executable
-/// itself, so that a daemon of an older build of the same version is replaced too. The
-/// executable is told by where it is as well as by its size and time: every build in the nix
-/// store has the same time, and two builds of a small change can have the same size, but no
-/// two have the same path.
+/// What two processes have to agree on to talk: the executable itself, so that a daemon of
+/// any other build is replaced. The executable is told by where it is as well as by its size
+/// and time: every build in the nix store has the same time, and two builds of a small change
+/// can have the same size, but no two have the same path. No version of blaze's: an
+/// executable's place, size and time already tell one release from another, and the version is
+/// the engine's alone (crates/blaze-engine/build.rs).
 pub fn version() -> String {
     let executable = std::env::current_exe().and_then(std::fs::canonicalize);
     let place: String = executable.as_ref().map_or_else(
@@ -1207,7 +1208,7 @@ pub fn version() -> String {
     let built = executable.and_then(std::fs::metadata);
     let built = built.map(|it| (it.len(), it.modified().map_or(0, stamp_of)));
     let (len, written) = built.unwrap_or_default();
-    format!("{}-{place}-{len:x}-{written:x}", env!("CARGO_PKG_VERSION"))
+    format!("{place}-{len:x}-{written:x}")
 }
 
 /// `blaze-engine daemon`: serves the user's builds until it has been idle for long enough or is
