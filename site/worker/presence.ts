@@ -30,7 +30,6 @@
  *                     {t: "error", text}                        why the tab's last chat message was refused
  *                     {t: "c", k, c}                            someone else on this tab's page moved their pointer:
  *                                                                  `k` their key, `c` as they sent it, or null
- *                     {t: "v", k, v}                            the same for the part of the page they are reading
  *                     {t: "say-live", k, text, done}            someone else on this tab's page is writing a line by
  *                                                                  their pointer (client/lib/cursors.ts): `text` as it
  *                                                                  stands, null when they gave up; `done` once sent
@@ -50,19 +49,20 @@
  *                                                                  back their reaction `kind` (REACTIONS) on a message
  *                     {t: "unsay", id}                          chat: for the author or a COMMENT_ADMINS id
  *                     {t: "thread", id}                         chat: asks for that message's thread
- *                     {t: "c", c: [x, block, f] | null}         the tab's pointer, or null when it left the page
- *                     {t: "v", v: [block, f, block, f] | null}  the top and bottom of the tab's viewport
+ *                     {t: "c", c: [region, key, x, y] | null}  the tab's pointer, or null when it left the page or is
+ *                                                                  on nothing the others have
  *                     {t: "say-live", text: string | null, done?}  the line the reader is writing by their pointer (any
  *                                                                  reader, signed in or not), at most CHAT_MAX; null to
  *                                                                  take it back; `done` when sent (a signed-in reader
  *                                                                  sends it to the chat too, as a `say`)
  *
- * `c` and `v` are positions in the page's text (client/lib/cursors.ts): x a fraction of the article's width, a block
- * index and a fraction of that block's height. They go only to the other people's tabs on the same page (pointers
- * not to hidden tabs), rebuilt from the numbers, never stored: nothing is written, not even to the socket's
- * attachment, so they cost a wake-up and nothing else. Each person gets MOVE_RATE a second (MOVE_BURST at once),
- * pointers and viewports together; the rest is dropped. `say-live` goes the same way, on the same budget: passed on to
- * the page, never stored, gone when the tab is.
+ * `c` is what the pointer is on (client/lib/anchor.ts): `region` one of REGIONS ("m" the article), `key` the thing in
+ * it (in the article `b<block>` or `b<block>.<character>`; elsewhere a short string of KEY's characters), and x and y
+ * fractions of that thing's box. Anything else (a pointer from a tab older than this shape) is dropped. It goes only to
+ * the other people's tabs on the same page that are not hidden, rebuilt from the checked values, never stored: nothing
+ * is written, not even to the socket's attachment, so it costs a wake-up and nothing else. Each person gets MOVE_RATE a
+ * second (MOVE_BURST at once); the rest is dropped. `say-live` goes the same way, on the same budget: passed on to the
+ * page, never stored, gone when the tab is.
  *
  * Msg is {id, key, login, avatar, text, at, parent?, broadcast?, to?, edited?, reactions?}; a top-level one in `chat`
  * and `thread` frames also carries its Summary, {replies, last, repliers}: how many replies, when the last came (ISO),
@@ -117,8 +117,11 @@ const MAX_PEOPLE = 300;
 const TYPING_MS = 2000;
 const MOVE_RATE = 30;
 const MOVE_BURST = 60;
-/** Bounds on the numbers in `c` and `v`: blocks are indexes into a page, the rest fractions, a little past 0 to 1. */
-const MAX_BLOCK = 100_000;
+/** What a pointer (`c`) may be on (client/lib/anchor.ts, which keeps the same): the regions, the article's keys, any
+ * other region's, and the bound on the fractions, a little past 0 to 1. */
+const REGIONS = new Set(['m', 'w', 't', 'c', 'o', 's']);
+const BLOCK_KEY = /^b\d{1,6}(?:\.\d{1,7})?$/;
+const KEY = /^[\w/.#:?=&%~+@,-]{0,160}$/;
 const MAX_FRAC = 50;
 /** A reload or a dropped connection shorter than this keeps someone's time on the site. */
 const RETURN_MS = 120_000;
@@ -202,6 +205,16 @@ export async function announce(env: Env, doc: string): Promise<void> {
 	}
 }
 
+/** A pointer's place as a tab sent it, checked (`relay`): its parts, rebuilt, or undefined when anything is off. */
+function spotOf(raw: unknown): [string, string, number, number] | undefined {
+	if (!Array.isArray(raw) || raw.length !== 4) return;
+	const [region, key, x, y]: unknown[] = raw;
+	if (typeof region !== 'string' || !REGIONS.has(region) || typeof key !== 'string') return;
+	if (region === 'm' ? !BLOCK_KEY.test(key) : !KEY.test(key)) return;
+	if (typeof x !== 'number' || typeof y !== 'number' || !(Math.abs(x) <= MAX_FRAC) || !(Math.abs(y) <= MAX_FRAC)) return;
+	return [region, key, Math.round(x * 1000) / 1000, Math.round(y * 1000) / 1000];
+}
+
 const avatarOf = (url: string | null): string | null =>
 	url && /^https:\/\/avatars\.githubusercontent\.com\/[\x21-\x7e]*$/.test(url) ? url : null;
 
@@ -216,9 +229,9 @@ export class Presence extends DurableObject<Env> {
 	private typed = new Map<string, number>();
 	/** When each person came, and when their last tab went (null while one is open). Lost on hibernation; then a tab's own `since` stands. */
 	private arrived = new Map<string, { at: number; gone: number | null }>();
-	/** Each person's budget for `c` and `v` frames (a token bucket). Lost on hibernation, which only forgives. */
+	/** Each person's budget for `c` and `say-live` frames (a token bucket). Lost on hibernation, which only forgives. */
 	private moved = new Map<string, { at: number; n: number }>();
-	/** The open tabs on each page, for `c` and `v`; rebuilt from the attachments after any tab moves, comes or goes. */
+	/** The open tabs on each page, for `c` and `say-live`; rebuilt from the attachments after any tab moves, comes or goes. */
 	private rooms: Map<string, { ws: WebSocket; key: string; away: boolean }[]> | null = null;
 
 	constructor(ctx: DurableObjectState, env: Env) {
@@ -313,7 +326,6 @@ export class Presence extends DurableObject<Env> {
 			kind?: unknown;
 			on?: unknown;
 			c?: unknown;
-			v?: unknown;
 		};
 		try {
 			m = JSON.parse(message) as typeof m;
@@ -321,8 +333,7 @@ export class Presence extends DurableObject<Env> {
 			return ws.close(1003, 'Not JSON.');
 		}
 		const tab = ws.deserializeAttachment() as Tab;
-		if (m.t === 'c') return this.relay(tab, 'c', m.c, 3);
-		if (m.t === 'v') return this.relay(tab, 'v', m.v, 4);
+		if (m.t === 'c') return this.relay(tab, m.c);
 		if (m.t === 'say-live') return this.sayLive(tab, m.text, m.done);
 		if (m.t === 'typing') {
 			const now = Date.now();
@@ -359,28 +370,14 @@ export class Presence extends DurableObject<Env> {
 		this.schedule();
 	}
 
-	/**
-	 * Passes a pointer (`c`) or viewport (`v`) on to the other people on the tab's page: `n` numbers, every other one
-	 * a block index (for `c` the second; for `v` the first and third), or null. Anything else is dropped.
-	 */
-	private relay(tab: Tab, t: 'c' | 'v', raw: unknown, n: number): void {
+	/** Passes a pointer (`c`) on to the other people on the tab's page, checked and rebuilt, or null. Anything else is dropped. */
+	private relay(tab: Tab, raw: unknown): void {
 		if (!tab.path) return;
-		let at: number[] | null = null;
-		if (raw !== null) {
-			if (!Array.isArray(raw) || raw.length !== n) return;
-			at = [];
-			for (let i = 0; i < n; i++) {
-				const x: unknown = raw[i];
-				if (typeof x !== 'number' || !Number.isFinite(x)) return;
-				const block = t === 'c' ? i === 1 : i % 2 === 0;
-				if (block ? !Number.isInteger(x) || x < 0 || x > MAX_BLOCK : Math.abs(x) > MAX_FRAC) return;
-				at.push(block ? x : Math.round(x * 1000) / 1000);
-			}
-		}
-		if (!this.allow(tab.key)) return;
-		const out = JSON.stringify({ t, k: tab.key, [t]: at });
+		const c = raw === null ? null : spotOf(raw);
+		if (c === undefined || !this.allow(tab.key)) return;
+		const out = JSON.stringify({ t: 'c', k: tab.key, c });
 		for (const r of this.room(tab.path)) {
-			if (r.key === tab.key || (t === 'c' && r.away)) continue;
+			if (r.key === tab.key || r.away) continue;
 			try {
 				r.ws.send(out);
 			} catch {

@@ -566,7 +566,7 @@ fn quiz(n: Id, ctx: &mut Ctx) -> Result<String, String> {
 }
 
 /// A lesson's steps, and the ids of its questions (Quiz and Tap blocks, as their path under the page): what the
-/// course map counts and client/learn.ts keeps answers under.
+/// course path counts and client/learn.ts keeps answers under.
 pub fn lesson_parts(world: &World, lesson: Id) -> (usize, Vec<String>) {
     fn walk(world: &World, n: Id, base: usize, out: &mut Vec<String>) {
         for &c in &world.get(n).children {
@@ -585,8 +585,35 @@ pub fn lesson_parts(world: &World, lesson: Id) -> (usize, Vec<String>) {
     (steps, quizzes)
 }
 
-/// The course map: each lesson under the page as a node on a path, numbered, with its line, steps and minutes. It is
-/// a list of links without JS; client/learn.ts lights each node with the reader's progress and adds the mastery meter.
+/// A lesson page's glyph: the drawing gen/glyphs.ts made for its `Lesson.glyph`, baked onto the page by the build.
+fn glyph(ctx: &Ctx, lesson: Id) -> Result<String, String> {
+    match ctx.e(lesson).value("Baked").and_then(|v| v.get("html")) {
+        Some(crate::world::Scalar::Str(h)) if !h.is_empty() => Ok(h.clone()),
+        _ => Err(format!("{}: the lesson's glyph is not baked (run the build)", ctx.e(lesson).path)),
+    }
+}
+
+/// The check on a finished lesson's node.
+const DONE_MARK: &str = "<svg viewBox=\"0 0 12 12\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M3.2 6.3l1.9 1.9 3.7-4.1\"/></svg>";
+
+/// The end of the path: a check in pixel cells on a faint grid, as the lesson's "complete" screen draws it
+/// (client/learn.ts `seal`).
+fn end_seal() -> String {
+    const ON: [(u8, u8); 7] = [(1, 3), (2, 4), (3, 5), (4, 4), (5, 3), (6, 2), (7, 1)];
+    let mut cells = String::new();
+    for y in 0..7u8 {
+        for x in 0..9u8 {
+            let on = if ON.contains(&(x, y)) { " class=\"on\"" } else { "" };
+            cells += &format!("<rect x=\"{x}.1\" y=\"{y}.1\" width=\"0.8\" height=\"0.8\"{on}/>");
+        }
+    }
+    format!("<svg class=\"seal\" viewBox=\"0 0 9 7\" aria-hidden=\"true\">{cells}</svg>")
+}
+
+/// The course path: the way in (the first lesson, until client/learn.ts points it at the reader's next one), then each
+/// lesson under the page as a node on a winding path, with its glyph, number, title, line, steps, minutes and
+/// questions, and the path's end. Without JS it is a list of links; client/learn.ts lights each node with the
+/// reader's progress, draws the trail between them, and adds the counts and each lesson's mastery cells.
 fn course(n: Id, ctx: &mut Ctx) -> Result<String, String> {
     let source = ctx.s.world.course_source(n)?;
     let lessons = ctx.s.world.lessons(source);
@@ -594,13 +621,13 @@ fn course(n: Id, ctx: &mut Ctx) -> Result<String, String> {
         .first()
         .and_then(|&l| ctx.s.page_of(l))
         .ok_or_else(|| format!("{}: a Course with no lessons", ctx.e(n).path))?;
-    // The way in: the first lesson without JS; client/learn.ts points it at the reader's next one.
     let go = format!(
-        "<p class=\"course-go\"><a class=\"go\" href=\"{}\"><span class=\"k\">Start lesson 1</span><span class=\"t\">{}</span></a></p>",
+        "<div class=\"course-top\"><a class=\"course-go\" href=\"{}\"><span class=\"k\">Start lesson 1</span><span class=\"t\">{}</span></a></div>",
         esc(&ctx.s.served.href(&first.url)),
         esc(&text(ctx.e(first.node), "Title"))
     );
     let mut items = String::new();
+    let count = lessons.len();
     for (i, c) in lessons.into_iter().enumerate() {
         let e = ctx.e(c);
         let p =
@@ -608,19 +635,29 @@ fn course(n: Id, ctx: &mut Ctx) -> Result<String, String> {
         let (steps, quizzes) = lesson_parts(ctx.s.world, c);
         // About 20 seconds a step: a short paragraph, or a question.
         let minutes = (steps * 20).div_ceil(60).max(1);
+        let questions = match quizzes.len() {
+            0 => String::new(),
+            1 => " · 1 question".to_string(),
+            q => format!(" · {q} questions"),
+        };
         let line = prose(&field(e.value("Lesson"), "line"));
         items += &format!(
-            "<li class=\"node\" data-lesson=\"{}\" data-steps=\"{steps}\" data-quizzes=\"{}\"><a href=\"{}\"><span class=\"n\" aria-hidden=\"true\">{}</span><span class=\"body\"><span class=\"t\">{}</span><span class=\"l\">{}</span><span class=\"m\">{steps} steps · {minutes} min</span></span></a></li>",
+            "<li class=\"node\" data-lesson=\"{}\" data-steps=\"{steps}\" data-quizzes=\"{}\"><a href=\"{}\"><span class=\"pin\" aria-hidden=\"true\"><span class=\"disc\">{}</span><span class=\"badge\">{DONE_MARK}</span></span><span class=\"body\"><span class=\"n\">Lesson {}</span><span class=\"t\">{}</span><span class=\"l\">{}</span><span class=\"m\">{steps} steps · {minutes} min{questions}</span></span></a></li>",
             esc(&e.name),
             esc(&quizzes.join(" ")),
             esc(&ctx.s.served.href(&p.url)),
+            glyph(ctx, c)?,
             i + 1,
             esc(&text(e, "Title")),
             esc(&line),
         );
     }
+    let end = format!(
+        "<div class=\"path-end\"><span class=\"pin\" aria-hidden=\"true\"><span class=\"disc\">{}</span></span><span class=\"body\"><span class=\"t\">The end of the course</span><span class=\"l\">After lesson {count}, you know how blaze builds.</span></span></div>",
+        end_seal(),
+    );
     ctx.script("learn");
-    Ok(format!("{go}<ol class=\"course\">{items}</ol>"))
+    Ok(format!("<div class=\"course\">{go}<ol class=\"path\">{items}</ol>{end}</div>"))
 }
 
 /// Every child of the table is a row and every child of a row a cell, comments included, as the TS has it.
@@ -719,14 +756,14 @@ fn meta(ctx: &Ctx) -> Result<String, String> {
 }
 
 /// On a lesson page, what client/learn.ts needs on `<main>`: the lesson's name (its key in the reader's progress),
-/// its number, its line, its questions, and where the course map and the next lesson are.
+/// its number, its line, its questions, and where the course path and the next lesson are.
 fn lesson_attrs(ctx: &mut Ctx) -> Result<(&'static str, String), String> {
     let e = ctx.e(ctx.page.node);
     let Some(v) = e.value("Lesson") else { return Ok(("", String::new())) };
     let line = prose(&field(Some(v), "line"));
     let name = e.name.clone();
     let parent = e.parent.ok_or("a Lesson has no parent")?;
-    // The course map is on the page whose Course widget lists this lesson's siblings (the home page).
+    // The course path is on the page whose Course widget lists this lesson's siblings (the home page).
     let course = ctx
         .s
         .pages
@@ -913,8 +950,15 @@ pub fn render(
             crate::side::picture(s.world, s.site, s.served, "logo", "")
         )
     } else {
+        // A lesson's glyph above its title, as on its node on the course path (client/learn.ts moves it to the
+        // player's cover).
+        let glyph = if n.has("Lesson") {
+            format!("<span class=\"lesson-glyph\">{}</span>", glyph(&ctx, page.node)?)
+        } else {
+            String::new()
+        };
         format!(
-            "<header class=\"head\">{}<h1{say_intro}>{}</h1>{}{listen}</header>",
+            "<header class=\"head\">{}{glyph}<h1{say_intro}>{}</h1>{}{listen}</header>",
             crate::side::crumb(s.nav, page, s.served),
             esc(&title),
             meta(&ctx)?

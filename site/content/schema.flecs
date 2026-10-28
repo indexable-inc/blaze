@@ -61,11 +61,13 @@ Ol { (With, flecs.core.OrderedChildren) }
 Table { (With, flecs.core.OrderedChildren) }
 Tr { (With, flecs.core.OrderedChildren) }
 
-// The course (the home page's map; renderer core render.rs, client/learn.ts). A lesson is a page under site.learn
-// (/learn/<slug>) with Lesson; its
-// children are Steps, one idea per screen. Without JS the steps are stacked and each question shows its answer in a
-// fold; client/learn.ts turns the page into one step at a time and keeps the reader's progress in localStorage.
-struct Lesson(order: i32, line: string) // a lesson page: its place on the course map, and what it teaches in one line
+// The course (the home page's path; renderer core render.rs, client/learn.ts). A lesson is a page under site.learn
+// (/learn/<slug>) with Lesson; its children are Steps, one idea per screen. Without JS the steps are stacked and each
+// question shows its answer in a fold; client/learn.ts turns the page into one step at a time and keeps the reader's
+// progress in localStorage.
+// A lesson page: its place on the course path, what it teaches in one line, and its glyph, the drawing on its node (a
+// key of gen/glyphs.ts GLYPHS; the build bakes it onto the page, and an unknown name fails the build).
+struct Lesson(order: i32, line: string, glyph: string)
 struct Step(title: string)              // one screen of a lesson: a short paragraph, maybe a diagram, maybe a question
 struct Quiz(prompt: string)             // a question: its children are Choices, exactly one of them Right
 struct Choice(text: string, why: string) // an answer, and the one line the reader sees once they pick it
@@ -74,7 +76,7 @@ struct Figure(piece: string, label: string) // a diagram the reader can touch (c
 // A question answered by tapping parts of a diagram: `right` is the names of the parts to pick, comma separated (the
 // piece's node ids), `hint` what a wrong pick is told, `why` the explanation once it is right.
 struct Tap(prompt: string, piece: string, right: string, hint: string, why: string)
-Course {}                               // the course map: the Lesson pages under its (Lessons, page), or under this page, by order
+Course {}                               // the course path: the Lesson pages under its (Lessons, page), or under this page, by order
 Step { (With, flecs.core.OrderedChildren) }
 Quiz { (With, flecs.core.OrderedChildren) }
 
@@ -108,7 +110,7 @@ Resolved {}
 Cites {}                                // (Cites, ref): a block leans on that reference
 DependsOn {}                            // (DependsOn, page): read that page first
 InGroup { Exclusive }                   // (InGroup, nav.<section>): the page's sidebar row is in that section
-Lessons { Exclusive }                   // (Lessons, page) on a Course: the lessons it maps are that page's
+Lessons { Exclusive }                   // (Lessons, page) on a Course: the lessons on its path are that page's
 
 // Page kinds.
 Discussable {}                          // signed-in readers comment on each block (every other page has one discussion for the whole page)

@@ -46,7 +46,7 @@ form.signup button:disabled { opacity: 0.6; cursor: default; }
 
 /* Inline comments, rendered by the worker (render/comments.ts) and enhanced by client/comments.ts. A block with
    comments, or under the pointer, shows its button in the left margin (code blocks and tables: their top-right
-   corner; images: below, right-aligned); on a narrow screen the button sits after the block's text.
+   corner; images: below, right-aligned); without a margin, see main:not(.gutter) below.
    Without JS a thread shows when it (or a comment in it) is the URL's target: the button links to it. Once the
    script runs (main.c-live) it shows and hides threads with `hidden` instead. */
 main[data-doc]:not(.c-live) .c-thread:not(.c-page):not(:target):not(:has(:target)) { display: none; }
@@ -62,10 +62,6 @@ img + .c-btn { position: static; display: block; margin: -1.2em 0 1.2em auto; }
 [data-block]:hover > .c-btn, img[data-block]:hover + .c-btn, .c-btn:hover, .c-btn.has, .c-btn:focus-visible, .c-btn[aria-expanded=true] { opacity: 1; }
 .c-btn.has, .c-btn[aria-expanded=true] { color: var(--ink-1); }
 .c-btn:hover { background: var(--bg-4); }
-@media (max-width: 1180px) {
-	.c-btn { position: static; margin-left: 0.5em; opacity: 0.55; vertical-align: 0.1em; }
-	.codeblock > .c-btn, .ref > .c-btn { position: absolute; }
-}
 /* A block's thread opens as a card under it; the page's own (`.c-page`, the Discussion section) sits on the page.
    Both are a column of faces joined by a thread line, then the composer: the chat's (shell.css .chat-form), the
    reader's face beside it once client/comments.ts has set it up (.c-ready). */
@@ -218,9 +214,21 @@ li > .say-btn:has(+ .c-btn) { left: -102px; }
 .say-btn .listen-icon { width: 10px; height: 10px; }
 [data-say]:hover > .say-btn, .say-btn:hover, .say-btn:focus-visible { opacity: 1; }
 .say-btn:hover { background: var(--bg-4); color: var(--ink-1); }
-@media (max-width: 1180px) {
-	.say-btn, .say-btn:has(+ .c-btn), li > .say-btn, li > .say-btn:has(+ .c-btn) { position: static; margin-left: 0.5em; opacity: 0.55; vertical-align: 0.1em; }
-	.codeblock > .say-btn, .cmd > .say-btn, .ref > .say-btn { position: absolute; }
+
+/* Where the page has no left margin for them (client/lib/blockctl.ts sets main.gutter when it has), a block's
+   controls float at its top-right corner over the text, still only for the block under the pointer; a block with
+   comments keeps its count in the text instead. On a touch screen the controls show for the block last tapped
+   (.ctl-open) and nowhere else. */
+main:not(.gutter) [data-block] > .c-btn, main:not(.gutter) [data-say] > .say-btn { left: auto; right: 0; top: -0.15em; border-radius: 8px; background: var(--pop-bg); box-shadow: var(--pop-ring), 0 4px 14px rgb(0 0 0 / 0.08); }
+main:not(.gutter) [data-say] > .say-btn:has(+ .c-btn) { right: 40px; }
+main:not(.gutter) [data-say] > .say-btn:has(+ .c-btn.has) { right: 0; }
+main:not(.gutter) [data-block] > .c-btn.has { position: static; margin-left: 0.5em; vertical-align: 0.1em; background: none; box-shadow: none; }
+main:not(.gutter) :is(.codeblock, .cmd, .ref) > :is(.c-btn, .say-btn) { top: 8px; }
+main:not(.gutter) :is(.codeblock, .ref) > .c-btn { right: 8px; }
+main:not(.gutter) :is(.codeblock, .cmd, .ref) > .say-btn { right: 52px; }
+@media (hover: none) {
+	.say-btn, .c-btn:not(.has, [aria-expanded=true]) { visibility: hidden; }
+	.ctl-open > .say-btn, .ctl-open > .c-btn, img.ctl-open + .c-btn { visibility: visible; opacity: 1; }
 }
 .say-now { border-radius: 6px; background: var(--s-tint); box-shadow: 0 0 0 6px var(--s-tint); transition: background 0.2s, box-shadow 0.2s; }
 ::highlight(say-word) { background-color: var(--line-2); color: var(--ink-1); }

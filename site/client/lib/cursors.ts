@@ -1,8 +1,8 @@
 /**
  * Where the others on this page are (worker/presence.ts passes it on; client/lib/presence.ts owns the socket and
  * hands over the frames, `message`, and who is on the page, `setPeople`): their mouse pointer, an arrow in their
- * colour with their face and name, and the part of the page each is reading, a band with their face on a thin rail
- * at the right edge (click the face to go there).
+ * colour with their face and name, and their face on a thin rail at the right edge where their pointer is on the page
+ * (click the face to go there). Where a reader has scrolled is not sent: only the pointer.
  *
  * On a desk (a mouse or a trackpad, which hovers) the rail is also the page's scrollbar, there whenever the page
  * scrolls, whoever else is here: styles/shell.css hides the browser's own, the reader's viewport is the thumb (drag
@@ -10,42 +10,42 @@
  * takes no focus, so the keys scroll the page as ever. On a phone the browser's scrollbar stays and the rail shows
  * only the others, while there are any.
  *
- * Positions are in the page's text, not the window, so readers with other window sizes line up: x is a fraction of
- * `main`'s width, y a block (the index of a heading, paragraph, list item, ... in `main`, in document order, comment
- * threads left out) and how far down it, as a fraction of its height. Every reader has the same blocks in the same
- * order, so the same place in the text is the same anchor wherever the lines wrap.
+ * A pointer is sent as what it is on, so it lands on the same thing for every reader whatever their window and layout
+ * (client/lib/anchor.ts): a block of the article and the character in it, or a link, a button, ... in the sidebar,
+ * the top line or "On this page". A pointer on one of those regions is drawn over the window
+ * (`fixedLayer`), since they stay put while the page scrolls; one in the article on the page (`layer`). A reader who
+ * doesn't have that thing on screen (the sidebar shut) doesn't see the pointer until it moves to
+ * something they have, and only a pointer in the article has a face on the rail.
  *
  * A tab sends its pointer (a mouse or a pen; phones send none and draw none) at most every MOVE_MS while it moves,
- * nothing while it rests, and null when it leaves the window or the tab is hidden; its viewport at most every VIEW_MS
- * when it scrolls or resizes, and again when someone comes to the page. Nothing goes while nobody else is here. A
+ * nothing while it rests, and null when it leaves the window or the tab is hidden; again when someone comes to the
+ * page. Nothing goes while nobody else is here. A
  * pointer that rests for IDLE_MS fades. The who-is-here list has a switch that hides the others' pointers, kept per
  * browser (localStorage).
  *
- * Saying something by the pointer, like Figma's cursor chat or Minecraft's T: on a desk T (outside a field, no
- * modifiers) opens a one-line composer at the reader's pointer (at the foot of the window when the pointer is off the
- * page). What is typed goes to the others on the page as it is typed (`say-live`, at most every SAY_MS), shown as a
- * bubble by the pointer, or by the face on the rail while the pointer is off their screen. Enter sends: the bubble
- * stays SAY_LINGER_MS and a signed-in reader's line goes to the chat too, to be kept (client/lib/chat.ts `post`);
- * an anonymous one's is only ever the bubble. Esc, or leaving the field, takes it back.
+ * What the reader writes in the chat's input (client/lib/feed.ts, opened with T) goes to the others on the page as it
+ * is typed (`say`, sent as `say-live` at most every SAY_MS), shown as a bubble by the writer's pointer, in its layer, or
+ * by their face on the rail while the pointer is off this reader's screen or not drawn (a phone). Once sent the
+ * bubble stays SAY_LINGER_MS where it was: on the page, or in the window for a pointer on a region.
  */
 
 import { tipOn } from './tip';
 import { LEAVE, PAGE } from './page';
+import { SHELL, pageTop, placeOf, remeasure, spotAt, spotOf, type Place, type Spot } from './anchor';
 
 type Who = { key: string; login: string | null; avatar: string | null };
 /** Someone else on this page; `away` while every tab of theirs here is hidden. */
 type Peer = Who & { away: boolean };
 type Remote = {
 	who: Peer;
-	/** Their pointer as sent ([x, block, f]), where it is drawn (document px) and where it is going. */
-	c: number[] | null;
+	/** Their pointer as sent, which layer it is drawn in, and where it is drawn and where it is going, in that layer's px. */
+	c: Spot | null;
+	fixed: boolean;
 	pos: { x: number; y: number } | null;
 	to: { x: number; y: number } | null;
 	el: HTMLElement | null;
 	/** When their pointer last moved (ms). */
 	t: number;
-	/** Their viewport as sent ([block, f, block, f]). */
-	v: number[] | null;
 	/** The line they are writing by their pointer (`done` once sent), its bubble, and when it goes. */
 	say: { text: string; done: boolean } | null;
 	sayEl: HTMLElement | null;
@@ -53,11 +53,8 @@ type Remote = {
 };
 
 const MOVE_MS = 60;
-const VIEW_MS = 200;
 const IDLE_MS = 5000;
 const HIDE_KEY = 'blaze.cursors.hide';
-/** What counts as a block: what the text is made of, in every page's `main`. */
-const BLOCKS = 'h1, h2, h3, h4, h5, h6, p, li, pre, table, tr, figure, blockquote, dt, dd, img, details, summary';
 const SVG = 'http://www.w3.org/2000/svg';
 const fine = matchMedia('(pointer: fine)');
 /** Where the rail is the page's scrollbar; the same query hides the browser's in styles/shell.css. */
@@ -78,8 +75,6 @@ const SAY_LINGER_MS = 4000;
 let send: (m: object) => void = () => {};
 let face: (w: Who, away?: boolean) => HTMLElement = () => document.createElement('span');
 let name: (w: Who) => string = (w) => w.key;
-let me: () => Who | null = () => null;
-let post: (text: string) => boolean = () => false;
 let path = '';
 const peers = new Map<string, Peer>();
 const remotes = new Map<string, Remote>();
@@ -100,8 +95,6 @@ function hueOf(key: string): number {
 }
 
 const colour = (key: string) => `hsl(${hueOf(key).toFixed(0)} 70% 50%)`;
-const round = (x: number) => Math.round(x * 1000) / 1000;
-const clampFrac = (x: number) => Math.max(-50, Math.min(50, x));
 
 function hidden(): boolean {
 	try {
@@ -111,60 +104,16 @@ function hidden(): boolean {
 	}
 }
 
-// ---- Where things are -------------------------------------------------------------------------------------------
-
-/** Each block's top (document px) and height, -1 for one not shown (in a shut `<details>`). Dropped when it moves. */
-let blocks: { top: number; h: number }[] | null = null;
-
-function layout(): { top: number; h: number }[] {
-	if (blocks) return blocks;
-	const main = document.querySelector('main');
-	const sy = scrollY;
-	blocks = main
-		? [...main.querySelectorAll<HTMLElement>(BLOCKS)]
-				.filter((e) => !e.closest('.c-thread'))
-				.map((e) => {
-					const r = e.getBoundingClientRect();
-					return { top: r.top + sy, h: e.getClientRects().length ? r.height : -1 };
-				})
-		: [];
-	return blocks;
-}
-
-/** The anchor for document y: the shown block that starts last at or above it (the innermost, on a tie). */
-function anchor(y: number): [number, number] | null {
-	const bs = layout();
-	let best = -1;
-	for (let i = 0; i < bs.length; i++) if (bs[i].h > 0 && bs[i].top <= y && (best < 0 || bs[i].top >= bs[best].top)) best = i;
-	if (best < 0) best = bs.findIndex((b) => b.h > 0);
-	if (best < 0) return null;
-	return [best, round(clampFrac((y - bs[best].top) / bs[best].h))];
-}
-
-/** Document y for an anchor, or null when this reader doesn't have that block shown. */
-function place(b: number, f: number): number | null {
-	const x = layout()[b];
-	return x && x.h > 0 ? x.top + f * x.h : null;
-}
-
 // ---- What this tab sends ----------------------------------------------------------------------------------------
 
 /** The pointer in window px, while it is over the page. */
 let pointer: { x: number; y: number } | null = null;
 let sentC = '';
-let sentV = '';
 let cTimer: ReturnType<typeof setTimeout> | undefined;
-let vTimer: ReturnType<typeof setTimeout> | undefined;
 
 function sendCursor(): void {
 	cTimer = undefined;
-	let c: number[] | null = null;
-	const main = document.querySelector('main');
-	const a = pointer && !document.hidden && main ? anchor(pointer.y + scrollY) : null;
-	if (pointer && main && a) {
-		const r = main.getBoundingClientRect();
-		c = [round(clampFrac((pointer.x - r.left) / (r.width || 1))), ...a];
-	}
+	const c = pointer && !document.hidden ? spotAt(pointer.x, pointer.y, mineOnly) : null;
 	const s = JSON.stringify(c);
 	if (s === sentC || (!sentC && !c)) return;
 	sentC = s;
@@ -172,41 +121,25 @@ function sendCursor(): void {
 }
 
 function queueCursor(): void {
-	// While the reader writes, their pointer stays where they pressed the key, for them and for the others.
-	if (saying) return;
 	if (peers.size && fine.matches) cTimer ??= setTimeout(sendCursor, MOVE_MS);
-}
-
-function sendView(): void {
-	vTimer = undefined;
-	const top = anchor(scrollY);
-	const bottom = anchor(scrollY + innerHeight);
-	const v = top && bottom ? [...top, ...bottom] : null;
-	const s = JSON.stringify(v);
-	if (s === sentV) return;
-	sentV = s;
-	send({ t: 'v', v });
-}
-
-function queueView(): void {
-	if (peers.size) vTimer ??= setTimeout(sendView, VIEW_MS);
 }
 
 /** Drops what was sent, so the next change goes out whatever it is (someone new is here, or the socket is new). */
 function resend(): void {
 	sentC = '';
-	sentV = '';
 	sentSay = '';
 	if (pointer) queueCursor();
-	queueView();
-	if (saying) queueSay();
+	if (sayText) queueSay();
 }
 
 // ---- What the others are doing ----------------------------------------------------------------------------------
 
-/** Over the page, scrolling with it: an absolute box as tall as the body, clipped so a pointer never widens it. */
+/** Over the page, scrolling with it: an absolute box as tall as the body, clipped so a pointer never widens it. The
+ * pointers in the article are drawn there; those on the regions beside it in `fixedLayer`, over the window. */
 const layer = el('div', 'cursors');
 layer.setAttribute('aria-hidden', 'true');
+const fixedLayer = el('div', 'cursors cursors-fixed');
+fixedLayer.setAttribute('aria-hidden', 'true');
 const rail = el('div', 'reading');
 /** The others' bands, under the track; the track (the scrollbar, on a desk) holds the reader's own, the thumb. */
 const others = el('div', 'reading-others');
@@ -214,6 +147,17 @@ const track = el('div', 'reading-track');
 const mine = el('span', 'reading-me');
 track.append(mine);
 rail.append(others, track);
+
+/** This tab's own overlays, which a pointer is never on as far as the others go: what is under them is. */
+const mineOnly: Element[] = [];
+
+/** Where a layer's px start in the window's: the fixed layer is the window, the page's layer is off by the scroll. */
+const origin = (fixed: boolean) => (fixed ? { x: 0, y: 0 } : { x: -scrollX, y: -pageTop() });
+/** A place in its layer's px. */
+function onLayer(p: Place): { x: number; y: number } {
+	const o = origin(p.fixed);
+	return { x: p.x - o.x, y: p.y - o.y };
+}
 
 function arrow(): SVGSVGElement {
 	const svg = document.createElementNS(SVG, 'svg');
@@ -235,24 +179,30 @@ function cursorOf(r: Remote): HTMLElement {
 	return (r.el = e);
 }
 
-/** Where `r`'s pointer goes on this reader's page, or null. */
-function target(r: Remote): { x: number; y: number } | null {
-	const main = document.querySelector('main');
-	if (!r.c || !main) return null;
-	const y = place(r.c[1], r.c[2]);
-	if (y === null) return null;
-	const m = main.getBoundingClientRect();
-	return { x: m.left + scrollX + r.c[0] * m.width, y };
-}
-
-function aim(r: Remote): void {
-	r.to = hidden() || !fine.matches ? null : target(r);
-	if (!r.to) {
+/**
+ * Points `r`'s pointer where it now is on this reader's screen, or fades it while they don't have that. Moving between
+ * the article and a region, it changes layers and keeps its place on screen, so it still glides; `snap` puts it there
+ * at once (a region's pointer while the page or the region scrolls, which must not trail).
+ */
+function aim(r: Remote, snap = false): void {
+	const at = hidden() || !fine.matches || !r.c ? null : placeOf(r.c);
+	if (!at) {
+		r.to = null;
 		r.el?.classList.add('idle');
 		return placeSay(r);
 	}
+	const to = (r.to = onLayer(at));
 	const e = cursorOf(r);
-	r.pos ??= { ...r.to };
+	if (r.fixed !== at.fixed) {
+		(at.fixed ? fixedLayer : layer).append(e);
+		const [a, b] = [origin(r.fixed), origin(at.fixed)];
+		if (r.pos) r.pos = { x: r.pos.x + a.x - b.x, y: r.pos.y + a.y - b.y };
+		r.fixed = at.fixed;
+	}
+	if (snap || !r.pos) {
+		r.pos = { ...to };
+		e.style.transform = `translate(${to.x.toFixed(1)}px, ${to.y.toFixed(1)}px)`;
+	}
 	e.classList.toggle('idle', Date.now() - r.t > IDLE_MS);
 	placeSay(r);
 	animate();
@@ -283,28 +233,36 @@ function animate(): void {
 	raf ||= requestAnimationFrame(tick);
 }
 
-/** The rail: a band and a face for each viewport sent, and the reader's own (the thumb, on a desk). */
+let railQueued = 0;
+/** drawRail at the next frame, once however many pointers moved. */
+function queueRail(): void {
+	railQueued ||= requestAnimationFrame(() => {
+		railQueued = 0;
+		drawRail();
+	});
+}
+
+/** The rail: a mark and a face where each other reader's pointer is, and the reader's own place (the thumb, on a desk). */
 function drawRail(): void {
 	const H = document.documentElement.scrollHeight || 1;
 	const bands: HTMLElement[] = [];
 	for (const r of remotes.values()) {
-		if (!r.v) continue;
-		const y0 = place(r.v[0], r.v[1]);
-		const y1 = place(r.v[2], r.v[3]);
-		if (y0 === null || y1 === null) continue;
+		// Only a pointer in the article has a place on the page.
+		const at = r.c && placeOf(r.c);
+		if (!at || at.fixed) continue;
+		const y0 = onLayer(at).y;
 		const band = el('span', 'reading-band');
 		band.style.setProperty('--c', colour(r.who.key));
 		band.dataset.key = r.who.key;
 		band.style.top = `${((Math.max(0, y0) / H) * 100).toFixed(2)}%`;
-		band.style.height = `${((Math.max(0, y1 - y0) / H) * 100).toFixed(2)}%`;
 		const go = el('button', 'reading-face');
 		go.type = 'button';
 		const f = face(r.who, r.who.away);
 		// The button's tooltip, not the face's.
 		delete f.dataset.tip;
 		go.append(f);
-		tipOn(go, `${name(r.who)} is reading here`);
-		go.addEventListener('click', () => scrollTo({ top: Math.max(0, y0 - 56), behavior: still.matches ? 'auto' : 'smooth' }));
+		tipOn(go, `${name(r.who)}'s pointer is here`);
+		go.addEventListener('click', () => scrollTo({ top: Math.max(0, y0 - innerHeight / 3), behavior: still.matches ? 'auto' : 'smooth' }));
 		band.append(go);
 		bands.push(band);
 	}
@@ -387,7 +345,7 @@ function grab(e: PointerEvent): void {
 
 /** The page moved under the anchors (a resize, a fold, a thread opened): place everything again. */
 function relayout(): void {
-	blocks = null;
+	remeasure();
 	layer.style.height = `${document.body.offsetHeight}px`;
 	for (const r of remotes.values()) {
 		if (!r.c) continue;
@@ -432,7 +390,15 @@ function drawSay(r: Remote): void {
 		setTimeout(() => b.remove(), 300);
 		return;
 	}
-	if (!b) {
+	if (b?.classList.contains('pinned') && !r.say.done) {
+		// A new line after a sent one: the sent one stays its while, and the new one follows the pointer.
+		setTimeout(() => {
+			b.classList.add('out');
+			setTimeout(() => b.remove(), 300);
+		}, SAY_LINGER_MS);
+		r.sayEl = null;
+	}
+	if (!r.sayEl) {
 		r.sayEl = el('div', 'cursor-say');
 		r.sayEl.style.setProperty('--c', colour(r.who.key));
 	}
@@ -441,15 +407,32 @@ function drawSay(r: Remote): void {
 	placeSay(r);
 }
 
-/** By their pointer while it is on this reader's screen, else by their face on the rail, else nowhere for now. */
+/**
+ * By their pointer while it is on this reader's screen, else by their face on the rail, else nowhere for now. Once sent,
+ * a bubble by the pointer stays on the page where it was, and the pointer moves on.
+ */
 function placeSay(r: Remote): void {
 	const b = r.sayEl;
-	if (!b) return;
-	const to = r.to;
-	if (r.el && to && !r.el.classList.contains('idle') && to.y > scrollY && to.y < scrollY + innerHeight - 40) {
+	if (!b || b.classList.contains('pinned')) return;
+	if (r.say?.done && b.parentElement === r.el && r.el) {
+		// Into the pointer's layer: on the page for one in the article, in the window for one on a region, which stays put.
+		const into = r.fixed ? fixedLayer : layer;
+		const at = b.getBoundingClientRect();
+		const to = into.getBoundingClientRect();
+		b.classList.remove('flip');
+		b.classList.add('pinned');
+		b.style.left = `${Math.round(at.left - to.left)}px`;
+		b.style.top = `${Math.round(at.top - to.top)}px`;
+		into.append(b);
+		return;
+	}
+	// In the window.
+	const o = origin(r.fixed);
+	const to = r.to && { x: r.to.x + o.x, y: r.to.y + o.y };
+	if (r.el && to && !r.el.classList.contains('idle') && to.y > 0 && to.y < innerHeight - 40) {
 		b.classList.remove('on-rail');
 		// Near the right edge it opens to the left of the pointer, so the page's clip never cuts it.
-		b.classList.toggle('flip', to.x - scrollX > innerWidth - 300);
+		b.classList.toggle('flip', to.x > innerWidth - 300);
 		if (b.parentElement !== r.el) r.el.append(b);
 		return;
 	}
@@ -460,35 +443,20 @@ function placeSay(r: Remote): void {
 	if (b.parentElement !== band) band.append(b);
 }
 
-/** The reader's own composer: one line, in their colour, by their pointer. */
-const sayBox = el('form', 'say-live');
-sayBox.hidden = true;
-const sayField = el('input');
-sayField.type = 'text';
-sayField.maxLength = SAY_MAX;
-sayField.autocomplete = 'off';
-sayField.enterKeyHint = 'send';
-sayField.setAttribute('aria-label', 'Say something on this page');
-const sayKey = el('kbd', '', '↵');
-sayKey.setAttribute('aria-hidden', 'true');
-sayBox.append(sayField, sayKey);
-/** Whether the composer is open; what the others have of it ('' nothing); the timers that send it. */
-let saying = false;
+/**
+ * The line the reader is writing (client/lib/feed.ts's input, client/lib/chat.ts): what the others have of it ('' none),
+ * what it is now, and the timers that send it.
+ */
+let sayText = '';
 let sentSay = '';
 let sayQueue: ReturnType<typeof setTimeout> | undefined;
 let sayKeep: ReturnType<typeof setInterval> | undefined;
-let sayFade: ReturnType<typeof setTimeout> | undefined;
-/** Where on the page (document px) the composer opened, or null at the foot of the window. */
-let sayAt: { x: number; y: number } | null = null;
-
-const line = (v: string) => v.replace(/\s+/g, ' ').trim();
 
 function pushSay(again = false): void {
 	sayQueue = undefined;
-	const text = line(sayField.value);
-	if (!saying || !peers.size || (text === sentSay && !again) || (!text && !sentSay)) return;
-	sentSay = text;
-	send({ t: 'say-live', text: text || null });
+	if (!peers.size || (sayText === sentSay && !again) || (!sayText && !sentSay)) return;
+	sentSay = sayText;
+	send({ t: 'say-live', text: sayText || null });
 }
 
 function queueSay(): void {
@@ -496,104 +464,25 @@ function queueSay(): void {
 }
 
 /**
- * Where the pointer was when the composer opened, scrolling with the page and kept inside the window; at the foot of
- * the window when it opened with the pointer off the page.
+ * The line the reader is writing, as it stands: the others on the page see it by the reader's pointer as it is typed.
+ * Null (or empty) takes it back; `done` sends it, and their bubble stays SAY_LINGER_MS where the pointer was.
  */
-function placeBox(): void {
-	if (sayBox.hidden) return;
-	sayBox.classList.toggle('at-foot', !sayAt);
-	if (!sayAt) return void (sayBox.style.left = sayBox.style.top = '');
-	sayBox.style.left = `${Math.round(Math.max(8, Math.min(innerWidth - sayBox.offsetWidth - 8, sayAt.x - scrollX + 14)))}px`;
-	sayBox.style.top = `${Math.round(Math.max(8, Math.min(innerHeight - sayBox.offsetHeight - 8, sayAt.y - scrollY + 18)))}px`;
-}
-
-function openSay(): void {
-	if (saying) return sayField.focus();
-	clearTimeout(sayFade);
-	const w = me();
-	saying = true;
-	sentSay = '';
-	sayBox.classList.remove('sent', 'out');
-	sayBox.style.setProperty('--c', colour(w?.key ?? ''));
-	sayField.readOnly = false;
-	sayField.value = '';
-	sayField.placeholder = w?.login ? 'Say something on this page' : 'Say hi to this page (not kept)';
-	tipOn(sayKey, 'Enter sends, Esc cancels');
-	sayBox.querySelector(':scope > .face')?.remove();
-	if (w) sayBox.prepend(face(w));
-	sayAt = pointer ? { x: pointer.x + scrollX, y: pointer.y + scrollY } : null;
-	// The others' copy of the pointer parks here too, so the bubble they see stays put.
-	clearTimeout(cTimer);
-	if (peers.size) sendCursor();
-	sayBox.hidden = false;
-	placeBox();
-	sayField.focus({ preventScroll: true });
-	sayKeep = setInterval(() => sentSay && pushSay(true), SAY_KEEP_MS);
-}
-
-/** Shuts the composer: with `text` it was sent (a bubble a while, and the chat), without it taken back. */
-function closeSay(text: string | null): void {
-	if (!saying) return;
-	saying = false;
-	clearInterval(sayKeep);
-	clearTimeout(sayQueue);
-	sayQueue = undefined;
-	if (text) {
-		if (peers.size) send({ t: 'say-live', text, done: true });
-		post(text);
-		sayField.value = text;
-		sayField.readOnly = true;
-		sayBox.classList.add('sent');
-		sayField.blur();
-		sayFade = setTimeout(() => {
-			if (still.matches) return void (sayBox.hidden = true);
-			sayBox.classList.add('out');
-			sayFade = setTimeout(() => (sayBox.hidden = true), 300);
-		}, SAY_LINGER_MS);
-	} else {
-		if (sentSay) send({ t: 'say-live', text: null });
-		sayBox.hidden = true;
+export function say(text: string | null, done = false): void {
+	const t = (text ?? '').replace(/\s+/g, ' ').trim().slice(0, SAY_MAX);
+	if (done) {
+		clearTimeout(sayQueue);
+		clearInterval(sayKeep);
+		sayQueue = sayKeep = undefined;
+		if (t && peers.size) send({ t: 'say-live', text: t, done: true });
+		sayText = sentSay = '';
+		return;
 	}
-	sentSay = '';
-	queueCursor();
-}
-
-sayField.addEventListener('input', () => {
+	sayText = t;
+	if (!t) {
+		clearInterval(sayKeep);
+		sayKeep = undefined;
+	} else sayKeep ??= setInterval(() => sentSay && pushSay(true), SAY_KEEP_MS);
 	queueSay();
-	placeBox();
-});
-sayField.addEventListener('keydown', (e) => {
-	if (e.isComposing) return;
-	if (e.key === 'Enter') {
-		e.preventDefault();
-		closeSay(line(sayField.value) || null);
-	} else if (e.key === 'Escape') {
-		// Only the composer: nothing else's Esc (the chat, the who-is-here list) on the same press.
-		e.preventDefault();
-		e.stopPropagation();
-		closeSay(null);
-	}
-});
-sayField.addEventListener('blur', () => closeSay(null));
-sayBox.addEventListener('submit', (e) => e.preventDefault());
-// A press on the box (its padding, the key) keeps the field's focus.
-sayBox.addEventListener('mousedown', (e) => {
-	if (e.target !== sayField) e.preventDefault();
-});
-
-/**
- * T, on a desk, when the key would type nothing anywhere else; Enter too, for readers whose T an extension takes first
- * (Vimium opens a tab with it, before the page hears the key), when it would not press a link or a button.
- */
-function sayKeyDown(e: KeyboardEvent): void {
-	if (e.defaultPrevented || e.repeat || e.isComposing || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
-	if ((e.key !== 't' && e.key !== 'T' && e.key !== 'Enter') || !fine.matches) return;
-	const t = e.target instanceof HTMLElement ? e.target : null;
-	if (t && (t.isContentEditable || t.closest('input, textarea, select, [contenteditable]'))) return;
-	if (e.key === 'Enter' && t?.closest('a[href], button, summary, [role="button"], [tabindex]')) return;
-	if (document.querySelector('dialog[open]') || document.body.classList.contains('chat-full')) return;
-	e.preventDefault();
-	openSay();
 }
 
 // ---- What client/lib/presence.ts calls ----------------------------------------------------------------------------
@@ -604,7 +493,7 @@ export function setPeople(at: string, list: Peer[]): void {
 		path = at;
 		peers.clear();
 		for (const k of [...remotes.keys()]) forget(k);
-		blocks = null;
+		remeasure();
 	}
 	let fresh = false;
 	const now = new Set(list.map((p) => p.key));
@@ -624,27 +513,23 @@ export function setPeople(at: string, list: Peer[]): void {
 export function reset(): void {
 	peers.clear();
 	sentC = '';
-	sentV = '';
 	sentSay = '';
 }
 
-/** Takes a `c`, `v` or `say-live` frame; false for anything else. */
+/** Takes a `c` or `say-live` frame; false for anything else. */
 export function message(m: { t?: unknown }): boolean {
-	if (m.t !== 'c' && m.t !== 'v' && m.t !== 'say-live') return false;
-	const { k, c, v, text, done } = m as { k?: unknown; c?: unknown; v?: unknown; text?: unknown; done?: unknown };
+	if (m.t !== 'c' && m.t !== 'say-live') return false;
+	const { k, c, text, done } = m as { k?: unknown; c?: unknown; text?: unknown; done?: unknown };
 	const who = typeof k === 'string' ? peers.get(k) : undefined;
 	if (!who) return true;
-	const nums = (x: unknown, n: number) => (Array.isArray(x) && x.length === n && x.every((y) => typeof y === 'number' && Number.isFinite(y)) ? (x as number[]) : null);
 	let r = remotes.get(who.key);
-	if (!r) remotes.set(who.key, (r = { who, c: null, pos: null, to: null, el: null, t: 0, v: null, say: null, sayEl: null, sayTimer: undefined }));
+	if (!r) remotes.set(who.key, (r = { who, c: null, fixed: false, pos: null, to: null, el: null, t: 0, say: null, sayEl: null, sayTimer: undefined }));
 	if (m.t === 'say-live') hearSay(r, typeof text === 'string' && text ? text.slice(0, SAY_MAX) : null, done === true);
-	else if (m.t === 'v') {
-		r.v = nums(v, 4);
-		drawRail();
-	} else {
-		r.c = nums(c, 3);
+	else {
+		r.c = spotOf(c);
 		r.t = Date.now();
 		aim(r);
+		queueRail();
 	}
 	return true;
 }
@@ -673,28 +558,15 @@ export function toggle(): HTMLElement | null {
 	return b;
 }
 
-/** A line for the who-is-here list: how to say something by the pointer. Null on a phone, which has no T. */
-export function hint(): HTMLElement | null {
-	if (!fine.matches) return null;
-	const p = el('p', 'tl-hint');
-	p.append('Press ', el('kbd', '', 'T'), ' or ', el('kbd', '', '↵'), ' to say something on this page');
-	tipOn(p, 'If Vimium or another extension takes T, use Enter, or exclude the key t for ix.dev in its options.');
-	return p;
-}
-
 export function setup(opts: {
 	send: (m: object) => void;
 	face: (w: Who, away?: boolean) => HTMLElement;
 	name: (w: Who) => string;
-	/** The reader, once the socket says (for their colour and whether they can post). */
-	me: () => Who | null;
-	/** Posts a line to the chat; false when the reader can't (not signed in). */
-	post: (text: string) => boolean;
 }): void {
-	({ send, face, name, me, post } = opts);
+	({ send, face, name } = opts);
 	rail.hidden = true;
-	document.body.append(layer, rail, sayBox);
-	document.addEventListener('keydown', sayKeyDown);
+	document.body.append(layer, fixedLayer, rail);
+	mineOnly.push(rail);
 	rail.addEventListener('pointerdown', grab);
 	desk.addEventListener('change', drawRail);
 
@@ -713,21 +585,21 @@ export function setup(opts: {
 		pointer = null;
 		queueCursor();
 	});
-	addEventListener(
+	// The page or anything in it scrolled (captured, since a list's scroll doesn't bubble): what the pointer is on may be
+	// another thing, and the others' pointers on a region go with what they are on.
+	document.addEventListener(
 		'scroll',
-		() => {
+		(e) => {
 			if (pointer) queueCursor();
-			queueView();
-			moved();
-			placeBox();
-			for (const r of remotes.values()) placeSay(r);
+			if (e.target === document) moved();
+			for (const r of remotes.values()) {
+				if (r.c && (r.fixed || !r.to)) aim(r, true);
+				else placeSay(r);
+			}
 		},
-		{ passive: true },
+		{ capture: true, passive: true },
 	);
-	addEventListener('resize', () => {
-		relayout();
-		queueView();
-	});
+	addEventListener('resize', () => relayout());
 	document.addEventListener('visibilitychange', () => {
 		if (!document.hidden) return;
 		pointer = null;
@@ -736,22 +608,20 @@ export function setup(opts: {
 	});
 	// Leaving the page: off the others' screens now, rather than at the next who-is-here.
 	addEventListener(LEAVE, () => {
-		closeSay(null);
-		clearTimeout(sayFade);
-		sayBox.hidden = true;
+		// The line being written stays in the feed's input; the next page's readers get it (`resend`).
+		if (sentSay) send({ t: 'say-live', text: null });
+		sentSay = '';
 		clearTimeout(cTimer);
-		clearTimeout(vTimer);
-		cTimer = vTimer = undefined;
+		cTimer = undefined;
 		if (sentC && sentC !== 'null') send({ t: 'c', c: null });
-		if (sentV && sentV !== 'null') send({ t: 'v', v: null });
-		sentC = sentV = '';
+		sentC = '';
 	});
 	const ro = new ResizeObserver(() => relayout());
 	const watch = () => {
 		ro.disconnect();
 		ro.observe(document.body);
-		const main = document.querySelector('main');
-		if (main) ro.observe(main);
+		// The article, and the regions beside it, which open, shut and move with no change to the body.
+		for (const e of document.querySelectorAll(SHELL)) ro.observe(e);
 	};
 	addEventListener(PAGE, watch);
 	watch();

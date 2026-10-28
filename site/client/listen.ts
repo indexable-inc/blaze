@@ -21,7 +21,9 @@
  * highlights its blocks, so it has nothing to follow on the next one (as a load would stop it).
  */
 
+import { blockControls } from './lib/blockctl';
 import { SAVE, kept, onPage } from './lib/page';
+import { tipOn } from './lib/tip';
 
 type Word = [string, number, number];
 type ManifestLine = { id: string; block: string; src: string; duration: number; words: Word[] };
@@ -374,8 +376,7 @@ function start(root: HTMLElement, m: Manifest, base: URL, from?: Kept): () => vo
 		if (!b || b instanceof HTMLImageElement) return;
 		const btn = el('button', 'say-btn');
 		btn.type = 'button';
-		btn.setAttribute('aria-label', 'Play from here');
-		btn.title = 'Play from here';
+		tipOn(btn, 'Play from here');
 		btn.append(icon('play'));
 		btn.addEventListener('click', (e) => {
 			e.preventDefault();
@@ -451,6 +452,8 @@ onPage((signal) => {
 			const m = (await res.json()) as Manifest;
 			if (signal.aborted || !m.lines?.length) return;
 			stop = start(root, m, url, from);
+			const main = root.closest('main');
+			if (main) blockControls(main, signal);
 		} catch (e) {
 			if (signal.aborted) return;
 			root.textContent = '';

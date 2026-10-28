@@ -5,7 +5,7 @@ site {
   learn {
     sharing : Page {
       Narrow
-      Lesson: {5, "One store for your own work, and a shared one for your team."}
+      Lesson: {5, "One store for your own work, and a shared one for your team.", "store"}
       Title: {"Sharing work"}
       Description: {"Lesson 5: blaze's store, sharing it with your team, and what's planned next."}
       Intro: {"[warm] Lesson five, the last one. Where blaze keeps its work, and how that work can be shared."}

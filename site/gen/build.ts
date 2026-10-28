@@ -40,6 +40,7 @@ import path from 'node:path';
 import { Site, snapshot, type Page, type SnapshotInput, type SpokenLine } from '../worker/site-wasm';
 import { ANIMALS, sprite } from './animals';
 import { benchHistory } from './bench';
+import { glyphSvg } from './glyphs';
 import { highlight } from './highlight';
 import { dedent, load, prose, type Node } from './tree';
 
@@ -118,8 +119,9 @@ const STYLES = ['fonts.css', 'tokens.css', 'doc-code.css', 'base.css', 'site.css
 type Baked = SnapshotInput['bakes'];
 
 /**
- * What the renderer leaves to TS: highlighting (Code and Command, set as `Highlighted {html}`) and widgets that read
- * the build's files (BenchHistory, set as `Baked {html}`). By entity path.
+ * What the renderer leaves to TS: highlighting (Code and Command, set as `Highlighted {html}`), widgets that read
+ * the build's files (BenchHistory, set as `Baked {html}`) and each lesson's glyph (gen/glyphs.ts, set as the lesson
+ * page's `Baked {html}`). By entity path.
  */
 function bake(all: Map<string, Node>): Baked {
 	const baked: Baked = {};
@@ -133,6 +135,14 @@ function bake(all: Map<string, Node>): Baked {
 		const cmd = n.values.get('Command');
 		if (cmd) (baked[n.path] ??= {}).highlighted = highlight(prose(String(cmd.text ?? '')), 'bash');
 		if (n.tags.has('BenchHistory')) (baked[n.path] ??= {}).baked = benchHistory();
+		const lesson = n.values.get('Lesson');
+		if (lesson) {
+			try {
+				(baked[n.path] ??= {}).baked = glyphSvg(String(lesson.glyph ?? ''));
+			} catch (e) {
+				throw new Error(`${n.path}: ${(e as Error).message}`);
+			}
+		}
 	}
 	return baked;
 }

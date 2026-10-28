@@ -10,7 +10,7 @@
 //! - an Img is its alt text ("On screen: ..."); an Art (an animated drawing) and a Figure (a lesson's diagram) are not
 //!   read: their label is for screen readers, and the paragraphs beside them say the same in words;
 //! - a lesson's Step is its title, then its blocks; a Quiz or Tap is "Question: " and its prompt (an author marks
-//!   question steps Silent); the course map reads each lesson's number and title;
+//!   question steps Silent); the course path reads each lesson's number and title;
 //! - Code and Command blocks are skipped, citations are never read, References, the signup form and the bench widget
 //!   are skipped, and the RFC index reads each RFC's number and title.
 //!
