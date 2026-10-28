@@ -17,7 +17,9 @@
 //! manifest lists, and indexes only packs of the format it reads. A listed pack whose keys
 //! cannot be read is not indexed and the push fails naming it, as every later push does
 //! until its key list is mended or the pack is taken out of the manifest: a pack the index
-//! does not cover is one no miss finds.
+//! does not cover is one no miss finds. A run that cannot be used is taken out, and what it
+//! covered of this format indexed again: packs of another format wait for a push of a blaze
+//! that reads them.
 
 use std::{collections::BTreeSet, path::Path};
 
@@ -151,18 +153,17 @@ pub async fn update(
     let name = root_at(project);
     let root = match remote.read_small(&name, super::LIST_MAX).await? {
         None => Root::default(),
-        Some((bytes, _)) => {
-            let text = String::from_utf8_lossy(&bytes);
-            match remote.trust.open_to_extend(&name, &text) {
-                Ok(opened) => Root::parse(opened.lines),
-                // Written anew, as `extend_list` writes a list this machine would not sign
-                // under.
-                Err(e) => {
-                    eprintln!("remote: {e:#}: every pack is indexed as if there were no index");
-                    Root::default()
-                }
+        // Written anew, as `extend_list` writes a list this machine would not sign under.
+        Some((bytes, _)) => match String::from_utf8(bytes)
+            .map_err(anyhow::Error::from)
+            .and_then(|text| Ok(remote.trust.open_to_extend(&name, &text)?.lines.to_owned()))
+        {
+            Ok(lines) => Root::parse(&lines),
+            Err(e) => {
+                eprintln!("remote: {e:#}: every pack is indexed as if there were no index");
+                Root::default()
             }
-        }
+        },
     };
     let manifest = Manifest::fetch_to_extend(remote, project).await?.unwrap_or_default();
     let listed = manifest.0;
