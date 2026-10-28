@@ -386,6 +386,12 @@ pub struct FileText {
     #[returns(ref)]
     pub text: Arc<str>,
     pub file_id: vfs::FileId,
+    /// The module a crate root's text ends with that the compiler wrote, not the file on disk:
+    /// blaze's test harness or list of proc macros. rustc injects its own after it applies
+    /// the crate's `#![cfg]`, so a root that `#![cfg]` takes away still has it.
+    #[default]
+    #[returns(copy)]
+    pub appended_root_module: Option<&'static str>,
 }
 
 /// The contents of a file named by `include_bytes!` or `include_str!`, `None` if it can't be read.

@@ -3982,9 +3982,15 @@ fn harnesses<'a>(
 
 /// Gives the files the texts [`harnesses`] wrote. The files.
 fn write_harnesses(db: &mut RootDatabase, texts: Vec<(vfs::FileId, String)>) -> Vec<vfs::FileId> {
-    use ide_db::base_db::salsa::Durability;
+    use ide_db::base_db::salsa::{Durability, Setter as _};
     for (file, text) in &texts {
         db.set_file_text_with_durability(*file, text, Durability::LOW);
+        // What the crate's `#![cfg]` leaves of a root it takes away.
+        let module = test_harness::appended(text);
+        let input = db.file_text(*file);
+        if input.appended_root_module(db) != module {
+            input.set_appended_root_module(db).with_durability(Durability::LOW).to(module);
+        }
     }
     prepare_macro_sessions(db);
     texts.into_iter().map(|it| it.0).collect()
