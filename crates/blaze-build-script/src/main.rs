@@ -4,9 +4,10 @@
 //! - `run UNIT CARGO_ENV` runs the script as blaze runs it and prints the environment it was
 //!   given, its outputs and what cargo makes of them.
 //! - `parse UNIT CARGO_ENV OUTPUT` reads a file of a script's output as blaze reads it.
-//! - `inert SOURCE EDITION [ENV]` says whether the script of `SOURCE` is one blaze does not
-//!   compile or run ([`blaze_build_script::inert`]), and with `ENV`, the environment a run was
-//!   given, what it would print.
+//! - `inert SOURCE EDITION [ENV [ARGS]]` says whether the script of `SOURCE` is one blaze does
+//!   not compile or run ([`blaze_build_script::inert`]), and with `ENV`, the environment a run
+//!   was given, what it would print; with `ARGS`, the JSON list of what rustc was given for it,
+//!   whether those let it be one.
 //!
 //! Under any other name it stands in for a script cargo runs: the harness puts it where rustc
 //! wrote the script and the script's path in `harness-real` beside it. It writes what cargo
@@ -61,11 +62,12 @@ fn main() -> ExitCode {
     let printed = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["run", unit, cargo_env] => ran(unit, cargo_env),
         ["parse", unit, cargo_env, output] => parsed(unit, cargo_env, output),
-        ["inert", source, edition] => inert(source, edition, None),
-        ["inert", source, edition, env] => inert(source, edition, Some(env)),
+        ["inert", source, edition] => inert(source, edition, None, None),
+        ["inert", source, edition, env] => inert(source, edition, Some(env), None),
+        ["inert", source, edition, env, args] => inert(source, edition, Some(env), Some(args)),
         _ => Err(Error(
             "usage: blaze-build-script run UNIT CARGO_ENV | parse UNIT CARGO_ENV OUTPUT | inert \
-             SOURCE EDITION [ENV]"
+             SOURCE EDITION [ENV [ARGS]]"
                 .to_owned(),
         )),
     };
@@ -195,11 +197,17 @@ fn parsed(unit: &str, cargo_env: &str, output: &str) -> Result<String, Error> {
     })
 }
 
-fn inert(source: &str, edition: &str, env: Option<&str>) -> Result<String, Error> {
+fn inert(
+    source: &str,
+    edition: &str,
+    env: Option<&str>,
+    args: Option<&str>,
+) -> Result<String, Error> {
     let text = std::fs::read_to_string(source).map_err(|err| Error(format!("{source}: {err}")))?;
     let edition = edition.parse().map_err(|err| Error(format!("{err}")))?;
     let env: Option<BTreeMap<String, String>> = env.map(read).transpose()?;
-    json(&match inert::of(&text, edition) {
+    let args: Vec<String> = args.map(read).transpose()?.unwrap_or_default();
+    json(&match inert::args(&args).and_then(|()| inert::of(&text, edition)) {
         Ok(script) => {
             let printed = env.map(|env| script.run(|name| env.get(name).map(String::as_str)));
             let text = |it: &[u8]| String::from_utf8_lossy(it).into_owned();

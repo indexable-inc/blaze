@@ -184,7 +184,9 @@ pub fn args(args: &[String]) -> Result<(), NotInert> {
                 }
             };
             match flag {
-                "-D" | "--deny" | "-F" | "--forbid" if !capped => return refused(arg),
+                "-D" | "--deny" | "-F" | "--forbid" if !capped && !tool_lint(value) => {
+                    return refused(arg);
+                }
                 "--extern" if matches!(value.split('=').next(), Some("std" | "core" | "alloc")) => {
                     return refused(arg);
                 }
@@ -195,7 +197,7 @@ pub fn args(args: &[String]) -> Result<(), NotInert> {
             continue;
         }
         if let Some(lint) = ["-A", "-W", "-D", "-F"].iter().find(|it| arg.starts_with(**it)) {
-            if matches!(*lint, "-D" | "-F") && !capped {
+            if matches!(*lint, "-D" | "-F") && !capped && !tool_lint(&arg[2..]) {
                 return refused(arg);
             }
             continue;
@@ -212,12 +214,23 @@ pub fn args(args: &[String]) -> Result<(), NotInert> {
     Ok(())
 }
 
-/// Whether `-C option` changes nothing of whether a script compiles and links: what cargo
-/// passes for a profile and its own metadata. A linker, its arguments and a target CPU are
-/// refused: those can fail a build.
+/// Whether a lint is one of another tool's (`clippy::`, `rustdoc::`), which rustc does not run.
+fn tool_lint(name: &str) -> bool {
+    name.split_once("::").is_some_and(|(tool, _)| tool != "rust")
+}
+
+/// Whether `-C option` changes nothing of whether a script compiles: what cargo passes for a
+/// profile and its own metadata, a target CPU or feature (one rustc does not know it warns of),
+/// and the linker and its arguments, which blaze's own build of a script does not use: it
+/// links with `cc` whatever rustc was told.
 fn codegen(option: &str) -> Result<(), ()> {
     let name = option.split_once('=').map_or(option, |it| it.0);
-    const HARMLESS: [&str; 14] = [
+    const HARMLESS: [&str; 19] = [
+        "target-cpu",
+        "target-feature",
+        "linker",
+        "link-arg",
+        "link-args",
         "opt-level",
         "debuginfo",
         "debug-assertions",

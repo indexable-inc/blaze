@@ -17,7 +17,11 @@ check --unit-graph` and rustc, as blaze's resolver will describe it, and blaze-b
          (its `build-script-executed` message: libraries, search paths, cfgs, variables);
   run    runs the script again into an `OUT_DIR` of its own and judges the run, compared with
          cargo's: both fail, or both succeed and come to the same (blaze's reading of each
-         output); `stdout` counts those whose bytes are the same too.
+         output); `stdout` counts those whose bytes are the same too;
+  inert  says whether blaze would neither compile nor run the script (`inert.rs`), and for
+         each it would not, works out what it prints given cargo's environment for the run,
+         which must be the run's stdout and stderr byte for byte with nothing in `OUT_DIR`.
+         A difference fails the harness.
 
 blaze's `OUT_DIR` is named as cargo's in what is compared. The `DEP_<links>_<key>` variables
 of each environment come from blaze's reading of the dependency's output, so `env` checks
@@ -64,6 +68,8 @@ def wrap(argv):
             shutil.copy2(os.environ[WRAP], script)
             with open(os.path.join(out_dir, "harness-real"), "w") as f:
                 f.write(script + ".real")
+            with open(os.path.join(out_dir, "harness-rustc-args.json"), "w") as f:
+                json.dump(args, f)
     sys.exit(status)
 
 
@@ -550,7 +556,42 @@ def project(name, spec, work, t, blaze, jobs, clean):
                                    if (cargo_read or {}).get(k) != v}
         else:
             row["run_equal"] = True
+        inert(i, rec, run_dir, cargo_ok, row)
         return row
+
+    def inert(i, rec, run_dir, cargo_ok, row):
+        """Whether blaze would not compile or run the script (`inert`), and when so, whether
+        what it works out the script prints, given what cargo gave it, is what the script
+        printed: stdout and stderr byte for byte, and nothing in `OUT_DIR`."""
+        compile_unit = next((d["index"] for d in units[i]["dependencies"]
+                             if units[d["index"]]["mode"] == "build"
+                             and "custom-build" in units[d["index"]]["target"]["kind"]), None)
+        if compile_unit is None:
+            return
+        target = units[compile_unit]["target"]
+        script_dir = os.path.dirname(rec["args"][0])
+        env_file = os.path.join(blaze_dir, run_hash(i) + "-inert-env.json")
+        with open(env_file, "w") as f:
+            json.dump(rec["env"], f)
+        said = call("inert", target["src_path"], target["edition"], env_file,
+                    os.path.join(script_dir, "harness-rustc-args.json"))
+        row["inert"] = bool(said.get("inert"))
+        if not row["inert"]:
+            row["inert_why"] = said.get("why") or said.get("error")
+            return
+        out_dir = rec["env"]["OUT_DIR"]
+        ran = {"ok": cargo_ok, "out_dir": sorted(os.listdir(out_dir)) if os.path.isdir(out_dir) else None}
+        elided = {"ok": True, "out_dir": []}
+        if cargo_ok:
+            with open(printed(run_dir), "rb") as f:
+                ran["stdout"] = f.read().decode(errors="replace")
+            stderr = os.path.join(os.path.dirname(printed(run_dir)), "stderr")
+            with open(stderr, "rb") as f:
+                ran["stderr"] = f.read().decode(errors="replace")
+            elided.update(stdout=said["stdout"], stderr=said["stderr"])
+        row["inert_equal"] = ran == elided
+        if ran != elided:
+            row["inert_diff"] = {k: [ran.get(k), elided.get(k)] for k in elided if ran.get(k) != elided.get(k)}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs // 8)) as pool:
         rows = list(pool.map(blaze_run, runs))
@@ -579,6 +620,7 @@ def main():
     work = os.path.abspath(a.work)
     all_rows = []
     totals = [0] * 7
+    inert_totals = [0, 0]
     for name in names:
         rows, unmatched, status = project(name, specs[name], work, t, blaze, a.jobs, a.clean)
         all_rows += rows
@@ -590,19 +632,27 @@ def main():
         stdout_rows = sum("stdout_equal" in r for r in rows)
         for k, v in enumerate((len(rows), env_eq, len(parse_rows), parse_eq, run_eq, stdout_eq, stdout_rows)):
             totals[k] += v
-        note = f", {unmatched} runs not found in the unit graph" if unmatched else ""
+        inert_n = sum(r.get("inert", False) for r in rows)
+        inert_eq = sum(r.get("inert_equal", False) for r in rows)
+        inert_totals[0] += inert_n
+        inert_totals[1] += inert_eq
+        note = f", inert {inert_n} (as run {inert_eq}/{inert_n})"
+        note += f", {unmatched} runs not found in the unit graph" if unmatched else ""
         note += ", cargo failed" if status else ""
         print(f"{name}: {len(rows)} scripts, env {env_eq}/{len(rows)}, parse {parse_eq}/{len(parse_rows)}, "
               f"run {run_eq}/{len(rows)}, stdout {stdout_eq}/{stdout_rows}{note}", flush=True)
         for r in rows:
-            if not (r["env_equal"] and r.get("parse_equal", True) and r["run_equal"]):
+            if not (r["env_equal"] and r.get("parse_equal", True) and r["run_equal"]
+                    and r.get("inert_equal", True)):
                 print("  " + json.dumps(r)[:600], flush=True)
     n, env_eq, np, parse_eq, run_eq, stdout_eq, stdout_rows = totals
     print(f"total: {n} scripts, env {env_eq}/{n}, parse {parse_eq}/{np}, run {run_eq}/{n}, "
-          f"stdout {stdout_eq}/{stdout_rows}")
+          f"stdout {stdout_eq}/{stdout_rows}, inert {inert_totals[0]} (as run {inert_totals[1]}/{inert_totals[0]})")
     if a.json:
         with open(a.json, "w") as f:
             json.dump(all_rows, f, indent=1)
+    if inert_totals[1] != inert_totals[0]:
+        sys.exit("scripts.py: a script blaze would not run prints something else than its run")
 
 
 if __name__ == "__main__":

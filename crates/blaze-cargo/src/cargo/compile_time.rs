@@ -663,11 +663,19 @@ impl<'a> Driver<'a> {
         Ok(info)
     }
 
-    /// Compiles the build script of unit `at`: where its executable is.
+    /// Compiles the build script of unit `at`, or writes what stands for one that only prints
+    /// (`inert_script.rs`): where its executable is.
     fn script(&self, at: usize) -> anyhow::Result<PathBuf> {
         let unit = self.unit(at);
         let dir = self.unit_dir(at);
         let exe = dir.join(format!("build-script-build{}", std::env::consts::EXE_SUFFIX));
+        std::fs::create_dir_all(&dir).with_context(|| format!("making {}", dir.display()))?;
+        if super::inert_script::elide(&self.rustc_args(at)?, &unit.target.src_path, &exe)
+            .map_err(anyhow::Error::msg)?
+        {
+            _ = std::fs::remove_file(exe.with_extension("described"));
+            return Ok(exe);
+        }
         let mut crates = vec![Described {
             name: SCRIPT.to_owned(),
             root: unit.target.src_path.clone(),
@@ -691,6 +699,27 @@ impl<'a> Driver<'a> {
         };
         self.compile(&crates, &made, &dir.join("blaze"))?;
         Ok(exe)
+    }
+
+    /// What of rustc's arguments for unit `at` decides whether a script compiles: its edition,
+    /// the flags of the configuration and the profile, and its lints as cargo gives them, those
+    /// of its manifest for a package of the checkout and capped for one from a registry or git.
+    fn rustc_args(&self, at: usize) -> anyhow::Result<Vec<String>> {
+        let unit = self.unit(at);
+        let package = self.package(at)?;
+        let mut args = vec![format!("--edition={}", unit.target.edition)];
+        let flags = self.platform(at).rustflags.iter().chain(unit.profile.rustflags.iter());
+        args.extend(flags.cloned());
+        if package.is_local {
+            let root: &Path = self.cargo.workspace_root().as_ref();
+            let manifest = AsRef::<Path>::as_ref(&package.manifest);
+            let lints = blaze_lints::manifest::lints(manifest, &root.join("Cargo.toml"))
+                .map_err(anyhow::Error::msg)?;
+            args.extend(blaze_lints::manifest::flags(&lints));
+        } else {
+            args.extend(["--cap-lints".to_owned(), "allow".to_owned()]);
+        }
+        Ok(args)
     }
 
     /// Builds the proc macro of unit `at` as a WebAssembly module, or links it for blaze's

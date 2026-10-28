@@ -208,8 +208,10 @@ fn what_rustc_is_given() {
     assert_eq!(with(&["-Dwarnings", "--cap-lints=warn"]), Ok(()));
     assert!(with(&["-Dwarnings", "--cap-lints", "deny"]).is_err());
     assert!(with(&["--extern", "std=/x/libstd.rlib"]).is_err());
-    assert!(with(&["-C", "link-arg=-lmissing"]).is_err());
-    assert!(with(&["-Clinker=/no/such/cc"]).is_err());
+    assert_eq!(with(&["-C", "link-arg=-fuse-ld=mold", "-Ctarget-cpu=native"]), Ok(()));
+    assert_eq!(with(&["-Dclippy::all", "--deny=rustdoc::broken"]), Ok(()));
+    assert!(with(&["-Drust::unused"]).is_err());
+    assert!(with(&["-C", "instrument-coverage"]).is_err());
     assert!(with(&["-lmissing"]).is_err());
     assert!(with(&["-Zcrate-attr=deny(warnings)"]).is_err());
     assert!(with(&["@args"]).is_err());
