@@ -181,15 +181,18 @@ impl Watch {
             }
             Of::Named(name) => (hash(&(2u8, name)), None, None, name.to_owned()),
         };
-        let took = timed.and_then(|it| TOOK.lock().unwrap_or_else(|e| e.into_inner()).get(&it).copied());
+        let took =
+            timed.and_then(|it| TOOK.lock().unwrap_or_else(|e| e.into_inner()).get(&it).copied());
         let how = match took {
             Some(ns) => How::Compiled { ns },
             None => kept,
         };
         let krate = match krate {
-            Some(krate) => {
-                self.crates.entry(krate).or_insert_with(|| crate::fncache::crate_name(db, krate)).clone()
-            }
+            Some(krate) => self
+                .crates
+                .entry(krate)
+                .or_insert_with(|| crate::fncache::crate_name(db, krate))
+                .clone(),
             None => String::new(),
         };
         self.batch.push(Placed { id, key, krate, name, calls, how });

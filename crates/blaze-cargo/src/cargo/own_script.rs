@@ -13,6 +13,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Condvar, Mutex, PoisonError},
 };
 
 use serde_json::{Value, json};
@@ -585,6 +586,33 @@ fn build(
     Ok(said)
 }
 
+/// How many fetches of the standard library a release ships are under way in this process
+/// ([`fetching`]).
+static FETCHING: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+/// A fetch of the standard library a release ships, under way while this is kept: the
+/// standard library of the scripts' builds is what it brings, so it is made once it is in
+/// ([`standard_library_once`]). A build that read the store while the fetch wrote it would
+/// find some of its packs and compile what is in the others.
+pub struct Fetching(());
+
+pub fn fetching() -> Fetching {
+    *FETCHING.0.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+    Fetching(())
+}
+
+impl Drop for Fetching {
+    fn drop(&mut self) {
+        *FETCHING.0.lock().unwrap_or_else(PoisonError::into_inner) -= 1;
+        FETCHING.1.notify_all();
+    }
+}
+
+fn fetched() {
+    let held = FETCHING.0.lock().unwrap_or_else(PoisonError::into_inner);
+    let _held = FETCHING.1.wait_while(held, |it| *it > 0);
+}
+
 /// Has the store `store` hold what every build of a script or proc macro takes from it before
 /// its own crates ([`build_nothing`]), once a store, build of blaze and toolchain of
 /// `sysroot`, building in `dir`. The builds cargo starts together in a cold build wait for the
@@ -597,6 +625,7 @@ fn standard_library_once(sysroot: &Path, store: &Path, dir: &Path) -> Result<(),
     once(&store.join(format!("scripts-std-{key}")), || {
         let of = Some("the standard library of build scripts");
         crate::events::within(blaze_protocol::events::Step::Std, of, || {
+            fetched();
             build_nothing(sysroot, dir, store, true).map(drop)
         })
     })

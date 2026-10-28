@@ -275,6 +275,10 @@ pub fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
         readable.extend(sandboxed::workspace_root(script.cwd)?);
     }
     readable.extend(target_of(script.out_dir).map(Path::to_owned));
+    // The store, read-only as the sandbox has the rest of the machine, where it would be empty
+    // (one below `/tmp`): the blaze a script runs as its `rustc` reads the standard library's
+    // frozen maps from it, and without them makes them again, seconds a probe.
+    readable.extend(super::daemon::store().filter(|it| it.is_dir() && emptied(it)));
     // The programs cargo names, and the directories of `PATH`, where a sandbox has empty
     // directories: `RUSTC` is blaze's own, which may be built below `/dev/shm`.
     let var = |name: &str| env.iter().find(|it| it.0 == name).map(|it| it.1.as_str());

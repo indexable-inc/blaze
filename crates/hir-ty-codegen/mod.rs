@@ -173,8 +173,8 @@ mod type_id;
 mod unwind;
 mod vtable;
 pub mod wasm;
-pub mod watch;
 mod wasm_object;
+pub mod watch;
 mod x86;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

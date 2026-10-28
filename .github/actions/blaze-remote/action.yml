@@ -65,10 +65,11 @@ runs:
         esac
         log="$RUNNER_TEMP/blaze-remote-$MODE.log"
         start=$(date +%s.%N)
+        # The exit status is said too: a blaze killed by a signal (137 for SIGKILL) says nothing.
         if blaze-engine cache "$MODE" "$REMOTE" "$PROJECT" 2>&1 | tee "$log"; then
           status=ok
         else
-          status=failed
+          status="failed (blaze-engine exit status ${PIPESTATUS[0]})"
         fi
         took=$(awk -v a="$start" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }')
         {
@@ -79,6 +80,6 @@ runs:
           echo '```'
         } >> "$GITHUB_STEP_SUMMARY"
         if [ "$status" != ok ]; then
-          echo "::error::blaze remote $MODE failed: see the job summary"
+          echo "::error::blaze remote $MODE $status: see the job summary"
           exit 1
         fi

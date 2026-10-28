@@ -468,7 +468,8 @@ fn a_record_of_functions_is_small() {
         })
         .collect();
     let names: usize = fns.iter().map(|it| it.name.len()).sum();
-    let record = Record { at_ns: 1, event: Event::Functions { object: 2, whole: true, functions: fns } };
+    let record =
+        Record { at_ns: 1, event: Event::Functions { object: 2, whole: true, functions: fns } };
     let bytes = to_vec(&record).unwrap();
     check(&bytes).unwrap();
     assert_eq!(from_slice::<Record>(&bytes).unwrap(), record);

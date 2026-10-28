@@ -7808,10 +7808,7 @@ pub fn main() -> anyhow::Result<()> {
             println!("{}", version());
             return Ok(());
         }
-        Some("cache") => {
-            end_with_reader();
-            return remote::command(std::env::args().skip(2));
-        }
+        Some("cache") => return remote::command(std::env::args().skip(2)),
         Some("std") => return shipped::command(std::env::args().skip(2)),
         Some("version-fetch") => return versions::command(std::env::args().skip(2)),
         Some("version-resolve") => return versions::resolve_command(std::env::args().skip(2)),
@@ -8662,6 +8659,13 @@ fn run_holding(
     {
         blaze_store::compiles_against(&toolchain);
     }
+    // A build with nothing of rustc's starts from the standard library, which a release ships:
+    // fetched while the workspace loads, it is in before the names are resolved, and the
+    // standard library of the build scripts the load builds is made of it.
+    let nothing_of_rustc = !ahead && args.symbol_files.is_empty();
+    if nothing_of_rustc && args.prebuilt.is_none() && !patches_its_library(&args) {
+        shipped::fetch_ahead(emits.triple(), &args.project)?;
+    }
 
     // What other machines compiled is fetched beside the build, which never waits for it: the
     // store reads what arrived once it is in, and the build finds it from then on.
@@ -8740,11 +8744,6 @@ fn run_holding(
             std::thread::spawn(blaze_store::check_packs);
         }
         None => eprintln!("store: the toolchain of the library cannot be told from another"),
-    }
-    // A build with nothing of rustc's starts from the standard library, which a release ships.
-    let nothing_of_rustc = library.is_none() && args.symbol_files.is_empty();
-    if nothing_of_rustc && args.prebuilt.is_none() && !patches_its_library(&args) {
-        shipped::fetch_ahead(emits.triple(), &args.project)?;
     }
     let following_at = start.elapsed();
     let built = follow_cargo(&mut db, &mut vfs, &mut checkouts, &args, &listed)?;

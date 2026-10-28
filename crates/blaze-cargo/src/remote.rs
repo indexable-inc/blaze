@@ -994,6 +994,11 @@ pub fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
         return collect_remote(args);
     }
     let store = crate::cargo::daemon::store().context("BLAZE_CACHE says there is no store")?;
+    // Not for push and pull, which write to sockets: a reset from the remote would end them
+    // by SIGPIPE, with no word of why (exit status 141).
+    if matches!(verb.as_str(), "stats" | "gc" | "verify") {
+        crate::end_with_reader();
+    }
     match verb.as_str() {
         "stats" => stats(&store),
         "gc" => collect(&store, args),
