@@ -2920,13 +2920,14 @@ impl Checkouts {
         }
         let workspaces_at = start.elapsed();
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        let added_at = start.elapsed();
         prepare_macro_sessions(db);
         if std::env::var_os("BLAZE_STATS").is_some() {
-            let files = start.elapsed() - workspaces_at;
             eprintln!(
-                "load-us: workspaces={} files={}",
+                "load-us: workspaces={} files={} sessions={}",
                 workspaces_at.as_micros(),
-                files.as_micros()
+                (added_at - workspaces_at).as_micros(),
+                (start.elapsed() - added_at).as_micros()
             );
         }
         self.roots.extend(roots);
