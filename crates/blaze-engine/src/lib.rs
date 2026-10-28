@@ -7811,6 +7811,7 @@ pub fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some("cache") => return remote::command(std::env::args().skip(2)),
+        Some("patch-image") => return splice::image::command(std::env::args().skip(2)),
         Some("std") => return shipped::command(std::env::args().skip(2)),
         Some("version-fetch") => return versions::command(std::env::args().skip(2)),
         Some("version-resolve") => return versions::resolve_command(std::env::args().skip(2)),

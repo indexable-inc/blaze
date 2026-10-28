@@ -1,6 +1,6 @@
 [package]
 name = "blaze-splice"
-description = "blaze's splice: an edit's functions written into the executable of the last link, ELF, Mach-O, PE and wasm"
+description = "blaze's patcher: an edit's functions written into the running program or the executable of the last build (ELF, Mach-O, PE and wasm), and a cold build patched onto an empty ELF image"
 publish = false
 
 version.workspace = true
@@ -23,6 +23,9 @@ memmap2 = "0.9"
 object = { version = "0.37", default-features = false, features = ["read", "write", "std", "archive", "elf", "macho", "coff", "pe", "wasm"] }
 pdb = "0.8"
 rustc-hash.workspace = true
+serde.workspace = true
+serde_derive.workspace = true
+serde_json.workspace = true
 sha2 = "0.10"
 wasmparser = { version = "0.236", default-features = false, features = ["std"] }
 wasm-encoder = { version = "0.244", default-features = false, features = ["std"] }

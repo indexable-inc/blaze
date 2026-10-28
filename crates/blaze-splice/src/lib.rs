@@ -80,6 +80,7 @@ pub use self::lasting::Lasting;
 use self::lasting::{Own, is_lasting, left_behind};
 
 pub mod debug;
+pub mod image;
 pub mod lasting;
 pub mod macho;
 pub mod pe;
