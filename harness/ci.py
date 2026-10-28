@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+# pyright: basic
 """ci.py: the harnesses CI runs, in parts that take about the same time on a hosted runner.
 
 usage: ci.py run '{"part": "core-1"}'   run the harnesses of a part for BLAZE_BACKEND on this machine
@@ -30,16 +30,29 @@ the store on.
 Every harness in a part runs even when one before it fails; the part fails at the end and names
 them. BLAZE_BIN is the blaze the harnesses run, as for each harness on its own.
 """
-import json, math, os, platform, shutil, subprocess, sys, tempfile, time
+import json
+import math
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
 from dataclasses import dataclass
 from typing import Literal
 
 from typed_input import fail, parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
 SYSTEM = {"linux": "linux", "darwin": "macos", "win32": "windows"}[sys.platform]
 ARCH = "aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "x86_64"
 BACKEND = os.environ.get("BLAZE_BACKEND") or "cranelift"
+BLAZE_CLI = os.path.join(
+    os.path.dirname(os.path.abspath(os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/blaze-engine"))),
+    "blaze.exe" if SYSTEM == "windows" else "blaze",
+)
 KEYS = 3
 
 
@@ -121,7 +134,11 @@ HARNESSES = [
     # Each scenario runs rustc and rustdoc no more often than norustc/baseline.json says.
     ("core", ["norustc.py"], {}, on("linux", "macos"), 2),
     # `blaze check`'s diagnostics, in each `--message-format`, against rustc's.
-    ("core", ["check_json.py"], {}, on("linux", "macos", backend="cranelift"), 2),
+    ("core", ["check_json.py", arg({"blaze_bin": os.environ.get("BLAZE_BIN", "")})], {},
+     on("linux", "macos", backend="cranelift"), 2),
+    # Generated proc-macro input and writable LazyLock identity across edits and a restart.
+    ("core", ["own_inputs.py", arg({"blaze": BLAZE_CLI})], {},
+     on("linux", "macos", backend="cranelift"), None),
     ("core", ["checktargets.py"], {}, on("linux", "macos", backend="cranelift"), 2),
     ("core", ["nativespans.py"], {}, on("linux", "macos"), 2),
     ("core", ["gitindex.py"], {}, on("linux", "macos", backend="cranelift"), 2),
@@ -361,11 +378,12 @@ def run_one(args, env):
     # Under /tmp, short: a daemon's socket is under its home, and macOS allows 104 bytes.
     home = tempfile.mkdtemp(prefix="rj-ci-", dir="/tmp" if SYSTEM != "windows" else None)
     own = {"BLAZE_HOME": home}
-    status = subprocess.run([sys.executable, *args], cwd=HERE, env={**os.environ, **own, **env}).returncode
+    status = subprocess.run([sys.executable, *args], cwd=HERE, env={**os.environ, **own, **env}, check=False).returncode
     # A daemon the harness left running in that home, which nothing after it may talk to.
     blaze_cli = os.path.join(os.path.dirname(os.path.abspath(os.environ.get("BLAZE_BIN", ""))), "blaze")
     if os.environ.get("BLAZE_BIN") and os.path.exists(blaze_cli + (".exe" if SYSTEM == "windows" else "")):
-        subprocess.run([blaze_cli, "blaze", "stop"], env={**os.environ, **own}, capture_output=True, timeout=120)
+        subprocess.run([blaze_cli, "blaze", "stop"], env={**os.environ, **own}, capture_output=True,
+                       timeout=120, check=False)
     if status == 0:
         shutil.rmtree(home, ignore_errors=True)
     return status
