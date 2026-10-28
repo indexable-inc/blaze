@@ -89,6 +89,7 @@ fn version() {
                         && day.bytes().all(|b| b.is_ascii_digit())
                         && !n.is_empty()
                         && n.bytes().all(|b| b.is_ascii_digit())
+                        && (n == "0" || !n.starts_with('0'))
                 },
             );
             assert!(dated, "BLAZE_RELEASE is {tag:?}, not a release's tag v0.YYYYMMDD.N");
@@ -103,9 +104,11 @@ fn version() {
         None if package == "0.0.0" => "0.0.0-dev".to_owned(),
         None => package,
     };
+    // TZ: the date is UTC's, as release.yaml's `BLAZE_GIT_DATE`.
     let git = |args: &[&str]| {
         let out = std::process::Command::new("git")
             .args(args)
+            .env("TZ", "UTC0")
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .output()
             .ok()
@@ -126,7 +129,9 @@ fn version() {
                 }
             }
             let sha = git(&["rev-parse", "--short=7", "HEAD"]);
-            let date = sha.as_ref().and_then(|_| git(&["show", "-s", "--format=%cs", "HEAD"]));
+            let date = sha.as_ref().and_then(|_| {
+                git(&["show", "-s", "--date=format-local:%Y-%m-%d", "--format=%cd", "HEAD"])
+            });
             (sha, date)
         }
     };

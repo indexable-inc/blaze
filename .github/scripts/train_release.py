@@ -113,6 +113,15 @@ async def release(args):
         print(f"nothing to release: no change since {base} but the bots' own", flush=True)
         return [f"nothing to release since {base}"]
     tags = (await run("git", "tag", "-l", "v*", step="the release tags")).split()
+    # The newest release by number must be on HEAD's history: a canary (canary.yaml) may have
+    # tagged a newer commit of main since this checkout's, and a higher number on older code
+    # would move the canary channel back to it.
+    newest = max((t for t in tags if DATED.fullmatch(t)), key=lambda t: tuple(int(n) for n in t[1:].split(".")))
+    if newest != base:
+        on_history = (await run("git", "tag", "--merged", "HEAD", "-l", newest, step="the newest release")).strip()
+        if on_history != newest:
+            print(f"nothing to release: {newest}, the newest release, is not on HEAD's history (a newer commit of main has it)", flush=True)
+            return [f"nothing to release: {newest} is newer than HEAD"]
     tag = f"v{next_version(tags, datetime.datetime.now(datetime.UTC).date())}"
     head = (await run("git", "rev-parse", "HEAD", step="HEAD")).strip()
     if not args.push:
