@@ -193,7 +193,7 @@ def request_of(collect2: list[str], machine: str, output: str) -> tuple[dict, li
 def collect2_of(said: str) -> list[str]:
     """collect2's arguments (without its name) in what `cc -###` printed."""
     for line in said.splitlines():
-        if line.startswith(" ") and line.strip().startswith('"'):
+        if line.startswith(" "):
             argv = shlex.split(line)
             if os.path.basename(argv[0]) in ("collect2", "ld", "ld.lld"):
                 return argv[1:]
