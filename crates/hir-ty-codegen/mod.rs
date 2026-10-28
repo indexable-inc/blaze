@@ -114,6 +114,7 @@ pub use fncache::{Call, Found, Kind as ReachKind, Reach, tests_reach};
 mod fragment;
 mod home;
 mod later;
+mod masked;
 pub use home::body_file;
 #[cfg(feature = "llvm")]
 mod imports;
@@ -4731,6 +4732,7 @@ fn compile_as<'db>(
         }
         Result::Ok(ctx)
     })?;
+    let mut masked = None;
     let code = match cg.naked.take() {
         // The function is its assembly: what was built of it is only its signature.
         Some((text, syms)) => {
@@ -4777,7 +4779,14 @@ fn compile_as<'db>(
                 closure: None,
             }));
         }
-        None => Backend::emit(&mut cg, &mut ctx)?,
+        None => {
+            static SHAPES: LazyLock<bool> =
+                LazyLock::new(|| std::env::var_os("BLAZE_SHAPES").is_some());
+            if *SHAPES {
+                masked = Some(Box::new(masked::masked(&ctx.func)));
+            }
+            Backend::emit(&mut cg, &mut ctx)?
+        }
     };
     let (source, variables) = described(&mut cg, env, body);
     let (requests, layouts) = cg.finish();
@@ -4792,6 +4801,7 @@ fn compile_as<'db>(
         closure: None,
         variables,
         layouts,
+        masked,
     }))
 }
 
@@ -4839,6 +4849,7 @@ impl Pending {
             closure: self.closure,
             variables: self.variables,
             layouts: self.layouts,
+            masked: None,
         })
     }
 }
@@ -6687,6 +6698,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let start = stdx::time::Instant::now();
         let relocs: Vec<_> = compiled.code.relocs.iter().map(|it| ids.reloc(it, id)).collect();
         self.shape_code(id, &compiled.code, &relocs);
+        self.shape_masked(id, compiled.masked.as_deref(), &ids);
         self.define_code(id, &compiled.code, &relocs)?;
         for (ty, size, align) in &compiled.layouts {
             self.layouts.entry(ty.clone()).or_insert((*size, *align));
@@ -6741,6 +6753,38 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 derive as u8,
                 took.as_micros(),
                 hasher.finish()
+            );
+        }
+    }
+
+    fn shape_masked(&mut self, id: FuncId, masked: Option<&masked::Masked>, ids: &Resolved) {
+        use std::io::Write;
+        let (Some(masked), Some(_)) = (masked, &self.shapes) else { return };
+        let decls = self.module.declarations();
+        let show = |it: &masked::Const| match it {
+            masked::Const::Int(v) => format!("i{v}"),
+            masked::Const::Float(v) => format!("f{v:x}"),
+            masked::Const::Name(0, index, offset) => {
+                let f = ids.funcs[*index as usize];
+                format!("F{}+{offset}", decls.get_function_decl(f).linkage_name(f))
+            }
+            masked::Const::Name(1, index, offset) => {
+                let d = ids.datas[*index as usize];
+                format!("D{}+{offset}", decls.get_data_decl(d).linkage_name(d))
+            }
+            other => format!("O{other:?}"),
+        };
+        let consts: Vec<_> = masked.consts.iter().map(show).collect();
+        let calls: Vec<_> = masked.calls.iter().map(show).collect();
+        let symbol = decls.get_function_decl(id).linkage_name(id).into_owned();
+        if let Some(out) = &mut self.shapes {
+            let _ = writeln!(
+                out,
+                "M\t{symbol}\t{:x}\t{}\t{}\t{}",
+                masked.hash,
+                masked.insts,
+                consts.join("\x1f"),
+                calls.join("\x1f")
             );
         }
     }

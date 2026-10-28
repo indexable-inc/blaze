@@ -162,6 +162,8 @@ pub struct CompiledFunction {
     pub(super) variables: Option<(StoredParamEnvAndCrate, Vec<Variable>)>,
     /// Size and alignment of every type laid out, collected when `BLAZE_LAYOUTS` is set.
     pub(super) layouts: Vec<(String, u64, u64)>,
+    /// Its IR with the constants masked, with `BLAZE_SHAPES`.
+    pub(super) masked: Option<Box<super::masked::Masked>>,
 }
 
 /// A local written with a name that is kept in one slot of the frame for as long as the

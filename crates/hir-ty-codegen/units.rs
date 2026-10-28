@@ -794,6 +794,7 @@ fn unit(db: &dyn HirDatabase, members: Vec<Built>) -> Vec<(Kind, Outcome)> {
                 closure: None,
                 variables: None,
                 layouts: Vec::new(),
+                masked: None,
             };
             Some((Kind::Instance(instance, env), Outcome::Kept(compiled)))
         })
@@ -816,7 +817,7 @@ fn unit(db: &dyn HirDatabase, members: Vec<Built>) -> Vec<(Kind, Outcome)> {
             tally.llvm.add(each, code.bytes.len());
             COMPILED.fetch_add(1, Ordering::Relaxed);
             let Pending { source, variables, layouts, closure, .. } = member.pending;
-            let compiled = CompiledFunction { requests, code, source, closure, variables, layouts };
+            let compiled = CompiledFunction { requests, code, source, closure, variables, layouts, masked: None };
             (member.kind, Outcome::Code(compiled))
         })
         .collect();
