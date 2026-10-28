@@ -65,7 +65,7 @@ runs:
         # for one job, so nothing needs collecting.
         echo "BLAZE_CACHE_MAX=off" >> "$GITHUB_ENV"
         echo "project=blaze-$RUNNER_OS-$RUNNER_ARCH-$JOB-$version" | tee -a "$GITHUB_OUTPUT"
-    - if: steps.toolchain.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+    - if: steps.toolchain.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || github.head_ref == 'nonix-gate')
       uses: actions/cache/save@v6
       with:
         path: ~/.blaze/toolchains
@@ -108,7 +108,7 @@ runs:
       run: |
         python3 .github/scripts/llvm.py fetch --target "$TRIPLE" --dir "$DIR"
         echo "LLVM_SYS_231_PREFIX=$DIR" >> "$GITHUB_ENV"
-    - if: inputs.llvm == 'true' && steps.llvm-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+    - if: inputs.llvm == 'true' && steps.llvm-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || github.head_ref == 'nonix-gate')
       uses: actions/cache/save@v6
       with:
         path: ${{ steps.llvm.outputs.dir }}
