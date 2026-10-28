@@ -26,6 +26,6 @@ pub fn run() -> (Option<u8>, Vec<(String, bool)>) {
         let file = file.replace('\\', "/");
         let named = file.rfind("/library/").map_or(file.as_str(), |at| &file[at + 1..]).to_owned();
         (named, std::path::Path::new(&file).is_file())
-    });
-    (summed, files.collect())
+    }).collect();
+    (summed, files)
 }
