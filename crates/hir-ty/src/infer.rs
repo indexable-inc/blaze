@@ -129,6 +129,13 @@ pub fn infer_query_with_inspect<'db>(
     lowering_mode: LoweringMode,
 ) -> InferenceResult<'db> {
     let _p = tracing::info_span!("infer_query").entered();
+    base_db::demand_trace::record(
+        if inspect.is_some() || lowering_mode != LoweringMode::Analysis { "infer2" } else { "infer" },
+        db,
+        Some(hir_def::HasModule::krate(&def, db)),
+        def,
+        0,
+    );
     let resolver = def.resolver(db);
     let body = Body::of(db, def);
     let mut ctx = InferenceContext::new(

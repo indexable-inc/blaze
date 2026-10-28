@@ -180,6 +180,13 @@ impl Body {
 
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &dyn SourceDatabase, def: DefWithBodyId) -> Arc<Body> {
+        base_db::demand_trace::record(
+            "body",
+            db,
+            Some(crate::HasModule::krate(&def, db)),
+            def,
+            0,
+        );
         match Self::relative(db, def) {
             Some((body, _)) => body.clone(),
             None => Self::with_source_map(db, def).0.clone(),

@@ -24,6 +24,8 @@ impl EditionedFileId {
         let _p = tracing::info_span!("parse", ?self).entered();
         let (file_id, edition) = self.unpack(db);
         let text = db.file_text(file_id).text(db);
+        let krate = crate::relevant_crates(db, file_id).first().copied();
+        crate::demand_trace::record("parse", db, krate, file_id, text.len());
         ast::SourceFile::parse(text, edition)
     }
 

@@ -4895,6 +4895,9 @@ pub fn mir_body_query<'db>(
     def: InferBodyId<'db>,
 ) -> Result<'db, MirBody<'db>> {
     let krate = def.krate(db);
+    if let InferBodyId::DefWithBodyId(def) = def {
+        base_db::demand_trace::record("mir", db, Some(krate), def, 0);
+    }
     let edition = krate.data(db).edition;
     let detail = match def {
         InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(it)) => {

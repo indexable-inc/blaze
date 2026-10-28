@@ -11,6 +11,7 @@ pub use salsa;
 use span::TextSize;
 
 mod change;
+pub mod demand_trace;
 mod editioned_file_id;
 mod input;
 pub mod target;
