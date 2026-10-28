@@ -1,14 +1,15 @@
 # Probe branch of lane relax-images (blaze #1295, #1299): not for merging. Measures the anim
-# stand-in's warm load and the worker's memory with two releases.
+# stand-in's warm load and the worker's memory with two releases, the second's engine replaced
+# by one blaze builds from a ref when one is named.
 name: fuzz
 on:
   workflow_dispatch:
     inputs:
       seed:
-        description: unused
+        description: ref whose blaze-engine replaces the new release's (optional)
         required: false
       rounds:
-        description: old release, new release, engine artifact run id (optional)
+        description: old release, new release
         default: "0.20261028.9 0.20261028.10"
 
 jobs:
@@ -17,18 +18,33 @@ jobs:
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v7
+      - if: inputs.seed != ''
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.seed }}
+          path: arm
+      - if: inputs.seed != ''
+        uses: ./.github/actions/toolchain
+        with:
+          llvm: build
+      - if: inputs.seed != ''
+        id: blaze
+        uses: ./.github/actions/blaze
+        with:
+          job: build
+      - if: inputs.seed != ''
+        working-directory: arm
+        run: |
+          nix develop --command blaze build -p blaze-engine --release --features llvm --locked
+          blaze stop || true
+          cp target/release/blaze-engine "$RUNNER_TEMP/blaze-engine"
       - run: sudo apt-get update -q && sudo apt-get install -yq libasound2-dev pkg-config
       - name: measure
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -- ${{ inputs.rounds }}
           export OLD=$1 NEW=$2
-          if [ -n "${3:-}" ]; then
-            gh run download "$3" -n blaze-linux-x86_64 -D "$RUNNER_TEMP/engine"
-            export ENGINE=$(find "$RUNNER_TEMP/engine" -name blaze-engine -type f | head -1)
-            chmod +x "$ENGINE"
-          fi
+          [ -f "$RUNNER_TEMP/blaze-engine" ] && export ENGINE="$RUNNER_TEMP/blaze-engine"
+          unset BLAZE_CACHE
           nproc; free -g
           OUT="$RUNNER_TEMP/probe/out" bash probe/measure.sh
       - if: always()
