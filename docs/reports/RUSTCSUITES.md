@@ -1,3 +1,8 @@
+---
+status: record
+summary: rustc's own test suites through blaze.
+date: 2026-10-20
+---
 # rustc's own test suites through blaze
 
 Branch `blaze-rustc-suites`, off `blaze-collate`; round two merges `blaze-collate` again, last at

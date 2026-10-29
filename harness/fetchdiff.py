@@ -92,7 +92,7 @@ class Mirror(http.server.BaseHTTPRequestHandler):
         path = self.path
         if path.startswith("/auth/"):
             sent = self.headers.get("authorization") == AUTH_TOKEN
-            client = "blaze" if self.headers.get("user-agent", "").startswith("blaze/") else "cargo"
+            client = "blaze" if self.headers.get("user-agent", "").startswith("blaze") else "cargo"
             AUTH_ASKED.append((client, path, sent))
             if not sent:
                 body = b"this registry wants a token"

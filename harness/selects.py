@@ -34,7 +34,7 @@ PACKAGE = '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n'
 # What cargo is asked for, and the same said to blaze.
 SELECTIONS = [
     ("one program", ["build", "-p", "app"], ["--package", "app"]),
-    ("its tests", ["test", "--no-run", "-p", "app"], ["--package", "app", "--cfg-test"]),
+    ("its tests", ["test", "--no-run", "-p", "app"], ["--package", "app", "--unit-test"]),
     ("the workspace", ["build", "--workspace"], ["--workspace"]),
 ]
 

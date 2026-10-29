@@ -630,7 +630,7 @@ impl ItemScope {
                             // A non-glob import either shadows a glob import of the same
                             // name, or re-resolves a stale binding it recorded earlier.
                             if glob_imports.types.remove(&lookup)
-                                || entry.get().is_reresolved_by(&fld.def, import)
+                                || entry.get().is_reresolved_by(&fld, import)
                             {
                                 let prev = std::mem::replace(&mut fld.import, import);
                                 if let Some(import) = import {
@@ -673,7 +673,7 @@ impl ItemScope {
                 {
                     let import = import.and_then(ImportOrExternCrate::import_or_glob);
                     if glob_imports.values.remove(&lookup)
-                        || entry.get().is_reresolved_by(&fld.def, import)
+                        || entry.get().is_reresolved_by(&fld, import)
                     {
                         cov_mark::hit!(import_shadowed);
 
@@ -713,7 +713,7 @@ impl ItemScope {
                 Entry::Occupied(mut entry)
                     if !matches!(import, Some(ImportOrExternCrate::Glob(..)))
                         && (glob_imports.macros.remove(&lookup)
-                            || entry.get().is_reresolved_by(&fld.def, import)) =>
+                            || entry.get().is_reresolved_by(&fld, import)) =>
                 {
                     cov_mark::hit!(import_shadowed);
                     let prev = std::mem::replace(&mut fld.import, import);

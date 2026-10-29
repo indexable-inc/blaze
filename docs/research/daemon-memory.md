@@ -1,3 +1,8 @@
+---
+status: record
+summary: What the daemon's memory is, by salsa query and allocation site, and what salsa's lru can evict.
+date: 2026-10-21
+---
 # What the daemon's memory is, and what salsa's `lru` can do about it
 
 2026-10-21, for [#39](https://github.com/indexable-inc/blaze/issues/39) (Glancer item 5,

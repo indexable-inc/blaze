@@ -1,4 +1,4 @@
-//! blaze's cache gateway (worker/remote-cache/API-v0.md): a tenant's objects at
+//! blaze's cache gateway (tools/remote-cache/API-v0.md): a tenant's objects at
 //! `<base>/<name>`, read with GET and HEAD and written with PUT, behind a bearer token.
 //!
 //! `BLAZE_REMOTE=blaze+https://<gateway>/t/<tenant>/v3` names it (`blaze+http://` for a

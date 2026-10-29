@@ -2,11 +2,16 @@
 
 All notable changes to blaze are written here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions after 0.1.0 are dated,
-`0.YYYYMMDD.N` with N counting the releases of that day from 0, and the release train writes
-each one's section: what `[Unreleased]` had, and the title of each change merged since
-(docs/harness.md, "CI").
+`0.YYYYMMDD.N` with N counting the releases of that day from 0. Up to 0.20261028.9 the release
+train wrote each one's section here; since then no release commits to main (docs/release.md,
+"Versions"), and a release's notes, in its GitHub release, are the lines `[Unreleased]` gained
+since the release before and the title of each change merged since.
 
 ## [Unreleased]
+
+### Changed
+
+- Releases: a canary is cut as soon as main's Linux x86-64 build of a commit passes, without waiting for the unit tests; stable now also needs main's merge gate on that commit green, with the unit tests run and passed on Linux x86-64, Linux ARM64 and macOS (docs/release.md).
 
 ## [0.20261028.9] - 2026-10-28
 

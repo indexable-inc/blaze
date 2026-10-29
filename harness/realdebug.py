@@ -224,12 +224,12 @@ def verify(tally, what, binary):
     left out, which it finds to overlap, in the cargo build as well."""
     said = subprocess.run([DWARFDUMP, "--verify", binary], capture_output=True, text=True, errors="replace").stdout
     heads = units(binary)
-    count = sum(bool(re.search(r'DW_AT_producer\s+\("blaze ', unit)) for unit in heads)
+    count = sum(bool(re.search(r'DW_AT_producer\s+\("blaze[ "]', unit)) for unit in heads)
     spans = []
     listed = subprocess.run([DWARFDUMP, "--debug-info", "--show-children=0", "--recurse-depth=0", binary],
                             capture_output=True, text=True, errors="replace").stdout
     for unit in re.finditer(r"^(0x[0-9a-f]+): Compile Unit: length = (0x[0-9a-f]+).*?(?=^0x[0-9a-f]+: Compile Unit|\Z)", listed, re.S | re.M):
-        if re.search(r'DW_AT_producer\s+\("blaze ', unit.group(0)):
+        if re.search(r'DW_AT_producer\s+\("blaze[ "]', unit.group(0)):
             spans.append((int(unit.group(1), 16), int(unit.group(1), 16) + int(unit.group(2), 16)))
     errors = [it for it in re.split(r"^error: ", said, flags=re.M)[1:] if "occurred" not in it.splitlines()[0] and not it.startswith("Aggregated")]
     ours = [it for it in errors

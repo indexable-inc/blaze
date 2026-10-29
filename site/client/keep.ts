@@ -4,10 +4,13 @@
  * unless the reader opened it there) and the sidebar's scroller
  * goes back to where it was, and moving to another page doesn't make the sidebar jump. side.ts writes both (the
  * folds on toggle, the scroll on pagehide) and marks the scroller `data-kept` so it doesn't re-centre the open row.
+ * The width the reader dragged the sidebar to (client/lib/resize.ts) is set here too.
  * A block, not a module: it must not wait for the parse to end.
  */
 {
 	try {
+		const w = Number(localStorage.getItem('blaze.side.w'));
+		if (w > 0) document.documentElement.style.setProperty('--side-w', `${w}px`);
 		const raw = localStorage.getItem('blaze.side.folded');
 		const folded: unknown = raw === null ? [] : JSON.parse(raw);
 		// In the phone drawer a FoldOnPhone section (Reference) starts folded unless the reader opened it there

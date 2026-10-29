@@ -1,3 +1,7 @@
+---
+status: current
+summary: blaze doc: HTML documentation written from the front end's HIR, with no rustdoc.
+---
 # `blaze doc`
 
 `blaze doc` (and `blaze doc`) writes the HTML documentation of the packages asked for and

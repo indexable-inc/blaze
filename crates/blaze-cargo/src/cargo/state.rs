@@ -361,6 +361,7 @@ pub fn checked(asked: &Invocation) -> anyhow::Result<daemon::Ahead> {
         env: worker_env(),
         command_env: BTreeMap::new(),
         whole: false,
+        tests_told: None,
     };
     Ok(daemon::Ahead { config, crates, root, targets: asked.target_flags() })
 }

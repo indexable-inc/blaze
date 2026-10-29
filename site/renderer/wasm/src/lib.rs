@@ -8,7 +8,6 @@
 //! site_pages(h)                                                                   -> 0, output = JSON [{url, file, doc, discussable}]
 //! site_discussable(h)                                                             -> 0, output = JSON {doc: {title, blocks: {id: text}}}
 //! site_render(h, url, url_len, comments, comments_len, discussion, discussion_len) -> 0 with HTML, or 1 with the error
-//! site_spoken(h, url, url_len)                                                    -> 0, output = JSON [{id, block, text, authored}]
 //! read site_output_len(h) bytes at site_output_ptr(h); site_drop(h)
 //! ```
 //!
@@ -138,28 +137,6 @@ pub unsafe extern "C" fn site_render(
         (None, _) => Err("no site loaded".to_string()),
         (_, Err(e)) => Err(format!("url: {e}")),
         (Some(s), Ok(url)) => s.render_cbor(url, comments, discussion).map(|r| r.html.into_bytes()),
-    };
-    h.status(r)
-}
-
-/// The spoken lines of the page at `url` (core `spoken.rs`), in order: `[{id, block, text, authored}]`.
-///
-/// # Safety
-/// `h` from `site_new`; `url` readable for `url_len`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn site_spoken(h: *mut Handle, url: *const u8, url_len: usize) -> i32 {
-    let h = unsafe { &mut *h };
-    let url = unsafe { bytes(url, url_len) };
-    let r = match (h.site.as_ref(), std::str::from_utf8(url)) {
-        (None, _) => Err("no site loaded".to_string()),
-        (_, Err(e)) => Err(format!("url: {e}")),
-        (Some(s), Ok(url)) => s.spoken(url).map(|lines| {
-            let v: Vec<_> = lines
-                .iter()
-                .map(|l| serde_json::json!({ "id": l.id, "block": l.block, "text": l.text, "authored": l.authored }))
-                .collect();
-            serde_json::to_vec(&v).expect("serialises")
-        }),
     };
     h.status(r)
 }

@@ -1,3 +1,8 @@
+---
+status: record
+summary: blaze's MIR against rustc's optimized MIR: match rates, passes ported and not, production gaps ranked.
+date: 2026-10-20
+---
 # blaze's MIR against rustc's, and what production apps still need
 
 2026-10-20. Claims are marked **read** (in source we read, or measured here, with the command),

@@ -1,3 +1,8 @@
+---
+status: record
+summary: Build scripts under WASI, an experiment, on the bench corpus.
+date: 2026-10-27
+---
 # Build scripts under WASI: the bench corpus
 
 An experiment, off by default ([docs/cargo.md](../cargo.md#build-scripts-under-wasi-an-experiment-off-by-default)
@@ -46,7 +51,7 @@ Per project (cargo's exit is 101 where a native script failed; `--keep-going` me
 | total | | 624 | 473 | 6 | 0 | 135 | 10 |
 
 Every run with its category and why is in
-[bench/results/2026-10-27-bswasi/](../../bench/results/2026-10-27-bswasi/) (`README.md` lists
+[tools/bench/results/2026-10-27-bswasi/](../../tools/bench/results/2026-10-27-bswasi/) (`README.md` lists
 each crate by category, `runs.json` has one entry per run, `<project>.json` what was compared).
 
 ## Measured with

@@ -47,6 +47,9 @@ pub struct CargoWorkspace {
     requires_rustc_private: bool,
     /// The directory the build put the executables of the workspace in.
     executables: Option<AbsPathBuf>,
+    /// The directory cargo gives the integration tests and benchmarks of the build to write
+    /// in, `CARGO_TARGET_TMPDIR`.
+    scratch: Option<AbsPathBuf>,
 }
 
 impl ops::Index<Package> for CargoWorkspace {
@@ -155,6 +158,9 @@ pub struct CargoConfig {
     /// The directory a build put the executables of the workspace in, which the tests of a
     /// package are told as `CARGO_BIN_EXE_<name>`.
     pub executables: Option<AbsPathBuf>,
+    /// The directory the integration tests and benchmarks of a build are told to write in as
+    /// `CARGO_TARGET_TMPDIR`, which cargo makes `<target-dir>/tmp`.
+    pub scratch: Option<AbsPathBuf>,
     /// Where the workspace and its `cargo metadata` come from instead of cargo. When it fails,
     /// so does the load: cargo is not asked instead.
     pub own_metadata: Option<OwnMetadata>,
@@ -380,6 +386,9 @@ pub struct TargetData {
     pub kind: TargetKind,
     /// Required features of the target without which it won't build
     pub required_features: Vec<String>,
+    /// Whether `cargo test` builds it as tests (`test = true`), which an example is only when
+    /// its manifest says so.
+    pub tested: bool,
 }
 
 fn convert_target_kind(kinds: &[cargo_metadata::TargetKind]) -> TargetKind {
@@ -626,8 +635,14 @@ impl CargoWorkspace {
             requires_rustc_private |= pkg_data.metadata.rustc_private;
             pkg_by_id.insert(id, pkg);
             for meta_tgt in meta_targets {
-                let cargo_metadata::Target { name, kind, required_features, src_path, .. } =
-                    meta_tgt;
+                let cargo_metadata::Target {
+                    name,
+                    kind,
+                    required_features,
+                    src_path,
+                    test: tested,
+                    ..
+                } = meta_tgt;
                 let kind = convert_target_kind(&kind);
                 let tgt = targets.alloc(TargetData {
                     package: pkg,
@@ -645,6 +660,7 @@ impl CargoWorkspace {
                     },
                     kind,
                     required_features,
+                    tested,
                 });
                 pkg_data.targets.push(tgt);
             }
@@ -724,6 +740,7 @@ impl CargoWorkspace {
             is_virtual_workspace,
             requires_rustc_private,
             executables: None,
+            scratch: None,
             is_sysroot,
             env: cargo_env,
         }
@@ -765,6 +782,9 @@ impl CargoWorkspace {
             None => path.to_path_buf(),
         };
         let mut placed = self.clone();
+        // What the tests of the build are told of where it puts things is of its checkout.
+        placed.executables = self.executables.as_deref().map(place);
+        placed.scratch = self.scratch.as_deref().map(place);
         let mut targets = Vec::new();
         for (_, package) in placed.packages.iter_mut() {
             if !package.is_member || !moved(package.manifest.parent()) {
@@ -882,6 +902,14 @@ impl CargoWorkspace {
 
     pub fn set_executables(&mut self, directory: Option<AbsPathBuf>) {
         self.executables = directory;
+    }
+
+    pub fn scratch(&self) -> Option<&AbsPath> {
+        self.scratch.as_deref()
+    }
+
+    pub fn set_scratch(&mut self, directory: Option<AbsPathBuf>) {
+        self.scratch = directory;
     }
 
     pub fn is_sysroot(&self) -> bool {

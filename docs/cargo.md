@@ -1,3 +1,7 @@
+---
+status: current
+summary: Every blaze command and setting: cargo's commands and flags, what a build does, sandboxing, manifests.
+---
 # Using blaze
 
 `blaze <command>` takes cargo's commands and flags (`blaze build`, `blaze test`, `blaze run`),
@@ -25,7 +29,7 @@ have to be installed side by side, with `blaze-rustc`. The [installer](../instal
 From the release after 0.1.0, `--profile dist` builds the profile a release is built with, less
 the PGO a release adds ([reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md)); 0.1.0 has no such
 profile and fails with it. From a checkout, the release's own recipe builds all of it, with the profile
-[pgo/profiles.json](../pgo/profiles.json) pins:
+[tools/pgo/profiles.json](../tools/pgo/profiles.json) pins:
 
     python3 .github/scripts/build_release.py --target $(rustc +"$(cat harness/toolchain)" -vV | sed -n 's/^host: //p') --out shipped
     cp shipped/* ~/.cargo/bin/
@@ -105,14 +109,11 @@ the daemon served and how many went to cargo, with the reasons. `stop` ends the 
 other subcommand of cargo's is blaze's own, or fails saying blaze has none yet: none is passed
 to cargo, and no cargo plugin is run ([Every subcommand](#every-subcommand)).
 
-While a build or check waits for the daemon, the command shows what the worker is at
-(`crates/blaze-engine/src/progress.rs`): the worker writes a status word and its object to a
-`phase` file beside its socket (`Loading workspace`, `Resolving names`, `Compiling the
-functions of app`, `Checking 12 files`, `Linking app`), and the daemon sends it to the waiting
-command every 250 ms as a `Progress` line ahead of the answer. On a terminal that is one line
-with the seconds of the step, written over and cleared when the answer comes, shown once the
-wait passes half a second; off a terminal, one line for each step the command saw; with `-q`,
-nothing. `harness/experience.py` runs each cold build on a terminal and fails one that shows
+While a build or check waits for the daemon, the command shows what the worker is at: the
+worker sends events (`crates/blaze-protocol/src/events.rs`: each step as it starts and ends, and
+`Progress` counts within it), and `crates/blaze-ui` draws them (`Resolving names 2.40s (3/120
+crates)`). On a terminal that is a live view, cleared when the answer comes; off a terminal, one
+line for each step the command saw; with `-q`, nothing. `harness/experience.py` runs each cold build on a terminal and fails one that shows
 nothing for more than 1.5 s.
 
 ## What a build does
@@ -157,8 +158,11 @@ macros are still built and run as the daemon's load does (`target/rust-analyzer`
 `test` builds whole what cargo would test: each member's library, binaries and integration
 tests with `test = true`, the examples built beside them to see that they compile, and the
 binaries an integration test runs (`CARGO_BIN_EXE_<name>`), or what `--lib`, `--bin`,
-`--example` and one `--test` name. A worker that loads the workspace with `cfg(test)` builds
-the unit tests, one that loads it without builds the rest; a test's executable is
+`--example` and one `--test` name. One worker loads the workspace once, as `cargo test`
+builds it, and builds them all: each library and binary twice, without `cfg(test)` and as its
+unit tests with it, the integration tests with `cfg(test)`, and the examples without. Only an
+integration test or a benchmark is told `CARGO_BIN_EXE_<name>` of its package's binaries and
+`CARGO_TARGET_TMPDIR`, in its crate's own environment, as cargo tells them; a test's executable is
 `target/debug/deps/<name>-<kind>`. A unit test with `harness = false`, several `--test`s and
 the other target flags fail the build and say so. The doc tests come after, each example
 built by blaze with no cargo, rustc or rustdoc (below).
@@ -411,7 +415,7 @@ itself (`CARGO_PKG_*`, `CARGO_MANIFEST_DIR`, `OUT_DIR`, `RUSTC*`, ...); what car
 build scripts (`CARGO_CFG_*`, `CARGO_FEATURE_*`, `CARGO_ENCODED_RUSTFLAGS`) it may forward, as
 rav1e's does. Anything
 else fails the build, naming the script and each line. Over the bench corpus's 587 runs the
-rules refuse none (`bench/results/2026-10-27-bscache/directives.md`).
+rules refuse none (`tools/bench/results/2026-10-27-bscache/directives.md`).
 
 and, for a package of the workspace, in its own manifest:
 
@@ -501,7 +505,7 @@ A failed run says what it was given and what it lacked: a library (the `system-d
 add), a write outside `OUT_DIR` (the way out), a variable. Over the bench corpus 425 of 434
 runs succeed in their closure, 24 of them with libraries of the table, and every one is a
 store hit on the same machine and from another's store pulled from the remote, at the same
-checkout path (`bench/results/2026-10-27-bscache/closure.md`). A script cargo's rustc compiled
+checkout path (`tools/bench/results/2026-10-27-bscache/closure.md`). A script cargo's rustc compiled
 is keyed by its bytes, which name `CARGO_HOME`, so another checkout path misses it yet.
 `BLAZE_KEY_TRACE=<dir>` writes each key's fields to `<dir>/<key>.txt`, to see what two
 machines' keys differ in.
@@ -773,7 +777,7 @@ projects it is not yet faster than running every test, whose tests are short: th
 tests' hashes on a fresh daemon takes 0.94 s for axum and 0.45 s for just, down from 6.2 s and
 7.6 s before dependencies were hashed by name, and the run takes 13.5 s against 11.9 s for every
 test (axum) and 32.3 s against 28.8 s (just;
-[the numbers](../bench/results/2026-10-27-testcache/README.md)).
+[the numbers](../tools/bench/results/2026-10-27-testcache/README.md)).
 
 `-v`, `-q` and `--color` only change what cargo prints, and are the same build to the daemon.
 
@@ -1027,8 +1031,8 @@ A new worktree still starts with a cargo build, because it has a target director
 own. What it saves is the daemon's side: the worktree joins the worker that is already
 loaded instead of loading the workspace again. With a ripgrep checkout loaded, the first
 `blaze build` in a new worktree of it was cargo's and took 16 s, the worktree showed
-as ready under the same worker, and the first edit there was built by the daemon in 0.4 s. A `blaze test` can use
-two workers, because unit tests are built with `cfg(test)` and integration tests without.
+as ready under the same worker, and the first edit there was built by the daemon in 0.4 s. A `blaze test` uses
+one worker: its unit tests and its integration tests are crates of one load.
 
 `blaze status` shows the daemon, its workers and their log files:
 

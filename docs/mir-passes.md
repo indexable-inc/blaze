@@ -1,12 +1,15 @@
+---
+status: current
+summary: The MIR passes from built MIR to runtime MIR, ported from rustc, that codegen and the interpreter run on.
+---
 # MIR passes: from built MIR to runtime MIR
 
-This fork (indexable-inc/rust-analyzer, branch `blaze`) gives rust-analyzer's MIR the
-pre-codegen passes rustc runs, so that the code generator of
-[blaze](https://github.com/indexable-inc/blaze) (`crates/hir-ty-codegen`) and the interpreter
-(`hir-ty/src/mir/eval.rs`) execute a body as rustc's post-pass MIR says, instead of each
-re-deriving drop flags, moves and unwinding on its own.
+blaze's front end gives its MIR the pre-codegen passes rustc runs, so that the code generator
+(`crates/hir-ty-codegen`) and the interpreter (`crates/hir-ty-mir/src/mir/eval.rs`) execute a
+body as rustc's post-pass MIR says, instead of each re-deriving drop flags, moves and unwinding
+on its own.
 
-The code is `crates/hir-ty/src/mir/transform.rs` and `transform/`.
+The code is `crates/hir-ty-mir/src/mir/transform.rs` and `transform/`.
 
 ## Phases and queries
 
@@ -213,7 +216,7 @@ with the words its own checks used (`Overflow in Add`, `index out of bounds: ..`
 
 ## Optimizations
 
-The code is `crates/hir-ty/src/mir/optimize.rs` and `optimize/`: rustc's
+The code is `crates/hir-ty-mir/src/mir/optimize.rs` and `optimize/`: rustc's
 `run_optimization_passes`, ported pass by pass in its order, on top of the runtime
 body: `optimized_mir_body(def, level)`, `optimized_mir_body_for_closure` and their
 `monomorphized_optimized_*` variants, again separate salsa queries so nothing else computes

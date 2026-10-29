@@ -1,3 +1,8 @@
+---
+status: plan
+summary: blaze self-contained: one curl install that builds any Cargo project with no rustup, toolchain or cargo.
+date: 2026-10-25
+---
 # blaze is self-contained
 
 ## The goal
