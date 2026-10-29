@@ -6,13 +6,16 @@ fork indexable-inc/llvm, branch ix/23.x, LLVM 23.1.4 with our fixes, at the comm
 ix-aot pins, so blaze and ix-aot run one LLVM), the release of this repository whose assets are
 the builds, and per target the asset's name and sha256.
 
-  llvm.py build --target T --work DIR --out DIR [--from REPO]
-                                                    # build the pinned commit, archive it into --out
-                                                    # (named by its sha256, beside a T.json); --from
-                                                    # fetches the commit from a clone or bundle
-  llvm.py fetch --target T --dir DIR               # the pinned archive for T, checked and unpacked
-                                                    # into DIR (a no-op when DIR already holds it)
-  llvm.py pin DIR...                               # llvm.json names the archives in DIR
+One JSON value, inline, a file's path, or `-` for stdin (AGENTS.md, scripts-take-typed-input);
+`command` says which, the other fields are its arguments, and an unknown one is refused:
+
+  {"command": "build", "target": T, "work": DIR, "out": DIR, "jobs": N, "origin": REPO}
+      build the pinned commit, archive it into `out` (named by its sha256, beside a T.json);
+      `jobs` (default: ninja's) and `origin`, a clone or bundle to fetch the commit from
+  {"command": "fetch", "target": T, "dir": DIR}
+      the pinned archive for T, checked and unpacked into `dir` (a no-op when it holds it)
+  {"command": "pin", "root": DIR}
+      llvm.json names the archives in each directory of `root`
 
 `build` makes a prefix of what the feature and the harnesses read, and no more: the static
 libraries of the X86 and AArch64 targets, the headers, `llvm-config`, `llvm-dwarfdump` and
@@ -27,10 +30,9 @@ The fork is public: it is fetched anonymously, or with `--from` from a clone or 
 has the commit.
 
 Every step is bounded; a failure names the step, the command, its exit code and its output's
-tail. Stdlib only; `build` needs Python 3.11+, `fetch` and `pin` 3.10.
+tail. Stdlib only (typed_input, python/typed-input, is one file of it); Python 3.12+.
 """
 
-import argparse
 import asyncio
 import hashlib
 import json
@@ -42,11 +44,20 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 ROOT = Path(__file__).resolve().parents[2]
+# Run by a bare python on a runner, and by build_release.py with -I, not by uv: the one stdlib-only
+# module it needs is found from the tree.
+sys.path.insert(0, str(ROOT / "python" / "typed-input" / "src"))
+
+from typed_input import fail, parse  # noqa: E402
 PIN = ROOT / "crates" / "hir-ty-codegen" / "llvm.json"
 MARKER = "blaze-llvm.json"
+# The sha256 of the archive a directory was unpacked from, written by `fetch`.
+UNPACKED = "blaze-llvm.sha256"
 # What the prefix has: `ninja install-distribution` installs these components.
 COMPONENTS = ["llvm-libraries", "llvm-headers", "cmake-exports", "llvm-config", "llvm-dwarfdump", "llvm-pdbutil"]
 WINDOWS = sys.platform == "win32"
@@ -155,12 +166,21 @@ def cmake_env(target):
     (`__std_max_element_8u` in 14.4x is `__std_max_element_8` in 14.50), and without them the
     archive links with any MSVC from the one it was built with on, Visual Studio 2022's and
     2026's (#1387). In CFLAGS and CXXFLAGS, which cmake adds to its own defaults when it first
-    configures the build; `-DCMAKE_CXX_FLAGS` would replace them."""
+    configures the build; `-DCMAKE_CXX_FLAGS` would replace them. Exactly these, not whatever
+    flags the caller's environment has."""
     env = dict(os.environ)
-    if "windows" in target:
-        for name in ("CFLAGS", "CXXFLAGS"):
-            env[name] = " ".join(filter(None, [env.get(name), "/D_USE_STD_VECTOR_ALGORITHMS=0"]))
+    for name in ("CFLAGS", "CXXFLAGS"):
+        env.pop(name, None)
+        if "windows" in target:
+            env[name] = "/D_USE_STD_VECTOR_ALGORITHMS=0"
     return env
+
+
+def recipe(target):
+    """What a build tree is configured with. cmake reads CFLAGS and CXXFLAGS only when it first
+    configures a tree, so a tree configured with other ones is not built on."""
+    env = cmake_env(target)
+    return json.dumps({"args": cmake_args(target), "cflags": env.get("CFLAGS"), "cxxflags": env.get("CXXFLAGS")})
 
 
 def pack(prefix, out, top):
@@ -183,13 +203,17 @@ def pack(prefix, out, top):
 async def build(args):
     p = pin()
     origin = source(p, args.origin)
-    work, out = args.work.resolve(), args.out.resolve()
+    work, out = Path(args.work).resolve(), Path(args.out).resolve()
     work.mkdir(parents=True, exist_ok=True)
     out.mkdir(parents=True, exist_ok=True)
     src = await checkout(p, work, origin)
     bld, prefix = work / "build", work / "prefix"
     shutil.rmtree(prefix, ignore_errors=True)
+    stamp = bld / "blaze-recipe.json"
+    if bld.exists() and (not stamp.exists() or stamp.read_text() != recipe(args.target)):
+        shutil.rmtree(bld)
     bld.mkdir(exist_ok=True)
+    stamp.write_text(recipe(args.target))
     await run("cmake", "cmake", *cmake_args(args.target), f"-DCMAKE_INSTALL_PREFIX={prefix}", src / "llvm",
               cwd=bld, env=cmake_env(args.target), limit=900)
     jobs = ["-j", str(args.jobs)] if args.jobs else []
@@ -216,13 +240,19 @@ def fetch(args):
     entry = p["targets"].get(args.target)
     if not entry:
         sys.exit(f"error: llvm.py: {PIN} has no LLVM for {args.target}: run the llvm workflow for it")
-    dest = args.dir.resolve()
+    dest = Path(args.dir).resolve()
     marker = dest / MARKER
+    unpacked = dest / UNPACKED
     if marker.exists():
         have = json.loads(marker.read_text())
         if have.get("commit") == p["commit"] and have.get("version") == p["version"]:
-            print(dest)
-            return
+            # The same commit can be built again (a flag, a compiler): a directory is the pinned
+            # archive when it was unpacked from it.
+            if unpacked.exists() and unpacked.read_text().strip() == entry["sha256"]:
+                print(dest)
+                return
+            sys.exit(f"error: llvm.py: {dest} holds LLVM {have.get('version')} at {have.get('commit')}, but not "
+                     f"the archive {entry['name']} that llvm.json pins now: delete it or choose another directory")
         sys.exit(f"error: llvm.py: {dest} holds LLVM {have.get('version')} at {have.get('commit')}, not the pinned "
                  f"{p['version']} at {p['commit']}: delete it or choose another directory")
     if dest.exists() and any(dest.iterdir()):
@@ -251,12 +281,15 @@ def fetch(args):
         shutil.move(str(top), dest)
     if not marker.exists():
         sys.exit(f"error: llvm.py: {url} has no {MARKER}")
+    unpacked.write_text(entry["sha256"] + "\n")
     print(dest)
 
 
-def pin_dirs(dirs):
+def pin_dirs(root):
     p = pin()
-    for d in map(Path, dirs):
+    for d in sorted(Path(root).iterdir()):
+        if not d.is_dir():
+            continue
         for entry in sorted(d.glob("*.json")):
             got = json.loads(entry.read_text())
             if sha256(d / got["name"]) != got["sha256"]:
@@ -268,27 +301,44 @@ def pin_dirs(dirs):
     PIN.write_text(json.dumps(p, indent=2) + "\n")
 
 
+@dataclass(frozen=True)
+class Input:
+    command: Literal["build", "fetch", "pin"]
+    target: str = ""
+    work: str = ""
+    out: str = ""
+    jobs: int = 0
+    origin: str = ""
+    dir: str = ""
+    root: str = ""
+
+
+# What each command needs, and what it may also be given.
+FIELDS = {
+    "build": ({"target", "work", "out"}, {"jobs", "origin"}),
+    "fetch": ({"target", "dir"}, set()),
+    "pin": ({"root"}, set()),
+}
+
+
 def main():
-    parser = argparse.ArgumentParser(description="The one LLVM blaze's `llvm` feature links.")
-    sub = parser.add_subparsers(dest="cmd", required=True)
-    b = sub.add_parser("build")
-    b.add_argument("--target", required=True)
-    b.add_argument("--work", type=Path, required=True)
-    b.add_argument("--out", type=Path, required=True)
-    b.add_argument("--jobs", type=int)
-    b.add_argument("--from", dest="origin", help="a clone or bundle to fetch the pinned commit from")
-    f = sub.add_parser("fetch")
-    f.add_argument("--target", required=True)
-    f.add_argument("--dir", type=Path, required=True)
-    s = sub.add_parser("pin")
-    s.add_argument("dirs", nargs="+")
-    args = parser.parse_args()
-    if args.cmd == "build":
+    match sys.argv[1:]:
+        case [text]:
+            args = parse(Input, text, "llvm.py")
+        case _:
+            fail("llvm.py", "usage: llvm.py JSON (see the top of the file)")
+    needs, may = FIELDS[args.command]
+    given = {name for name in vars(args) if name != "command" and getattr(args, name) not in ("", 0)}
+    if missing := needs - given:
+        fail("llvm.py", f"{args.command} needs {', '.join(sorted(missing))}")
+    if extra := given - needs - may:
+        fail("llvm.py", f"{args.command} takes no {', '.join(sorted(extra))}")
+    if args.command == "build":
         asyncio.run(build(args))
-    elif args.cmd == "fetch":
+    elif args.command == "fetch":
         fetch(args)
     else:
-        pin_dirs(args.dirs)
+        pin_dirs(args.root)
 
 
 if __name__ == "__main__":

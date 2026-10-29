@@ -417,7 +417,7 @@ install.sh fetching its own Rust (the release's pinned `rustc`, `cargo`, `rust-s
 `rust-src`, into `~/.blaze/toolchains`,
 [self-contained.md](self-contained.md#blazes-own-toolchain-the-stopgap)), and for the build the
 pinned LLVM as a contributor outside Nix gets it
-([contributing.md](contributing.md#llvm-for---features-llvm)): `.github/scripts/llvm.py fetch`
+([contributing.md](contributing.md#llvm-for---features-llvm)): `.github/scripts/llvm.py` with `{"command": "fetch", ...}`
 into `/usr/local/lib/blaze-llvm/<triple>`, checked against `crates/hir-ty-codegen/llvm.json`'s
 sha256, as `LLVM_SYS_231_PREFIX`. Neither is cached by CI. The C compiler, linker and libc are
 the runner's (gcc and glibc 2.39 on Ubuntu 24.04, Xcode's clang on macOS), so what the build and

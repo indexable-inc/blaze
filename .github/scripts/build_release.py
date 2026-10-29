@@ -149,7 +149,8 @@ def llvm_prefix(target):
     if given:
         return Path(given)
     prefix = ROOT / "target" / "llvm" / target
-    run([sys.executable, "-I", ROOT / ".github" / "scripts" / "llvm.py", "fetch", "--target", target, "--dir", prefix])
+    fetch = json.dumps({"command": "fetch", "target": target, "dir": str(prefix)})
+    run([sys.executable, "-I", ROOT / ".github" / "scripts" / "llvm.py", fetch])
     return prefix
 
 
