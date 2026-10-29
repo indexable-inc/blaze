@@ -20,8 +20,8 @@ run = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:anyhow"]
 [dependencies]
 anyhow = { workspace = true, optional = true }
 # Wasmtime 49 is built on Cranelift 0.136, which hir-ty-codegen uses.
-wasmtime = { version = "49", optional = true, default-features = false, features = ["anyhow", "cranelift", "runtime", "std", "parallel-compilation", "demangle"] }
-wasmtime-wasi = { version = "49", optional = true, default-features = false, features = ["p1"] }
+wasmtime = { version = "50", optional = true, default-features = false, features = ["anyhow", "cranelift", "runtime", "std", "parallel-compilation", "demangle"] }
+wasmtime-wasi = { version = "50", optional = true, default-features = false, features = ["p1"] }
 
 [lints]
 workspace = true

@@ -20,12 +20,12 @@ blaze-in-place = { path = "../blaze-in-place" }
 # What the program reads of a patch for its statics (`lasting.rs`, `macho.rs`).
 blaze-live = { path = "../blaze-live" }
 memmap2 = "0.9"
-object = { version = "0.37", default-features = false, features = ["read", "write", "std", "archive", "elf", "macho", "coff", "pe", "wasm"] }
+object = { version = "0.40", default-features = false, features = ["read", "write", "std", "archive", "elf", "macho", "coff", "pe", "wasm"] }
 pdb = "0.8"
 rustc-hash.workspace = true
-sha2 = "0.10"
-wasmparser = { version = "0.236", default-features = false, features = ["std"] }
-wasm-encoder = { version = "0.244", default-features = false, features = ["std"] }
+sha2 = "0.11"
+wasmparser = { version = "0.258", default-features = false, features = ["std"] }
+wasm-encoder = { version = "0.258", default-features = false, features = ["std"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

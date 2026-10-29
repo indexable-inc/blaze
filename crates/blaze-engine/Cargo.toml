@@ -48,17 +48,17 @@ cfg.workspace = true
 toolchain.workspace = true
 intern.workspace = true
 memmap2 = "0.9"
-wasmparser = { version = "0.236", default-features = false, features = ["std"] }
-wasm-encoder = { version = "0.244", default-features = false, features = ["std"] }
-object = { version = "0.37", default-features = false, features = ["read", "write", "std", "archive", "elf", "macho", "coff", "pe", "wasm"] }
+wasmparser = { version = "0.258", default-features = false, features = ["std"] }
+wasm-encoder = { version = "0.258", default-features = false, features = ["std"] }
+object = { version = "0.40", default-features = false, features = ["read", "write", "std", "archive", "elf", "macho", "coff", "pe", "wasm"] }
 rustc-demangle = "0.1.28"
 # Where rustc's object says a static LLVM split up is (`symbols::whole_in_dwarf`).
-gimli = { version = "0.33", default-features = false, features = ["read", "std"] }
+gimli = { version = "0.34", default-features = false, features = ["read", "std"] }
 rustc-hash.workspace = true
 salsa.workspace = true
 same-file = "1"
 dunce = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 shlex = "2"
 toml.workspace = true
 cargo_metadata.workspace = true
@@ -92,7 +92,7 @@ toml_edit = { version = "=0.25.12", default-features = false, features = ["displ
 tar = "0.4.44"
 # The releases of blaze a workspace pins arrive as `.tar.gz` (`versions.rs`).
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
-zstd = "0.13.3"
+zstd = "0.14.3"
 blaze-live = { path = "../blaze-live" }
 # blaze's std::process for build scripts compiled for wasm32-wasip1; its runner with the
 # feature `wasi`.
@@ -105,7 +105,7 @@ tikv-jemallocator = "0.5.4"
 
 [dev-dependencies]
 tokio = { version = "1.47", features = ["net"] }
-object = { version = "0.37", default-features = false, features = ["write", "elf"] }
+object = { version = "0.40", default-features = false, features = ["write", "elf"] }
 test-fixture.workspace = true
 tempfile = "3"
 

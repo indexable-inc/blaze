@@ -47,14 +47,14 @@ syntax.workspace = true
 
 blaze-store.workspace = true
 
-cranelift-codegen = { version = "0.136", features = ["incremental-cache", "x86", "arm64"] }
-cranelift-frontend = "0.136"
-cranelift-module = { version = "0.136", features = ["enable-serde"] }
+cranelift-codegen = { version = "0.137", features = ["incremental-cache", "x86", "arm64"] }
+cranelift-frontend = "0.137"
+cranelift-module = { version = "0.137", features = ["enable-serde"] }
 cranelift-object = "0.136"
 target-lexicon = "0.13"
-object = { version = "0.37", default-features = false, features = ["read", "std", "elf", "macho", "coff"] }
-wasm-encoder = { version = "0.244", default-features = false, features = ["std"] }
-sha2 = "0.10"
+object = { version = "0.40", default-features = false, features = ["read", "std", "elf", "macho", "coff"] }
+wasm-encoder = { version = "0.258", default-features = false, features = ["std"] }
+sha2 = "0.11"
 # The LLVM backend, against the LLVM 23 blaze pins (llvm.json beside build.rs, checked there).
 # inkwell's llvm-sys (vendor/llvm-sys) links it statically, with libstdc++ on Linux. Nothing of
 # LLVM's calls into libffi, so inkwell need not link it.

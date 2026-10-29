@@ -16,7 +16,7 @@ doctest = false
 [dependencies]
 anyhow.workspace = true
 # The version cargo 1.99 renders its manifest diagnostics with, so that they read the same.
-annotate-snippets = "=0.12.16"
+annotate-snippets = "=0.12.17"
 cargo-platform = "0.3.3"
 # cargo 1.99's own schema of Cargo.toml, so that what deserializes and the messages of what does
 # not are cargo's: docs/resolve.md, "Decisions".

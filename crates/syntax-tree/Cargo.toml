@@ -13,8 +13,8 @@ publish = false
 exclude = [".github/", "bors.toml", "rustfmt.toml"]
 
 [dependencies]
-rustc-hash = "1.0.1"
-hashbrown = { version = "0.14.3", features = [
+rustc-hash = "2.1.2"
+hashbrown = { version = "0.17.1", features = [
     "inline-more",
 ], default-features = false }
 text-size = "1.1.0"

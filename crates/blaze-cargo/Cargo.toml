@@ -36,7 +36,7 @@ cargo-platform = "0.3.3"
 toolchain.workspace = true
 intern.workspace = true
 memmap2 = "0.9"
-object = { version = "0.37", default-features = false, features = ["read", "write", "std", "archive", "elf", "macho", "coff", "pe", "wasm"] }
+object = { version = "0.40", default-features = false, features = ["read", "write", "std", "archive", "elf", "macho", "coff", "pe", "wasm"] }
 # Writes an rlib again whose objects had statics made linkable (`weaken::shared`): rustc's own
 # archive writer.
 ar_archive_writer = "0.5.3"
@@ -44,11 +44,11 @@ rustc-hash.workspace = true
 salsa.workspace = true
 same-file = "1"
 dunce = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 cargo_metadata.workspace = true
 shlex = "2"
 toml.workspace = true
-thorin-dwp = "0.10"
+thorin-dwp = "0.11"
 typed-arena = "2.0.2"
 
 hir-ty-codegen.workspace = true
@@ -89,8 +89,8 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 http-body-util = "0.1"
 tokio = { version = "1.47", features = ["rt-multi-thread", "fs", "io-util", "signal", "sync", "time"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-ed25519-dalek = "2.2"
-getrandom = "0.3"
+ed25519-dalek = "3.0"
+getrandom = "0.4"
 url.workspace = true
 semver.workspace = true
 # `cargo remove` edits manifests as cargo's `toml_mut` does, layout and comments kept: the
@@ -100,10 +100,10 @@ tar = "0.4.44"
 # The zips build scripts download, unpacked where a crate's variable names a directory
 # (`cargo/fetches.rs`): deflate on flate2, which is in the tree already.
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
-zstd = "0.13.3"
+zstd = "0.14.3"
 # The `.tar.xz` files of blaze's own toolchain (`cargo/toolchain/own.rs`): in Rust, within 1.3x
 # of liblzma's time on rustc's 84 MB.
-lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "xz", "optimization"] }
+lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "xz", "optimization"] }
 # The keys and signatures of nixpkgs' binary cache (`cargo/closure/narinfo.rs`); already in the
 # graph, by hyper-util.
 base64 = "0.23"
@@ -124,7 +124,7 @@ tikv-jemalloc-sys = "0.5.4"
 # The in-process fake of the cache gateway that `remote/gateway/tests.rs` talks to.
 hyper = { version = "1", default-features = false, features = ["server", "http1"] }
 tokio = { version = "1.47", features = ["net"] }
-lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "xz", "encoder"] }
+lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "xz", "encoder"] }
 tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]

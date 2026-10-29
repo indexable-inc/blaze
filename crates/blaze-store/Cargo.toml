@@ -17,10 +17,10 @@ doctest = false
 crc32fast = "1"
 memmap2 = "0.9"
 rustc-hash.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-zstd = "0.13.3"
+zstd = "0.14.3"
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

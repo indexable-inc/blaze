@@ -16,11 +16,11 @@ doctest = false
 [dependencies]
 ra-ap-rustc_lexer.workspace = true
 rustc-hash.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 # The one `wasmtime` 49's Cranelift names its targets with.
 target-lexicon = "0.13"
 # The version whose Cranelift is the one hir-ty-codegen compiles with (`cranelift-codegen` 0.136).
-wasmtime = { version = "49", default-features = false, features = ["cranelift", "parallel-compilation", "runtime", "std"] }
+wasmtime = { version = "50", default-features = false, features = ["cranelift", "parallel-compilation", "runtime", "std"] }
 
 base-db.workspace = true
 salsa.workspace = true

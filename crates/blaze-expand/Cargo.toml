@@ -16,7 +16,7 @@ doctest = false
 [dependencies]
 postcard.workspace = true
 rustc-hash.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 
 base-db.workspace = true
 hir-expand.workspace = true
