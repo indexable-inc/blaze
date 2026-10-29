@@ -478,7 +478,9 @@ def reached(img: Image, base: int, rel: tuple[int, int, int, int], target_name: 
         if r_type in (X_GOTPCREL, X_GOTPCRELX, X_REX_GOTPCRELX):
             # The opcode and ModRM byte before the field.
             op = img.read(p - 2, 2)
-            if op[0] == 0x8B or op in (b"\xff\x15", b"\xff\x25"):
+            # `cmpq $imm, x@GOTPCREL(%rip)` and the other immediate forms read the slot; no linker
+            # relaxes them.
+            if op[0] == 0x8B or op in (b"\xff\x15", b"\xff\x25") or op[0] in (0x81, 0x83) and op[1] & 0xC7 == 0x05:
                 (field,) = struct.unpack("<i", img.read(p, 4))
                 return img.slot(p + field - addend, 0)
             if op[0] == 0x8D or op == b"\x67\xe8":
@@ -516,6 +518,9 @@ def reached(img: Image, base: int, rel: tuple[int, int, int, int], target_name: 
             return img.slot(page + ((word >> 10) & 0xFFF) * 8 - addend, 0)
         if word & 0xFF800000 == 0x91000000:
             return img.what(page + ((word >> 10) & 0xFFF) - addend)
+        if word & 0x9F000000 == 0x10000000:
+            # lld's `adrp; ldr` through the GOT relaxed to `nop; adr`.
+            return img.what(p + sext(((word >> 5) & 0x7FFFF) << 2 | (word >> 29) & 3, 21) - addend)
         raise Failed(f"{img.label}: a GOT low-12 relocation at {p:#x} on {word:#010x}, which coldimage.py does not read")
     if r_type == A_ABS64:
         return img.slot(p, 0) if p in img.dynrel else img.what(img.u64(p) - addend)
