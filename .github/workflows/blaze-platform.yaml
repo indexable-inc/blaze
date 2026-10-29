@@ -182,7 +182,29 @@ jobs:
       # C runtime, and names libraries of the SDK that the linker is not otherwise shown.
       - name: blaze build -p blaze-engine --release --features llvm
         if: env.BLAZE == 'true'
+        env:
+          BLAZE_STATS: "1"
+          BLAZE_TRACE: ${{ runner.temp }}/blaze-trace
         run: blaze build -p blaze-engine --release --features llvm --locked
+      - if: always() && env.BLAZE == 'true'
+        run: |
+          out="$RUNNER_TEMP/blaze-trace"
+          mkdir -p "$out"
+          blaze why > "$out/why.txt" 2>&1 || true
+          cat "$out/why.txt"
+          for d in "$HOME/.cache/blaze" "${XDG_RUNTIME_DIR:-/nonexistent}"; do
+            [ -d "$d" ] || continue
+            find "$d" -name log -type f | while read -r f; do
+              cp "$f" "$out/$(echo "${f#$d/}" | tr / _)"
+            done
+          done
+          ls -la "$out"
+          grep -h -E 'steps:|load-us|store:|not found|round [0-9]|timeline|phases|backend:|kept|manifest' "$out"/*log* | cut -c1-600 || true
+      - if: always() && env.BLAZE == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: warmstate-trace-${{ inputs.os }}
+          path: ${{ runner.temp }}/blaze-trace
       - name: cargo build -p blaze-engine --release --features llvm
         if: env.BLAZE != 'true'
         run: |
