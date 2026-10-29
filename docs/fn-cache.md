@@ -1,3 +1,7 @@
+---
+status: current
+summary: #[blaze::cache]: results of pure functions kept across runs, keyed by the code they reach.
+---
 # Cached functions
 
 `#[blaze::cache]` on a pure function keeps what it returns, in memory for the run and on

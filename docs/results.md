@@ -1,3 +1,8 @@
+---
+status: record
+summary: Results: every number with the harness, commit and report it came from.
+date: 2026-10-27
+---
 # Results
 
 Every number here names the harness that printed it, the commit it was measured at, and

@@ -1,3 +1,8 @@
+---
+status: record
+summary: The test suites of 1100 crates.io crates through blaze.
+date: 2026-10-20
+---
 # The test suites of 1100 crates.io crates through blaze
 
 Branch `blaze-sweep-2`: `blaze-collate` at `3d47ed59bf` with `blaze-sweep-1000` (`f4fca15318`)

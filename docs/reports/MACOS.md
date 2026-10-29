@@ -1,3 +1,8 @@
+---
+status: record
+summary: blaze on macOS aarch64: the first port.
+date: 2026-10-20
+---
 # blaze on macOS aarch64
 
 Branch `blaze-macos`, off `blaze-spike`. Everything below was run on one machine: an Apple M4

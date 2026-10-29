@@ -1,6 +1,7 @@
 //! What a build tells whoever watches it of the functions it puts in the program: each one
 //! once, as it is put in the object, with what it calls and where its code came from. The
-//! build page draws the program's whole graph of functions from it (docs/web.md).
+//! build page draws the program's whole graph of functions from it
+//! (https://github.com/indexable-inc/blaze/pull/1341).
 //!
 //! Nothing of it runs until [`watch`] is given somewhere to say it.
 
