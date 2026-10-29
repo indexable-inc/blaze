@@ -1,0 +1,67 @@
+# The repository's Python, as one uv workspace: scripts run with `uv run --frozen` from the
+# lock beside this file, on the Python `.python-version` pins. Shared helpers are its members
+# (python/*). The older scripts of harness/ and .github/scripts/ move here when next changed.
+[project]
+name = "blaze-scripts"
+version = "0"
+requires-python = ">=3.13"
+dependencies = ["typed-input"]
+
+[dependency-groups]
+dev = ["ruff>=0.14", "pyright[nodejs]>=1.1.400"]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["python/*"]
+
+[tool.uv.sources]
+typed-input = { workspace = true }
+
+# What ruff and pyright check (blaze.yaml's scripts job): the scripts that are in the workspace.
+[tool.ruff]
+target-version = "py313"
+line-length = 110
+include = [
+  ".github/scripts/downstream.py",
+  ".github/scripts/downstream_build.py",
+  "harness/check_json.py",
+  "harness/ci.py",
+  "harness/focused.py",
+  "harness/fnincr.py",
+  "harness/fuzz/edits.py",
+  "harness/includes.py",
+  "harness/keys.py",
+  "harness/own_inputs.py",
+  "harness/storerevisions.py",
+  "harness/toolchain_bump.py",
+  "python/**/*.py",
+]
+
+# These older harnesses arrange their sibling imports after computing HERE. Their runtime
+# migration keeps that existing import order; new workspace packages use normal imports.
+[tool.ruff.lint.per-file-ignores]
+"harness/fnincr.py" = ["E402"]
+"harness/fuzz/edits.py" = ["E402"]
+"harness/includes.py" = ["E402"]
+"harness/keys.py" = ["E402"]
+
+[tool.pyright]
+include = [
+  ".github/scripts/downstream.py",
+  ".github/scripts/downstream_build.py",
+  "harness/check_json.py",
+  "harness/ci.py",
+  "harness/focused.py",
+  "harness/fnincr.py",
+  "harness/fuzz/edits.py",
+  "harness/includes.py",
+  "harness/keys.py",
+  "harness/own_inputs.py",
+  "harness/storerevisions.py",
+  "harness/toolchain_bump.py",
+  "python",
+]
+pythonVersion = "3.13"
+typeCheckingMode = "strict"

@@ -1000,6 +1000,7 @@ impl<'a> Driver<'a> {
         if made.wasm {
             digest.update(super::own_macro::MODULE_CFG.as_bytes());
         }
+        digest.update(own_script::generated_fingerprint(&described).map_err(anyhow::Error::msg)?);
         let digest = format!("{:x}", digest.finalize());
         let inputs =
             crates.iter().filter_map(|it| it.inputs.as_ref().map(|(info, _)| info.as_path()));

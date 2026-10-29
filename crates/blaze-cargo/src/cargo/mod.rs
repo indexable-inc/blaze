@@ -411,7 +411,7 @@ pub fn built(checkout: &Checkout) -> Result<Vec<Result<(), String>>, NotBuilt> {
 /// reads where cargo set none, but those that say what blaze prints of the build: one that
 /// changed would be an edit of every `env!`.
 fn asking(checkout: &Checkout) -> Checkout {
-    let printing = |name: &str| name == "BLAZE_STATS" || name == "BLAZE_TRACE";
+    let printing = |name: &str| matches!(name, "BLAZE_STATS" | "BLAZE_TRACE" | "BLAZE_TRACE_CONST");
     let mut env: BTreeMap<String, String> =
         std::env::vars().filter(|(name, _)| !printing(name)).collect();
     env.extend(checkout.env.clone());

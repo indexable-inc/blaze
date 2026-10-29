@@ -278,7 +278,10 @@ fn without_tests(file: &Path) -> Option<String> {
         return Some(crate::content::hex(&hash[..16]));
     }
     let parse = syntax::SourceFile::parse(&text, syntax::Edition::CURRENT);
-    let mut bytes = text.clone().into_bytes();
+    // This byte cannot occur in the UTF-8 source. Only padding introduced below can be
+    // discarded at the end of a line. A real space can belong to a multiline literal.
+    const MASKED: u8 = 0xff;
+    let mut bytes = text.into_bytes();
     let only_tests = |item: &ast::Item| {
         ast::HasAttrs::attrs(item).any(|attr| {
             let attr: String =
@@ -291,15 +294,28 @@ fn without_tests(file: &Path) -> Option<String> {
             let range = item.syntax().text_range();
             for byte in &mut bytes[usize::from(range.start())..usize::from(range.end())] {
                 if *byte != b'\n' {
-                    *byte = b' ';
+                    *byte = MASKED;
                 }
             }
         }
     }
-    let blanked = String::from_utf8_lossy(&bytes);
-    let lines: Vec<&str> = blanked.lines().map(str::trim_end).collect();
-    let kept = lines.len() - lines.iter().rev().take_while(|it| it.is_empty()).count();
-    let hash = sha2::Sha256::digest(lines[..kept].join("\n"));
+    // Ignore tests and whitespace past the last production token, including appended tests.
+    let last = parse.tree().syntax().last_token();
+    let end = std::iter::successors(last, |token| token.prev_token())
+        .find(|token| {
+            let range = token.text_range();
+            !range.is_empty()
+                && token.kind() != syntax::SyntaxKind::WHITESPACE
+                && bytes[usize::from(range.start())] != MASKED
+        })
+        .map_or(0, |token| usize::from(token.text_range().end()));
+    let mut hash = sha2::Sha256::new();
+    for line in bytes[..end].split(|&byte| byte == b'\n') {
+        let kept = line.iter().rposition(|&byte| byte != MASKED).map_or(0, |at| at + 1);
+        hash.update(&line[..kept]);
+        hash.update(b"\n");
+    }
+    let hash = hash.finalize();
     Some(crate::content::hex(&hash[..16]))
 }
 
@@ -927,6 +943,11 @@ mod tests {
         assert_eq!(print(&base.replace("fn t() {}", "fn t() { assert!(true); }")), was);
         assert_ne!(print(&base.replace("    1\n", "    2\n")), was);
         assert_ne!(print(&format!("\n{base}")), was);
+        let literal = "pub const MSG: &str = r#\"first \n   \nlast\"#;\n";
+        assert_ne!(print(literal), print(&literal.replace("first ", "first")));
+        assert_ne!(print(literal), print(&literal.replace("   \n", "\n")));
+        let between = format!("{base}\npub fn last() {{}}\n");
+        assert_eq!(print(&between), print(&between.replace("fn t() {}", "fn t() { one(); }")));
         assert_ne!(print(&format!("{base}\n#[cfg(not(test))]\nfn other() {{}}\n")), was);
         std::fs::remove_dir_all(&dir).unwrap();
     }

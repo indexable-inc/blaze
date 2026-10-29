@@ -1,6 +1,6 @@
 // Written by hand after listed-function-gone.rs, edition 2021: the block a function is in goes while a
 // function of its name stays.
-// Again: edits.py check block-gone.rs
+// Again: edits.py check '{"files": ["block-gone.rs"]}'
 mod c0 {
     use super::*;
     pub fn run() {

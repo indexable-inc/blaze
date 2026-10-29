@@ -1405,6 +1405,8 @@ impl SymbolResolver for Resolver<'_> {
         if threads < 2 {
             return beside();
         }
+        let batch = trace::cold_batch(count);
+        let mut join = None;
         let next = std::sync::atomic::AtomicUsize::new(0);
         // What the threads compile, the build that asked counts.
         let counted = hir_ty_codegen::counted::now();
@@ -1416,6 +1418,7 @@ impl SymbolResolver for Resolver<'_> {
                     let (db, next, parts) = (self.db.clone(), &next, self.parts());
                     let counted = counted.clone();
                     scope.spawn(move || {
+                        let _worker = trace::cold_span("worker", batch);
                         let resolver = parts.over(&db);
                         hir_ty_codegen::counted::within(counted, || {
                             hir::attach_db(&db, || {
@@ -1432,7 +1435,12 @@ impl SymbolResolver for Resolver<'_> {
                     })
                 })
                 .collect();
-            beside();
+            {
+                let _caller = trace::cold_span("caller", batch);
+                beside();
+            }
+            // From when the caller is done to when the last thread is.
+            join = trace::cold_span("join", batch);
             let mut stopped: Option<Box<dyn std::any::Any + Send>> = None;
             for worker in workers {
                 let Err(panic) = worker.join() else { continue };
@@ -1446,6 +1454,7 @@ impl SymbolResolver for Resolver<'_> {
             }
             stopped
         });
+        drop(join);
         if let Some(panic) = stopped {
             std::panic::resume_unwind(panic);
         }
@@ -2776,6 +2785,7 @@ impl Checkouts {
             self.splits[at] = Some(Split { base: self.roots[base].1.clone(), own });
         }
         self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        *lock(&UNEDITED) = Unedited::of(self.loaded.workspaces());
         prepare_macro_sessions(db);
         Ok(())
     }
@@ -2924,6 +2934,7 @@ impl Checkouts {
         }
         let workspaces_at = start.elapsed();
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        *lock(&UNEDITED) = Unedited::of(self.loaded.workspaces());
         prepare_macro_sessions(db);
         if std::env::var_os("BLAZE_STATS").is_some() {
             let files = start.elapsed() - workspaces_at;
@@ -3016,6 +3027,7 @@ impl Checkouts {
             self.debug[at] = self.debug[base].clone();
         }
         self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        *lock(&UNEDITED) = Unedited::of(self.loaded.workspaces());
         prepare_macro_sessions(db);
         failed
     }
@@ -3990,9 +4002,15 @@ fn harnesses<'a>(
 
 /// Gives the files the texts [`harnesses`] wrote. The files.
 fn write_harnesses(db: &mut RootDatabase, texts: Vec<(vfs::FileId, String)>) -> Vec<vfs::FileId> {
-    use ide_db::base_db::salsa::Durability;
+    use ide_db::base_db::salsa::{Durability, Setter as _};
     for (file, text) in &texts {
         db.set_file_text_with_durability(*file, text, Durability::LOW);
+        // What the crate's `#![cfg]` leaves of a root it takes away.
+        let module = test_harness::appended(text);
+        let input = db.file_text(*file);
+        if input.appended_root_module(db) != module {
+            input.set_appended_root_module(db).with_durability(Durability::LOW).to(module);
+        }
     }
     prepare_macro_sessions(db);
     texts.into_iter().map(|it| it.0).collect()
@@ -5795,7 +5813,7 @@ fn packs_whole(args: &Args) -> bool {
 fn run_link(cmd: &str, binary: Option<&Path>, start: Instant, note: &str) -> anyhow::Result<()> {
     let aside = binary.and_then(|binary| Some((binary, linked_aside(cmd, binary)?)));
     let line = aside.as_ref().map_or(cmd, |(_, (line, _))| line);
-    let linked = shell(line).output();
+    let linked = trace::link_output(&mut shell(line), "link");
     let placed = match (&aside, &linked) {
         (Some((binary, (_, at))), Ok(linked)) if linked.status.success() => {
             std::fs::rename(at, binary)
@@ -6563,7 +6581,8 @@ enum Watched {
 struct WatchedFile {
     file: Watched,
     path: PathBuf,
-    mtime: SystemTime,
+    /// `None` for one taken for a changed one, or an input that is not there.
+    mtime: Option<SystemTime>,
 }
 
 /// What [`WatchedFile::include_sources`] took in.
@@ -6575,6 +6594,54 @@ enum Loaded {
     New,
 }
 
+/// The registry directories the loaded workspaces' dependencies were installed in, their
+/// sysroots' sources, and the target directories of those workspaces: what
+/// [`WatchedFile::immutable`] does not watch. They are the directories themselves, not their
+/// names, since a package can have modules of its own in a directory named `registry`,
+/// `rustlib` or `target`.
+#[derive(Default)]
+struct Unedited {
+    installed: Vec<PathBuf>,
+    targets: Vec<PathBuf>,
+}
+
+static UNEDITED: Mutex<Unedited> =
+    Mutex::new(Unedited { installed: Vec::new(), targets: Vec::new() });
+
+impl Unedited {
+    fn of(workspaces: &[ProjectWorkspace]) -> Unedited {
+        let mut unedited = Unedited::default();
+        let install = |installed: &mut Vec<PathBuf>, dir: PathBuf| {
+            if !installed.contains(&dir) {
+                installed.push(dir);
+            }
+        };
+        for workspace in workspaces {
+            // Only the library's sources: the sysroot itself can be `/usr`, with projects below.
+            if let Some(library) = workspace.sysroot.rust_lib_src_root() {
+                install(&mut unedited.installed, PathBuf::from(library.to_string()));
+            }
+            // The sysroot's own dependencies are among the roots too, not only the workspace's.
+            for root in workspace.to_roots().into_iter().filter(|it| !it.is_local) {
+                for dir in root.include.iter().map(|it| PathBuf::from(it.to_string())) {
+                    // A registry by its layout, `<home>/registry/src/<index>/<package>`: a
+                    // directory only named `registry` above a vendored package can be the
+                    // project's own.
+                    let Some(home) = cargo::hermetic::cargo_home_of(&dir) else { continue };
+                    let registry = home.join("registry");
+                    if dir.starts_with(&registry) {
+                        install(&mut unedited.installed, registry);
+                    }
+                }
+            }
+            if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind {
+                unedited.targets.push(PathBuf::from(cargo.target_directory().to_string()));
+            }
+        }
+        unedited
+    }
+}
+
 impl WatchedFile {
     /// Whether the file is never written again: everything is watched but the sysroot, the
     /// registry, the Nix store (crates vendored by Nix, which `nix run` of the demo reads its
@@ -6583,12 +6650,13 @@ impl WatchedFile {
     /// file is looked at on every edit, so one too many is time on every keystroke.
     fn immutable(path: &Path) -> bool {
         let names: Vec<&str> = path.components().filter_map(|c| c.as_os_str().to_str()).collect();
-        let of_script = cargo::script::in_out_dir(path);
+        let unedited = lock(&UNEDITED);
         path.starts_with("/nix/store")
             || cargo::toolchain::library::has(path)
-            || names.contains(&"rustlib")
+            || unedited.installed.iter().any(|it| path.starts_with(it))
             || WatchedFile::fetched(&names)
-            || names.contains(&"target") && !of_script
+            || unedited.targets.iter().any(|it| path.starts_with(it))
+                && !cargo::script::in_out_dir(path)
     }
 
     /// Whether a file is in what cargo fetched: `registry/src/<index>-<hash>/` or
@@ -6611,7 +6679,7 @@ impl WatchedFile {
             return None;
         }
         let mtime = std::fs::metadata(on_disk).ok()?.modified().ok()?;
-        Some(WatchedFile { file, path: path.to_owned(), mtime })
+        Some(WatchedFile { file, path: path.to_owned(), mtime: Some(mtime) })
     }
 
     /// The files of the VFS that are text. One that is not UTF-8 can only be named by an
@@ -6630,10 +6698,10 @@ impl WatchedFile {
             .filter_map(|(id, path)| {
                 let path: &Path = path.as_path()?.as_ref();
                 let mut watched = WatchedFile::new(Watched::Source(id), path, path)?;
-                if watched.mtime >= since
+                if watched.mtime.is_some_and(|at| at >= since)
                     && source_on_disk(path).is_ok_and(|text| *text != **db.file_text(id).text(db))
                 {
-                    watched.mtime = SystemTime::UNIX_EPOCH;
+                    watched.mtime = None;
                 }
                 Some(watched)
             })
@@ -6699,7 +6767,7 @@ impl WatchedFile {
             files.push(WatchedFile {
                 file: Watched::Included(path.clone()),
                 path: AsRef::<Path>::as_ref(&path).to_owned(),
-                mtime: mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+                mtime: mtime.ok(),
             });
             changed |= db.reload_included_file(&path);
         }
@@ -7997,7 +8065,46 @@ pub fn main() -> anyhow::Result<()> {
         return ask(request, Path::new(&socket), Target::from_flags(std::env::args().skip(3))?);
     }
     trace::install();
-    run(Args::parse(std::env::args().skip(1))?, None)
+    let args = Args::parse(std::env::args().skip(1))?;
+    // A worker the daemon started answers its builds' traces; one started directly has
+    // only its own to write its first build to.
+    if args.socket.is_none()
+        && std::env::var_os(cargo::daemon::ENDS_WITH_INPUT).is_none()
+        && trace::start_cold().is_some()
+    {
+        hir_ty::consteval::trace_consts_with(followed_const);
+    }
+    let result = run(args, None);
+    trace::finish_cold(if result.is_ok() { "complete" } else { "failed" });
+    result
+}
+
+/// Whether `def` is the constant `BLAZE_TRACE_CONST` names, `crate::module::NAME`: its
+/// crate, every module and its name, so one of the same name elsewhere, in an impl or in a
+/// block is not. What to note for it, a request or a run of its query.
+fn followed_const(
+    db: &dyn hir_ty::db::HirDatabase,
+    def: hir_def::ConstId,
+    executing: bool,
+) -> Option<fn(Instant)> {
+    use hir_def::{HasModule as _, Lookup as _, signatures::ConstSignature};
+    let mut path = trace::cold_const()?.rsplit("::");
+    if ConstSignature::of(db, def).name.as_ref()?.as_str() != path.next()? {
+        return None;
+    }
+    let ItemContainerId::ModuleId(mut module) = def.lookup(db).container else { return None };
+    while let Some(parent) = module.containing_module(db) {
+        // A block's module has no name, so no path names a constant in a block.
+        if module.name(db)?.as_str() != path.next()? {
+            return None;
+        }
+        module = parent;
+    }
+    let krate = def.krate(db).extra_data(db).display_name.as_ref()?.crate_name();
+    if krate.as_str() != path.next()? || path.next().is_some() {
+        return None;
+    }
+    Some(if executing { trace::const_execution } else { trace::const_request })
 }
 
 /// Compiles the crates `args` names on `threads` threads until `done`, giving up on what is
@@ -9331,6 +9438,7 @@ fn run_holding(
         memo_capacities(&mut db)?;
     }
     memory::report(&mut db, "warm-up")?;
+    trace::finish_cold("watch ready");
     eprintln!("watching {} files", files.len());
     ide_db::executions::take(&db);
     // Requests wait here while a build is under way, and those that have come by the time it
@@ -10020,25 +10128,30 @@ fn run_holding(
             }
             // A new file has no timestamp yet, so the pass below takes it for a changed one.
             for (file, path) in tree.added(&mut db).added {
-                files.push(WatchedFile {
-                    file: Watched::Source(file),
-                    path,
-                    mtime: SystemTime::UNIX_EPOCH,
-                });
+                files.push(WatchedFile { file: Watched::Source(file), path, mtime: None });
             }
             let before = touched.len() + gone.len();
             for (index, file) in files.iter_mut().enumerate() {
                 let on_disk = db.on_disk(&file.path);
                 let Ok(now) = std::fs::metadata(&on_disk).and_then(|m| m.modified()) else {
-                    if matches!(file.file, Watched::Source(_)) && gone.insert(index) {
-                        touched.remove(&index);
+                    let changed = match file.file {
+                        Watched::Source(_) => {
+                            touched.remove(&index);
+                            gone.insert(index)
+                        }
+                        // Still watched, so the input put back invalidates the macro again.
+                        Watched::Included(_) => {
+                            file.mtime.take().is_some() && touched.insert(index)
+                        }
+                    };
+                    if changed {
                         noticed.get_or_insert((Instant::now(), Duration::ZERO));
                     }
                     continue;
                 };
                 gone.remove(&index);
                 if switched.iter().any(|base| file.path.starts_with(base)) {
-                    file.mtime = now;
+                    file.mtime = Some(now);
                     let same = match file.file {
                         Watched::Source(id) => source_on_disk(&on_disk)
                             .is_ok_and(|text| *text == **db.file_text(id).text(&db)),
@@ -10048,11 +10161,11 @@ fn run_holding(
                         touched.insert(index);
                         noticed.get_or_insert((Instant::now(), Duration::ZERO));
                     }
-                } else if now != file.mtime {
-                    let was = std::mem::replace(&mut file.mtime, now);
+                } else if Some(now) != file.mtime {
+                    let was = file.mtime.replace(now);
                     // An editor that sent its text writes it after: the same text again.
                     let built = match file.file {
-                        Watched::Source(id) if was != SystemTime::UNIX_EPOCH => {
+                        Watched::Source(id) if was.is_some() => {
                             !sent.contains_key(&id)
                                 && source_on_disk(&on_disk)
                                     .is_ok_and(|text| *text == **db.file_text(id).text(&db))
@@ -10590,9 +10703,9 @@ impl Settled {
             {
                 own.push((directory.to_owned(), written(directory)));
             }
-            own.push((path, Some(file.mtime)));
+            own.push((path, file.mtime));
         }
-        let others = Settled::others(files, base, |file| Some(file.mtime));
+        let others = Settled::others(files, base, |file| file.mtime);
         Settled { over: over.to_owned(), patch, link_cmd, own, others }
     }
 
@@ -10755,7 +10868,10 @@ impl Program {
                     as_compiled.get(inside).is_some_and(|was| **was == **text)
                 }
                 // No timestamp is a file taken for a changed one, which rustc did not read.
-                None => file.mtime != SystemTime::UNIX_EPOCH && file.mtime <= built?,
+                None => match file.mtime {
+                    Some(written) => written <= built?,
+                    None => false,
+                },
             })
         };
         let unread: Vec<vfs::FileId> = files
@@ -11703,6 +11819,37 @@ mod user {
     }
 
     #[test]
+    fn package_sources_can_be_named_like_installed_sources_and_build_outputs() {
+        let ws = std::env::temp_dir().join("watch-paths");
+        let before = std::mem::replace(
+            &mut *lock(&UNEDITED),
+            Unedited {
+                installed: vec![
+                    ws.join(".cargo/registry"),
+                    ws.join("toolchain/lib/rustlib/src/rust/library"),
+                ],
+                targets: vec![ws.join("custom-output")],
+            },
+        );
+        for source in [
+            "src/registry/rule_set.rs",
+            "src/rustlib/mod.rs",
+            "src/target/opcode.rs",
+            "custom-output/debug/build/pkg-hash/out/generated.rs",
+        ] {
+            assert!(!WatchedFile::immutable(&ws.join(source)), "{source}");
+        }
+        for cached in [
+            ".cargo/registry/src/index/pkg/src/lib.rs",
+            "toolchain/lib/rustlib/src/rust/library/core/src/lib.rs",
+            "custom-output/debug/deps/old.rs",
+        ] {
+            assert!(WatchedFile::immutable(&ws.join(cached)), "{cached}");
+        }
+        *lock(&UNEDITED) = before;
+    }
+
+    #[test]
     fn a_file_written_after_it_was_loaded_is_taken_for_a_changed_one() {
         let dir = std::env::temp_dir().join(format!("blaze-loaded-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -11725,7 +11872,7 @@ mod user {
         let files = WatchedFile::sources(&vfs, &db, read_from);
         let changed = |name: &str| {
             let file = files.iter().find(|it| it.path.ends_with(name)).unwrap();
-            file.mtime == SystemTime::UNIX_EPOCH
+            file.mtime.is_none()
         };
         assert!(!changed("same.rs"));
         assert!(changed("written.rs"));

@@ -55,6 +55,13 @@
             installPhase = "cp -r . $out";
           };
         llvmEnv = { LLVM_SYS_231_PREFIX = "${llvm}"; };
+        # The Python workspace uses Nix's pinned interpreter on NixOS, where uv's downloaded
+        # interpreters cannot run. uv itself comes from the same flake.lock as the toolchain.
+        scripts = {
+          packages = [ pkgs.uv pkgs.python313 pkgs.nodejs ];
+          UV_PYTHON = "${pkgs.python313}/bin/python3";
+          UV_PYTHON_DOWNLOADS = "never";
+        };
         # What harness/bench.py runs in on the benchmark machine (docs/benchmarks.md): the
         # pinned toolchain, LLVM 23 for `--features llvm`, and the C side the projects' build
         # scripts use. Nothing here wraps rustc (no sccache) or replaces the default linker:
@@ -64,7 +71,9 @@
         bench = llvmEnv // {
           packages = [
             rust
-            pkgs.python3
+            pkgs.python313
+            pkgs.uv
+            pkgs.nodejs
             pkgs.git
             pkgs.pkg-config
             pkgs.openssl
@@ -86,6 +95,7 @@
             pkgs.dioxus-cli
           ];
           BLAZE_NIGHTLY = "${nightly}";
+          inherit (scripts) UV_PYTHON UV_PYTHON_DOWNLOADS;
           # A C compiler as a distribution ships it: the wrapper's _FORTIFY_SOURCE warns at the
           # -O0 of a debug build, which fails configure probes (jemalloc's, in fd).
           hardeningDisable = [ "all" ];
@@ -235,7 +245,8 @@
         # toolchain with libstdc++.a, so `cargo build --features llvm` links it in. Rust is
         # rustup at the pinned nightly: plain `cargo` is harness/toolchain's and `cargo +<toolchain>` works.
         devShells.default = pkgs.mkShell (llvmEnv // {
-          packages = [ pkgs.rustup pkgs.python3 llvm ];
+          packages = scripts.packages ++ [ pkgs.rustup llvm ];
+          inherit (scripts) UV_PYTHON UV_PYTHON_DOWNLOADS;
           RUSTUP_TOOLCHAIN = pkgs.lib.fileContents ./harness/toolchain;
           # As in the bench shell: the wrapper's _FORTIFY_SOURCE fails configure probes at -O0 in
           # the C code of the projects the harnesses build.
@@ -251,11 +262,14 @@
         # wasm-tools where the harnesses read objects, wasm-bindgen and node for web guests. The
         # targets are rustup's: `rustup target add wasm32-wasip1 wasm32-unknown-unknown`.
         devShells.wasm = pkgs.mkShell (llvmEnv // {
-          packages = [ pkgs.rustup pkgs.python3 llvm pkgs.wasmtime pkgs.wasm-tools pkgs.wasm-bindgen-cli pkgs.nodejs ];
+          packages = scripts.packages ++ [ pkgs.rustup llvm pkgs.wasmtime pkgs.wasm-tools pkgs.wasm-bindgen-cli ];
+          inherit (scripts) UV_PYTHON UV_PYTHON_DOWNLOADS;
           RUSTUP_TOOLCHAIN = pkgs.lib.fileContents ./harness/toolchain;
           hardeningDisable = [ "all" ];
         });
         devShells.bench = pkgs.mkShell bench;
+        # Python-only work needs neither LLVM nor a Rust toolchain.
+        devShells.scripts = pkgs.mkShell scripts;
         # What harness/bench.py and runbench.py measure bun in (bunprep.py, docs/research/bun.md):
         # bun's own pinned nightly in place of blaze's, for the cargo side (blaze ignores the pin
         # and compiles its own library/), and
@@ -265,7 +279,9 @@
         devShells.bench-bun = (pkgs.mkShell.override { stdenv = pkgs.llvmPackages_23.stdenv; }) {
           packages = [
             pkgs.rust-bin.nightly."2026-09-15".default
-            pkgs.python3
+            pkgs.python313
+            pkgs.uv
+            pkgs.nodejs
             pkgs.git
             pkgs.curl
             pkgs.unzip
@@ -284,6 +300,7 @@
             pkgs.llvmPackages_23.lld
           ];
           hardeningDisable = [ "all" ];
+          inherit (scripts) UV_PYTHON UV_PYTHON_DOWNLOADS;
           shellHook = ''
             export CC=${pkgs.llvmPackages_23.clang}/bin/clang CXX=${pkgs.llvmPackages_23.clang}/bin/clang++
             export AR=${pkgs.llvmPackages_23.llvm}/bin/llvm-ar RANLIB=${pkgs.llvmPackages_23.llvm}/bin/llvm-ranlib

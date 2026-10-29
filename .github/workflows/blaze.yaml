@@ -79,8 +79,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
-      # Some scripts ask rustc for the host when imported: after the toolchain is installed.
-      - run: python3 harness/imports.py
+      # The repository's Python workspace (pyproject.toml, uv.lock): its scripts lint and type-check.
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          checksum: f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f
+          enable-cache: false
+      - run: uv run --frozen ruff check
+      - run: uv run --frozen pyright
+      # Some scripts ask rustc for the host when imported: after the toolchain is installed. In
+      # the workspace's Python, which has its helpers (python/*) for the scripts that use them.
+      - run: uv run --frozen python harness/imports.py
       # No new place in blaze's code starts rustc, rustdoc or cargo (docs/no-rustc.md).
       - run: python3 harness/rustcsites.py
       # The agent rules: tools/agents/rules.ts type-checks, and AGENTS.md is what it generates.

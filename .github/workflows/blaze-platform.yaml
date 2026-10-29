@@ -56,6 +56,10 @@ on:
         description: the std cases of the smoke corpus (harness/smoke.py), in every tier
         type: boolean
         default: false
+      harnesses:
+        description: "a JSON list of ci.py's harnesses (focused.yaml): these alone in place of the tier's parts, and no unit tests"
+        type: string
+        default: ""
 
 env:
   CARGO_INCREMENTAL: 0
@@ -78,6 +82,7 @@ defaults:
 jobs:
   tests:
     name: tests
+    if: inputs.harnesses == ''
     runs-on: ${{ inputs.os }}
     # A store blaze's release has not compiled into yet: 49 min on Linux x86-64, and over an
     # hour on macOS's 7 GB runner (the 16-minute step of 4-cpu Linux had not ended at 48). Long
@@ -118,7 +123,7 @@ jobs:
       # compiled. Run out here, the step fails and main's push still runs.
       - if: env.BLAZE == 'true'
         timeout-minutes: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 335 || startsWith(inputs.os, 'macos') && 220 || 150 }}
-        run: $PYTHON harness/unittests.py
+        run: $PYTHON harness/unittests.py --events json
       - if: env.BLAZE != 'true'
         run: |
           $PYTHON harness/unittests.py '{"cargo": true}'
@@ -153,10 +158,16 @@ jobs:
       # another yet (https://github.com/indexable-inc/blaze/issues/899; the smoke corpus took
       # 15 min instead of 74 s, unit tests 60 s instead of 5). The merge gate and main build
       # with blaze.
-      BLAZE: ${{ !startsWith(inputs.os, 'windows') && inputs.tier != 'fast' && inputs.tier != 'full' }}
+      # Named harness runs are a new route: bootstrap them with blaze too.
+      BLAZE: ${{ !startsWith(inputs.os, 'windows') && (inputs.harnesses != '' || (inputs.tier != 'fast' && inputs.tier != 'full')) }}
     outputs:
-      parts: ${{ steps.parts.outputs.parts }}
+      parts: ${{ steps.parts.outputs.parts || steps.focused.outputs.parts }}
     steps:
+      - name: blaze bootstrap for named harnesses
+        if: runner.os == 'Windows' && inputs.harnesses != ''
+        run: |
+          echo 'Named harness builds on Windows need a released Windows blaze to bootstrap with; none is shipped yet.' >&2
+          exit 1
       # Nightly cargo's build-dir layout gives rustc one `-L dependency=` per dependency: for
       # blaze-cargo that is over Windows' 32K command line, and sccache spawns rustc with it as is.
       - if: runner.os == 'Windows'
@@ -209,8 +220,18 @@ jobs:
       # release blaze does not build yet. Only for the harnesses of the `fast` and `full` tiers:
       # the smoke corpus of every tier is std alone, with no proc macros.
       - name: blaze's proc-macro server
-        if: runner.os != 'Windows' && (inputs.tier == 'fast' || inputs.tier == 'full')
+        if: runner.os != 'Windows' && inputs.harnesses == '' && (inputs.tier == 'fast' || inputs.tier == 'full')
         run: nix develop --command python3 .github/scripts/build_release.py --server-beside target/release/blaze-engine
+      - name: blaze's proc-macro server (named harnesses)
+        if: runner.os != 'Windows' && inputs.harnesses != ''
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/proc-macro-server
+          BLAZE_STD_FROM: 'off'
+          RUST_BACKTRACE: '0'
+        run: |
+          "$PWD/target/release/blaze-engine" cargo build --manifest-path vendor/proc-macro-srv/Cargo.toml -p proc-macro-srv-cli --bin rust-analyzer-proc-macro-srv --release --locked
+          cp "$CARGO_TARGET_DIR/release/rust-analyzer-proc-macro-srv" target/release/blaze-proc-macro-srv
+          RUST_ANALYZER_INTERNALS_DO_NOT_USE=1 target/release/blaze-proc-macro-srv --version
       # The binaries run each other from next to themselves (`blaze enable` links `cargo fmt`
       # and `cargo clippy` to the blaze beside it, and fails without one; a load finds
       # blaze-proc-macro-srv beside blaze). A tar keeps them executable.
@@ -225,9 +246,27 @@ jobs:
           name: blaze-${{ inputs.platform }}
           path: target/release/blaze.tar
           retention-days: 3
+      # ci.py and focused.py run in the repository's Python workspace (pyproject.toml, uv.lock),
+      # and the harnesses in the Python that runs them: they read their input with typed_input.
+      - if: inputs.tier == 'fast' || inputs.tier == 'full'
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          enable-cache: false
       - id: parts
-        if: (inputs.tier == 'fast' || inputs.tier == 'full')
-        run: echo "parts=$($PYTHON harness/ci.py --parts ${{ inputs.tier }})" >> "$GITHUB_OUTPUT"
+        if: (inputs.tier == 'fast' || inputs.tier == 'full') && inputs.harnesses == ''
+        run: |
+          parts=$(uv run --frozen --no-dev python harness/ci.py parts '{"tier": "${{ inputs.tier }}"}')
+          echo "parts=$parts" >> "$GITHUB_OUTPUT"
+      # focused.yaml's harnesses, by name (harness/focused.py).
+      - id: focused
+        if: inputs.harnesses != ''
+        env:
+          HARNESSES: ${{ inputs.harnesses }}
+        # A name that is no harness's, or runs nowhere here, fails this step.
+        run: |
+          parts=$(uv run --frozen --no-dev python harness/focused.py parts "{\"harnesses\": $HARNESSES}")
+          echo "parts=$parts" >> "$GITHUB_OUTPUT"
 
   harness:
     name: harness (${{ matrix.backend }}, ${{ matrix.part }})
@@ -235,7 +274,7 @@ jobs:
     needs: build
     runs-on: ${{ inputs.os }}
     # A fast part is about four minutes of harnesses: one that hangs ends here, not at the hour.
-    timeout-minutes: ${{ inputs.tier == 'fast' && 25 || 60 }}
+    timeout-minutes: ${{ inputs.tier == 'fast' && inputs.harnesses == '' && 25 || 60 }}
     strategy:
       fail-fast: false
       # {"include": [{"backend", "part", "apt"}, ...]}: each backend has parts of its own.
@@ -292,7 +331,19 @@ jobs:
           tar -xf blaze.tar
           if [ "$RUNNER_OS" = Windows ]; then bin="$(cygpath -w "$PWD")\\blaze-engine.exe"; else bin="$PWD/blaze-engine"; fi
           echo "BLAZE_BIN=$bin" >> "$GITHUB_ENV"
-      - run: $PYTHON harness/ci.py ${{ matrix.part }}
+      # The harnesses run in the Python of the repository's workspace, as ci.py and focused.py do.
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          enable-cache: false
+      - if: inputs.harnesses == ''
+        run: |
+          uv run --frozen --no-dev python harness/ci.py run '{"part": "${{ matrix.part }}"}'
+      - if: inputs.harnesses != ''
+        env:
+          HARNESSES: ${{ inputs.harnesses }}
+        run: |
+          uv run --frozen --no-dev python harness/focused.py run "{\"harnesses\": $HARNESSES, \"backend\": \"${{ matrix.backend }}\"}"
       # What the daemons said when a harness failed (each harness keeps its daemon's log in a
       # temporary directory of its own), and the report of a process that crashed on macOS.
       - name: Daemon logs

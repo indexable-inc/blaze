@@ -130,7 +130,7 @@ on the same switch and as lines of the same kind:
   round, so a build of four rounds showed three quarters of its time as "compile-rest".
 
 The client, the daemon and the worker also record spans of every build on one clock, always
-(`crates/blaze-engine/src/trace.rs`): the worker sends its own with its answer, the daemon adds its
+(`crates/blaze-cargo/src/trace.rs`): the worker sends its own with its answer, the daemon adds its
 own, and the client puts them together. With them:
 
 - `BLAZE_STATS=1` makes `blaze build` print `blaze time: 402.1 ms: check 285.5 (71%),
@@ -143,6 +143,19 @@ own, and the client puts them together. With them:
   cranelift) of 0.2 ms or longer. The worker's
   reach, resolve, define, object, statics, setup and compile-rest are sums over threads laid
   end to end, so read them as one stretch.
+- A worker started directly (`blaze <crates> --watch`, or one build without it) with
+  `BLAZE_TRACE=<path>` writes its first build as a trace of its own: the steps and queries
+  from its start until it says `watching N files`, or until that one build ends.
+  `blaze.startup.outcome` says which (`watch ready`, `complete` or `failed`), and
+  `blaze.startup.dropped` counts the spans that did not fit. Each parallel dispatch has a
+  `parallel N worker` span per thread, `parallel N caller` for the caller's own share and
+  `parallel N join` for its wait on the last thread, and each linker run a `link` span,
+  failed ones saying how they ended. A worker the daemon starts writes none.
+- `BLAZE_TRACE_CONST=crate::module::NAME` with it follows one module-level constant: a
+  `const request` span is a wait for its value, and a `const eval` inside it is a run of its
+  query, however short; a request with none found it already computed. Compare them with the
+  threads of the same parallel dispatch, its join and the link. An associated constant or
+  one in a block has no such path and is not followed.
 - `harness/realbench.py` runs every warm build with `BLAZE_TRACE` and keeps the breakdown of
   each row's median run; `realbench.py --table FILE` prints it under the results.
 

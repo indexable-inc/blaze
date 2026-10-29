@@ -63,6 +63,8 @@ jobs:
           token: ${{ secrets.BLAZE_BOT_TOKEN || github.token }}
       # `nix flake update rust-overlay`, which toolchain_bump.py runs when nix is there.
       - uses: DeterminateSystems/nix-installer-action@v23
+      # The helper passes its Python to toolchain_bump.py, which reads typed workspace input.
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - id: prepare
         env:
           GH_TOKEN: ${{ github.token }}
@@ -70,7 +72,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          python3 .github/scripts/toolchain_bump_ci.py prepare ${DATE:+--date "$DATE"}
+          uv run --frozen --no-dev python .github/scripts/toolchain_bump_ci.py prepare ${DATE:+--date "$DATE"}
       - if: failure()
         env:
           GH_TOKEN: ${{ github.token }}

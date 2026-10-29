@@ -851,6 +851,45 @@ pub fn f() {}
     );
 }
 
+/// rustc applies a crate's `#![cfg]` before it injects its test harness, so a test crate of
+/// `#![cfg(target_arch = "wasm32")]` still has the harness's `main` (astral-experiments/blaze#35).
+#[test]
+fn cfg_the_entire_crate_keeps_the_appended_module() {
+    use base_db::{SourceDatabase as _, salsa::Setter as _};
+    let mut db = TestDB::with_files(
+        r#"
+//- /main.rs
+#![cfg(never)]
+
+pub fn f() {}
+mod __blaze_test_harness {
+    pub fn main() {}
+}
+"#,
+    );
+    let krate = db.fetch_test_crate();
+    let root = krate.root_file_id(&db).file_id(&db);
+    // The same module written only in source follows the crate's cfg.
+    expect![[r#"
+        crate
+    "#]]
+    .assert_eq(&crate_def_map(&db, krate).dump(&db));
+    db.file_text(root).set_appended_root_module(&mut db).to(Some("__blaze_test_harness"));
+    expect![[r#"
+        crate
+        - __blaze_test_harness : type
+
+        crate::__blaze_test_harness
+        - main : value
+    "#]]
+    .assert_eq(&crate_def_map(&db, krate).dump(&db));
+    db.file_text(root).set_appended_root_module(&mut db).to(None);
+    expect![[r#"
+        crate
+    "#]]
+    .assert_eq(&crate_def_map(&db, krate).dump(&db));
+}
+
 #[test]
 fn use_crate_as() {
     check(

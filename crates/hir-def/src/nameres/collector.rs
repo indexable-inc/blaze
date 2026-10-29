@@ -379,7 +379,8 @@ impl<'db> DefCollector<'db> {
         self.inject_prelude();
         self.inject_std_extern_crate();
 
-        if let Some(AttrsOrCfg::CfgDisabled(attrs)) = item_tree.top_level_attrs() {
+        let items = item_tree.top_level_items();
+        let items = if let Some(AttrsOrCfg::CfgDisabled(attrs)) = item_tree.top_level_attrs() {
             let (cfg_expr, _) = &**attrs;
             self.def_map.diagnostics.push(DefDiagnostic::unconfigured_code(
                 self.def_map.root,
@@ -387,8 +388,23 @@ impl<'db> DefCollector<'db> {
                 cfg_expr.clone(),
                 self.cfg_options.clone(),
             ));
-            return;
-        }
+            // rustc takes the crate's items away before it injects its test harness, so a
+            // test crate of `#![cfg(target_arch = "wasm32")]` still has a `main` that runs
+            // no tests. The module the compiler appended to the root is all that stays.
+            let root = self.db.file_text(file_id.file_id(self.db));
+            let appended = root.appended_root_module(self.db);
+            let Some(item) = appended.and_then(|name| {
+                items.last().filter(|&&item| {
+                    matches!(item_tree.index(item),
+                        ModItemKind::Mod(_, module) if module.name.as_str() == name)
+                })
+            }) else {
+                return;
+            };
+            std::slice::from_ref(item)
+        } else {
+            items
+        };
 
         let module_id = self.def_map.root;
         ModCollector {
@@ -399,7 +415,7 @@ impl<'db> DefCollector<'db> {
             item_tree,
             mod_dir: ModDir::root(),
         }
-        .collect_in_top_module(item_tree.top_level_items());
+        .collect_in_top_module(items);
         Arc::get_mut(&mut self.def_map.data).unwrap().shrink_to_fit();
     }
 

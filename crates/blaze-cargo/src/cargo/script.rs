@@ -438,7 +438,7 @@ const IN_VIEW: &str = "build script runs in their closure 1";
 /// prints or writes either: a run that the sandbox refused something fails, and a failed run
 /// is not kept. Nor does where blaze keeps its store, its traces and its statistics, or
 /// whether it checks the store's runs.
-pub const UNREAD: [&str; 13] = [
+pub const UNREAD: [&str; 14] = [
     "CARGO_MAKEFLAGS",
     "MAKEFLAGS",
     "MFLAGS",
@@ -449,6 +449,7 @@ pub const UNREAD: [&str; 13] = [
     sandboxed::VAR,
     "BLAZE_CACHE",
     "BLAZE_TRACE",
+    "BLAZE_TRACE_CONST",
     "BLAZE_STATS",
     "BLAZE_HOME",
     keyed::CHECK,

@@ -130,8 +130,8 @@ The daily workflow does this every day and opens the pull request
 ([toolchain.md, "The daily bump"](toolchain.md#the-daily-bump)); by hand it is for fixing what
 a nightly breaks, on the bump's branch `toolchain/bump`, or for trying a nightly:
 
-    python3 harness/toolchain_bump.py '{}'                      # the newest nightly blaze can use
-    python3 harness/toolchain_bump.py '{"date": "2026-11-02"}'  # or a given one
+    uv run --frozen python harness/toolchain_bump.py '{}'                      # the newest nightly blaze can use
+    uv run --frozen python harness/toolchain_bump.py '{"date": "2026-11-02"}'  # or a given one
 
 picks the nightly (the newest of the last two weeks whose manifest has every component blaze
 needs on every host it ships for, or the date given), writes `harness/toolchain` and
@@ -154,7 +154,7 @@ What it leaves to a person, and prints at the end:
    `rustc_abi`'s renamed layout calls, vectors of at most 128 bits passed in registers on
    x86-64 and AArch64, Windows x64's rule for zero-sized types, the `f16b` and `ppcf128`
    layouts, libtest's new entry `test_main_env_args` and the intrinsic `abort_immediate`.
-3. `python3 harness/toolchain_bump.py checks '{}'` in an ix VM, under Cranelift and under LLVM
+3. `uv run --frozen python harness/toolchain_bump.py checks '{}'` in an ix VM, under Cranelift and under LLVM
    (in `nix develop`, with `BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`). It builds
    blaze and runs, in parallel, what proves blaze and the nightly agree: `toolchain_pins.py`,
    `answers.py`, `macroserver.py`, the corpus with its `nightly` feature and `--layouts`, and
