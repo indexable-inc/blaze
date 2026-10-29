@@ -6,22 +6,13 @@ site {
     Icon: {"download"}
     (InGroup, nav.reference)
     Description: {"Install blaze with one line on macOS on Apple silicon or Linux, or with Nix."}
-    Intro: {"[warm] Installing blaze. It's one line, and you don't need Rust installed first."}
-    Outro: {"[warm] That's it: one line, then blaze run. The usage page picks up from there. Thanks for listening."}
 
-    Lede lede("One line, on macOS on Apple silicon or Linux, with or without Rust installed:") {
-      Say: {"[warm] The short way: one line in your terminal. It works on macOS on Apple silicon and on Linux, whether or not you have Rust installed. It's the first command on this page."}
-    }
-    Command curl("curl -fsSL https://ix.dev/blaze | sh") {
-      Silent
-    }
-    P then("Then, in a project of yours, `blaze run`. Change a function and run it again: the `Finished` line now says `[blaze]` (blaze's engine), which means blaze built it, not cargo. What to do next: [Usage](/usage).") {
-      Say: {"[curious] Then go to one of your projects and type blaze run. Change a function and run it again. The finished line now says R A jit, that's blaze's engine, which means blaze built it, not cargo. [short pause] From there, the usage page says what to do next."}
-    }
+    Lede lede("One line, on macOS on Apple silicon or Linux, with or without Rust installed:")
+    Command curl("curl -fsSL https://ix.dev/blaze | sh")
+    P then("Then, in a project of yours, `blaze run`. Change a function and run it again: the `Finished` line now says `[blaze]` (blaze's engine), which means blaze built it, not cargo. What to do next: [Usage](/usage).")
     Code first(lang: "bash", text: "blaze run")
 
     Section needs(title: "What you need") {
-      Say: {"[matter-of-fact] What you need. A Mac with Apple silicon, or Linux on x86 or ARM, with a recent glibc: RHEL 9, Debian 12, Ubuntu 22.04, or anything newer. Intel Macs, musl systems like Alpine, and Windows, for now, aren't supported. [short pause] A C compiler for linking. In a container, user namespaces, since build scripts and proc macros run in a sandbox made of them. And memory to spare: blaze's background process holds a few gigabytes for a small project. [pause] What you don't need is Rust. blaze is its own toolchain: it downloads its pinned nightly once, and builds every project with it, whatever the project pins."}
       Ul list {
         Li platform("**macOS on Apple silicon, or Linux on x86-64 or ARM64.** Intel Macs are not supported, and neither is Windows yet ([platforms](https://github.com/indexable-inc/blaze/blob/main/docs/platforms.md#windows-x86-64-msvc)).")
         Li glibc("**On Linux, glibc 2.34 or newer:** RHEL 9, Debian 12, Ubuntu 22.04 and anything newer. Alpine and other musl systems are not supported; the installer says so.")
@@ -33,20 +24,17 @@ site {
     }
 
     Section installer(title: "What the installer does") {
-      Say: {"[calm] What the installer does. It downloads the build for your machine from blaze's GitHub releases, checks it against the published checksums, puts blaze in your cargo bin directory, and has blaze fetch its Rust. It asks nothing. [short pause] Run it again to upgrade. Releases are dated. A canary goes out whenever main has changed and blaze builds, and a canary that passes main's tests on every platform and the heavy tests becomes the stable release, which is what the installer gives you unless you ask for canary."}
       P what("It downloads the build for your machine from the [releases](https://github.com/indexable-inc/blaze/releases), checks it against the published checksums, puts `blaze` and the programs it runs in `~/.cargo/bin`, and has blaze download its Rust. It asks nothing. Run it again to upgrade.")
       P versions("Releases are dated, `0.YYYYMMDD.N`. A canary is published whenever main has changed and main's build of it passes; a canary whose commit then passes main's unit tests on every platform and the heavy tests (building and testing bun, servo, cargo, zed and others, and beating cargo on them) becomes the stable release, which the installer installs. End the line with `| sh -s -- --channel canary` for the newest canary, or `| sh -s -- --version 0.YYYYMMDD.N` for a given release; `--help` says what else it takes.")
     }
 
     Section nix(title: "With Nix") {
-      Say: {"[matter-of-fact] And with Nix: install it into your profile from the GitHub flake, or try it without installing anything with nix run, which is the same as blaze build. Nix compiles blaze from source; there's no binary cache yet."}
       Code profile(lang: "bash", text: `nix profile install github:indexable-inc/blaze
         nix run github:indexable-inc/blaze -- build   # try it without installing`)
       Dim cache("Nix compiles blaze from source; there is no binary cache yet. In a flake, take `blaze.packages.\$\{system}.blaze` from the input `github:indexable-inc/blaze`.")
     }
 
     Section from_source(title: "Building blaze itself") {
-      Say: {"[light] One last thing. If you want to build blaze itself, the contributing guide has every way to do it."}
       P what("Every way to build blaze itself: [contributing](https://github.com/indexable-inc/blaze/blob/main/docs/contributing.md).")
     }
   }

@@ -1,3 +1,7 @@
+---
+status: current
+summary: How to build, test and change blaze: AI use, where new code goes, rules for code, working in parallel, landing.
+---
 # Contributing
 
 ## AI use
@@ -55,7 +59,7 @@ it was a module of `hir-ty`. The front end's crates depend on none of blaze's ma
 The front end's crates in `crates/` (`hir-ty`, `hir-def`, `hir-expand`, `syntax`, `parser`,
 `base-db`, `syntax-tree` and the rest) started as a fork of rust-analyzer (DioxusLabs' rustd branch
 merged with upstream master at `0b21bd6596`, with the MIR passes that make its MIR like rustc's
-on top: [mir-passes.md](mir-passes.md)); until 2026-10-28 they lived in `vendor/rust-analyzer`.
+on top: [mir-passes.md](mir-passes.md)); until 2026-10-28 they were a subtree under vendor/.
 They are no longer synced with upstream or with a fork repository, and keep rust-analyzer's crate
 names. Edit them, build and test from the root, and commit like any other file. A plain clone
 builds:
@@ -205,6 +209,18 @@ did about it in one line.
 
 When you report what you did, separate what you ran from what you inferred. The reports
 under `docs/reports/` do this and it is the reason they can be used.
+
+## Documents
+
+Every doc under `docs/` opens with front matter saying what it is (`tools/docs.py` has the
+fields): `current` (how blaze is now, kept true), `plan` (a design not fully built, dated),
+`record` (research, a report or a measurement, true on its date and never brought up to date) or
+`superseded` (with `superseded_by`, what replaced it). [docs/README.md](README.md) is the index,
+generated from it; superseded docs are left out. CI's `python3 tools/docs.py check` holds every
+doc's links, and a current doc's anchors, repository paths in backticks and `BLAZE_*` settings,
+against the tree, and every doc that code names. A change that makes a current doc
+untrue fixes it in the same change, or marks it superseded; `python3 tools/docs.py write`
+regenerates the index.
 
 ## Working in parallel
 

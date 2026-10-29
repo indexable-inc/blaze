@@ -1,3 +1,7 @@
+---
+status: current
+summary: Getting started: using blaze on a project, in short.
+---
 # Using blaze
 
 Not installed yet: [install.md](install.md). Every command and setting in detail:

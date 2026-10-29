@@ -1,3 +1,7 @@
+---
+status: current
+summary: The harnesses that compare blaze with rustc, what each checks, and how CI runs them.
+---
 # The harnesses
 
 blaze is tested by comparison with rustc. Almost every script under `harness/` builds

@@ -1,3 +1,8 @@
+---
+status: record
+summary: Proc macros built and run as WebAssembly.
+date: 2026-10-27
+---
 # Proc macros run as WebAssembly
 
 The report for the `pmwasm` lane of wasm32: proc macros built by blaze as `wasm32-wasip1`

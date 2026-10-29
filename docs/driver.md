@@ -1,3 +1,8 @@
+---
+status: plan
+summary: The build driver as a graph that does no IO: what is wrong with the serial driver and what replaces it.
+date: 2026-10-28
+---
 # The build driver: a graph that does no IO
 
 The compiler's core (parser, `hir-def`, `hir-expand`, `hir-ty`, MIR) is salsa queries that
