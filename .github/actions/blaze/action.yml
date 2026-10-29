@@ -72,6 +72,11 @@ runs:
     # build script in blaze's sandbox may name only system directories of libraries
     # (crates/blaze-cargo/src/cargo/directives.rs, SYSTEM). The same directory every run, so the
     # store's runs of the build scripts that read LLVM_SYS_231_PREFIX are found.
+    # llvm.py takes JSON through typed_input, which needs Python 3.12; the oldest hosted Ubuntu has 3.10.
+    - if: inputs.llvm == 'true'
+      uses: actions/setup-python@v7
+      with:
+        python-version: "3.13"
     - name: LLVM (the pin)
       if: inputs.llvm == 'true'
       shell: bash
