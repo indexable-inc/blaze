@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>blaze</title>
+<!-- No icon: a browser asks for /favicon.ico without the token otherwise, and is refused. -->
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<header id="status">
+  <span class="brand">blaze</span>
+  <span id="st-build" class="st"></span>
+  <span id="st-root" class="st root"></span>
+  <span id="st-step" class="st step"></span>
+  <span id="st-counts" class="st counts"></span>
+  <span id="st-conn" class="conn connecting">connecting</span>
+</header>
+<main>
+  <section id="graph">
+    <div id="graph-canvas"></div>
+    <div id="graph-tools">
+      <button id="btn-fit" type="button">Fit</button>
+      <button id="btn-layout" type="button">Pause layout</button>
+      <label class="check"><input id="follow" type="checkbox" checked> follow edits</label>
+    </div>
+    <div id="legend">
+      <span><i class="lg compiled"></i>compiled</span>
+      <span><i class="lg dim"></i>not compiled this build</span>
+      <span><i class="lg glow"></i>just compiled</span>
+      <span>size: compile time</span>
+    </div>
+  </section>
+  <div id="splitter" title="drag to resize"></div>
+  <aside id="panel">
+    <nav id="tabs">
+      <button id="tabbtn-crates" type="button">Crates</button>
+      <button id="tabbtn-search" type="button">Search</button>
+      <button id="tabbtn-time" type="button">Compile time</button>
+      <button id="tabbtn-phases" type="button">Phases</button>
+      <button id="tabbtn-edit" type="button">Edit</button>
+    </nav>
+    <div id="tab-crates" class="tab"></div>
+    <div id="tab-search" class="tab" hidden></div>
+    <div id="tab-time" class="tab fill" hidden></div>
+    <div id="tab-phases" class="tab" hidden></div>
+    <div id="tab-edit" class="tab" hidden></div>
+  </aside>
+</main>
+<div id="error" hidden>
+  <div class="error-box">
+    <h2 id="error-title"></h2>
+    <pre id="error-detail"></pre>
+    <p>The page stopped here rather than show something it could not check.</p>
+  </div>
+</div>
+</body>
+</html>

@@ -723,6 +723,7 @@ dependencies = [
  "blaze-build-script",
  "blaze-cache",
  "blaze-fmt",
+ "blaze-graph",
  "blaze-in-place",
  "blaze-lints",
  "blaze-live",
@@ -738,6 +739,7 @@ dependencies = [
  "blaze-ui",
  "blaze-units",
  "blaze-wasi",
+ "blaze-web",
  "cargo-platform",
  "cargo-util-schemas",
  "cargo_metadata",
@@ -1181,6 +1183,19 @@ dependencies = [
  "anyhow",
  "wasmtime",
  "wasmtime-wasi",
+]
+
+[[package]]
+name = "blaze-web"
+version = "0.0.0"
+dependencies = [
+ "base64",
+ "blaze-protocol",
+ "flate2",
+ "flecs-c",
+ "getrandom 0.3.4",
+ "rustc-hash 2.1.2",
+ "sha1 0.10.7",
 ]
 
 [[package]]
@@ -2097,6 +2112,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "flecs-c"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2486,6 +2508,7 @@ dependencies = [
  "itertools 0.15.0",
  "la-arena",
  "macros",
+ "parser",
  "project-model",
  "ra-ap-rustc_ast_ir",
  "ra-ap-rustc_pattern_analysis",
@@ -2498,6 +2521,7 @@ dependencies = [
  "span",
  "stdx",
  "syntax",
+ "syntax-bridge",
  "test-fixture",
  "test-utils",
  "tracing",

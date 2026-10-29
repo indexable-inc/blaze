@@ -8,7 +8,8 @@ date: 2026-10-28
 Status: design. Stage 0 of the prototype ([below](#the-prototype-stage-0)) is on main behind
 `experimental = ["const-macros"]`: the evaluator call and expander (#915), and the manifest key
 and loading (#959). Of stage 2 ([below](#stage-2-the-item-as-a-flat-tree-through-const-views),
-#1441), the const views are on main and not yet given to macros. Nothing here is on by default. Issues: #859 (hermetic build graph), #860 (purity as a front-end query), #867
+#1441), the const views are on main, and a macro that takes `&const_ast::Item` is given its
+input through them. Nothing here is on by default. Issues: #859 (hermetic build graph), #860 (purity as a front-end query), #867
 (const traits, const closures, const heap, step budget), #863 (the build graph's `map`).
 
 ## What it is
@@ -295,11 +296,30 @@ plan, a pull request a step:
    `consteval::const_ast`). Running them in the evaluator found it laying out an overflowing
    `u128` operation's `(u128, bool)` as twice a `u128` where the target aligns `u128` to 8;
    it now pads to the alignment.
-2. The expander passes the flat input to a macro that takes `&const_ast::Item`: the input's
-   token tree parsed back to a flat tree (so it is what a proc macro is given: cfg-stripped,
-   the derive itself taken out), each token's span as its index in the call's span table, and
-   `const-ast` itself in the macro crate's graph, from blaze's own copy, so the host and the
-   views agree on the layout and the kinds.
+2. **The item as input** (on main): each parameter of a const macro's function is `&str`, the
+   tokens as text as in stage 0, or `&const_ast::Item`, the tokens parsed back to an item as a
+   flat tree (so it is what a proc macro is given: cfg-stripped, the derive itself taken
+   out). For a derive:
+
+   ```rust
+   #[proc_macro_derive(Fields)]
+   pub const fn fields(item: &const_ast::Item) -> String {
+       match item.as_struct() { Some(adt) => /* adt.name(), adt.record_field_list() */, None => .. }
+   }
+   ```
+
+   Each token's span is its index in the call's span table: `def_site` 0, `call_site` 1,
+   `mixed_site` 2, then each distinct span of the input in the order it first appears. The
+   expander (`hir-ide`'s `const_macro.rs`) writes the arrays, the `Tree` and the `Item` into the
+   evaluator's heap (`call_const_macro`, `hir-ty-mir`'s `eval/macro_call.rs`) and passes a
+   reference. Every macro crate depends on `const_ast`, blaze's own copy of `crates/const-ast`
+   (its files are `const_ast::SOURCE`, which the loader gives the VFS at
+   `<sysroot>/lib/rustlib/blaze/const-ast`, a directory not on disk), so the layout and kinds
+   the host writes are the ones the views read; a `const_ast` whose root is not blaze's text is
+   refused. A parameter of any other type, a count of parameters that is not the macro kind's,
+   or an input that does not parse to one item is an error naming it. The output is still
+   text, every token with the call site's span; giving output tokens spans from the table waits
+   for the const `proc_macro`.
 3. The evaluator's call memo, keyed by (`cache_code` of the callee, the hashes of its
    arguments; a view's is its slice's and spans'), for calls whose arguments include a view
    and whose callee is in the macro file, measured on a derive over a large struct: edit one
@@ -329,7 +349,7 @@ wasm instance:
   in its result is already a `FunctionId` (or a closure's id and its captures). When it ran
   as wasm, the pointer is a table slot. blaze built the module, so it maps the slot to the
   function itself, as #863 already requires.
-- The call: `call_with_strs`, generalised from text to the graph's value encoding (bytes in,
+- The call: `call_const_macro`, generalised from text to the graph's value encoding (bytes in,
   bytes out). Each input is written into the evaluator's heap, and the result is read back
   from the returned words. Whether `f` is const is the purity query's answer, not its
   signature's.

@@ -101,14 +101,11 @@ pub fn idle() {
 /// How often a compile says how many functions it has compiled.
 pub const COUNTED: Duration = Duration::from_millis(100);
 
-/// The next id of a node of the build's graph ([`Event::Node`]) not said yet.
-static NODES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
 /// The first of `count` ids of nodes no other node of the process has: whatever says nodes
-/// takes them here, so the nodes of one graph and another's are told apart.
+/// takes them here or from [`blaze_graph::exec::ids`], which this is, so the nodes of one
+/// graph and another's are told apart.
 pub fn node_ids(count: usize) -> u32 {
-    let count = u32::try_from(count).unwrap_or(u32::MAX);
-    NODES.fetch_add(count, std::sync::atomic::Ordering::Relaxed)
+    blaze_graph::exec::ids(count)
 }
 
 /// A count of what a step does, said every [`COUNTED`] while it goes on, with what is taking

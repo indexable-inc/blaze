@@ -6,8 +6,9 @@
 The input, when given, is JSON: `keep` (bool, default false) keeps the copy of the fixture.
 
 harness/constmacros is a package whose `[package.metadata.blaze] const-macros` file defines the
-derive `Named` (docs/future/const-macros.md). In a copy of it, with a daemon of its own:
-  cold      `blaze run` from nothing: the derive expands and the program prints `Point 3`
+derives `Named`, given the struct as text, and `Fields`, given it as a flat tree read through
+`const_ast`'s views (docs/future/const-macros.md). In a copy of it, with a daemon of its own:
+  cold      `blaze run` from nothing: the derives expand and the program prints `Point 3 x,y`
   warm      `blaze run` again
   edit      the macro's output is edited: the program prints what the new one generates
   off       the root's `experimental = ["const-macros"]` taken out: the build fails, naming it
@@ -66,10 +67,10 @@ def main():
         return check
 
     try:
-        step("cold", ["run", "-q"], prints("Point 3"))
-        step("warm", ["run", "-q"], prints("Point 3"))
+        step("cold", ["run", "-q"], prints("Point 3 x,y"))
+        step("warm", ["run", "-q"], prints("Point 3 x,y"))
         edit("src/macros.rs", 'NAME: &\'static str = \\"{name}\\"', 'NAME: &\'static str = \\"the {name}\\"')
-        step("edit", ["run", "-q"], prints("the Point 3"))
+        step("edit", ["run", "-q"], prints("the Point 3 x,y"))
         edit("Cargo.toml", 'experimental = ["const-macros"]', "experimental = []")
 
         def refused(ran):

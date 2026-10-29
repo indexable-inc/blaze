@@ -12,6 +12,12 @@ since the release before and the title of each change merged since.
 ### Added
 
 - Remote cache: every push writes the project's key index (`manifests/<project>.index`, runs and shards under `index/`), which says which pack holds a key without the key list of every pack; the gateway takes `index/<sha256>` (docs/cache.md, "The remote").
+- `blaze ui` opens the build page: the daemon serves it on 127.0.0.1 under a random token,
+  starting it at the first `blaze ui` (`--no-open` prints the address alone). It draws every
+  function of the program and every call, lights up what a build compiles as it goes, and has
+  the crates, search, compile time, the build's steps and what an edit rebuilt. Its model is a
+  Flecs world of the workspace, its crates, modules and functions, which Flecs's REST answers
+  queries of, read only, under the same token (docs/web.md).
 
 ### Changed
 

@@ -6586,8 +6586,23 @@ impl WatchedFile {
         let of_script = cargo::script::in_out_dir(path);
         path.starts_with("/nix/store")
             || cargo::toolchain::library::has(path)
-            || names.iter().any(|&it| matches!(it, "rustlib" | "registry"))
+            || names.contains(&"rustlib")
+            || WatchedFile::fetched(&names)
             || names.contains(&"target") && !of_script
+    }
+
+    /// Whether a file is in what cargo fetched: `registry/src/<index>-<hash>/` or
+    /// `git/checkouts/<repository>-<hash>/`. A directory of the checkout that is only named
+    /// `registry` is edited like any other (cargo's own `src/cargo/sources/registry`).
+    fn fetched(names: &[&str]) -> bool {
+        let hashed = |name: &str| {
+            name.rsplit_once('-').is_some_and(|(_, hash)| {
+                hash.len() == 16 && hash.bytes().all(|it| it.is_ascii_hexdigit())
+            })
+        };
+        names.windows(3).any(|it| {
+            matches!((it[0], it[1]), ("registry", "src") | ("git", "checkouts")) && hashed(it[2])
+        })
     }
 
     /// `path` is what the file is known as, `on_disk` where it is read from.
@@ -11322,6 +11337,22 @@ mod tests {
     fn the_splice_names_statics_as_the_code_generator_does() {
         assert_eq!(splice::LASTING_STATIC, hir_ty_codegen::LASTING_STATIC);
         assert_eq!(splice::MOVED_STATIC, hir_ty_codegen::MOVED_STATIC);
+    }
+
+    #[test]
+    fn a_directory_of_the_checkout_named_registry_is_watched() {
+        let immutable = |path: &str| WatchedFile::immutable(Path::new(path));
+        let home = "/home/one/.cargo";
+        assert!(immutable(&format!(
+            "{home}/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.7.4/src/lib.rs"
+        )));
+        assert!(immutable(&format!(
+            "{home}/git/checkouts/gix-0f1c5b2bd2cb9a5e/1a2b3c4/src/lib.rs"
+        )));
+        assert!(!immutable("/ws/cargo/src/cargo/ops/registry/publish.rs"));
+        assert!(!immutable("/ws/cargo/src/cargo/sources/registry/index/mod.rs"));
+        assert!(!immutable("/ws/crates/registry/src/lib.rs"));
+        assert!(!immutable("/ws/crates/git/checkouts.rs"));
     }
 
     #[test]
