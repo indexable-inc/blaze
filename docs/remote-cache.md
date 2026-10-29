@@ -1,3 +1,8 @@
+---
+status: plan
+summary: One shared remote cache for CI and everyone: the gateway, the CAS API, and the slices built and to come.
+date: 2026-10-27
+---
 # A shared remote cache: one store for CI and everyone
 
 2026-10-27. Status: slice 1's gateway is built and deployed (`tools/remote-cache`, API-v0.md,

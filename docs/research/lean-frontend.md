@@ -1,3 +1,8 @@
+---
+status: record
+summary: Where nushell's cold start, edits and heap go in the front end (#236), and the lean path ranked.
+date: 2026-10-24
+---
 # A lean frontend for compiling: where the time and memory go
 
 2026-10-24, for [#236](https://github.com/indexable-inc/blaze/issues/236) (a strict, lean
