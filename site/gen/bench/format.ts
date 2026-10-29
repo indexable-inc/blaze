@@ -1,48 +1,9 @@
-// Numbers as the README writes them (harness/benchreport.py `seconds` and `speedup`).
+// The words /bench uses for what the history names by key.
 
 export const REPO = 'https://github.com/indexable-inc/blaze';
 
 export const commitUrl = (commit: string) => `${REPO}/commit/${commit}`;
-export const short = (commit: string | undefined) => (commit ?? 'unknown').slice(0, 10);
-
-export function seconds(v: number | null | undefined) {
-	if (v == null) return '–';
-	return v < 1 ? `${Math.round(v * 1000)} ms` : `${v.toFixed(2)} s`;
-}
-
-/** cargo's time over blaze's: "5.0x", "14x", or "2.0x slower" when blaze took longer. */
-export function speedup(cargo: number | undefined, ours: number | undefined) {
-	if (!cargo || !ours) return '';
-	const ratio = cargo / ours;
-	const times = (r: number) => (r >= 10 ? `${r.toFixed(0)}x` : `${r.toFixed(1)}x`);
-	return ratio >= 0.95 ? times(ratio) : `${times(1 / ratio)} slower`;
-}
-
-export function millis(v: number | null | undefined) {
-	if (v == null) return '–';
-	if (v >= 1000) return seconds(v / 1000);
-	return v < 10 ? `${v.toFixed(1)} ms` : `${Math.round(v)} ms`;
-}
-
-export function megabytes(v: number | null | undefined) {
-	if (v == null) return '–';
-	return v >= 1000 ? `${(v / 1000).toFixed(2)} GB` : `${Math.round(v)} MB`;
-}
-
-const trim = (v: number) => String(Number(v.toPrecision(3)));
-
-/** Axis labels: as short as the value allows. */
-export const secondsTick = (v: number) => (v === 0 ? '0' : v < 1 ? `${trim(v * 1000)} ms` : `${trim(v)} s`);
-export const millisTick = (v: number) => (v === 0 ? '0' : v >= 1000 ? `${trim(v / 1000)} s` : `${trim(v)} ms`);
-export const megabytesTick = (v: number) => (v === 0 ? '0' : v >= 1000 ? `${trim(v / 1000)} GB` : `${trim(v)} MB`);
-
-const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-
-/** "Oct 20", in UTC so that the prerendered page and the browser agree. */
-export function day(iso: string) {
-	const d = new Date(iso);
-	return Number.isNaN(d.getTime()) ? '' : `${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}`;
-}
+export const short = (commit: string) => commit.slice(0, 10);
 
 /** "2026-10-20 16:53 UTC". */
 export function when(iso: string) {
@@ -64,27 +25,29 @@ export const EDITS: Record<string, string> = {
 };
 export const EDIT_ORDER = ['body', 'leaf', 'signature', 'generic', 'newfn', 'struct', 'no-op', 'test-edit', 'test', 'cold'];
 
-/** The other cargo setups measured on the same edits: a short column name and what it is. */
-export const SETUPS: Record<string, [string, string]> = {
-	mold: ['mold', 'cargo with the mold linker'],
-	wild: ['wild', 'cargo with the wild linker'],
-	threads8: ['8 threads', 'cargo with -Zthreads=8, the parallel front end'],
-	nightly: ['nightly', 'cargo on plain nightly Rust'],
-	cranelift: ['Cranelift', 'cargo on nightly with the Cranelift backend'],
-	fastest: ['fastest', 'cargo with Cranelift, wild and 8 threads together'],
-	check: ['check', 'cargo check: no program is built'],
+/** The other cargo setups measured on the same edits, as a note on the fastest one's bar. */
+export const SETUPS: Record<string, string> = {
+	mold: 'cargo with the mold linker',
+	wild: 'cargo with the wild linker',
+	threads8: 'cargo with -Zthreads=8, the parallel front end',
+	nightly: 'cargo on plain nightly Rust',
+	cranelift: 'cargo on nightly with the Cranelift backend',
+	fastest: 'cargo with Cranelift, wild and 8 threads together',
 };
-export const SETUP_ORDER = ['mold', 'wild', 'threads8', 'nightly', 'cranelift', 'fastest', 'check'];
 
 export const BACKEND_NAMES: Record<string, string> = { cranelift: 'Cranelift', llvm: 'LLVM' };
 
-export const PROGRAMS: Record<string, string> = { probe: 'probe, a small program', life: 'Game of Life' };
+export const PROGRAMS: Record<string, string> = { probe: 'probe, a small program', life: 'Game of Life', bevy: 'Bevy', egui: 'egui' };
+export const PROGRAM_ORDER = ['probe', 'life', 'bevy', 'egui'];
 export const MODES: Record<string, string> = {
 	socket: 'One edit, sent to the daemon',
 	burst: 'Typing, keystroke to running',
 	replay: 'Replayed edits',
 	cargo: 'Save, then blaze build',
+	restart: 'An edit that needs a restart',
+	'cargo-run': 'The same edits with plain cargo run',
 };
+export const MODE_ORDER = ['socket', 'burst', 'replay', 'cargo', 'restart', 'cargo-run'];
 
 export const projectName = (project: string, tag: string | undefined) =>
 	`${project} ${(tag ?? '').replace(/^axum-v/, '').replace(/^v/, '')}`.trim();

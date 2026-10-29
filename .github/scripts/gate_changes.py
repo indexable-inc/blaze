@@ -27,8 +27,8 @@ from dataclasses import dataclass, fields
 # tiers gate and warm) read. A path ending in `/` is the directory and everything under it.
 CODE = (
     # The workspace's crates, with their test data, crates/hir-ty-codegen/llvm.json (the LLVM
-    # the flake and the toolchain action fetch) and blaze-cargo's toolchain pins.txt (the commit
-    # of rustc's tests the rust-tests action fetches).
+    # the blaze action fetches) and blaze-cargo's toolchain pins.txt (the commit of rustc's
+    # tests the rust-tests action fetches).
     "crates/",
     # The patched crates of [patch.crates-io], hashed into BLAZE_SOURCES (blaze-engine/build.rs).
     "vendor/",
@@ -40,13 +40,13 @@ CODE = (
     # by their tests.
     ".rustfmt.toml",
     ".clippy.toml",
-    # The pinned nightly: compiled into blaze-cargo, the flake's dev shell and the toolchain action.
+    # The pinned nightly: compiled into blaze-cargo.
     "harness/toolchain",
     # The tests job runs it.
     "harness/unittests.py",
-    # `nix develop`: the dev shell both jobs build and test in, and `.#llvm`.
-    "flake.nix",
-    "flake.lock",
+    # What fetches and checks the pinned LLVM for the build (.github/actions/blaze). No Nix:
+    # neither job reads the flake.
+    ".github/scripts/llvm.py",
     # The release of blaze that builds and tests blaze (.github/actions/blaze), and its installer.
     ".github/blaze-version",
     "install.sh",

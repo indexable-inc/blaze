@@ -3,27 +3,22 @@ site {
   rfcs {
     "linear-types" : Rfc {
       Title: {"Values that must be used"}
-      Intro: {"[warm] RFC two: values that must be used. [short pause] This one is about a promise Rust can't make today, and how blaze means to make it."}
-      Outro: {"[warm] So, to recap. Rust today lets any value be dropped or forgotten, safely. This RFC lets a type refuse, using upstream's design, unchanged, in the new edition. blaze's own borrow checker can enforce it now, and that opens the door to scoped async tasks, effects that must be handled, and cheaper pure code. [breath] Thanks for listening."}
       Description: {"Types that cannot be forgotten or silently dropped, following Rust's 2026 Move/Destruct/Forget goal, in the new edition."}
       Number: {2}
       (DependsOn, site.charter)
       (DependsOn, site.rfcs.capabilities)
 
       Lede summary("Every Rust value today can be dropped without a word and leaked with `mem::forget`, safely. In the new edition, a type can opt out: a transaction that must be committed or rolled back, a task handle that must be joined, an effect that must be handled. We follow the Rust 2026 goal's design and names, so this can go back upstream.") {
-        Say: {"[curious] Here's the problem. In Rust today, any value can be dropped without a word, and you can even leak one on purpose, perfectly safely. [pause] So what about a value that really <emphasis>must</emphasis> be dealt with? A transaction that has to be committed or rolled back. A task handle that has to be joined. An effect that has to be handled. [confident] In the new edition, a type can opt out of being dropped or forgotten. And blaze follows the Rust twenty twenty-six project goal's design and names, so this can go back upstream."}
         (Cites, refs.move_goal)
       }
 
       Section status_quo(title: "Where Rust is") {
-        Say: {"[thoughtful] So where is Rust today? Its types are affine: you can use a value at most once. But nothing makes you use it at least once. Drop runs at the end of a scope, sure, but forgetting a value, leaking a box, or a reference cycle can all skip it, and all of them are safe. [pause] That was decided in twenty fifteen. A reference cycle let a scoped thread outlive what it borrowed, and the fix was to make leaks safe. Guaranteed destructors went away with it. [short pause] Since then, APIs that must clean up keep ownership to themselves. Scoped threads never hand the scope out, and that works for blocking code. [sigh] But not for async, where the future is a value the caller can simply forget."}
         P affine("Rust's types are affine: a value is used at most once. Nothing makes you use it at least once. Drop runs at the end of scope, but `mem::forget`, `Box::leak` and reference cycles can skip it, and all of them are safe.")
         P leakpocalypse("That was decided in 2015, when a reference cycle through `Rc` let a scoped thread outlive its borrows (`JoinGuard`). Making leaks safe was the fix; guaranteed destructors went away with it.") { (Cites, refs.joinguard); (Cites, refs.niko_leaks) }
         P workaround("Since then, APIs that must run cleanup keep ownership themselves: `thread::scope(|s| ...)` never hands the scope out. That works for sync code. It does not work for `async`, where the future is a value the caller can forget.") { (Cites, refs.niko_mdl) }
       }
 
       Section proposal(title: "Proposal") {
-        Say: {"[confident] The proposal: take the hierarchy from the Rust project goal and Niko Matsakis's design, unchanged. [short pause] Picture four traits, each a stronger promise. Any value at all. A value that can be moved. One that can be dropped at the end of a scope. And one that can also be forgotten. [pause] Every generic parameter still assumes the strongest by default, so every existing signature means what it does today, and writing a weaker bound opts out, the way a recent RFC does for sized types. The borrow checker enforces it, and since blaze has its own, it can build and test this now, on real code. [curious] The example on the page: a transaction that can't be dropped or forgotten, so it must end in commit or rollback. A transfer function can return early on an error, and on that path the transaction would just be dropped. [firm] So the compiler rejects it."}
         P adopt("Adopt the hierarchy from the Rust 2026 project goal and Niko Matsakis's design, unchanged, in the new edition:") { (Cites, refs.move_goal); (Cites, refs.niko_mdl) }
         Code traits(lang: "rust", text: `trait Forget: Destruct \{}  // can be forgotten: mem::forget, Box::leak
         trait Destruct: Move \{}    // can be dropped implicitly at end of scope
@@ -49,7 +44,6 @@ site {
       }
 
       Section why(title: "Why blaze wants it") {
-        Say: {"[excited] So why does blaze want this? Four reasons. [short pause] Scoped async tasks that borrow from the stack: the handle can't be forgotten, so the join is guaranteed. [short pause] Effects that must be handled: with capabilities, a pending write or an open connection has to be finished, or explicitly abandoned. [short pause] GPU, DMA and foreign resources whose cleanup must run, sometimes with arguments. [short pause] And in-place updates in pure code: a value the compiler knows is unique can be updated in place, which makes cacheable code cheaper."}
         Ul list {
           Li scoped("**Scoped async tasks** that borrow from the stack: the handle cannot be forgotten, so the join is guaranteed.")
           Li effects("**Effects that must be handled.** With [capabilities](/rfcs/capabilities), a pending write or an open connection can be a value that has to be finished or explicitly abandoned, not silently dropped.")
@@ -59,7 +53,6 @@ site {
       }
 
       Section prior(title: "Prior art") {
-        Say: {"[calm] The prior art is on the page, with links. At its heart is the Rust project's own goal and Niko Matsakis's writing, which this RFC adopts. Around it, the earlier RFCs on linear types and forgetting, essays on why this is hard and how editions can carry it, the history of how Rust got here, and other languages: Austral, which pairs linear types with capabilities, linear Haskell, and Perceus."}
         Ul list {
           Li upstream("[[move_goal]], [[move_tracking]], [[niko_mdl]]: the design this RFC adopts.")
           Li rfcs("[[rfc_linear]], [[rfc_forget]], [[rfc_forgettable]], [[rfc_sized]]: the RFCs around it.")
@@ -70,7 +63,6 @@ site {
       }
 
       Section issues(title: "Open issues") {
-        Say: {"[thoughtful] And what's still open? Quite a lot. [short pause] Panics: one between creating such a value and consuming it would drop it. So those functions can't panic, or unwinding gets its own cleanup path, or the code requires abort on panic. [short pause] Reference cycles leak without ever calling forget, so shared pointers need a bound that rules them out. [short pause] Which standard containers should accept these values, since each one that can leak has to be checked. [short pause] Old-edition generic code assumes everything can be forgotten, so it can't take these types until its bounds relax. [short pause] Closures that capture such a value. Futures, where dropping means cancelling, and executors assume they can. [short pause] And the function cache, which copies results, so it must refuse values that can't be copied."}
         Issue unwinding(title: "Panics and unwinding") {
           (Status, Open)
           P q("A panic between creating a `!Destruct` value and consuming it would drop it. Either such functions must not panic (pressure to track panics, see RFC 0001), or unwinding gets a separate cleanup path, or `!Destruct` code requires `panic = abort`.")

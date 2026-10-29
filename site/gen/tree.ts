@@ -9,7 +9,7 @@ import path from 'node:path';
 
 export type Value = Record<string, string | number | boolean>;
 
-/** One entity, as the build reads it to bake HTML into the snapshot (highlighted code, the bench widget). */
+/** One entity, as the build reads it to bake HTML into the snapshot (highlighted code) and find what to generate. */
 export type Node = {
 	/** Full path, dotted: `site.rfcs.capabilities.motivation.why`. */
 	path: string;

@@ -1,3 +1,8 @@
+---
+status: record
+summary: The differential fuzzer and the bugs it found.
+date: 2026-10-20
+---
 # A differential fuzzer for blaze
 
 Every harness before this one runs programs that somebody wrote. This one makes programs up.

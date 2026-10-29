@@ -1,3 +1,8 @@
+---
+status: record
+summary: Linux AArch64 towards production: the gaps closed and left.
+date: 2026-10-20
+---
 # Linux AArch64: towards production
 
 Branch `blaze-aarch64-prod`, cut from `blaze-collate`. This file is kept accurate for the head

@@ -1,3 +1,8 @@
+---
+status: record
+summary: The Rust compiler's 2026 (next solver, Polonius, LLVM 23, polymorphization, cargo's build-dir) and what blaze does about each.
+date: 2026-10-20
+---
 # 2026 in the Rust compiler, and what blaze does about each part
 
 2026-10-20. Source: panstromek, a member of rustc's performance triage,
