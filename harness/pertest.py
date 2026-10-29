@@ -8,12 +8,13 @@ usage: pertest.py INPUT    (INPUT: a JSON object, a file of one, or `-`: {"blaze
 A workspace of two libraries: `t`, whose tests pass, fail with output, panic as they should,
 are ignored, abort the process, sleep when asked, and two that each count a static from zero
 (both pass only when each has a process of its own); and `bare`, a `#![no_std]` library whose
-tests name `std` only in their own module, as `crates/const-ast`'s do. Steps:
+tests name `std` only in their own module, as `crates/const-ast`'s do, with a dev-dependency
+on `t` as const-ast has one (one with none can't build its tests yet, #1530). Steps:
 
 - `blaze test --no-fail-fast` runs every test: each ends as libtest says it would on its own,
   the test that aborts fails alone, the failing test's output is printed with it, and `bare`'s
   tests run.
-- `BLAZE_TEST_TIMEOUT=2` kills a test that sleeps past it, which fails with `timed out`.
+- `BLAZE_TEST_TIMEOUT=2` kills a test that sleeps past it, which fails as `TIMEOUT`.
 - `BLAZE_TEST_PROCESSES=one` runs the tests as libtest's threads in one process, as `cargo
   test` does: one of the two counting tests then fails.
 
@@ -88,7 +89,8 @@ mod tests {
     }
 }
 """,
-    "bare/Cargo.toml": '[package]\nname = "bare"\nversion = "0.1.0"\nedition = "2021"\n',
+    "bare/Cargo.toml": '[package]\nname = "bare"\nversion = "0.1.0"\nedition = "2021"\n\n'
+                       '[dev-dependencies]\nt = { path = "../t" }\n',
     "bare/src/lib.rs": r"""#![no_std]
 
 pub const fn double(x: u32) -> u32 {
@@ -111,7 +113,7 @@ mod tests {
 }
 """,
 }
-RESULT = re.compile(r"^test (\S+) \.\.\. (ok|FAILED|ignored)", re.M)
+RESULT = re.compile(r"^test (\S+) \.\.\. (ok|FAILED|ignored|TIMEOUT)", re.M)
 EVERY = {
     "tests::adds": "ok", "tests::fails": "FAILED", "tests::panics": "ok",
     "tests::ignored": "ignored", "tests::aborts": "FAILED", "tests::sleeps": "ok",
@@ -195,9 +197,9 @@ def main():
         code, out, err = run(ws, env, "-p", "t", "sleeps", BLAZE_TEST_TIMEOUT="2",
                              PERTEST_SLEEP="1")
         verdict = "ok"
-        if code != 101 or results(out).get("tests::sleeps") != "FAILED":
+        if code != 101 or results(out).get("tests::sleeps") != "TIMEOUT":
             verdict = f"ENDED {code}, sleeps {results(out).get('tests::sleeps')}"
-        elif "timed out after 2s" not in out + err:
+        elif "it took more than its 2.0 s" not in out + err:
             verdict = "IT DOES NOT SAY IT TIMED OUT"
         step("BLAZE_TEST_TIMEOUT=2 kills a test past it", verdict, out + err)
 

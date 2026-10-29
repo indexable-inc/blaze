@@ -207,7 +207,7 @@ timeout = 60        # seconds a test may take before it is killed and fails
 
 Any other key there is an error. `BLAZE_TEST_TIMEOUT=<seconds>` gives every test of the command
 a time limit, over the manifest's; there is none by default. A test past its limit is killed
-(`SIGKILL`) and fails with `timed out after <n>s`.
+(`SIGKILL`) and fails as `TIMEOUT`, its output ending `blaze: it took more than its <n> s`.
 
 What does not run this way is an error that says so and how to run the tests as threads, never
 a quiet switch to threads: a harness flag the fork server does not take yet (`--format json`,
