@@ -7,9 +7,9 @@
 use hir_def::{
     AdtId, ConstId, DefWithBodyId, ItemContainerId, Lookup,
     expr_store::{Body, ExpressionStore},
-    hir::{Array, Expr, ExprId, RecordSpread, Statement, UnaryOp},
+    hir::{Array, Expr, ExprId, RecordLitField, RecordSpread, Statement, UnaryOp},
     resolver::{HasResolver, ValueNs},
-    signatures::ImplSignature,
+    signatures::{ImplSignature, VariantFields},
 };
 use std::cell::RefCell;
 
@@ -107,7 +107,7 @@ impl<'db> ValueCx<'_, 'db> {
                 if self.infer.variant_resolution_for_expr(expr).is_some()
                     && !matches!(ty.kind(), TyKind::FnDef(..))
                 {
-                    return self.aggregate(ty, &[], depth);
+                    return self.aggregate(ty, Qualifs::default);
                 }
                 let of_ty = self.of_ty(ty);
                 match self.const_item(expr) {
@@ -119,23 +119,29 @@ impl<'db> ValueCx<'_, 'db> {
                 exprs.iter().fold(Qualifs::default(), |acc, &it| acc.or(self.value(it, depth + 1)))
             }
             &Expr::Array(Array::Repeat { initializer, .. }) => self.value(initializer, depth + 1),
-            // The fields a spread fills are copied out of its base, so the base's qualifs bound
-            // theirs.
             Expr::RecordLit { fields, spread, .. }
                 if !matches!(spread, RecordSpread::FieldDefaults) =>
             {
-                let mut parts: Vec<_> = fields.iter().map(|it| it.expr).collect();
-                if let RecordSpread::Expr(base) = *spread {
-                    parts.push(base);
-                }
-                self.aggregate(ty, &parts, depth)
+                self.aggregate(ty, || {
+                    let written = fields.iter().map(|it| it.expr);
+                    let parts = self.parts(written, depth);
+                    match *spread {
+                        RecordSpread::Expr(base) => {
+                            parts.or(self.spread(expr, ty, fields, base, depth))
+                        }
+                        _ => parts,
+                    }
+                })
             }
             Expr::Call { callee, args }
                 if matches!(self.infer.expr_ty(*callee).kind(), TyKind::FnDef(def, _)
                     if !matches!(def.0, hir_def::CallableDefId::FunctionId(_))) =>
             {
-                self.aggregate(ty, args, depth)
+                self.aggregate(ty, || self.parts(args.iter().copied(), depth))
             }
+            // A `const { .. }` block's value is inferred and stored in this body; its qualifs
+            // are its value's, as rustc's `mir_const_qualif` of the anonymous const.
+            &Expr::Const(inner) => self.value(inner, depth + 1),
             &Expr::Ref { expr: inner, .. } => self.borrowed(inner, depth + 1),
             &Expr::Cast { expr: inner, .. }
             | &Expr::UnaryOp { expr: inner, op: UnaryOp::Not | UnaryOp::Neg } => {
@@ -162,9 +168,7 @@ impl<'db> ValueCx<'_, 'db> {
     /// rustc's `Rvalue::Aggregate`: a struct or variant is made of its fields unless it is
     /// a union, or its type has a `Drop` impl (for `NeedsDrop`) or is `UnsafeCell` (for
     /// `HasMutInterior`), which have what any value of the type has.
-    fn aggregate(&self, ty: Ty<'db>, parts: &[ExprId], depth: usize) -> Qualifs {
-        let parts =
-            || parts.iter().fold(Qualifs::default(), |acc, &it| acc.or(self.value(it, depth + 1)));
+    fn aggregate(&self, ty: Ty<'db>, parts: impl FnOnce() -> Qualifs) -> Qualifs {
         let TyKind::Adt(def, _) = ty.kind() else { return parts() };
         let id = def.def_id();
         if matches!(id, AdtId::UnionId(_)) {
@@ -181,6 +185,43 @@ impl<'db> ValueCx<'_, 'db> {
         Qualifs {
             needs_drop: if has_dtor { of_ty.needs_drop } else { parts.needs_drop },
             mut_interior: if unsafe_cell { of_ty.mut_interior } else { parts.mut_interior },
+        }
+    }
+
+    fn parts(&self, exprs: impl Iterator<Item = ExprId>, depth: usize) -> Qualifs {
+        exprs.fold(Qualifs::default(), |acc, it| acc.or(self.value(it, depth + 1)))
+    }
+
+    /// What the fields `..base` fills give a record literal: rustc copies each out of a
+    /// temporary holding the base, `copy _t.f`, which has what its field's type can have of
+    /// the base's qualifs (`in_place`), so a cell in a field the literal writes is not one
+    /// of the value's. The temporary itself is promoted only if it needs no drop
+    /// (`validate_local`), whichever fields are copied.
+    fn spread(
+        &self,
+        lit: ExprId,
+        ty: Ty<'db>,
+        written: &[RecordLitField],
+        base: ExprId,
+        depth: usize,
+    ) -> Qualifs {
+        let of_base = self.value(base, depth + 1);
+        let (Some(variant), TyKind::Adt(_, args)) =
+            (self.infer.variant_resolution_for_expr(lit), ty.kind())
+        else {
+            return of_base;
+        };
+        let fields = VariantFields::of(self.db, variant);
+        let written: Vec<_> = written.iter().filter_map(|it| fields.field(&it.name)).collect();
+        let mut_interior = self.db.field_types(variant).iter().any(|(field, it)| {
+            !written.contains(&field) && {
+                let ty = it.ty().instantiate(self.infcx.interner, args).skip_norm_wip();
+                self.of_ty(ty).mut_interior
+            }
+        });
+        Qualifs {
+            needs_drop: of_base.needs_drop,
+            mut_interior: mut_interior && of_base.mut_interior,
         }
     }
 

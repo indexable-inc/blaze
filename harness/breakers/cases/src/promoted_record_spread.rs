@@ -33,6 +33,32 @@ fn all_default<'a>() -> &'a Migrator {
     &Migrator { ..Migrator::DEFAULT }
 }
 
+/// A cell only in the field the literal writes is not copied out of the base.
+#[derive(Debug)]
+pub enum MaybeCell {
+    Empty,
+    Full(std::cell::Cell<u32>),
+}
+
+#[derive(Debug)]
+pub struct State {
+    pub state: MaybeCell,
+    pub n: u32,
+}
+
+const FULL: State = State { state: MaybeCell::Full(std::cell::Cell::new(0)), n: 7 };
+
+#[inline(never)]
+fn cell_overwritten() -> &'static State {
+    &State { state: MaybeCell::Empty, ..FULL }
+}
+
+/// A const block has its value's qualifs, not its type's.
+#[inline(never)]
+fn none() -> &'static Option<Box<u8>> {
+    &(const { None::<Box<u8>> })
+}
+
 #[inline(never)]
 fn overwritten() -> u64 {
     std::hint::black_box([u64::MAX; 64]).iter().fold(0, |sum, it| sum ^ it)
@@ -40,6 +66,7 @@ fn overwritten() -> u64 {
 
 pub fn run() -> String {
     let (migrator, all_default) = (migrator(), all_default());
+    let (state, none) = (cell_overwritten(), none());
     let sum = overwritten();
-    format!("{migrator:?} {all_default:?} {sum}")
+    format!("{migrator:?} {all_default:?} {state:?} {none:?} {sum}")
 }
