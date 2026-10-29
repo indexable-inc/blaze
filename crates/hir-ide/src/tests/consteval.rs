@@ -3267,6 +3267,27 @@ fn memory_limit() {
 }
 
 #[test]
+fn inline_const_in_a_loop_is_evaluated_once() {
+    // 3000 copies of the block's 512 KiB would be past the default 1 GiB.
+    check_number(
+        r#"
+    const fn f() -> usize {
+        let mut i = 0;
+        let mut sum = 0;
+        while i < 3000 {
+            let a = const { [1u8; 1 << 19] };
+            sum += a[i] as usize;
+            i += 1;
+        }
+        sum
+    }
+    const GOAL: usize = f();
+    "#,
+        3000,
+    );
+}
+
+#[test]
 fn type_error() {
     check_fail(
         r#"
