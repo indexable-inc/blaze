@@ -443,9 +443,10 @@ impl Checkout {
             false => (plan.binary.display().to_string(), String::new()),
         };
         // A shared library is linked again for each build, not patched: see [`Plan::shared`].
-        let (shared, patch) = match plan.shared {
-            true => ("shared", String::new()),
-            false => ("", plan.patch.display().to_string()),
+        let (shared, patch) = match (plan.shared, plan.staticlib) {
+            (true, true) => ("staticlib", String::new()),
+            (true, false) => ("shared", String::new()),
+            (false, _) => ("", plan.patch.display().to_string()),
         };
         let unit_test = if plan.unit_test { super::plan::UNIT_TEST } else { "" };
         let mut line = format!(
@@ -570,6 +571,9 @@ impl Worker {
         }
         if first.shared {
             args.push("--shared".into());
+        }
+        if first.staticlib {
+            args.push("--staticlib".into());
         }
         if first.unit_test {
             args.push("--unit-test".into());

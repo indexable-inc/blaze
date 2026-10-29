@@ -136,8 +136,8 @@ build, which says which and why; nothing is handed to cargo or rustc:
 What blaze does not build yet fails the same way, saying what: the targets `--bins`,
 `--examples`, `--tests`, `--benches` and `--all-targets` pick, several `--target`s,
 `--target-dir`, `--message-format`, `-Z`, and `--build-plan` and `--unit-graph`, and a
-library whose crate types include `staticlib` or `dylib` when the build would write it (a
-plain `build`, or `--lib`): blaze does not link one yet, and says which
+library whose crate types include `dylib` when the build would write it (a plain `build`,
+or `--lib`): blaze does not link one yet, and says which
 ([#262](https://github.com/indexable-inc/blaze/issues/262)). A library's `cdylib` (a native
 Node addon, a Python extension, a plugin) is a program of the build: a plain `build` or
 `--lib` links it as a shared library at cargo's path (`target/debug/lib<name>.so`, `.dylib`
@@ -146,7 +146,14 @@ names with `#[no_mangle]` or `#[export_name]` and nothing else, with the package
 `cargo:rustc-link-arg` and `cargo:rustc-cdylib-link-arg`. Each build after an edit compiles
 what changed on what the worker loaded and links the library again; it is not spliced, so an
 exported function an edit adds is exported. A host that loaded the library (node, python)
-loads it again to see the edit. A build of other libraries alone (`--lib`, or a workspace with
+loads it again to see the edit. A library's `staticlib` (dynamo's C API) is built as its
+`cdylib` would be, and that shared library is linked beside it, which leaves out what its
+exports do not reach: a function blaze cannot compile that they reach fails the build. It is
+written at cargo's path (`target/debug/lib<name>.a`), and holds blaze's objects of what the
+exports reach, the standard library's object, and, as rustc bundles them, the members of each static
+native library the crates link (a build script's `rustc-link-lib=static=`, a `#[link]` of
+`kind = "static"`) but one that says `-bundle`. What they link shared is for the program that
+links the archive to name, as with rustc's. A build of other libraries alone (`--lib`, or a workspace with
 no program) is the daemon's check of them: blaze writes no `rlib` for cargo, and says what it
 finds.
 

@@ -63,6 +63,12 @@ pub struct Plan {
     /// exported static, and the splice reads no Mach-O library.
     #[serde(default)]
     pub shared: bool,
+    /// Whether `binary` is the archive of a `staticlib`, with `shared`: what a `cdylib` of the
+    /// library exports, and what it reaches, built as for one, archived with the standard
+    /// library's object and the static native libraries the crates ask for, as rustc's
+    /// `staticlib` bundles them.
+    #[serde(default)]
+    pub staticlib: bool,
 }
 
 /// What a request to a worker says of a program that is the unit tests of its target
