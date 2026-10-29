@@ -6,15 +6,10 @@ site {
     Icon: {"terminal"}
     (InGroup, nav.reference)
     Description: {"Using blaze day to day: cargo's commands, rebuild on save, plain cargo through blaze, live edits, and what works yet."}
-    Intro: {"[warm] Using blaze, day to day. If you know cargo, you mostly know this already."}
-    Outro: {"[warm] So: blaze wherever you'd type cargo, a daemon that keeps your project compiled, and a clear error whenever blaze can't do something yet. Thanks for listening."}
 
-    Lede lede("Type `blaze` wherever you'd type `cargo`. Not installed yet: [Install](/install). Every command and setting in detail: [cargo.md](https://github.com/indexable-inc/blaze/blob/main/docs/cargo.md).") {
-      Say: {"[warm] The short version: type blaze wherever you'd type cargo. If it's not installed yet, the install page is one step back."}
-    }
+    Lede lede("Type `blaze` wherever you'd type `cargo`. Not installed yet: [Install](/install). Every command and setting in detail: [cargo.md](https://github.com/indexable-inc/blaze/blob/main/docs/cargo.md).")
 
     Section project(title: "Use it on your project") {
-      Say: {"[curious] Here's what happens the first time. Go to your project and run blaze build. The first build starts a background process, the daemon, which loads your project and compiles every crate of it from source, without cargo build. That first one takes a while. [pause] [excited] From then on, an edit builds in hundredths of a second, and the finished line says R A jit, meaning blaze built it. The program lands where cargo would have put it. [short pause] Build, run, test and check all take cargo's flags and do what cargo's do. Status shows what the daemon has loaded, and stop stops it; it also stops itself after half an hour without a build."}
       Code build(lang: "bash", text: `cd my-project
         blaze build`)
       P daemon("The first build starts a background process, the daemon, which loads your project and compiles every crate of it from source; no `cargo build` runs. From then on, an edit builds like this:")
@@ -31,12 +26,10 @@ site {
     }
 
     Section watch(title: "Rebuild on every save") {
-      Say: {"[matter-of-fact] blaze has no watch mode of its own, and doesn't need one: any file watcher can run it. With watchexec, for example, you rebuild on every save of a Rust file."}
       Code watchexec(lang: "bash", text: "watchexec -e rs -- blaze build")
     }
 
     Section live(title: "Change a running program") {
-      Say: {"[warm] Now the fun part: changing a program while it runs. Add the live edits crate, start a live handle once, and poll it every frame. Run your program with blaze run, and in another terminal build after each edit. The next poll swaps in the functions that changed, usually in under a millisecond, and keeps the program's state. [short pause] An edit that changes a type the program is holding, like a struct's fields, can't apply to data that already exists, so the poll asks for a restart instead. [calm] It works on macOS on Apple silicon; Linux and Windows support comes with the next release."}
       Code dep(lang: "toml", text: `[dependencies]
         blaze-live = "0.1"`)
       Code poll(lang: "rust", text: `let mut live = blaze_live::Live::start().ok();
@@ -51,7 +44,6 @@ site {
     }
 
     Section limits(title: "What works and what doesn't yet") {
-      Say: {"[straightforward] And what works, and what doesn't yet. [short pause] Platforms: macOS on Apple silicon and Linux on x86 and ARM are measured; Windows builds too, run by hand. Intel Macs aren't supported. [short pause] One Rust version: blaze's pinned nightly, whatever the project pins. [short pause] Not everything builds yet, and when it doesn't, you get the reason, never a quiet hand-off to cargo. [short pause] The borrow checker is blaze's own and still misses some errors, so keep cargo check or your CI as the final word. [short pause] It trades memory and disk for speed. [warm] And it's young: if a program behaves differently under blaze, that's a bug, and an issue is welcome."}
       Ul list {
         Li platforms("**Platforms.** macOS on Apple silicon, Linux x86-64 and Linux ARM64 are measured ([benchmarks](/bench)). Windows x86-64 (MSVC) builds and takes live edits through blaze too, run by hand and not in CI. Intel Macs are not supported.")
         Li toolchain("**One Rust version, the latest nightly.** blaze builds with the dated nightly it pins, whatever toolchain the project pins. Stable code and `#![feature(...)]` code both build; code that needs what that nightly lacks fails with rustc's error.")

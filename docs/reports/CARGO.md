@@ -1,3 +1,8 @@
+---
+status: record
+summary: Using blaze with cargo, as of the early daemon.
+date: 2026-10-20
+---
 # Using blaze with cargo
 
 blaze is a daemon that keeps your Rust workspaces compiled in memory. After an edit it

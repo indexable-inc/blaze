@@ -1,5 +1,6 @@
-//! What a crate of a checkout is, by what is written in it: two checkouts with the same
-//! sources have the same crate, and what was compiled for one is the code of the other.
+//! What a crate of a checkout is, by what is written in it and the identity it is built
+//! with: two checkouts with the same sources and identities have the same crate, and what
+//! was compiled for one is the code of the other.
 
 pub(crate) use blaze_cargo::content::hex;
 
@@ -113,7 +114,13 @@ impl Contents {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"blaze crate 3");
+        field(b"blaze crate 4");
+        // The crate's identity is in what is compiled of it (a `TypeId` of one of its types),
+        // so code stored for it is of that identity alone, whatever its sources are.
+        match stable_crate_id(krate) {
+            Some(id) => field(&id.to_le_bytes()),
+            None => field(&[]),
+        }
         let name = krate.extra_data(db).display_name.as_ref().map(|it| it.to_string());
         field(name.unwrap_or_default().as_bytes());
         field(format!("{:?} {}", data.edition, data.target_kind.is_proc_macro()).as_bytes());

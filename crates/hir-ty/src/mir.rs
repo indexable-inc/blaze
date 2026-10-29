@@ -1553,6 +1553,40 @@ impl MirBody<'_> {
         self.param_locals.iter().copied().chain(self.upvars_in_place.iter().map(|it| it.0))
     }
 
+    /// Receives the final tuple of a monomorphized `extern "rust-call"` body as individual
+    /// parameters, as rustc's ABI passes it (`untuple_args`). The body still uses its tuple,
+    /// assembled once on entry. Says false when the last parameter is not a tuple.
+    pub fn spread_rust_call_tuple(&mut self) -> bool {
+        let Some(&tuple) = self.param_locals.last() else { return false };
+        let ty = self.locals[tuple].ty.as_ref();
+        let TyKind::Tuple(fields) = ty.kind() else { return false };
+        self.param_locals.pop();
+        let operands = fields
+            .iter()
+            .map(|field| {
+                let local = self.locals.alloc(Local { ty: field.store() });
+                self.param_locals.push(local);
+                Operand { kind: OperandKind::Move(Place::from(local).store()), span: None }
+            })
+            .collect();
+        let span = MirSpan::Unknown;
+        self.start_block = self.basic_blocks.alloc(BasicBlock {
+            statements: vec![Statement {
+                kind: StatementKind::Assign(
+                    Place::from(tuple).store(),
+                    Rvalue::Aggregate(AggregateKind::Tuple(ty.store()), operands),
+                ),
+                span,
+            }],
+            terminator: Some(Terminator {
+                span,
+                kind: TerminatorKind::Goto { target: self.start_block },
+            }),
+            is_cleanup: false,
+        });
+        true
+    }
+
     pub fn local_to_binding_map(&self) -> ArenaMap<LocalId, BindingId> {
         self.binding_locals.iter().map(|(it, y)| (*y, it)).collect()
     }

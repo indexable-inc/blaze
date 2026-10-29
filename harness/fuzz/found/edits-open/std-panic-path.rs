@@ -1,6 +1,6 @@
 // Found by edits.py: seed E5-15-s9-cranelift, edition 2021, backend cranelift.
 // The edit (regen.constants): c5 from constants
-// Again: edits.py check ../edits-open/std-panic-path.rs (open, see FUZZ.md)
+// Again: edits.py check '{"files": ["../edits-open/std-panic-path.rs"]}' (open, see FUZZ.md)
 // differs in c5: panic location
 // rustc:
 // panic: panicked at /home/ubuntu/.rustup/toolchains/1.99.0-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/num/mod.rs:1290:5:

@@ -310,6 +310,64 @@ pub fn build_described(
 /// toolchain, and the first field of each: what a build is made of is in its key.
 const BUILDS: &str = "build script and proc macro builds 1";
 
+/// Build-script output can be included by an expression that the dep-info does not list.
+/// Key both the local freshness stamp and the store lookup by the files below every
+/// described crate's OUT_DIR. In particular, rebuilding a proc macro must not retrieve the
+/// old module from the store after its generated constant changed.
+pub fn generated_fingerprint(described: &str) -> Result<[u8; 32], String> {
+    fn walk(
+        dir: &Path,
+        files: &mut Vec<PathBuf>,
+        visiting: &mut std::collections::BTreeSet<PathBuf>,
+    ) -> std::io::Result<()> {
+        let real = std::fs::canonicalize(dir)?;
+        if !visiting.insert(real.clone()) {
+            return Err(std::io::Error::other(format!(
+                "cyclic output directory {}",
+                dir.display()
+            )));
+        }
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            let metadata = std::fs::metadata(&path)?;
+            if metadata.is_dir() {
+                walk(&path, files, visiting)?;
+            } else if metadata.is_file() {
+                files.push(path);
+            } else {
+                return Err(std::io::Error::other(format!(
+                    "output {} is not a regular file",
+                    path.display()
+                )));
+            }
+        }
+        visiting.remove(&real);
+        Ok(())
+    }
+    let mut key = keyed::Key::new("generated compile-time inputs 1");
+    let described: serde_json::Value = serde_json::from_str(described)
+        .map_err(|why| format!("reading the compile-time description: {why}"))?;
+    let crates =
+        described["crates"].as_array().ok_or("the compile-time description has no crates")?;
+    for krate in crates {
+        let Some(out) = krate["env"].get("OUT_DIR") else { continue };
+        let out = out.as_str().ok_or("a compile-time crate has a non-string OUT_DIR")?;
+        let out = Path::new(out);
+        let mut files = Vec::new();
+        walk(out, &mut files, &mut std::collections::BTreeSet::new())
+            .map_err(|why| format!("reading build-script output {}: {why}", out.display()))?;
+        files.sort();
+        key.field(out.as_os_str().as_encoded_bytes());
+        for file in files {
+            let bytes = std::fs::read(&file)
+                .map_err(|why| format!("reading generated input {}: {why}", file.display()))?;
+            let relative = file.strip_prefix(out).map_err(|why| why.to_string())?;
+            key.field(relative.as_os_str().as_encoded_bytes()).field(&bytes);
+        }
+    }
+    Ok(key.done())
+}
+
 /// The file beside a build script blaze built that names what it was built from: the key
 /// of its build ([`keyed`]) and the digest of the executable, by a space. A run of the script
 /// is keyed by it (`script.rs`), not by the executable, whose bytes depend on what the store
@@ -359,6 +417,7 @@ fn built(
     if made.wasm {
         first.field(super::own_macro::MODULE_CFG.as_bytes());
     }
+    first.field(&generated_fingerprint(described)?);
     let first = first.done();
     let store = store();
     let found = store.and_then(|it| keyed::find(it, &first, &keyed::digest));
@@ -770,6 +829,27 @@ fn described(krate: &Described, member: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_compile_time_inputs_are_keyed_by_names_and_contents() {
+        let root = std::env::temp_dir().join(format!("blaze-generated-key-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        let description = json!({"crates": [{"env": {"OUT_DIR": root}}]}).to_string();
+        let key = || generated_fingerprint(&description).unwrap();
+        let file = root.join("nested/version.expr");
+        std::fs::write(&file, "7").unwrap();
+        let seven = key();
+        std::fs::write(&file, "7").unwrap();
+        assert_eq!(key(), seven, "an unchanged output rewritten by a script");
+        std::fs::write(&file, "9").unwrap();
+        assert_ne!(key(), seven, "an expression include missing from the dep-info changed");
+        std::fs::write(&file, "7").unwrap();
+        assert_eq!(key(), seven, "restoring generated contents can reuse the old build");
+        std::fs::rename(&file, root.join("nested/renamed.expr")).unwrap();
+        assert_ne!(key(), seven, "the generated file was renamed");
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(generated_fingerprint(&description).is_err(), "a missing OUT_DIR is an error");
+    }
 
     /// `mime_guess`'s build script sets `MIME_TYPES_GENERATED_PATH`, which its source reads with
     /// `env!`: the crate is described with it, from the script's output in either of cargo's

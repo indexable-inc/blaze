@@ -390,7 +390,8 @@ pub fn for_tool(plan: &Plan, env: Vec<(String, String)>, cwd: &Path, scratch: &P
 /// Whether the variable `name` of cargo's environment is given to a build script in the
 /// sandbox: cargo's own for scripts (`CARGO_*`, `DEP_*`, `OUT_DIR`, `TARGET`, the profile's),
 /// the toolchain's and blaze's (blaze is the `RUSTC` a script runs), the C compiler's, its
-/// tools' and their flags, by any target (`CC`, `CC_<target>`, `TARGET_CC`), pkg-config's and
+/// tools' and their flags, by any target (`CC`, `CC_<target>`, `TARGET_CC`), the libclang
+/// bindgen loads and its arguments (`LIBCLANG_PATH`, `BINDGEN_EXTRA_CLANG_ARGS`), pkg-config's and
 /// CMake's, the SDKs' of Apple's platforms, Nix's compiler wrappers', the jobserver, and what
 /// a test is given ([`sandboxed::KEPT`]).
 pub fn given(name: &str) -> bool {
@@ -437,7 +438,7 @@ pub fn given(name: &str) -> bool {
         "COMPILER_PATH",
         "GCC_EXEC_PREFIX",
     ];
-    const TOOLS: [&str; 20] = [
+    const TOOLS: [&str; 25] = [
         "CC",
         "CXX",
         "CPP",
@@ -458,6 +459,12 @@ pub fn given(name: &str) -> bool {
         "ARFLAGS",
         "ASFLAGS",
         "RANLIBFLAGS",
+        // clang-sys's, which finds the libclang bindgen loads, and bindgen's own.
+        "LIBCLANG_PATH",
+        "LIBCLANG_STATIC_PATH",
+        "LLVM_CONFIG_PATH",
+        "CLANG_PATH",
+        "BINDGEN_EXTRA_CLANG_ARGS",
     ];
     let tool = |it: &&str| {
         name.strip_prefix(*it).is_some_and(|rest| rest.is_empty() || rest.starts_with('_'))
@@ -810,6 +817,12 @@ mod tests {
             assert!(given(name), "{name}");
         }
         for name in ["PATH", "PKG_CONFIG_PATH", "SOURCE_DATE_EPOCH", "MACOSX_DEPLOYMENT_TARGET"] {
+            assert!(given(name), "{name}");
+        }
+        // What nixpkgs' bindgenHook sets (flox's GSSAPI bindings): without it clang-sys finds
+        // the machine's libclang, which a script linked against Nix's glibc can't load.
+        for name in ["LIBCLANG_PATH", "BINDGEN_EXTRA_CLANG_ARGS", "BINDGEN_EXTRA_CLANG_ARGS_x86_64"]
+        {
             assert!(given(name), "{name}");
         }
         for name in ["OPENSSL_DIR", "CCACHE", "RUSTC_WRAPPER", "NIX_BUILD_TOP", "SSH_AUTH_SOCK"] {

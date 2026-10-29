@@ -32,6 +32,11 @@ use crate::remote::{self, Https, Traffic};
 /// The variable that names the library's directory to a process blaze starts.
 pub const VAR: &str = "BLAZE_LIBRARY";
 
+/// The variable that names where [`fetch`] gets the library from in place of the checkout or
+/// the release: a release's address or a directory with its `library-<digest>.tar.xz`, or a
+/// library to copy.
+const FROM_VAR: &str = "BLAZE_LIBRARY_FROM";
+
 /// The file of the library that has its digest, and is not part of what it is a digest of.
 const DIGEST_FILE: &str = "DIGEST";
 
@@ -169,10 +174,10 @@ fn short() -> &'static str {
     &digest()[..digest().len().min(12)]
 }
 
-/// [`found`], else blaze's own copy, made in `~/.blaze/library` once: copied from the checkout
-/// this blaze was built in while it has the same library, else downloaded from the release this
-/// blaze is (the tag of its version, `v0.YYYYMMDD.N`). `Err` says what
-/// failed and what to do.
+/// [`found`], else blaze's own copy, made in `~/.blaze/library` once: from where [`FROM_VAR`]
+/// names, else copied from the checkout this blaze was built in while it has the same library,
+/// else downloaded from the release this blaze is (the tag of its version, `v0.YYYYMMDD.N`).
+/// `Err` says what failed and what to do.
 pub fn fetch() -> Result<Library, String> {
     if let Ok(found) = found() {
         return Ok(found.clone());
@@ -182,10 +187,10 @@ pub fn fetch() -> Result<Library, String> {
          home directory: `BLAZE_HOME` names where to keep it"
             .to_owned()
     })?;
-    let given = std::env::var("BLAZE_LIBRARY_FROM").ok().filter(|it| !it.is_empty());
-    let from = match (Library::ours_at(checkout()), given) {
-        (Some(_), _) => checkout().to_string_lossy().into_owned(),
-        (None, Some(given)) => given,
+    let given = std::env::var(FROM_VAR).ok().filter(|it| !it.is_empty());
+    let from = match (given, Library::ours_at(checkout())) {
+        (Some(given), _) => given,
+        (None, Some(_)) => checkout().to_string_lossy().into_owned(),
         // The release this blaze is: its version, which only the engine's build.rs knows
         // (`BLAZE_RELEASE`), so that no release changes this crate.
         (None, None) => format!("{RELEASES}/v{}", crate::engine::get().version),

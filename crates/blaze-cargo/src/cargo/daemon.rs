@@ -44,6 +44,11 @@ const SETTLE: Duration = Duration::from_secs(60);
 /// How often the daemon looks for what is idle.
 const TICK: Duration = Duration::from_secs(1);
 
+/// How long a worker whose first build compiled from cold goes unasked before the daemon
+/// starts one from the store in its place ([`Daemon::settle`]): builds asked while it does
+/// wait for the new one to load.
+const SETTLE_AFTER: Duration = Duration::from_secs(10);
+
 /// How many checkers the daemon keeps loaded, each of another build: a check for several
 /// targets, or checks of several workspaces in turn.
 const CHECKERS: usize = 4;
@@ -139,6 +144,13 @@ pub fn errors_beside(socket: &Path) -> PathBuf {
     socket.with_file_name("errors")
 }
 
+/// The file a worker that listens at `socket` writes once its first build compiled from
+/// cold and the store has all of it: a worker started now would load it from the store, and
+/// hold what a warm start holds.
+pub fn settles_beside(socket: &Path) -> PathBuf {
+    socket.with_file_name("settles")
+}
+
 /// What the daemon reads of a request of a blaze from before the frames, which sent JSON:
 /// whether it starts a daemon of its own.
 #[derive(Deserialize)]
@@ -177,6 +189,8 @@ pub enum Request {
         subscribe: Subscribe,
         follow: bool,
     },
+    /// Where the build page is (docs/web.md), its server started if it is not yet.
+    Ui,
 }
 
 impl Request {
@@ -226,6 +240,8 @@ pub enum Reply {
     /// The records of a [`Request::Watch`] that does not follow; one that does was sent them
     /// as they came.
     Watched(Vec<Record>),
+    /// Where the build page is, or why it is not served.
+    Ui(Result<String, String>),
 }
 
 /// Why the worker did not build a program.
@@ -439,9 +455,10 @@ impl Checkout {
             false => (plan.binary.display().to_string(), String::new()),
         };
         // A shared library is linked again for each build, not patched: see [`Plan::shared`].
-        let (shared, patch) = match plan.shared {
-            true => ("shared", String::new()),
-            false => ("", plan.patch.display().to_string()),
+        let (shared, patch) = match (plan.shared, plan.staticlib) {
+            (true, true) => ("staticlib", String::new()),
+            (true, false) => ("shared", String::new()),
+            (false, _) => ("", plan.patch.display().to_string()),
         };
         let unit_test = if plan.unit_test { super::plan::UNIT_TEST } else { "" };
         let mut line = format!(
@@ -487,6 +504,8 @@ struct Loaded {
     generation: u128,
     root: PathBuf,
     warmth: Warmth,
+    /// What it was loaded with, which a worker started in its place loads.
+    checkout: Checkout,
 }
 
 /// A `blaze <project> --socket` process and the checkouts it holds.
@@ -501,6 +520,8 @@ struct Worker {
     answering: AtomicUsize,
     /// Whether the daemon's log says it ended: it says so once.
     noted: AtomicBool,
+    /// Whether it was started in place of one that built from cold: it is not swapped again.
+    settled: bool,
 }
 
 /// Counts a request among those a worker is answering for as long as it lives, also when the
@@ -520,6 +541,16 @@ impl Drop for Answering<'_> {
     }
 }
 
+/// A checker a check has, counted among those it is answering ([`Daemon::checker`]) until
+/// this is dropped.
+struct Answers(Arc<Checker>);
+
+impl Drop for Answers {
+    fn drop(&mut self) {
+        self.0.answering.fetch_sub(1, Relaxed);
+    }
+}
+
 impl Worker {
     /// Starts a worker on the first program of `checkout`, with its files in `dir`.
     /// `spare` is a process that waits to be told a build, and is told this one.
@@ -531,6 +562,7 @@ impl Worker {
         // is not the one to connect to.
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_file(errors_beside(&socket));
+        let _ = std::fs::remove_file(settles_beside(&socket));
         blaze_protocol::follow::forget_beside(&socket);
         let config = &checkout.config;
         let mut args = config.args(&checkout.root, &first.crates);
@@ -556,6 +588,9 @@ impl Worker {
         }
         if first.shared {
             args.push("--shared".into());
+        }
+        if first.staticlib {
+            args.push("--staticlib".into());
         }
         if first.unit_test {
             args.push("--unit-test".into());
@@ -609,6 +644,7 @@ impl Worker {
             generation: checkout.generation,
             root: checkout.root.clone(),
             warmth: Warmth::Loading(Instant::now()),
+            checkout: checkout.clone(),
         };
         Ok(Worker {
             project: checkout.project(),
@@ -619,6 +655,7 @@ impl Worker {
             asked: Mutex::new(Instant::now()),
             answering: AtomicUsize::new(0),
             noted: AtomicBool::new(false),
+            settled: false,
         })
     }
 
@@ -966,11 +1003,18 @@ impl Spare {
 struct Checker {
     /// The [`WorkerConfig::id`] it was started with.
     id: String,
-    child: Child,
+    child: Mutex<Child>,
     socket: PathBuf,
     log: PathBuf,
     project: PathBuf,
-    asked: Instant,
+    asked: Mutex<Instant>,
+    /// The checks that have it now, asking or waiting to: it is not made way for meanwhile.
+    answering: AtomicUsize,
+    /// Held for the whole of an ask. The process answers one request at a time, and the one
+    /// that has it load again ends it, with what was sent behind that unread.
+    asking: Mutex<()>,
+    /// Stopped: a check that waited for [`Self::asking`] asks a new one.
+    stopped: AtomicBool,
 }
 
 impl Checker {
@@ -997,23 +1041,30 @@ impl Checker {
         command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
         own_group(&mut command);
         let child = command.spawn().context("starting a checker")?;
-        Ok(Checker {
-            id: id.to_owned(),
-            child,
-            socket,
-            log,
-            project: ahead.root.join(&ahead.config.project),
-            asked: Instant::now(),
-        })
+        Ok(Checker::of(id, child, socket, log, ahead.root.join(&ahead.config.project)))
     }
 
-    fn ended(&mut self) -> Option<String> {
-        exited(&mut self.child)
+    fn of(id: &str, child: Child, socket: PathBuf, log: PathBuf, project: PathBuf) -> Checker {
+        Checker {
+            id: id.to_owned(),
+            child: Mutex::new(child),
+            socket,
+            log,
+            project,
+            asked: Mutex::new(Instant::now()),
+            answering: AtomicUsize::new(0),
+            asking: Mutex::new(()),
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    fn ended(&self) -> Option<String> {
+        exited(&mut lock(&self.child))
     }
 
     /// Its answer: `ok`, the errors, or [`crate::check::RELOAD`]. Waits for it to have loaded
-    /// the workspace and to listen.
-    fn ask(&mut self, request: &str) -> anyhow::Result<String> {
+    /// the workspace and to listen. The caller holds [`Self::asking`].
+    fn ask(&self, request: &str) -> anyhow::Result<String> {
         let mut stream = loop {
             match socket::connect(&self.socket) {
                 Ok(stream) => break stream,
@@ -1039,8 +1090,8 @@ impl Checker {
         }
     }
 
-    fn status(&mut self) -> WorkerStatus {
-        let pid = self.child.id();
+    fn status(&self) -> WorkerStatus {
+        let pid = lock(&self.child).id();
         WorkerStatus {
             pid,
             project: self.project.clone(),
@@ -1050,8 +1101,9 @@ impl Checker {
         }
     }
 
-    fn stop(&mut self) {
-        kill(&mut self.child);
+    fn stop(&self) {
+        self.stopped.store(true, Relaxed);
+        kill(&mut lock(&self.child));
         let _ = std::fs::remove_file(&self.socket);
     }
 }
@@ -1091,11 +1143,15 @@ struct Daemon {
     /// How many spare workers were started: each has a directory of its own.
     spares: AtomicUsize,
     /// The checkers of the last [`Request::Check`]s, each of another build and loaded for
-    /// the next check of it: a check for several targets asks one for each.
-    checkers: Mutex<Vec<Checker>>,
-    asked: Mutex<Instant>,
+    /// the next check of it: a check for several targets asks one for each. Held only to
+    /// find, add or drop one, never for an ask, which can wait for a whole load: nothing
+    /// else (another workspace's check, `blaze status`, the daemon's end) waits for that.
+    checkers: Mutex<Vec<Arc<Checker>>>,
+    asked: Arc<Mutex<Instant>>,
     watched: Arc<Mutex<Watched>>,
     relays: Arc<Relays>,
+    /// Where the build page is, once a `blaze ui` started its server ([`Request::Ui`]).
+    ui: Mutex<Option<String>>,
 }
 
 /// The records of the builds under way and of the last of each workspace, for the commands
@@ -1107,6 +1163,8 @@ struct Watched {
     builds: u64,
     watching: Vec<Watching>,
     watchers: Vec<Watcher>,
+    /// The graph of each workspace's functions, for the build page.
+    graphs: Arc<blaze_web::Graphs>,
 }
 
 struct Watching {
@@ -1151,6 +1209,7 @@ impl Watched {
 
     fn record(&mut self, build: u64, record: &Record) {
         let Some(watching) = self.watching.iter_mut().find(|it| it.build == build) else { return };
+        self.graphs.record(&watching.root, build, record.clone());
         watching.records.push(record.clone());
         let done = matches!(record.event, Event::Finished { .. });
         watching.done |= done;
@@ -1161,6 +1220,12 @@ impl Watched {
             let ours = watcher.root.as_ref().is_none_or(|it| it == root);
             !ours || watcher.to.send(record.clone()).is_ok() && !(done && watcher.root.is_some())
         });
+    }
+
+    /// The functions build `build` put in its program: the build page's alone.
+    fn functions(&mut self, build: u64, record: Record) {
+        let Some(watching) = self.watching.iter().find(|it| it.build == build) else { return };
+        self.graphs.record(&watching.root, build, record);
     }
 
     /// The build under way in the workspace `at` is in, or else its last.
@@ -1257,6 +1322,14 @@ pub fn serve() -> anyhow::Result<()> {
     let home = home()?;
     private_dir(&home).with_context(|| format!("the daemon's directory {}", home.display()))?;
     let memory_max = memory_max().map_err(anyhow::Error::msg)?;
+    let own = crate::memory::held_by(std::process::id()).unwrap_or(0);
+    match crate::memory::Budget::now(own).map_err(anyhow::Error::msg)? {
+        Some(budget) => eprintln!("memory budget: {budget}"),
+        None => eprintln!(
+            "memory budget: none ({}=off, or the system says nothing of memory)",
+            crate::memory::BUDGET
+        ),
+    }
     let spare_when = spares().map_err(anyhow::Error::msg)?;
     let socket = socket_in(&home);
     let served = match Served::bind(&socket) {
@@ -1283,9 +1356,10 @@ pub fn serve() -> anyhow::Result<()> {
         spare_when,
         spares: AtomicUsize::new(0),
         checkers: Mutex::default(),
-        asked: Mutex::new(Instant::now()),
+        asked: Arc::new(Mutex::new(Instant::now())),
         watched: Arc::default(),
         relays: Arc::default(),
+        ui: Mutex::default(),
     });
     // A build starts the daemon, and is given this one.
     daemon.spare();
@@ -1400,8 +1474,9 @@ struct Relayed {
 impl Relay {
     fn send(&self, relayed: &mut Relayed, event: Event, at_ns: u64) {
         let record = Record { at_ns: at_ns.saturating_sub(self.began_ns), event };
-        // The functions of a cold build are some megabytes, and nothing reads them yet.
+        // The functions of a cold build are some megabytes: they are the build page's alone.
         if matches!(record.event, Event::Functions { .. }) {
+            lock(&self.watched).functions(self.number, record);
             return;
         }
         relayed.build.apply(&record);
@@ -1560,17 +1635,20 @@ impl Daemon {
         let escaped = line["edit\t".len()..].split('\t').next().unwrap_or_default();
         let path = PathBuf::from(blaze_live::format::unescape(escaped));
         let path = dunce::canonicalize(&path).unwrap_or(path);
-        let worker = lock(&self.workers).values().find_map(|worker| {
-            let checkouts = lock(&worker.checkouts);
-            let has = checkouts.values().any(|it| {
+        let has = |worker: &Worker| {
+            lock(&worker.checkouts).values().any(|it| {
                 matches!(it.warmth, Warmth::Ready)
                     && dunce::canonicalize(&it.root).is_ok_and(|root| path.starts_with(root))
-            });
-            has.then(|| worker.clone())
-        });
+            })
+        };
+        let worker = lock(&self.workers).values().find(|it| has(it)).cloned();
         let worker = worker.with_context(|| {
             format!("the daemon has no workspace loaded that has {}", path.display())
         })?;
+        // Counted, then seen to be ready still: [`Self::settle`] takes a worker that is
+        // answering nothing out of use.
+        let _answering = Answering::new(&worker.answering);
+        anyhow::ensure!(has(&worker), "the daemon is loading the workspace of {}", path.display());
         *lock(&worker.asked) = Instant::now();
         let mut stream = socket::connect(&worker.socket)?;
         // The worker builds it for the process its last build was for.
@@ -1597,7 +1675,11 @@ impl Daemon {
             Request::Lint(ahead, _) => {
                 (self.home.join("checkers").join(ahead.config.id()), &ahead.root, "clippy")
             }
-            Request::Warm(_) | Request::Status | Request::Stop | Request::Watch { .. } => {
+            Request::Warm(_)
+            | Request::Status
+            | Request::Stop
+            | Request::Watch { .. }
+            | Request::Ui => {
                 return None;
             }
         };
@@ -1659,7 +1741,7 @@ impl Daemon {
                 let mut workers: Vec<WorkerStatus> = lock(&self.workers)
                     .values()
                     .map(|it| it.status())
-                    .chain(lock(&self.checkers).iter_mut().map(Checker::status))
+                    .chain(lock(&self.checkers).iter().map(|it| it.status()))
                     .collect();
                 // A checkout being loaded says the step its build is at, as the live view of
                 // that build does.
@@ -1682,7 +1764,23 @@ impl Daemon {
             }
             Request::Stop => Reply::Stopping,
             Request::Watch { .. } => Reply::Watched(Vec::new()),
+            Request::Ui => Reply::Ui(self.ui()),
         }
+    }
+
+    /// Where the build page is, its server started the first time it is asked for.
+    fn ui(&self) -> Result<String, String> {
+        let mut ui = lock(&self.ui);
+        if let Some(url) = &*ui {
+            return Ok(url.clone());
+        }
+        let graphs = lock(&self.watched).graphs.clone();
+        let asked = self.asked.clone();
+        let asked = Arc::new(move || *lock(&asked) = Instant::now());
+        let served = blaze_web::serve(graphs, asked)
+            .map_err(|why| format!("the build page is not served: {why}"))?;
+        eprintln!("the build page is at {}", served.url);
+        Ok(ui.insert(served.url).clone())
     }
 
     fn sync(&self, checkout: &Checkout) -> Reply {
@@ -1691,6 +1789,9 @@ impl Daemon {
             return Reply::Cold { reason: "the daemon has not loaded this workspace".to_owned() };
         };
         *lock(&worker.asked) = Instant::now();
+        // Counted before it is seen to be ready: [`Self::settle`] takes a worker that is
+        // answering nothing out of use.
+        let _answering = Answering::new(&worker.answering);
         let warmth = match lock(&worker.checkouts).get(&checkout.key) {
             Some(loaded) if loaded.generation == checkout.generation => loaded.warmth.clone(),
             _ => Warmth::Failed("the daemon has not loaded this build of the workspace".to_owned()),
@@ -1775,6 +1876,7 @@ impl Daemon {
                         generation: checkout.generation,
                         root: checkout.root.clone(),
                         warmth: Warmth::Loading(Instant::now()),
+                        checkout: checkout.clone(),
                     };
                     checkouts.insert(checkout.key.clone(), loading);
                     let worker = worker.clone();
@@ -1806,7 +1908,7 @@ impl Daemon {
 
     /// Stops the workers asked longest ago while together they hold more than they may, and
     /// those nobody has asked for the idle time; and the daemon when nobody has asked it.
-    fn reap(&self) {
+    fn reap(self: Arc<Self>) {
         loop {
             std::thread::sleep(self.idle.map_or(TICK, |idle| idle.min(TICK)));
             // A worker that ended by itself is in the daemon's log when it ends, not when a
@@ -1826,6 +1928,9 @@ impl Daemon {
             let live = crate::live::any_running();
             if let Some(most) = self.memory_max.filter(|_| !live) {
                 self.fit(most);
+            }
+            if !live {
+                self.settle();
             }
             let Some(idle) = self.idle else { continue };
             if live {
@@ -1852,16 +1957,13 @@ impl Daemon {
                 }
                 keep
             });
-            // One that is checking holds the lock, and is not idle.
-            if let Ok(mut checkers) = self.checkers.try_lock() {
-                checkers.retain_mut(|it| {
-                    let keep = it.asked.elapsed() < idle;
-                    if !keep {
-                        it.stop();
-                    }
-                    keep
-                });
-            }
+            lock(&self.checkers).retain(|it| {
+                let keep = it.answering.load(Relaxed) != 0 || lock(&it.asked).elapsed() < idle;
+                if !keep {
+                    it.stop();
+                }
+                keep
+            });
         }
     }
 
@@ -1886,51 +1988,126 @@ impl Daemon {
         }
     }
 
+    /// Starts a worker from the store in place of one whose first build compiled from cold,
+    /// once that has gone [`SETTLE_AFTER`] unasked (Rik Arends' settle rebuild in Relax,
+    /// `compiler/src/settle_rebuild.rs`). The new one holds what a warm start holds, half of
+    /// what a cold build leaves (2.3 GB rather than 4.4 GB of a 94-crate program, #1299), and
+    /// its edits do not expand again the macros of crates the cold build had no frozen def
+    /// maps of. The old one has gone before the new one starts, for the two not to write the
+    /// same programs; a build asked meanwhile waits for the new one as for any that loads.
+    /// Not while a program takes edits: a new worker links every program again.
+    fn settle(self: &Arc<Self>) {
+        let due = lock(&self.workers).iter().find_map(|(id, worker)| {
+            let due = !worker.settled
+                && lock(&worker.asked).elapsed() >= SETTLE_AFTER
+                && settles_beside(&worker.socket).exists()
+                && worker.ended().is_none();
+            due.then(|| (id.clone(), worker.clone()))
+        });
+        let Some((id, old)) = due else { return };
+        let checkout = {
+            let mut checkouts = lock(&old.checkouts);
+            let mut loaded = checkouts.values_mut();
+            match (loaded.next(), loaded.next()) {
+                (Some(loaded), None) if matches!(loaded.warmth, Warmth::Ready) => {
+                    loaded.warmth = Warmth::Loading(Instant::now());
+                    loaded.checkout.clone()
+                }
+                // One that holds several checkouts loads the others again when asked.
+                _ => {
+                    _ = std::fs::remove_file(settles_beside(&old.socket));
+                    return;
+                }
+            }
+        };
+        // A request counts itself before it looks at the warmth set above.
+        if old.answering.load(Relaxed) != 0 {
+            old.set(&checkout, Warmth::Ready);
+            return;
+        }
+        _ = std::fs::remove_file(settles_beside(&old.socket));
+        eprintln!(
+            "worker {id} for {} built from cold: starting one from the store in its place",
+            old.project.display()
+        );
+        let daemon = self.clone();
+        std::thread::spawn(move || {
+            old.let_go();
+            old.finish();
+            let mut workers = lock(&daemon.workers);
+            // A build of another generation started a worker of its own meanwhile.
+            if !workers.get(&id).is_some_and(|it| Arc::ptr_eq(it, &old)) {
+                return;
+            }
+            workers.remove(&id);
+            let dir = daemon.home.join("workers").join(&id);
+            let log = dir.join("log");
+            if old.log == log {
+                _ = std::fs::rename(&log, dir.join("log.cold"));
+            }
+            let spare = match checkout.config.whole {
+                true => None,
+                false => lock(&daemon.spare).take(),
+            };
+            let mut worker = match Worker::start(&checkout, dir, spare) {
+                Ok(worker) => worker,
+                Err(why) => {
+                    eprintln!(
+                        "worker {id}: not started in place of the one built from cold: {why:#}"
+                    );
+                    return;
+                }
+            };
+            worker.settled = true;
+            let worker = Arc::new(worker);
+            eprintln!(
+                "worker {id} of pid {} for {}, from the store",
+                lock(&worker.child).id(),
+                worker.project.display()
+            );
+            workers.insert(id, worker.clone());
+            drop(workers);
+            worker.warm(&checkout);
+        });
+    }
+
     /// Has the checker of `ahead` say what it finds in the source, started when there is
     /// none of its build or it ended, and started again when it can only take the source in
     /// by loading it again. The one asked longest ago makes way for it when there are
     /// [`CHECKERS`]. `request` is the line the checker is asked with.
     fn check(&self, ahead: &Ahead, request: &str) -> Reply {
         let id = ahead.config.id();
-        let mut held = lock(&self.checkers);
-        held.retain_mut(|it| {
-            let ended = it.ended().is_some();
-            if ended {
-                it.stop();
-            }
-            !ended
-        });
-        for _ in 0..2 {
-            let at = match held.iter().position(|it| it.id == id) {
-                Some(at) => at,
-                None => {
-                    if held.len() >= CHECKERS
-                        && let Some(oldest) = (0..held.len()).min_by_key(|&at| held[at].asked)
-                    {
-                        held.remove(oldest).stop();
-                    }
-                    let dir = self.home.join("checkers").join(&id);
-                    match Checker::start(ahead, &id, &dir) {
-                        Ok(checker) => held.push(checker),
-                        Err(why) => return Reply::Cold { reason: format!("{why:#}") },
-                    }
-                    held.len() - 1
-                }
+        let request = crate::check::request(&ahead.targets, request);
+        let mut loads = 0;
+        while loads < 2 {
+            let held = match self.checker(ahead, &id) {
+                Ok(held) => held,
+                Err(why) => return Reply::Cold { reason: format!("{why:#}") },
             };
-            let checker = &mut held[at];
-            checker.asked = Instant::now();
-            match checker.ask(&crate::check::request(&ahead.targets, request)) {
+            let checker = &*held.0;
+            let asking = lock(&checker.asking);
+            // Made way for, or loaded again by the check before this one.
+            if checker.stopped.load(Relaxed) {
+                continue;
+            }
+            *lock(&checker.asked) = Instant::now();
+            let asked = checker.ask(&request);
+            drop(asking);
+            match asked {
                 Ok(reply) if reply == "ok" => return Reply::Checked { errors: None },
                 Ok(reply) if reply.starts_with(crate::check::LINT) => {
                     return Reply::Linted { answer: reply[crate::check::LINT.len()..].to_owned() };
                 }
-                Ok(reply) if reply == crate::check::RELOAD => held.remove(at).stop(),
+                Ok(reply) if reply == crate::check::RELOAD => {
+                    loads += 1;
+                    self.drop_checker(checker);
+                }
                 Ok(reply) => match NotBuilt::of(&reply) {
                     NotBuilt::Error(said) => return Reply::Checked { errors: Some(said) },
                     why => return Reply::Cold { reason: why.why() },
                 },
                 Err(why) => {
-                    held.remove(at).stop();
+                    self.drop_checker(checker);
                     return Reply::Cold { reason: format!("{why:#}") };
                 }
             }
@@ -1938,6 +2115,44 @@ impl Daemon {
         Reply::Cold {
             reason: "the checker loaded the workspace twice and still had to again".to_owned(),
         }
+    }
+
+    /// The checker of the build `id`, started when there is none or it ended, counted among
+    /// those answering under the lock that would make way for it. The one asked longest ago
+    /// that nobody is asking makes way for a new one when there are [`CHECKERS`].
+    fn checker(&self, ahead: &Ahead, id: &str) -> anyhow::Result<Answers> {
+        let mut held = lock(&self.checkers);
+        held.retain(|it| {
+            let ended = it.ended().is_some();
+            if ended {
+                it.stop();
+            }
+            !ended
+        });
+        let checker = match held.iter().find(|it| it.id == id) {
+            Some(checker) => checker.clone(),
+            None => {
+                let idle =
+                    held.iter().enumerate().filter(|(_, it)| it.answering.load(Relaxed) == 0);
+                let oldest = idle.min_by_key(|(_, it)| *lock(&it.asked)).map(|(at, _)| at);
+                if held.len() >= CHECKERS
+                    && let Some(oldest) = oldest
+                {
+                    held.remove(oldest).stop();
+                }
+                let dir = self.home.join("checkers").join(id);
+                let checker = Arc::new(Checker::start(ahead, id, &dir)?);
+                held.push(checker.clone());
+                checker
+            }
+        };
+        checker.answering.fetch_add(1, Relaxed);
+        Ok(Answers(checker))
+    }
+
+    fn drop_checker(&self, checker: &Checker) {
+        lock(&self.checkers).retain(|it| !std::ptr::eq(&**it, checker));
+        checker.stop();
     }
 
     /// Starts a spare worker when there is none.
@@ -1975,7 +2190,8 @@ impl Daemon {
         if let Some(spare) = spare.as_mut() {
             spare.stop();
         }
-        for checker in lock(&self.checkers).iter_mut() {
+        let checkers = lock(&self.checkers);
+        for checker in checkers.iter() {
             checker.stop();
         }
         for worker in workers.values() {
@@ -2116,6 +2332,121 @@ mod tests {
         watched.record(again, &record(began("/w/a")));
         assert!(!watched.of(Path::new("/w/a")).unwrap().done, "the one under way before the last");
         assert_eq!(watched.watching.len(), 2, "a's last is dropped once another begins");
+    }
+
+    /// A check that waits for its checker (one still loading, or stuck) keeps nothing else
+    /// waiting: not `blaze status`, not a check of another build.
+    #[cfg(unix)]
+    #[test]
+    fn a_check_waiting_for_its_checker_holds_up_nothing_else() {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("blaze-checkers-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ahead = |project: &str| Ahead {
+            config: WorkerConfig {
+                repository: dir.clone(),
+                project: project.into(),
+                cfg_test: false,
+                selection: crate::plan::Selection {
+                    profile: "dev".to_owned(),
+                    features: Vec::new(),
+                    no_default_features: false,
+                    all_features: false,
+                    packages: Vec::new(),
+                    workspace: false,
+                    excludes: Vec::new(),
+                    unstable: Vec::new(),
+                    target: None,
+                    dev_deps: false,
+                    config: Vec::new(),
+                    asked_in: None,
+                },
+                env: BTreeMap::new(),
+                command_env: BTreeMap::new(),
+                whole: false,
+            },
+            root: dir.clone(),
+            crates: Vec::new(),
+            targets: Vec::new(),
+        };
+        let (stuck, answers) = (ahead("stuck"), ahead("answers"));
+        // A checker that takes the request and never answers, and one that answers at once.
+        let stuck_at = dir.join("stuck.sock");
+        let never = UnixListener::bind(&stuck_at).unwrap();
+        let answers_at = dir.join("answers.sock");
+        let at_once = UnixListener::bind(&answers_at).unwrap();
+        std::thread::spawn(move || {
+            for stream in at_once.incoming() {
+                let stream = stream.unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                (&stream).write_all(b"ok\n").unwrap();
+            }
+        });
+        let checker = |ahead: &Ahead, socket: PathBuf| {
+            let child = Command::new("sleep").arg("600").spawn().unwrap();
+            Arc::new(Checker::of(&ahead.config.id(), child, socket, dir.join("log"), dir.clone()))
+        };
+        let daemon = Arc::new(Daemon {
+            version: String::new(),
+            home: dir.clone(),
+            idle: None,
+            memory_max: None,
+            workers: Mutex::default(),
+            spare: Mutex::default(),
+            spare_when: Spares::Never,
+            spares: AtomicUsize::new(0),
+            checkers: Mutex::new(vec![checker(&stuck, stuck_at), checker(&answers, answers_at)]),
+            asked: Arc::new(Mutex::new(Instant::now())),
+            watched: Arc::default(),
+            relays: Arc::default(),
+            ui: Mutex::default(),
+        });
+        let waiting = {
+            let daemon = daemon.clone();
+            std::thread::spawn(move || daemon.check(&stuck, "check"))
+        };
+        // Its request is read once it waits for the answer.
+        never.set_nonblocking(true).unwrap();
+        let given_up = Instant::now() + Duration::from_secs(10);
+        let asked = loop {
+            match never.accept() {
+                Ok((asked, _)) => break asked,
+                Err(_) if waiting.is_finished() => {
+                    panic!("the check asked nothing: {:?}", waiting.join().unwrap())
+                }
+                Err(_) if Instant::now() < given_up => std::thread::sleep(POLL),
+                Err(why) => panic!("the check asked nothing in 10 s: {why}"),
+            }
+        };
+        asked.set_nonblocking(false).unwrap();
+        let mut line = String::new();
+        BufReader::new(&asked).read_line(&mut line).unwrap();
+        assert!(!waiting.is_finished(), "the check did not wait for its checker");
+        let within = |what: &'static str, ask: Box<dyn FnOnce() -> Reply + Send>| {
+            let (to, told) = std::sync::mpsc::channel();
+            std::thread::spawn(move || _ = to.send(ask()));
+            told.recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("{what} waited for another build's check"))
+        };
+        let status = {
+            let daemon = daemon.clone();
+            within("`blaze status`", Box::new(move || daemon.handle(Request::Status)))
+        };
+        assert!(matches!(status, Reply::Status(Status { ref workers, .. }) if workers.len() == 2));
+        let other = {
+            let daemon = daemon.clone();
+            within("a check of another build", Box::new(move || daemon.check(&answers, "check")))
+        };
+        assert!(matches!(other, Reply::Checked { errors: None }), "{other:?}");
+        // The stuck one hangs up, which ends its check.
+        drop(asked);
+        assert!(matches!(waiting.join().unwrap(), Reply::Cold { .. }));
+        for checker in lock(&daemon.checkers).iter() {
+            checker.stop();
+        }
+        _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

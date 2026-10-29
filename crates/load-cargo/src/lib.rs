@@ -183,6 +183,9 @@ impl Loaded {
         vfs: &mut vfs::Vfs,
         db: &mut RootDatabase,
     ) -> anyhow::Result<()> {
+        let start = std::time::Instant::now();
+        let mut steps: Vec<(&str, std::time::Duration)> = Vec::new();
+        let step = |name, steps: &mut Vec<_>| steps.push((name, start.elapsed()));
         self.workspaces.extend(workspaces);
         let known: FxHashSet<vfs::FileId> = vfs.iter().map(|(file, _)| file).collect();
         let ws = self.workspaces.first().ok_or_else(|| anyhow::anyhow!("no workspace to load"))?;
@@ -194,6 +197,13 @@ impl Loaded {
         let mut proc_macros = FxHashMap::default();
         let mut members = Vec::new();
         for ws in &self.workspaces {
+            // blaze's copy of `const-ast`, which const macros depend on, is in no folder on disk.
+            if let Some(dir) = ws.const_ast_dir() {
+                for (name, text) in ide_db::const_macro::CONST_AST {
+                    let path = vfs::VfsPath::from(dir.join(name));
+                    vfs.set_file_contents(path, Some(text.as_bytes().to_vec()));
+                }
+            }
             let (other, mut paths) = ws.to_crate_graph(
                 &mut |path: &AbsPath| {
                     let path = vfs::VfsPath::from(path.to_path_buf());
@@ -212,6 +222,7 @@ impl Loaded {
             members.push(ids.into_values().collect::<Vec<_>>());
             proc_macros.extend(paths);
         }
+        step("graph", &mut steps);
         // A library rustc compiled is expanded with what the caller has of it, if anything.
         let unlisted: Vec<listed::Compiled> = match listed::owned() {
             true => {
@@ -395,6 +406,7 @@ impl Loaded {
             }
             loaded.into_iter().collect()
         };
+        step("macros", &mut steps);
 
         let was = self.file_sets.len();
         let mut claimed: FxHashSet<VfsPath> =
@@ -426,6 +438,7 @@ impl Loaded {
                 }
             }
         }
+        step("read", &mut steps);
 
         db.enable_proc_attr_macros();
         let mut fsc = FileSetConfig::builder();
@@ -459,6 +472,7 @@ impl Loaded {
         }
         LocalRoots::get(db).set_roots(db).to(local_roots);
         LibraryRoots::get(db).set_roots(db).to(library_roots);
+        step("roots", &mut steps);
 
         let mut change = ChangeWithProcMacros::default();
         for (_, file) in vfs.take_changes() {
@@ -471,11 +485,25 @@ impl Loaded {
                 change.change_file(file.file_id, Some(text))
             }
         }
+        step("texts", &mut steps);
         change.set_crate_graph(crate_graph);
         change.set_proc_macros(proc_macros);
         db.trigger_cancellation();
         let ids = change.apply(db).expect("the crate graph is set");
         self.crates = members.into_iter().map(|it| it.iter().map(|id| ids[id]).collect()).collect();
+        step("apply", &mut steps);
+        if std::env::var_os("BLAZE_STATS").is_some() {
+            let mut since = std::time::Duration::ZERO;
+            let said: Vec<String> = steps
+                .iter()
+                .map(|&(name, at)| {
+                    let took = at - since;
+                    since = at;
+                    format!("{name}={}", took.as_micros())
+                })
+                .collect();
+            eprintln!("load-us: {} files={}", said.join(" "), vfs.iter().count());
+        }
         Ok(())
     }
 }

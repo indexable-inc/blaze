@@ -1,3 +1,8 @@
+---
+status: plan
+summary: The no-rustc rule and the plan to remove every rustc use, step by step, with what is done.
+date: 2026-10-22
+---
 # blaze never runs rustc
 
 ## The rule
@@ -24,6 +29,14 @@ refused where possible: the root manifest's `unsandboxed-build-scripts` and
 
 Andrew, 2026-10-24: "we want to be a superset of Rust (i.e., any existing Rust program should
 work, minus a proc macro that isn't sandboxed, which it should be tbh)."
+
+Superset runs one way. Every Rust program must work under blaze, but a program that uses a blaze
+extension (new syntax, attributes or semantics, such as const macros or
+[#1448](https://github.com/indexable-inc/blaze/issues/1448)) only has to work under blaze; it
+never has to build under rustc. An extension is opt-in, and turning it on must not change the
+behaviour of code that doesn't use it.
+
+Andrew, 2026-10-28: "we are superset and if using superset dont need rustc to compile it either."
 
 This describes where blaze is going, not where it is. Today rustc still does much of the work:
 it builds every program once before the daemon takes over, it compiles the standard library,
@@ -476,7 +489,9 @@ of each host (x86-64 Linux's rustc links with its own lld, so its specs differ).
 knows the release by rustup's manifest in the sysroot, and adds what the arguments decide, as
 rustc does: `debug_assertions` from `-C debug-assertions` or the optimization level,
 `overflow_checks` and `ub_checks` as a nightly prints them (`RUSTC_BOOTSTRAP=-1` makes it
-answer as a stable release), `-C panic`, `--cfg`, `proc_macro`,
+answer as a stable release; a list of crates, as servo's `[env]` sets, allows unstable features
+for the `--crate-name` it names as `1` does and leaves the channel's default for any other, as
+rustc's `UnstableFeatures::from_environment` does), `-C panic`, `--cfg`, `proc_macro`,
 the sysroot and target libdir from where the toolchain is. A question with anything it does not
 model (`-C target-cpu`, `-C target-feature`, other `-Z` flags, a deployment target or SDK in the
 environment, a JSON target, another release, a host whose target specs it lacks) is asked of rustc
@@ -508,7 +523,8 @@ names another toolchain, which is what made main's no-op `blaze build` run 8 rus
 (4 questions through rustup's proxy, #833). `rustcsites.py`: 33 places to 27. rustup is not
 run either: loading a workspace took cargo from `rustup which cargo` and ran it through rustup's
 proxy, and ran `rustup component add rust-src` when the library's source was missing; the
-sysroot's own `bin/cargo` is run now, and a missing source is an error that says to add it.
+sysroot's own `bin/cargo` is run now, and a missing source is an error that names
+`BLAZE_LIBRARY` (no toolchain's `rust-src` is looked for).
 `rustcsites.py` counts the places that start rustup too: 29 to 28. The one left,
 `cargo/own_macro.rs`'s `rustup target add wasm32-wasip1`, installs WASI's libc for proc-macro
 modules when blaze's release has none; it asks nothing.
@@ -653,7 +669,7 @@ function to rustc but those step G removes ("no rustc symbol"). On Linux x86-64 
 
 **F. The standard library compiled by blaze.** ([#86](https://github.com/indexable-inc/blaze/issues/86)) `core`, `alloc`, `std`, `compiler_builtins`
 (with its intrinsics and `#[naked]` functions), `panic_unwind`, `panic_abort`, `unwind`,
-`proc_macro`, `test` and their dependencies, from `rust-src`, with std's own build script and
+`proc_macro`, `test` and their dependencies, from blaze's `library/` (no `rust-src`), with std's own build script and
 cfgs, kept in the store per target and profile and served by the remote. The harness's std
 tests (11 of 2,846 refused today) are the bar. Risk: lang items, intrinsics and
 `compiler_builtins` are where blaze has had least practice.
@@ -717,7 +733,9 @@ over ripgrep: 2.5 s against 0.25 s), and the native libraries the crates linked 
 `#[link(name, kind, modifiers, cfg)]`, read from their `extern` blocks, a crate's before those
 of the crates it depends on; no list of libraries is fixed. What the link leaves out it proves
 unreachable, so a stand-in left in the executable is a function the program can reach that
-blaze could not compile: blaze says how many after the link and fails on any.
+blaze could not compile: blaze says how many after the link and fails on any. Not yet on
+Windows: blaze's COFF objects have no COMDAT sections for `link.exe`'s `/OPT:REF` to take out,
+so every stand-in stays, and one says what blaze could not compile only when it is called.
 None is left in hello, the four `allblaze.py` programs or ripgrep. The rest of what rustc
 does around the link: the allocator shim calls the `#[global_allocator]`'s methods (through the
 four functions the attribute's expansion exports) or else std's defaults; the panic runtime is

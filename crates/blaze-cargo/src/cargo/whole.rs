@@ -114,7 +114,7 @@ pub fn build(asked: &Invocation) -> anyhow::Result<i32> {
     if asked.subcommand == Subcommand::Run {
         programs.retain(|it| !it.kind.linked_library());
     }
-    if let Some(it) = programs.iter().find(|it| matches!(it.kind, Kind::Staticlib | Kind::Dylib)) {
+    if let Some(it) = programs.iter().find(|it| it.kind == Kind::Dylib) {
         let kind = format!("{:?}", it.kind).to_lowercase();
         say::error(&format!(
             "blaze does not link the `{kind}` of `{}` (target `{}`) yet, so it would write no `{}` (#262)",
@@ -142,6 +142,7 @@ pub fn build(asked: &Invocation) -> anyhow::Result<i32> {
         }
     }
     finished(asked, asked.profile(), started);
+    crate::trace::finish();
     if let Some(failed) = super::remote_failed_it() {
         return Ok(failed);
     }
@@ -274,6 +275,7 @@ pub fn test(asked: &Invocation) -> anyhow::Result<i32> {
         }
     }
     finished(asked, profile, started);
+    crate::trace::finish();
     if let Some(failed) = super::remote_failed_it() {
         return Ok(failed);
     }
@@ -446,10 +448,18 @@ fn turned_down(program: &Program, said: &crate::errors::Said) -> String {
 /// builds them again on what it has loaded when asked next. `Ok` names the programs, by
 /// index, the daemon built rather than found up to date; `Err` says why not.
 fn whole(cwd: &Path, checkout: &Checkout, programs: &[Program]) -> Result<Vec<usize>, Unbuilt> {
+    let asking_at = Instant::now();
     let reply = client::ask(Request::Build(super::asking(checkout)), Start::IfMissing)
         .map_err(|it| format!("{it:#}"))?;
+    crate::trace::note("client↔daemon", crate::trace::CLIENT, asking_at);
     let built = match reply {
-        Some(Reply::Synced { programs, .. }) => programs,
+        Some(Reply::Synced { programs, spans }) => {
+            crate::trace::note_all(spans);
+            for line in programs.iter().flatten() {
+                crate::trace::note_all(crate::trace::split(line).1);
+            }
+            programs
+        }
         Some(Reply::Cold { reason }) => return Err(not_loaded(cwd, checkout, &reason).into()),
         None => return Err(client::why_none().into()),
         Some(other) => return Err(format!("the daemon answered {other:?}").into()),
@@ -535,9 +545,10 @@ fn checkout(
     let worker = config.id();
     let dirs: Vec<PathBuf> = programs.iter().map(|it| it.dir.join(&worker)).collect();
     let plans = programs.iter().zip(&dirs).map(|(program, dir)| {
-        // A `cdylib` is linked under the name of its file, which a binary of the same name
-        // beside it does not have.
-        let shared = program.kind == Kind::Cdylib;
+        // A `cdylib` or `staticlib` is linked under the name of its file, which a binary of
+        // the same name beside it does not have.
+        let staticlib = program.kind == Kind::Staticlib;
+        let shared = program.kind == Kind::Cdylib || staticlib;
         let name = match shared {
             true => program.executable.file_name().unwrap_or_default().to_string_lossy().into(),
             false => program.name.clone(),
@@ -557,6 +568,7 @@ fn checkout(
             stamp: 0,
             whole: true,
             shared,
+            staticlib,
         }
     });
     for dir in &dirs {

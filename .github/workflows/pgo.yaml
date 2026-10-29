@@ -46,9 +46,9 @@ jobs:
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
     steps:
       - uses: actions/checkout@v7
-      # llvm-tools: llvm-profdata, which merges what the instrumented build counted; rust-src:
-      # the daemon being trained reads the standard library from it.
-      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal --component llvm-tools,rust-src && rustup default "$tc"
+      # llvm-tools: llvm-profdata, which merges what the instrumented build counted. The daemon
+      # being trained reads the standard library from blaze's library/, not from a rust-src.
+      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal --component llvm-tools && rustup default "$tc"
       # lld links the instrumented AArch64 blaze, whose code is past a direct call's reach for GNU ld
       # (build_release.py, `train`).
       - if: matrix.target == 'aarch64-unknown-linux-gnu'

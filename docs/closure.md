@@ -1,3 +1,8 @@
+---
+status: plan
+summary: The closure build scripts run with: what is fetched and laid out (built), and the mount namespace (not yet).
+date: 2026-10-27
+---
 # The closure build scripts run with
 
 2026-10-27. Status: fetching, keeping and laying out the closure is built

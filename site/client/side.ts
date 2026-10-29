@@ -6,7 +6,8 @@
  *   A fold slides open and shut as the ix sidebar's (svelte/transition slide, 180 ms). The sidebar's scroll carries
  *   over too (sessionStorage, written on pagehide); keep.ts puts both back before the next page's first paint.
  * - Rows: ix's hover pill (lib/site/glide.ts) slides from row to row under the pointer. A lesson row's mark shows the
- *   reader's progress (client/lib/progress.ts), painted on every page.
+ *   reader's progress (client/lib/progress.ts), painted on every page. What's new's row counts the updates new since
+ *   the reader's last visit and not yet studied; every page brings that list up to date (progress.ts `roll`).
  * - Reference folds in the phone drawer until the reader opens it there (blaze.side.opened; keep.ts applies it).
  * - The drawer: Menu opens it, the scrim, the close button and Escape close it, without touching the URL.
  * - Search: the pill (and ⌘K, Ctrl K or /) opens a dialog over `search.json` (gen/build.ts writes it: one entry per
@@ -24,7 +25,7 @@ import { PAGE, onPage } from './lib/page';
 import './lib/presence';
 import './lib/tip';
 import { SIDE, handle } from './lib/resize';
-import { KEY as PROGRESS, load, stateOf, stateWords } from './lib/progress';
+import { CHANGED, KEY as PROGRESS, fresh, load, roll, stateOf, stateWords } from './lib/progress';
 
 type Entry = { u: string; t: string; h: string; x: string };
 
@@ -358,10 +359,22 @@ document.querySelector('.side')?.append(handle(SIDE));
 
 onPage(spy);
 
-/** Each lesson row's mark: not started, started, finished, or every question right the first time. */
+/** Each lesson row's mark: not started, started, finished, or every question right the first time. What's new's
+ * count: the updates new to the reader. */
 function marks(signal: AbortSignal) {
 	const paint = () => {
-		const saved = load();
+		let saved = load();
+		const log = document.querySelector<HTMLAnchorElement>('.navlist .row[data-updates]');
+		if (log) {
+			saved = roll(saved, (log.dataset.updates ?? '').split(' ').filter(Boolean));
+			const n = fresh(saved).length;
+			const count = log.querySelector<HTMLElement>('.count');
+			if (count) {
+				count.textContent = String(n);
+				count.hidden = n === 0;
+			}
+			log.setAttribute('aria-label', n ? `${log.title}, ${n} new` : log.title);
+		}
 		for (const row of document.querySelectorAll<HTMLAnchorElement>('.navlist .row[data-lesson]')) {
 			const state = stateOf(saved.lessons[row.dataset.lesson!], (row.dataset.quizzes ?? '').split(' ').filter(Boolean));
 			row.dataset.state = state;
@@ -370,5 +383,6 @@ function marks(signal: AbortSignal) {
 	};
 	paint();
 	addEventListener('storage', (e) => e.key === PROGRESS && paint(), { signal });
+	addEventListener(CHANGED, paint, { signal });
 }
 onPage(marks);

@@ -1,3 +1,7 @@
+---
+status: current
+summary: Releases: the canary and stable channels, how a release is cut and what gates promotion to stable.
+---
 # Releases: canary and stable
 
 blaze has two release channels, made of the same releases:
@@ -149,10 +153,18 @@ PATH for an installed release).
 
 - **std** (no dependencies; the merge gate runs these on every pull request, under two minutes):
   `HashMap` insert and iterate, `thread::spawn` + `join`, `thread_local!`, `Mutex`/`OnceLock`/
-  atomic statics, `std::env` and `std::fs` basics.
+  atomic statics, `std::env` and `std::fs` basics, and `const_heap` (`Vec`, `String`, `Box` and
+  `BTreeMap` in constants).
 - **crates** (from crates.io, at the versions their Cargo.lock pins): tokio (multi-threaded
   runtime, a TCP echo on localhost), a serde_json round trip, proc-macro derives (thiserror,
-  clap's derive).
+  clap's derive), and three constants of real crates: SHA-256 of 1 MiB (`ce_sha256`, sha2), a
+  Cargo manifest parsed with basic-toml (`ce_toml`) and 4 MiB inflated with miniz_oxide
+  (`ce_inflate`).
+  `const_heap` and the three `ce_` cases call ordinary functions in a `const`, which the pinned
+  nightly refuses (E0015) and blaze does not yet (issue #1440). Each asserts that the constant
+  equals what the program computes at run time, and prints the values. `expected.txt` has the
+  same values computed independently (Python's `hashlib` and `tomllib`, and the same
+  arithmetic).
 - **projects** (real repositories at pinned commits): ripgrep, indexable-inc/anim, and blaze
   itself.
 - **apps** (large applications at pinned commits, with the system libraries each builds with
@@ -166,12 +178,15 @@ PATH for an installed release).
   (the file finder formerly fff.nvim: its MCP server's `--version` and health check; the tests
   of fff-search and the crates below it), fframes v1.3.0 (a video rendering framework, with
   the prebuilt static FFmpeg and Skia its build scripts download: its hello-world example's
-  timeline and one frame rendered to PNG on the CPU; the tests of the crates that need no GPU)
-  and flox v1.19.2 (in the environment of flox's own package build, which
+  timeline and one frame rendered to PNG on the CPU; the tests of the crates that need no GPU),
+  flox v1.19.2 (in the environment of flox's own package build, which
   `harness/floxprep.py` takes from its flake: the CLI's `--version`; the tests of flox-core and
-  flox-config). What a runner without a GPU cannot build or test is listed with why in the
-  entry's `excluded`, which smoke.py prints. Each is also measured against cargo (above); cargo
-  builds dynamo with its pinned Rust 1.96.1, which its users build with.
+  flox-config) and OpenAI's Codex CLI rust-v0.165.0 (its workspace `codex-rs`, the entry's
+  `dir`; `codex --version`; the tests of codex-apply-patch, codex-protocol, codex-execpolicy
+  and codex-features, which need no model, network or credentials). What a runner without a
+  GPU cannot build or test is listed with why in the entry's `excluded`, which smoke.py prints.
+  Each is also measured against cargo (above); cargo builds dynamo and codex with their pinned
+  Rust (1.96.1 and 1.99.1), which their users build with.
 
 The std cases are the merge gate's; all four groups are the promotion gate. blaze itself is in
 the corpus but not measured against cargo here: how fast blaze builds blaze is the self-build's

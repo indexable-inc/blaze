@@ -50,7 +50,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: true
-      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal -c rust-src && rustup default "$tc"
+      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal && rustup default "$tc"
       # cargo, with no cache: the latency timed is of blaze as rustc compiles it, since the blaze
       # that blaze builds runs about ten times slower until it inlines one function into another
       # (https://github.com/indexable-inc/blaze/issues/899).

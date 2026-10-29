@@ -72,14 +72,24 @@ pub fn host_side_cfg(project: &Path) -> Result<Option<project_model::CfgOverride
     let mut overrides = project_model::CfgOverrides::default();
     for krate in crates {
         let Some(name) = krate["display_name"].as_str() else { continue };
-        let root = krate["root_module"].as_str().and_then(|it| std::fs::read_to_string(it).ok());
-        let links = krate["is_proc_macro"] == true
-            || root.is_some_and(|text| text.contains("extern crate proc_macro"));
-        if links {
+        let root = krate["root_module"].as_str().map(Path::new);
+        if links_proc_macro(krate["is_proc_macro"] == true, root) {
             overrides.selective.insert(name.to_owned(), diff.clone());
         }
     }
     Ok(Some(overrides))
+}
+
+/// Whether a crate of a proc macro's module links `proc_macro`: a proc macro, or a crate whose
+/// root, at `root`, says `extern crate proc_macro`. It is told of the host's side
+/// ([`host_side_cfg`]), and the build script of its package runs for the module as for the
+/// host (`compile_time.rs`), the platform the script of a crate rustc builds for a proc macro
+/// is told of and probes for (proc-macro2's).
+pub fn links_proc_macro(is_proc_macro: bool, root: Option<&Path>) -> bool {
+    is_proc_macro
+        || root
+            .and_then(|it| std::fs::read_to_string(it).ok())
+            .is_some_and(|text| text.contains("extern crate proc_macro"))
 }
 
 /// Has the toolchain at `sysroot` the WASI libc a module is linked with (`link.rs`), which

@@ -25,10 +25,9 @@
  * It answers with `blaze:refreshed` (whether it could); it never falls back to a load itself.
  *
  * Only left clicks with no modifier on a same-origin link under the site's base are taken: not downloads, links with
- * a target, hash links within the page (the browser scrolls), the worker's routes that act (/api, /auth) or serve
- * files (/audio), or files (`install.sh`, `search.json`). Anything that goes wrong (not 200, not HTML, a redirect out of
- * the site, a network error, a page in another frame, a page with a script from another origin, which needs its own
- * CSP: /updates with Turnstile) falls back to the browser's own navigation to the same URL. Without JS every link is
+ * a target, hash links within the page (the browser scrolls), the worker's routes that act (/api, /auth), or files (`install.sh`, `search.json`). Anything that goes wrong (not 200, not HTML, a redirect out of
+ * the site, a network error, a page in another frame, a page with a script from another origin, which would need its
+ * own CSP) falls back to the browser's own navigation to the same URL. Without JS every link is
  * a plain link.
  */
 
@@ -48,7 +47,7 @@ const BASE = (() => {
 	return css ? new URL('.', css.href).pathname : '/';
 })();
 /** The worker's routes that do something or serve a file rather than a page (worker/index.ts). */
-const NOT_PAGES = ['api/', 'auth/', 'audio/'].map((p) => BASE + p);
+const NOT_PAGES = ['api/', 'auth/'].map((p) => BASE + p);
 /** How long a fetched page is kept: a page with comments (rendered per request) briefly, the static ones longer. */
 const KEEP_LIVE_MS = 15_000;
 const KEEP_MS = 300_000;
@@ -96,7 +95,7 @@ async function fetchPage(url: URL, fresh = false): Promise<Got> {
 	const final = new URL(res.url);
 	if (!routable(final)) throw new Miss(`redirected to ${final.href}`);
 	const html = await res.text();
-	// Live: rendered for this request (comments, the reader, /updates' referrer), so used once and kept briefly.
+	// Live: rendered for this request (comments, the reader), so used once and kept briefly.
 	const live = /<main\b[^>]*\sdata-doc="/.test(html) || /no-store|private/.test(res.headers.get('cache-control') ?? '');
 	return { url: final.pathname + final.search, html, live };
 }

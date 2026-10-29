@@ -10,11 +10,6 @@
  *    snapshot.
  * 3. site.wasm loads it and renders every page without comments, anonymous, into dist/; it also lists the pages and
  *    the discussable blocks.
- *    Narration (audio/README.md): it asks site.wasm for each page's spoken lines (`.gen/spoken.json`, what
- *    audio/generate.py voices). A page whose manifest (audio/manifests/<doc>.json) matches those lines, and whose
- *    audio files are at hand (.audio/files/, or served from R2 when SITE_AUDIO_REMOTE=1), gets `Audio {manifest}` in a
- *    second snapshot, and the renderer adds the player; its manifest and files are copied to dist/audio/. Any other
- *    page simply has no player, so the build never needs audio.
  * 4. Bundles client/*.ts, concatenates styles/, copies static/, puts the chat translator's ONNX Runtime in dist/ort/
  *    (`ortFiles`) and the anonymous readers' animals in dist/animals/<hash>.svg (`animalSprite`). For the worker, under .gen/:
  *
@@ -24,7 +19,6 @@
  *      build.json             {hash} of the module, the snapshot and the client scripts (part of the cache key), and
  *                             {assets}, of the client scripts' and styles' sources (client/nav.ts, worker/http.ts),
  *                             and {at}, when it was built (worker/presence.ts tells an old Durable Object by it)
- *      spoken.json            every page's spoken lines and their hash (the input of audio/generate.py)
  *      site.json              {origin, base}: where the site is served (`Served` on `site` in content/site.flecs)
  *
  *    and dist/sitemap.xml, every page but the 404 at its full URL (origin + base + path), dist/install.sh, the
@@ -39,7 +33,7 @@ import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, watch, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { Site, snapshot, type Page, type SnapshotInput, type SpokenLine } from '../worker/site-wasm';
+import { Site, snapshot, type Page, type SnapshotInput } from '../worker/site-wasm';
 import { ANIMALS, ROBOT, sprite, symbolId } from './animals';
 import { benchScript } from './bench';
 import { glyphSvg } from './glyphs';
@@ -57,25 +51,6 @@ function scripts(): string[] {
 	const files = readdirSync(content, { recursive: true, encoding: 'utf8' }).filter((f) => f.endsWith('.flecs'));
 	const rank = (f: string) => (f === 'schema.flecs' ? 0 : f === 'refs.flecs' ? 1 : f === 'nav.flecs' ? 2 : 3);
 	return files.sort((a, b) => rank(a) - rank(b) || (a < b ? -1 : a > b ? 1 : 0));
-}
-
-const audioDir = path.join(root, 'audio');
-/** Generated audio files, content-addressed (gitignored; audio/generate.py writes them). */
-const audioFiles = path.join(root, '.audio', 'files');
-
-/** A page's narration as audio/generate.py writes it (audio/README.md has the format). */
-type Manifest = {
-	doc: string;
-	/** The hash of the spoken lines it was generated from (`spokenHash`). */
-	hash: string;
-	lines: { id: string; block: string; src: string; duration: number; words: [string, number, number][] }[];
-};
-
-/** The hash a manifest must carry to match the page: over each line's id, block and text, in order. */
-function spokenHash(lines: SpokenLine[]): string {
-	const h = createHash('sha256');
-	for (const l of lines) h.update(`${l.id}\t${l.block}\t${l.text}\n`);
-	return h.digest('hex').slice(0, 16);
 }
 
 /** The page's entity path: `/rfcs/capabilities` is `site.rfcs.capabilities`, `/` is `site.index`. */
@@ -96,48 +71,13 @@ function generated(all: Map<string, Node>): { name: string; code: string }[] {
 	return out;
 }
 
-/**
- * Which pages can have the player: those whose manifest matches their spoken lines and whose files are available.
- * Copies their manifests (content-addressed names) and files into dist/audio/ and returns the bakes that set
- * `Audio {manifest}` on them.
- */
-function narration(pages: Page[], spoken: Map<string, { hash: string; lines: SpokenLine[] }>): Baked {
-	const bakes: Baked = {};
-	const remote = process.env.SITE_AUDIO_REMOTE === '1';
-	for (const p of pages) {
-		const file = path.join(audioDir, 'manifests', `${p.doc}.json`);
-		if (!existsSync(file)) continue;
-		const raw = readFileSync(file);
-		const m = JSON.parse(raw.toString('utf8')) as Manifest;
-		const want = spoken.get(p.url)!;
-		if (m.hash !== want.hash) {
-			console.warn(`audio: ${p.url}: the manifest is for other spoken lines (run audio/generate.py); no player`);
-			continue;
-		}
-		const missing = m.lines.filter((l) => !existsSync(path.join(audioFiles, l.src)));
-		if (missing.length && !remote) {
-			console.warn(`audio: ${p.url}: ${missing.length} of ${m.lines.length} audio files missing from .audio/files (run audio/generate.py, or SITE_AUDIO_REMOTE=1); no player`);
-			continue;
-		}
-		mkdirSync(path.join(dist, 'audio'), { recursive: true });
-		for (const l of m.lines) {
-			const src = path.join(audioFiles, l.src);
-			if (existsSync(src)) cpSync(src, path.join(dist, 'audio', l.src));
-		}
-		const name = `${p.doc.replaceAll('/', '-')}.${createHash('sha256').update(raw).digest('hex').slice(0, 12)}.json`;
-		writeFileSync(path.join(dist, 'audio', name), raw);
-		bakes[entityOf(p)] = { audio: `/audio/${name}` };
-	}
-	return bakes;
-}
-
 const STYLES = ['fonts.css', 'tokens.css', 'doc-code.css', 'base.css', 'site.css', 'shell.css', 'art.css', 'learn.css'];
 
 type Baked = SnapshotInput['bakes'];
 
 /**
- * What the renderer leaves to TS: highlighting (Code and Command, set as `Highlighted {html}`) and each lesson's
- * glyph (gen/glyphs.ts, set as the lesson page's `Baked {html}`). By entity path.
+ * What the renderer leaves to TS: highlighting (Code and Command, set as `Highlighted {html}`) and each lesson's and
+ * update's glyph (gen/glyphs.ts, set as the page's `Baked {html}`). By entity path.
  */
 function bake(all: Map<string, Node>): Baked {
 	const baked: Baked = {};
@@ -150,7 +90,7 @@ function bake(all: Map<string, Node>): Baked {
 		}
 		const cmd = n.values.get('Command');
 		if (cmd) (baked[n.path] ??= {}).highlighted = highlight(prose(String(cmd.text ?? '')), 'bash');
-		const lesson = n.values.get('Lesson');
+		const lesson = n.values.get('Lesson') ?? n.values.get('Update');
 		if (lesson) {
 			try {
 				(baked[n.path] ??= {}).baked = glyphSvg(String(lesson.glyph ?? ''));
@@ -198,7 +138,7 @@ function served(tree: Map<string, Node>): { origin: string; base: string } {
 	return { origin: String(v?.origin ?? ''), base: String(v?.base ?? '') };
 }
 
-/** Text of an HTML fragment: tags (and the comment and narration buttons' markup) out, entities in, spaces collapsed. */
+/** Text of an HTML fragment: tags (and the comment buttons' markup) out, entities in, spaces collapsed. */
 function textOf(html: string): string {
 	return html
 		.replace(/<(script|style|svg|button|form)\b[\s\S]*?<\/\1>/g, ' ')
@@ -286,23 +226,10 @@ async function build() {
 		scripts: [...files.map((name) => ({ name, code: readFileSync(path.join(content, name), 'utf8') })), ...generated(tree)],
 		bakes: bake(tree),
 	};
-	let snap = snapshot(wasmModule('site-snapshot.wasm'), input);
-	let site = Site.load(wasmModule('site.wasm'), snap);
+	const snap = snapshot(wasmModule('site-snapshot.wasm'), input);
+	const site = Site.load(wasmModule('site.wasm'), snap);
 	const pages = site.pages();
 	checkRoutes(pages.filter((p) => p.discussable).map((p) => p.url));
-
-	const spoken = new Map(pages.map((p) => {
-		const lines = site.spoken(p.url);
-		return [p.url, { hash: spokenHash(lines), lines }] as const;
-	}));
-	write(path.join(gen, 'spoken.json'), JSON.stringify(pages.map((p) => ({ ...p, ...spoken.get(p.url)! })), null, '\t'));
-	rmSync(path.join(dist, 'audio'), { recursive: true, force: true });
-	const audio = narration(pages, spoken);
-	if (Object.keys(audio).length) {
-		for (const [k, v] of Object.entries(audio)) input.bakes[k] = { ...input.bakes[k], ...v };
-		snap = snapshot(wasmModule('site-snapshot.wasm'), input);
-		site = Site.load(wasmModule('site.wasm'), snap);
-	}
 
 	const client = readdirSync(path.join(root, 'client')).filter((f) => f.endsWith('.ts')).map((f) => path.join(root, 'client', f));
 	// What the pages run and look with: the client router swaps in a page only when its build had the same (nav.ts).
@@ -355,14 +282,13 @@ async function build() {
 	for (const f of ['site.cbor', 'site.wasm']) hash.update(f).update(readFileSync(path.join(gen, f)));
 	for (const f of readdirSync(path.join(dist, 'js')).sort()) hash.update(f).update(readFileSync(path.join(dist, 'js', f)));
 	write(path.join(gen, 'build.json'), JSON.stringify({ hash: hash.digest('hex').slice(0, 16), assets, at: Date.now() }));
-	const narrated = Object.keys(audio).length ? `, ${Object.keys(audio).length} with audio` : '';
-	console.log(`built ${pages.length} pages${narrated} (snapshot ${snap.length} bytes) in ${Math.round(performance.now() - t0)} ms`);
+	console.log(`built ${pages.length} pages (snapshot ${snap.length} bytes) in ${Math.round(performance.now() - t0)} ms`);
 }
 
 await build();
 if (process.argv.includes('--watch')) {
 	let timer: Timer | undefined;
-	for (const dir of ['content', 'gen', 'client', 'styles', 'static', 'audio/manifests']) {
+	for (const dir of ['content', 'gen', 'client', 'styles', 'static']) {
 		if (!existsSync(path.join(root, dir))) continue;
 		watch(path.join(root, dir), { recursive: true }, () => {
 			clearTimeout(timer);

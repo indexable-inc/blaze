@@ -1,3 +1,7 @@
+---
+status: current
+summary: How to build, test and change blaze: AI use, where new code goes, rules for code, working in parallel, landing.
+---
 # Contributing
 
 ## AI use
@@ -55,7 +59,7 @@ it was a module of `hir-ty`. The front end's crates depend on none of blaze's ma
 The front end's crates in `crates/` (`hir-ty`, `hir-def`, `hir-expand`, `syntax`, `parser`,
 `base-db`, `syntax-tree` and the rest) started as a fork of rust-analyzer (DioxusLabs' rustd branch
 merged with upstream master at `0b21bd6596`, with the MIR passes that make its MIR like rustc's
-on top: [mir-passes.md](mir-passes.md)); until 2026-10-28 they lived in `vendor/rust-analyzer`.
+on top: [mir-passes.md](mir-passes.md)); until 2026-10-28 they were a subtree under vendor/.
 They are no longer synced with upstream or with a fork repository, and keep rust-analyzer's crate
 names. Edit them, build and test from the root, and commit like any other file. A plain clone
 builds:
@@ -126,8 +130,8 @@ The daily workflow does this every day and opens the pull request
 ([toolchain.md, "The daily bump"](toolchain.md#the-daily-bump)); by hand it is for fixing what
 a nightly breaks, on the bump's branch `toolchain/bump`, or for trying a nightly:
 
-    python3 harness/toolchain_bump.py '{}'                      # the newest nightly blaze can use
-    python3 harness/toolchain_bump.py '{"date": "2026-11-02"}'  # or a given one
+    uv run --frozen python harness/toolchain_bump.py '{}'                      # the newest nightly blaze can use
+    uv run --frozen python harness/toolchain_bump.py '{"date": "2026-11-02"}'  # or a given one
 
 picks the nightly (the newest of the last two weeks whose manifest has every component blaze
 needs on every host it ships for, or the date given), writes `harness/toolchain` and
@@ -150,7 +154,7 @@ What it leaves to a person, and prints at the end:
    `rustc_abi`'s renamed layout calls, vectors of at most 128 bits passed in registers on
    x86-64 and AArch64, Windows x64's rule for zero-sized types, the `f16b` and `ppcf128`
    layouts, libtest's new entry `test_main_env_args` and the intrinsic `abort_immediate`.
-3. `python3 harness/toolchain_bump.py checks '{}'` in an ix VM, under Cranelift and under LLVM
+3. `uv run --frozen python harness/toolchain_bump.py checks '{}'` in an ix VM, under Cranelift and under LLVM
    (in `nix develop`, with `BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`). It builds
    blaze and runs, in parallel, what proves blaze and the nightly agree: `toolchain_pins.py`,
    `answers.py`, `macroserver.py`, the corpus with its `nightly` feature and `--layouts`, and
@@ -205,6 +209,18 @@ did about it in one line.
 
 When you report what you did, separate what you ran from what you inferred. The reports
 under `docs/reports/` do this and it is the reason they can be used.
+
+## Documents
+
+Every doc under `docs/` opens with front matter saying what it is (`tools/docs.py` has the
+fields): `current` (how blaze is now, kept true), `plan` (a design not fully built, dated),
+`record` (research, a report or a measurement, true on its date and never brought up to date) or
+`superseded` (with `superseded_by`, what replaced it). [docs/README.md](README.md) is the index,
+generated from it; superseded docs are left out. CI's `python3 tools/docs.py check` holds every
+doc's links, and a current doc's anchors, repository paths in backticks and `BLAZE_*` settings,
+against the tree, and every doc that code names. A change that makes a current doc
+untrue fixes it in the same change, or marks it superseded; `python3 tools/docs.py write`
+regenerates the index.
 
 ## Working in parallel
 
@@ -295,10 +311,15 @@ and pinned by its sha256 in `crates/hir-ty-codegen/llvm.json`. The flake's dev s
 
     nix develop -c cargo build -p blaze-engine --release --features llvm
 
-Outside the shell, fetch the same archive and point the build at it:
+Outside the shell, fetch the same archive and point the build at it, as CI's merge gate does
+(`.github/actions/blaze`). It goes below `/usr/local/lib`: llvm-sys's build script names the
+prefix's `lib` to the linker, and a build script in blaze's sandbox may name only a system
+directory of libraries (`crates/blaze-cargo/src/cargo/directives.rs`, `SYSTEM`), so `blaze
+build` refuses a prefix in your home directory.
 
-    python3 .github/scripts/llvm.py fetch --target <triple> --dir ~/.cache/blaze-llvm
-    LLVM_SYS_231_PREFIX=~/.cache/blaze-llvm cargo build -p blaze-engine --release --features llvm
+    sudo mkdir -p /usr/local/lib/blaze-llvm && sudo chown "$USER" /usr/local/lib/blaze-llvm
+    python3 .github/scripts/llvm.py fetch --target <triple> --dir /usr/local/lib/blaze-llvm/<triple>
+    LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/<triple> blaze build -p blaze-engine --release --features llvm
 
 `build.rs` checks the prefix's `blaze-llvm.json` against the pin and stops otherwise: neither
 Homebrew's LLVM nor a distribution's is a source. LLVM is linked in statically, and on Linux so

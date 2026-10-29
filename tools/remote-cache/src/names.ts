@@ -1,6 +1,6 @@
 // Object names a tenant may use (API-v0.md, "Names"). Anything else is the gateway's one 404.
 
-export type Kind = "pack" | "pack.zst" | "key" | "unit" | "manifest" | "deps";
+export type Kind = "pack" | "pack.zst" | "key" | "index" | "unit" | "manifest" | "deps";
 
 export interface Name {
   name: string;
@@ -18,6 +18,7 @@ export function parseName(name: string): Name | null {
   if ((m = /^packs\/([0-9a-f]{64})\.pack$/.exec(name))) return { name, kind: "pack", hash: m[1] };
   if ((m = /^packs\/([0-9a-f]{64})\.pack\.zst$/.exec(name))) return { name, kind: "pack.zst", hash: m[1] };
   if ((m = /^keys\/([0-9a-f]{64})$/.exec(name))) return { name, kind: "key", hash: m[1] };
+  if ((m = /^index\/([0-9a-f]{64})$/.exec(name))) return { name, kind: "index", hash: m[1] };
   if ((m = /^units\/([0-9a-f]{64})$/.exec(name))) return { name, kind: "unit", hash: m[1] };
   if ((m = /^(manifests|deps)\/(.*)$/.exec(name))) {
     const project = m[2];
