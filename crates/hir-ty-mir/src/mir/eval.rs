@@ -2354,15 +2354,14 @@ impl<'db> Evaluator<'db> {
     }
 
     /// Whether every use of `konst` reads the same copy ([`Self::constants`]): not of a
-    /// static, which may be written, nor of an inline `const { .. }`, which is run again as
-    /// its `TypeId`s are this evaluation's ([`Self::inline_const_in_heap`]).
+    /// static, which may be written. An inline `const { .. }` is run by the evaluation
+    /// ([`Self::inline_const_in_heap`]) once, as the `TypeId`s it makes are the evaluation's.
     fn shares_one_copy(&self, konst: Const<'db>) -> bool {
         match konst.kind() {
             ConstKind::Value(_) => true,
             ConstKind::Unevaluated(UnevaluatedConst { def, .. }) => match def.0 {
-                GeneralConstId::ConstId(_) => true,
+                GeneralConstId::ConstId(_) | GeneralConstId::AnonConstId(_) => true,
                 GeneralConstId::StaticId(_) => false,
-                GeneralConstId::AnonConstId(it) => !it.is_inline_const(self.db),
             },
             _ => false,
         }

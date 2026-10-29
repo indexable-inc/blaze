@@ -174,10 +174,11 @@ impl Tree {
         })
     }
 
-    /// The crates with a file whose `include!` names one [`Tree::included`] would load now:
-    /// what was compiled without it is of them, and of what depends on them, alone.
+    /// The crates that named a file [`Tree::included`] would load now, by an `include!` or a
+    /// module declaration: what was compiled without it is of them, and of what depends on them,
+    /// alone.
     pub fn including(&self, db: &RootDatabase) -> Vec<ide_db::base_db::Crate> {
-        let roots: FxHashSet<SourceRootId> = db
+        let loading: FxHashSet<AbsPathBuf> = db
             .included_sources()
             .into_iter()
             .filter(|(path, root)| {
@@ -185,19 +186,15 @@ impl Tree {
                 let known = self.vfs.file_id(&VfsPath::from(path.clone()));
                 !known.is_some_and(|(file, _)| source_root.path_for_file(&file).is_some())
             })
-            .map(|(_, root)| root)
+            .map(|(path, _)| path)
             .collect();
-        if roots.is_empty() {
-            return Vec::new();
-        }
-        ide_db::base_db::all_crates(db)
-            .iter()
-            .copied()
-            .filter(|krate| {
-                let root = krate.data(db).root_file_id;
-                roots.contains(&db.file_source_root(root).source_root_id(db))
-            })
-            .collect()
+        let crates: FxHashSet<_> = db
+            .sources_included_by()
+            .into_iter()
+            .filter(|(_, path)| loading.contains(path))
+            .map(|(krate, _)| krate)
+            .collect();
+        crates.into_iter().collect()
     }
 
     pub fn included(&mut self, db: &mut RootDatabase) -> Vec<(FileId, PathBuf)> {

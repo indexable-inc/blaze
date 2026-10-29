@@ -299,11 +299,17 @@ jobs:
               [ -n "$id" ] && break
             done
             [ -n "$id" ] || { echo "::error::the train dispatched on $TAG did not start"; exit 1; }
+            echo "TRAIN_STARTED=$id" >> "$GITHUB_ENV"
           fi
           echo "train: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$id" | tee -a "$GITHUB_STEP_SUMMARY"
           gh run watch "$id" -R "$GITHUB_REPOSITORY" --interval 120 --exit-status > /dev/null
           [ "$(gh run view "$id" -R "$GITHUB_REPOSITORY" --json headBranch -q .headBranch)" = "$TAG" ] ||
             { echo "::error::run $id is not a train on $TAG"; exit 1; }
+      # A train this promote started serves only it: once the promote is cancelled, nothing
+      # reads the train's result, and it would hold the runners and the train group for hours.
+      - name: cancel the train this promote started
+        if: cancelled() && env.TRAIN_STARTED != ''
+        run: gh run cancel "$TRAIN_STARTED" -R "$GITHUB_REPOSITORY"
 
   verdict:
     name: promote or file

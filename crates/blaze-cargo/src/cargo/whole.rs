@@ -114,7 +114,7 @@ pub fn build(asked: &Invocation) -> anyhow::Result<i32> {
     if asked.subcommand == Subcommand::Run {
         programs.retain(|it| !it.kind.linked_library());
     }
-    if let Some(it) = programs.iter().find(|it| matches!(it.kind, Kind::Staticlib | Kind::Dylib)) {
+    if let Some(it) = programs.iter().find(|it| it.kind == Kind::Dylib) {
         let kind = format!("{:?}", it.kind).to_lowercase();
         say::error(&format!(
             "blaze does not link the `{kind}` of `{}` (target `{}`) yet, so it would write no `{}` (#262)",
@@ -545,9 +545,10 @@ fn checkout(
     let worker = config.id();
     let dirs: Vec<PathBuf> = programs.iter().map(|it| it.dir.join(&worker)).collect();
     let plans = programs.iter().zip(&dirs).map(|(program, dir)| {
-        // A `cdylib` is linked under the name of its file, which a binary of the same name
-        // beside it does not have.
-        let shared = program.kind == Kind::Cdylib;
+        // A `cdylib` or `staticlib` is linked under the name of its file, which a binary of
+        // the same name beside it does not have.
+        let staticlib = program.kind == Kind::Staticlib;
+        let shared = program.kind == Kind::Cdylib || staticlib;
         let name = match shared {
             true => program.executable.file_name().unwrap_or_default().to_string_lossy().into(),
             false => program.name.clone(),
@@ -567,6 +568,7 @@ fn checkout(
             stamp: 0,
             whole: true,
             shared,
+            staticlib,
         }
     });
     for dir in &dirs {

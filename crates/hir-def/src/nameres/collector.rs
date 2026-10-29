@@ -2480,6 +2480,7 @@ impl ModCollector<'_, '_> {
                 let db = self.def_collector.db;
                 match self.mod_dir.resolve_declaration(
                     db,
+                    self.def_collector.def_map.krate,
                     self.file_id(),
                     &module.name,
                     path_attr.as_deref(),
