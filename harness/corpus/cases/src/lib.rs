@@ -6,7 +6,7 @@
 // toolchain only.
 #![cfg_attr(
     feature = "nightly",
-    feature(deref_patterns, c_variadic_int128, portable_simd, core_intrinsics, f16, f128, f16b, unsized_fn_params)
+    feature(deref_patterns, c_variadic_int128, portable_simd, core_intrinsics, f16, f128, f16b, unsized_fn_params, unboxed_closures)
 )]
 // The const traits, closures and std const impls `const_traits` uses.
 #![cfg_attr(
@@ -812,6 +812,36 @@ pub mod objects {
 
     pub fn call_fn(f: &dyn Fn(u32, u32) -> u32, x: u32) -> u32 {
         f(x, 2) + f(1, x)
+    }
+    /// The vtable of `&dyn Fn` as a `dyn Fn` is its written `Fn` impl, whose slot is called
+    /// with the arguments one by one.
+    pub fn forwarded_fn(f: &dyn Fn(&u64, [u64; 2]) -> [u64; 3], word: &u64) -> [u64; 3] {
+        let forwarded: &dyn Fn(&u64, [u64; 2]) -> [u64; 3] = std::hint::black_box(&f);
+        forwarded(word, [11, 13])
+    }
+    /// A non-generic `extern "rust-call"` function is passed its tuple one field at a time,
+    /// as rustc passes it, whether it is called directly or through a pointer: the array is
+    /// large enough that a pointer to the tuple can't pass for the two arguments.
+    #[cfg(feature = "nightly")]
+    #[inline(never)]
+    pub extern "rust-call" fn rust_call_add((first, rest): (&u64, [u64; 5])) -> u64 {
+        *first + rest[4]
+    }
+    #[cfg(feature = "nightly")]
+    pub fn rust_call_pointer(word: &u64) -> (u64, u64) {
+        let args = (word, [1, 2, 3, 4, 5]);
+        let pointer =
+            std::hint::black_box(rust_call_add as extern "rust-call" fn((&u64, [u64; 5])) -> u64);
+        (rust_call_add(args), pointer(args))
+    }
+    /// The runner, built by rustc, calls blaze's `rust_call_add` through this pointer, and
+    /// blaze calls rustc's through `f`: both sides have to spread the tuple alike.
+    #[cfg(feature = "nightly")]
+    pub fn rust_call_across(
+        f: extern "rust-call" fn((&u64, [u64; 5])) -> u64,
+        word: &u64,
+    ) -> (u64, extern "rust-call" fn((&u64, [u64; 5])) -> u64) {
+        (f((word, [6, 7, 8, 9, 10])), std::hint::black_box(rust_call_add))
     }
     pub fn call_fn_mut(f: &mut dyn FnMut(u64) -> u64) -> u64 {
         f(1);

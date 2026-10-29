@@ -77,12 +77,7 @@ pub(crate) struct Flight(Option<u64>);
 
 impl Flight {
     pub(crate) fn root(db: &dyn HirDatabase, func: FunctionId) -> Flight {
-        Flight::of(|| {
-            let name = hir_ty_mir::mir::type_name::rustc_function_name(db, func, &[]);
-            let name =
-                name.unwrap_or_else(|| FunctionSignature::of(db, func).name.as_str().to_owned());
-            (func.krate(db), name)
-        })
+        Flight::of(|| (func.krate(db), root_name(db, func).clone()))
     }
 
     pub(crate) fn instance(
@@ -90,13 +85,7 @@ impl Flight {
         instance: &Instance,
         env: &StoredParamEnvAndCrate,
     ) -> Flight {
-        Flight::of(|| {
-            let krate = match instance.def {
-                InstanceDef::Fn(func) => func.krate(db),
-                _ => env.krate,
-            };
-            (krate, crate::backtrace_name(db, instance))
-        })
+        Flight::of(|| instance_named(db, instance.clone(), env.clone()).clone())
     }
 
     fn of(what: impl FnOnce() -> (Crate, String)) -> Flight {
@@ -108,6 +97,28 @@ impl Flight {
         lock(&LIVE).insert(id, (krate, name, Instant::now()));
         Flight(Some(id))
     }
+}
+
+// The compile that names itself depends on the name: a query of its own keeps what the name is
+// spelled from (bodies, for one) out of the compile's inputs, so an edit that leaves the name
+// as it was recompiles nothing.
+#[salsa::tracked(returns(ref))]
+fn root_name(db: &dyn HirDatabase, func: FunctionId) -> String {
+    let name = hir_ty_mir::mir::type_name::rustc_function_name(db, func, &[]);
+    name.unwrap_or_else(|| FunctionSignature::of(db, func).name.as_str().to_owned())
+}
+
+#[salsa::tracked(returns(ref))]
+fn instance_named(
+    db: &dyn HirDatabase,
+    instance: Instance,
+    env: StoredParamEnvAndCrate,
+) -> (Crate, String) {
+    let krate = match instance.def {
+        InstanceDef::Fn(func) => func.krate(db),
+        _ => env.krate,
+    };
+    (krate, crate::backtrace_name(db, &instance))
 }
 
 impl Drop for Flight {

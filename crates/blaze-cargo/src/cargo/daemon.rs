@@ -520,6 +520,16 @@ impl Drop for Answering<'_> {
     }
 }
 
+/// A checker a check has, counted among those it is answering ([`Daemon::checker`]) until
+/// this is dropped.
+struct Answers(Arc<Checker>);
+
+impl Drop for Answers {
+    fn drop(&mut self) {
+        self.0.answering.fetch_sub(1, Relaxed);
+    }
+}
+
 impl Worker {
     /// Starts a worker on the first program of `checkout`, with its files in `dir`.
     /// `spare` is a process that waits to be told a build, and is told this one.
@@ -966,11 +976,18 @@ impl Spare {
 struct Checker {
     /// The [`WorkerConfig::id`] it was started with.
     id: String,
-    child: Child,
+    child: Mutex<Child>,
     socket: PathBuf,
     log: PathBuf,
     project: PathBuf,
-    asked: Instant,
+    asked: Mutex<Instant>,
+    /// The checks that have it now, asking or waiting to: it is not made way for meanwhile.
+    answering: AtomicUsize,
+    /// Held for the whole of an ask. The process answers one request at a time, and the one
+    /// that has it load again ends it, with what was sent behind that unread.
+    asking: Mutex<()>,
+    /// Stopped: a check that waited for [`Self::asking`] asks a new one.
+    stopped: AtomicBool,
 }
 
 impl Checker {
@@ -997,23 +1014,30 @@ impl Checker {
         command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
         own_group(&mut command);
         let child = command.spawn().context("starting a checker")?;
-        Ok(Checker {
-            id: id.to_owned(),
-            child,
-            socket,
-            log,
-            project: ahead.root.join(&ahead.config.project),
-            asked: Instant::now(),
-        })
+        Ok(Checker::of(id, child, socket, log, ahead.root.join(&ahead.config.project)))
     }
 
-    fn ended(&mut self) -> Option<String> {
-        exited(&mut self.child)
+    fn of(id: &str, child: Child, socket: PathBuf, log: PathBuf, project: PathBuf) -> Checker {
+        Checker {
+            id: id.to_owned(),
+            child: Mutex::new(child),
+            socket,
+            log,
+            project,
+            asked: Mutex::new(Instant::now()),
+            answering: AtomicUsize::new(0),
+            asking: Mutex::new(()),
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    fn ended(&self) -> Option<String> {
+        exited(&mut lock(&self.child))
     }
 
     /// Its answer: `ok`, the errors, or [`crate::check::RELOAD`]. Waits for it to have loaded
-    /// the workspace and to listen.
-    fn ask(&mut self, request: &str) -> anyhow::Result<String> {
+    /// the workspace and to listen. The caller holds [`Self::asking`].
+    fn ask(&self, request: &str) -> anyhow::Result<String> {
         let mut stream = loop {
             match socket::connect(&self.socket) {
                 Ok(stream) => break stream,
@@ -1039,8 +1063,8 @@ impl Checker {
         }
     }
 
-    fn status(&mut self) -> WorkerStatus {
-        let pid = self.child.id();
+    fn status(&self) -> WorkerStatus {
+        let pid = lock(&self.child).id();
         WorkerStatus {
             pid,
             project: self.project.clone(),
@@ -1050,8 +1074,9 @@ impl Checker {
         }
     }
 
-    fn stop(&mut self) {
-        kill(&mut self.child);
+    fn stop(&self) {
+        self.stopped.store(true, Relaxed);
+        kill(&mut lock(&self.child));
         let _ = std::fs::remove_file(&self.socket);
     }
 }
@@ -1091,8 +1116,10 @@ struct Daemon {
     /// How many spare workers were started: each has a directory of its own.
     spares: AtomicUsize,
     /// The checkers of the last [`Request::Check`]s, each of another build and loaded for
-    /// the next check of it: a check for several targets asks one for each.
-    checkers: Mutex<Vec<Checker>>,
+    /// the next check of it: a check for several targets asks one for each. Held only to
+    /// find, add or drop one, never for an ask, which can wait for a whole load: nothing
+    /// else (another workspace's check, `blaze status`, the daemon's end) waits for that.
+    checkers: Mutex<Vec<Arc<Checker>>>,
     asked: Mutex<Instant>,
     watched: Arc<Mutex<Watched>>,
     relays: Arc<Relays>,
@@ -1659,7 +1686,7 @@ impl Daemon {
                 let mut workers: Vec<WorkerStatus> = lock(&self.workers)
                     .values()
                     .map(|it| it.status())
-                    .chain(lock(&self.checkers).iter_mut().map(Checker::status))
+                    .chain(lock(&self.checkers).iter().map(|it| it.status()))
                     .collect();
                 // A checkout being loaded says the step its build is at, as the live view of
                 // that build does.
@@ -1852,16 +1879,13 @@ impl Daemon {
                 }
                 keep
             });
-            // One that is checking holds the lock, and is not idle.
-            if let Ok(mut checkers) = self.checkers.try_lock() {
-                checkers.retain_mut(|it| {
-                    let keep = it.asked.elapsed() < idle;
-                    if !keep {
-                        it.stop();
-                    }
-                    keep
-                });
-            }
+            lock(&self.checkers).retain(|it| {
+                let keep = it.answering.load(Relaxed) != 0 || lock(&it.asked).elapsed() < idle;
+                if !keep {
+                    it.stop();
+                }
+                keep
+            });
         }
     }
 
@@ -1892,45 +1916,37 @@ impl Daemon {
     /// [`CHECKERS`]. `request` is the line the checker is asked with.
     fn check(&self, ahead: &Ahead, request: &str) -> Reply {
         let id = ahead.config.id();
-        let mut held = lock(&self.checkers);
-        held.retain_mut(|it| {
-            let ended = it.ended().is_some();
-            if ended {
-                it.stop();
-            }
-            !ended
-        });
-        for _ in 0..2 {
-            let at = match held.iter().position(|it| it.id == id) {
-                Some(at) => at,
-                None => {
-                    if held.len() >= CHECKERS
-                        && let Some(oldest) = (0..held.len()).min_by_key(|&at| held[at].asked)
-                    {
-                        held.remove(oldest).stop();
-                    }
-                    let dir = self.home.join("checkers").join(&id);
-                    match Checker::start(ahead, &id, &dir) {
-                        Ok(checker) => held.push(checker),
-                        Err(why) => return Reply::Cold { reason: format!("{why:#}") },
-                    }
-                    held.len() - 1
-                }
+        let request = crate::check::request(&ahead.targets, request);
+        let mut loads = 0;
+        while loads < 2 {
+            let held = match self.checker(ahead, &id) {
+                Ok(held) => held,
+                Err(why) => return Reply::Cold { reason: format!("{why:#}") },
             };
-            let checker = &mut held[at];
-            checker.asked = Instant::now();
-            match checker.ask(&crate::check::request(&ahead.targets, request)) {
+            let checker = &*held.0;
+            let asking = lock(&checker.asking);
+            // Made way for, or loaded again by the check before this one.
+            if checker.stopped.load(Relaxed) {
+                continue;
+            }
+            *lock(&checker.asked) = Instant::now();
+            let asked = checker.ask(&request);
+            drop(asking);
+            match asked {
                 Ok(reply) if reply == "ok" => return Reply::Checked { errors: None },
                 Ok(reply) if reply.starts_with(crate::check::LINT) => {
                     return Reply::Linted { answer: reply[crate::check::LINT.len()..].to_owned() };
                 }
-                Ok(reply) if reply == crate::check::RELOAD => held.remove(at).stop(),
+                Ok(reply) if reply == crate::check::RELOAD => {
+                    loads += 1;
+                    self.drop_checker(checker);
+                }
                 Ok(reply) => match NotBuilt::of(&reply) {
                     NotBuilt::Error(said) => return Reply::Checked { errors: Some(said) },
                     why => return Reply::Cold { reason: why.why() },
                 },
                 Err(why) => {
-                    held.remove(at).stop();
+                    self.drop_checker(checker);
                     return Reply::Cold { reason: format!("{why:#}") };
                 }
             }
@@ -1938,6 +1954,44 @@ impl Daemon {
         Reply::Cold {
             reason: "the checker loaded the workspace twice and still had to again".to_owned(),
         }
+    }
+
+    /// The checker of the build `id`, started when there is none or it ended, counted among
+    /// those answering under the lock that would make way for it. The one asked longest ago
+    /// that nobody is asking makes way for a new one when there are [`CHECKERS`].
+    fn checker(&self, ahead: &Ahead, id: &str) -> anyhow::Result<Answers> {
+        let mut held = lock(&self.checkers);
+        held.retain(|it| {
+            let ended = it.ended().is_some();
+            if ended {
+                it.stop();
+            }
+            !ended
+        });
+        let checker = match held.iter().find(|it| it.id == id) {
+            Some(checker) => checker.clone(),
+            None => {
+                let idle =
+                    held.iter().enumerate().filter(|(_, it)| it.answering.load(Relaxed) == 0);
+                let oldest = idle.min_by_key(|(_, it)| *lock(&it.asked)).map(|(at, _)| at);
+                if held.len() >= CHECKERS
+                    && let Some(oldest) = oldest
+                {
+                    held.remove(oldest).stop();
+                }
+                let dir = self.home.join("checkers").join(id);
+                let checker = Arc::new(Checker::start(ahead, id, &dir)?);
+                held.push(checker.clone());
+                checker
+            }
+        };
+        checker.answering.fetch_add(1, Relaxed);
+        Ok(Answers(checker))
+    }
+
+    fn drop_checker(&self, checker: &Checker) {
+        lock(&self.checkers).retain(|it| !std::ptr::eq(&**it, checker));
+        checker.stop();
     }
 
     /// Starts a spare worker when there is none.
@@ -1975,7 +2029,8 @@ impl Daemon {
         if let Some(spare) = spare.as_mut() {
             spare.stop();
         }
-        for checker in lock(&self.checkers).iter_mut() {
+        let checkers = lock(&self.checkers);
+        for checker in checkers.iter() {
             checker.stop();
         }
         for worker in workers.values() {
@@ -2116,6 +2171,120 @@ mod tests {
         watched.record(again, &record(began("/w/a")));
         assert!(!watched.of(Path::new("/w/a")).unwrap().done, "the one under way before the last");
         assert_eq!(watched.watching.len(), 2, "a's last is dropped once another begins");
+    }
+
+    /// A check that waits for its checker (one still loading, or stuck) keeps nothing else
+    /// waiting: not `blaze status`, not a check of another build.
+    #[cfg(unix)]
+    #[test]
+    fn a_check_waiting_for_its_checker_holds_up_nothing_else() {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("blaze-checkers-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ahead = |project: &str| Ahead {
+            config: WorkerConfig {
+                repository: dir.clone(),
+                project: project.into(),
+                cfg_test: false,
+                selection: crate::plan::Selection {
+                    profile: "dev".to_owned(),
+                    features: Vec::new(),
+                    no_default_features: false,
+                    all_features: false,
+                    packages: Vec::new(),
+                    workspace: false,
+                    excludes: Vec::new(),
+                    unstable: Vec::new(),
+                    target: None,
+                    dev_deps: false,
+                    config: Vec::new(),
+                    asked_in: None,
+                },
+                env: BTreeMap::new(),
+                command_env: BTreeMap::new(),
+                whole: false,
+            },
+            root: dir.clone(),
+            crates: Vec::new(),
+            targets: Vec::new(),
+        };
+        let (stuck, answers) = (ahead("stuck"), ahead("answers"));
+        // A checker that takes the request and never answers, and one that answers at once.
+        let stuck_at = dir.join("stuck.sock");
+        let never = UnixListener::bind(&stuck_at).unwrap();
+        let answers_at = dir.join("answers.sock");
+        let at_once = UnixListener::bind(&answers_at).unwrap();
+        std::thread::spawn(move || {
+            for stream in at_once.incoming() {
+                let stream = stream.unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                (&stream).write_all(b"ok\n").unwrap();
+            }
+        });
+        let checker = |ahead: &Ahead, socket: PathBuf| {
+            let child = Command::new("sleep").arg("600").spawn().unwrap();
+            Arc::new(Checker::of(&ahead.config.id(), child, socket, dir.join("log"), dir.clone()))
+        };
+        let daemon = Arc::new(Daemon {
+            version: String::new(),
+            home: dir.clone(),
+            idle: None,
+            memory_max: None,
+            workers: Mutex::default(),
+            spare: Mutex::default(),
+            spare_when: Spares::Never,
+            spares: AtomicUsize::new(0),
+            checkers: Mutex::new(vec![checker(&stuck, stuck_at), checker(&answers, answers_at)]),
+            asked: Mutex::new(Instant::now()),
+            watched: Arc::default(),
+            relays: Arc::default(),
+        });
+        let waiting = {
+            let daemon = daemon.clone();
+            std::thread::spawn(move || daemon.check(&stuck, "check"))
+        };
+        // Its request is read once it waits for the answer.
+        never.set_nonblocking(true).unwrap();
+        let given_up = Instant::now() + Duration::from_secs(10);
+        let asked = loop {
+            match never.accept() {
+                Ok((asked, _)) => break asked,
+                Err(_) if waiting.is_finished() => {
+                    panic!("the check asked nothing: {:?}", waiting.join().unwrap())
+                }
+                Err(_) if Instant::now() < given_up => std::thread::sleep(POLL),
+                Err(why) => panic!("the check asked nothing in 10 s: {why}"),
+            }
+        };
+        asked.set_nonblocking(false).unwrap();
+        let mut line = String::new();
+        BufReader::new(&asked).read_line(&mut line).unwrap();
+        assert!(!waiting.is_finished(), "the check did not wait for its checker");
+        let within = |what: &'static str, ask: Box<dyn FnOnce() -> Reply + Send>| {
+            let (to, told) = std::sync::mpsc::channel();
+            std::thread::spawn(move || _ = to.send(ask()));
+            told.recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("{what} waited for another build's check"))
+        };
+        let status = {
+            let daemon = daemon.clone();
+            within("`blaze status`", Box::new(move || daemon.handle(Request::Status)))
+        };
+        assert!(matches!(status, Reply::Status(Status { ref workers, .. }) if workers.len() == 2));
+        let other = {
+            let daemon = daemon.clone();
+            within("a check of another build", Box::new(move || daemon.check(&answers, "check")))
+        };
+        assert!(matches!(other, Reply::Checked { errors: None }), "{other:?}");
+        // The stuck one hangs up, which ends its check.
+        drop(asked);
+        assert!(matches!(waiting.join().unwrap(), Reply::Cold { .. }));
+        for checker in lock(&daemon.checkers).iter() {
+            checker.stop();
+        }
+        _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -266,9 +266,8 @@ fn compile_in(
     if let Some(why) = crate::unstable::refusal(asked.args) {
         return Err(format!("it is built with {why}"));
     }
-    let library = sysroot.join("lib/rustlib/src/rust/library");
-    if !library.is_dir() {
-        return Err("the toolchain has no source of the standard library".to_owned());
+    if let Err(why) = crate::cargo::toolchain::library::found() {
+        return Err(format!("blaze has no source of the standard library: {why}"));
     }
     let mut crates = Vec::new();
     let first = Described {
@@ -509,11 +508,11 @@ fn links_proc_macro(crates: &[Described]) -> bool {
     })
 }
 
-/// The `rust-project.json` of `crates` over the standard library of `sysroot`.
+/// The `rust-project.json` of `crates` over blaze's standard library, for `sysroot`.
 pub fn description(sysroot: &Path, crates: &[Described]) -> String {
     json!({
         "sysroot": sysroot,
-        "sysroot_src": sysroot.join("lib/rustlib/src/rust/library"),
+        "sysroot_src": crate::cargo::toolchain::library::dir(),
         "crates": crates.iter().enumerate().map(|(at, it)| described(it, at == 0)).collect::<Vec<_>>(),
     })
     .to_string()

@@ -341,7 +341,10 @@ def test_results(ran):
     # the failures from the list at the end, and the totals say the rest.
     failed = [name for listed in re.findall(r"^failures:\n((?:    \S.*\n)+)", names, re.M) for name in listed.split("\n")]
     kept = getattr(ran, "kept", [])
-    tests = collections.Counter([(name, "ran") for name in re.findall(r"^test (.+?) \.\.\. ", names, re.M) + kept] + [(name.strip(), "FAILED") for name in failed if name])
+    # libtest prints a test's mode after its name (`name - should panic ... ok`); the name
+    # of a kept pass is without it.
+    shown = re.findall(r"^test (.+?)(?: - (?:should panic|compile fail|compilation))? \.\.\. ", names, re.M)
+    tests = collections.Counter([(name, "ran") for name in shown + kept] + [(name.strip(), "FAILED") for name in failed if name])
     ended = re.findall(r"^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; \d+ filtered out", ran.stdout, re.M)
     passed, failing, ignored, measured = (sum(int(it[at]) for it in ended) for at in range(1, 5))
     totals = (sum(it[0] != "ok" for it in ended), passed + len(kept), failing, ignored, measured)

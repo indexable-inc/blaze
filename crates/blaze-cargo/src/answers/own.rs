@@ -23,6 +23,10 @@ struct Release {
     version: String,
     /// What `-vV` prints, with `{host}` for the host's tuple.
     verbose: String,
+    /// The warning of `-C target-feature=+{feature}` of a feature neither rustc nor LLVM has
+    /// of the target, with `{feature}` for its name.
+    #[serde(default)]
+    unknown_feature: Option<String>,
     targets: BTreeMap<String, Target>,
 }
 
@@ -59,6 +63,10 @@ struct Target {
     /// The cfgs besides `target_feature` a feature has: wasm's `atomics`, `target_has_threads`.
     #[serde(default)]
     feature_cfgs: BTreeMap<String, Vec<String>>,
+    /// The other features rustc or LLVM lists of the target (`--print target-features`).
+    /// One of none of these turns nothing on or off, with a warning.
+    #[serde(default)]
+    other_features: Vec<String>,
 }
 
 impl Target {
@@ -81,15 +89,25 @@ impl Target {
         specs.all(|it| it == spec).then_some(spec)
     }
 
+    /// Whether rustc or LLVM lists `name` as a feature of the target.
+    fn lists(&self, name: &str) -> bool {
+        self.features.contains_key(name)
+            || self.llvm_features.contains_key(name)
+            || self.features_off.contains_key(name)
+            || self.other_features.iter().any(|it| it == name)
+    }
+
     /// The `target_feature`s of `cpu` with `features` turned on (`true`) and off in order,
-    /// starting from `have`, the target's own; `None` for a CPU or feature rustc warns of or
-    /// does not have.
-    fn tuned(
+    /// starting from `have`, the target's own, and the features of `features` neither rustc
+    /// nor LLVM has, which change nothing and which rustc warns of, in order; `None` for a
+    /// CPU or feature rustc warns of otherwise or does not have, and where what is listed is
+    /// not recorded.
+    fn tuned<'a>(
         &self,
         have: Vec<String>,
         cpu: Option<(&str, Option<&str>)>,
-        features: &[(bool, &str)],
-    ) -> Option<Vec<String>> {
+        features: &[(bool, &'a str)],
+    ) -> Option<(Vec<String>, Vec<&'a str>)> {
         let own: Vec<String> = have.clone();
         let mut have: std::collections::BTreeSet<String> = match cpu {
             Some((name, _)) => {
@@ -138,10 +156,15 @@ impl Target {
         for (enable, name) in &host {
             apply(*enable, name, true)?;
         }
+        let mut unknown = Vec::new();
         for &(enable, name) in features {
+            if !self.other_features.is_empty() && !self.lists(name) {
+                unknown.push(name);
+                continue;
+            }
             apply(enable, name, false)?;
         }
-        Some(have.into_iter().collect())
+        Some((have.into_iter().collect(), unknown))
     }
 }
 
@@ -494,6 +517,7 @@ pub fn answered(
     let target = release.targets.get(tuple)?;
     let mut out = String::new();
     let mut dropped: Vec<&str> = Vec::new();
+    let mut unknown: Vec<&str> = Vec::new();
     for print in &given.prints {
         match *print {
             // Beside another print rustc stops before it links.
@@ -575,7 +599,8 @@ pub fn answered(
                     };
                     let own = cfgs.iter().filter_map(feature).collect();
                     let cpu = cpu.as_ref().map(|(name, host)| (name.as_str(), host.as_deref()));
-                    let tuned = target.tuned(own, cpu, &given.features)?;
+                    let (tuned, unlisted) = target.tuned(own, cpu, &given.features)?;
+                    unknown = unlisted;
                     cfgs.retain(|it| feature(it).is_none());
                     for feature in &tuned {
                         cfgs.extend(
@@ -629,16 +654,19 @@ pub fn answered(
         }
     }
     let mut warned = String::new();
-    if !dropped.is_empty() && !given.lints_capped && !given.warnings_hidden {
-        if given.diagnostics_set {
+    let count = unknown.len() + dropped.len();
+    if count > 0 && !given.lints_capped && !given.warnings_hidden {
+        if given.diagnostics_set || (!unknown.is_empty() && !dropped.is_empty()) {
             return None;
+        }
+        for feature in &unknown {
+            warned += &release.unknown_feature.as_ref()?.replace("{feature}", feature);
         }
         for kind in &dropped {
             warned += &format!(
                 "warning: dropping unsupported crate type `{kind}` for target `{tuple}`\n\n"
             );
         }
-        let count = dropped.len();
         warned +=
             &format!("warning: {count} warning{} emitted\n\n", if count == 1 { "" } else { "s" });
     }

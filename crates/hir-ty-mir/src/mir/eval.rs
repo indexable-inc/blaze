@@ -42,6 +42,7 @@ use crate::{
     CallableDefId, ComplexMemoryMap, InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate,
     consteval::{self, ConstEvalError, try_const_usize},
     db::{AnonConstId, GeneralConstId, HirDatabase, InternedClosureId},
+    drop::{DropGlue, has_drop_glue},
     infer::PointerCast,
     layout::{Layout, LayoutError, RustcEnumVariantIdx, RustcFieldIdx},
     method_resolution::{is_dyn_method, lookup_impl_const},
@@ -201,6 +202,14 @@ enum Origin {
 /// A block of the heap: the size and alignment it was asked for, the bytes it takes, of a
 /// size class ([`size_class`]) a freed block of the same class and alignment is reused for,
 /// and what made it.
+/// What is left of a drop ([`Evaluator::run_drop_glue_deep`]).
+enum DropStep<'db> {
+    /// The drop glue of a value: its type, where it is, and its metadata if unsized.
+    Glue(Ty<'db>, Address, Vec<u8>),
+    /// The `Drop` impl of a `Box`, once what it points to is dropped.
+    DropImpl(Ty<'db>, Address),
+}
+
 #[derive(Debug, Clone, Copy)]
 struct HeapBlock {
     size: usize,
@@ -214,9 +223,6 @@ struct HeapBlock {
 fn size_class(size: usize) -> usize {
     size.max(8).checked_next_power_of_two().unwrap_or(usize::MAX)
 }
-
-/// Whether a frame's stack is given back when it returns ([`Evaluator::free_stack`]).
-const FREES_FRAMES: bool = false;
 
 pub struct Evaluator<'db> {
     db: &'db dyn HirDatabase,
@@ -235,6 +241,8 @@ pub struct Evaluator<'db> {
     /// Where a promoted temporary of a body (`&[1, 2]`) is: in the heap, as its borrow
     /// outlives the call, once for every call of the body.
     promoted: FxHashMap<(usize, LocalId), Address>,
+    /// Whether dropping a value of a type does anything ([`Self::has_drop_glue`]).
+    drop_glue: FxHashMap<Ty<'db>, bool>,
     /// Where the value of a constant operand is, once read: the program never writes it, so
     /// every use of the constant reads the same copy.
     constants: FxHashMap<Either<Const<'db>, Allocation<'db>>, Interval>,
@@ -579,6 +587,7 @@ impl<'db> Evaluator<'db> {
             heap_blocks: BTreeMap::new(),
             free_blocks: FxHashMap::default(),
             promoted: FxHashMap::default(),
+            drop_glue: FxHashMap::default(),
             constants: FxHashMap::default(),
             code_stack: vec![],
             running: None,
@@ -1055,14 +1064,8 @@ impl<'db> Evaluator<'db> {
     /// Gives back the stack above `len`, of the frames that returned: nothing points there
     /// any more but what a dangling pointer would, as the temporaries whose borrows outlive
     /// a call are in the heap ([`Self::promoted`]).
-    ///
-    /// Not yet: with it, the standard library's integer formatting has no buffer length
-    /// (`[MaybeUninit<u8>; {const error}]`, `MAX.ilog10() + 1`), so something still reads a
-    /// returned frame.
     fn free_stack(&mut self, len: usize) {
-        if FREES_FRAMES {
-            self.truncate_stack(len);
-        }
+        self.truncate_stack(len);
     }
 
     fn truncate_stack(&mut self, len: usize) {
@@ -3492,6 +3495,7 @@ impl<'db> Evaluator<'db> {
                 args,
                 locals,
                 span,
+                None,
             ),
             _ => Err(MirEvalError::InternalError("function pointer to non function".into())),
         }
@@ -3506,6 +3510,7 @@ impl<'db> Evaluator<'db> {
         args: &[IntervalAndTy<'db>],
         locals: &Locals<'db>,
         span: MirSpan,
+        consumed: Option<Ty<'db>>,
     ) -> Result<'db, Option<StackFrame<'db>>> {
         let mir_body = super::optimize::interpreted_closure_body(
             self.db,
@@ -3514,12 +3519,14 @@ impl<'db> Evaluator<'db> {
             self.param_env.store(),
         )
         .map_err(|it| MirEvalError::MirLowerErrorForClosure(closure, it))?;
-        let closure_data =
-            if mir_body.locals[mir_body.param_locals[0]].ty.as_ref().as_reference().is_some() {
-                closure_data.addr.to_bytes().to_vec()
-            } else {
-                closure_data.get(self)?.to_owned()
-            };
+        let by_reference =
+            mir_body.locals[mir_body.param_locals[0]].ty.as_ref().as_reference().is_some();
+        let closure_addr = closure_data.addr;
+        let closure_data = if by_reference {
+            closure_addr.to_bytes().to_vec()
+        } else {
+            closure_data.get(self)?.to_owned()
+        };
         let arg_bytes = iter::once(Ok(closure_data))
             .chain(args.iter().map(|it| Ok(it.get(self)?.to_owned())))
             .collect::<Result<'db, Vec<_>>>()?;
@@ -3533,6 +3540,14 @@ impl<'db> Evaluator<'db> {
                 )
             })?;
         destination.write_from_interval(self, interval)?;
+        // A `Fn` or `FnMut` closure called by value through `FnOnce::call_once` is dropped
+        // after the call, as rustc's `ClosureOnceShim` does: nothing else owns it then. One
+        // whose body takes it by value dropped it itself.
+        if let Some(closure_ty) = consumed
+            && by_reference
+        {
+            self.run_drop_glue_deep(closure_ty, locals, closure_addr, &[], span)?;
+        }
         self.free_stack(mark);
         Ok(None)
     }
@@ -3779,15 +3794,20 @@ impl<'db> Evaluator<'db> {
             TyKind::FnPtr(..) => {
                 self.exec_fn_pointer(func_data, destination, &args[1..], locals, target_bb, span)
             }
-            TyKind::Closure(closure, subst) => self.exec_closure(
-                closure.0,
-                func_data,
-                GenericArgs::new_from_slice(subst.as_closure().parent_args()),
-                destination,
-                &args[1..],
-                locals,
-                span,
-            ),
+            TyKind::Closure(closure, subst) => {
+                let consumed = (Some(def) == self.cached_fn_once_trait_func && func_ty == func.ty)
+                    .then_some(func_ty);
+                self.exec_closure(
+                    closure.0,
+                    func_data,
+                    GenericArgs::new_from_slice(subst.as_closure().parent_args()),
+                    destination,
+                    &args[1..],
+                    locals,
+                    span,
+                    consumed,
+                )
+            }
             _ => {
                 // try to execute the manual impl of `FnTrait` for structs (nightly feature used in std)
                 let arg0 = func;
@@ -3907,6 +3927,13 @@ impl<'db> Evaluator<'db> {
         self.run_drop_glue_deep(ty, locals, addr, &metadata, span)
     }
 
+    /// Drops the value of type `ty` at `addr`, as rustc's `drop_in_place::<ty>`: its `Drop`
+    /// impl, then its parts in order (a struct's or tuple's fields, a closure's captures, the
+    /// fields of the variant an enum holds, an array's or slice's elements). A `Box` drops what
+    /// it points to before its `Drop` frees it.
+    ///
+    /// The parts wait on a stack of steps rather than the native one: a list of a thousand
+    /// boxes is a thousand levels deep.
     fn run_drop_glue_deep(
         &mut self,
         ty: Ty<'db>,
@@ -3915,12 +3942,167 @@ impl<'db> Evaluator<'db> {
         metadata: &[u8],
         span: MirSpan,
     ) -> Result<'db, ()> {
-        let Some(drop_fn) = self.lang_items().Drop_drop else {
-            // in some tests we don't have drop trait in minicore, and
-            // we can ignore drop in them.
+        if self.lang_items().Drop_drop.is_none() {
             return Ok(());
-        };
+        }
+        let mut steps = vec![DropStep::Glue(ty, addr, metadata.to_vec())];
+        while let Some(step) = steps.pop() {
+            match step {
+                DropStep::Glue(ty, addr, metadata) => {
+                    self.drop_glue_step(ty, locals, addr, &metadata, span, &mut steps)?
+                }
+                DropStep::DropImpl(ty, addr) => self.call_drop_impl(ty, locals, addr, span)?,
+            }
+        }
+        Ok(())
+    }
 
+    /// One step of [`Self::run_drop_glue_deep`]: runs what comes first in dropping the value
+    /// and pushes the rest onto `steps`, last first.
+    fn drop_glue_step(
+        &mut self,
+        ty: Ty<'db>,
+        locals: &Locals<'db>,
+        addr: Address,
+        metadata: &[u8],
+        span: MirSpan,
+        steps: &mut Vec<DropStep<'db>>,
+    ) -> Result<'db, ()> {
+        if !self.has_drop_glue(ty) {
+            return Ok(());
+        }
+        // A field's declared type can be a projection (`Cow::Owned`'s `<B as ToOwned>::Owned`,
+        // `FlatMap`'s `Option<U::IntoIter>`), which `has_drop_glue` saw through.
+        let ty = match ty.kind() {
+            TyKind::Alias(..) => {
+                let normalized = ObligationCtxt::new(&self.infcx)
+                    .structurally_normalize_ty(
+                        &ObligationCause::dummy(),
+                        self.param_env.param_env,
+                        ty,
+                    )
+                    .map_err(|_| {
+                        MirEvalError::NotSupported(format!(
+                            "dropping {ty:?}, which does not normalize"
+                        ))
+                    })?;
+                if matches!(normalized.kind(), TyKind::Alias(..) | TyKind::Infer(..)) {
+                    not_supported!("dropping {ty:?}, which does not normalize");
+                }
+                normalized
+            }
+            _ => ty,
+        };
+        let mut parts = Vec::new();
+        match ty.kind() {
+            TyKind::Adt(adt_def, subst) => {
+                let id = adt_def.def_id();
+                if let AdtId::StructId(s) = id
+                    && StructSignature::of(self.db, s).flags.contains(StructFlags::IS_MANUALLY_DROP)
+                {
+                    return Ok(());
+                }
+                let layout = self.layout_adt(id, subst)?;
+                if adt_def.is_box() {
+                    let AdtId::StructId(s) = id else {
+                        not_supported!("a box that is not a struct")
+                    };
+                    let field_types = self.db.field_types(s.into());
+                    let Some((_, pointer)) = field_types.iter().next() else {
+                        not_supported!("a box with no pointer");
+                    };
+                    let pointer = pointer.ty().instantiate(self.interner(), subst).skip_norm_wip();
+                    let size = self.size_of_sized(pointer, locals, "pointer of a box")?;
+                    let offset = layout.fields.offset(0).bytes_usize();
+                    let bytes = self.read_memory(addr.offset(offset), size)?.to_vec();
+                    let (data, contents_metadata) = bytes.split_at(self.ptr_size());
+                    parts.push(DropStep::Glue(
+                        subst.type_at(0),
+                        Address::from_bytes(data)?,
+                        contents_metadata.to_vec(),
+                    ));
+                    parts.push(DropStep::DropImpl(ty, addr));
+                } else {
+                    self.call_drop_impl(ty, locals, addr, span)?;
+                }
+                let bytes;
+                let (variant, layout): (VariantId, Cow<'_, Layout>) = match id {
+                    AdtId::StructId(s) => (s.into(), Cow::Borrowed(&*layout)),
+                    AdtId::UnionId(_) => return Ok(()),
+                    AdtId::EnumId(e) => {
+                        bytes = self.read_memory(addr, layout.size.bytes_usize())?.to_vec();
+                        match detect_variant_from_bytes(
+                            &layout,
+                            self.db,
+                            self.target_data_layout,
+                            &bytes,
+                            e,
+                        ) {
+                            Some((variant, layout)) => (variant.into(), layout),
+                            None => not_supported!("dropping {ty:?}: no variant has its tag"),
+                        }
+                    }
+                };
+                let field_types = self.db.field_types(variant);
+                let fields = variant.fields(self.db).fields();
+                let last = fields.iter().count().checked_sub(1);
+                for (index, (field, _)) in fields.iter().enumerate() {
+                    let offset =
+                        layout.fields.offset(u32::from(field.into_raw()) as usize).bytes_usize();
+                    let ty =
+                        field_types[field].ty().instantiate(self.interner(), subst).skip_norm_wip();
+                    // The metadata of an unsized struct is its last field's (`RefCell<dyn FnMut()>`).
+                    let metadata = if Some(index) == last { metadata.to_vec() } else { Vec::new() };
+                    parts.push(DropStep::Glue(ty, addr.offset(offset), metadata));
+                }
+            }
+            TyKind::Tuple(fields) => self.field_steps(ty, fields.iter(), addr, &mut parts)?,
+            TyKind::Closure(_, args) => {
+                let upvars = args.as_closure().tupled_upvars_ty();
+                self.field_steps(ty, upvars.tuple_fields().iter(), addr, &mut parts)?;
+            }
+            TyKind::Array(inner, len) => {
+                let Some(len) = try_const_usize(self.db, len) else {
+                    not_supported!("dropping an array of no evaluated length");
+                };
+                self.element_steps(inner, len as usize, locals, addr, &mut parts)?;
+            }
+            TyKind::Slice(inner) => {
+                let len = from_bytes!(usize, metadata);
+                self.element_steps(inner, len, locals, addr, &mut parts)?;
+            }
+            TyKind::Dynamic(..) => {
+                if metadata.is_empty() {
+                    not_supported!("dropping {ty:?} with no vtable");
+                }
+                let concrete_ty = self.vtable_map.ty_of_bytes(metadata)?;
+                parts.push(DropStep::Glue(concrete_ty, addr, Vec::new()));
+            }
+            _ => not_supported!("drop glue of {ty:?}"),
+        }
+        steps.extend(parts.into_iter().rev());
+        Ok(())
+    }
+
+    /// Whether dropping a value of `ty` does anything, once per type.
+    fn has_drop_glue(&mut self, ty: Ty<'db>) -> bool {
+        if let Some(&it) = self.drop_glue.get(&ty) {
+            return it;
+        }
+        let it = has_drop_glue(&self.infcx, ty, self.param_env.param_env) != DropGlue::None;
+        self.drop_glue.insert(ty, it);
+        it
+    }
+
+    /// `<ty as Drop>::drop` on the value at `addr`, if `ty` has a `Drop` impl.
+    fn call_drop_impl(
+        &mut self,
+        ty: Ty<'db>,
+        locals: &Locals<'db>,
+        addr: Address,
+        span: MirSpan,
+    ) -> Result<'db, ()> {
+        let Some(drop_fn) = self.lang_items().Drop_drop else { return Ok(()) };
         let generic_args = GenericArgs::new_from_slice(&[ty.into()]);
         let (drop_impl, drop_args) = self.db.lookup_impl_method(
             ParamEnvAndCrate { param_env: self.param_env.param_env, krate: self.crate_id },
@@ -3929,13 +4111,14 @@ impl<'db> Evaluator<'db> {
         );
         if let Either::Left(drop_impl) = drop_impl
             && matches!(drop_impl.lookup(self.db).container, ItemContainerId::ImplId(_))
-            && let Ok(body) = super::optimize::interpreted_body(
+        {
+            let body = super::optimize::interpreted_body(
                 self.db,
                 drop_impl.into(),
                 drop_args.store(),
                 self.param_env.store(),
             )
-        {
+            .map_err(|it| MirEvalError::MirLowerError(drop_impl, it))?;
             self.exec_looked_up_function(
                 body,
                 locals,
@@ -3946,74 +4129,39 @@ impl<'db> Evaluator<'db> {
                 None,
             )?;
         }
-        match ty.kind() {
-            TyKind::Adt(adt_def, subst) => {
-                let id = adt_def.def_id();
-                match id {
-                    AdtId::StructId(s) => {
-                        let data = StructSignature::of(self.db, s);
-                        if data.flags.contains(StructFlags::IS_MANUALLY_DROP) {
-                            return Ok(());
-                        }
-                        let layout = self.layout_adt(id, subst)?;
-                        let variant_fields = s.fields(self.db);
-                        match variant_fields.shape {
-                            FieldsShape::Record | FieldsShape::Tuple => {
-                                let field_types = self.db.field_types(s.into());
-                                for (field, _) in variant_fields.fields().iter() {
-                                    let offset = layout
-                                        .fields
-                                        .offset(u32::from(field.into_raw()) as usize)
-                                        .bytes_usize();
-                                    let addr = addr.offset(offset);
-                                    let ty = field_types[field]
-                                        .ty()
-                                        .instantiate(self.interner(), subst)
-                                        .skip_norm_wip();
-                                    self.run_drop_glue_deep(ty, locals, addr, &[], span)?;
-                                }
-                            }
-                            FieldsShape::Unit => (),
-                        }
-                    }
-                    AdtId::UnionId(_) => (), // union fields don't need drop
-                    AdtId::EnumId(_) => (),
-                }
-            }
-            TyKind::Dynamic(..) => {
-                if !metadata.is_empty() {
-                    let concrete_ty = self.vtable_map.ty_of_bytes(metadata)?;
-                    self.run_drop_glue_deep(concrete_ty, locals, addr, &[], span)?;
-                }
-            }
-            TyKind::Bool
-            | TyKind::Char
-            | TyKind::Int(_)
-            | TyKind::Uint(_)
-            | TyKind::Float(_)
-            | TyKind::Tuple(_)
-            | TyKind::Array(_, _)
-            | TyKind::Slice(_)
-            | TyKind::RawPtr(_, _)
-            | TyKind::Ref(_, _, _)
-            | TyKind::Alias(..)
-            | TyKind::FnDef(_, _)
-            | TyKind::Str
-            | TyKind::Never
-            | TyKind::Closure(_, _)
-            | TyKind::Coroutine(_, _)
-            | TyKind::CoroutineClosure(..)
-            | TyKind::CoroutineWitness(_, _)
-            | TyKind::Foreign(_)
-            | TyKind::Error(_)
-            | TyKind::Param(_)
-            | TyKind::Placeholder(_)
-            | TyKind::FnPtr(..)
-            | TyKind::Bound(..)
-            | TyKind::Infer(..)
-            | TyKind::Pat(..)
-            | TyKind::UnsafeBinder(..) => (),
-        };
+        Ok(())
+    }
+
+    /// The drops of the fields of the tuple or closure `ty` at `addr`, of types `fields`, in order.
+    fn field_steps(
+        &mut self,
+        ty: Ty<'db>,
+        fields: impl Iterator<Item = Ty<'db>>,
+        addr: Address,
+        parts: &mut Vec<DropStep<'db>>,
+    ) -> Result<'db, ()> {
+        let layout = self.layout(ty)?;
+        for (i, field) in fields.enumerate() {
+            let offset = layout.fields.offset(i).bytes_usize();
+            parts.push(DropStep::Glue(field, addr.offset(offset), Vec::new()));
+        }
+        Ok(())
+    }
+
+    /// The drops of `len` elements of type `inner` from `addr` on, first to last.
+    fn element_steps(
+        &mut self,
+        inner: Ty<'db>,
+        len: usize,
+        locals: &Locals<'db>,
+        addr: Address,
+        parts: &mut Vec<DropStep<'db>>,
+    ) -> Result<'db, ()> {
+        if !self.has_drop_glue(inner) {
+            return Ok(());
+        }
+        let size = self.size_of_sized(inner, locals, "element to drop")?;
+        parts.extend((0..len).map(|i| DropStep::Glue(inner, addr.offset(i * size), Vec::new())));
         Ok(())
     }
 

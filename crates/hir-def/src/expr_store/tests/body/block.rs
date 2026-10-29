@@ -607,3 +607,43 @@ pub const S;
         "#]],
     )
 }
+
+#[test]
+fn module_in_block_after_include_has_its_macro_rules() {
+    // clang-sys 1.8.1 (`runtime`): `load_manually` has `mod build { include!("macros.rs");
+    // pub mod dynamic { .. } }` in its body, and `dynamic` calls the `target_os!` it defines.
+    check_at(
+        r#"
+//- minicore: include
+//- /lib.rs
+fn load_manually() {
+    mod build {
+        include!("macros.rs");
+        pub mod dynamic {
+            target_os!();
+            $0
+        }
+    }
+}
+//- /macros.rs
+macro_rules! target_os {
+    () => { pub struct Linux; };
+}
+"#,
+        expect![[r#"
+            (block scope)
+            - build : type
+
+            (block scope)::build
+            - dynamic : type
+            - (legacy) target_os : macro!
+
+            (block scope)::build::dynamic
+            - Linux : type value
+            - (legacy) target_os : macro!
+
+            crate
+            - load_manually : value
+        "#]],
+    )
+}

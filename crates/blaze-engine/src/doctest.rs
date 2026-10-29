@@ -577,6 +577,11 @@ impl Ours {
         };
         let linked = line.link(&[&objects[0], &objects[1]], &binary).map_err(refused);
         let linked = linked.and_then(|_| {
+            // On Windows the executable keeps every stand-in of the unit, reached or not
+            // (`link_whole`): one the example calls says so when it runs.
+            if cfg!(windows) {
+                return Ok(());
+            }
             let stand_ins = crate::link::stand_ins(&binary)?;
             match stand_ins.first() {
                 Some(first) => anyhow::bail!(
@@ -1159,7 +1164,13 @@ fn compile(
     let reads = ["include!", "include_str!", "include_bytes!", "env!"];
     let reads = reads.iter().any(|it| test.program.source.contains(it));
     let blaze = std::env::current_exe().ok().and_then(|it| stamp(&it));
-    let env = [("BLAZE", format!("{blaze:?}")), ("built from", built_from.to_owned())];
+    // Examples of the same code and line (a file included in two places, or one item's and
+    // the crate's) are compiled at once: each has a directory of its own to link in.
+    let env = [
+        ("BLAZE", format!("{blaze:?}")),
+        ("built from", built_from.to_owned()),
+        ("example", test.name.clone()),
+    ];
     let edition = format!("{:?}", test.edition);
     let memo = asked.memo().filter(|_| !reads && blaze.is_some()).map(|memo| {
         memo.join(format!("blaze-{}", asked.key(&test.program.source, &edition, &env, true)))
