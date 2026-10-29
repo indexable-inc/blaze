@@ -3275,8 +3275,8 @@ fn inline_const_in_a_loop_is_evaluated_once() {
         let mut i = 0;
         let mut sum = 0;
         while i < 3000 {
-            let a = const { [1u8; 1 << 19] };
-            sum += a[i] as usize;
+            let [first, ..] = const { [1u8; 1 << 19] };
+            sum += first as usize;
             i += 1;
         }
         sum
