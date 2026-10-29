@@ -44,6 +44,11 @@ const SETTLE: Duration = Duration::from_secs(60);
 /// How often the daemon looks for what is idle.
 const TICK: Duration = Duration::from_secs(1);
 
+/// How long a worker whose first build compiled from cold goes unasked before the daemon
+/// starts one from the store in its place ([`Daemon::settle`]): builds asked while it does
+/// wait for the new one to load.
+const SETTLE_AFTER: Duration = Duration::from_secs(10);
+
 /// How many checkers the daemon keeps loaded, each of another build: a check for several
 /// targets, or checks of several workspaces in turn.
 const CHECKERS: usize = 4;
@@ -137,6 +142,13 @@ pub const ENDS_WITH_INPUT: &str = "BLAZE_ENDS_WITH_INPUT";
 /// loaded the workspace, in JSON, before it ends.
 pub fn errors_beside(socket: &Path) -> PathBuf {
     socket.with_file_name("errors")
+}
+
+/// The file a worker that listens at `socket` writes once its first build compiled from
+/// cold and the store has all of it: a worker started now would load it from the store, and
+/// hold what a warm start holds.
+pub fn settles_beside(socket: &Path) -> PathBuf {
+    socket.with_file_name("settles")
 }
 
 /// What the daemon reads of a request of a blaze from before the frames, which sent JSON:
@@ -447,9 +459,10 @@ impl Checkout {
             false => (plan.binary.display().to_string(), String::new()),
         };
         // A shared library is linked again for each build, not patched: see [`Plan::shared`].
-        let (shared, patch) = match plan.shared {
-            true => ("shared", String::new()),
-            false => ("", plan.patch.display().to_string()),
+        let (shared, patch) = match (plan.shared, plan.staticlib) {
+            (true, true) => ("staticlib", String::new()),
+            (true, false) => ("shared", String::new()),
+            (false, _) => ("", plan.patch.display().to_string()),
         };
         let unit_test = if plan.unit_test { super::plan::UNIT_TEST } else { "" };
         let mut line = format!(
@@ -495,6 +508,8 @@ struct Loaded {
     generation: u128,
     root: PathBuf,
     warmth: Warmth,
+    /// What it was loaded with, which a worker started in its place loads.
+    checkout: Checkout,
 }
 
 /// A `blaze <project> --socket` process and the checkouts it holds.
@@ -509,6 +524,8 @@ struct Worker {
     answering: AtomicUsize,
     /// Whether the daemon's log says it ended: it says so once.
     noted: AtomicBool,
+    /// Whether it was started in place of one that built from cold: it is not swapped again.
+    settled: bool,
 }
 
 /// Counts a request among those a worker is answering for as long as it lives, also when the
@@ -549,6 +566,7 @@ impl Worker {
         // is not the one to connect to.
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_file(errors_beside(&socket));
+        let _ = std::fs::remove_file(settles_beside(&socket));
         blaze_protocol::follow::forget_beside(&socket);
         let config = &checkout.config;
         let mut args = config.args(&checkout.root, &first.crates);
@@ -574,6 +592,9 @@ impl Worker {
         }
         if first.shared {
             args.push("--shared".into());
+        }
+        if first.staticlib {
+            args.push("--staticlib".into());
         }
         if first.unit_test {
             args.push("--unit-test".into());
@@ -630,6 +651,7 @@ impl Worker {
             generation: checkout.generation,
             root: checkout.root.clone(),
             warmth: Warmth::Loading(Instant::now()),
+            checkout: checkout.clone(),
         };
         Ok(Worker {
             project: checkout.project(),
@@ -640,6 +662,7 @@ impl Worker {
             asked: Mutex::new(Instant::now()),
             answering: AtomicUsize::new(0),
             noted: AtomicBool::new(false),
+            settled: false,
         })
     }
 
@@ -1622,17 +1645,20 @@ impl Daemon {
         let escaped = line["edit\t".len()..].split('\t').next().unwrap_or_default();
         let path = PathBuf::from(blaze_live::format::unescape(escaped));
         let path = dunce::canonicalize(&path).unwrap_or(path);
-        let worker = lock(&self.workers).values().find_map(|worker| {
-            let checkouts = lock(&worker.checkouts);
-            let has = checkouts.values().any(|it| {
+        let has = |worker: &Worker| {
+            lock(&worker.checkouts).values().any(|it| {
                 matches!(it.warmth, Warmth::Ready)
                     && dunce::canonicalize(&it.root).is_ok_and(|root| path.starts_with(root))
-            });
-            has.then(|| worker.clone())
-        });
+            })
+        };
+        let worker = lock(&self.workers).values().find(|it| has(it)).cloned();
         let worker = worker.with_context(|| {
             format!("the daemon has no workspace loaded that has {}", path.display())
         })?;
+        // Counted, then seen to be ready still: [`Self::settle`] takes a worker that is
+        // answering nothing out of use.
+        let _answering = Answering::new(&worker.answering);
+        anyhow::ensure!(has(&worker), "the daemon is loading the workspace of {}", path.display());
         *lock(&worker.asked) = Instant::now();
         let mut stream = socket::connect(&worker.socket)?;
         // The worker builds it for the process its last build was for.
@@ -1773,6 +1799,9 @@ impl Daemon {
             return Reply::Cold { reason: "the daemon has not loaded this workspace".to_owned() };
         };
         *lock(&worker.asked) = Instant::now();
+        // Counted before it is seen to be ready: [`Self::settle`] takes a worker that is
+        // answering nothing out of use.
+        let _answering = Answering::new(&worker.answering);
         let warmth = match lock(&worker.checkouts).get(&checkout.key) {
             Some(loaded) if loaded.generation == checkout.generation => loaded.warmth.clone(),
             _ => Warmth::Failed("the daemon has not loaded this build of the workspace".to_owned()),
@@ -1857,6 +1886,7 @@ impl Daemon {
                         generation: checkout.generation,
                         root: checkout.root.clone(),
                         warmth: Warmth::Loading(Instant::now()),
+                        checkout: checkout.clone(),
                     };
                     checkouts.insert(checkout.key.clone(), loading);
                     let worker = worker.clone();
@@ -1888,7 +1918,7 @@ impl Daemon {
 
     /// Stops the workers asked longest ago while together they hold more than they may, and
     /// those nobody has asked for the idle time; and the daemon when nobody has asked it.
-    fn reap(&self) {
+    fn reap(self: Arc<Self>) {
         loop {
             std::thread::sleep(self.idle.map_or(TICK, |idle| idle.min(TICK)));
             // A worker that ended by itself is in the daemon's log when it ends, not when a
@@ -1908,6 +1938,9 @@ impl Daemon {
             let live = crate::live::any_running();
             if let Some(most) = self.memory_max.filter(|_| !live) {
                 self.fit(most);
+            }
+            if !live {
+                self.settle();
             }
             let Some(idle) = self.idle else { continue };
             if live {
@@ -1963,6 +1996,89 @@ impl Daemon {
             );
             worker.stop();
         }
+    }
+
+    /// Starts a worker from the store in place of one whose first build compiled from cold,
+    /// once that has gone [`SETTLE_AFTER`] unasked (Rik Arends' settle rebuild in Relax,
+    /// `compiler/src/settle_rebuild.rs`). The new one holds what a warm start holds, half of
+    /// what a cold build leaves (2.3 GB rather than 4.4 GB of a 94-crate program, #1299), and
+    /// its edits do not expand again the macros of crates the cold build had no frozen def
+    /// maps of. The old one has gone before the new one starts, for the two not to write the
+    /// same programs; a build asked meanwhile waits for the new one as for any that loads.
+    /// Not while a program takes edits: a new worker links every program again.
+    fn settle(self: &Arc<Self>) {
+        let due = lock(&self.workers).iter().find_map(|(id, worker)| {
+            let due = !worker.settled
+                && lock(&worker.asked).elapsed() >= SETTLE_AFTER
+                && settles_beside(&worker.socket).exists()
+                && worker.ended().is_none();
+            due.then(|| (id.clone(), worker.clone()))
+        });
+        let Some((id, old)) = due else { return };
+        let checkout = {
+            let mut checkouts = lock(&old.checkouts);
+            let mut loaded = checkouts.values_mut();
+            match (loaded.next(), loaded.next()) {
+                (Some(loaded), None) if matches!(loaded.warmth, Warmth::Ready) => {
+                    loaded.warmth = Warmth::Loading(Instant::now());
+                    loaded.checkout.clone()
+                }
+                // One that holds several checkouts loads the others again when asked.
+                _ => {
+                    _ = std::fs::remove_file(settles_beside(&old.socket));
+                    return;
+                }
+            }
+        };
+        // A request counts itself before it looks at the warmth set above.
+        if old.answering.load(Relaxed) != 0 {
+            old.set(&checkout, Warmth::Ready);
+            return;
+        }
+        _ = std::fs::remove_file(settles_beside(&old.socket));
+        eprintln!(
+            "worker {id} for {} built from cold: starting one from the store in its place",
+            old.project.display()
+        );
+        let daemon = self.clone();
+        std::thread::spawn(move || {
+            old.let_go();
+            old.finish();
+            let mut workers = lock(&daemon.workers);
+            // A build of another generation started a worker of its own meanwhile.
+            if !workers.get(&id).is_some_and(|it| Arc::ptr_eq(it, &old)) {
+                return;
+            }
+            workers.remove(&id);
+            let dir = daemon.home.join("workers").join(&id);
+            let log = dir.join("log");
+            if old.log == log {
+                _ = std::fs::rename(&log, dir.join("log.cold"));
+            }
+            let spare = match checkout.config.whole {
+                true => None,
+                false => lock(&daemon.spare).take(),
+            };
+            let mut worker = match Worker::start(&checkout, dir, spare) {
+                Ok(worker) => worker,
+                Err(why) => {
+                    eprintln!(
+                        "worker {id}: not started in place of the one built from cold: {why:#}"
+                    );
+                    return;
+                }
+            };
+            worker.settled = true;
+            let worker = Arc::new(worker);
+            eprintln!(
+                "worker {id} of pid {} for {}, from the store",
+                lock(&worker.child).id(),
+                worker.project.display()
+            );
+            workers.insert(id, worker.clone());
+            drop(workers);
+            worker.warm(&checkout);
+        });
     }
 
     /// Has the checker of `ahead` say what it finds in the source, started when there is

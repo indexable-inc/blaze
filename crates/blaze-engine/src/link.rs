@@ -64,6 +64,87 @@ pub(crate) fn executable(
     took
 }
 
+/// Writes the archive of a `staticlib` at `archive`: the members of `objects` (an archive's
+/// each), then those of each static library the crates `program` links ask for, but one
+/// that says `-bundle`, as rustc bundles them, looked for where a link of them looks. What
+/// they link shared (`dylib`, a framework) is the user's link's to name. Its index is of the
+/// target's format, as rustc's is (`archive_format`). How long it took.
+pub(crate) fn archive(
+    db: &RootDatabase,
+    program: &[Crate],
+    objects: &[&Path],
+    archive: &Path,
+) -> anyhow::Result<Duration> {
+    let start = Instant::now();
+    let Some(&first) = program.first() else { bail!("nothing to archive") };
+    let target = Target { shared: true, ..Target::of(db, first.into()) };
+    let native = native(db, program, &target);
+    let dirs: Vec<PathBuf> = native
+        .search
+        .iter()
+        .filter_map(|it| it.strip_prefix("-L").or_else(|| it.strip_prefix("/LIBPATH:")))
+        .map(PathBuf::from)
+        .collect();
+    let mut files: Vec<PathBuf> = objects.iter().map(|it| it.to_path_buf()).collect();
+    for lib in native.libs.iter().filter(|it| it.kind == NativeLibKind::Static && it.bundle) {
+        let name = lib.name.as_str();
+        let file = match (lib.verbatim, target.windows) {
+            (true, _) => name.to_owned(),
+            (false, true) => format!("{name}.lib"),
+            (false, false) => format!("lib{name}.a"),
+        };
+        let Some(found) = dirs.iter().map(|it| it.join(&file)).find(|it| it.is_file()) else {
+            bail!(
+                "the static library `{name}` the staticlib bundles, `{file}`, is in none of \
+                 the directories its link is told to look in: {dirs:?}"
+            );
+        };
+        files.push(found);
+    }
+    let read: Vec<(PathBuf, Vec<u8>)> = files
+        .into_iter()
+        .map(|it| std::fs::read(&it).map(|bytes| (it.clone(), bytes)))
+        .collect::<Result<_, _>>()
+        .context("reading what the staticlib archives")?;
+    let mut members = Vec::new();
+    for (path, bytes) in &read {
+        if !split::is_archive(bytes) {
+            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            members.push((name, &bytes[..]));
+            continue;
+        }
+        let parsed = object::read::archive::ArchiveFile::parse(&bytes[..])
+            .with_context(|| format!("reading the archive {}", path.display()))?;
+        for member in parsed.members() {
+            let member = member.with_context(|| format!("reading {}", path.display()))?;
+            let name = String::from_utf8_lossy(member.name()).into_owned();
+            let data = member.data(&bytes[..]).with_context(|| format!("reading {name}"))?;
+            members.push((name, data));
+        }
+    }
+    let members: Vec<ar_archive_writer::NewArchiveMember<'_>> = members
+        .into_iter()
+        .map(|(name, bytes)| {
+            ar_archive_writer::NewArchiveMember::new(
+                bytes,
+                &ar_archive_writer::DEFAULT_OBJECT_READER,
+                name,
+            )
+        })
+        .collect();
+    let kind = match (target.apple, target.windows) {
+        (true, _) => ar_archive_writer::ArchiveKind::Darwin,
+        (_, true) => ar_archive_writer::ArchiveKind::Coff,
+        _ => ar_archive_writer::ArchiveKind::Gnu,
+    };
+    let mut out = std::io::Cursor::new(Vec::new());
+    ar_archive_writer::write_archive_to_stream(&mut out, &members, kind, false, None)
+        .with_context(|| format!("writing the archive {}", archive.display()))?;
+    blaze_cargo::replace(archive, &out.into_inner())
+        .with_context(|| format!("writing {}", archive.display()))?;
+    Ok(start.elapsed())
+}
+
 /// The command that links `objects` into the executable `exe` as [`executable`] does, for a
 /// shell: the daemon's line, which its edits are spliced after.
 pub(crate) fn command(
@@ -649,11 +730,14 @@ fn lib_of(spec: &str) -> Option<NativeLib> {
     };
     let name = name.split_once(':').map_or(name, |(_, renamed)| renamed);
     let on = |modifier: &str| modifiers.split(',').any(|it| it.strip_prefix('+') == Some(modifier));
+    let off =
+        |modifier: &str| modifiers.split(',').any(|it| it.strip_prefix('-') == Some(modifier));
     (!name.is_empty()).then(|| NativeLib {
         name: intern::Symbol::intern(name),
         kind,
         verbatim: on("verbatim"),
         whole_archive: on("whole-archive"),
+        bundle: !off("bundle"),
     })
 }
 
@@ -966,6 +1050,7 @@ mod tests {
             kind: NativeLibKind::RawDylib,
             verbatim: true,
             whole_archive: false,
+            bundle: true,
         };
         assert_eq!(windows_target().lib(&dll), ["api-ms-win-core-test-l1-1-0.lib"]);
         let upper = NativeLib { name: intern::Symbol::intern("SHELL32.DLL"), ..dll.clone() };
@@ -1018,6 +1103,11 @@ mod tests {
             Some(("libz.so.1".to_owned(), NativeLibKind::Dylib, true, false))
         );
         assert_eq!(lib("bogus=x"), None);
+        // A `staticlib` bundles a static library unless it says `-bundle`, as rustc's does.
+        let bundled = |spec| lib_of(spec).map(|it| it.bundle);
+        assert_eq!(bundled("static=z"), Some(true));
+        assert_eq!(bundled("static:+bundle=z"), Some(true));
+        assert_eq!(bundled("static:+whole-archive,-bundle=z"), Some(false));
         let linux = Target {
             apple: false,
             wasm: false,

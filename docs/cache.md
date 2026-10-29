@@ -56,8 +56,9 @@ outside this workspace (the published crate) keys by the bytes of its executable
 build did before. `blaze-engine cache build` prints sixteen hex digits of the store's format
 and what the build was made from, and fails for a build keyed by its executable: two builds
 that print the same keep the same keys for a toolchain, whatever release each is, so CI names
-the remote's project by it rather than by the release (`.github/actions/blaze`). Upgrading blaze makes the old
-entries unreachable; they are removed over time as least recently used.
+the remote's project by it rather than by the release (`.github/actions/blaze`). Upgrading to a
+blaze built from other sources makes the old entries unreachable; they are removed over time as
+least recently used. A release built from the same sources finds them all.
 
 A build script's run is kept under a key with the checkout and the target directory apart:
 its package's directory and the target directory its `OUT_DIR` is in are named by what stands
@@ -172,7 +173,8 @@ Eviction is by pack, not by record. One recently used record keeps its whole pac
 holds up to 64M of values (some 13M on disk), so a limit smaller than a few packs evicts
 nearly everything. The limit counts bytes on disk, compressed.
 
-Upgrading blaze leaves the old build's entries in the store, unreachable, until they are
+Upgrading to a blaze built from other sources leaves the old build's entries in the store,
+unreachable, until they are
 the least recently used; `blaze-engine cache gc --max 0` empties the store at once.
 
 ### Commands
