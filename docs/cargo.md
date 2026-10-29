@@ -355,7 +355,8 @@ it (blaze or rustc), and the daemon's own reruns of one, runs in the sandbox tes
 one place a script is run. A script is given, of what cargo gave it, what cargo sets for
 scripts (`CARGO_*`, `DEP_*`, `OUT_DIR`, `TARGET`, `PROFILE`, ...), the C compiler's and
 pkg-config's variables (`CC`, `CFLAGS_<target>`, `PKG_CONFIG_PATH`, `NIX_CFLAGS_COMPILE`,
-`CPATH`, `SOURCE_DATE_EPOCH`, ...), `PATH`, `HOME`, `LANG` and the rest tests are given, and
+`CPATH`, `SOURCE_DATE_EPOCH`, ...), bindgen's (`LIBCLANG_PATH`, `CLANG_PATH`,
+`LLVM_CONFIG_PATH`, `BINDGEN_EXTRA_CLANG_ARGS_<target>`), `PATH`, `HOME`, `LANG` and the rest tests are given, and
 what the root manifest's `build-script-env` names, and what it says it reads
 (`cargo:rerun-if-env-changed=OPENSSL_DIR`) as cargo has it; what else the shell had is not
 there. A run that said it reads a variable it was not given saw it unset, so the script runs
