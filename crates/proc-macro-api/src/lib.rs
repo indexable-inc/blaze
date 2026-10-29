@@ -25,7 +25,7 @@ pub mod wrap;
 use paths::{AbsPath, AbsPathBuf};
 use semver::Version;
 use span::{ErasedFileAstId, FIXUP_ERASED_FILE_AST_ID_MARKER, Span};
-use std::{fmt, io, sync::Arc, time::SystemTime};
+use std::{collections::BTreeMap, ffi::OsString, fmt, io, sync::Arc, time::SystemTime};
 
 use crate::{
     bidirectional_protocol::SubCallback, pool::ProcMacroServerPool, process::ProcMacroServerProcess,
@@ -90,6 +90,23 @@ pub struct ProcMacroClient {
     pool: Arc<ProcMacroServerPool>,
     /// The path to the proc-macro server binary.
     path: AbsPathBuf,
+    inherited_env: Option<InheritedEnv>,
+}
+
+/// The native host's startup variables, kept only in memory. Debug output never names them.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InheritedEnv(Arc<[(OsString, OsString)]>);
+
+impl fmt::Debug for InheritedEnv {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InheritedEnv").field("variables", &self.0.len()).finish_non_exhaustive()
+    }
+}
+
+impl InheritedEnv {
+    pub fn variables(&self) -> &[(OsString, OsString)] {
+        &self.0
+    }
 }
 
 /// Represents a dynamically loaded library containing procedural macros.
@@ -155,6 +172,26 @@ impl ProcMacroClient {
         version: Option<&Version>,
         num_process: usize,
     ) -> io::Result<ProcMacroClient> {
+        let overrides: Vec<(OsString, Option<OsString>)> = env
+            .clone()
+            .into_iter()
+            .map(|(name, value)| {
+                (name.as_ref().to_owned(), value.as_ref().map(|it| it.as_ref().to_owned()))
+            })
+            .collect();
+        let outside = overrides.iter().any(|(name, value)| {
+            name == std::ffi::OsStr::new(wrap::UNSANDBOXED) && value.is_some()
+        });
+        let mut inherited: BTreeMap<OsString, OsString> = std::env::vars_os()
+            .filter(|(name, _)| outside || name.to_str().is_some_and(wrap::inherits))
+            .collect();
+        for (name, value) in overrides {
+            match value {
+                Some(value) => _ = inherited.insert(name, value),
+                None => _ = inherited.remove(&name),
+            }
+        }
+        let inherited_env = Some(InheritedEnv(inherited.into_iter().collect::<Vec<_>>().into()));
         let pool_size = num_process;
         let mut workers = Vec::with_capacity(pool_size);
         for _ in 0..pool_size {
@@ -163,7 +200,7 @@ impl ProcMacroClient {
         }
 
         let pool = ProcMacroServerPool::new(workers);
-        Ok(ProcMacroClient { pool: Arc::new(pool), path: process_path.to_owned() })
+        Ok(ProcMacroClient { pool: Arc::new(pool), path: process_path.to_owned(), inherited_env })
     }
 
     /// Invokes `spawn` and returns a client connected to the resulting read and write handles.
@@ -190,12 +227,21 @@ impl ProcMacroClient {
         }
 
         let pool = ProcMacroServerPool::new(workers);
-        Ok(ProcMacroClient { pool: Arc::new(pool), path: process_path.to_owned() })
+        Ok(ProcMacroClient {
+            pool: Arc::new(pool),
+            path: process_path.to_owned(),
+            inherited_env: None,
+        })
     }
 
     /// Returns the absolute path to the proc-macro server.
     pub fn server_path(&self) -> &AbsPath {
         &self.path
+    }
+
+    /// The environment the host was started with, including explicit overrides and removals.
+    pub fn inherited_env(&self) -> Option<InheritedEnv> {
+        self.inherited_env.clone()
     }
 
     /// Loads a proc-macro dylib into the server process returning a list of `ProcMacro`s loaded.

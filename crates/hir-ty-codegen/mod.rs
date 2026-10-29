@@ -99,6 +99,12 @@ use hir_ty_mir::mir::{
 };
 
 mod asm;
+
+/// The search path supplied to an external assembler. The in-process assembler has none.
+/// A build's code and assembly caches must distinguish the environments of external tools.
+pub fn assembler_path(db: &dyn HirDatabase) -> Option<Option<String>> {
+    asm::Assembler::for_build(db).path()
+}
 mod avx512;
 mod backend;
 use backend::Step;
@@ -4739,7 +4745,7 @@ fn compile_as<'db>(
     let code = match cg.naked.take() {
         // The function is its assembly: what was built of it is only its signature.
         Some((text, syms)) => {
-            let assembled = asm::assemble(&isa.triple().to_string(), &text)
+            let assembled = asm::assemble(&cg.assembler, &isa.triple().to_string(), &text)
                 .map_err(CodegenError::Unsupported)?;
             let relocs = assembled.relocs.iter().map(|named| {
                 let name = syms.get(named.operand as usize).cloned().flatten()?;
@@ -6870,7 +6876,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return Ok(id);
         }
         let triple = self.module.isa().triple().to_string();
-        let assembled = asm::assemble(&triple, text).map_err(CodegenError::Unsupported)?;
+        let assembled = asm::assemble(&asm::Assembler::for_build(self.db), &triple, text)
+            .map_err(CodegenError::Unsupported)?;
         let name = format!("blaze::asm::{}", self.assemblies.len());
         let id = self
             .module

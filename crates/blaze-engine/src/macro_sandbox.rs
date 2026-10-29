@@ -30,6 +30,7 @@ static SEEN: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 /// Has every proc-macro server be started in the sandbox, but those of the macros the root
 /// manifest of their workspace takes out.
 pub(crate) fn install() {
+    proc_macro_api::wrap::inherited_env_with(|name| !sandbox::on() || given_to_server(name));
     proc_macro_api::wrap::wrap_servers_with(wrapped);
     load_cargo::unsandboxed_macros_with(Box::new(|workspace, crate_name, library| {
         let (workspace, library): (&Path, &Path) = (workspace.as_ref(), library.as_ref());
@@ -104,7 +105,13 @@ mod tests {
         ] {
             assert!(super::given_to_server(name), "{name}");
         }
-        for name in ["GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK", "OPENSSL_DIR"] {
+        for name in [
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "SSH_AUTH_SOCK",
+            "OPENSSL_DIR",
+            "BLAZE_PROC_MACRO_CACHE",
+        ] {
             assert!(!super::given_to_server(name), "{name}");
         }
     }
@@ -112,13 +119,15 @@ mod tests {
 
 /// Whether the variable `name` of this process's environment is given to a proc-macro server:
 /// what finds the toolchain and how a failure is shown ([`sandboxed::KEPT`]) and blaze's and
-/// rust-analyzer's own. Nothing else (a CI's secrets): what a macro reads with `env!` or
+/// rust-analyzer's own, apart from the compiler's expansion-cache mode. Nothing else (a
+/// CI's secrets): what a macro reads with `env!` or
 /// `std::env::var` is its crate's environment (`CARGO_*`, `OUT_DIR`, a build script's
 /// `rustc-env`), which each expansion is sent with.
 fn given_to_server(name: &str) -> bool {
-    sandboxed::KEPT.contains(&name)
-        || name.starts_with("BLAZE_")
-        || name.starts_with("RUST_ANALYZER_")
+    name != "BLAZE_PROC_MACRO_CACHE"
+        && (sandboxed::KEPT.contains(&name)
+            || name.starts_with("BLAZE_")
+            || name.starts_with("RUST_ANALYZER_"))
 }
 
 /// The file of the spec `server` runs in, written where only this user reads it: the

@@ -4,6 +4,7 @@
 
 use std::sync::OnceLock;
 
+use ide_db::FxHashMap;
 use vfs::{AbsPath, AbsPathBuf};
 
 /// The name of the static the list is in.
@@ -26,11 +27,29 @@ pub type Own = dyn Fn(Option<&AbsPath>, &AbsPath, &[Compiled]) -> Vec<Result<Opt
     + Send
     + Sync;
 
-static OWN: OnceLock<Box<Own>> = OnceLock::new();
+/// Like [`Own`], with the current request's environment for compiler subprocesses.
+pub type OwnWithEnv = dyn Fn(
+        Option<&AbsPath>,
+        &AbsPath,
+        &[Compiled],
+        &FxHashMap<String, Option<String>>,
+    ) -> Vec<Result<Option<AbsPathBuf>, String>>
+    + Send
+    + Sync;
+
+static OWN: OnceLock<Box<OwnWithEnv>> = OnceLock::new();
 
 /// Has each library a load names that does not list its macros expanded with what `own` has
 /// of it. The first call is the one kept.
 pub fn own_libraries_with(own: Box<Own>) {
+    own_libraries_with_env(Box::new(move |sysroot, workspace, libraries, _| {
+        own(sysroot, workspace, libraries)
+    }));
+}
+
+/// Like [`own_libraries_with`], passing the environment to use for compiler subprocesses.
+/// These variables are not part of a library's persisted description.
+pub fn own_libraries_with_env(own: Box<OwnWithEnv>) {
     _ = OWN.set(own);
 }
 
@@ -44,9 +63,10 @@ pub(crate) fn own(
     sysroot: Option<&AbsPath>,
     workspace: &AbsPath,
     libraries: &[Compiled],
+    env: &FxHashMap<String, Option<String>>,
 ) -> Vec<Result<Option<AbsPathBuf>, String>> {
     match OWN.get() {
-        Some(own) if !libraries.is_empty() => own(sysroot, workspace, libraries),
+        Some(own) if !libraries.is_empty() => own(sysroot, workspace, libraries, env),
         _ => vec![Ok(None); libraries.len()],
     }
 }

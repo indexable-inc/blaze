@@ -19519,6 +19519,10 @@
        "unit": "tar@0.4.46 lib tar build"
       },
       {
+       "name": "tempfile",
+       "unit": "tempfile@3.27.0 lib tempfile build"
+      },
+      {
        "name": "thorin",
        "unit": "thorin-dwp@0.10.0 lib thorin build"
       },
@@ -34825,6 +34829,46 @@
      },
      "src": "src/lib.rs",
      "target": "target_lexicon"
+    },
+    "tempfile@3.27.0 lib tempfile build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "fastrand",
+       "unit": "fastrand@2.4.1 lib fastrand build"
+      },
+      {
+       "name": "getrandom",
+       "unit": "getrandom@0.4.2 lib getrandom build"
+      },
+      {
+       "name": "once_cell",
+       "unit": "once_cell@1.21.4 lib once_cell build"
+      },
+      {
+       "name": "rustix",
+       "unit": "rustix@1.1.4 lib rustix build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "getrandom"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "tempfile@3.27.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "tempfile"
     },
     "termcolor@1.4.1 lib termcolor build": {
      "crate_type": "lib",
@@ -41098,6 +41142,10 @@
        "unit": "tar@0.4.46 lib tar build"
       },
       {
+       "name": "tempfile",
+       "unit": "tempfile@3.27.0 lib tempfile build"
+      },
+      {
        "name": "thorin",
        "unit": "thorin-dwp@0.10.0 lib thorin build"
       },
@@ -56282,6 +56330,46 @@
      "src": "src/lib.rs",
      "target": "target_lexicon"
     },
+    "tempfile@3.27.0 lib tempfile build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "fastrand",
+       "unit": "fastrand@2.4.1 lib fastrand build"
+      },
+      {
+       "name": "getrandom",
+       "unit": "getrandom@0.4.2 lib getrandom build"
+      },
+      {
+       "name": "once_cell",
+       "unit": "once_cell@1.21.4 lib once_cell build"
+      },
+      {
+       "name": "rustix",
+       "unit": "rustix@1.1.4 lib rustix build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "getrandom"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "tempfile@3.27.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "tempfile"
+    },
     "termcolor@1.4.1 lib termcolor build": {
      "crate_type": "lib",
      "deps": [],
@@ -62548,6 +62636,10 @@
       {
        "name": "tar",
        "unit": "tar@0.4.46 lib tar build"
+      },
+      {
+       "name": "tempfile",
+       "unit": "tempfile@3.27.0 lib tempfile build"
       },
       {
        "name": "thorin",
@@ -77884,6 +77976,46 @@
      "src": "src/lib.rs",
      "target": "target_lexicon"
     },
+    "tempfile@3.27.0 lib tempfile build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "fastrand",
+       "unit": "fastrand@2.4.1 lib fastrand build"
+      },
+      {
+       "name": "getrandom",
+       "unit": "getrandom@0.4.2 lib getrandom build"
+      },
+      {
+       "name": "once_cell",
+       "unit": "once_cell@1.21.4 lib once_cell build"
+      },
+      {
+       "name": "rustix",
+       "unit": "rustix@1.1.4 lib rustix build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "getrandom"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "tempfile@3.27.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "tempfile"
+    },
     "termcolor@1.4.1 lib termcolor build": {
      "crate_type": "lib",
      "deps": [],
@@ -84154,6 +84286,10 @@
       {
        "name": "tar",
        "unit": "tar@0.4.46 lib tar build"
+      },
+      {
+       "name": "tempfile",
+       "unit": "tempfile@3.27.0 lib tempfile build"
       },
       {
        "name": "thorin",
@@ -99366,6 +99502,46 @@
      },
      "src": "src/lib.rs",
      "target": "target_lexicon"
+    },
+    "tempfile@3.27.0 lib tempfile build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "fastrand",
+       "unit": "fastrand@2.4.1 lib fastrand build"
+      },
+      {
+       "name": "getrandom",
+       "unit": "getrandom@0.4.2 lib getrandom build"
+      },
+      {
+       "name": "once_cell",
+       "unit": "once_cell@1.21.4 lib once_cell build"
+      },
+      {
+       "name": "rustix",
+       "unit": "rustix@1.1.4 lib rustix build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "getrandom"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "tempfile@3.27.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "tempfile"
     },
     "termcolor@1.4.1 lib termcolor build": {
      "crate_type": "lib",

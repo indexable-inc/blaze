@@ -45,6 +45,7 @@ salsa.workspace = true
 same-file = "1"
 dunce = "1"
 sha2 = "0.10"
+tempfile = "3"
 cargo_metadata.workspace = true
 shlex = "2"
 toml.workspace = true
@@ -130,7 +131,6 @@ tikv-jemalloc-sys = "0.5.4"
 hyper = { version = "1", default-features = false, features = ["server", "http1"] }
 tokio = { version = "1.47", features = ["net"] }
 lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "xz", "encoder"] }
-tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 find-msvc-tools = "0.1"

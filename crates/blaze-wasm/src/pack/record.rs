@@ -34,6 +34,14 @@ struct Recorder {
 }
 
 impl ProcMacroExpander for Recorder {
+    fn inherits_process_env(&self) -> bool {
+        self.inner.inherits_process_env()
+    }
+
+    fn inherited_env(&self) -> Option<&[(std::ffi::OsString, std::ffi::OsString)]> {
+        self.inner.inherited_env()
+    }
+
     fn requires_session(&self) -> bool {
         self.inner.requires_session()
     }

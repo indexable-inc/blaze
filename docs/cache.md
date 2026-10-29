@@ -83,13 +83,15 @@ at every new database revision, including client requests without source changes
 the macro library's content, the macro's name and kind, its input with each span replaced
 by its place in the call's table of spans, that table (each span's byte range within the
 item it is anchored to, and which of the call's anchors and hygiene contexts it has), the
-environment and the current directory the macro is given. The output is kept with its spans
+environment and the current directory the macro is given. Native hosts also key a digest
+of the host's startup environment, so a new command cannot reuse an earlier environment's
+expansion; the variables themselves are not stored. The output is kept with its spans
 written the same way, so tokens the macro made from a string at the call site come back
 anchored where the next call is. An expansion is not kept when it failed, when it asked
 rust-analyzer anything while it ran (a span's text, file or line), or when its output has a
 span anchored where no span of its input is.
 
-A macro that reads a file or an environment variable by itself is pure to the key and is
+A macro that reads a file or mutates its own process environment is pure to the key and is
 not: name it in `BLAZE_PROC_MACRO_CACHE_SKIP` (a comma-separated list of macro names) to
 expand it every time. `BLAZE_PROC_MACRO_CACHE=all` keeps function-like macros too, which
 are off by default because they are the ones that read outside their input (`sqlx::query!`,

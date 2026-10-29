@@ -1300,10 +1300,15 @@ impl Assembled {
 
 /// The machine code of the function that `text` defines. Each text is assembled once: the
 /// store keeps the code, as it does a compiled function's.
-pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<Assembled>, String> {
+pub(super) fn assemble(
+    assembler: &Assembler,
+    triple: &str,
+    text: &str,
+) -> Result<Arc<Assembled>, String> {
     static ASSEMBLED: OnceLock<Mutex<FxHashMap<[u8; 32], Arc<Assembled>>>> = OnceLock::new();
     let mut hasher = Sha256::new();
-    hasher.update(b"blaze asm 3");
+    hasher.update(b"blaze asm 4");
+    hasher.update(format!("{assembler:?}"));
     hasher.update(triple);
     hasher.update([0]);
     hasher.update(text);
@@ -1320,7 +1325,7 @@ pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<Assembled>, Strin
     let code = Arc::new(match kept {
         Some(code) => code,
         None => {
-            let code = Assembler::selected().assemble(triple, text, &key)?;
+            let code = assembler.assemble(triple, text, &key)?;
             if let Some(store) = store {
                 store.insert(&key, &code.to_bytes());
             }
@@ -1333,29 +1338,50 @@ pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<Assembled>, Strin
 
 /// What turns the text of a block into an object file. `BLAZE_ASSEMBLER=cc` picks the C
 /// compiler in a build with LLVM.
-#[derive(Clone, Copy)]
-enum Assembler {
+#[derive(Clone, Debug)]
+pub(super) enum Assembler {
     /// The platform's C compiler, run as a process: clang, or a `cc` for the host.
-    Cc,
+    Cc(Option<String>),
     /// LLVM's, in this process, when blaze is built with LLVM.
     #[cfg(feature = "llvm")]
     Llvm,
 }
 
 impl Assembler {
-    fn selected() -> Assembler {
+    pub(super) fn for_build(db: &dyn hir_ty::db::HirDatabase) -> Assembler {
+        #[cfg(feature = "llvm")]
+        if matches!(Self::selected(None), Self::Llvm) {
+            return Self::Llvm;
+        }
+        let path = match base_db::ProcessEnv::try_get(db) {
+            Some(env) => env.vars(db).get("PATH"),
+            None => std::env::var("PATH").ok(),
+        };
+        Self::Cc(path)
+    }
+
+    pub(super) fn path(&self) -> Option<Option<String>> {
+        match self {
+            Self::Cc(path) => Some(path.clone()),
+            #[cfg(feature = "llvm")]
+            Self::Llvm => None,
+        }
+    }
+
+    pub(super) fn selected(path: Option<String>) -> Assembler {
         if std::env::var("BLAZE_ASSEMBLER").as_deref() == Ok("cc") {
-            return Assembler::Cc;
+            return Assembler::Cc(path);
         }
         #[cfg(feature = "llvm")]
         return Assembler::Llvm;
         #[cfg(not(feature = "llvm"))]
-        Assembler::Cc
+        Assembler::Cc(path)
     }
 
-    fn assemble(self, triple: &str, text: &str, key: &[u8; 32]) -> Result<Assembled, String> {
+    fn assemble(&self, triple: &str, text: &str, key: &[u8; 32]) -> Result<Assembled, String> {
         match self {
-            Assembler::Cc => run_cc(triple, text, key).unwrap_or_else(|| Err(no_assembler(triple))),
+            Assembler::Cc(path) => run_cc(path.as_deref(), triple, text, key)
+                .unwrap_or_else(|| Err(no_assembler(triple))),
             #[cfg(feature = "llvm")]
             Assembler::Llvm => code(&super::llvm::assemble(text)?),
         }
@@ -1407,11 +1433,11 @@ fn hash_comment(line: &str) -> String {
 
 /// The C compiler that assembles for `triple`, with the arguments that say the target:
 /// clang for any target it knows, else `cc` for the host's alone. `None` when there is none.
-fn c_compiler(triple: &str) -> Option<(PathBuf, Vec<String>)> {
-    let paths = std::env::var_os("PATH")?;
+fn c_compiler(paths: Option<&str>, triple: &str) -> Option<(PathBuf, Vec<String>)> {
+    let paths = paths?;
     let find = |name: &str| {
         let name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
-        std::env::split_paths(&paths).map(|dir| dir.join(&name)).find(|it| it.is_file())
+        std::env::split_paths(paths).map(|dir| dir.join(&name)).find(|it| it.is_file())
     };
     if let Some(clang) = find("clang") {
         return Some((clang, vec![format!("--target={triple}")]));
@@ -1439,8 +1465,13 @@ fn no_assembler(triple: &str) -> String {
 }
 
 /// The block assembled by the platform's C compiler. `None` when there is none for `triple`.
-fn run_cc(triple: &str, text: &str, key: &[u8; 32]) -> Option<Result<Assembled, String>> {
-    let (compiler, target) = c_compiler(triple)?;
+fn run_cc(
+    path: Option<&str>,
+    triple: &str,
+    text: &str,
+    key: &[u8; 32],
+) -> Option<Result<Assembled, String>> {
+    let (compiler, target) = c_compiler(path, triple)?;
     static RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name: String =
@@ -1452,7 +1483,12 @@ fn run_cc(triple: &str, text: &str, key: &[u8; 32]) -> Option<Result<Assembled, 
     }
     let object = dir.join(name);
     #[allow(clippy::disallowed_methods)]
-    let child = Command::new(&compiler)
+    let mut command = Command::new(&compiler);
+    match path {
+        Some(path) => command.env("PATH", path),
+        None => command.env_remove("PATH"),
+    };
+    let child = command
         .args(&target)
         .args(["-c", "-x", "assembler", "-o"])
         .arg(&object)

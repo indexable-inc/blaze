@@ -22,6 +22,16 @@ pub enum ProcMacroKind {
 
 /// A proc-macro expander implementation.
 pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + Any {
+    /// Native hosts inherit process variables; virtual guests receive only crate variables.
+    fn inherits_process_env(&self) -> bool {
+        false
+    }
+
+    /// The actual native host snapshot, when the implementation can provide it.
+    fn inherited_env(&self) -> Option<&[(std::ffi::OsString, std::ffi::OsString)]> {
+        None
+    }
+
     /// Whether calls share mutable state within one calling crate's compilation.
     fn requires_session(&self) -> bool {
         false
@@ -144,6 +154,15 @@ pub struct ProcMacros {
 impl ProcMacros {
     pub fn init_default(db: &dyn SourceDatabase, durability: Durability) {
         _ = Self::builder(Default::default()).durability(durability).new(db);
+    }
+
+    /// Whether a macro loaded for this crate can read the server's inherited environment.
+    pub fn inherits_process_env(db: &dyn SourceDatabase, krate: Crate) -> bool {
+        Self::get_for_crate(db, krate)
+            .and_then(|it| {
+                it.macros().map(|macros| macros.iter().any(|it| it.expander.inherits_process_env()))
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -384,7 +403,15 @@ impl CustomProcMacroExpander {
                 };
 
                 // Proc macros have access to the environment variables of the invoking crate.
-                let env = calling_crate.env(db);
+                let mut env = calling_crate.env(db).clone();
+                // A native server lives beyond the command that started it. Its tools and
+                // an expansion that reads PATH use this build's value, as env! does.
+                if proc_macro.expander.inherits_process_env() && !env.contains_key("PATH") {
+                    db.env_is_read(calling_crate, "PATH");
+                    if let Some(path) = base_db::process_env_var(db, "PATH") {
+                        env.set("PATH", &path);
+                    }
+                }
                 // FIXME: Can we avoid the string allocation here?
                 let current_dir = calling_crate.data(db).proc_macro_cwd.to_string();
 
@@ -393,7 +420,7 @@ impl CustomProcMacroExpander {
                     calling_crate,
                     tt,
                     attr_arg,
-                    env,
+                    &env,
                     def_site,
                     call_site,
                     mixed_site,

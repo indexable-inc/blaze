@@ -187,6 +187,7 @@ pub(crate) fn command(
 /// program, the toolchain's `rust-lld` as `wasm-ld`, which rustc runs itself.
 pub(crate) struct Line {
     program: PathBuf,
+    path: Option<String>,
     before: Vec<String>,
     after: Vec<String>,
     apple: bool,
@@ -197,6 +198,15 @@ pub(crate) struct Line {
 }
 
 impl Line {
+    fn tool(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
+        let mut command = Command::new(program);
+        match &self.path {
+            Some(path) => command.env("PATH", path),
+            None => command.env_remove("PATH"),
+        };
+        command
+    }
+
     /// The line of `program`, with `user`, what the flags pass the linker (`-C link-arg`),
     /// after the native libraries as rustc has them.
     pub(crate) fn of(
@@ -247,6 +257,10 @@ impl Line {
         }
         Ok(Line {
             program: linker,
+            path: match base_db::ProcessEnv::try_get(db) {
+                Some(env) => env.vars(db).get("PATH"),
+                None => std::env::var("PATH").ok(),
+            },
             before,
             after,
             apple: target.apple,
@@ -269,7 +283,7 @@ impl Line {
         if self.windows {
             return self.msvc_link(objects, exe);
         }
-        let mut cmd = Command::new(&self.program);
+        let mut cmd = self.tool(&self.program);
         cmd.args(&self.before);
         for &object in objects {
             if split::is_archive(&leading_bytes(object)?) {
@@ -353,7 +367,8 @@ impl Line {
             }
             let file = dir.join(format!("{}.def", dll_stem(dll)));
             std::fs::write(&file, def).with_context(|| format!("writing {}", file.display()))?;
-            let ran = Command::new(&tool)
+            let ran = self
+                .tool(&tool)
                 .arg("/NOLOGO")
                 .arg(format!("/DEF:{}", file.display()))
                 .arg(format!("/OUT:{}", dir.join(import_library(dll)).display()))
@@ -377,7 +392,7 @@ impl Line {
 
     fn msvc_link(&self, objects: &[&Path], exe: &Path) -> anyhow::Result<Duration> {
         let (linker, response) = self.msvc_arguments(objects, exe)?;
-        let mut cmd = Command::new(&linker);
+        let mut cmd = self.tool(&linker);
         cmd.arg(format!("@{}", response.display()));
         let start = Instant::now();
         let ran = blaze_cargo::trace::link_output(&mut cmd, "link executable")
@@ -1013,6 +1028,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let line = Line {
             program: PathBuf::from("link.exe"),
+            path: std::env::var("PATH").ok(),
             before: Vec::new(),
             after: Vec::new(),
             apple: false,

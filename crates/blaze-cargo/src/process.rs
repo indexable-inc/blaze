@@ -17,6 +17,21 @@ pub fn own() -> Env {
         .collect()
 }
 
+/// An opaque macro can read any inherited variable. Keep only a digest in code identity.
+pub fn fingerprint(env: &Env) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hash = Sha256::new();
+    let mut vars: Vec<_> = env.iter().collect();
+    vars.sort_unstable();
+    for (key, value) in vars {
+        for field in [key, value] {
+            hash.update((field.len() as u64).to_le_bytes());
+            hash.update(field.as_bytes());
+        }
+    }
+    crate::content::hex(&hash.finalize())
+}
+
 /// `env` on one line with no tab in it.
 pub fn encode(env: &Env) -> String {
     let mut line = String::new();
@@ -82,6 +97,13 @@ pub fn turn(db: &mut RootDatabase, env: Env) -> Vec<Crate> {
         })
         .map(|(krate, _)| krate)
         .collect();
+    if let Some(path) = hir_ty_codegen::assembler_path(db)
+        && path != env.get("PATH")
+    {
+        // An external assembler can itself invoke tools through PATH. Its environment is
+        // part of the code producer, even in crates that do not read env! themselves.
+        reading.extend(ide_db::base_db::all_crates(db).iter().copied());
+    }
     reading.sort_unstable();
     reading.dedup();
     set_process_env(db, env);

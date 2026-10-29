@@ -507,6 +507,7 @@ impl Warmth {
 struct Loaded {
     generation: u128,
     root: PathBuf,
+    command_env: BTreeMap<String, String>,
     warmth: Warmth,
     /// What it was loaded with, which a worker started in its place loads.
     checkout: Checkout,
@@ -650,6 +651,7 @@ impl Worker {
         let loading = Loaded {
             generation: checkout.generation,
             root: checkout.root.clone(),
+            command_env: config.command_env.clone(),
             warmth: Warmth::Loading(Instant::now()),
             checkout: checkout.clone(),
         };
@@ -1847,20 +1849,28 @@ impl Daemon {
     fn warm(&self, checkout: Checkout) -> anyhow::Result<()> {
         let id = checkout.config.id();
         let mut workers = lock(&self.workers);
-        // Source diagnostics stay valid until a source is written. A failed load has not
-        // established its inputs: configuration, even a file since deleted, may have caused
-        // it. Retry that load on the next request rather than keep its error indefinitely.
+        // Source diagnostics stay valid while source and command environment are unchanged.
+        // A failed load has not established its inputs: configuration, even a file since
+        // deleted, may have caused it. Retry it rather than keep its error indefinitely.
         let failed = workers.get(&id).and_then(|it| match lock(&it.checkouts).get(&checkout.key) {
-            Some(Loaded { generation, warmth, .. }) if *generation == checkout.generation => {
+            Some(Loaded { generation, warmth, command_env, .. })
+                if *generation == checkout.generation =>
+            {
                 match warmth {
-                    Warmth::Failed(_) | Warmth::Broken(..) => Some(warmth.clone()),
+                    Warmth::Failed(_) | Warmth::Broken(..) => {
+                        Some((warmth.clone(), command_env.clone()))
+                    }
                     _ => None,
                 }
             }
             _ => None,
         });
         match failed {
-            Some(Warmth::Broken(_, at)) if !checkout.written_since(at) => return Ok(()),
+            Some((Warmth::Broken(_, at), env))
+                if env == checkout.config.command_env && !checkout.written_since(at) =>
+            {
+                return Ok(());
+            }
             Some(_) => {
                 if let Some(old) = workers.remove(&id) {
                     old.stop();
@@ -1885,6 +1895,7 @@ impl Daemon {
                     let loading = Loaded {
                         generation: checkout.generation,
                         root: checkout.root.clone(),
+                        command_env: checkout.config.command_env.clone(),
                         warmth: Warmth::Loading(Instant::now()),
                         checkout: checkout.clone(),
                     };
@@ -2313,6 +2324,31 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_paths_share_a_worker_but_keep_their_own_environment() {
+        let mut config = WorkerConfig {
+            repository: "/repo/.git".into(),
+            project: "".into(),
+            cfg_test: false,
+            selection: Default::default(),
+            env: BTreeMap::new(),
+            command_env: BTreeMap::from([("PATH".to_owned(), "/tools/first".to_owned())]),
+            whole: true,
+        };
+        let first = config.id();
+        config.command_env.insert("PATH".to_owned(), "/empty:/tools/first".to_owned());
+        assert_eq!(config.id(), first);
+        assert_eq!(
+            config.builds_env().get("PATH").map(String::as_str),
+            Some("/empty:/tools/first")
+        );
+        config.command_env.remove("PATH");
+        assert_eq!(config.id(), first);
+        assert!(!config.builds_env().contains_key("PATH"));
+        config.env.insert("RUSTFLAGS".to_owned(), "--cfg other".to_owned());
+        assert_ne!(config.id(), first);
+    }
 
     #[test]
     fn a_watcher_is_handed_the_builds_it_watches_and_a_workspace_keeps_its_last() {

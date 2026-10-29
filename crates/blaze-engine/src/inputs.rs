@@ -61,6 +61,8 @@ struct Scripts {
     scripts: Vec<Script>,
     /// The variables it runs one again for a change of, as they were when they last ran.
     variables: Vec<(String, Option<String>)>,
+    /// A failed run or reload may already have replaced OUT_DIR files.
+    unsettled: bool,
 }
 
 /// The build script of one package of the workspace.
@@ -211,7 +213,13 @@ impl Inputs {
         let scripts = self.checkouts.iter().find(|it| it.root == root);
         let scripts = scripts.and_then(|it| it.scripts.as_ref());
         let read = scripts.into_iter().flat_map(|it| it.variables.iter().map(|it| &*it.0));
-        FLAGS.iter().copied().chain(read).map(|it| (it.to_owned(), env.get(it))).collect()
+        FLAGS
+            .iter()
+            .copied()
+            .chain(read)
+            .chain(["PATH"])
+            .map(|it| (it.to_owned(), env.get(it)))
+            .collect()
     }
 }
 
@@ -230,7 +238,19 @@ impl Scripts {
             (it, value)
         }));
         for package in cargo.packages() {
+            if cargo[package]
+                .targets
+                .iter()
+                .any(|&it| matches!(cargo[it].kind, TargetKind::Lib { is_proc_macro: true }))
+            {
+                // env! in a macro crate reads the environment that compiles it, before
+                // any expansion is asked for with the invoking crate's variables.
+                variables.push(("PATH".to_owned(), run_with(config, "PATH")));
+            }
             let Some(out_dir) = build_scripts.out_dir(package) else { continue };
+            // A script can resolve a tool without declaring PATH. Re-run it with the new
+            // search path; unchanged output keeps the workspace and its compiled state.
+            variables.push(("PATH".to_owned(), run_with(config, "PATH")));
             let root: &Path = cargo[package].manifest.parent().as_ref();
             let said = Said::read(out_dir.as_ref());
             variables.extend(said.variables.into_iter().map(|it| {
@@ -266,7 +286,13 @@ impl Scripts {
         if scripts.is_empty() && variables.is_empty() {
             return None;
         }
-        Some(Scripts { workspace: workspace.clone(), config: config.clone(), scripts, variables })
+        Some(Scripts {
+            workspace: workspace.clone(),
+            config: config.clone(),
+            scripts,
+            variables,
+            unsettled: false,
+        })
     }
 
     /// Runs the scripts again where cargo would for a process with `env`, or with `None`
@@ -277,12 +303,15 @@ impl Scripts {
             (0..self.scripts.len()).filter(|&at| self.scripts[at].changed()).collect();
         let variables =
             env.is_some_and(|env| self.variables.iter().any(|(name, was)| env.get(name) != *was));
-        if changed.is_empty() && !variables {
+        if changed.is_empty() && !variables && !self.unsettled {
             return Ok(false);
         }
         // Cargo would run only the scripts whose files changed: each is run again here as
         // cargo ran it, which costs the script and not a cargo that resolves the workspace.
-        if !variables && changed.iter().all(|&at| self.scripts[at].reruns_the_same()) {
+        if !variables
+            && !self.unsettled
+            && changed.iter().all(|&at| self.scripts[at].reruns_the_same())
+        {
             changed.into_iter().for_each(|at| self.scripts[at].stamp_again());
             return Ok(false);
         }
@@ -294,6 +323,7 @@ impl Scripts {
             let value = env.map_or_else(|| was.clone(), |env| env.get(name));
             config.extra_env.insert(name.clone(), value);
         }
+        self.unsettled = true;
         let said = crate::events::within(crate::events::Step::BuildScripts, None, || {
             self.workspace.run_build_scripts(&config, &|_| {})
         })?;
@@ -308,6 +338,7 @@ impl Scripts {
             *was = config.extra_env.get(name).cloned().flatten();
         }
         self.config = config;
+        self.unsettled = false;
         Ok(false)
     }
 }

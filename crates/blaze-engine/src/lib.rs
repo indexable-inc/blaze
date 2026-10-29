@@ -4709,9 +4709,15 @@ fn std_unit(
     std_unit_at(db, table, args, listed, args.out.with_extension("std.o"))
 }
 
-/// The [`UnitStamps`] of each standard library's unit this process wrote, by its path.
-static UNITS_WRITTEN: std::sync::LazyLock<Mutex<FxHashMap<PathBuf, UnitStamps>>> =
+/// The files and code producer of each standard library's unit this process wrote.
+static UNITS_WRITTEN: std::sync::LazyLock<Mutex<FxHashMap<PathBuf, WrittenUnit>>> =
     std::sync::LazyLock::new(Default::default);
+
+#[derive(Clone)]
+struct WrittenUnit {
+    stamps: UnitStamps,
+    assembler: Option<Option<String>>,
+}
 
 /// The length and write time of a standard library's unit and of its list of what it refused.
 type UnitStamps = [Option<(u64, SystemTime)>; 2];
@@ -4736,14 +4742,14 @@ fn std_unit_again(
     static AGAIN: Mutex<()> = Mutex::new(());
     let Some(unit) = &args.prebuilt else { return Ok(()) };
     let _again = lock(&AGAIN);
-    let Some(written) = lock(&UNITS_WRITTEN).get(unit).copied() else { return Ok(()) };
-    if written.iter().all(Option::is_some) && unit_stamps(unit) == written {
+    let Some(written) = lock(&UNITS_WRITTEN).get(unit).cloned() else { return Ok(()) };
+    if written.assembler == hir_ty_codegen::assembler_path(db)
+        && written.stamps.iter().all(Option::is_some)
+        && unit_stamps(unit) == written.stamps
+    {
         return Ok(());
     }
-    eprintln!(
-        "standard library: {} is not the file blaze wrote there, written again",
-        unit.display()
-    );
+    eprintln!("standard library: {} changed inputs or was replaced, written again", unit.display());
     // As the worker had it when it wrote the unit first, before it had a line to link with.
     let of_unit = Args { prebuilt: None, link_cmd: None, splice: None, ..args.clone() };
     match std_unit_at(db, table, &of_unit, listed, unit.with_extension("o"))? {
@@ -4802,6 +4808,10 @@ fn std_unit_at(
         hasher.update(bytes);
     };
     field(b"blaze standard library 5");
+    if let Some(path) = hir_ty_codegen::assembler_path(db) {
+        field(b"external assembler PATH");
+        field(format!("{path:?}").as_bytes());
+    }
     field(format!("{:?} {debug:?}", args.selection.target).as_bytes());
     // A file of one of its crates whose text is blaze's, not the toolchain's.
     if args.run_tool {
@@ -4836,7 +4846,13 @@ fn std_unit_at(
     let archive = object.with_extension("a");
     let refused = refused_exports_of(&object);
     let written = |path: &Path| {
-        lock(&UNITS_WRITTEN).insert(path.to_owned(), unit_stamps(path));
+        lock(&UNITS_WRITTEN).insert(
+            path.to_owned(),
+            WrittenUnit {
+                stamps: unit_stamps(path),
+                assembler: hir_ty_codegen::assembler_path(db),
+            },
+        );
     };
     let store = blaze_store::Store::global();
     let stored = || -> anyhow::Result<Option<PathBuf>> {
@@ -5658,6 +5674,7 @@ impl std::error::Error for PatchUnlinked {}
 /// ([`headerpad_ahead`]).
 #[expect(clippy::too_many_arguments)]
 fn link(
+    path: Option<&str>,
     cmd: Option<&str>,
     splice: Option<&Path>,
     patch: Option<&Path>,
@@ -5790,13 +5807,13 @@ fn link(
         let objects: Vec<&Path> = [Some(object), prebuilt, patch].into_iter().flatten().collect();
         headerpad_ahead(binary, &objects)?;
     }
-    run_link(cmd, splice, start, &declined)?;
+    run_link(path, cmd, splice, start, &declined)?;
     if let Some(binary) = splice
         && let Some(pad) = headerpad_short(binary)
     {
         cargo::plan::write_headerpad(binary, pad)?;
         let again = format!("; again with -Wl,-headerpad,{pad:#x}, for the splices to fit");
-        run_link(cmd, splice, Instant::now(), &again)?;
+        run_link(path, cmd, splice, Instant::now(), &again)?;
     }
     drop(reading);
     if let (Some(binary), Some(patch), true) = (splice, patch, relinked) {
@@ -5842,10 +5859,21 @@ fn packs_whole(args: &Args) -> bool {
 /// beside it and renamed into place: lld moves the file there aside as it starts to write, and
 /// GNU ld removes it, so a client that installs the last build's while another client's
 /// request links it again would find none.
-fn run_link(cmd: &str, binary: Option<&Path>, start: Instant, note: &str) -> anyhow::Result<()> {
+fn run_link(
+    path: Option<&str>,
+    cmd: &str,
+    binary: Option<&Path>,
+    start: Instant,
+    note: &str,
+) -> anyhow::Result<()> {
     let aside = binary.and_then(|binary| Some((binary, linked_aside(cmd, binary)?)));
     let line = aside.as_ref().map_or(cmd, |(_, (line, _))| line);
-    let linked = trace::link_output(&mut shell(line), "link");
+    let mut command = shell(line);
+    match path {
+        Some(path) => command.env("PATH", path),
+        None => command.env_remove("PATH"),
+    };
+    let linked = trace::link_output(&mut command, "link");
     let placed = match (&aside, &linked) {
         (Some((binary, (_, at))), Ok(linked)) if linked.status.success() => {
             std::fs::rename(at, binary)
@@ -8837,7 +8865,7 @@ fn process_wide() {
     // A proc macro rustc compiled, as cargo's builds do, is expanded with blaze's module or
     // library of it.
     if server.is_some() || cargo::own_macro::wasm() {
-        load_cargo::own_libraries_with(Box::new(|sysroot, workspace, libraries| {
+        load_cargo::own_libraries_with_env(Box::new(|sysroot, workspace, libraries, env| {
             let libraries: Vec<_> = libraries
                 .iter()
                 .map(|it| cargo::own_macro::Compiled {
@@ -8847,7 +8875,12 @@ fn process_wide() {
                 })
                 .collect();
             let sysroot = sysroot.map(AsRef::<Path>::as_ref);
-            let made = cargo::own_macro::libraries_of(sysroot, workspace.as_ref(), &libraries);
+            let made = cargo::own_macro::libraries_of_with_env(
+                sysroot,
+                workspace.as_ref(),
+                &libraries,
+                env,
+            );
             let path = |it: PathBuf| match it.to_str().map(AbsPathBuf::try_from) {
                 Some(Ok(it)) => Ok(it),
                 _ => Err(format!("blaze made {} where a path is not text", it.display())),
@@ -9373,6 +9406,7 @@ fn run_holding(
         let named = shown_crate(&db, &args);
         events::at(events::Step::Link, Some(&named));
         link(
+            ide_db::base_db::process_env_var(&db, "PATH").as_deref(),
             args.link_cmd.as_deref(),
             args.splice.as_deref(),
             args.patch.as_deref(),
@@ -9619,6 +9653,8 @@ fn run_holding(
     let mut links: FxHashMap<PathBuf, std::thread::JoinHandle<()>> = FxHashMap::default();
     // What the files were like when each object was last built and linked.
     let as_built: Arc<std::sync::Mutex<FxHashMap<PathBuf, Settled>>> = Arc::default();
+    // A failed checkout reload must still refresh macro processes on the next request.
+    let mut refresh_macros = false;
     // The checkout each loaded one is read from, when that is not itself.
     let mut viewed: FxHashMap<PathBuf, PathBuf> = FxHashMap::default();
     // The crates whose variables name another checkout than the one they were loaded in.
@@ -9719,6 +9755,76 @@ fn run_holding(
                     }
                     let asked = target.clone();
                     let mut target = target;
+                    // Re-running scripts can replace OUT_DIR files. Finish the previous
+                    // environment's builds before checking inputs of the next command.
+                    let turning = process::differs(&db, &stream.env);
+                    if turning {
+                        if !clients.is_empty() {
+                            later.push((request, asked, stream));
+                            continue;
+                        }
+                        builds.settle(&mut db, &mut programs)?;
+                        for (_, link) in links.drain() {
+                            _ = link.join();
+                        }
+                    }
+                    // Install the request before dependency tools or macro compilers run.
+                    if turning {
+                        let path_changed =
+                            ide_db::base_db::process_env_var(&db, "PATH") != stream.env.get("PATH");
+                        checkouts
+                            .cargo_config
+                            .extra_env
+                            .insert("PATH".to_owned(), stream.env.get("PATH"));
+                        let reading = process::turn(&mut db, stream.env.clone());
+                        // An opaque native macro can retain any inherited variable, not
+                        // just PATH. Its code identity includes this request's snapshot.
+                        let macros = checkouts.loaded.reset_proc_macro_servers()
+                            || ide_db::base_db::all_crates(&db)
+                                .iter()
+                                .any(|krate| krate.data(&db).target_kind.is_proc_macro());
+                        refresh_macros |= macros;
+                        if macros {
+                            for program in &mut programs {
+                                program.known.start_again();
+                                program.unbuilt.stale = true;
+                            }
+                            listed.touch(&db, None);
+                            lock(&as_built).clear();
+                        }
+                        if path_changed {
+                            let external_assembler = hir_ty_codegen::assembler_path(&db).is_some();
+                            // A linker and the tools it invokes resolve through PATH too.
+                            // Emit a whole object from the retained database's code: a
+                            // zero-change splice would keep the previous linker's image.
+                            for program in &mut programs {
+                                if external_assembler {
+                                    // The precompiled library is rebuilt in std_unit_again.
+                                    // Its old frozen code must not outlive that producer.
+                                    let patching = program.known.patching;
+                                    let used_by_rustc = program.known.used_by_rustc;
+                                    program.known = Rejections::default();
+                                    program.known.patching = patching;
+                                    program.known.used_by_rustc = used_by_rustc;
+                                    program.unbuilt.stale = true;
+                                } else if program.args.exe.is_some()
+                                    || program.args.link_cmd.is_some()
+                                {
+                                    program.known.start_again();
+                                    program.unbuilt.stale = true;
+                                }
+                            }
+                            lock(&as_built).clear();
+                        }
+                        if !reading.is_empty() {
+                            for program in &mut programs {
+                                program.known.touch(&db, Some(&reading));
+                                program.unbuilt.stale = true;
+                            }
+                            listed.touch(&db, Some(&reading));
+                            lock(&as_built).clear();
+                        }
+                    }
                     // A checkout that is not what it was loaded from is loaded again before
                     // anything is built of it. The builds under way and the ones already
                     // taken for this turn are of the checkout as it was.
@@ -9767,29 +9873,26 @@ fn run_holding(
                                 let _ = writeln!(&stream, "failed: {error:#}");
                                 continue;
                             }
+                            refresh_macros = false;
                         }
                         Err(error) => {
                             let _ = writeln!(&stream, "failed: {error:#}");
                             continue;
                         }
                     }
-                    // One build is for one process: its variables are what `env!` reads.
-                    if process::differs(&db, &stream.env) {
-                        if !clients.is_empty() {
-                            later.push((request, asked, stream));
-                            continue;
-                        }
-                        builds.settle(&mut db, &mut programs)?;
-                        let reading = process::turn(&mut db, stream.env.clone());
+                    let refreshed_macros = refresh_macros;
+                    if refresh_macros {
+                        checkouts.loaded.add(
+                            Vec::new(),
+                            &checkouts.cargo_config.extra_env,
+                            &checkouts.load_config,
+                            tree.vfs(),
+                            &mut db,
+                        )?;
+                        refresh_macros = false;
+                    }
+                    if turning || refreshed_macros {
                         prepare_macro_sessions(&db);
-                        if !reading.is_empty() {
-                            for program in &mut programs {
-                                program.known.touch(&db, Some(&reading));
-                                program.unbuilt.stale = true;
-                            }
-                            listed.touch(&db, Some(&reading));
-                            lock(&as_built).clear();
-                        }
                     }
                     given_up.extend(lock(&unlinked).drain(..));
                     let view = match target.as_ref().and_then(|it| it.project.as_ref()) {
@@ -10724,8 +10827,10 @@ fn run_holding(
             let own_line = programs[at].args.exe.is_some();
             let prebuilt = programs[at].args.prebuilt.clone();
             let read_as = (over != base).then(|| (over.clone(), unlinked.clone()));
+            let path = ide_db::base_db::process_env_var(&db, "PATH");
             let linked = std::thread::spawn(move || {
                 let failed = link(
+                    path.as_deref(),
                     link_cmd.as_deref(),
                     splice.as_deref(),
                     spliced.as_deref(),
@@ -11360,6 +11465,7 @@ impl Program {
             let packs = packs_whole(args);
             let own_line = args.exe.is_some();
             let unlinked = link(
+                ide_db::base_db::process_env_var(db, "PATH").as_deref(),
                 cmd,
                 splice,
                 patch,

@@ -104,7 +104,6 @@ const WORKER_ENV: &[&str] = &[
     "RUSTUP_TOOLCHAIN",
     "RUSTUP_HOME",
     "CARGO_HOME",
-    "PATH",
     "BLAZE_BACKEND",
     "BLAZE_OPT",
     "BLAZE_MIR_OPT",
@@ -533,9 +532,8 @@ pub fn worker_env() -> BTreeMap<String, String> {
     env
 }
 
-/// The variables of this process its build scripts may be given that [`worker_env`] leaves
-/// out: what a script says it reads or the root manifest's `build-script-env` names is the
-/// command's, not that of whoever started the daemon. Not blaze's own.
+/// The variables of this process that belong to each command, rather than worker identity:
+/// what scripts and proc macros read, and the PATH that resolves their tools. Not blaze's own.
 pub fn command_env() -> BTreeMap<String, String> {
     std::env::vars_os()
         .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))

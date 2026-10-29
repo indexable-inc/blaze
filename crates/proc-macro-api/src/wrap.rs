@@ -13,6 +13,17 @@ pub const UNSANDBOXED: &str = "BLAZE_PROC_MACROS_UNSANDBOXED";
 pub type Wrap = fn(Command) -> io::Result<Command>;
 
 static WRAP: OnceLock<Wrap> = OnceLock::new();
+static INHERITED: OnceLock<fn(&str) -> bool> = OnceLock::new();
+
+/// Restricts which inherited request variables a sandboxed server receives. Explicit
+/// configuration overrides and the crate's expansion variables keep their own scope.
+pub fn inherited_env_with(kept: fn(&str) -> bool) {
+    _ = INHERITED.set(kept);
+}
+
+pub fn inherits(name: &str) -> bool {
+    INHERITED.get().is_none_or(|kept| kept(name))
+}
 
 /// Has every proc-macro server started from here on be started with what `wrap` makes of its
 /// command. The first call is the one kept.

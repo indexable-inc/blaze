@@ -474,10 +474,15 @@ fn mk_child<'a>(
     let mut cmd = crate::wrap::wrapped(cmd)?;
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
     if cfg!(windows) {
+        let search_path = cmd
+            .get_envs()
+            .find(|(name, _)| *name == "PATH")
+            .map(|(_, value)| value.map(std::ffi::OsStr::to_owned))
+            .unwrap_or_else(|| std::env::var_os("PATH"));
         let mut path_var = std::ffi::OsString::new();
         path_var.push(path.parent().unwrap().parent().unwrap());
         path_var.push("\\bin;");
-        path_var.push(std::env::var_os("PATH").unwrap_or_default());
+        path_var.push(search_path.unwrap_or_default());
         cmd.env("PATH", path_var);
     }
     cmd.spawn()

@@ -561,10 +561,16 @@ store kept: ...`), where cargo shows what a script printed.
 
 Every proc-macro server a load starts, the toolchain's and blaze's own, runs in the sandbox
 too, writing nothing: no `OUT_DIR`, only the empty temporary directories. It is given what a
-test is given and blaze's and rust-analyzer's own variables, not the shell's; a crate's
-variables come with each expansion. A server is started
-once, when a load first needs it, and serves every expansion after, so the sandbox costs its
-start (about 8 ms on Linux, 25 ms on macOS) and nothing per expansion. The packages of
+test is given and blaze's and rust-analyzer's own variables, apart from the compiler's
+`BLAZE_PROC_MACRO_CACHE` mode; a crate's
+variables come with each expansion. A server is kept while the request environment is
+unchanged. A different environment starts fresh native servers so a macro cannot retain an
+earlier request's values in statics. The sandbox costs its start (about 8 ms on Linux,
+25 ms on macOS) and nothing per expansion. Native code keys include a digest of the request
+environment; expansion keys include the actual host's startup variables as well as the
+crate's variables. Only digests enter the cache, and inherited variables obey the sandbox's
+allowlist. An explicit crate variable keeps its own scope.
+The packages of
 `unsandboxed-proc-macros` are expanded by servers of their own, started outside. The hook is
 `proc_macro_api::wrap` (the command a server is started with) and
 `load_cargo::unsandboxed_macros_with` (which libraries get the outside servers).

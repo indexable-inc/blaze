@@ -24,6 +24,11 @@ since the release before and the title of each change merged since.
   Flecs world of the workspace, its crates, modules and functions, which Flecs's REST answers
   queries of, read only, under the same token (docs/web.md).
 
+### Fixed
+
+- Commands with different `PATH` values reuse a compilation worker while scripts, proc macros,
+  assemblers and linkers use the current command's environment (#805).
+
 ### Changed
 
 - `blaze-engine cache build` prints what this build's store keys are made with apart from the toolchain (the store's format and the hash of blaze's sources), and fails for a build keyed by its executable's bytes: CI will name the remote's project by it instead of by the release, so a release whose compiled-in sources did not change keeps the store (docs/cache.md).

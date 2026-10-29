@@ -1434,7 +1434,8 @@ define void @"blaze.own"(ptr %to, i64 %from) {
         use super::super::fragment::FuncTarget;
 
         let isa = super::super::target().unwrap();
-        let mut wants = Wants::new(&**isa);
+        let mut wants =
+            Wants::new(&**isa, super::super::asm::Assembler::selected(std::env::var("PATH").ok()));
         let mut sig = ir::Signature::new(isa.default_call_conv());
         sig.params.push(AbiParam::new(F64));
         sig.returns.push(AbiParam::new(F64));
@@ -1524,7 +1525,8 @@ define double @"blaze.own"(double %x) #0 {
 attributes #0 = { alwaysinline }
 "#;
         let isa = super::super::target().unwrap();
-        let mut wants = Wants::new(&**isa);
+        let mut wants =
+            Wants::new(&**isa, super::super::asm::Assembler::selected(std::env::var("PATH").ok()));
         let mut sig = ir::Signature::new(isa.default_call_conv());
         sig.params.push(AbiParam::new(F64));
         sig.returns.push(AbiParam::new(F64));

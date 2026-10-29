@@ -223,7 +223,15 @@ pub fn compile_as(
     let sysroot = super::toolchain::sysroot().ok_or("blaze's toolchain is not installed")?;
     let env = crate_env();
     let asked = Asked { args, cwd };
-    compile_in(&sysroot, &asked, source, env, made, dir, &|name| std::env::var(name).ok())
+    compile_in(
+        &sysroot,
+        &asked,
+        source,
+        env,
+        made,
+        dir,
+        CompileInputs { rustc_had: &|name| std::env::var(name).ok(), macros: &BTreeMap::new() },
+    )
 }
 
 /// [`compile_as`] of the crate rustc compiled as `record` says, over the standard library of
@@ -234,10 +242,29 @@ pub fn compile_record(
     made: &Made<'_>,
     dir: &Path,
 ) -> Result<(), String> {
+    compile_record_with_macros(sysroot, record, made, dir, &BTreeMap::new())
+}
+
+/// Like [`compile_record`], expanding with the dependencies built for this request.
+pub fn compile_record_with_macros(
+    sysroot: &Path,
+    record: &Record,
+    made: &Made<'_>,
+    dir: &Path,
+    macros: &BTreeMap<PathBuf, PathBuf>,
+) -> Result<(), String> {
     let asked = Asked { args: &record.args, cwd: &record.cwd };
     let env = record.crate_env.clone();
     let rustc_had = |name: &str| record.crate_env.get(name).cloned().or(std::env::var(name).ok());
-    compile_in(sysroot, &asked, &record.source, env, made, dir, &rustc_had)
+    compile_in(
+        sysroot,
+        &asked,
+        &record.source,
+        env,
+        made,
+        dir,
+        CompileInputs { rustc_had: &rustc_had, macros },
+    )
 }
 
 /// Builds the first crate of `described`, a `rust-project.json` over the standard library of
@@ -254,6 +281,11 @@ pub fn compile_described(
 
 /// [`compile_as`] of the crate rustc was `asked` for, the variables its source reads by `env!`
 /// being `env` and the others what `rustc_had` says.
+struct CompileInputs<'a> {
+    rustc_had: &'a dyn Fn(&str) -> Option<String>,
+    macros: &'a BTreeMap<PathBuf, PathBuf>,
+}
+
 fn compile_in(
     sysroot: &Path,
     asked: &Asked<'_>,
@@ -261,7 +293,7 @@ fn compile_in(
     env: BTreeMap<String, String>,
     made: &Made<'_>,
     dir: &Path,
-    rustc_had: &dyn Fn(&str) -> Option<String>,
+    inputs: CompileInputs<'_>,
 ) -> Result<(), String> {
     if let Some(why) = crate::unstable::refusal(asked.args) {
         return Err(format!("it is built with {why}"));
@@ -287,7 +319,14 @@ fn compile_in(
     let deps =
         deps.iter().map(|(name, path)| Ok((name.clone(), add(&mut crates, &mut linked, path)?)));
     crates[0].deps = deps.collect::<Result<_, String>>()?;
-    build_described(sysroot, &crates, made, dir, rustc_had)
+    for krate in &mut crates {
+        if let Some(path) = krate.proc_macro.as_ref().and_then(|path| {
+            inputs.macros.get(path).or_else(|| inputs.macros.get(&path.canonicalize().ok()?))
+        }) {
+            krate.proc_macro = Some(path.clone());
+        }
+    }
+    build_described(sysroot, &crates, made, dir, inputs.rustc_had)
 }
 
 /// Builds the first of `crates`, over the standard library of `sysroot`, as `made` says,
@@ -410,6 +449,17 @@ fn built(
 ) -> Result<(), String> {
     let mut first = keyed::Key::new(BUILDS);
     first.field(described.as_bytes()).field(keyed::toolchain(sysroot).as_bytes());
+    let description: Value = serde_json::from_str(described).map_err(|it| it.to_string())?;
+    if description["crates"].as_array().is_some_and(|crates| {
+        crates.iter().any(|it| it["proc_macro_dylib_path"].as_str().is_some())
+    }) {
+        // Native macros can read arbitrary inherited variables, including in statics.
+        // A digest covers that opaque input without persisting the variables themselves.
+        first.field(b"proc-macro host environment");
+        first.field(crate::process::fingerprint(&crate::process::own()).as_bytes());
+        let here = std::env::current_dir().map_err(|it| it.to_string())?;
+        first.field(b"proc-macro host directory").field(here.as_os_str().as_encoded_bytes());
+    }
     first.field(&[u8::from(made.proc_macro) | u8::from(made.wasm) << 1]);
     if made.wasi {
         first.field(crate::RUN_TOOL_TARGET.as_bytes());
@@ -630,7 +680,13 @@ fn build(
     if !shipped || made.wasi || made.wasm {
         blaze.env("BLAZE_STD_FROM", "off");
     }
-    blaze.current_dir(dir).stdin(Stdio::null()).stdout(Stdio::null());
+    // Native macros expanded during compilation see the caller's workspace, as cargo's
+    // compiler does. The sandbox admits that directory; the output scratch directory
+    // would hide workspace tools. All output paths above are absolute.
+    if !made.proc_macro || made.wasm {
+        blaze.current_dir(dir);
+    }
+    blaze.stdin(Stdio::null()).stdout(Stdio::null());
     let built = blaze.output().map_err(|it| format!("blaze did not run: {it}"))?;
     let said = String::from_utf8_lossy(&built.stderr).into_owned();
     std::fs::write(dir.join("blaze.log"), &said).map_err(|it| it.to_string())?;

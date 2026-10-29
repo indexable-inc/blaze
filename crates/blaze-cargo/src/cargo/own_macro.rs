@@ -14,7 +14,9 @@
 //! package in `native-proc-macros` ([`NATIVE_KEY`]): then it is expanded as it was before.
 
 use std::{
+    collections::BTreeMap,
     ffi::OsStr,
+    io::Write as _,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
@@ -23,7 +25,7 @@ use anyhow::Context as _;
 
 use super::{
     own_script::{self, Made},
-    sandboxed, say,
+    sandboxed,
     units::Record,
 };
 
@@ -254,24 +256,30 @@ pub const COMMAND: &str = "proc-macro-library";
 /// The directory, in the record of a proc macro rustc compiled, of blaze's library of it.
 const OWN: &str = "blaze";
 
-/// How many libraries are made at once: each is a build that uses every core itself.
-const AT_ONCE: usize = 4;
-
 /// What stands for each of `libraries`, proc macros rustc compiled in a build through the
 /// wrapper, which recorded them (`units.rs`), each with its crate's name, in the workspace at
 /// `workspace`: the store's or a new build from source over the standard library of
-/// `sysroot`, each in a process of its own. A WebAssembly module ([`wasm`]), or `Err` naming
-/// the macro when it cannot be one, but for a package the workspace runs natively
-/// ([`NATIVE_KEY`]), which is `None`, expanded with rustc's library. Otherwise blaze's
-/// library for [`server`], or `None` for one blaze could not make, which is said.
+/// `sysroot`, each in a process of its own. A WebAssembly module ([`wasm`]), or blaze's
+/// native library for [`server`] when the workspace opts into it ([`NATIVE_KEY`]). A
+/// missing sysroot or server, or a failed compilation, is an error naming the macro.
 pub fn libraries_of(
     sysroot: Option<&Path>,
     workspace: &Path,
     libraries: &[Compiled],
 ) -> Vec<Result<Option<PathBuf>, String>> {
+    libraries_of_with_env(sysroot, workspace, libraries, &rustc_hash::FxHashMap::default())
+}
+
+/// Like [`libraries_of`], with a request's environment for the compiler subprocesses.
+pub fn libraries_of_with_env(
+    sysroot: Option<&Path>,
+    workspace: &Path,
+    libraries: &[Compiled],
+    env: &rustc_hash::FxHashMap<String, Option<String>>,
+) -> Vec<Result<Option<PathBuf>, String>> {
     let wasm = wasm();
     if !wasm && server().is_none() {
-        return vec![Ok(None); libraries.len()];
+        return vec![Err("blaze has no native proc-macro server".to_owned()); libraries.len()];
     }
     let native = match wasm {
         true => {
@@ -286,80 +294,77 @@ pub fn libraries_of(
     let refused = |name: &str, why: &str| refusal(name, why, workspace);
     let Some(sysroot) = sysroot else {
         let why = "the workspace has no sysroot to build it over";
-        return libraries
-            .iter()
-            .map(|Compiled { name, .. }| match wasm && !native.contains(name) {
-                true => Err(refused(name, why)),
-                false => Ok(None),
-            })
-            .collect();
+        return libraries.iter().map(|Compiled { name, .. }| Err(refused(name, why))).collect();
     };
     let Ok(exe) = std::env::current_exe() else {
         return vec![Err("blaze does not know where it is".to_owned()); libraries.len()];
     };
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let made = std::sync::Mutex::new(vec![Ok(None); libraries.len()]);
-    std::thread::scope(|scope| {
-        for _ in 0..AT_ONCE.min(libraries.len()) {
-            scope.spawn(|| {
-                loop {
-                    let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(Compiled { name, library, description }) = libraries.get(at) else {
-                        break;
-                    };
-                    let as_wasm = wasm && !native.contains(name);
-                    if !as_wasm && server().is_none() {
-                        continue;
-                    }
-                    let mut command = std::process::Command::new(&exe);
-                    command.arg(COMMAND);
-                    if as_wasm {
-                        let Some(description) = description else {
-                            let why = "the load can't describe its crate";
-                            made.lock().unwrap()[at] = Err(refused(name, why));
-                            continue;
-                        };
-                        match described_at(library, description) {
-                            Ok(file) => _ = command.arg(WASM_FLAG).arg(file),
-                            Err(why) => {
-                                made.lock().unwrap()[at] = Err(refused(name, &why));
-                                continue;
-                            }
-                        }
-                    }
-                    command.arg(sysroot).arg(library);
-                    if let Some((var, dir)) = crate::trace::child_env() {
-                        command.env(var, dir);
-                    }
-                    let ran =
-                        tracing::info_span!(target: "blaze", "make proc macro", subject = %name)
-                            .in_scope(|| command.stdin(std::process::Stdio::null()).output());
-                    let found = match ran {
-                        Ok(ran) if ran.status.success() => {
-                            let said = String::from_utf8_lossy(&ran.stdout).trim_end().to_owned();
-                            Ok((!said.is_empty()).then(|| PathBuf::from(said)))
-                        }
-                        Ok(ran) => Err(String::from_utf8_lossy(&ran.stderr).trim_end().to_owned()),
-                        Err(error) => Err(error.to_string()),
-                    };
-                    let found = match found {
-                        Err(why) if as_wasm => Err(refused(name, &why)),
-                        Err(why) => {
-                            let file = library.file_name().unwrap_or_default().to_string_lossy();
-                            say::fallback(
-                                &format!("blaze did not make the proc macro {file}: {why}"),
-                                "rustc's library of it is expanded by the toolchain's server",
-                            );
-                            Ok(None)
-                        }
-                        found => found,
-                    };
-                    made.lock().unwrap()[at] = found;
+    // The loader supplies dependencies first. Each later compiler expands with the
+    // immutable artifacts already made for this request, never the old Cargo outputs.
+    let mut paths = BTreeMap::new();
+    let mut made = Vec::with_capacity(libraries.len());
+    for Compiled { name, library, description } in libraries {
+        let as_wasm = wasm && !native.contains(name);
+        let found = (|| -> Result<PathBuf, String> {
+            if !as_wasm && server().is_none() {
+                return Err("blaze has no native proc-macro server".to_owned());
+            }
+            let mut command = std::process::Command::new(&exe);
+            command.current_dir(workspace);
+            for (key, value) in env {
+                match value {
+                    Some(value) => _ = command.env(key, value),
+                    None => _ = command.env_remove(key),
                 }
-            });
+            }
+            command.arg(COMMAND);
+            if let Some(description) = description {
+                let description = with_macro_paths(description, &paths)?;
+                command
+                    .arg(if as_wasm { WASM_FLAG } else { NATIVE_FLAG })
+                    .arg(described_at(library, &description)?);
+            } else if as_wasm {
+                return Err("the load can't describe its crate".to_owned());
+            }
+            if !paths.is_empty() {
+                command.arg(MACROS_FLAG).arg(macro_paths_at(library, &paths)?);
+            }
+            command.arg(sysroot).arg(library);
+            if let Some((var, dir)) = crate::trace::child_env() {
+                command.env(var, dir);
+            }
+            let ran = tracing::info_span!(target: "blaze", "make proc macro", subject = %name)
+                .in_scope(|| command.stdin(std::process::Stdio::null()).output())
+                .map_err(|it| it.to_string())?;
+            if !ran.status.success() {
+                return Err(String::from_utf8_lossy(&ran.stderr).trim_end().to_owned());
+            }
+            let said = String::from_utf8_lossy(&ran.stdout).trim_end().to_owned();
+            if said.is_empty() {
+                return Err("the compiler produced no library".to_owned());
+            }
+            Ok(PathBuf::from(said))
+        })();
+        match found {
+            Ok(path) => {
+                if let Ok(original) = library.canonicalize() {
+                    paths.insert(original, path.clone());
+                }
+                paths.insert(library.clone(), path.clone());
+                made.push(Ok(Some(path)));
+            }
+            Err(why) => {
+                let why = if as_wasm {
+                    refused(name, &why)
+                } else {
+                    format!("blaze did not make the proc macro {name}: {why}")
+                };
+                made.resize(libraries.len(), Err(why));
+                break;
+            }
         }
-    });
-    made.into_inner().unwrap()
+    }
+    made
 }
 
 /// A proc macro rustc compiled: its crate's name, its library, and the `rust-project.json`
@@ -386,6 +391,56 @@ pub fn refusal(name: &str, why: &str, workspace: &Path) -> String {
 /// The flag of [`COMMAND`] that has it make a WebAssembly module rather than a library, from
 /// the description in the file after it.
 const WASM_FLAG: &str = "--wasm";
+const NATIVE_FLAG: &str = "--native";
+const MACROS_FLAG: &str = "--macro-libraries";
+
+fn with_macro_paths(
+    description: &str,
+    paths: &BTreeMap<PathBuf, PathBuf>,
+) -> Result<String, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(description).map_err(|it| it.to_string())?;
+    let crates = value["crates"].as_array_mut().ok_or("the description has no crates")?;
+    for krate in crates {
+        if let Some(path) =
+            krate["proc_macro_dylib_path"].as_str().and_then(|it| paths.get(Path::new(it)))
+        {
+            krate["proc_macro_dylib_path"] = serde_json::json!(path);
+        }
+    }
+    Ok(value.to_string())
+}
+
+fn write_input(file: &Path, bytes: &[u8]) -> Result<(), String> {
+    let dir = file.parent().ok_or("an input without a directory")?;
+    std::fs::create_dir_all(dir).map_err(|it| it.to_string())?;
+    let mut new = tempfile::NamedTempFile::new_in(dir).map_err(|it| it.to_string())?;
+    new.write_all(bytes).map_err(|it| it.to_string())?;
+    new.persist(file).map_err(|it| it.to_string())?;
+    Ok(())
+}
+
+fn macro_paths_at(library: &Path, paths: &BTreeMap<PathBuf, PathBuf>) -> Result<PathBuf, String> {
+    use sha2::Digest as _;
+    let bytes = serde_json::to_vec(paths).map_err(|it| it.to_string())?;
+    let digest = crate::content::hex(&sha2::Sha256::digest(&bytes));
+    let dir = library.parent().ok_or("a library without a directory")?;
+    let file = dir.join("blaze-macro-inputs").join(format!("{digest}.json"));
+    write_input(&file, &bytes)?;
+    Ok(file)
+}
+
+/// Publish immutable bytes so another environment or compiler cannot overwrite a loaded DLL.
+fn publish(dir: &Path, made: &Path) -> Result<PathBuf, String> {
+    use sha2::Digest as _;
+    let bytes = std::fs::read(made).map_err(|it| it.to_string())?;
+    let digest = crate::content::hex(&sha2::Sha256::digest(&bytes));
+    let file = dir.join(digest).join(made.file_name().ok_or("a library unnamed")?);
+    if std::fs::read(&file).ok().as_deref() != Some(&bytes) {
+        write_input(&file, &bytes)?;
+    }
+    Ok(file)
+}
 
 /// The directory, beside rustc's library, of the modules blaze builds of it.
 const WASM_DIR: &str = "blaze-wasm";
@@ -401,7 +456,7 @@ fn described_at(library: &Path, description: &str) -> Result<PathBuf, String> {
     let dir = dir.join(WASM_DIR).join(format!("{stem}-{digest}"));
     std::fs::create_dir_all(&dir).map_err(|it| format!("making {}: {it}", dir.display()))?;
     let file = dir.join("rust-project.json");
-    std::fs::write(&file, description).map_err(|it| format!("writing {}: {it}", file.display()))?;
+    write_input(&file, description.as_bytes())?;
     Ok(file)
 }
 
@@ -409,15 +464,27 @@ fn described_at(library: &Path, description: &str) -> Result<PathBuf, String> {
 /// through the wrapper, which recorded nothing of it.
 pub fn command(args: impl Iterator<Item = std::ffi::OsString>) -> anyhow::Result<()> {
     let mut args = args.peekable();
-    let described = match args.next_if(|it| it == WASM_FLAG) {
-        Some(_) => Some(PathBuf::from(args.next().context("a description after --wasm")?)),
+    let described = match args.next_if(|it| it == WASM_FLAG || it == NATIVE_FLAG) {
+        Some(flag) => Some((
+            PathBuf::from(args.next().context("a description after --wasm or --native")?),
+            flag == WASM_FLAG,
+        )),
         None => None,
+    };
+    let macros: BTreeMap<PathBuf, PathBuf> = match args.next_if(|it| it == MACROS_FLAG) {
+        Some(_) => {
+            let file = PathBuf::from(args.next().context("a path map after --macro-libraries")?);
+            serde_json::from_slice(&std::fs::read(file)?)?
+        }
+        None => BTreeMap::new(),
     };
     let sysroot = PathBuf::from(args.next().context("the sysroot is named first")?);
     let library = PathBuf::from(args.next().context("then rustc's library")?);
     let made = match &described {
-        Some(described) => module_of(&sysroot, &library, described).map(Some),
-        None => library_of(&sysroot, &library),
+        Some((described, wasm)) => {
+            described_library(&sysroot, &library, described, *wasm).map(Some)
+        }
+        None => library_of(&sysroot, &library, &macros),
     };
     match made {
         Ok(own) => {
@@ -433,34 +500,56 @@ pub fn command(args: impl Iterator<Item = std::ffi::OsString>) -> anyhow::Result
     }
 }
 
-/// blaze's WebAssembly module of the proc macro rustc compiled at `library`, built from the
-/// `rust-project.json` at `described` ([`described_at`]) over the standard library of
-/// `sysroot`, beside it.
-fn module_of(sysroot: &Path, library: &Path, described: &Path) -> Result<PathBuf, String> {
+/// A native library or WebAssembly module built from the load's current description.
+fn described_library(
+    sysroot: &Path,
+    library: &Path,
+    described: &Path,
+    wasm: bool,
+) -> Result<PathBuf, String> {
     let description = std::fs::read_to_string(described).map_err(|it| it.to_string())?;
     let value: serde_json::Value =
         serde_json::from_str(&description).map_err(|it| it.to_string())?;
     let name = value["crates"][0]["display_name"].as_str().ok_or("a proc macro unnamed")?;
     let dir = described.parent().ok_or("a description without a directory")?;
     let stem = library.file_stem().and_then(OsStr::to_str).unwrap_or(name);
+    let scratch = tempfile::Builder::new()
+        .prefix("building-")
+        .tempdir_in(dir)
+        .map_err(|it| it.to_string())?;
     let made = Made {
         name,
         proc_macro: true,
         wasi: false,
-        wasm: true,
-        exe: dir.join(format!("{stem}.wasm")),
-        dep_info: dir.join(format!("{stem}.d")),
+        wasm,
+        exe: scratch.path().join(if wasm {
+            format!("{stem}.wasm")
+        } else {
+            library
+                .file_name()
+                .and_then(OsStr::to_str)
+                .ok_or("a native library unnamed")?
+                .to_owned()
+        }),
+        dep_info: scratch.path().join(format!("{stem}.d")),
     };
-    own_script::compile_described(sysroot, &description, &made, dir)?;
+    own_script::compile_described(sysroot, &description, &made, scratch.path())?;
+    let file = publish(dir, &made.exe)?;
     // Here, as soon as it is built and beside the other modules' builds, rather than in the
     // load, which loads one module after another.
-    blaze_macro_wasm::prepare(&made.exe, own_script::store())?;
-    Ok(made.exe)
+    if wasm {
+        blaze_macro_wasm::prepare(&file, own_script::store())?;
+    }
+    Ok(file)
 }
 
 /// blaze's library of the proc macro rustc compiled at `library`, made from its record over
 /// the standard library of `sysroot`, in that record. `None` when it has no record.
-fn library_of(sysroot: &Path, library: &Path) -> Result<Option<PathBuf>, String> {
+fn library_of(
+    sysroot: &Path,
+    library: &Path,
+    macros: &BTreeMap<PathBuf, PathBuf>,
+) -> Result<Option<PathBuf>, String> {
     let (prefix, suffix) = (std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX);
     let file = library.file_name().and_then(OsStr::to_str).ok_or("a library unnamed")?;
     let stem = file.strip_prefix(prefix).and_then(|it| it.strip_suffix(suffix));
@@ -469,18 +558,22 @@ fn library_of(sysroot: &Path, library: &Path) -> Result<Option<PathBuf>, String>
     let unit = &super::layout::unit_of_file(stem, dir);
     let Some((record, records)) = Record::described_or_seeded(dir, unit) else { return Ok(None) };
     let dir = records.join(unit).join(OWN);
+    std::fs::create_dir_all(&dir).map_err(|it| it.to_string())?;
+    let scratch = tempfile::Builder::new()
+        .prefix("building-")
+        .tempdir_in(&dir)
+        .map_err(|it| it.to_string())?;
     let extra = record.codegen("extra-filename").unwrap_or_default();
     let made = Made {
         name: &record.crate_name,
         proc_macro: true,
         wasi: false,
         wasm: false,
-        exe: dir.join(file),
-        dep_info: dir.join(format!("{}{extra}.d", record.crate_name)),
+        exe: scratch.path().join(file),
+        dep_info: scratch.path().join(format!("{}{extra}.d", record.crate_name)),
     };
-    std::fs::create_dir_all(&dir).map_err(|it| it.to_string())?;
-    own_script::compile_record(sysroot, &record, &made, &dir)?;
-    Ok(Some(made.exe))
+    own_script::compile_record_with_macros(sysroot, &record, &made, scratch.path(), macros)?;
+    Ok(Some(publish(&dir, &made.exe)?))
 }
 
 /// What blaze makes of the proc macro `record` is of: its library, or with `wasm` its module,

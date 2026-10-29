@@ -374,6 +374,7 @@ pub(super) struct Recorder<'db> {
 /// once the database is let go of (see `tier::Prepared`).
 pub(super) struct Wants {
     pub(super) isa: &'static dyn TargetIsa,
+    pub(super) assembler: super::asm::Assembler,
     pub(super) requests: Requests,
     funcs: FxHashMap<FuncRequest, FuncId>,
     shared: FxHashMap<ConstBlob, DataId>,
@@ -385,9 +386,10 @@ pub(super) struct Wants {
 }
 
 impl Wants {
-    pub(super) fn new(isa: &'static dyn TargetIsa) -> Wants {
+    pub(super) fn new(isa: &'static dyn TargetIsa, assembler: super::asm::Assembler) -> Wants {
         Wants {
             isa,
+            assembler,
             requests: Requests::default(),
             funcs: FxHashMap::default(),
             shared: FxHashMap::default(),
@@ -594,7 +596,7 @@ impl Wants {
     /// object would otherwise run the assembler for each block in turn. An error is not kept,
     /// so that thread meets it again and refuses the caller with it as before.
     pub(super) fn assembly(&mut self, text: String, sig: &Signature) -> FuncId {
-        _ = super::asm::assemble(&self.isa.triple().to_string(), &text);
+        _ = super::asm::assemble(&self.assembler, &self.isa.triple().to_string(), &text);
         self.func(FuncTarget::Asm(text), sig)
     }
 
@@ -702,7 +704,7 @@ impl<'db> Recorder<'db> {
             isa,
             target,
             checked,
-            wants: Wants::new(isa),
+            wants: Wants::new(isa, super::asm::Assembler::for_build(db)),
             vtables: FxHashMap::default(),
             statics: FxHashMap::default(),
             layouts: std::env::var_os("BLAZE_LAYOUTS").map(|_| Default::default()),

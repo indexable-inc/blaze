@@ -93,6 +93,8 @@ HARNESSES = [
     ("core", ["loadretry.py"], {}, on("linux", "macos"), 2),
     # A build script reads the command's environment, not the daemon's (#720).
     ("core", ["scriptenv.py"], {}, on("linux", "macos"), 2),
+    # PATH changes reuse the worker while scripts, macros and external tools read the command's.
+    ("core", ["pathenv.py"], {}, on("linux", "macos"), 2),
     # Its program of writable statics of its own crates on macOS too, where anim's `HOME` was refused.
     ("core", ["coldbuild.py", "statics"], {}, on("macos"), None),
     # std's own writable statics (`thread_local!`s, `MIN`), from a unit built on another machine (#840).
@@ -207,6 +209,7 @@ FAST = {
     "stdstatics.py": (113, (X64, MAC)),
     "loadretry.py": (30, ()),
     "scriptenv.py": (70, ()),
+    "pathenv.py": (120, (X64,)),
     "splices.py": (51, ()),
     "live_e2e.py": (16, ()),
     "live_types.py": (9, ()),
