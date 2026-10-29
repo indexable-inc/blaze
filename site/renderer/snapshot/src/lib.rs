@@ -1,5 +1,5 @@
 //! The content scripts to a snapshot, for gen/build.ts under Bun: the scripts run in Flecs (compiled into this
-//! module for wasm32-unknown-unknown), what the build baked (highlighted code, drawings, narration) is set on its entities, and the world comes back as the
+//! module for wasm32-unknown-unknown), what the build baked (highlighted code, drawings) is set on its entities, and the world comes back as the
 //! flecs-snapshot DAG-CBOR document `site_load` reads. Build time only; the worker's module (`site-wasm`) has no Flecs.
 //!
 //! ```text
@@ -8,7 +8,7 @@
 //! read snap_output_len(h) bytes at snap_output_ptr(h); snap_drop(h)
 //! ```
 //!
-//! The input is JSON: `{scripts: [{name, code}], bakes: {<entity path>: {highlighted?, baked?, audio?}}}`, the scripts in run
+//! The input is JSON: `{scripts: [{name, code}], bakes: {<entity path>: {highlighted?, baked?}}}`, the scripts in run
 //! order (schema.flecs, refs.flecs, then the rest by path, then what the build generates).
 
 use std::collections::BTreeMap;
@@ -32,7 +32,6 @@ struct ScriptJson {
 struct BakeJson {
     highlighted: Option<String>,
     baked: Option<String>,
-    audio: Option<String>,
 }
 
 /// The snapshot for `input` (the JSON above).
@@ -43,7 +42,7 @@ pub fn build(input: &[u8]) -> Result<Vec<u8>, String> {
     let bakes = i
         .bakes
         .into_iter()
-        .map(|(k, b)| (k, Bake { highlighted: b.highlighted, baked: b.baked, audio: b.audio }))
+        .map(|(k, b)| (k, Bake { highlighted: b.highlighted, baked: b.baked }))
         .collect();
     scripts::snapshot(&scripts, &bakes)
 }

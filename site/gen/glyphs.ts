@@ -1,8 +1,9 @@
 /**
- * The course's lesson glyphs: one small line drawing per lesson, the picture on its node on the course path (the home
- * page) and above its title on the lesson page. A lesson names its glyph (`Lesson: {1, "...", "pipeline"}` in
- * content/learn/*.flecs, the `glyph` field of `Lesson` in schema.flecs); gen/build.ts bakes the drawing onto the lesson
- * page as its `Baked {html}`, and the renderer (render.rs `glyph`) inlines it. An unknown name fails the build.
+ * The course's glyphs: one small line drawing per lesson and per update, the picture on its node on the course path
+ * (the home page), on What's new, and above its title on its page. A lesson or update names its glyph
+ * (`Lesson: {1, "...", "pipeline"}` in content/learn/*.flecs, `Update: {..., "fetch"}` in content/updates/*.flecs);
+ * gen/build.ts bakes the drawing onto the page as its `Baked {html}`, and the renderer (render.rs `glyph`) inlines it.
+ * An unknown name fails the build.
  *
  * Drawn as the site's icons are (Phosphor light, renderer/core/src/icons.rs): thin round-capped strokes in
  * `currentColor`, here on a 32x32 canvas. Each glyph also has one filled pixel cell, `.g-cell`: the one part that
@@ -68,6 +69,28 @@ export const GLYPHS: Record<string, Glyph> = {
 		...as('pulse', curve(7.25, 9.5, 12.5, 17), curve(24.75, 9.5, 19.5, 17)),
 		cell(16, 24.2, 2.8),
 	],
+
+	// Updates (content/updates/*.flecs name these in `Update`), drawn the same way.
+	/** Pinned downloads: a download comes down into the build, held where the lock says (the cell). */
+	fetch: [...as('flow', line(16, 3.5, 16, 17.5), line(11, 12.5, 16, 17.5, 21, 12.5)), ...as('link', line(4.5, 19.5, 4.5, 27.5, 27.5, 27.5, 27.5, 19.5)), cell(16, 23.2)],
+	/** Why it rebuilt: a build's last lines, the rebuilt function marked. */
+	why: [...as('code', line(11.5, 8.5, 27.5, 8.5), line(11.5, 16, 23.5, 16), line(11.5, 23.5, 25.5, 23.5)), box(3.5, 5.5, 5, 5, 1), box(3.5, 20.5, 5, 5, 1), cell(6, 16, 5)],
+	/** Kept test passes: a passing check, kept in its cell. */
+	pass: [box(4.5, 4.5, 23, 23, 3), ...as('flow', line(10, 16.5, 14, 20.5, 22.5, 11)), cell(24.5, 24.5)],
+	/** Macros that keep state: two expansions in one session, what the first left behind carried to the next. */
+	session: [box(3.5, 9.5, 10, 13, 2), ...as('flow', curve(13.5, 16, 18.5, 16)), ...as('link', box(18.5, 9.5, 10, 13, 2)), cell(8.5, 16), cell(23.5, 16)],
+	/** Build scripts, shared: two checkouts finding one kept run. */
+	anywhere: [
+		box(3.5, 3.5, 8, 7, 1.2),
+		box(3.5, 21.5, 8, 7, 1.2),
+		curve(11.5, 7, 21, 16),
+		curve(11.5, 25, 21, 16),
+		...as('pulse', curve(11.5, 7, 21, 16), curve(11.5, 25, 21, 16)),
+		arc('M21 16a5 5 0 1 0 10 0a5 5 0 1 0 -10 0'),
+		cell(26, 16, 2.8),
+	],
+	/** Const macros: code that writes code, with no box round it: it runs where it is. */
+	inline: [...as('code', line(11.5, 9.5, 5, 16, 11.5, 22.5), line(20.5, 9.5, 27, 16, 20.5, 22.5)), line(18, 7.5, 14, 24.5), cell(16, 27.5, 2.6)],
 };
 
 /** A glyph as an inline SVG, sized by CSS (`.glyph svg`). */

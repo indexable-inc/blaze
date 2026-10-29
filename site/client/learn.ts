@@ -1,7 +1,8 @@
 /**
- * The course (the lessons at /learn/<slug> and the path on the home page; Lesson, Step, Quiz, Tap and Figure in content/schema.flecs, rendered by the
- * renderer's render.rs). Without JS a lesson is one page of steps under each other, each question with its answer in
- * a fold. This script turns it into the lesson player, one step at a time:
+ * The course (the lessons at /learn/<slug>, the updates at /updates/<slug>, What's new at /updates and the path on the
+ * home page; Lesson, Update, Step, Quiz, Tap and Figure in content/schema.flecs, rendered by the renderer's render.rs).
+ * Without JS a lesson or update is one page of steps under each other, each question with its answer in a fold. This
+ * script turns it into the lesson player, one step at a time:
  *
  * - a bar at the top (back to the course, how far along, step k of n) and one at the bottom, within thumb reach (Back,
  *   and the one big button: Start, Check, Continue, Finish), where a question's feedback appears too;
@@ -11,9 +12,10 @@
  *   the answer;
  * - keys: Enter is the big button, the arrows step back and forward, 1 to 9 pick a choice, Escape is the course.
  *
- * On the home page it lights the course path (`.course`, render.rs `course`) with the reader's progress: each lesson's
- * node and its mastery cells (one per question, solid when it was right the first time), the trail between the nodes
- * filled as far as the reader has come, Start or Continue on the next lesson, and the big button pointed at it.
+ * On the home page it lights the course path (`.course`, render.rs `course`, a graph course.rs lays out) with the
+ * reader's progress: each node and its mastery cells (one per question, solid when it was right the first time), the
+ * edges from finished nodes inked, the updates new since the reader's last visit marked New, Start or Continue on what
+ * comes next, and the big button pointed at it. On What's new it marks each update the same way.
  *
  * Progress stays in this browser (client/lib/progress.ts, localStorage `blaze.learn`): per lesson the step to come back to, the furthest
  * step seen, whether it is finished, and each question's tries. Storage can be missing or refuse writes (private
@@ -24,7 +26,7 @@
 
 import { mount, type Diagram } from './lib/diagrams';
 import { onPage } from './lib/page';
-import { KEY, firstTime, load, progress, stateOf, stateWords, store } from './lib/progress';
+import { CHANGED, KEY, type Saved, clearFresh, firstTime, fresh as freshOf, load, progress, roll, stateOf, stateWords, store } from './lib/progress';
 import { enabled as soundOn, setEnabled as setSound, sound } from './lib/sound';
 
 const still = matchMedia('(prefers-reduced-motion: reduce)');
@@ -187,8 +189,12 @@ function player(main: HTMLElement, signal: AbortSignal): () => void {
 
 	// Cover and end, as screens like the steps: 0 is the cover, 1..n the steps, n + 1 the end.
 	const cover = el('section', 'step lp-cover');
-	cover.innerHTML = `<p class="lp-eyebrow">Lesson ${main.dataset.n ?? ''}</p><h2></h2><p class="lp-line"></p><p class="lp-meta"></p><ol class="lp-map" aria-label="Steps"></ol>`;
+	cover.innerHTML = `<p class="lp-eyebrow"></p><h2></h2><p class="lp-line"></p><p class="lp-meta"></p><ol class="lp-map" aria-label="Steps"></ol>`;
 	cover.querySelector('h2')!.textContent = title;
+	cover.querySelector('.lp-eyebrow')!.textContent = main.dataset.eyebrow ?? '';
+	// An update (render.rs gives it data-log, What's new) says so where a lesson says lesson.
+	const log = main.dataset.log;
+	const kind = log ? 'Update' : 'Lesson';
 	// The lesson's glyph (render.rs puts it above the page's title), as on its node on the course path.
 	const glyph = main.querySelector('.head .lesson-glyph');
 	if (glyph) cover.prepend(glyph.cloneNode(true));
@@ -210,14 +216,14 @@ function player(main: HTMLElement, signal: AbortSignal): () => void {
 		map.append(li);
 	});
 	const end = el('section', 'step lp-end');
-	end.innerHTML = `<div class="lp-seal" aria-hidden="true">${seal()}</div><h2>Lesson complete</h2><p class="lp-score"></p><p class="lp-next"></p>`;
+	end.innerHTML = `<div class="lp-seal" aria-hidden="true">${seal()}</div><h2>${kind} complete</h2><p class="lp-score"></p><p class="lp-next"></p>`;
 	const screens = [cover, ...steps, end];
 	steps[0]!.before(cover);
 	steps[n - 1]!.after(end);
 
 	// The bars.
 	const top = el('div', 'lp-top');
-	top.innerHTML = `<a class="lp-x" aria-label="Back to the course">${icon('close')}</a><div class="lp-bar" role="progressbar" aria-label="Lesson progress" aria-valuemin="0" aria-valuemax="${n}"><i></i></div><span class="lp-count"></span><button type="button" class="lp-snd"></button>`;
+	top.innerHTML = `<a class="lp-x" aria-label="Back to the course">${icon('close')}</a><div class="lp-bar" role="progressbar" aria-label="${kind} progress" aria-valuemin="0" aria-valuemax="${n}"><i></i></div><span class="lp-count"></span><button type="button" class="lp-snd"></button>`;
 	const snd = top.querySelector<HTMLButtonElement>('.lp-snd')!;
 	const paintSound = () => {
 		snd.innerHTML = icon(soundOn() ? 'sound' : 'muted');
@@ -372,10 +378,17 @@ function player(main: HTMLElement, signal: AbortSignal): () => void {
 			const a = el('a', '', main.dataset.nextTitle ?? 'the next lesson');
 			a.href = main.dataset.next;
 			next.append(a, '. Or go back to the ');
-		} else next.append('That was the last lesson. Back to the ');
+		} else if (log) next.append('Back to the ');
+		else next.append('That was the last lesson. Back to the ');
 		const c = el('a', '', 'course');
 		c.href = course;
-		next.append(c, '.');
+		next.append(c);
+		if (log) {
+			const w = el('a', '', 'What’s new');
+			w.href = log;
+			next.append(', or to ', w);
+		}
+		next.append('.');
 	}
 
 	function primary() {
@@ -493,20 +506,45 @@ function svgEl<K extends keyof SVGElementTagNameMap>(tag: K, attrs: Record<strin
 	return e;
 }
 
+/** A node on the course path or What's new: its key, questions and state. */
+function nodeState(li: HTMLElement, saved: Saved) {
+	const p = saved.lessons[li.dataset.lesson!];
+	const qs = (li.dataset.quizzes ?? '').split(' ').filter(Boolean);
+	return { p, qs, state: stateOf(p, qs), right: firstTime(p, qs) };
+}
+
+/** The "New" mark on an update's node, shown while it is new to the reader. */
+function markNew(li: HTMLElement, on: boolean) {
+	li.toggleAttribute('data-new', on);
+	const b = li.querySelector<HTMLElement>('.new');
+	if (b) b.hidden = !on;
+}
+
 /**
- * The course path (on the home page): each lesson's node lit with the reader's progress (its state, the ring for how
- * far in, its mastery cells), the next one marked with its Start or Continue, the trail drawn between the nodes and
- * filled as far as the reader has come, the counts and Reset progress under the big button, which points at the next
- * lesson.
+ * The course path (on the home page; render.rs `course`, laid out by course.rs): each node lit with the reader's
+ * progress (its state, the ring for how far in, its mastery cells), the updates new since their last visit marked
+ * New, the next node marked with its Start or Continue, the edges stroked between the pins (render.rs gives them in
+ * `data-edges`; this only measures where the pins landed), the counts and Reset progress under the big button, which
+ * points at the next node: a new update whose lessons are done first, then the next lesson, then the next update.
  */
 function coursePath(course: HTMLElement, signal: AbortSignal): () => void {
-	const list = course.querySelector<HTMLOListElement>('ol.path')!;
-	const nodes = [...list.querySelectorAll<HTMLLIElement>(':scope > li.node')];
+	const nodes = [...course.querySelectorAll<HTMLLIElement>('ol.path > li.node')];
 	const end = course.querySelector<HTMLElement>('.path-end');
 	const go = course.querySelector<HTMLAnchorElement>('.course-go');
+	const updates = nodes.filter((li) => li.classList.contains('update')).map((li) => li.dataset.lesson!);
+	const lessons = nodes.filter((li) => !li.classList.contains('update'));
+	const edges = (course.dataset.edges ?? '')
+		.split(' ')
+		.filter(Boolean)
+		.map((e) => {
+			const [ft, t] = e.split(':');
+			const [f, to] = ft!.split('-').map(Number);
+			return { from: f!, to: to!, track: t === undefined ? -1 : Number(t) };
+		})
+		.filter((e) => nodes[e.from] && nodes[e.to]);
 
 	const stats = el('p', 'course-stats');
-	stats.innerHTML = '<span class="c-done"></span><span class="c-first"></span>';
+	stats.innerHTML = '<span class="c-done"></span><span class="c-upd"></span><span class="c-first"></span>';
 	const reset = el('button', 'c-reset', 'Reset progress');
 	reset.type = 'button';
 	stats.append(reset);
@@ -521,8 +559,8 @@ function coursePath(course: HTMLElement, signal: AbortSignal): () => void {
 			return;
 		}
 		disarm();
-		store({ v: 1, lessons: {} });
-		paint();
+		// What the reader has seen stays seen: clearing progress is not a first visit.
+		store({ v: 1, lessons: {}, seen: load().seen, fresh: [] });
 		reset.textContent = 'Progress cleared';
 		reset.hidden = false;
 		cleared = setTimeout(() => {
@@ -537,7 +575,7 @@ function coursePath(course: HTMLElement, signal: AbortSignal): () => void {
 		delete reset.dataset.armed;
 	}
 
-	// Each lesson's mastery cells, under its meta line; the way on, for the next one.
+	// Each node's mastery cells, under its meta line; the way on, for the next one.
 	const cells = nodes.map((li) => {
 		const qs = el('span', 'qs');
 		qs.setAttribute('role', 'img');
@@ -546,22 +584,22 @@ function coursePath(course: HTMLElement, signal: AbortSignal): () => void {
 	});
 	const goPill = el('span', 'go');
 
-	// The trail: one curve from each disc to the next (the last to the end), a dotted track and its fill, the fill
-	// revealed by a mask as far as the lesson it leaves from has come.
+	// The edges: a halo in the page's background under each line, so where two cross the one on top reads as passing
+	// over. Those that cross a divider first, under the ones within a band.
 	const trail = svgEl('svg', { class: 'trail', 'aria-hidden': 'true' });
 	course.prepend(trail);
 	course.dataset.drawn = '';
-	const pins = [...nodes.map((li) => li.querySelector<HTMLElement>('.pin')!), ...(end ? [end.querySelector<HTMLElement>('.pin')!] : [])];
-	const segments = pins.slice(1).map((_, i) => {
-		const reveal = svgEl('path', { pathLength: '1' });
-		const mask = svgEl('mask', { id: `trail-${i}`, maskUnits: 'userSpaceOnUse' });
-		mask.append(reveal);
-		const track = svgEl('path', { class: 'track' });
-		const fill = svgEl('path', { class: 'fill', mask: `url(#trail-${i})` });
-		trail.append(mask, track, fill);
-		return { reveal, track, fill };
+	const pins = nodes.map((li) => li.querySelector<HTMLElement>('.pin')!);
+	const order = [...edges.filter((e) => e.track >= 0), ...edges.filter((e) => e.track < 0)];
+	const strokes = order.map((e) => {
+		const dashed = nodes[e.to]!.closest('.theme')?.classList.contains('dashed') ?? false;
+		const g = svgEl('g', { class: `edge${e.track >= 0 ? ' cross' : ''}${dashed ? ' dash' : ''}` });
+		const halo = svgEl('path', { class: 'halo' });
+		const line = svgEl('path', { class: 'line' });
+		g.append(halo, line);
+		trail.append(g);
+		return { e, g, halo, line };
 	});
-	let fills = segments.map(() => 0);
 
 	function draw() {
 		const box = course.getBoundingClientRect();
@@ -571,39 +609,53 @@ function coursePath(course: HTMLElement, signal: AbortSignal): () => void {
 			const r = p.getBoundingClientRect();
 			return [r.left - box.left + r.width / 2, r.top - box.top + r.height / 2] as const;
 		});
-		segments.forEach((s, i) => {
-			const [x0, y0] = at[i]!;
-			const [x1, y1] = at[i + 1]!;
-			const k = (y1 - y0) / 2;
-			const d = `M${x0} ${y0}C${x0} ${y0 + k} ${x1} ${y1 - k} ${x1} ${y1}`;
-			for (const p of [s.reveal, s.track, s.fill]) p.setAttribute('d', d);
-		});
-	}
-
-	function fillTrail() {
-		segments.forEach((s, i) => s.reveal.style.setProperty('stroke-dashoffset', String(1 - fills[i]!)));
+		// The gutter's tracks, from the inside out: the first list's left edge plus its padding is where column 0
+		// starts (styles/learn.css gives the padding as --gut,
+		// and the spacing of the tracks as --trk).
+		const path = course.querySelector<HTMLElement>('ol.path');
+		const inner = path ? path.getBoundingClientRect().left - box.left + parseFloat(getComputedStyle(path).paddingLeft) : 0;
+		const trk = parseFloat(getComputedStyle(course).getPropertyValue('--trk'));
+		const trackX = (t: number) => inner - 6 - t * trk;
+		for (const { e, halo, line } of strokes) {
+			const [x1, y1] = at[e.from]!;
+			const [x2, y2] = at[e.to]!;
+			let d: string;
+			if (e.track >= 0) {
+				const tx = trackX(e.track);
+				const r = Math.min(8, (y2 - y1) / 2);
+				d = `M${x1} ${y1}H${tx + r}Q${tx} ${y1} ${tx} ${y1 + r}V${y2 - r}Q${tx} ${y2} ${tx + r} ${y2}H${x2}`;
+			} else if (Math.abs(x1 - x2) < 1) {
+				d = `M${x1} ${y1}V${y2}`;
+			} else {
+				// Bend into the target's column halfway to the next row, then straight down it.
+				const yn = at[e.from + 1]?.[1] ?? y2;
+				const bend = (y1 + yn) / 2;
+				const k = Math.min(16, (bend - y1) / 2);
+				d = `M${x1} ${y1}V${bend - k}C${x1} ${bend} ${x2} ${bend} ${x2} ${bend + k}V${y2}`;
+			}
+			halo.setAttribute('d', d);
+			line.setAttribute('d', d);
+		}
 	}
 
 	function paint() {
-		const saved = load();
+		const saved = roll(load(), updates);
+		const fresh = new Set(freshOf(saved));
+		const done = (key: string) => saved.lessons[key]?.done === true;
 		let first = 0;
 		let total = 0;
-		let done = 0;
-		let next: HTMLLIElement | null = null;
-		const at: number[] = [];
+		let lessonsDone = 0;
+		let updatesDone = 0;
 		for (const [i, li] of nodes.entries()) {
-			const p = saved.lessons[li.dataset.lesson!];
+			const { p, qs, state, right } = nodeState(li, saved);
 			const steps = Number(li.dataset.steps ?? 1);
-			const qs = (li.dataset.quizzes ?? '').split(' ').filter(Boolean);
-			const state = stateOf(p, qs);
-			const right = firstTime(p, qs);
 			first += right;
 			total += qs.length;
-			if (p?.done) done++;
-			const far = p?.done ? 1 : Math.min(1, (p?.seen ?? 0) / steps);
-			at.push(far);
+			if (p?.done) li.classList.contains('update') ? updatesDone++ : lessonsDone++;
 			li.dataset.state = state;
-			li.style.setProperty('--p', String(far));
+			li.style.setProperty('--p', String(p?.done ? 1 : Math.min(1, (p?.seen ?? 0) / steps)));
+			const isNew = fresh.has(li.dataset.lesson!);
+			markNew(li, isNew);
 			cells[i]!.replaceChildren(
 				...qs.map((id) => {
 					const pass = p?.pass?.[id];
@@ -614,43 +666,58 @@ function coursePath(course: HTMLElement, signal: AbortSignal): () => void {
 			);
 			cells[i]!.hidden = qs.length === 0;
 			cells[i]!.setAttribute('aria-label', `${right} of ${qs.length} questions right the first time`);
-			if (!next && state !== 'done' && state !== 'mastered') next = li;
+			const n = li.querySelector('.body .n')?.firstChild?.textContent ?? '';
 			const title = li.querySelector('.body .t')?.textContent ?? '';
 			const doing = state === 'doing' ? `, step ${Math.min(steps, p?.seen ?? 0)} of ${steps}` : '';
-			li.querySelector('a')?.setAttribute('aria-label', `Lesson ${i + 1}: ${title}, ${stateWords[state]}${doing}`);
+			li.querySelector('a')?.setAttribute('aria-label', `${n}: ${title}, ${isNew ? 'new, ' : ''}${stateWords[state]}${doing}`);
 		}
-		for (const li of nodes) li.toggleAttribute('data-next', li === next);
-		const up: HTMLLIElement | null = next;
+		for (const s of strokes) s.g.classList.toggle('lit', done(nodes[s.e.from]!.dataset.lesson!));
+
+		// What comes next: a new update the reader can follow, the next lesson, the next update.
+		const ready = (li: HTMLElement) => (li.dataset.requires ?? '').split(' ').filter(Boolean).every(done);
+		const open = (li: HTMLElement) => !done(li.dataset.lesson!) && ready(li);
+		const up =
+			nodes.find((li) => li.classList.contains('update') && fresh.has(li.dataset.lesson!) && open(li)) ??
+			lessons.find(open) ??
+			nodes.find(open) ??
+			null;
+		for (const li of nodes) li.toggleAttribute('data-next', li === up);
 		goPill.textContent = up?.dataset.state === 'doing' ? 'Continue' : 'Start';
 		if (up) up.querySelector('.body')!.append(goPill);
 		else goPill.remove();
-		// The trail from a node fills as far as its lesson has come; from the last, to the end, once it is done.
-		fills = segments.map((_, i) => at[i] ?? 0);
-		fillTrail();
 
-		const all = done === nodes.length;
+		const all = nodes.every((li) => done(li.dataset.lesson!));
 		if (all) course.dataset.all = first === total ? 'mastered' : 'done';
 		else delete course.dataset.all;
 		if (end) {
-			end.querySelector('.t')!.textContent = all ? 'Course complete' : 'The end of the course';
+			end.querySelector('.t')!.textContent = all ? 'You’re caught up' : 'The end of the course';
 			end.querySelector('.l')!.textContent = all
 				? first === total
-					? `Every question right the first time. You know how blaze builds.`
-					: `${first} of ${total} questions right the first time. Review a lesson to fill in the rest.`
-				: `After lesson ${nodes.length}, you know how blaze builds.`;
+					? 'Every lesson and update done, every question right the first time. New updates show up here as blaze changes.'
+					: `Every lesson and update done; ${first} of ${total} questions right the first time. Review one to fill in the rest.`
+				: `After lesson ${lessons.length}, you know how blaze builds. New updates show up in their section as blaze changes.`;
 		}
 
-		// The big button: the next lesson to start or finish, or a way back in once all are done.
+		// The big button: what comes next, or a way back in once all is done.
 		const target = up ?? nodes[0];
 		const a = target?.querySelector('a');
 		if (go && a && target) {
-			const n = nodes.indexOf(target) + 1;
 			go.href = a.href;
-			go.querySelector('.k')!.textContent = !up ? 'Review the course' : up.dataset.state === 'doing' ? `Continue lesson ${n}` : `Start lesson ${n}`;
+			const eyebrow = target.querySelector('.body .n')?.firstChild?.textContent ?? '';
 			const title = target.querySelector('.body .t')?.textContent ?? '';
-			go.querySelector('.t')!.textContent = up ? title : `From lesson 1: ${title}`;
+			const update = target.classList.contains('update');
+			const doing = up?.dataset.state === 'doing';
+			go.querySelector('.k')!.textContent = !up
+				? 'Review the course'
+				: update
+					? fresh.has(target.dataset.lesson!)
+						? `${doing ? 'Continue' : 'New'}: ${title}`
+						: `${doing ? 'Continue' : 'Study'} the update: ${title}`
+					: `${doing ? 'Continue' : 'Start'} ${eyebrow.toLowerCase()}`;
+			go.querySelector('.t')!.textContent = !up ? `From lesson 1: ${title}` : update ? eyebrow : title;
 		}
-		stats.querySelector('.c-done')!.innerHTML = `<b>${done}/${nodes.length}</b> lessons done`;
+		stats.querySelector('.c-done')!.innerHTML = `<b>${lessonsDone}/${lessons.length}</b> lessons done`;
+		stats.querySelector('.c-upd')!.innerHTML = updates.length ? `<b>${updatesDone}/${updates.length}</b> updates${fresh.size ? `, <b>${fresh.size}</b> new` : ''}` : '';
 		stats.querySelector('.c-first')!.innerHTML = `<b>${first}/${total}</b> questions right the first time`;
 		reset.hidden = Object.keys(saved.lessons).length === 0 && reset.textContent === 'Reset progress';
 	}
@@ -660,6 +727,7 @@ function coursePath(course: HTMLElement, signal: AbortSignal): () => void {
 	const ro = new ResizeObserver(draw);
 	ro.observe(course);
 	addEventListener('storage', (e) => e.key === KEY && paint(), { signal });
+	addEventListener(CHANGED, paint, { signal });
 	return () => {
 		ro.disconnect();
 		if (armed) clearTimeout(armed);
@@ -673,11 +741,49 @@ function coursePath(course: HTMLElement, signal: AbortSignal): () => void {
 	};
 }
 
+/**
+ * What's new (render.rs `update_log`): each update's state, as on the path, and the ones new since the reader's last
+ * visit marked New, with a way to mark them all as seen.
+ */
+function updateLog(log: HTMLElement, signal: AbortSignal): () => void {
+	const items = [...log.querySelectorAll<HTMLLIElement>('li.node')];
+	const keys = (log.dataset.updates ?? '').split(' ').filter(Boolean);
+	const bar = el('p', 'ulog-bar');
+	bar.innerHTML = '<span class="ulog-count"></span>';
+	const clear = el('button', 'c-reset', 'Mark all as seen');
+	clear.type = 'button';
+	clear.addEventListener('click', () => clearFresh(load()));
+	bar.append(clear);
+	log.before(bar);
+	function paint() {
+		const saved = roll(load(), keys);
+		const fresh = new Set(freshOf(saved));
+		for (const li of items) {
+			const { state } = nodeState(li, saved);
+			li.dataset.state = state;
+			markNew(li, fresh.has(li.dataset.lesson!));
+			const title = li.querySelector('.body .t')?.textContent ?? '';
+			li.querySelector('a')?.setAttribute('aria-label', `${title}, ${fresh.has(li.dataset.lesson!) ? 'new, ' : ''}${stateWords[state]}`);
+		}
+		const done = items.filter((li) => saved.lessons[li.dataset.lesson!]?.done).length;
+		bar.querySelector('.ulog-count')!.textContent = fresh.size
+			? `${fresh.size} new since your last visit · ${done} of ${items.length} studied`
+			: `Nothing new since your last visit · ${done} of ${items.length} studied`;
+		clear.hidden = fresh.size === 0;
+	}
+	paint();
+	addEventListener('storage', (e) => e.key === KEY && paint(), { signal });
+	addEventListener(CHANGED, paint, { signal });
+	return () => bar.remove();
+}
+
 onPage((signal) => {
 	const main = document.querySelector<HTMLElement>('main.lesson[data-lesson]');
 	if (main && !main.hasAttribute('data-on')) return player(main, signal);
-	const course = document.querySelector<HTMLElement>('.course:has(> ol.path)');
+	const course = document.querySelector<HTMLElement>('.course[data-edges]');
 	if (course) return coursePath(course, signal);
+	const log = document.querySelector<HTMLElement>('.ulog[data-updates]');
+	if (log) return updateLog(log, signal);
 	// A figure outside a lesson (none yet), drawn all the same.
 	const figs = [...document.querySelectorAll<HTMLElement>('figure.diagram:not([data-drawn])')].map((f) => mount(f, false));
 	return () => figs.forEach((d) => d?.stop());

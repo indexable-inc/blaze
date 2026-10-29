@@ -19,17 +19,12 @@ site {
     Icon: {"chart"}
     (InGroup, nav.reference)
     Description: {"blaze's build and live-edit benchmarks over every run, next to plain cargo on the same machine."}
-    Intro: {"[calm] This is blaze's benchmark history: every measured run, next to plain cargo."}
-    Outro: {"[warm] The charts are on the page, with every number in a table under each one; pick a platform, a backend or a machine to see its runs. Thanks for listening."}
 
-    Lede lede("How long blaze takes to build after an edit, next to plain cargo on the same machine, on real projects at pinned commits ([how it is measured](https://github.com/indexable-inc/blaze/blob/main/docs/benchmarks.md)), and how soon a live edit runs. Each platform, macOS arm64, Linux aarch64 and Linux x86-64, is measured on a machine of its own, so compare its numbers with each other, not with another platform's. It updates after every push to main and every night.") {
-      Say: {"[matter-of-fact] Here's what's measured: how long blaze takes to build after an edit, next to plain cargo on the same machine, on real projects pinned at fixed commits, and how soon a live edit runs. [short pause] Each platform, macOS on Apple silicon, Linux on ARM, and Linux on x86, has a machine of its own, so compare a platform's numbers with each other, not across platforms. It updates after every push to main, and every night."}
-    }
+    Lede lede("How long blaze takes to build after an edit, next to plain cargo on the same machine, on real projects at pinned commits ([how it is measured](https://github.com/indexable-inc/blaze/blob/main/docs/benchmarks.md)), and how soon a live edit runs. Each platform, macOS arm64, Linux aarch64 and Linux x86-64, is measured on a machine of its own, so compare its numbers with each other, not with another platform's. It updates after every push to main and every night.")
 
     BenchHistory history(dir: "docs/benchmarks/history")
 
     Section regressions(title: "Regressions") {
-      Say: {"[serious] And regressions. Each run is compared with the runs before it on the same machine, and a number that climbs above its noise band opens an issue on GitHub, labelled bench regression. The raw data is in the repo, one line per run."}
       P compared("Each run is compared with the runs before it on the same machine. A number that goes above its noise band opens an issue labelled [bench-regression](https://github.com/indexable-inc/blaze/issues?q=label%3Abench-regression).")
       Dim data("The data: [docs/benchmarks/history](https://github.com/indexable-inc/blaze/tree/main/docs/benchmarks/history), one line per run.")
     }

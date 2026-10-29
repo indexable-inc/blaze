@@ -355,7 +355,7 @@ export class Presence extends DurableObject<Env> {
 			if (m.t === 'say' || m.t === 'edit' || m.t === 'react' || m.t === 'unsay') ws.send(JSON.stringify({ t: 'error', text: 'Bots can read, not chat.' }));
 			return;
 		}
-		if (m.t === 'c') return this.relay(tab, m.c);
+		if (m.t === 'c' || m.t === 'k') return this.relay(tab, m.c, m.t);
 		if (m.t === 'say-live') return this.sayLive(tab, m.text, m.done);
 		if (m.t === 'typing') {
 			const now = Date.now();
@@ -392,12 +392,15 @@ export class Presence extends DurableObject<Env> {
 		this.schedule();
 	}
 
-	/** Passes a pointer (`c`) on to the other people on the tab's page, checked and rebuilt, or null. Anything else is dropped. */
-	private relay(tab: Tab, raw: unknown): void {
+	/**
+	 * Passes a pointer (`c`) or a press (`k`, where the reader clicked) on to the other people on the tab's page, checked
+	 * and rebuilt; a pointer may be null (gone), a press may not. Anything else is dropped.
+	 */
+	private relay(tab: Tab, raw: unknown, t: 'c' | 'k'): void {
 		if (!tab.path) return;
-		const c = raw === null ? null : spotOf(raw);
+		const c = raw === null && t === 'c' ? null : spotOf(raw);
 		if (c === undefined || !this.allow(tab.key)) return;
-		const out = JSON.stringify({ t: 'c', k: tab.key, c });
+		const out = JSON.stringify({ t, k: tab.key, c });
 		for (const r of this.room(tab.path)) {
 			if (r.key === tab.key || r.away) continue;
 			try {

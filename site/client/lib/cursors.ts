@@ -120,6 +120,17 @@ function sendCursor(): void {
 	send({ t: 'c', c });
 }
 
+/** A press: where it was, at once (the pointer is there too), for the others to see a ring there. */
+function sendClick(x: number, y: number): void {
+	if (!peers.size || !fine.matches || document.hidden) return;
+	const c = spotAt(x, y, mineOnly);
+	if (!c) return;
+	clearTimeout(cTimer);
+	cTimer = undefined;
+	sentC = JSON.stringify(c);
+	send({ t: 'k', c });
+}
+
 function queueCursor(): void {
 	if (peers.size && fine.matches) cTimer ??= setTimeout(sendCursor, MOVE_MS);
 }
@@ -177,6 +188,14 @@ function cursorOf(r: Remote): HTMLElement {
 	e.append(arrow(), chip);
 	layer.append(e);
 	return (r.el = e);
+}
+
+/** A ring at the tip of `r`'s pointer, in their colour: they pressed there. */
+function ring(r: Remote): void {
+	if (!r.el || r.el.classList.contains('idle')) return;
+	const e = el('span', 'cursor-click');
+	e.addEventListener('animationend', () => e.remove());
+	r.el.prepend(e);
 }
 
 /**
@@ -516,9 +535,9 @@ export function reset(): void {
 	sentSay = '';
 }
 
-/** Takes a `c` or `say-live` frame; false for anything else. */
+/** Takes a `c` (pointer), `k` (a press) or `say-live` frame; false for anything else. */
 export function message(m: { t?: unknown }): boolean {
-	if (m.t !== 'c' && m.t !== 'say-live') return false;
+	if (m.t !== 'c' && m.t !== 'k' && m.t !== 'say-live') return false;
 	const { k, c, text, done } = m as { k?: unknown; c?: unknown; text?: unknown; done?: unknown };
 	const who = typeof k === 'string' ? peers.get(k) : undefined;
 	if (!who) return true;
@@ -528,7 +547,9 @@ export function message(m: { t?: unknown }): boolean {
 	else {
 		r.c = spotOf(c);
 		r.t = Date.now();
-		aim(r);
+		// A press snaps the pointer to where it was, so the ring is where they clicked, not where the glide is.
+		aim(r, m.t === 'k');
+		if (m.t === 'k' && r.c) ring(r);
 		queueRail();
 	}
 	return true;
@@ -578,6 +599,13 @@ export function setup(opts: {
 			queueCursor();
 		},
 		{ passive: true },
+	);
+	document.addEventListener(
+		'pointerdown',
+		(e) => {
+			if (e.pointerType !== 'touch' && e.isPrimary) sendClick(e.clientX, e.clientY);
+		},
+		{ passive: true, capture: true },
 	);
 	// Out of the window: gone for the others at once.
 	document.addEventListener('mouseout', (e) => {

@@ -283,29 +283,41 @@ main.lesson[data-on] .quiz .choice { margin: 0; }
 
 /* ---------- The course path (the home page) ---------- */
 
-/* The lessons as nodes on a winding path, top to bottom, each with its glyph (gen/glyphs.ts). The nodes sway in a lane
-   on the left (a step of --sway per lesson, back and forth every four), the text stays in one column beside them.
-   client/learn.ts sets each node's data-state (todo, doing, done, mastered) and --p (how far into it), marks the next
-   one data-next, draws the trail between the nodes (.trail: a dotted line of cells, filled as far as the reader has
-   come) and adds the counts and each lesson's mastery cells. Without JS it is a list of links on a plain dotted line. */
+/* The course is a graph (renderer core course.rs lays it out): bands (.theme, one per Theme, under a divider with its
+   name), each a list of nodes, one per row, a node's disc in its column (--col) of a narrow graph on the left and its
+   text in one column to the right of it. The gutter left of column 0 (--gut) holds the tracks the edges from an
+   earlier band run down. client/learn.ts sets each node's data-state (todo, doing, done, mastered), --p (how far into
+   it) and data-new, marks the next one data-next, strokes the edges (.trail) and adds the counts and the mastery cells.
+   Without JS it is a list of links per band on a plain dotted line. */
 .course {
-	--lane: 120px;
+	--colw: 64px;
 	--disc: 56px;
-	--sway: 20px;
+	--trk: 8px;
+	--cgap: 4px;
+	--gut: calc(var(--tracks, 0) * var(--trk) + 6px);
+	--graph: calc(var(--cols, 1) * var(--colw));
 	--fire: #e0461a;
+	--canary: #d9a441;
 	position: relative;
 	margin: 22px 0 22px;
 }
 @media (prefers-color-scheme: light) {
-	.course { --fire: #d63c12; }
+	.course, .ulog, .ulog-bar { --fire: #d63c12; --canary: #9a6408; }
 }
 @media (max-width: 560px) {
-	.course { --lane: 96px; --disc: 52px; --sway: 12px; }
+	.course { --colw: 42px; --disc: 40px; --trk: 6px; --cgap: 10px; }
 }
+.ulog { --fire: #e0461a; --canary: #d9a441; }
+/* The layout from course.rs, as attributes (the CSP refuses inline styles); course.rs MAX_COLS and MAX_TRACKS match. */
+.course[data-cols='2'] { --cols: 2; } .course[data-cols='3'] { --cols: 3; } .course[data-cols='4'] { --cols: 4; }
+.course[data-tracks='1'] { --tracks: 1; } .course[data-tracks='2'] { --tracks: 2; } .course[data-tracks='3'] { --tracks: 3; }
+.course[data-tracks='4'] { --tracks: 4; } .course[data-tracks='5'] { --tracks: 5; } .course[data-tracks='6'] { --tracks: 6; }
+.course[data-tracks='7'] { --tracks: 7; } .course[data-tracks='8'] { --tracks: 8; }
+.course .node[data-col='1'] { --col: 1; } .course .node[data-col='2'] { --col: 2; } .course .node[data-col='3'] { --col: 3; }
 
-/* The way in: the next lesson to start or finish (the first without JS). */
-.course-top { display: grid; gap: 14px; margin: 0 0 30px; }
-.doc .course-go { display: inline-grid; justify-self: start; gap: 2px; min-width: min(100%, 320px); padding: 14px 22px 15px; border-radius: 16px; background: var(--ink-1); color: var(--bg); text-decoration: none; transition: background-color 0.2s; }
+/* The way in: the next node to start or finish (the first lesson without JS). */
+.course-top { display: grid; gap: 14px; margin: 0 0 34px; }
+.doc .course-go { display: inline-grid; justify-self: start; gap: 2px; min-width: min(100%, 320px); max-width: 100%; padding: 14px 22px 15px; border-radius: 16px; background: var(--ink-1); color: var(--bg); text-decoration: none; transition: background-color 0.2s; }
 .course-go .k { font-size: 17px; font-weight: 650; letter-spacing: -0.01em; }
 .course-go .k::after { content: ' →'; }
 .course-go .t { color: color-mix(in srgb, var(--bg) 70%, var(--ink-1)); font-size: 14.5px; }
@@ -314,26 +326,46 @@ main.lesson[data-on] .quiz .choice { margin: 0; }
 .doc .course-go:focus-visible { outline: 2px solid var(--ink-1); outline-offset: 3px; }
 @media (max-width: 560px) { .doc .course-go { justify-self: stretch; } }
 
-/* The counts under it: lessons done, questions right the first time, and Reset progress. */
+/* The counts under it: lessons done, updates studied and new, questions right the first time, and Reset progress. */
 .course-stats { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 22px; margin: 0; color: var(--ink-3); font-size: 14px; }
 .course-stats b { color: var(--ink-1); font-family: var(--font-mono); font-size: 13.5px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.course-stats span:empty { display: none; }
 .c-reset { margin-left: auto; padding: 2px 0; border: 0; background: none; color: var(--ink-4); font: inherit; font-size: 13px; cursor: pointer; }
 .c-reset:hover { color: var(--ink-2); text-decoration: underline; text-underline-offset: 3px; }
 .c-reset:focus-visible { outline: 2px solid var(--ink-1); outline-offset: 2px; border-radius: 4px; }
 .c-reset[data-armed] { color: var(--danger); }
 .c-reset[hidden] { display: none; }
 
-.doc .path { position: relative; z-index: 1; margin: 0; padding: 0; list-style: none; }
-.doc .path .node { position: relative; margin: 0; padding: 0; }
-.doc .path a { display: grid; grid-template-columns: var(--lane) minmax(0, 1fr); align-items: start; padding: 0 8px 30px 0; border-radius: 16px; color: inherit; text-decoration: none; }
-.path .node:last-child a { padding-bottom: 34px; }
-.path .node:nth-child(4n + 2), .path .node:nth-child(4n) { --x: var(--sway); }
-.path .node:nth-child(4n + 3) { --x: calc(var(--sway) * 2); }
-.path-end { --x: var(--sway); }
+/* A band: its divider (a rule across the whole width, the gutter's tracks crossing it), its number, name and line,
+   set in the text column so the graph stays clear. */
+.theme { position: relative; z-index: 1; }
+.theme + .theme { margin-top: 6px; padding-top: 30px; border-top: 1px solid var(--line); }
+.theme.dashed + .theme, .theme + .theme.dashed { border-top-style: dashed; border-top-color: var(--line-2); }
+.theme-head { display: grid; gap: 2px; margin: 0 0 26px calc(var(--gut) + var(--graph) + var(--cgap)); }
+.theme-k { color: var(--ink-3); font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; }
+.doc .theme-head h3 { margin: 0; font-size: 19px; font-weight: 650; letter-spacing: -0.015em; }
+.doc .theme-head p { margin: 2px 0 0; color: var(--ink-3); font-size: 14.5px; line-height: 1.45; }
+.theme-canary .theme-k { color: var(--canary); }
 
-/* A node: the disc with the lesson's glyph; the ring round it (how far into the lesson); the check once done. */
-.course .pin { position: relative; display: block; width: var(--disc); height: var(--disc); margin-left: calc(var(--x, 0px) + 8px); }
-.course .disc {
+.doc .path { position: relative; margin: 0; padding: 0 0 0 var(--gut); list-style: none; }
+.doc .path .node { position: relative; margin: 0; padding: 0; }
+.doc .path a { display: grid; grid-template-columns: var(--graph) minmax(0, 1fr); column-gap: var(--cgap); align-items: start; padding: 0 8px 30px 0; border-radius: 16px; color: inherit; text-decoration: none; }
+.theme:last-of-type .path .node:last-child a { padding-bottom: 38px; }
+
+/* A node: the disc with its glyph, centred in its column; the ring round it (how far into it); the check once done.
+   An update's disc is smaller: it hangs off a lesson. */
+.course .pin, .ulog .pin { position: relative; display: block; width: var(--disc); height: var(--disc); }
+.course .pin { margin-left: calc(var(--col, 0) * var(--colw) + (var(--colw) - var(--disc)) / 2); }
+.node.update { --disc: 40px; }
+@media (max-width: 560px) {
+	.course .node.update { --disc: 30px; }
+	.doc .course .path a { padding-right: 0; }
+	:is(.course, .ulog) .body .t { font-size: 16.5px; }
+	.course .node.update .body .t { font-size: 15.5px; }
+	.course .node.update .badge { right: -6px; bottom: -6px; }
+}
+.node.update .pin { margin-top: 2px; }
+:is(.course, .ulog) .disc {
 	display: grid;
 	place-items: center;
 	width: 100%;
@@ -344,14 +376,19 @@ main.lesson[data-on] .quiz .choice { margin: 0; }
 	color: var(--ink-2);
 	transition: background-color 0.25s, color 0.25s, box-shadow 0.25s;
 }
-.course .disc .glyph { width: 56%; height: 56%; }
-.course .badge { position: absolute; right: -3px; bottom: -3px; display: none; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: var(--ink-1); color: var(--bg); box-shadow: 0 0 0 3px var(--bg); }
-.course .badge svg { width: 14px; height: 14px; }
+:is(.course, .ulog) .disc .glyph { width: 56%; height: 56%; }
+.node.update .disc .glyph { width: 62%; height: 62%; }
+:is(.course, .ulog) .badge { position: absolute; right: -3px; bottom: -3px; display: none; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: var(--ink-1); color: var(--bg); box-shadow: 0 0 0 3px var(--bg); }
+:is(.course, .ulog) .badge svg { width: 14px; height: 14px; }
+.node.update .badge { right: -5px; bottom: -5px; width: 18px; height: 18px; }
+.node.update .badge svg { width: 12px; height: 12px; }
+/* In a dashed band, a node not yet started has a dashed rim: what it teaches may still change. */
+.theme.dashed .node[data-state='todo']:not([data-next]) .disc, .course:not([data-drawn]) .theme.dashed .disc { box-shadow: none; background-image: radial-gradient(circle closest-side, var(--bg-3) calc(100% - 1.5px), transparent calc(100% - 1px)), repeating-conic-gradient(var(--line-2) 0 10deg, transparent 10deg 20deg); }
 
 /* Not started: quiet. */
-.path .node[data-state='todo'] .disc { color: var(--ink-3); }
+.node[data-state='todo'] .disc { color: var(--ink-3); }
 /* In progress: the ring fills as far as the reader has come. */
-.path .node[data-state='doing'] .pin::before {
+.node[data-state='doing'] .pin::before {
 	content: '';
 	position: absolute;
 	inset: -6px;
@@ -360,32 +397,40 @@ main.lesson[data-on] .quiz .choice { margin: 0; }
 	-webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2.5px));
 	mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2.5px));
 }
-.path .node[data-state='doing'] .disc { color: var(--ink-1); }
+.node.update[data-state='doing'] .pin::before { inset: -5px; }
+.node[data-state='doing'] .disc { color: var(--ink-1); }
 /* Done: solid, the glyph cut out of it, and a check. Mastered (every question right the first time): the glyph's cell
    and the check in the fire orange. */
-.path .node:is([data-state='done'], [data-state='mastered']) .disc { background: var(--ink-1); color: var(--bg); box-shadow: none; }
-.path .node:is([data-state='done'], [data-state='mastered']) .badge { display: grid; }
-.path .node[data-state='mastered'] .badge { background: var(--fire); color: #fff; }
-.path .node[data-state='mastered'] .g-cell { fill: var(--fire); }
-/* The next lesson: a ring in the ink and a soft halo, so the eye lands there. */
-.path .node[data-next] .disc { color: var(--ink-1); box-shadow: inset 0 0 0 2px var(--ink-1), 0 0 0 7px var(--s-tint); }
-.path .node[data-next][data-state='doing'] .disc { box-shadow: 0 0 0 9px var(--s-tint); }
+.node:is([data-state='done'], [data-state='mastered']) .disc { background: var(--ink-1); color: var(--bg); box-shadow: none; }
+.node:is([data-state='done'], [data-state='mastered']) .badge { display: grid; }
+.node[data-state='mastered'] .badge { background: var(--fire); color: #fff; }
+.node[data-state='mastered'] .g-cell { fill: var(--fire); }
+/* The next one: a ring in the ink and a soft halo, so the eye lands there. */
+.node[data-next] .disc { color: var(--ink-1); box-shadow: inset 0 0 0 2px var(--ink-1), 0 0 0 7px var(--s-tint); }
+.node[data-next][data-state='doing'] .disc { box-shadow: 0 0 0 9px var(--s-tint); }
+/* New since the reader's last visit: a small dot on the disc, and the word by its eyebrow. */
+.node[data-new]:not([data-state='done'], [data-state='mastered']) .pin::after { content: ''; position: absolute; top: -1px; right: -1px; width: 9px; height: 9px; border-radius: 50%; background: var(--fire); box-shadow: 0 0 0 2.5px var(--bg); }
+.new { display: inline-block; margin-left: 8px; padding: 0 6px; border-radius: 4px; background: color-mix(in srgb, var(--fire) 14%, transparent); color: var(--fire); font-family: var(--font-sans); font-size: 11px; font-weight: 600; letter-spacing: 0.02em; line-height: 17px; text-transform: uppercase; vertical-align: 1px; }
+.new[hidden] { display: none; }
 
-.course .body { display: grid; gap: 3px; min-width: 0; padding-top: 1px; }
-.course .body .n { color: var(--ink-3); font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.02em; }
-.course .body .t { color: var(--ink-1); font-size: 17.5px; font-weight: 600; letter-spacing: -0.015em; line-height: 1.3; }
-.course .body .l { color: var(--ink-2); font-size: 15px; line-height: 1.45; }
-.course .body .m { color: var(--ink-3); font-family: var(--font-mono); font-size: 12.5px; }
-.path .node[data-state='todo']:not([data-next]) .body .t { color: var(--ink-2); }
+:is(.course, .ulog) .body { display: grid; gap: 3px; min-width: 0; padding-top: 1px; }
+:is(.course, .ulog) .body .n { color: var(--ink-3); font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.02em; }
+:is(.course, .ulog) .body .t { color: var(--ink-1); font-size: 17.5px; font-weight: 600; letter-spacing: -0.015em; line-height: 1.3; }
+:is(.course, .ulog) .body .l { color: var(--ink-2); font-size: 15px; line-height: 1.45; }
+:is(.course, .ulog) .body .m { color: var(--ink-3); font-family: var(--font-mono); font-size: 12.5px; }
+.course .node.update .body .t { font-size: 16px; }
+.course .node.update .body .l { font-size: 14.5px; }
+.node[data-state='todo']:not([data-next]) .body .t { color: var(--ink-2); }
+.theme-canary .node.update .body .n, .ulog .tag.theme-canary { color: var(--canary); }
 
-/* Mastery, in the lesson it belongs to: a cell per question. Solid: right the first time; mid: right later; faint:
-   not yet. The fire orange when every one was right the first time. */
+/* Mastery, in the node it belongs to: a cell per question. Solid: right the first time; mid: right later; faint: not
+   yet. */
 .course .qs { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 5px; }
 .course .qs i { display: block; width: 10px; height: 10px; background: var(--line-2); transition: background-color 0.3s; }
 .course .qs i[data-state='later'] { background: var(--ink-3); }
 .course .qs i[data-state='first'] { background: var(--ink-1); }
 
-/* The way on, on the next lesson's node. */
+/* The way on, on the next node. */
 .course .go { justify-self: start; display: inline-flex; align-items: center; gap: 6px; margin-top: 10px; padding: 8px 16px 8px 18px; border-radius: 999px; background: var(--ink-1); color: var(--bg); font-size: 14.5px; font-weight: 600; }
 .course .go::after { content: '→'; }
 
@@ -395,8 +440,11 @@ main.lesson[data-on] .quiz .choice { margin: 0; }
    functions: the grid holds still and dims; only the changed function rebuilds, in steps.
    sandbox: the code is written, then the walls close round it.
    sealed: the lid closes, and the seal sets.
-   store: work travels from both machines into the store, a fire-orange bead down each line. */
-:is(.doc .path a:is(:hover, :focus-visible), .course:has(.course-go:hover) .node[data-next]) .glyph {
+   store: work travels from both machines into the store, a fire-orange bead down each line.
+   The updates: fetch, the download comes down into the tray; why, the build's lines are written out; pass, the check
+   is drawn; session, the second expansion opens on what the first left; anywhere, both checkouts reach the one run;
+   inline, the code is written with no box round it. */
+:is(:is(.doc .path, .ulog) a:is(:hover, :focus-visible), .course:has(.course-go:hover) .node[data-next]) .glyph {
 	& :is(.flow, .link, .code, .wall, .lid) { stroke-dasharray: 1; animation: g-draw 0.4s cubic-bezier(0.4, 0, 0.2, 1) both; }
 	&.g-pipeline .flow + .flow { animation-delay: 0.08s; }
 	&.g-pipeline .link { animation-duration: 0.45s; animation-delay: 0.3s; }
@@ -413,22 +461,36 @@ main.lesson[data-on] .quiz .choice { margin: 0; }
 	&.g-sandbox { --lands: 0.8s; }
 	&.g-sealed { --lands: 0.45s; }
 	&.g-store { --lands: 0.9s; }
+	&.g-fetch .link { animation-delay: 0.3s; }
+	&.g-why .code + .code { animation-delay: 0.08s; }
+	&.g-why .code + .code + .code { animation-delay: 0.16s; }
+	&.g-session .link { animation-delay: 0.25s; }
+	&.g-anywhere .pulse { stroke-dasharray: 0.01 1.2; animation: g-travel 0.6s cubic-bezier(0.4, 0, 0.6, 1) 2; }
+	&.g-anywhere .pulse + .pulse { animation-delay: 0.12s; }
+	&.g-inline .code + .code { animation-delay: 0.1s; }
+	&.g-fetch { --lands: 0.65s; }
+	&.g-why { --lands: 0.5s; }
+	&.g-pass { --lands: 0.4s; }
+	&.g-session { --lands: 0.6s; }
+	&.g-anywhere { --lands: 0.9s; }
+	&.g-inline { --lands: 0.45s; }
 }
 .glyph .pulse { stroke: var(--fire); stroke-width: 2.4; stroke-opacity: 0; }
-.doc .path .node[data-state='todo']:not([data-next]) a:hover .disc { box-shadow: inset 0 0 0 1.5px var(--ink-3); }
+:is(.doc .path, .ulog) .node[data-state='todo']:not([data-next]) a:hover .disc { box-shadow: inset 0 0 0 1.5px var(--ink-3); }
 /* Hidden until it starts: a round cap on a stroke of length 0 is still a dot. */
 @keyframes g-draw { 0% { stroke-dashoffset: 1; stroke-opacity: 0; } 1% { stroke-opacity: 1; } 100% { stroke-dashoffset: 0; } }
 @keyframes g-dim { 0%, 100% { opacity: 1; } 25%, 70% { opacity: 0.3; } }
 @keyframes g-rebuild { 0% { opacity: 0.25; } 30% { opacity: 1; } 55% { opacity: 0.25; } 80%, 100% { opacity: 1; } }
 @keyframes g-travel { from { stroke-opacity: 1; stroke-dashoffset: 0; } 90% { stroke-opacity: 1; } to { stroke-opacity: 0; stroke-dashoffset: -1; } }
 @media (prefers-reduced-motion: reduce) {
-	.doc .path a .glyph *, .course .glyph * { animation: none !important; transition: none !important; }
+	.doc .path a .glyph *, .course .glyph *, .ulog .glyph * { animation: none !important; transition: none !important; }
 }
-.doc .path a:hover .t { text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1px; }
-.doc .path a:focus-visible { outline: 2px solid var(--ink-1); outline-offset: 4px; }
+.doc .path a:hover .t, .ulog a:hover .t { text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1px; }
+:is(.doc .path, .ulog) a:focus-visible { outline: 2px solid var(--ink-1); outline-offset: 4px; }
 
-/* The end of the path: a check in pixel cells, lit once every lesson is done. */
-.path-end { position: relative; z-index: 1; display: grid; grid-template-columns: var(--lane) minmax(0, 1fr); align-items: center; }
+/* The end of the path: a check in pixel cells, lit once every lesson and update is done. */
+.path-end { position: relative; z-index: 1; display: grid; grid-template-columns: var(--graph) minmax(0, 1fr); column-gap: var(--cgap); align-items: center; margin-top: 8px; padding-left: var(--gut); }
+.path-end .pin { --col: 0; }
 .path-end .disc { background: var(--bg); box-shadow: inset 0 0 0 1.5px var(--line); }
 .path-end .seal { width: 50%; height: auto; shape-rendering: crispEdges; }
 .path-end .seal rect { fill: var(--line); }
@@ -441,30 +503,53 @@ main.lesson[data-on] .quiz .choice { margin: 0; }
 .course[data-all] .path-end .body .t { color: var(--ink-1); }
 .course[data-all] .path-end .body .l { color: var(--ink-2); }
 
-/* The trail. Without JS: a straight dotted line down the lane, behind the discs. */
+/* The edges. Without JS: a dotted line down column 0 of each band, behind the discs. */
 .course:not([data-drawn]) .path::before {
 	content: '';
 	position: absolute;
 	z-index: -1;
 	top: calc(var(--disc) / 2);
-	bottom: calc(var(--disc) / -2);
-	left: calc(var(--disc) / 2 + 6px);
-	width: 4px;
+	bottom: 30px;
+	left: calc(var(--gut) + var(--colw) / 2 - 1.5px);
+	width: 3px;
 	background: repeating-linear-gradient(var(--line-2) 0 4px, transparent 4px 10px);
 }
-.course:not([data-drawn]) :is(.path .node, .path-end) { --x: 0px; }
-/* With it (client/learn.ts): an SVG of curves from disc to disc, each a dotted track and its fill in the ink. */
+/* With it (client/learn.ts): each edge a line from pin to pin with a halo in the background under it, so a crossing
+   reads as one passing over the other. Faint until the node it leaves from is done, then the ink; into a dashed band,
+   dashed, and its accent once lit. */
 .trail { position: absolute; z-index: 0; top: 0; left: 0; overflow: visible; pointer-events: none; }
-.trail .track, .trail .fill { fill: none; stroke-width: 4; stroke-dasharray: 4 6; }
-.trail .track { stroke: var(--line-2); }
-.trail .fill { stroke: var(--ink-1); }
-.trail mask path { fill: none; stroke: #fff; stroke-width: 10; stroke-dasharray: 1 1; transition: stroke-dashoffset 0.7s cubic-bezier(0.3, 0.7, 0.3, 1); }
+.trail path { fill: none; stroke-linecap: round; stroke-linejoin: round; }
+.trail .halo { stroke: var(--bg); stroke-width: 7; }
+.trail .line { stroke: var(--line-2); stroke-width: 2.5; transition: stroke 0.4s; }
+.trail .cross .line { stroke-width: 1.75; }
+.trail .dash .line { stroke-dasharray: 5 5; stroke-linecap: butt; }
+.trail .lit .line { stroke: var(--ink-1); }
+.trail .lit.dash .line { stroke: var(--canary); }
+
+/* ---------- What's new (/updates; render.rs update_log) ---------- */
+
+/* Every update, newest first, under its date: its disc, version and tag, title, line and what it extends; New and
+   each one's state from the reader's progress (client/learn.ts). */
+.ulog-bar { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; margin: 22px 0 0; color: var(--ink-3); font-size: 14px; }
+.ulog-bar .c-reset { margin-left: auto; }
+.ulog-day + .ulog-day { margin-top: 10px; }
+.doc .ulog-date { margin: 28px 0 14px; padding: 0 0 8px; border-bottom: 1px solid var(--line); color: var(--ink-3); font-family: var(--font-mono); font-size: 12.5px; font-weight: 500; letter-spacing: 0.04em; text-transform: uppercase; }
+.doc .ulog-list { margin: 0; padding: 0; list-style: none; }
+.doc .ulog-list .node { margin: 0; padding: 0; }
+.doc .ulog-list a { display: grid; grid-template-columns: 40px minmax(0, 1fr); gap: 16px; align-items: start; padding: 12px 8px 14px 0; border-radius: 14px; color: inherit; text-decoration: none; }
+.ulog .body .v { font-variant-numeric: tabular-nums; }
+.ulog .body .m { margin-top: 2px; }
 
 /* A lesson page's glyph, above its title (the player shows it on its cover). */
 .lesson-glyph { display: block; width: 40px; height: 40px; margin: 6px 0 10px; color: var(--ink-2); }
 .lesson-glyph .glyph { display: block; width: 100%; height: 100%; }
 .lp-cover .lesson-glyph { display: grid; place-items: center; width: 64px; height: 64px; margin: 0 0 18px; border-radius: 50%; background: var(--bg-3); box-shadow: inset 0 0 0 1.5px var(--line-2); color: var(--ink-1); }
 .lp-cover .lesson-glyph .glyph { width: 34px; height: 34px; }
+
+/* What's new's row: how many updates are new to the reader (client/side.ts). */
+.row .count { flex: none; margin-left: auto; min-width: 18px; padding: 0 5px; border-radius: 9px; background: color-mix(in srgb, #e0461a 16%, transparent); color: #e0461a; font-family: var(--font-mono); font-size: 11px; font-weight: 600; line-height: 18px; text-align: center; font-variant-numeric: tabular-nums; }
+.row .count[hidden] { display: none; }
+@media (prefers-color-scheme: light) { .row .count { color: #c2380f; } }
 
 /* The sidebar's lesson rows: a mark where the icon would be. Hollow: not started; a dot: started; solid: finished;
    solid with the orange cell: every question right the first time (client/side.ts sets data-state). */
@@ -477,5 +562,5 @@ main.lesson[data-on] .quiz .choice { margin: 0; }
 
 @media (prefers-reduced-motion: reduce) {
 	main.lesson[data-on] > section.step.in-fwd, main.lesson[data-on] > section.step.in-back, .pick[data-mark='wrong'] { animation: none; }
-	.lp-bar i, .pick, .dg-part, .dg-wires rect, .course .qs i, .course .pin, .course .disc, .doc .course-go, .trail mask path { transition: none; }
+	.lp-bar i, .pick, .dg-part, .dg-wires rect, .course .qs i, .course .pin, :is(.course, .ulog) .disc, .doc .course-go, .trail .line { transition: none; }
 }

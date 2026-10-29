@@ -1,3 +1,7 @@
+---
+status: current
+summary: The state of each platform blaze runs on, from the last CI run that covered them all.
+---
 # Platforms
 
 This is the current state of each platform blaze has been run on, in one place. The

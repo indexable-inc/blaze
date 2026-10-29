@@ -6,7 +6,7 @@ object, and whether this build compiled it (and in how long), took it from the s
 it. The codegen says them as it places each function (`crates/hir-ty-codegen/watch.rs`), and
 times `compiled_root` and `compiled_instance` while a build is watched. The daemon reads them
 from the worker's events file with the rest and sends them to no command; the build page reads
-them (docs/web.md, next).
+them ([#1341](https://github.com/indexable-inc/blaze/pull/1341), next).
 
 ## Method
 

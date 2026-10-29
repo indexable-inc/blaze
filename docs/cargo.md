@@ -1,3 +1,7 @@
+---
+status: current
+summary: Every blaze command and setting: cargo's commands and flags, what a build does, sandboxing, manifests.
+---
 # Using blaze
 
 `blaze <command>` takes cargo's commands and flags (`blaze build`, `blaze test`, `blaze run`),
@@ -105,14 +109,11 @@ the daemon served and how many went to cargo, with the reasons. `stop` ends the 
 other subcommand of cargo's is blaze's own, or fails saying blaze has none yet: none is passed
 to cargo, and no cargo plugin is run ([Every subcommand](#every-subcommand)).
 
-While a build or check waits for the daemon, the command shows what the worker is at
-(`crates/blaze-engine/src/progress.rs`): the worker writes a status word and its object to a
-`phase` file beside its socket (`Loading workspace`, `Resolving names`, `Compiling the
-functions of app`, `Checking 12 files`, `Linking app`), and the daemon sends it to the waiting
-command every 250 ms as a `Progress` line ahead of the answer. On a terminal that is one line
-with the seconds of the step, written over and cleared when the answer comes, shown once the
-wait passes half a second; off a terminal, one line for each step the command saw; with `-q`,
-nothing. `harness/experience.py` runs each cold build on a terminal and fails one that shows
+While a build or check waits for the daemon, the command shows what the worker is at: the
+worker sends events (`crates/blaze-protocol/src/events.rs`: each step as it starts and ends, and
+`Progress` counts within it), and `crates/blaze-ui` draws them (`Resolving names 2.40s (3/120
+crates)`). On a terminal that is a live view, cleared when the answer comes; off a terminal, one
+line for each step the command saw; with `-q`, nothing. `harness/experience.py` runs each cold build on a terminal and fails one that shows
 nothing for more than 1.5 s.
 
 ## What a build does

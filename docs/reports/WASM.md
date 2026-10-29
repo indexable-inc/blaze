@@ -1,3 +1,8 @@
+---
+status: record
+summary: blaze's compiler in the browser, a spike.
+date: 2026-10-20
+---
 # blaze in the browser
 
 This is the report for the `blaze-wasm` spike: can blaze's compiler run in a web page,

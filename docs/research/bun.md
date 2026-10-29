@@ -1,3 +1,8 @@
+---
+status: record
+summary: bun's Rust port built by blaze: the harness, what broke and was fixed, and its edit and runtime numbers.
+date: 2026-10-21
+---
 # bun's Rust port through blaze
 
 2026-10-21; Linux x86-64 and the whole-program build 2026-10-22. Claims are marked **read** (in a source we read, or measured here, with the
