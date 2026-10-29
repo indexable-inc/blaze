@@ -131,7 +131,8 @@ jobs:
       - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal && rustup default "$tc"
       # cargo and rustc, with no cache: this is the release's own recipe (build_release.py, the
       # dist profile), and the recipe is what it checks.
-      - run: python3 .github/scripts/build_release.py --target x86_64-unknown-linux-gnu --out shipped --no-pgo --server
+      - run: |
+          python3 .github/scripts/build_release.py '{"target": "x86_64-unknown-linux-gnu", "out": "shipped", "no_pgo": true, "server": true}'
         timeout-minutes: 40
       - name: archive
         run: |

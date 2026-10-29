@@ -3,13 +3,19 @@
 work (PGO). The release workflow, the flake's `daemon` and `cargo install` from a checkout all
 build it with this.
 
-  build_release.py --target T [--profdata FILE] [--features F] [--out DIR [--server]]
+One JSON value, inline, a file's path, or `-` for stdin (AGENTS.md, scripts-take-typed-input);
+an unknown field is refused. The fields, and what a value of them does:
+
+  {"target": T, "profdata": FILE, "features": F, "out": DIR, "server": true}
                                                   # the build, into target/T/dist; DIR gets every binary of blaze,
-                                                  # and with --server blaze's proc-macro server
-  build_release.py --target T --train DIR         # a new profile for T, into DIR (the pgo workflow)
-  build_release.py --pin DIR                      # tools/pgo/profiles.json names the profiles in DIR
-  build_release.py --target T --show              # the command the build runs, for any other driver
-  build_release.py --server-beside BLAZE         # blaze's proc-macro server beside a blaze already built (CI)
+                                                  # and with `server` blaze's proc-macro server
+  {"target": T, "train": DIR}                     # a new profile for T, into DIR (the pgo workflow)
+  {"pin": [DIR, ...]}                             # tools/pgo/profiles.json names the profiles in DIR
+  {"target": T, "show": true}                     # the command the build runs, for any other driver
+  {"server_beside": BLAZE}                        # blaze's proc-macro server beside a blaze already built (CI)
+
+Besides these: `strict` fails when the profile is of other crates (a release), `no_pgo` builds
+without a profile (releases, while PGO is off) and `nix` is the flake's build (below).
 
 The build is `cargo build -p blaze-engine --profile dist --locked --target T --features llvm` with
 `RUSTFLAGS=-Cprofile-use=<profile>`. The `llvm` feature is part of every build of it, the
@@ -51,7 +57,7 @@ build of blaze does (blaze-platform.yaml). Its flags go in `CARGO_ENCODED_RUSTFL
 SDK's path has spaces. A shipped `.exe` is refused when it imports LLVM or the Visual C++ runtime,
 which a machine that downloads it may not have.
 
-With `--server` the blaze just built builds blaze's proc-macro server (`vendor/proc-macro-srv`,
+With `server` the blaze just built builds blaze's proc-macro server (`vendor/proc-macro-srv`,
 docs/no-rustc.md step J1) into DIR as `blaze-proc-macro-srv`, the server that expands with the
 proc-macro libraries blaze links, found beside blaze (`BLAZE_PROC_MACRO_SERVER=1`). It is
 built whole by blaze (`--exe`), over the standard library blaze compiles, so it speaks the
@@ -61,13 +67,12 @@ toolchain's server with rustc's libraries, as blaze's own executable may be buil
 On Linux every binary in DIR, the server's included, is refused when it asks for a glibc newer
 than `GLIBC` (RHEL 9's; Debian 12 and Ubuntu 22.04 have newer): the release builds on the
 oldest hosted Ubuntu, and a binary linked on a newer system asks for that system's glibc
-(GitHub issue #351). install.sh says the same floor to a system below it. With `--nix` (the
+(GitHub issue #351). install.sh says the same floor to a system below it. With `nix` (the
 flake's `dist`) every binary has to load nixpkgs' glibc through a loader under /nix/store
 instead, as a binary built by Nix does: it never meets the system's glibc, so the floor is not
 its own, and a binary of the build that would meet it is refused.
 """
 
-import argparse
 import collections
 import hashlib
 import json
@@ -81,9 +86,14 @@ import sys
 import tempfile
 import time
 import urllib.request
+import types
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+# Run by a bare python (and with -I), not by uv: the one stdlib-only module it needs is found from the tree.
+sys.path.insert(0, str(ROOT / "python" / "typed-input" / "src"))
+from typed_input import fail, parse  # noqa: E402
 HARNESS = ROOT / "harness"
 TOOLCHAIN = (HARNESS / "toolchain").read_text().strip()
 PINS = ROOT / "tools" / "pgo" / "profiles.json"
@@ -328,6 +338,10 @@ def proc_macro_server(blaze, out):
     with tempfile.TemporaryDirectory(prefix="blaze-server-") as work:
         env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_CACHE=str(Path(work) / "store"),
                    BLAZE_STD_FROM="off", RUST_BACKTRACE="0")
+        if sys.platform == "win32":
+            # The C runtime is linked in, as blaze's own binaries have it (link.rs, `crt_static`), and
+            # check_loads refuses an `.exe` that imports the Visual C++ runtime.
+            env["CARGO_ENCODED_RUSTFLAGS"] = "".join(["-C", "target-feature=+crt-static", "-L", f"native={windows_sdk()}"])
         start = time.monotonic()
         # `proc_macro` is not in the standard library's unit: the program that links it has it.
         run([str(blaze), str(SERVER), "--crate", SERVER_CRATE, "--crate", "proc_macro",
@@ -470,23 +484,33 @@ def ship(args, binaries):
         check_nix(args.out) if args.nix else check_glibc(args.out)
 
 
+@dataclass(frozen=True)
+class Input:
+    target: str = ""
+    profdata: str = ""  # the pinned profile, already fetched
+    train: str = ""  # train a new profile into this directory
+    pin: tuple[str, ...] = ()  # pin the profiles trained into these directories
+    out: str = ""  # copy the binaries into this directory
+    features: str = ""  # cargo features of blaze besides `llvm`, which every build has
+    server: bool = False  # build blaze's proc-macro server into `out` with that blaze
+    server_beside: str = ""  # only build the server, with this blaze, beside it (CI's build of blaze)
+    strict: bool = False
+    no_pgo: bool = False
+    show: bool = False
+    nix: bool = False
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--target")
-    parser.add_argument("--profdata", help="the pinned profile, already fetched")
-    parser.add_argument("--train", type=Path, metavar="DIR", help="train a new profile into DIR")
-    parser.add_argument("--pin", nargs="+", metavar="DIR", help="pin the profiles trained into DIR")
-    parser.add_argument("--out", type=Path, metavar="DIR", help="copy the binaries into DIR")
-    parser.add_argument("--features", help="cargo features of blaze besides `llvm`, which every build has")
-    parser.add_argument("--server", action="store_true", help="build blaze's proc-macro server into --out with that blaze")
-    parser.add_argument("--server-beside", type=Path, metavar="BLAZE",
-                        help="only build blaze's proc-macro server, with BLAZE, beside it (CI's build of blaze)")
-    parser.add_argument("--strict", action="store_true", help="fail when the profile is of other crates (a release)")
-    parser.add_argument("--no-pgo", action="store_true", help="build without a profile (releases, while PGO is off)")
-    parser.add_argument("--show", action="store_true", help="print the build's environment and command")
-    parser.add_argument("--nix", action="store_true",
-                        help="the flake's build: its Linux binaries load nixpkgs' glibc, not the system's (no RHEL 9 floor)")
-    args = parser.parse_args()
+    match sys.argv[1:]:
+        case [text]:
+            given = parse(Input, text, "build_release.py")
+        case _:
+            fail("build_release.py", "usage: build_release.py JSON (see the top of the file)")
+    args = types.SimpleNamespace(
+        target=given.target, profdata=given.profdata or None, train=Path(given.train) if given.train else None,
+        pin=list(given.pin), out=Path(given.out) if given.out else None, features=given.features or None,
+        server=given.server, server_beside=Path(given.server_beside) if given.server_beside else None,
+        strict=given.strict, no_pgo=given.no_pgo, show=given.show, nix=given.nix)
     if args.pin:
         return pin(args.pin)
     if args.server_beside:
@@ -494,9 +518,9 @@ def main():
         proc_macro_server(blaze, blaze.parent)
         return
     if not args.target:
-        parser.error("--target is required")
+        fail("build_release.py", "target is required")
     if args.server and not args.out:
-        parser.error("--server builds into --out")
+        fail("build_release.py", "server builds into out")
     # The server is built from its own directory, where a relative `--out` names nothing.
     args.out = args.out and args.out.resolve()
     if args.train:

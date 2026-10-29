@@ -784,6 +784,8 @@ struct Target {
     os: String,
     /// A shared library is linked, not an executable.
     shared: bool,
+    /// `-C target-feature=+crt-static`: the C runtime is linked in, not loaded.
+    crt_static: bool,
 }
 
 impl Target {
@@ -795,7 +797,8 @@ impl Target {
         let (apple, arch) = (value("target_vendor") == "apple", value("target_arch"));
         let wasm = value("target_family") == "wasm" || arch.starts_with("wasm");
         let windows = value("target_os") == "windows" && value("target_env") == "msvc";
-        Target { apple, wasm, windows, arch, os: value("target_os"), shared: false }
+        let crt_static = cfg.get_cfg_values("target_feature").any(|it| it.as_str() == "crt-static");
+        Target { apple, wasm, windows, arch, os: value("target_os"), shared: false, crt_static }
     }
 
     /// The directory of the C runtime the rust project builds for the target and ships with
@@ -941,11 +944,14 @@ impl Target {
             return args;
         }
         if self.windows {
-            // The dynamic C runtime, which rustc's objects name with `/DEFAULTLIB` and
-            // blaze's do not.
-            return ["msvcrt.lib", "vcruntime.lib", "ucrt.lib", "oldnames.lib"]
-                .map(str::to_owned)
-                .to_vec();
+            // The C runtime, which rustc's objects name with `/DEFAULTLIB` and blaze's do not:
+            // the static one (`/MT`) for `+crt-static`, else the dynamic one.
+            let runtime = if self.crt_static {
+                ["libcmt.lib", "libvcruntime.lib", "libucrt.lib", "oldnames.lib"]
+            } else {
+                ["msvcrt.lib", "vcruntime.lib", "ucrt.lib", "oldnames.lib"]
+            };
+            return runtime.map(str::to_owned).to_vec();
         }
         let args: &[&str] = match (self.apple, self.shared) {
             (true, false) => &["-Wl,-dead_strip", "-nodefaultlibs"],
@@ -986,6 +992,7 @@ mod tests {
             arch: "x86_64".to_owned(),
             os: "windows".to_owned(),
             shared: false,
+            crt_static: false,
         }
     }
 
@@ -1002,6 +1009,12 @@ mod tests {
         assert_eq!(target.search("framework=F"), Some("-LF".to_owned()));
         assert_eq!(target.leading()[0], "/NOLOGO");
         assert_eq!(target.trailing(), ["msvcrt.lib", "vcruntime.lib", "ucrt.lib", "oldnames.lib"]);
+        // `+crt-static` links the C runtime in: the `/MT` libraries, none of the DLL's.
+        let target = Target { crt_static: true, ..target };
+        assert_eq!(
+            target.trailing(),
+            ["libcmt.lib", "libvcruntime.lib", "libucrt.lib", "oldnames.lib"]
+        );
     }
 
     /// The import library of a `raw-dylib` is made from the names imported, unless the system
@@ -1068,6 +1081,7 @@ mod tests {
             kind: NativeLibKind::RawDylib,
             verbatim,
             whole_archive: false,
+            bundle: true,
         };
         assert_eq!(raw_dylib_file(&lib("SHELL32.DLL", true)), "SHELL32.DLL");
         assert_eq!(raw_dylib_file(&lib("kernel32.dll", true)), "kernel32.dll");
@@ -1115,6 +1129,7 @@ mod tests {
             arch: "x86_64".to_owned(),
             os: "linux".to_owned(),
             shared: false,
+            crt_static: false,
         };
         assert_eq!(linux.search("native=/a/out").as_deref(), Some("-L/a/out"));
         assert_eq!(linux.search("/b").as_deref(), Some("-L/b"));
@@ -1131,6 +1146,7 @@ mod tests {
                 arch: "aarch64".to_owned(),
                 os: "macos".to_owned(),
                 shared,
+                crt_static: false,
             };
             assert_eq!(mac.leading(), ["-arch", "arm64", "-Wl,-no_fixup_chains"]);
         }

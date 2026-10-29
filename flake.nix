@@ -135,7 +135,7 @@
           auditable = false;
           buildPhase = ''
             runHook preBuild
-            python3 -I .github/scripts/build_release.py --target ${triple} --profdata ${pgoProfile} --out shipped --nix
+            python3 -I .github/scripts/build_release.py '{"target": "${triple}", "profdata": "${pgoProfile}", "out": "shipped", "nix": true}'
             runHook postBuild
           '';
           installPhase = ''

@@ -221,7 +221,8 @@ jobs:
       # the smoke corpus of every tier is std alone, with no proc macros.
       - name: blaze's proc-macro server
         if: runner.os != 'Windows' && inputs.harnesses == '' && (inputs.tier == 'fast' || inputs.tier == 'full')
-        run: nix develop --command python3 .github/scripts/build_release.py --server-beside target/release/blaze-engine
+        run: |
+          nix develop --command python3 .github/scripts/build_release.py '{"server_beside": "target/release/blaze-engine"}'
       - name: blaze's proc-macro server (named harnesses)
         if: runner.os != 'Windows' && inputs.harnesses != ''
         env:

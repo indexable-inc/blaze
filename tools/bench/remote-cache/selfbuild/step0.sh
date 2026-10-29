@@ -9,7 +9,7 @@ cd c
 t() { local s=$(date +%s.%N); "$@"; local rc=$?; echo "STEP $1 ${*:2} rc=$rc secs=$(awk "BEGIN { print $(date +%s.%N) - $s }")"; return $rc; }
 t nix develop --command true
 t nix develop --command cargo build -p blaze-engine --release --features llvm --locked || exit 1
-t nix develop --command python3 .github/scripts/build_release.py --server-beside target/release/blaze-engine || exit 1
+t nix develop --command python3 .github/scripts/build_release.py '{"server_beside": "target/release/blaze-engine"}' || exit 1
 mkdir -p /root/rb/bin
 for b in blaze-engine blaze blaze-rustc blaze-proc-macro-srv; do
   cp target/release/$b /root/rb/bin/ || echo "missing $b"

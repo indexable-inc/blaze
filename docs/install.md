@@ -21,8 +21,9 @@ Change a function and run `blaze run` again: the `Finished` line now says `[blaz
 ## What you need
 
 - **macOS on Apple silicon, or Linux on x86-64 or ARM64.** On Windows x86-64 (MSVC) blaze
-  builds through its engine and takes live edits of a running program, but has no release
-  build and the installer refuses Windows: install it [from crates.io](#from-cratesio). There
+  builds through its engine and takes live edits of a running program. A release has an archive
+  for it, which promotion unpacks and tries, but the installer (`install.sh`) refuses Windows:
+  install it [from crates.io](#from-cratesio). There
   is no sandbox there yet, so a build with build scripts or proc macros needs
   `BLAZE_SANDBOX=off` ([platforms.md](platforms.md#windows-x86-64-msvc)). Intel Macs are not
   supported.
