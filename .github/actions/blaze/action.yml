@@ -63,6 +63,7 @@ runs:
         # for one job, so nothing needs collecting.
         echo "BLAZE_CACHE_MAX=off" >> "$GITHUB_ENV"
         build=$(blaze-engine cache build) || { echo "::error::blaze-engine cache build failed: blaze $version cannot say what its store keys are made with"; exit 1; }
+        [[ "$build" =~ ^[0-9a-f]{16}$ ]] || { echo "::error::blaze-engine cache build said '$build', not sixteen hex digits"; exit 1; }
         echo "project=blaze-$RUNNER_OS-$RUNNER_ARCH-$JOB-$build" | tee -a "$GITHUB_OUTPUT"
     # The pinned LLVM, as a contributor outside Nix gets it (docs/contributing.md, "LLVM for
     # `--features llvm`"): llvm.py fetches the archive llvm.json names for this host, checks its
