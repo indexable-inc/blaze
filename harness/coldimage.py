@@ -317,10 +317,15 @@ class Image:
 
     def __init__(self, label: str, elf: Elf):
         self.label, self.elf = label, elf
-        self.syms = [s for s in elf.symbols(SHT_SYMTAB) if s.name and s.type not in (STT_SECTION, STT_FILE) and s.shndx != 0]
+        # `.L` names are the assembler's temporaries: lld drops them from mergeable sections and
+        # keeps them elsewhere, so what they name is told by the symbol before it or its bytes.
+        self.syms = [s for s in elf.symbols(SHT_SYMTAB)
+                     if s.name and not s.name.startswith(".L") and s.type not in (STT_SECTION, STT_FILE) and s.shndx != 0]
         self.count = Counter(s.name for s in self.syms)
         self.by_name = {s.name: s for s in self.syms}
-        placed = sorted((s for s in self.syms if s.type != STT_TLS and s.shndx < 0xFF00), key=lambda s: (s.value, -s.size))
+        # At one address `what` takes the largest, so an empty section's end marker that falls on
+        # an object (`__TMC_END__` on `completed.0`) names nothing in either image.
+        placed = sorted((s for s in self.syms if s.type != STT_TLS and s.shndx < 0xFF00), key=lambda s: (s.value, s.size, s.name))
         self.starts = [s.value for s in placed]
         self.placed = placed
         self.dynsym = elf.symbols(SHT_DYNSYM)
