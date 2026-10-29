@@ -125,18 +125,15 @@ const GOAL: usize = <Point as Named>::LEN;
 }
 
 /// A fixture whose macro crate depends on `const_ast` and defines `macros`, and whose crate
-/// `main` is `main`.
+/// `main` is `main`. `const_ast`'s files are blaze's to the byte, each ending in a newline.
 fn with_const_ast(macros: &str, main: &str) -> String {
     let [(_, lib), (_, kinds), (_, views)] = crate::const_macro::CONST_AST;
     format!(
         "//- minicore: sized, copy, clone, derive, option, result, slice, index, coerce_unsized, str, iterator, panic, transmute
 //- /const_ast/lib.rs crate:const_ast
-{lib}
-//- /const_ast/kinds.rs
-{kinds}
-//- /const_ast/views.rs
-{views}
-//- /macros.rs crate:proc-macro:macros deps:const_ast
+{lib}//- /const_ast/kinds.rs
+{kinds}//- /const_ast/views.rs
+{views}//- /macros.rs crate:proc-macro:macros deps:const_ast
 {STRING}
 {macros}
 //- /main.rs crate:main deps:macros
