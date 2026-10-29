@@ -19,7 +19,7 @@ its tests failed. `ide-diagnostics` is the daemon's errors (its diagnostics are 
 `hir-ide` is rust-analyzer's type inference with its own tests; the ones in OPEN are what the
 fork does differently from upstream that its expectations have not caught up with.
 """
-import dataclasses, json, os, re, shutil, subprocess, sys, threading, time, typing
+import dataclasses, json, os, re, shutil, signal, subprocess, sys, threading, time, typing
 
 import memory
 
@@ -159,7 +159,12 @@ class Watch:
                 self.dumped = True
                 self.dump()
                 print(f"::error::the run used under {self.IDLE * 100:.0f}% of a core for {self.STILL // 60} min: stuck, stopped (the threads are above)", flush=True)
-                self.proc.kill()
+                # The daemon keeps the output open, which the run's end waits for.
+                for pid in [self.proc.pid, *self.engines()]:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
 
     def __enter__(self):
         self.sampler.start()
