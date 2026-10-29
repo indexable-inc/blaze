@@ -9231,9 +9231,9 @@ fn run_holding(
                 counted = compiling.counted();
                 let mut cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
                 // An `include!` in a body is first seen when the body is compiled. Only the
-                // crates that include the file, and what depends on them, compiled without
-                // it: touching every crate compiles all of a program from the store again to
-                // tell what changed.
+                // crates that named the file, and what depends on them, compiled without it:
+                // touching every crate compiles all of a program from the store again to tell
+                // what changed.
                 let including = tree.including(&db);
                 if WatchedFile::include_sources(&mut files, &mut tree, &mut db) != Loaded::Nothing {
                     let named: Vec<String> = including
@@ -9243,10 +9243,12 @@ fn run_holding(
                             name.map_or_else(|| "?".to_owned(), ToString::to_string)
                         })
                         .collect();
+                    if including.is_empty() {
+                        bail!("a file an `include!` or a module named was loaded late, with no crate noted as naming it");
+                    }
                     eprintln!("included late, by {}", named.join(", "));
-                    let crates = (!including.is_empty()).then_some(&including[..]);
-                    known.touch(&db, crates);
-                    listed.touch(&db, crates);
+                    known.touch(&db, Some(&including));
+                    listed.touch(&db, Some(&including));
                     cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
                 }
                 cold
