@@ -109,19 +109,12 @@ const GOAL: usize = <Point as Named>::LEN;
     crate::attach_db(&db, || {
         let (krate, func) = expander_of(root, "Named").function(&db).expect("the macro's function");
         let input = crate::mir::MacroArg::Str("pub struct Point { x : i32 , y : i32 }");
-        let output =
-            crate::mir::call_const_macro(&db, func, &[input])
-                .unwrap_or_else(|e| {
-                    let mut text = String::new();
-                    let target = crate::display::DisplayTarget::from_crate(&db, krate);
-                    _ = e.pretty_print(
-                        &mut text,
-                        &db,
-                        |file, range| format!("{file:?} {range:?}"),
-                        target,
-                    );
-                    panic!("calling the macro: {text}");
-                });
+        let output = crate::mir::call_const_macro(&db, func, &[input]).unwrap_or_else(|e| {
+            let mut text = String::new();
+            let target = crate::display::DisplayTarget::from_crate(&db, krate);
+            _ = e.pretty_print(&mut text, &db, |file, range| format!("{file:?} {range:?}"), target);
+            panic!("calling the macro: {text}");
+        });
         assert_eq!(output, "impl Named for Point { const LEN: usize = 5; }");
         let goal = eval_goal(&db, file_id).unwrap_or_else(|e| {
             let main = *base_db::all_crates(&db).last().expect("the main crate");

@@ -57,7 +57,11 @@ pub fn call_const_macro<'db>(
 }
 
 /// `bytes` written to a new allocation of the heap aligned to `align`.
-fn allocate<'db>(evaluator: &mut Evaluator<'db>, bytes: &[u8], align: usize) -> Result<'db, Address> {
+fn allocate<'db>(
+    evaluator: &mut Evaluator<'db>,
+    bytes: &[u8],
+    align: usize,
+) -> Result<'db, Address> {
     let addr = evaluator.heap_allocate(bytes.len().max(1), align)?;
     evaluator.write_memory(addr, bytes)?;
     Ok(addr)

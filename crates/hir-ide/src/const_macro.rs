@@ -179,7 +179,7 @@ fn const_ast_item(db: &dyn HirDatabase, krate: Crate) -> Result<Option<StructId>
         return Ok(None);
     };
     let root = dep.crate_id.data(db).root_file_id;
-    if *db.file_text(root).text(db) != *CONST_AST[0].1 {
+    if **db.file_text(root).text(db) != *CONST_AST[0].1 {
         return Err(format!(
             "the macro crate's `{CONST_AST_NAME}` is not blaze's own: a const macro reads \
              its input with the views of the copy blaze writes it for"
@@ -234,8 +234,9 @@ fn flat_input(
         }
         input.text_ends.push(input.text.len() as u32);
     }
-    let mut items = tree.children(0).filter(|&it| ast::Item::can_cast(tree.kind(it)));
-    input.item = items.next().ok_or("the input has no item")?;
+    let mut items = root.children().filter(|it| ast::Item::can_cast(it.kind()));
+    let item = items.next().ok_or("the input has no item")?;
+    input.item = item.flat().ok_or("the input has no flat tree")?.1;
     if items.next().is_some() {
         return Err("the input is more than one item".to_owned());
     }
@@ -310,14 +311,12 @@ impl ProcMacroExpander for ConstMacroExpander {
                 Err(_) => ProcMacroExpansionError::Panic(format!("{text}{error:?}")),
             }
         })?;
-        parse_to_token_tree_static_span(edition, call_site, &output).ok_or_else(
-            || {
-                ProcMacroExpansionError::Panic(format!(
-                    "the const macro `{}` returned text that is not tokens: {output:?}",
-                    self.name
-                ))
-            },
-        )
+        parse_to_token_tree_static_span(edition, call_site, &output).ok_or_else(|| {
+            ProcMacroExpansionError::Panic(format!(
+                "the const macro `{}` returned text that is not tokens: {output:?}",
+                self.name
+            ))
+        })
     }
 
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
