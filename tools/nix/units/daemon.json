@@ -1120,6 +1120,9 @@
      "object 0.37.3",
      "pdb",
      "rustc-hash 2.1.2",
+     "serde",
+     "serde_derive",
+     "serde_json",
      "sha2 0.10.9",
      "wasm-encoder 0.244.0",
      "wasmparser 0.236.1"
@@ -8322,7 +8325,7 @@
   },
   "blaze-splice@0.0.0": {
    "authors": "blaze contributors",
-   "description": "blaze's splice: an edit's functions written into the executable of the last link, ELF, Mach-O, PE and wasm",
+   "description": "blaze's patcher: an edit's functions written into the running program or the executable of the last build (ELF, Mach-O, PE and wasm), and a cold build patched onto an empty ELF image",
    "homepage": "https://ix.dev/blaze",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
@@ -21392,6 +21395,18 @@
       {
        "name": "rustc_hash",
        "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      },
+      {
+       "name": "serde_derive",
+       "unit": "serde_derive@1.0.228 proc-macro serde_derive build host"
+      },
+      {
+       "name": "serde_json",
+       "unit": "serde_json@1.0.150 lib serde_json build"
       },
       {
        "name": "sha2",
@@ -42594,6 +42609,18 @@
        "unit": "rustc-hash@2.1.2 lib rustc_hash build"
       },
       {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      },
+      {
+       "name": "serde_derive",
+       "unit": "serde_derive@1.0.228 proc-macro serde_derive build host"
+      },
+      {
+       "name": "serde_json",
+       "unit": "serde_json@1.0.150 lib serde_json build"
+      },
+      {
        "name": "sha2",
        "unit": "sha2@0.10.9 lib sha2 build"
       },
@@ -63665,6 +63692,18 @@
       {
        "name": "rustc_hash",
        "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      },
+      {
+       "name": "serde_derive",
+       "unit": "serde_derive@1.0.228 proc-macro serde_derive build host"
+      },
+      {
+       "name": "serde_json",
+       "unit": "serde_json@1.0.150 lib serde_json build"
       },
       {
        "name": "sha2",
@@ -84892,6 +84931,18 @@
       {
        "name": "rustc_hash",
        "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      },
+      {
+       "name": "serde_derive",
+       "unit": "serde_derive@1.0.228 proc-macro serde_derive build host"
+      },
+      {
+       "name": "serde_json",
+       "unit": "serde_json@1.0.150 lib serde_json build"
       },
       {
        "name": "sha2",
