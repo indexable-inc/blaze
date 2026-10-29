@@ -2365,6 +2365,7 @@ mod tests {
                 env: BTreeMap::new(),
                 command_env: BTreeMap::new(),
                 whole: false,
+                tests_told: None,
             },
             root: dir.clone(),
             crates: Vec::new(),
