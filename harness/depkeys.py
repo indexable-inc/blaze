@@ -5,10 +5,10 @@
 A crate of a registry is the same source wherever it is built, but not the same code: its
 features, the cfgs and variables its build script sets and the files the script writes differ
 between checkouts that share one store (the default) and between runs of the script, as a
-change to the sandbox reruns it. Each case builds a program on such a crate with nothing of
-rustc's and an empty store, changes one of those, and builds again on the store the first build
-filled: the program has to print what cargo's build of it does after the change, and the second
-build of `nothing` has to find what the first kept.
+change to the sandbox reruns it. A program on such a crate is built with nothing of rustc's on
+an empty store; each case changes one of those and builds again on a copy of the store the first
+build filled: the program has to print what cargo's build of it does after the change, and the
+second build of `nothing` has to compile nothing the first kept.
 
 usage: depkeys.py '{}'
        depkeys.py '{"cases": ["a feature"]}'
@@ -178,22 +178,28 @@ def main():
         return
     work = scratch("blaze-depkeys-")
     config = registry(work)
+    ws, home, filled = (os.path.join(work, name) for name in ("app", "home", "filled"))
+    # The first build once: each case starts from a copy of the store it filled.
+    checkout(ws, config)
+    before, got, _, _ = build(ws, work, {"CARGO_HOME": home, "BLAZE_CACHE": filled})
+    if got != before:
+        print(f"DIFFERENT the first build: cargo's prints {before[1]!r}, blaze's {got[1]!r}")
+        sys.exit(1)
     wrong = 0
     chosen = [(name, change) for name, change in CASES if not it.cases or any(case in name for case in it.cases)]
     for number, (name, change) in enumerate(chosen, 1):
-        at = os.path.join(work, str(number))
-        ws = os.path.join(at, "app")
+        store = os.path.join(work, f"store-{number}")
+        shutil.copytree(filled, store)
         checkout(ws, config)
-        env = {"CARGO_HOME": os.path.join(at, "home"), "BLAZE_CACHE": os.path.join(at, "store")}
-        before, got, _, _ = build(ws, at, env)
-        problems = [] if got == before else ["the first build differs"]
+        env = {"CARGO_HOME": home, "BLAZE_CACHE": store}
         change(ws, env)
-        want, got, found, added = build(ws, at, env)
+        want, got, found, added = build(ws, work, env)
+        problems = []
         if got != want:
             problems.append(f"the second build differs: cargo's prints {want[1]!r}, blaze's {got[1]!r}")
         if name == "nothing":
-            if not found:
-                problems.append("the second build found nothing the first kept")
+            if added:
+                problems.append(f"the second build compiled {added} entries the first kept")
         elif want == before:
             problems.append("cargo's program is the same after the change")
         wrong += bool(problems)
