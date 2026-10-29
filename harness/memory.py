@@ -135,6 +135,17 @@ def largest_processes(count):
     return sorted(found, key=lambda it: it[0] + it[1], reverse=True)[:count]
 
 
+def cpu_seconds(pid):
+    """The CPU time `pid` has used, user and system, in seconds; None when it is gone or off
+    Linux."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+    except (OSError, IndexError):
+        return None
+    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+
+
 def resident_mb(roots):
     """What the trees of `roots` hold now, summed, in megabytes."""
     pids = {p for root in roots if root for p in tree(root)}

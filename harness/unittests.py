@@ -88,6 +88,41 @@ class Watch:
         self.sampler = memory.Sampler(interval=1.0).add(pid)
         self.dirs, self.peak, self.at_peak, self._stop = dirs, 0, None, threading.Event()
         self.began = time.monotonic()
+        self.cpu, self.cpu_shown, self.idle_since, self.dumped = {}, {}, None, False
+
+    # A run whose processes use less than this share of one core for `STILL` seconds is stuck,
+    # and the threads of its blaze-engines are dumped once.
+    IDLE, STILL = 0.05, 300
+
+    @staticmethod
+    def busy(table, pid, now):
+        """The share of one core `pid` used since `table` last had it, or None the first time."""
+        cpu = memory.cpu_seconds(pid)
+        last, table[pid] = table.get(pid), (now, cpu)
+        if cpu is None or last is None or last[1] is None or now <= last[0]:
+            return None
+        return (cpu - last[1]) / (now - last[0])
+
+    def stuck(self, now):
+        """Whether the run's processes have been as good as idle for `STILL` seconds."""
+        shares = [self.busy(self.cpu, pid, now) for pid in list(self.sampler.most)]
+        shares = [it for it in shares if it is not None]
+        if not shares or sum(shares) >= self.IDLE:
+            self.idle_since = None
+            return False
+        self.idle_since = self.idle_since or now
+        return now - self.idle_since >= self.STILL
+
+    def dump(self):
+        """Every thread's stack of each blaze-engine of the run, by gdb."""
+        engines = [pid for pid in self.sampler.most if os.path.exists(f"/proc/{pid}/comm") and open(f"/proc/{pid}/comm").read().strip() == "blaze-engine"]
+        if not shutil.which("gdb"):
+            print(f"::warning::the run is stuck (blaze-engine {engines}) and there is no gdb to say where", flush=True)
+            return
+        for pid in engines:
+            print(f"::group::the threads of blaze-engine[{pid}], stuck {self.STILL // 60} min", flush=True)
+            subprocess.run(["sudo", "-n", "gdb", "-p", str(pid), "-batch", "-ex", "thread apply all bt 40"], stdin=subprocess.DEVNULL, timeout=600)
+            print("::endgroup::", flush=True)
 
     def line(self):
         machine = memory.system_mb()
@@ -101,12 +136,17 @@ class Watch:
             said.append(f"machine {gb(machine['used'])}/{gb(machine['total'])} GB, swap {gb(machine['swap_used'])}/{gb(machine['swap_total'])} GB;")
         said.append(f"the run's processes {gb(self.sampler.peak_mb)} GB at most;")
         said.append("disk free " + ", ".join(f"{d} {shutil.disk_usage(d).free / 2**30:.0f} GB" for d in self.dirs if os.path.isdir(d)) + ";")
-        said.append("largest " + ", ".join(f"{name}[{pid}] {gb(rss)}+{gb(swap)} GB" for rss, swap, pid, name in memory.largest_processes(4)))
+        now = time.monotonic()
+        cpu = lambda pid: "" if (share := self.busy(self.cpu_shown, pid, now)) is None else f" {share * 100:.0f}% cpu"
+        said.append("largest " + ", ".join(f"{name}[{pid}] {gb(rss)}+{gb(swap)} GB{cpu(pid)}" for rss, swap, pid, name in memory.largest_processes(4)))
         return " ".join(said)
 
     def _loop(self):
         while not self._stop.wait(self.EVERY):
             print(self.line(), flush=True)
+            if not self.dumped and self.stuck(time.monotonic()):
+                self.dumped = True
+                self.dump()
 
     def __enter__(self):
         self.sampler.start()
