@@ -6,9 +6,9 @@ name: promote
 # itself. Against the archives the release published, installed with install.sh --version as a
 # user installs them, on macOS (Apple silicon) and Linux (x86-64, ARM64): install checks, the
 # whole smoke corpus (harness/smoke.py), and the train (train.yaml, every tier) on the tag. Each
-# application of the corpus's `apps` group (cargo, zed, servo, bun, dynamo, fff, fframes, flox) has
-# two jobs of its own per platform: `works` (dev and release builds run, its tests pass under
-# `blaze test`) and `speed`
+# application of the corpus's `apps` group (cargo, zed, servo, bun, dynamo, fff, fframes, flox,
+# codex) has two jobs of its own per platform: `works` (dev and release builds run, its tests
+# pass under `blaze test`) and `speed`
 # (bench.py: cold, no-op, every edit and the tests faster than cargo on the same runner, nothing
 # otherwise than cargo's, and nothing more than 25% worse than the stable release's numbers, an
 # asset of it). All green: the same release is marked stable and Latest, with a line in its notes
@@ -207,9 +207,13 @@ jobs:
             nix develop .#bench-bun --command true
             echo "SHELL_OF_APP=nix develop .#bench-bun --command" >> "$GITHUB_ENV"
           fi
-          # bench.py's cargo builds dynamo with its pin (rust-toolchain.toml), as its users do.
-          if [ "$APP" = dynamo ] && [ "$CHECK" = speed ]; then
-            rustup toolchain install 1.96.1 --profile minimal
+          # bench.py's cargo builds dynamo and codex with their pins (rust-toolchain.toml), as
+          # their users do.
+          if [ "$CHECK" = speed ]; then
+            case "$APP" in
+              dynamo) rustup toolchain install 1.96.1 --profile minimal ;;
+              codex) rustup toolchain install 1.99.1 --profile minimal ;;
+            esac
           fi
       - name: ${{ matrix.app }} works
         if: matrix.check == 'works'

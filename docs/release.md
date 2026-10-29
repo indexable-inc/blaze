@@ -178,12 +178,15 @@ PATH for an installed release).
   (the file finder formerly fff.nvim: its MCP server's `--version` and health check; the tests
   of fff-search and the crates below it), fframes v1.3.0 (a video rendering framework, with
   the prebuilt static FFmpeg and Skia its build scripts download: its hello-world example's
-  timeline and one frame rendered to PNG on the CPU; the tests of the crates that need no GPU)
-  and flox v1.19.2 (in the environment of flox's own package build, which
+  timeline and one frame rendered to PNG on the CPU; the tests of the crates that need no GPU),
+  flox v1.19.2 (in the environment of flox's own package build, which
   `harness/floxprep.py` takes from its flake: the CLI's `--version`; the tests of flox-core and
-  flox-config). What a runner without a GPU cannot build or test is listed with why in the
-  entry's `excluded`, which smoke.py prints. Each is also measured against cargo (above); cargo
-  builds dynamo with its pinned Rust 1.96.1, which its users build with.
+  flox-config) and OpenAI's Codex CLI rust-v0.165.0 (its workspace `codex-rs`, the entry's
+  `dir`; `codex --version`; the tests of codex-apply-patch, codex-protocol, codex-execpolicy
+  and codex-features, which need no model, network or credentials). What a runner without a
+  GPU cannot build or test is listed with why in the entry's `excluded`, which smoke.py prints.
+  Each is also measured against cargo (above); cargo builds dynamo and codex with their pinned
+  Rust (1.96.1 and 1.99.1), which their users build with.
 
 The std cases are the merge gate's; all four groups are the promotion gate. blaze itself is in
 the corpus but not measured against cargo here: how fast blaze builds blaze is the self-build's
