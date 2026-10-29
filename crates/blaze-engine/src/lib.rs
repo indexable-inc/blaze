@@ -1406,24 +1406,49 @@ impl SymbolResolver for Resolver<'_> {
             return beside();
         }
         let next = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|scope| {
-            for _ in 0..threads {
-                let (db, next, parts) = (self.db.clone(), &next, self.parts());
-                scope.spawn(move || {
-                    let resolver = parts.over(&db);
-                    hir::attach_db(&db, || {
-                        loop {
-                            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if at >= count {
-                                break;
-                            }
-                            work(&db, &resolver, at);
-                        }
+        // What the threads compile, the build that asked counts.
+        let counted = hir_ty_codegen::counted::now();
+        // A worker's panic goes on as itself, a cancellation first: the scope would end in one
+        // of its own, which callers can't tell from a bug.
+        let stopped = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    let (db, next, parts) = (self.db.clone(), &next, self.parts());
+                    let counted = counted.clone();
+                    scope.spawn(move || {
+                        let resolver = parts.over(&db);
+                        hir_ty_codegen::counted::within(counted, || {
+                            hir::attach_db(&db, || {
+                                loop {
+                                    let at =
+                                        next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if at >= count {
+                                        break;
+                                    }
+                                    work(&db, &resolver, at);
+                                }
+                            })
+                        })
                     })
-                });
-            }
+                })
+                .collect();
             beside();
+            let mut stopped: Option<Box<dyn std::any::Any + Send>> = None;
+            for worker in workers {
+                let Err(panic) = worker.join() else { continue };
+                let cancelled = panic.is::<ide_db::base_db::salsa::Cancelled>();
+                if stopped
+                    .as_ref()
+                    .is_none_or(|it| cancelled && !it.is::<ide_db::base_db::salsa::Cancelled>())
+                {
+                    stopped = Some(panic);
+                }
+            }
+            stopped
         });
+        if let Some(panic) = stopped {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     fn source_path(&self, file: vfs::FileId) -> Option<String> {
@@ -3949,7 +3974,12 @@ fn harnesses<'a>(
                 test_harness::module(db, krate, functions, &name)
             });
             let module = module.map(|it| it.text).unwrap_or_default();
-            let wanted = format!("{}{module}", test_harness::without(&text));
+            // rustc empties a crate whose root's `#![cfg(...)]` is false, its crate attributes
+            // too, and then writes its harness: such a root is the harness alone, with no tests,
+            // or the `#![cfg]` would leave the program without the harness's `main` too.
+            let configured_out = hir::attach_db(db, || krate.is_configured_out(db));
+            let kept = if configured_out { "" } else { test_harness::without(&text) };
+            let wanted = format!("{kept}{module}");
             if *text != *wanted {
                 texts.push((file, wanted));
             }
@@ -4809,6 +4839,9 @@ fn std_unit_at(
         exe: None,
         shared: false,
         library: true,
+        // The unit is the standard library's crates, never the program's unit tests: asked as
+        // those, `crates_called` keeps only crates with `cfg(test)`, which no crate of it has.
+        unit_test: false,
         debug,
         ..args.clone()
     };
@@ -5081,6 +5114,9 @@ fn build(
     hold: Option<&dyn Fn() -> bool>,
 ) -> anyhow::Result<Option<Build>> {
     let start = Instant::now();
+    // What this build compiles, here and on the threads that work for it: not what builds of
+    // other programs compile beside it.
+    let counting = hir_ty_codegen::counted::Counting::start();
     let contents = &content::Contents::default();
     let resolver = Resolver::of(db, table, args, contents, listed)?;
     let hir_db: &dyn HirDatabase = db;
@@ -5216,17 +5252,24 @@ fn build(
             .map(|part| {
                 let (db, known, local, next) = (db.clone(), &*known, &local, &next);
                 let parts = resolver.parts();
+                let counted = Some(counting.counted().clone());
                 scope.spawn(move || {
                     PROBING.set(true);
                     let resolver = parts.over(&db);
-                    hir::attach_db(&db, || {
-                        while let Some(&krate) =
-                            local.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-                        {
-                            hir_ty::method_resolution::TraitImpls::for_crate(&db, krate.into());
-                            hir_ty::method_resolution::InherentImpls::for_crate(&db, krate.into());
-                        }
-                        known.stale(&db, Some(&resolver), part, threads)
+                    // What an edit changed is compiled again to tell what changed.
+                    hir_ty_codegen::counted::within(counted, || {
+                        hir::attach_db(&db, || {
+                            while let Some(&krate) =
+                                local.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                            {
+                                hir_ty::method_resolution::TraitImpls::for_crate(&db, krate.into());
+                                hir_ty::method_resolution::InherentImpls::for_crate(
+                                    &db,
+                                    krate.into(),
+                                );
+                            }
+                            known.stale(&db, Some(&resolver), part, threads)
+                        })
                     })
                 })
             })
@@ -5240,7 +5283,10 @@ fn build(
     let undoable = hold.is_some();
     let hold = hold.unwrap_or(&|| false);
     let unit = hir::attach_db(db, || {
-        CodegenUnit::compile_or_hold(hir_db, &resolver, roots, &denied, known, hold, undoable)
+        let counted = counting.counted();
+        CodegenUnit::compile_or_hold(
+            hir_db, &resolver, roots, &denied, known, hold, undoable, counted,
+        )
     })
     .map_err(anyhow::Error::msg)?;
     let Some(mut unit) = unit else { return Ok(None) };
@@ -5762,8 +5808,9 @@ fn run_link(cmd: &str, binary: Option<&Path>, start: Instant, note: &str) -> any
     }
     let linked = linked?;
     let status = linked.status;
-    let said = String::from_utf8_lossy(&linked.stderr).into_owned();
-    eprint!("{}{said}", String::from_utf8_lossy(&linked.stdout));
+    // `link.exe` says what failed on its standard output.
+    let said = [&linked.stdout, &linked.stderr].map(|it| String::from_utf8_lossy(it)).concat();
+    eprint!("{said}");
     eprintln!("link: {:.1?} ({status}{note})", start.elapsed());
     if !status.success() {
         return Err(LinkFailed { status, said }.into());
@@ -8978,10 +9025,11 @@ fn run_holding(
     let sysroot = checkouts.loaded.workspaces().first().and_then(|it| it.sysroot.root());
     let _ = SYSROOT.set(sysroot.map(|it| AsRef::<Path>::as_ref(it).to_owned()));
     let from_manifest;
+    // What the compile of the program counted, for what is said of it once it is built.
+    let mut counted = None;
     let cold = {
         if let Some(unit) = std_unit(&db, &table, &args, &listed)? {
             args.prebuilt = Some(unit);
-            known.not_counted();
         }
         if let Some((cmd, exe)) = own_link_line(&db, &args)? {
             (args.link_cmd, args.splice) = (Some(cmd), Some(exe));
@@ -9014,12 +9062,26 @@ fn run_holding(
             }
             None => {
                 fns::building();
-                let _compiling = events::compiling(&shown_crate(&db, &args));
+                let compiling = events::compiling(&shown_crate(&db, &args));
+                counted = compiling.counted();
                 let mut cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
-                // An `include!` in a body is first seen when the body is compiled.
+                // An `include!` in a body is first seen when the body is compiled. Only the
+                // crates that include the file, and what depends on them, compiled without
+                // it: touching every crate compiles all of a program from the store again to
+                // tell what changed.
+                let including = tree.including(&db);
                 if WatchedFile::include_sources(&mut files, &mut tree, &mut db) != Loaded::Nothing {
-                    known.touch(&db, None);
-                    listed.touch(&db, None);
+                    let named: Vec<String> = including
+                        .iter()
+                        .map(|&it| {
+                            let name = it.extra_data(&db).display_name.as_ref();
+                            name.map_or_else(|| "?".to_owned(), ToString::to_string)
+                        })
+                        .collect();
+                    eprintln!("included late, by {}", named.join(", "));
+                    let crates = (!including.is_empty()).then_some(&including[..]);
+                    known.touch(&db, crates);
+                    listed.touch(&db, crates);
                     cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
                 }
                 cold
@@ -9044,7 +9106,7 @@ fn run_holding(
             bail!("{why}");
         }
         if events::heard() {
-            events::built(&db, &shown_crate(&db, &args), &known.stats, None);
+            events::built(&db, &shown_crate(&db, &args), &known.stats, None, counted.as_deref());
             if !served {
                 events::cache(&known.stats);
             }
@@ -9155,12 +9217,16 @@ fn run_holding(
                 _ if again.as_ref() != Some(key) => {
                     eprintln!("manifest: not kept, the build loaded files its key was made without")
                 }
-                _ => match manifest::keep(&db, &args, key, &cold.wrote) {
-                    Ok(bytes) => eprintln!(
-                        "manifest: kept, {} files, {bytes} bytes ({:.1?})",
-                        cold.wrote.len(),
-                        start.elapsed()
-                    ),
+                _ => match manifest::keeping(&db, &args, key, &cold.wrote) {
+                    Ok(keeping) => {
+                        let (files, read) = (cold.wrote.len(), start.elapsed());
+                        keeping.settle(move |bytes, took| {
+                            eprintln!(
+                                "manifest: kept, {files} files, {bytes} bytes ({read:.1?} \
+                                 read, {took:.1?} kept beside what came next)"
+                            )
+                        });
+                    }
                     Err(why) => eprintln!("manifest: not kept: {why}"),
                 },
             }
@@ -9713,9 +9779,6 @@ fn run_holding(
                                 program.unbuilt.stale = false;
                                 program.whole = built.whole.clone();
                             }
-                            // Its first build counts what it compiles, not what the
-                            // programs before it did.
-                            program.known.not_counted();
                             let first = program.args.symbol_files == programs[0].args.symbol_files;
                             program.distrust_rustc(&db, &files, first.then_some(&as_compiled));
                             clients.push((programs.len(), (request, asked, stream)));
@@ -10334,6 +10397,8 @@ fn run_holding(
                                     program.refused_in_codegen(answer)
                                 }));
                             end_link();
+                            // Each build's steps are of its own thread ([`events::at`]).
+                            events::idle();
                             answer.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
                         });
                         (at, build)
@@ -10997,6 +11062,7 @@ impl Program {
         eprint!("edit (apply {apply:.1?}): ");
         report(&warm);
         report_stats(&known.stats);
+        let counted = compiling.counted();
         drop(compiling);
         let edited_paths: FxHashMap<vfs::FileId, PathBuf> = edited
             .iter()
@@ -11005,7 +11071,7 @@ impl Program {
                 Some((*file, path.strip_prefix(&args.checkout).unwrap_or(path).to_owned()))
             })
             .collect();
-        events::built(db, &named, &known.stats, Some(&edited_paths));
+        events::built(db, &named, &known.stats, Some(&edited_paths), counted.as_deref());
         let reported = start.elapsed();
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
         let dated = start.elapsed();

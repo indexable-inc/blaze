@@ -281,6 +281,7 @@ mod tests {
 
     #[test]
     fn what_is_not_built_fails_and_says_so() {
+        crate::engine::for_tests();
         assert_eq!(command(words("frobnicate")).unwrap(), super::super::FAILED);
         assert_eq!(command(words("publish --dry-run")).unwrap(), super::super::FAILED);
         assert_eq!(command(words("version")).unwrap(), 0);

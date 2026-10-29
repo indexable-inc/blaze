@@ -1,3 +1,7 @@
+---
+status: current
+summary: blaze's own pinned nightly: what it is, how it is fetched and checked, and the daily bump.
+---
 # blaze's own toolchain
 
 blaze is its own Rust toolchain. It builds every project with one toolchain that blaze

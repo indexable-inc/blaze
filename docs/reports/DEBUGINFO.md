@@ -1,3 +1,8 @@
+---
+status: record
+summary: Debug info: DWARF for ELF, and the Mach-O design.
+date: 2026-10-20
+---
 # Debug info
 
 Branch `blaze-debuginfo`. Everything of mine here is Linux x86-64 ELF. Mach-O is a design

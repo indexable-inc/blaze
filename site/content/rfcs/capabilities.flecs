@@ -3,18 +3,13 @@ site {
   rfcs {
     capabilities : Rfc {
       Title: {"Capabilities and effects"}
-      Intro: {"[warm] RFC one: capabilities and effects. [short pause] It all comes from one simple idea: a function's signature should tell you what it can touch."}
-      Outro: {"[warm] So, to recap. A function's signature says what it may touch. You write effects, and underneath, the compiler passes capabilities as hidden generic parameters. A function that touches nothing is pure, so it caches automatically. Build scripts get sandboxed. And one source runs blocking or async, the caller's choice. [breath] Plenty is still open, so come and comment. Thanks for listening."}
       Description: {"A function's signature says what it may touch. Effects on the surface, capabilities underneath; pure code is cacheable by construction."}
       Number: {1}
       (DependsOn, site.charter)
 
-      Lede summary("In the new edition, a function's signature says what it may touch: the filesystem, the network, the clock, randomness. You write effects; the compiler passes capabilities. A function that names none is pure, so blaze can cache it, sandbox it and run it sync or async without being told.") {
-        Say: {"[curious] Think about it. Can this function read a file? Check the clock? Open a socket? In Rust today, the signature won't tell you. [pause] [confident] In the new edition, it will. A function names what it uses: the filesystem, the network, the clock, randomness. You write those as effects, and the compiler passes capabilities underneath. And a function that names none? It's pure. So blaze can cache it, sandbox it, and run it sync or async, without being told."}
-      }
+      Lede summary("In the new edition, a function's signature says what it may touch: the filesystem, the network, the clock, randomness. You write effects; the compiler passes capabilities. A function that names none is pure, so blaze can cache it, sandbox it and run it sync or async without being told.")
 
       Section motivation(title: "Motivation") {
-        Say: {"[thoughtful] So why bother? Any Rust function can open a file, read the clock or call into C, and nothing in its signature says so. That costs blaze three things. [short pause] First, caching. The function cache can only reuse a result if the function sees nothing but its arguments. Today it proves that one rule at a time, refusing statics, foreign calls and exposed addresses, and it still asks for an attribute. A signature that says pure makes that one check. [short pause] Second, sandboxing. Build scripts and proc macros run with all of your authority. With capabilities, a build script can read its crate, write its output folder, and nothing else. [short pause] Third, sync and async. Rust writes the same logic twice, and libraries pick a runtime for you. If I/O is a capability passed in, the caller chooses. [warm] And tests get honest: hand in an in-memory filesystem and a fixed clock, instead of mocking globals."}
         P today("Any Rust function can open a file, read the clock or call into C, and nothing in its signature says so. That costs blaze three things it wants.")
         Ul costs {
           Li caching("**Caching.** The [[fn_cache]] can reuse a result only when the function cannot see anything but its arguments. Today it proves that by refusing statics, foreign calls, address exposure and the like, one rule at a time, and asks for `#[blaze::cache]`. A signature that says *pure* would make the check one line and the attribute unnecessary.")
@@ -25,7 +20,6 @@ site {
       }
 
       Section design(title: "Design sketch") {
-        Say: {"[curious] So what does it look like? On the surface, effects. After the return type, a function lists what it uses, the way the Effekt language does, joined like trait bounds. The syntax is only a sketch. [short pause] In the example, a function that loads a config says it uses the filesystem, and reads a file. The parser it calls names nothing, so it's pure, and blaze caches it. Main lists the filesystem, the network and the clock. [pause] Underneath, capabilities. Each effect becomes a hidden generic parameter bounded by a trait, so the loader really takes a filesystem and reads through it. Generic, not dynamic, so each caller's choice is specialised and inlined, with no indirect call on the hot path. [short pause] Callers pass capabilities on implicitly, or narrow or replace them. So a test runs the same loader against an in-memory filesystem and checks the port is eighty. [serious] Main gets every capability the platform has, and nothing else is ambient."}
         P surface("On the surface, effects: after the return type, `/` lists what a function uses, as in Effekt (`T / Fs`, read \"T, using Fs\"). Several join with `+`, like trait bounds. Syntax is illustrative; see the open issues.") { (Cites, refs.koka); (Cites, refs.effekt) }
         Code example(lang: "rust", text: `// a crate on the new edition
         fn load_config(path: &Path) -> Result<Config, Error> / Fs \{
@@ -57,7 +51,6 @@ site {
       }
 
       Section sync_async(title: "Sync and async from one source") {
-        Say: {"[excited] Now here's where it gets fun: sync and async from one source. [short pause] Zig made the same choice from the other side. In Zig zero point sixteen, I/O is a value you pass in, and the caller picks a blocking or an evented implementation. Zig dropped async and await, and code is no longer coloured by how its I/O runs. [short pause] But Zig's version is a runtime interface, and the evented side needs a stack per task, or stackless frames that Zig doesn't have yet. [confident] blaze owns its compiler, so it decides at compile time. A function that does I/O is compiled twice when needed: a direct version that blocks, and a stackless state machine, like async functions become today. The capability the caller passes picks which, the way a generic picks its instance. No keywords, no stacks per task, no colouring. [short pause] And libraries follow the sans-I/O pattern, made a rule: protocol code never does I/O itself."}
         P zig("Zig 0.16 made the same choice from the other side: I/O is an `Io` value passed in, and the caller picks a blocking or an evented implementation. It dropped the `async` and `await` keywords, and code is no longer coloured by how its I/O runs.") { (Cites, refs.zig_016); (Cites, refs.kelley_io); (Cites, refs.cro_io); (Cites, refs.zig_6025) }
         P runtime("Zig's `Io` is a runtime interface: a vtable. An evented implementation needs a stack per task, or stackless frames, which Zig does not have yet; the proposals for them are still open.") { (Cites, refs.zig_23446); (Cites, refs.zig_23367); (Cites, refs.lwn_zig) }
         P ours("blaze owns the compiler, so it can decide at compile time. A function that uses an I/O capability is compiled twice when needed: a direct version, which blocks, and a stackless state machine like the one `async fn` lowers to today. Which one a call gets follows from the capability the caller passes, the way a generic picks its instance. No keywords in the source, no stacks per task, and no function colouring.")
@@ -65,7 +58,6 @@ site {
       }
 
       Section buys(title: "What it buys") {
-        Say: {"[upbeat] So what does all this buy? Automatic caching: a function with no effects, no unsafe code and only pure callees qualifies, with no attribute, and one that reads the clock or randomness visibly doesn't. Build scripts and proc macros sandboxed to what they need. One source for blocking and async code. Tests without global mocks. [short pause] And better review: a diff that gives a parser network access shows it right in the signature, not buried three calls down."}
         Ul list {
           Li cache("Automatic caching: a function with no effects, no `unsafe` and only pure callees is eligible, with no attribute. One with `/ Clock` or `/ Rand` is not, visibly.")
           Li sandbox("Sandboxed build scripts and proc macros, granted only what they need.")
@@ -76,7 +68,6 @@ site {
       }
 
       Section prior(title: "Prior art") {
-        Say: {"[calm] The prior art is on the page, with links. Zig's I/O as an interface the caller passes. The cap-std crate, capability-based filesystem and network access for today's Rust. Sans-I/O protocol libraries. Koka and Effekt, typed effects with no runtime for them. Unison's abilities, and its pure code cached by hash. Scala's capture checking. WASI, where the host grants a module its capabilities and nothing is ambient. OCaml's effect handlers on fibers. And the Rust project's own work on effect generics."}
         Ul list {
           Li zig("[[zig_016]], [[kelley_io]], [[cro_io]], [[zig_25592]]: I/O as an interface the caller passes.")
           Li cap_std("[[cap_std]]: capability-based filesystem and network APIs for today's Rust.")
@@ -92,59 +83,48 @@ site {
 
       Section issues(title: "Open issues") {
         Issue granularity(title: "How fine are capabilities?") {
-          Say: {"[curious] So, the open questions. First: how fine-grained are capabilities? One for the whole filesystem, or separate read and write? A single directory, as cap-std does? Finer is more checkable, and more to write. The charter says pay for checkability, but only for guarantees someone relies on."}
           (Status, Open)
           P q("`Fs` or `FsRead` and `FsWrite`? A directory, like cap-std's `Dir`, or the whole filesystem? Finer is more checkable and more to write; the charter says to pay for checkability, but only for guarantees someone relies on.")
         }
         Issue old_editions(title: "Calling old-edition code") {
-          Say: {"[thoughtful] Calling old-edition code. Code from editions up to twenty twenty-four can do anything. Calling it needs a capability that means everything, and that rules out caching and sandboxing through it. So how much of the standard library and crates dot io can get precise effects, and how?"}
           (Status, Open)
           P q("Code in editions 2015 to 2024 has ambient authority: it may do anything. Calling it from the new edition needs a capability that means everything (`/ Ambient`?), which makes caching and sandboxing impossible through it. How much of std and crates.io can be given precise effects, and how?")
         }
         Issue inference(title: "Inference and semver") {
-          Say: {"[curious] Inference and semver. Must every function spell out its effects, or can private ones infer them? Inferred effects on public functions would make adding a log line a breaking change, and writing them everywhere is noise. One option: explicit at crate boundaries, inferred inside."}
           (Status, Open)
           P q("Must every function spell out its effects, or can private functions infer them? Inferred effects on public functions would make adding a log line a breaking change; explicit ones are noise. One option: explicit at crate boundaries, inferred inside.")
         }
         Issue dynamic(title: "Trait objects and function pointers") {
-          Say: {"Trait objects and function pointers hide what they use. So effects have to be part of their type, and a pure function pointer must never be able to hold an effectful one."}
           (Status, Open)
           P q("A `dyn Fn` or `fn()` hides what it uses. Effects have to be part of the type (`dyn Fn() / Fs`), and a pure `fn()` must not be able to hold an effectful one.")
         }
         Issue code_size(title: "Two versions of every I/O function") {
-          Say: {"[matter-of-fact] Code size. Compiling a direct and a stackless version doubles the code of effectful functions used both ways. So: only build what's actually called, as generics do, and measure what that costs real programs."}
           (Status, Open)
           P q("Compiling a direct and a stackless version doubles code for effectful functions that are used both ways. Only instantiate what is called, as generics do; measure what that costs real programs.")
         }
         Issue panics(title: "Is panicking an effect?") {
-          Say: {"[small laugh] Is panicking an effect? Almost everything can panic, so tracking it would be accurate, and unusable. The likely answer: panics aren't tracked, but a cached function that panics doesn't get cached."}
           (Status, Open)
           P q("Almost everything can panic. Treating it as an effect would be accurate and unusable. Likely answer: panics are not tracked, but a cached function that panics is not cached.")
         }
         Issue alloc(title: "Is allocation an effect?") {
-          Say: {"[thoughtful] Is allocation an effect? The proposal says yes, explicitly, as in Zig. A function that allocates says so, and the caller picks the allocator: an arena for a request, a bump allocator for a frame, a counting one for a test. Code that names no allocator can't allocate at all, which is exactly what audio callbacks, interrupt handlers and kernel paths need, and nothing checks today. [short pause] It doesn't make a function impure, though. Same input, same answer. Allocation only shows through failure and through addresses, and the cache already refuses exposed addresses. [short pause] The cost: almost everything says it allocates, and the standard collections take their allocator. Still open: per collection or per call, how old-edition code gets one, and whether it's inferred inside a crate."}
           (Status, Open)
           P q("Proposed: explicit everywhere, as in Zig. Allocation is a capability like `Fs`: a function that allocates says `/ Alloc`, and the caller chooses which allocator it gets, so a request can run on an arena, a frame on a bump allocator, a test on a counting allocator. Code with no `Alloc` cannot allocate at all, which is what real-time audio callbacks, interrupt handlers and kernel paths need and what nothing checks today.") { (Cites, refs.kelley_io) }
           P cache("Allocation does not make a function impure. A function with only `/ Alloc` gives the same answer for the same input; allocation is observable only through failure and through addresses, and the cache already refuses functions that expose addresses. So `Alloc` decides which allocator and whether any, not whether a result can be cached.")
           P cost("The cost is that almost everything says `/ Alloc`, and std's collections take their allocator (`Vec<T, A>`, as in Rust's unstable allocator API, or Zig's unmanaged containers that take it per call). Open: per collection or per call, how code in old editions gets one (the global allocator, passed in at the edition boundary), and whether `Alloc` is inferred inside a crate and only written at public items.")
         }
         Issue threads(title: "Threads and Send") {
-          Say: {"Threads and Send. Spawning is an effect. Can a capability cross threads? The clock, obviously. A single-threaded executor's handle, no. It's Send all over again, for capabilities."}
           (Status, Open)
           P q("Spawning is an effect. Can a capability cross threads? Some (`Clock`) obviously; some (a single-threaded executor's handle) not. This is `Send` again, for capabilities.")
         }
         Issue unsafe_ffi(title: "unsafe and FFI") {
-          Say: {"Unsafe code and foreign calls can do anything. A function that uses them either declares the effects it really has, trusted, the way an unsafe Send is, or it counts as ambient."}
           (Status, Open)
           P q("`unsafe` code and `extern` calls can do anything. A function that uses them either declares the effects it really has (trusted, like `unsafe impl Send`) or counts as ambient.")
         }
         Issue escape(title: "Capabilities in cached values") {
-          Say: {"[serious] Capabilities in cached values. A pure function must never return or capture a capability, or its cached result would carry authority from one run into the next. So capability types can't be cacheable, and the check has to see through generics."}
           (Status, Open)
           P q("A pure function must not return or capture a capability, or its cached result would carry authority from one run into another. Capability types must be non-cacheable, and the check has to see through generics.")
         }
         Issue syntax(title: "Syntax") {
-          Say: {"[wry] And finally, the syntax, which is wide open. A slash after the return type, as sketched? A uses keyword, an attribute, bounds on a hidden generic? The slash is short and reads well, but has to be checked against division in a few places. Handlers as a block, or as plain arguments? Whatever reads best in diffs. Nothing is decided."}
           (Status, Open)
           P q("`/ Fs` after the return type (Effekt's form, the current sketch), `uses Fs`, an attribute, or bounds on a hidden generic? `/` reads well and is short, but needs checking against division in const generic and return-type positions. `with fs \{ ... }` for handlers, or ordinary arguments? Pick whatever reads best in diffs; nothing is decided.")
         }

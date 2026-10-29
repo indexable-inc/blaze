@@ -1,3 +1,8 @@
+---
+status: plan
+summary: The build driver as a graph that does no IO: what is wrong with the serial driver and what replaces it.
+date: 2026-10-28
+---
 # The build driver: a graph that does no IO
 
 The compiler's core (parser, `hir-def`, `hir-expand`, `hir-ty`, MIR) is salsa queries that
@@ -88,6 +93,15 @@ One executor per process performs the requests and feeds back completions:
   committed before the first `Work` starts; what changes first is that the input-producing nodes
   run concurrently and the `Work` nodes in DAG order. Committing while work runs (an input per
   crate, or salsa sets that do not cancel unrelated queries) is a later step, measured.
+- Nothing waits on the thread that steps the machine, so no wait can be part of a cycle (the
+  rule of Relax's owner thread, makepad's `libs/relax/compiler/src/owner.rs`). A node's work
+  never asks the executor for anything: what it finds it returns (`Did::added`). The
+  executor's one wait is for the next completion, and while it waits it takes every one that
+  comes. A `Commit` that cannot wait for the `Work` holding snapshots cancels it (salsa's
+  cancellation), and the nodes cancelled go back to `Ready` and run again: cancel and post
+  again, as a worker's `Builds::settle` does today with the clients of a build it interrupts.
+  The daemon keeps the same rule: a lock is held to find or change what it guards, never
+  across a wait for another process.
 
 ### Events
 

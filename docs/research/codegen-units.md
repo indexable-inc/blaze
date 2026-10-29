@@ -1,3 +1,8 @@
+---
+status: record
+summary: Codegen units for whole-program builds (#176): how functions are cut into LLVM modules, and the times.
+date: 2026-10-24
+---
 # Codegen units for whole-program builds
 
 2026-10-24, issue #176. Claims are marked **read** (measured here, with the command, or in a

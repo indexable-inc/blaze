@@ -13,7 +13,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from difftest import Fixture, RUNNER
 
-CRATES = ["devdep", "blanket", "edition2015", "fragment", "procmacro", "overlap", "hostcfg"]
+CRATES = ["devdep", "blanket", "edition2015", "fragment", "procmacro", "overlap", "hostcfg", "wasionly"]
 # Crates that use a nightly feature, built by the pinned compiler with RUSTC_BOOTSTRAP=1. That
 # also has cargo read the `[unstable]` table of its configuration, where `checksum-freshness`
 # would make the touch that has cargo link the test again do nothing.

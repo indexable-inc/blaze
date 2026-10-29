@@ -1,3 +1,8 @@
+---
+status: record
+summary: rustc's derive cache and earlier attempts, and what blaze's proc-macro expansion cache keys and why.
+date: 2026-10-21
+---
 # Caching proc-macro expansions: rustc's derive cache and what blaze keeps
 
 2026-10-21. For issue #38 (Glancer item 3, [docs/glancer.md](../glancer.md)). Sources under

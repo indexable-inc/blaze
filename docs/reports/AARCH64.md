@@ -1,3 +1,8 @@
+---
+status: record
+summary: blaze on aarch64-unknown-linux-gnu: the first port.
+date: 2026-10-20
+---
 # blaze on aarch64-unknown-linux-gnu
 
 Branch `blaze-aarch64-linux`, off `blaze-spike`. Everything here was done on a Linux x86-64

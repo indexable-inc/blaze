@@ -1,3 +1,7 @@
+---
+status: current
+summary: How long an edit takes to build, the memory and disk it uses and how fast its programs run, against cargo, on three platforms.
+---
 # Benchmarks
 
 How long an edit takes to build under blaze, how much memory and disk it uses, and how fast the

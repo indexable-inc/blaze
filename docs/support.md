@@ -1,3 +1,7 @@
+---
+status: current
+summary: What is supported, cell by cell, each pointing at the report or harness run behind it.
+---
 # What is supported
 
 Every cell here points at a report or a harness run. "CI" is GitHub Actions run

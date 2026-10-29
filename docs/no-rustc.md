@@ -1,3 +1,8 @@
+---
+status: plan
+summary: The no-rustc rule and the plan to remove every rustc use, step by step, with what is done.
+date: 2026-10-22
+---
 # blaze never runs rustc
 
 ## The rule
@@ -24,6 +29,14 @@ refused where possible: the root manifest's `unsandboxed-build-scripts` and
 
 Andrew, 2026-10-24: "we want to be a superset of Rust (i.e., any existing Rust program should
 work, minus a proc macro that isn't sandboxed, which it should be tbh)."
+
+Superset runs one way. Every Rust program must work under blaze, but a program that uses a blaze
+extension (new syntax, attributes or semantics, such as const macros or
+[#1448](https://github.com/indexable-inc/blaze/issues/1448)) only has to work under blaze; it
+never has to build under rustc. An extension is opt-in, and turning it on must not change the
+behaviour of code that doesn't use it.
+
+Andrew, 2026-10-28: "we are superset and if using superset dont need rustc to compile it either."
 
 This describes where blaze is going, not where it is. Today rustc still does much of the work:
 it builds every program once before the daemon takes over, it compiles the standard library,
@@ -718,7 +731,9 @@ over ripgrep: 2.5 s against 0.25 s), and the native libraries the crates linked 
 `#[link(name, kind, modifiers, cfg)]`, read from their `extern` blocks, a crate's before those
 of the crates it depends on; no list of libraries is fixed. What the link leaves out it proves
 unreachable, so a stand-in left in the executable is a function the program can reach that
-blaze could not compile: blaze says how many after the link and fails on any.
+blaze could not compile: blaze says how many after the link and fails on any. Not yet on
+Windows: blaze's COFF objects have no COMDAT sections for `link.exe`'s `/OPT:REF` to take out,
+so every stand-in stays, and one says what blaze could not compile only when it is called.
 None is left in hello, the four `allblaze.py` programs or ripgrep. The rest of what rustc
 does around the link: the allocator shim calls the `#[global_allocator]`'s methods (through the
 four functions the attribute's expansion exports) or else std's defaults; the panic runtime is

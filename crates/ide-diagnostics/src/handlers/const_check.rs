@@ -87,6 +87,54 @@ const fn built() -> Tuple { Tuple(1) }
     }
 
     #[test]
+    fn atomics_in_const_contexts() {
+        check_diagnostics(
+            r#"
+// The nightly's atomic intrinsics are `const` (`#![feature(const_atomic)]`), as `atomic_load` is
+// here; one not declared `const` is refused, as rustc refused them before.
+#[rustc_intrinsic]
+const unsafe fn atomic_load<T: Copy, const ORD: u8>(src: *const T) -> T;
+#[rustc_intrinsic]
+unsafe fn atomic_xadd<T: Copy, const ORD: u8>(dst: *mut T, src: T) -> T;
+const unsafe fn load(p: *const u32) -> u32 {
+    unsafe { atomic_load::<u32, 0>(p) }
+}
+const unsafe fn add(p: *mut u32) -> u32 {
+    unsafe { atomic_xadd::<u32, 0>(p, 1) }
+           //^^^^^^^^^^^^^^^^^^^^^^^^^^^ error: cannot call non-const intrinsic `atomic_xadd` in constant functions
+}
+// User code reaches atomics in const only through calls rustc refuses (E0015).
+fn bump(p: *mut u32) -> u32 {
+    unsafe { atomic_xadd::<u32, 0>(p, 1) }
+}
+struct Counter;
+impl Counter {
+    fn fetch_add(&self) -> u32 { 0 }
+}
+const fn via_fn(p: *mut u32) -> u32 {
+    bump(p)
+  //^^^^^^^ error: cannot call non-const function `bump` in constant functions
+}
+const C: u32 = Counter.fetch_add();
+             //^^^^^^^^^^^^^^^^^^^ error: cannot call non-const method `Counter::fetch_add` in constants
+"#,
+        );
+    }
+
+    #[test]
+    fn comptime_intrinsics_in_constants() {
+        // core writes `size_of`, `align_of` and `needs_drop` as `#[rustc_comptime] pub fn`,
+        // which rustc calls always const.
+        check_diagnostics(
+            r#"
+//- minicore: size_of
+const S: usize = core::mem::size_of::<u64>();
+static T: usize = core::mem::size_of::<u32>();
+"#,
+        );
+    }
+
+    #[test]
     fn pointers_in_const_fns() {
         check_diagnostics(
             r#"

@@ -1,3 +1,8 @@
+---
+status: record
+summary: Soak and robustness of the daemon.
+date: 2026-10-20
+---
 # Soak and robustness of the daemon
 
 Branch `blaze-soak`, from `blaze-security` c0dfb021cb merged with `blaze-collate` 8f21942505.

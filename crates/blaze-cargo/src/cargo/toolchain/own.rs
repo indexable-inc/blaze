@@ -731,7 +731,11 @@ mod tests {
     #[test]
     fn pins_are_of_the_host_and_the_release_blaze_builds_with() {
         let ours = Release::read(PINS, "x86_64-unknown-linux-gnu").unwrap();
-        assert_eq!(ours.version, super::super::OURS.trim(), "toolchain_pins.py '{{\"write\": true}}'");
+        assert_eq!(
+            ours.version,
+            super::super::OURS.trim(),
+            "toolchain_pins.py '{{\"write\": true}}'"
+        );
         assert_eq!(ours.channel, "nightly");
         assert!(ours.rustc.contains("-nightly ("), "{}", ours.rustc);
         let names: Vec<_> = ours.components.iter().map(Component::name).collect();

@@ -1,3 +1,7 @@
+---
+status: current
+summary: The differential fuzzer: how it makes programs, runs them under cargo and blaze, and what it does not cover.
+---
 # The fuzzer
 
 Every other harness runs programs somebody wrote. The fuzzer makes programs up, builds each

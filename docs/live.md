@@ -1,3 +1,7 @@
+---
+status: current
+summary: Live edits: what happens between a save and the new code running in a program, and what is refused.
+---
 # Live edits
 
 A program that links `blaze-live` takes each edit while it runs. This is what happens between
@@ -137,16 +141,6 @@ The program is told to start again (`Outcome::Restart`) when:
 - the executable was linked again: the daemon says so for a program it knew, and the program
   watches its own executable for another `LC_UUID`, which covers a daemon started since and a
   plain `cargo build`.
-
-A build of several programs where cargo builds one (`blaze build -p server -p client`, and an
-edit only rustc's copy of the client's code sees) links none of the others again: cargo's run
-is told which programs the daemon built (`BLAZE_DAEMONS_BUILT`), and the wrapper asks the
-daemon for each of those as it does under plain cargo, giving cargo the daemon's executable
-where rustc would have linked one; nor is rustc's old executable put back over a running one
-first. The checkout is then `kept`: the daemon's worker loads what rustc built in place,
-keeps the programs it built by the plans it built them by, and starts over with the ones
-rustc linked, rather than start again and link every program anew. A change cargo acts on
-(a manifest, the lock, a build script) still starts a new worker.
 
 A patch that can't be applied (`Outcome::Declined`) leaves the program as it was.
 
