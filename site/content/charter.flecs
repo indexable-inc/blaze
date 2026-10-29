@@ -2,46 +2,37 @@
 site {
   charter : Doc {
     Title: {"Charter"}
-    Intro: {"[calm, warm] This is the blaze charter: the rulebook every RFC gets checked against."}
-    Outro: {"[calm] So, five rules. Rust that builds keeps building. New things live in a new, unstable edition. Checkable beats short. Fast to build, fast to run, easy to change. And everything is decided in the open. [breath] Thanks for listening."}
     Nav: {"Charter", 3}
     Icon: {"scroll"}
     (InGroup, nav.reference)
     Description: {"What blaze holds to: Rust keeps working, new things are opt-in, and checkable code beats short code."}
 
-    Lede lede("blaze is Rust, plus a place to try what Rust could become. These are the rules for both.") {
-      Say: {"[thoughtful] Here's the setup. blaze is Rust, the Rust you already have, and it's also a place to try what Rust could become. [pause] Those could pull against each other, so there are five rules for both."}
-    }
+    Lede lede("blaze is Rust, plus a place to try what Rust could become. These are the rules for both.")
 
     Section compat(title: "1. Rust that builds keeps building") {
-      Say: {"[confident] Rule one: Rust that builds keeps building. Every crate that builds with the Rust compiler, version one point ninety-nine, builds with blaze and means the same thing: every edition from twenty fifteen to twenty twenty-four, the standard library, crates dot io as it is. blaze only adds; it never changes stable Rust. [pause] A change that would break existing code doesn't ship in the existing editions. [small laugh] That's what editions are for."}
       P what("Every crate that builds with rustc 1.99.0 builds with blaze and means the same thing: editions 2015 to 2024, std, crates.io as it is. blaze is a superset; it does not remove or change anything in stable Rust.")
       P how("When a change would break existing code, it does not ship in the existing editions. That is what editions are for.")
     }
 
     Section edition(title: "2. New things live in a new edition") {
-      Say: {"[curious] Rule two: so where do new things go? Into a new edition that a crate opts into, and crates on old and new editions still build together in one program. [serious] But <emphasis>the new edition is unstable.</emphasis> Anything in it can change or disappear between releases. The old editions are the stable part; the new one is where designs get tried on real code. [short pause] Its name, and how a crate opts in, are still open."}
       P what("Everything blaze adds to the language sits behind a new edition that a crate opts into. Crates on the new edition and crates on old ones build together in one program, as editions do today.")
       P unstable("**The new edition is unstable.** Anything in it may change shape or be removed between releases. The old editions are the stable part; the new one is where designs are tried on real code.")
       P open("Its name and how a crate opts in are open; see [the RFCs](/rfcs).")
     }
 
     Section checkable(title: "3. Checkable over short") {
-      Say: {"[thoughtful] Rule three: checkable over short. [pause] More and more code is written by language models. Typing is cheap for them; reading what they wrote is not. So a few more words that let the compiler <emphasis>prove</emphasis> something are a good trade. [short pause] Prefer designs the compiler can check: a signature that says what a function may touch, a value that must be used and can't be quietly dropped, a pure function cached because the compiler knows it's pure. That beats conventions, lints and docs you have to trust. [wry] But it's no licence for ceremony. Every annotation has to buy a guarantee someone relies on."}
       P why("More and more code is written by language models. Typing is cheap for them and reading their output is not, so a few more words that let the compiler prove something are a good trade.")
       P prefer("Prefer designs where the compiler can check the claim: a function's signature says what it may touch (capabilities), a value that must be used cannot be dropped, a pure function can be cached because the compiler knows it is pure. Prefer that to conventions, lints and documentation that have to be trusted.")
       P not_ceremony("This is not a licence for ceremony. Every annotation has to buy a guarantee someone relies on.")
     }
 
     Section fast(title: "4. Fast to build, fast to run, easy to change") {
-      Say: {"[upbeat] Rule four: fast to build, fast to run, easy to change. Compile speed is a feature: an edit should rebuild only what it changed, in milliseconds, and a feature that slows every build has to pay for it. [short pause] Generated code should be as fast as what the Rust compiler and LLVM produce, and safety is no excuse for a slower program. [short pause] And code should stay easy to change: small pieces, explicit dependencies, nothing global a reader has to discover."}
       P builds("Compile speed is a feature. An edit should rebuild what it changed and nothing else, in milliseconds. A language feature that makes every build slower has to pay for it with something users want more.")
       P runs("Generated code should be as fast as what rustc and LLVM produce for the same program. Safety and checks do not excuse a slower program where the compiler could do better.")
       P manage("Code should stay easy to change: small pieces, explicit dependencies, nothing global that a reader has to discover.")
     }
 
     Section open(title: "5. Decided in the open") {
-      Say: {"[warm] And rule five: decided in the open. Every addition starts as an RFC on this site, and anyone signed in with GitHub can comment on any paragraph. An RFC says what it adds, what it breaks, which in old editions is nothing, what it costs to build and to run, and what's still open. [short pause] Where Rust itself is working on the same problem, the RFC follows upstream's design and names, so what works here can go back to Rust."}
       P rfcs("Additions start as an RFC on this site. Anyone signed in with GitHub can comment on any paragraph. An RFC says what it adds, what it breaks (nothing, in old editions), what it costs at build time and at run time, and what is still open.")
       P upstream("Where Rust itself is working on the same problem, an RFC follows upstream's design and names, so what works here can go back to Rust.")
     }

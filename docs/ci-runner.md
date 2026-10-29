@@ -1,3 +1,8 @@
+---
+status: plan
+summary: A CI runner on ix VMs: a warm blaze VM per repository and a fork per branch. Design, nothing built.
+date: 2026-10-24
+---
 # A CI runner of our own: a warm blaze VM per repository, a fork per branch
 
 2026-10-24. Status: design, nothing built. Written against blaze main `d4f6027e82` and ix

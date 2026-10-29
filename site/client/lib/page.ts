@@ -6,7 +6,7 @@
  *   it into an already swapped page), and again after every swap (`blaze:page`, fired on window);
  * - before a swap (`blaze:leave`) its signal is aborted and the teardown it returned is called. Pass the signal to
  *   every addEventListener on something that outlives the page (window, document, a MediaQueryList); stop observers,
- *   animation frames, timers and audio in the teardown.
+ *   animation frames and timers in the teardown.
  *
  * `init` finds what it works on with querySelector and returns early when the page has none, so a script left loaded
  * from an earlier page does nothing on a page that doesn't use it.
@@ -22,8 +22,6 @@ export const LEAVE = 'blaze:leave';
 export const PAGE = 'blaze:page';
 /** Fired on window by client/lib/presence.ts when a doc's comments changed elsewhere (a CustomEvent, detail: the doc). */
 export const COMMENTS = 'blaze:comments';
-/** Fired on window by client/comments.ts after it swapped threads in, so the comment count can be redrawn. */
-export const THREADS = 'blaze:threads';
 
 /**
  * A new version of the site is going in (client/lib/update.ts): fired on window just before a reload or an in-place

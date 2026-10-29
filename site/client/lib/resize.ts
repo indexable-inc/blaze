@@ -1,6 +1,5 @@
 /**
- * A drag handle that sets a width: the sidebar's right edge (client/side.ts, `--side-w`) and the chat's left edge
- * (client/lib/chat.ts, `--chat-w`). The width is a custom property on `<html>`, kept per browser (localStorage), and
+ * A drag handle that sets a width: the sidebar's right edge (client/side.ts, `--side-w`). The width is a custom property on `<html>`, kept per browser (localStorage), and
  * client/keep.ts puts it back before the first paint. The handle is a focusable separator: the arrows move it 16px,
  * Home and End go to the ends, and a double click goes back to the default.
  */
@@ -12,13 +11,10 @@ export type Resize = {
 	min: number;
 	max: number;
 	initial: number;
-	/** Which way a drag to the right moves the width: +1 for an edge on the right of its box, -1 on the left. */
-	dir: 1 | -1;
 	label: string;
 };
 
-export const SIDE: Resize = { prop: '--side-w', key: 'blaze.side.w', min: 200, max: 440, initial: 268, dir: 1, label: 'Resize the sidebar' };
-export const CHAT: Resize = { prop: '--chat-w', key: 'blaze.chat.w', min: 280, max: 640, initial: 340, dir: -1, label: 'Resize the chat' };
+export const SIDE: Resize = { prop: '--side-w', key: 'blaze.side.w', min: 200, max: 440, initial: 268, label: 'Resize the sidebar' };
 
 function current(r: Resize): number {
 	const v = parseFloat(getComputedStyle(document.documentElement).getPropertyValue(r.prop));
@@ -59,13 +55,13 @@ export function handle(r: Resize): HTMLElement {
 		const x0 = e.clientX;
 		const w0 = current(r);
 		document.documentElement.classList.add('resizing');
-		const move = (m: PointerEvent) => show(set(r, w0 + r.dir * (m.clientX - x0), false));
+		const move = (m: PointerEvent) => show(set(r, w0 + m.clientX - x0, false));
 		const up = (u: PointerEvent) => {
 			h.removeEventListener('pointermove', move);
 			h.removeEventListener('pointerup', up);
 			h.removeEventListener('pointercancel', up);
 			document.documentElement.classList.remove('resizing');
-			show(set(r, w0 + r.dir * (u.clientX - x0), true));
+			show(set(r, w0 + u.clientX - x0, true));
 		};
 		h.addEventListener('pointermove', move);
 		h.addEventListener('pointerup', up);
@@ -74,8 +70,7 @@ export function handle(r: Resize): HTMLElement {
 	h.addEventListener('dblclick', () => show(set(r, r.initial, true)));
 	h.addEventListener('keydown', (e) => {
 		const w = current(r);
-		const step = r.dir * 16;
-		const to = e.key === 'ArrowRight' ? w + step : e.key === 'ArrowLeft' ? w - step : e.key === 'Home' ? r.min : e.key === 'End' ? r.max : null;
+		const to = e.key === 'ArrowRight' ? w + 16 : e.key === 'ArrowLeft' ? w - 16 : e.key === 'Home' ? r.min : e.key === 'End' ? r.max : null;
 		if (to === null) return;
 		e.preventDefault();
 		show(set(r, to, true));

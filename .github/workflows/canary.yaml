@@ -1,15 +1,17 @@
-# A canary of every green main, cheaply (docs/release.md, "Cutting a canary"): when the merge
-# gate's run on a push to main ends green, `canary.py cut` tags that commit v0.YYYYMMDD.N through
-# the API and dispatches release.yaml on the tag, which publishes it as a prerelease and starts
-# promote.yaml. No commit goes to main, so nothing races a merge. At most one release builds at a
-# time and one is cut per `min_minutes`; a green main inside that window is cut by the hourly run
-# (or the next green push). By hand: `gh workflow run canary.yaml` (`-f push=false` shows what it
-# would tag).
+# A canary of every built main, cheaply (docs/release.md, "Cutting a canary"): on each push to
+# main, `canary.py cut` waits for that push's `linux x64 / build` job of the merge gate
+# (blaze.yaml) to pass, then tags the newest commit of main that main's gate built v0.YYYYMMDD.N
+# through the API and dispatches release.yaml on the tag, which publishes it as a prerelease and
+# starts promote.yaml. It waits for the build alone: not the unit tests, not the other platforms
+# (macOS queues half an hour); stable needs those (promote.yaml, `main's tests`). Waiting here
+# rather than being dispatched from the build job keeps blaze-platform.yaml, which the train
+# calls too, at the read-only token. No commit goes to main, so nothing races a merge. At most
+# one release builds at a time and one is cut per `min_minutes`; a build inside that window is
+# cut by the hourly run (or the next push). By hand: `gh workflow run canary.yaml` (`-f
+# push=false` shows what it would tag).
 name: canary
 on:
-  workflow_run:
-    workflows: [blaze]
-    types: [completed]
+  push:
     branches: [main]
   schedule:
     - cron: "17 * * * *"
@@ -23,8 +25,9 @@ on:
         description: "minutes since the last release before another is cut"
         default: "30"
 
-# A cut waiting is replaced by a newer one. canary.py waits out a running release-cut.yaml
-# (both number releases from the same tags) by cutting nothing while it runs.
+# One cut at a time; a cut waiting to start is replaced by a newer one, which waits for the
+# newest build itself. canary.py waits out a running release-cut.yaml (both number releases
+# from the same tags) by cutting nothing while it runs.
 concurrency:
   group: canary
   cancel-in-progress: false
@@ -35,16 +38,13 @@ permissions:
 jobs:
   cut:
     name: cut
-    if: >-
-      github.repository == 'indexable-inc/blaze' &&
-      (github.event_name != 'workflow_run' ||
-       (github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success'))
+    if: github.repository == 'indexable-inc/blaze'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    # canary.py waits at most 90 minutes for main's build.
+    timeout-minutes: 100
     permissions:
       contents: write
       actions: write
-      checks: read
     steps:
       - uses: actions/checkout@v7
         with:
@@ -54,6 +54,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PUSH: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
           MINUTES: ${{ inputs.min-minutes || '30' }}
+          # A push waits for its build; the hourly run and a run by hand cut what is built.
+          WAIT: ${{ github.event_name == 'push' && github.sha || '' }}
         run: |
-          jq -n --argjson push "$PUSH" --argjson minutes "$MINUTES" '{push: $push, min_minutes: $minutes}' > "$RUNNER_TEMP/cut.json"
+          jq -n --argjson push "$PUSH" --argjson minutes "$MINUTES" --arg wait "$WAIT" \
+            '{push: $push, min_minutes: $minutes, wait: $wait, wait_minutes: 90}' > "$RUNNER_TEMP/cut.json"
           python3 -I .github/scripts/canary.py cut "$RUNNER_TEMP/cut.json"

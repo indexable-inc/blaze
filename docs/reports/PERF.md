@@ -1,3 +1,8 @@
+---
+status: record
+summary: Where blaze's time goes against cargo on three workspaces.
+date: 2026-10-20
+---
 # Where blaze's time goes
 
 Measurements of `blaze` against plain cargo on three pinned workspaces, what the daemon
