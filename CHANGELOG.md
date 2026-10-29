@@ -9,8 +9,13 @@ since the release before and the title of each change merged since.
 
 ## [Unreleased]
 
+### Added
+
+- Remote cache: every push writes the project's key index (`manifests/<project>.index`, runs and shards under `index/`), which says which pack holds a key without the key list of every pack; the gateway takes `index/<sha256>` (docs/cache.md, "The remote").
+
 ### Changed
 
+- `blaze-engine cache build` prints what this build's store keys are made with apart from the toolchain (the store's format and the hash of blaze's sources), and fails for a build keyed by its executable's bytes: CI will name the remote's project by it instead of by the release, so a release whose compiled-in sources did not change keeps the store (docs/cache.md).
 - Releases: a canary is cut as soon as main's Linux x86-64 build of a commit passes, without waiting for the unit tests; stable now also needs main's merge gate on that commit green, with the unit tests run and passed on Linux x86-64, Linux ARM64 and macOS (docs/release.md).
 
 ## [0.20261028.9] - 2026-10-28

@@ -54,8 +54,8 @@ use hir_ty::{db::HirDatabase, traits::StoredParamEnvAndCrate};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
-    Backend, COMPILED, CompiledFunction, Detach, Instance, InstanceDef, ObjectCodegen,
-    ObjectFormat, ParallelWork, Pending, Produced, Rejected, Result, SymbolResolver,
+    Backend, CompiledFunction, Detach, Instance, InstanceDef, ObjectCodegen, ObjectFormat,
+    ParallelWork, Pending, Produced, Rejected, Result, SymbolResolver,
     backend::{self, Tally},
     cached, compiled_instance, compiled_root,
     fragment::{self, DataRequest, FuncRequest, FuncTarget, Recorder},
@@ -814,7 +814,7 @@ fn unit(db: &dyn HirDatabase, members: Vec<Built>) -> Vec<(Kind, Outcome)> {
             let mut code = code;
             let requests = recorder.wants.referenced(&mut code);
             tally.llvm.add(each, code.bytes.len());
-            COMPILED.fetch_add(1, Ordering::Relaxed);
+            crate::counted::compiled();
             let Pending { source, variables, layouts, closure, .. } = member.pending;
             let compiled = CompiledFunction { requests, code, source, closure, variables, layouts };
             (member.kind, Outcome::Code(compiled))
