@@ -8,10 +8,15 @@
  * per UTC day: the same browser is the same animal all day, the next day it is another, and neither the IP nor the
  * key leaves the object. Signed-in readers are their GitHub login.
  *
+ * A crawler or other automation (worker/bots.ts decides, from Cloudflare's verified-bot signals and the user agent) is
+ * welcome but shows as what it is: `bot` set to its name ("Googlebot") on its entry in `here`, left out of `total` (and
+ * counted in `bots` instead), and refused everything but `at`: no pointer, no live line, no typing, no chat.
+ *
  * Protocol (JSON text frames):
  *
- *   server -> client  {t: "you", key, login, avatar, signIn}       once, on connect
- *                     {t: "here", people: [{key, login, avatar, pages: [{path, away}]}]}   on every change
+ *   server -> client  {t: "you", key, login, avatar, signIn, bot?}  once, on connect
+ *                     {t: "here", people: [{key, login, avatar, bot?, pages: [{path, away}]}], total, bots}
+ *                                                                  on every change: `total` the people, `bots` the bots
  *                     {t: "comments", doc}                      a comment on that doc was posted or deleted
  *                     {t: "chat", messages: [Msg], mine?}       the chat's last CHAT_SHOWN messages (top-level ones,
  *                                                                  each with its thread's summary, and replies also
@@ -89,6 +94,7 @@ import buildJson from '../.gen/build.json';
 import pagesJson from '../.gen/pages.json';
 import { currentUser, hasSessionCookie, isAdmin } from './auth';
 import type { Env } from './env';
+import { botName } from './bots';
 import { json, plain, sameOrigin } from './http';
 
 const PATHS = new Set<string>(pagesJson.map((p) => p.url));
@@ -126,7 +132,8 @@ const MAX_FRAC = 50;
 /** A reload or a dropped connection shorter than this keeps someone's time on the site. */
 const RETURN_MS = 120_000;
 
-type Who = { key: string; login: string | null; avatar: string | null; admin?: boolean };
+/** `bot` is the name of a crawler or other automation (worker/bots.ts), never set for a signed-in reader. */
+type Who = { key: string; login: string | null; avatar: string | null; admin?: boolean; bot?: string };
 type Reaction = { kind: string; who: { key: string; login: string }[] };
 type Msg = {
 	id: number;
@@ -187,7 +194,11 @@ export async function handlePresence(request: Request, env: Env): Promise<Respon
 	headers.set('x-presence-ip', request.headers.get('cf-connecting-ip') ?? '');
 	const country = String(request.cf?.country ?? '');
 	headers.set('x-presence-country', /^[A-Z]{2}$/.test(country) && country !== 'XX' ? country : '');
-	headers.set('x-presence-ua', (request.headers.get('user-agent') ?? '').slice(0, 512));
+	const ua = request.headers.get('user-agent') ?? '';
+	headers.set('x-presence-ua', ua.slice(0, 512));
+	// Decided here from what Cloudflare saw, never from the tab. A signed-in reader is a person.
+	const bot = user ? null : botName(ua, request.cf);
+	if (bot) headers.set('x-presence-bot', bot);
 	headers.set('x-presence-signin', env.GITHUB_CLIENT_ID ? '1' : '');
 	headers.set('x-presence-built', String(buildJson.at));
 	const stub = env.PRESENCE.get(env.PRESENCE.idFromName('site'));
@@ -279,9 +290,15 @@ export class Presence extends DurableObject<Env> {
 		if (Number(request.headers.get('x-presence-built')) > buildJson.at) this.ctx.abort('A newer deploy.');
 		if (this.ctx.getWebSockets().length >= MAX_SOCKETS) return json({ error: 'Too many visitors right now.' }, 503);
 		const whoHeader = request.headers.get('x-presence-who');
+		const bot = request.headers.get('x-presence-bot')?.slice(0, 64);
 		const who: Who = whoHeader
 			? (JSON.parse(whoHeader) as Who)
-			: { key: await this.anonKey(request.headers.get('x-presence-ip') ?? '', request.headers.get('x-presence-ua') ?? ''), login: null, avatar: null };
+			: {
+				key: await this.anonKey(request.headers.get('x-presence-ip') ?? '', request.headers.get('x-presence-ua') ?? ''),
+				login: null,
+				avatar: null,
+				...(bot ? { bot } : {}),
+			};
 		// One person's tabs past MAX_TABS: the newest stays and the one used longest ago goes (a hidden one first). It
 		// closes with TOO_MANY_TABS, and reconnects only when it is shown again (client/lib/presence.ts).
 		const mine = this.ctx.getWebSockets(who.key);
@@ -305,7 +322,7 @@ export class Presence extends DurableObject<Env> {
 		this.arrived.set(who.key, { at: since, gone: null });
 		const tab: Tab = { ...who, path: null, away: false, since, country: request.headers.get('x-presence-country') || null, device: deviceOf(request.headers.get('x-presence-ua') ?? '') };
 		server.serializeAttachment(tab);
-		server.send(JSON.stringify({ t: 'you', key: who.key, login: who.login, avatar: who.avatar, admin: !!who.admin, signIn: request.headers.get('x-presence-signin') === '1' }));
+		server.send(JSON.stringify({ t: 'you', key: who.key, login: who.login, avatar: who.avatar, admin: !!who.admin, signIn: request.headers.get('x-presence-signin') === '1', ...(who.bot ? { bot: who.bot } : {}) }));
 		server.send(this.snapshot());
 		server.send(JSON.stringify({ t: 'chat', messages: this.history(), ...(who.login && { mine: this.mine(who.key) }) }));
 		server.send(BUILD);
@@ -333,7 +350,12 @@ export class Presence extends DurableObject<Env> {
 			return ws.close(1003, 'Not JSON.');
 		}
 		const tab = ws.deserializeAttachment() as Tab;
-		if (m.t === 'c') return this.relay(tab, m.c);
+		// A bot is shown where it is, and that is all: no pointer, no live line, no typing, no chat.
+		if (tab.bot && m.t !== 'at') {
+			if (m.t === 'say' || m.t === 'edit' || m.t === 'react' || m.t === 'unsay') ws.send(JSON.stringify({ t: 'error', text: 'Bots can read, not chat.' }));
+			return;
+		}
+		if (m.t === 'c' || m.t === 'k') return this.relay(tab, m.c, m.t);
 		if (m.t === 'say-live') return this.sayLive(tab, m.text, m.done);
 		if (m.t === 'typing') {
 			const now = Date.now();
@@ -370,12 +392,15 @@ export class Presence extends DurableObject<Env> {
 		this.schedule();
 	}
 
-	/** Passes a pointer (`c`) on to the other people on the tab's page, checked and rebuilt, or null. Anything else is dropped. */
-	private relay(tab: Tab, raw: unknown): void {
+	/**
+	 * Passes a pointer (`c`) or a press (`k`, where the reader clicked) on to the other people on the tab's page, checked
+	 * and rebuilt; a pointer may be null (gone), a press may not. Anything else is dropped.
+	 */
+	private relay(tab: Tab, raw: unknown, t: 'c' | 'k'): void {
 		if (!tab.path) return;
-		const c = raw === null ? null : spotOf(raw);
+		const c = raw === null && t === 'c' ? null : spotOf(raw);
 		if (c === undefined || !this.allow(tab.key)) return;
-		const out = JSON.stringify({ t: 'c', k: tab.key, c });
+		const out = JSON.stringify({ t, k: tab.key, c });
 		for (const r of this.room(tab.path)) {
 			if (r.key === tab.key || r.away) continue;
 			try {
@@ -673,7 +698,7 @@ export class Presence extends DurableObject<Env> {
 			if (!tab) continue;
 			let p = people.get(tab.key);
 			if (!p) {
-				p = { key: tab.key, login: tab.login, avatar: tab.avatar, country: tab.country ?? null, since: tab.since ?? Date.now(), devices: [], pages: [] };
+				p = { key: tab.key, login: tab.login, avatar: tab.avatar, ...(tab.bot ? { bot: tab.bot } : {}), country: tab.country ?? null, since: tab.since ?? Date.now(), devices: [], pages: [] };
 				people.set(tab.key, p);
 			}
 			if (tab.since && tab.since < p.since) p.since = tab.since;
@@ -696,10 +721,12 @@ export class Presence extends DurableObject<Env> {
 		for (const key of this.moved.keys()) if (!people.has(key)) this.moved.delete(key);
 		// Each person's pages, the one in front of them first: in view before hidden, then the latest moved to.
 		for (const p of people.values()) p.pages.sort((a, b) => Number(a.away) - Number(b.away) || (seen.get(b) ?? 0) - (seen.get(a) ?? 0));
-		const list = [...people.values()]
-			.sort((a, b) => Number(!a.login) - Number(!b.login) || a.key.localeCompare(b.key))
-			.slice(0, MAX_PEOPLE);
-		return JSON.stringify({ t: 'here', people: list, total: people.size });
+		// Signed-in readers, then anonymous ones, then bots, so a crowd of crawlers never pushes a person off the list.
+		const rank = (p: Person) => (p.login ? 0 : p.bot ? 2 : 1);
+		const list = [...people.values()].sort((a, b) => rank(a) - rank(b) || a.key.localeCompare(b.key)).slice(0, MAX_PEOPLE);
+		let bots = 0;
+		for (const p of people.values()) if (p.bot) bots++;
+		return JSON.stringify({ t: 'here', people: list, total: people.size - bots, bots });
 	}
 
 	/** `a` + 12 hex chars of HMAC-SHA256(today's key, ip \0 user agent). The key is random, made once per UTC day. */

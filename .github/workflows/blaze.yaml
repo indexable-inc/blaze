@@ -88,6 +88,9 @@ jobs:
       - run: bun install --frozen-lockfile --cwd site
       - run: site/node_modules/.bin/tsc -p tools/agents
       - run: bun tools/agents/rules.ts --check
+      # Each doc says what it is, the current ones hold against the tree, and docs/README.md is
+      # their index (tools/docs.py).
+      - run: python3 tools/docs.py check
 
   linux-x64:
     name: linux x64

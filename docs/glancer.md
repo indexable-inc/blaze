@@ -1,3 +1,8 @@
+---
+status: plan
+summary: A front end more like Rust Glancer: six ideas, where time and memory go, and the ordered steps.
+date: 2026-10-21
+---
 # A front end more like Glancer
 
 2026-10-21. What Rust Glancer and matklad say, with sources, is in

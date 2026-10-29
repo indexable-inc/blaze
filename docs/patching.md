@@ -1,3 +1,8 @@
+---
+status: plan
+summary: blaze's patching: one engine with a lasting layout, writing to a running process or an executable, replacing cc, lld, ld64 and link.exe.
+date: 2026-10-28
+---
 # Patching: one engine, two outputs
 
 blaze stops linking with `cc`, `lld`, `ld64` and `link.exe`. A program's executable is made by

@@ -91,14 +91,12 @@ main.wide { max-width: none; }
 .doc .crumb a:hover { color: var(--ink-1); }
 .crumb span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .head h1 { margin: 0; font-size: clamp(30px, 3.4vw, 38px); line-height: 1.12; font-weight: 600; letter-spacing: -0.03em; color: var(--ink-1); overflow-wrap: anywhere; }
-.head .listen { margin: 20px 0 0; }
 .head + .lede, .head + p.lede { margin-top: 0; }
 
 /* The home page: the logo, large, then the lede in the reading colour. */
 .hero { padding: 56px 0 8px; }
 .hero-logo { margin: 0 0 8px; line-height: 0; }
 .hero-logo .logo img { width: min(100%, 344px); height: auto; margin: 0 0 0 -8px; border-radius: 0; box-shadow: none; background: none; }
-.hero .listen { margin: 16px 0 8px; }
 .hero ~ .lede { max-width: 34em; font-size: clamp(19px, 2.1vw, 22px); line-height: 1.45; color: var(--ink-1); letter-spacing: -0.015em; }
 
 /* A goal: a row with its title and one line, folded; open, its few paragraphs. */
@@ -184,7 +182,7 @@ main.wide { max-width: none; }
 
 /* Moving between pages. The client router (client/nav.ts) swaps the page column without a load, inside a
    same-document view transition: the sidebar and the phone bar are their own layers and stay put, and only the page
-   column cross-fades, quickly. The few navigations it leaves to the browser (a fallback, /updates with Turnstile) are
+   column cross-fades, quickly. The few navigations it leaves to the browser (a fallback) are
    the same cross-fade as a cross-document view transition (Chrome and Edge 126+, Safari 18.2+; elsewhere a plain
    load). Neither runs under prefers-reduced-motion (nav.ts skips its transition). */
 @view-transition { navigation: auto; }
@@ -265,6 +263,11 @@ body.side-shut .frame > .side { visibility: hidden; overflow: hidden; padding: 0
 .face.animal { --a-bg: hsl(var(--h) 30% 25%); --a1: hsl(var(--h) 55% 62%); --a2: hsl(var(--h) 40% 39%); --a3: hsl(var(--h) 75% 88%); --a-ink: hsl(var(--h) 45% 11%); background: var(--a-bg); }
 @media (prefers-color-scheme: light) {
 	.face.animal { --a-bg: hsl(var(--h) 55% 82%); --a1: hsl(var(--h) 50% 57%); --a2: hsl(var(--h) 42% 34%); --a3: hsl(var(--h) 70% 97%); --a-ink: hsl(var(--h) 45% 14%); }
+}
+/* A bot's robot (client/lib/presence.ts): steel, with lit eyes, the same for every bot. */
+.face.animal.bot { --a-bg: hsl(215 14% 22%); --a1: hsl(212 10% 63%); --a2: hsl(215 16% 30%); --a3: hsl(188 85% 70%); --a-ink: hsl(215 25% 10%); }
+@media (prefers-color-scheme: light) {
+	.face.animal.bot { --a-bg: hsl(212 18% 85%); --a1: hsl(212 9% 56%); --a2: hsl(215 18% 27%); --a3: hsl(186 90% 72%); --a-ink: hsl(215 25% 12%); }
 }
 .face.away { opacity: 0.45; }
 .face.more { width: auto; min-width: 20px; padding: 0 4px; border-radius: 10px; color: var(--ink-3); font-size: 10.5px; }
@@ -422,6 +425,10 @@ body.side-shut .feed { --feed-l: calc(clamp(8px, 1vw, 14px) + 16px); }
 .cursor { position: absolute; top: 0; left: 0; display: flex; align-items: flex-start; transition: opacity 0.4s; will-change: transform; }
 .cursor.idle { opacity: 0; transition-duration: 1s; }
 .cursor svg { width: 16px; height: 20px; flex: none; fill: var(--c); stroke: var(--bg); stroke-width: 1.2; stroke-linejoin: round; filter: drop-shadow(0 1px 2px rgb(0 0 0 / 0.3)); }
+/* A press: a ring from the pointer's tip, in their colour, gone in half a second. */
+.cursor-click { position: absolute; top: 1.5px; left: 1.5px; width: 26px; height: 26px; margin: -13px 0 0 -13px; border-radius: 50%; box-shadow: inset 0 0 0 2px var(--c); pointer-events: none; animation: cursor-click 0.5s cubic-bezier(0.2, 0.7, 0.3, 1) forwards; }
+@keyframes cursor-click { from { opacity: 0.9; transform: scale(0.25); } to { opacity: 0; transform: scale(1); } }
+@media (prefers-reduced-motion: reduce) { .cursor-click { animation: cursor-click-still 0.4s steps(1) forwards; transform: scale(0.6); } @keyframes cursor-click-still { to { opacity: 0; } } }
 .cursor-chip { display: inline-flex; align-items: center; gap: 4px; margin: 14px 0 0 -4px; padding: 2px 7px 2px 2px; border-radius: 10px; background: var(--c); color: #fff; font-size: 11px; font-weight: 500; line-height: 16px; white-space: nowrap; box-shadow: 0 2px 8px rgb(0 0 0 / 0.2); }
 .cursor-chip .face { width: 16px; height: 16px; box-shadow: none; }
 /* What someone types in the feed's input (T; client/lib/cursors.ts), in their colour (--c): a bubble under their name,

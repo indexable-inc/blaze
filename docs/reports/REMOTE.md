@@ -1,3 +1,8 @@
+---
+status: record
+summary: Remote hydration over S3.
+date: 2026-10-20
+---
 # Remote hydration over S3
 
 Branch `blaze-s3`, from `blaze-collate` at `27315323cb`, with `blaze-collate-wip` at

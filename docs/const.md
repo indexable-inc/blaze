@@ -1,3 +1,7 @@
+---
+status: current
+summary: Const evaluation: blaze's own interpreter for constants and const fns, and what it covers.
+---
 # Const
 
 A `const fn` is blaze's pure function: deterministic, touching no mutable state, so its result

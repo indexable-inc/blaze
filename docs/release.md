@@ -1,3 +1,7 @@
+---
+status: current
+summary: Releases: the canary and stable channels, how a release is cut and what gates promotion to stable.
+---
 # Releases: canary and stable
 
 blaze has two release channels, made of the same releases:
