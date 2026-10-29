@@ -1,3 +1,8 @@
+---
+status: record
+summary: blaze on Windows x86-64 (MSVC).
+date: 2026-10-20
+---
 # blaze on Windows x86-64 (MSVC)
 
 Branch `blaze-windows`, off `blaze-spike`. Everything below marked "measured" was run on this

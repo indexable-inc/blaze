@@ -142,6 +142,7 @@ pub fn build(asked: &Invocation) -> anyhow::Result<i32> {
         }
     }
     finished(asked, asked.profile(), started);
+    crate::trace::finish();
     if let Some(failed) = super::remote_failed_it() {
         return Ok(failed);
     }
@@ -274,6 +275,7 @@ pub fn test(asked: &Invocation) -> anyhow::Result<i32> {
         }
     }
     finished(asked, profile, started);
+    crate::trace::finish();
     if let Some(failed) = super::remote_failed_it() {
         return Ok(failed);
     }

@@ -1,3 +1,8 @@
+---
+status: record
+summary: What an edit inside one function redoes.
+date: 2026-10-20
+---
 # What an edit inside one function redoes
 
 Branch `fn-incremental`, from main at 46aff2550e, 2026-10-20. Measured on a loaded Mac (load

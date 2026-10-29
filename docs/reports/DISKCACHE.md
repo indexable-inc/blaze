@@ -1,3 +1,8 @@
+---
+status: record
+summary: The store on disk: what was hardened and measured.
+date: 2026-10-20
+---
 # The store on disk: what was hardened and what was measured
 
 Branch `blaze-disk-cache`, from `blaze-collate` at `b19fdfacd8`. Linux x86-64, 8 cores,

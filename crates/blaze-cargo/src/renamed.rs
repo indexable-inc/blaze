@@ -16,7 +16,8 @@ pub fn refuse_old_settings() {
         .filter_map(|(name, _)| name.to_str().filter(|it| it.starts_with(OLD)).map(str::to_owned))
         .collect();
     let traced = std::env::var_os("BLAZE_TRACE").is_some();
-    if old.is_empty() && !traced {
+    let traced_const = std::env::var_os("BLAZE_TRACE_CONST").is_some();
+    if old.is_empty() && !traced && !traced_const {
         return;
     }
     old.sort();
@@ -27,6 +28,11 @@ pub fn refuse_old_settings() {
         eprintln!(
             "BLAZE_TRACE is gone: BLAZE_PROFILE=<dir> writes the whole build's profile, its \
              Chrome trace as <dir>/trace.json"
+        );
+    }
+    if traced_const {
+        eprintln!(
+            "BLAZE_TRACE_CONST was renamed BLAZE_PROFILE_CONST, read with BLAZE_PROFILE=<dir>"
         );
     }
     std::process::exit(1);

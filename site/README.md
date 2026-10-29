@@ -78,11 +78,10 @@ Scripts, Workers Routes and D1 edit on the account and the ix.dev zone); until t
 deployed by hand from an up-to-date main, logged in with `wrangler login`:
 
 ```
-cd site && uv run --script renderer/fetch.py && SITE_AUDIO_REMOTE=1 bunx wrangler deploy
+cd site && uv run --script renderer/fetch.py && bunx wrangler deploy
 ```
 
-(`wrangler deploy` runs the build itself, so `SITE_AUDIO_REMOTE=1` has to be in its environment, or the pages lose
-their narration players.) The move to ix.dev/blaze was deployed that way on 2026-10-27 (version
+(`wrangler deploy` runs the build itself.) The move to ix.dev/blaze was deployed that way on 2026-10-27 (version
 2f7138f1-5ae3-42cf-b417-8538770f446e); nothing was changed in the Cloudflare dashboard or API by hand.
 
 It is reached three ways, all declared in `wrangler.jsonc` `routes`, so `wrangler deploy` creates them:
@@ -107,14 +106,6 @@ An RFC is a file in `content/rfcs/`: an instance of the `Rfc` prefab under `site
 charter, RFCs) has a name; its path under the page is the anchor comments attach to, so renaming a block orphans its
 comments (they still show, with their quote, in the page's discussion).
 
-## Narration (`audio/`)
-
-Each page can be listened to. What is said is not the page read out: the core derives a spoken version (code and
-reference lists skipped, tables read row by row, figures by their alt text), and a block can say something else with
-`Say: {"..."}`, or nothing with `Silent`. `audio/generate.py` voices it on a Mac (Fish Audio Drama 3 on MLX); the build
-adds the player only to pages whose audio matches their current text. [audio/README.md](audio/README.md) has the
-details, and the steps for serving the files from R2.
-
 ## Benchmark history (`/bench`)
 
 Built from `docs/benchmarks/history/*.jsonl` at the repo root, one line per benchmark run, appended by CI with
@@ -136,7 +127,7 @@ To look at the page with other data, point `BENCH_HISTORY` at a directory of `.j
 
 `worker/index.ts` is the Worker entry (plain `export default { fetch }`). `assets.run_worker_first` is `true`, so
 every request reaches the worker: `base.ts` `enter` redirects other hosts, strips the base (`/blaze`) from the path and
-the worker routes the site path (`/api/*`, `/auth/*`, `/audio/*`, discussable pages); anything else goes
+the worker routes the site path (`/api/*`, `/auth/*`, discussable pages); anything else goes
 to `env.ASSETS`, which serves `dist/` (built by `bun gen/build.ts`, laid out without the base). A missing page gets
 `dist/404.html`. Since every response comes from the worker, a `_headers` file would not apply: `http.ts`
 `assetHeaders` sets the CSP, nosniff and referrer policy on assets.
@@ -203,9 +194,9 @@ to `env.ASSETS`, which serves `dist/` (built by `bun gen/build.ts`, laid out wit
   open socket the first time it wakes (a deploy keeps hibernated sockets open), so each open tab hears of a new
   version as soon as anyone on the site moves (`client/lib/update.ts`). New scripts or styles
   reload the tab; new content alone is fetched again and swapped in place by the router. Either waits until the
-  reader isn't typing, playing the narration or dragging (a hidden tab goes at once), with an "update ready" line in
+  reader isn't typing or dragging (a hidden tab goes at once), with an "update ready" line in
   the feed and a button meanwhile, then says "Site updated". Drafts (the feed's input and whether it was open, and
-  comments), an edit in progress, scroll positions and the narration's place go through sessionStorage and come back; a reload that still gets the old
+  comments), an edit in progress and scroll positions go through sessionStorage and come back; a reload that still gets the old
   assets doesn't retry for a minute.
 - `http.ts`: cookies, origin check, `next` validation, tokens. `env.ts`: the `Env` type.
 

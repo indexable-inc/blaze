@@ -1,6 +1,6 @@
 target*/
 __pycache__/
-# The standard library is upstream's file for file (harness/library.py check), `target/` source
+# The standard library is upstream's file for file (harness/library.py import), `target/` source
 # directories included.
 !/library/**
 /library/target/

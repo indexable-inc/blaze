@@ -1,0 +1,179 @@
+# ruff, ty and uv's own test suites under `blaze test`, at pinned commits, by hand
+# (.github/scripts/downstream.py says what each suite runs and checks). Ported from Astral's
+# downstream workflow (astral-experiments/blaze#38, #41, #44, #80).
+#
+#   gh workflow run downstream.yaml -f suite=uv                      the newest canary
+#   gh workflow run downstream.yaml -f suite=uv -f blaze=0.20261028.5
+#   gh workflow run downstream.yaml --ref <same-branch-or-tag> -f suite=uv -f build-run=<run id>
+#
+# `blaze` is a release (a channel, `canary` or `stable`, or a version): the blaze users get,
+# built where releases are. `build-run` takes the `blaze-linux-x64` build of a run of focused.yaml
+# or train.yaml instead, which is how a branch is tested before it lands: that build was linked
+# in the flake's dev shell, so it runs with that shell's libraries, from blaze's checkout at the
+# run's commit. Dispatch downstream on that same commit: if the branch has moved, use a
+# retained tag there. A mismatching commit, a fork or another workflow's artifact is refused.
+#
+# Every build script and proc macro runs in blaze's sandbox, as for any user; the projects'
+# tests run as cargo runs them (neither has opted into sandboxed tests). Each run has to say
+# blaze built it; `uv` runs its copy-on-write tests on a second runner, which can mount Btrfs.
+name: downstream
+run-name: blaze on ${{ inputs.suite }}
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: the upstream test suite
+        type: choice
+        required: true
+        options: [ruff-and-ty, uv, uv-archive-fixtures, uv-lock-edit, ty-semantic-edit]
+      blaze:
+        description: the release of blaze, a channel (canary, stable) or a version
+        default: canary
+      build-run:
+        description: or the id of a focused.yaml or train.yaml run whose blaze-linux-x64 build to test
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  # ruff's checkout has ty; uv's is uv's.
+  REPO: ${{ startsWith(inputs.suite, 'uv') && 'astral-sh/uv' || 'astral-sh/ruff' }}
+  REV: ${{ startsWith(inputs.suite, 'uv') && '5b5a53e1803d426ba04f4af8ff7d6ff747548218' || '07872adbafa7c00f42f1174d8aa3c3e324033009' }}
+
+jobs:
+  # Validate the build against the trusted dispatch commit before consuming its artifact.
+  blaze:
+    name: blaze
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run-id: ${{ steps.build.outputs.run-id }}
+      artifact-id: ${{ steps.build.outputs.artifact-id }}
+    steps:
+      - if: inputs.build-run != ''
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - if: inputs.build-run != ''
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          checksum: f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f
+          enable-cache: false
+      - id: build
+        if: inputs.build-run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD: >-
+            {"repository": ${{ toJSON(github.repository) }}, "build_run": ${{ toJSON(inputs.build-run) }},
+             "sha": ${{ toJSON(github.sha) }}, "output": "${{ runner.temp }}/validated-build"}
+        run: |
+          uv run --frozen --no-dev python .github/scripts/downstream_build.py "$BUILD"
+          cat "$RUNNER_TEMP/validated-build" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: ${{ inputs.suite }}
+    needs: blaze
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Side by side: ruff's snapshot tests find their fixtures at the root of the workspace they
+      # are in, which a checkout inside blaze's would make blaze's.
+      - uses: actions/checkout@v7
+        with:
+          path: blaze
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.REPO }}
+          ref: ${{ env.REV }}
+          path: downstream
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          checksum: f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f
+          enable-cache: false
+      - name: blaze (a release)
+        if: inputs.build-run == ''
+        env:
+          BLAZE_WANTED: ${{ inputs.blaze }}
+        run: |
+          case "$BLAZE_WANTED" in canary|stable) how=--channel;; *) how=--version;; esac
+          sh blaze/install.sh "$how" "$BLAZE_WANTED" --verbose
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: blaze (a run's build)
+        if: inputs.build-run != ''
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.blaze.outputs.artifact-id }}
+          path: ${{ runner.temp }}/blaze
+          run-id: ${{ needs.blaze.outputs.run-id }}
+          github-token: ${{ github.token }}
+          digest-mismatch: error
+      # The dev shell's libraries in the Nix store, which that build's programs ask for.
+      - if: inputs.build-run != ''
+        uses: DeterminateSystems/nix-installer-action@v23
+      - if: inputs.build-run != ''
+        working-directory: ${{ runner.temp }}/blaze
+        run: |
+          nix develop "$GITHUB_WORKSPACE/blaze" --command true
+          tar -xf blaze.tar
+          echo "$PWD" >> "$GITHUB_PATH"
+      - run: blaze --version
+      - name: runner
+        run: |
+          uv run --frozen --project blaze python blaze/.github/scripts/downstream.py setup \
+            '{"suite": "${{ inputs.suite }}", "checkout": "downstream", "scratch": "${{ runner.temp }}/downstream"}'
+      - name: the upstream tests under blaze
+        run: |
+          uv run --frozen --project blaze python blaze/.github/scripts/downstream.py test \
+            '{"suite": "${{ inputs.suite }}", "checkout": "downstream", "scratch": "${{ runner.temp }}/downstream"}'
+      - if: ${{ !cancelled() && inputs.suite == 'uv' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: uv-cow-tests
+          path: ${{ runner.temp }}/downstream/uv-cow.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  # uv's copy-on-write tests need a Btrfs, which needs a loop device: run on a runner of their
+  # own with the executables the test job built, so they are of the same build.
+  uv-cow:
+    name: uv copy-on-write (Btrfs)
+    needs: [blaze, test]
+    if: ${{ !cancelled() && inputs.suite == 'uv' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: blaze
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.REPO }}
+          ref: ${{ env.REV }}
+          path: downstream
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: uv-cow-tests
+          path: ${{ runner.temp }}
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          checksum: f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f
+          enable-cache: false
+      - name: the copy-on-write tests on Btrfs
+        run: |
+          uv run --frozen --project blaze python blaze/.github/scripts/downstream.py cow \
+            '{"checkout": "downstream", "scratch": "${{ runner.temp }}/downstream", "archive": "${{ runner.temp }}/uv-cow.tar.gz"}'

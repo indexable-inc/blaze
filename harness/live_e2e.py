@@ -67,7 +67,7 @@ async def build(step: str, cwd: Path, env: dict[str, str]) -> str:
 
 # What `blaze` says when the toolchain is one the daemon never compiles for, which no
 # wait changes: another release than blaze's, or one without the standard library's source.
-OTHER_TOOLCHAIN = ("compiles for", "rust-src")
+OTHER_TOOLCHAIN = ("compiles for", "source of the standard library")
 
 
 async def serving(project: Path, env: dict[str, str]) -> None:

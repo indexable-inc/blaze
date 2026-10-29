@@ -310,6 +310,12 @@ impl Crate {
         self.id.data(db).root_file_id
     }
 
+    /// Whether the root file's `#![cfg(...)]` is false, which leaves the crate empty.
+    pub fn is_configured_out(self, db: &dyn HirDatabase) -> bool {
+        let file = self.id.root_file_id(db);
+        hir_def::item_tree::file_item_tree(db, file.into(), self.id).configured_out()
+    }
+
     pub fn edition(self, db: &dyn HirDatabase) -> Edition {
         self.id.data(db).edition
     }

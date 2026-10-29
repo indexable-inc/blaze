@@ -68,7 +68,6 @@ p = site_alloc(n); write the snapshot at p; site_load(h, p, n); site_free(p, n) 
 site_pages(h)                                                                     output: JSON [{url, file, doc, discussable}]
 site_discussable(h)                                                               output: JSON {doc: {title, blocks: {id: text}}}
 site_render(h, url, url_len, comments, comments_len, discussion, discussion_len)  0 with the HTML, or 1 with the error
-site_spoken(h, url, url_len)                                                      0 with JSON [{id, block, text, authored}], or 1
 output: site_output_len(h) bytes at site_output_ptr(h);  site_drop(h)
 ```
 
@@ -84,7 +83,7 @@ instance and makes a new one on the next request.
 
 `site-snapshot.wasm`: `snap_new`, `snap_alloc`, `snap_free`, `snap_build(h, input, len)` (0 with the snapshot, or 1 with
 the error), `snap_output_ptr`, `snap_output_len`, `snap_drop`. The input is JSON
-`{scripts: [{name, code}], bakes: {<entity path>: {highlighted?, baked?, audio?}}}`, the scripts in run order (`schema.flecs`,
+`{scripts: [{name, code}], bakes: {<entity path>: {highlighted?, baked?}}}`, the scripts in run order (`schema.flecs`,
 `refs.flecs`, then the rest by path, then the ones the build generated, such as the benchmark charts).
 
 ## Highlighting and glyphs stay in TS, embedded as-is; charts are content
@@ -124,7 +123,7 @@ The fixtures stay: `serve` seeds its store from `fixtures/comments.json`.
 ## Flecs, and what is left
 
 The core never touches Flecs; only `core/src/scripts.rs` does, behind the `scripts` feature, through flecs-snapshot's
-`World`: `run` for the content scripts and for `bake.flecs` (which only defines `Highlighted`, `Baked` and `Audio`),
+`World`: `run` for the content scripts and for `bake.flecs` (which only defines `Highlighted` and `Baked`),
 `set` for the baked HTML (checked against each component's layout), and `roots` for the root list (sorted bytewise).
 The `world_*` C exports are behind flecs-snapshot's `ffi` feature, which the renderer leaves off, so they are not in
 `site-snapshot.wasm`. `snapshot.rs` reads documents strictly, as flecs-snapshot's own reader does: an unknown key in

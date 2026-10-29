@@ -20,11 +20,11 @@
 //! the result to cargo's.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     ffi::OsString,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Condvar, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::SystemTime,
 };
 
@@ -79,8 +79,8 @@ pub fn build(
         .target_dir(Some(cargo.target_directory().as_ref()))
         .context("the load has no target directory of its own")?;
     let own = PathBuf::from(own.as_str()).join("compile-time");
-    let dir = manifest.parent().unwrap_or(Path::new("/"));
-    let mut driver = Driver::new(cargo, &graph, &toolchain, host, &own, dir, selection, config)?;
+    let mut driver =
+        Driver::new(cargo, &graph, &toolchain, host, &own, manifest, selection, config)?;
     driver.native = native;
     let ran = driver.run()?;
     Ok(driver.outputs(&ran))
@@ -103,6 +103,11 @@ struct Platform {
 enum Task {
     Script(usize),
     Run(usize),
+    /// A run of the build script for [`own_macro::WASM_TARGET`], of a library a proc macro's
+    /// module links.
+    ///
+    /// [`own_macro::WASM_TARGET`]: super::own_macro::WASM_TARGET
+    WasmRun(usize),
     Macro(usize),
 }
 
@@ -117,6 +122,7 @@ struct Ran {
 struct Made_ {
     scripts: FxHashMap<usize, PathBuf>,
     runs: FxHashMap<usize, Arc<Ran>>,
+    wasm_runs: FxHashMap<usize, Arc<Ran>>,
     macros: FxHashMap<usize, PathBuf>,
 }
 
@@ -142,6 +148,26 @@ struct Driver<'a> {
     /// the workspace expands natively (`own_macro::NATIVE_KEY`); `None` when every one is
     /// linked for blaze's server.
     native: Option<Vec<String>>,
+    /// The load's manifest, build and variables, as its unit graph was asked for.
+    manifest: PathBuf,
+    selection: Selection,
+    extra_env: FxHashMap<String, Option<String>>,
+    /// The unit graph of the build with [`own_macro::WASM_TARGET`] as its host, made once a
+    /// module links a crate with dependencies of that platform alone.
+    ///
+    /// [`own_macro::WASM_TARGET`]: super::own_macro::WASM_TARGET
+    wasm_graph: OnceLock<Result<Arc<UnitGraph>, String>>,
+    /// Whether the package of each unit has dependencies [`own_macro::WASM_TARGET`] has and
+    /// the host has not.
+    ///
+    /// [`own_macro::WASM_TARGET`]: super::own_macro::WASM_TARGET
+    wasm_only: Mutex<FxHashMap<usize, bool>>,
+    /// The platform of the runs of build scripts for [`own_macro::WASM_TARGET`].
+    ///
+    /// [`own_macro::WASM_TARGET`]: super::own_macro::WASM_TARGET
+    wasm_platform: OnceLock<Result<Platform, String>>,
+    /// Whether each unit's crate links `proc_macro` (`own_macro::links_proc_macro`).
+    links_proc_macro: Mutex<FxHashMap<usize, bool>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -180,10 +206,11 @@ impl<'a> Driver<'a> {
         toolchain: &'a Path,
         host: String,
         own: &'a Path,
-        dir: &Path,
+        manifest: &Path,
         selection: &Selection,
         config: &project_model::CargoConfig,
     ) -> anyhow::Result<Driver<'a>> {
+        let dir = manifest.parent().unwrap_or(Path::new("/"));
         let by_id: FxHashMap<String, Package> = cargo
             .packages()
             .map(|it| (crate::plan::package_named(&cargo[it].id.repr), it))
@@ -272,6 +299,13 @@ impl<'a> Driver<'a> {
             jobs: u32::try_from(jobs).unwrap_or(1),
             made: Mutex::new(Made_::default()),
             native: None,
+            manifest: manifest.to_owned(),
+            selection: selection.clone(),
+            extra_env: config.extra_env.clone(),
+            wasm_graph: OnceLock::new(),
+            wasm_only: Mutex::new(FxHashMap::default()),
+            wasm_platform: OnceLock::new(),
+            links_proc_macro: Mutex::new(FxHashMap::default()),
         })
     }
 
@@ -309,12 +343,70 @@ impl<'a> Driver<'a> {
         self.deps(at).find(|&it| self.unit(it).is_run() && self.unit(it).pkg_id == unit.pkg_id)
     }
 
+    /// Whether proc macro `at` is built as a WebAssembly module, not linked for the server.
+    fn as_wasm(&self, at: usize) -> bool {
+        let name = self.unit(at).crate_name();
+        self.native.as_ref().is_some_and(|native| !native.contains(&name))
+    }
+
+    /// Whether the crate of unit `at` links `proc_macro` (`own_macro::links_proc_macro`).
+    fn links_proc_macro(&self, at: usize) -> bool {
+        if let Some(&it) = lock(&self.links_proc_macro).get(&at) {
+            return it;
+        }
+        let unit = self.unit(at);
+        let found = super::own_macro::links_proc_macro(
+            unit.is_proc_macro(),
+            Some(unit.target.src_path.as_path()),
+        );
+        lock(&self.links_proc_macro).insert(at, found);
+        found
+    }
+
+    /// The run of build script `run` a crate described for a module (`wasm`), or for the host,
+    /// is compiled with: for a module, its package's run for [`own_macro::WASM_TARGET`], but
+    /// for a package whose crate links `proc_macro`, which is told of the host's side
+    /// (`own_macro::host_side_cfg`) and whose script runs as for the host.
+    ///
+    /// [`own_macro::WASM_TARGET`]: super::own_macro::WASM_TARGET
+    fn run_for(&self, run: usize, wasm: bool) -> Task {
+        let host_side = || {
+            (0..self.graph.units.len()).any(|it| {
+                self.unit(it).is_linked()
+                    && self.own_run(it) == Some(run)
+                    && self.links_proc_macro(it)
+            })
+        };
+        match wasm && !host_side() {
+            true => Task::WasmRun(run),
+            false => Task::Run(run),
+        }
+    }
+
+    /// Unit `at` and every library it is described with, and what those are described with.
+    fn described_with(&self, at: usize) -> Vec<usize> {
+        let mut found = Vec::new();
+        let mut seen = FxHashSet::default();
+        let mut queue: Vec<usize> = vec![at];
+        while let Some(it) = queue.pop() {
+            if !seen.insert(it) {
+                continue;
+            }
+            found.push(it);
+            queue.extend(self.deps(it).filter(|&dep| self.unit(dep).is_linked()));
+        }
+        found
+    }
+
     /// The steps of the build and what each waits for.
     fn tasks(&self) -> Vec<(Task, Vec<Task>)> {
         // A proc macro nothing depends on is one cargo's check only checks.
         let depended: FxHashSet<usize> =
             (0..self.graph.units.len()).flat_map(|it| self.deps(it)).collect();
         let mut tasks = Vec::new();
+        // The runs for a module that the steps wait for, each once.
+        let mut wasm_runs = Vec::new();
+        let mut wanted = FxHashSet::default();
         for (at, unit) in self.graph.units.iter().enumerate() {
             let task = if unit.is_run() {
                 Task::Run(at)
@@ -326,133 +418,147 @@ impl<'a> Driver<'a> {
                 continue;
             };
             let waits = match task {
-                Task::Run(_) => self
-                    .deps(at)
-                    .filter_map(|it| {
-                        let dep = self.unit(it);
-                        if dep.is_script() {
-                            Some(Task::Script(it))
-                        } else if dep.is_run() {
-                            Some(Task::Run(it))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect(),
+                Task::Run(_) | Task::WasmRun(_) => self.run_waits(at, false),
                 Task::Script(_) | Task::Macro(_) => {
-                    // Every library it is described with, and what those are described with.
+                    let wasm = matches!(task, Task::Macro(_)) && self.as_wasm(at);
                     let mut waits = Vec::new();
-                    let mut seen = FxHashSet::default();
-                    let mut queue: Vec<usize> = vec![at];
-                    while let Some(it) = queue.pop() {
-                        if !seen.insert(it) {
-                            continue;
-                        }
+                    for it in self.described_with(at) {
                         if let Some(run) = self.own_run(it) {
-                            waits.push(Task::Run(run));
+                            waits.push(self.run_for(run, wasm));
                         }
                         if it != at && self.unit(it).is_proc_macro() {
                             waits.push(Task::Macro(it));
                         }
-                        queue.extend(self.deps(it).filter(|&dep| self.unit(dep).is_linked()));
                     }
                     waits
                 }
             };
+            for &it in &waits {
+                if let Task::WasmRun(run) = it
+                    && wanted.insert(run)
+                {
+                    wasm_runs.push(run);
+                }
+            }
             tasks.push((task, waits));
+        }
+        while let Some(run) = wasm_runs.pop() {
+            let waits = self.run_waits(run, true);
+            for &it in &waits {
+                if let Task::WasmRun(dep) = it
+                    && wanted.insert(dep)
+                {
+                    wasm_runs.push(dep);
+                }
+            }
+            tasks.push((Task::WasmRun(run), waits));
         }
         tasks
     }
 
-    /// Does every step, as many at once as there are workers, each once what it waits for is
-    /// done. The first failure fails the build once the steps under way end.
+    /// What run `at` of a build script waits for, for a module (`wasm`) or for the host: the
+    /// compile of its script and the runs of the scripts it is given the `DEP_` of.
+    fn run_waits(&self, at: usize, wasm: bool) -> Vec<Task> {
+        self.deps(at)
+            .filter_map(|it| {
+                let dep = self.unit(it);
+                if dep.is_script() {
+                    Some(Task::Script(it))
+                } else if dep.is_run() {
+                    Some(self.run_for(it, wasm))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Does every step as a node of a build graph (docs/driver.md), as many at once as there
+    /// are workers, each once what it waits for is done, and says each node and its moves.
+    /// The first failure fails the build once the steps under way end.
     fn run(&self) -> anyhow::Result<()> {
+        use blaze_graph::{Config, Machine, NodeId, Pool, Spec, exec};
+        use blaze_protocol::events::NodeKind;
         let tasks = self.tasks();
         let index: FxHashMap<Task, usize> =
             tasks.iter().enumerate().map(|(at, (task, _))| (*task, at)).collect();
-        let mut waiting = vec![0usize; tasks.len()];
-        let mut then: Vec<Vec<usize>> = vec![Vec::new(); tasks.len()];
-        for (at, (_, waits)) in tasks.iter().enumerate() {
-            let waits: FxHashSet<usize> =
-                waits.iter().filter_map(|it| index.get(it).copied()).collect();
-            waiting[at] = waits.len();
-            for it in waits {
-                then[it].push(at);
-            }
-        }
-        struct State {
-            ready: VecDeque<usize>,
-            waiting: Vec<usize>,
-            busy: usize,
-            done: usize,
-            failed: Option<anyhow::Error>,
-        }
-        let ready = (0..tasks.len()).filter(|&it| waiting[it] == 0).collect();
-        let state = Mutex::new(State { ready, waiting, busy: 0, done: 0, failed: None });
-        let wake = Condvar::new();
+        let first = exec::ids(tasks.len());
+        let id = |at: usize| NodeId(first + at as u32);
+        let nodes = tasks
+            .iter()
+            .enumerate()
+            .map(|(at, (task, waits))| {
+                let mut deps: Vec<NodeId> =
+                    waits.iter().filter_map(|it| index.get(it)).map(|&it| id(it)).collect();
+                deps.sort();
+                deps.dedup();
+                let (unit, kind) = match *task {
+                    Task::Script(unit) => (unit, NodeKind::Script),
+                    Task::Run(unit) | Task::WasmRun(unit) => (unit, NodeKind::ScriptRun),
+                    Task::Macro(unit) => (unit, NodeKind::Macro),
+                };
+                let name = self.package(unit).map_or_else(
+                    |_| self.unit(unit).pkg_id.clone(),
+                    |it| format!("{} v{}", it.name, it.version),
+                );
+                // One pool for compiles and runs alike: a run can be a C build that takes cores
+                // of its own, and together they are held to `workers` as before.
+                Spec { id: id(at), kind, name, deps, pool: Pool::Work, cost: 1 }
+            })
+            .collect();
         let workers =
             std::thread::available_parallelism().map_or(1, |it| it.get()).div_ceil(4).max(4);
+        let config = Config { io: 1, work: workers, keep_going: false };
+        let mut machine = Machine::new(config)?;
         let slots = workers.min(tasks.len().max(1));
         let counting = crate::events::Counting::new(
             blaze_protocol::events::Step::BuildScripts,
             tasks.len(),
             slots,
         );
-        let counting = &counting;
-        std::thread::scope(|scope| {
-            for slot in 0..slots {
-                let (state, wake, tasks, then) = (&state, &wake, &tasks, &then);
-                scope.spawn(move || {
-                    loop {
-                        let mut held = lock(&state);
-                        let at = loop {
-                            let over = held.failed.is_some() || held.done == tasks.len();
-                            if over || held.ready.is_empty() && held.busy == 0 {
-                                return;
-                            }
-                            if let Some(at) = held.ready.pop_front() {
-                                break at;
-                            }
-                            held =
-                                wake.wait(held).unwrap_or_else(std::sync::PoisonError::into_inner);
-                        };
-                        held.busy += 1;
-                        drop(held);
-                        counting.on(slot, || self.shown(tasks[at].0));
-                        let result = self.step(tasks[at].0);
-                        counting.done(slot);
-                        let mut held = lock(&state);
-                        held.busy -= 1;
-                        held.done += 1;
-                        match result {
-                            Ok(()) => {
-                                for &next in &then[at] {
-                                    held.waiting[next] -= 1;
-                                    if held.waiting[next] == 0 {
-                                        held.ready.push_back(next);
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                held.failed.get_or_insert(error);
-                            }
-                        }
-                        wake.notify_all();
-                    }
-                });
+        // The slot a step under way says what it works on in: at most `slots` are under way.
+        let free: Mutex<Vec<usize>> = Mutex::new((0..slots).rev().collect());
+        let failed: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+        let work = |node: NodeId| {
+            let at = (node.0 - first) as usize;
+            let slot = lock(&free).pop().unwrap_or_default();
+            counting.on(slot, || self.shown(tasks[at].0));
+            let result = self.step(tasks[at].0);
+            counting.done(slot);
+            lock(&free).push(slot);
+            match result {
+                Ok(()) => exec::Did::built(),
+                Err(error) => {
+                    let why = format!("{error:#}");
+                    lock(&failed).get_or_insert(error);
+                    exec::Did::failed(why)
+                }
             }
-        });
-        let state = state.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(error) = state.failed {
+        };
+        // A step that panicked failed with no error of its own: the machine has why.
+        let mut first_why = None;
+        let mut said = |record: &blaze_protocol::events::Record| {
+            if let blaze_protocol::events::Event::Moved {
+                state: blaze_protocol::events::NodeState::Failed { why },
+                ..
+            } = &record.event
+            {
+                first_why.get_or_insert_with(|| why.clone());
+            }
+            crate::events::say(record.event.clone());
+        };
+        let ok = exec::drive(&mut machine, nodes, &work, &mut said, None)?;
+        if let Some(error) = failed.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
             return Err(error);
         }
-        anyhow::ensure!(
-            state.done == tasks.len(),
-            "{} of the build's {} steps wait for one another",
-            tasks.len() - state.done,
-            tasks.len()
-        );
-        Ok(())
+        match (ok, first_why) {
+            (true, _) => Ok(()),
+            (false, why) => anyhow::bail!(
+                "a step of the build failed: {}",
+                why.as_deref().unwrap_or("it said no more")
+            ),
+        }
     }
 
     /// A step as the build's progress names it: `serde (build script)`.
@@ -460,6 +566,7 @@ impl<'a> Driver<'a> {
         let (at, what) = match task {
             Task::Script(at) => (at, "compiling its build script"),
             Task::Run(at) => (at, "running its build script"),
+            Task::WasmRun(at) => (at, "running its build script for wasm32-wasip1"),
             Task::Macro(at) => (at, "linking the proc macro"),
         };
         let name = self
@@ -472,15 +579,19 @@ impl<'a> Driver<'a> {
         let (at, what) = match task {
             Task::Script(at) => (at, "compile the build script"),
             Task::Run(at) => (at, "run the build script"),
+            Task::WasmRun(at) => (at, "run for wasm32-wasip1 the build script"),
             Task::Macro(at) => (at, "link the proc macro"),
         };
         let done = match task {
             Task::Script(at) => {
                 self.script(at).map(|exe| _ = lock(&self.made).scripts.insert(at, exe))
             }
-            Task::Run(at) => {
-                self.run_script(at).map(|ran| _ = lock(&self.made).runs.insert(at, Arc::new(ran)))
-            }
+            Task::Run(at) => self
+                .run_script(at, false)
+                .map(|ran| _ = lock(&self.made).runs.insert(at, Arc::new(ran))),
+            Task::WasmRun(at) => self
+                .run_script(at, true)
+                .map(|ran| _ = lock(&self.made).wasm_runs.insert(at, Arc::new(ran))),
             Task::Macro(at) => {
                 self.proc_macro(at).map(|lib| _ = lock(&self.made).macros.insert(at, lib))
             }
@@ -505,22 +616,245 @@ impl<'a> Driver<'a> {
     /// The `--cfg`s rustc compiles the unit with beside the target's: its features,
     /// `debug_assertions` as its profile has it, and those of the flags.
     fn cfg(&self, at: usize) -> Vec<String> {
-        let unit = self.unit(at);
-        let mut cfg: Vec<String> =
-            unit.features.iter().map(|it| format!("feature={}", quoted(it))).collect();
-        if unit.profile.debug_assertions {
-            cfg.push("debug_assertions".to_owned());
+        unit_cfg(self.unit(at), &self.platform(at).rustflags)
+    }
+
+    /// Adds to `crates`, the description of the module of the proc macro of unit `at` with
+    /// where each unit is in it (`linked`), the libraries its crates link only when built for
+    /// [`own_macro::WASM_TARGET`]: a dependency of `cfg(target_os = "wasi")` (getrandom 0.2's
+    /// `wasi`), which the load's graph, of the host, has not. They are taken from the graph of
+    /// the build for that target, made only when a crate of the module has such dependencies.
+    ///
+    /// [`own_macro::WASM_TARGET`]: super::own_macro::WASM_TARGET
+    fn link_for_wasm(
+        &self,
+        at: usize,
+        crates: &mut Vec<Described>,
+        linked: &FxHashMap<usize, usize>,
+    ) -> anyhow::Result<()> {
+        let mut units: Vec<usize> = linked.keys().copied().collect();
+        units.sort_unstable();
+        let mut wanted = false;
+        for &it in &units {
+            wanted |= self.has_wasm_only(it)?;
         }
-        let flags = self.platform(at).rustflags.iter().chain(unit.profile.rustflags.iter());
-        let mut flags = flags.map(String::as_str);
-        while let Some(flag) = flags.next() {
-            if flag == "--cfg" {
-                cfg.extend(flags.next().map(str::to_owned));
-            } else if let Some(it) = flag.strip_prefix("--cfg=") {
-                cfg.push(it.to_owned());
+        if !wanted {
+            return Ok(());
+        }
+        let wasm = self.wasm_graph()?;
+        let unit = self.unit(at);
+        let same = |host: &Unit, wasm: &Unit| {
+            host.pkg_id == wasm.pkg_id
+                && host.target.name == wasm.target.name
+                && host.is_proc_macro() == wasm.is_proc_macro()
+                && wasm.is_linked()
+        };
+        let counterpart = wasm.units.iter().enumerate().filter(|(_, it)| same(unit, it));
+        let counterpart = counterpart.max_by_key(|(_, it)| it.features == unit.features);
+        let (first, _) = counterpart.with_context(|| {
+            format!("the graph of the build for wasm32-wasip1 has no proc macro `{}`", unit.pkg_id)
+        })?;
+        // Each unit of the host's graph in the module with its counterpart in `wasm`, and the
+        // units of `wasm` described here, by where they are in `crates`.
+        let mut queue = vec![(at, first)];
+        let mut paired = FxHashSet::default();
+        let mut described: FxHashMap<usize, usize> = FxHashMap::default();
+        while let Some((host, built)) = queue.pop() {
+            if !paired.insert(host) {
+                continue;
+            }
+            let host_deps: Vec<usize> =
+                self.deps(host).filter(|&it| self.unit(it).is_linked()).collect();
+            for dep in &wasm.units[built].dependencies {
+                let Some(it) = wasm.units.get(dep.index).filter(|it| it.is_linked()) else {
+                    continue;
+                };
+                if let Some(&mate) = host_deps.iter().find(|&&h| same(self.unit(h), it)) {
+                    queue.push((mate, dep.index));
+                    continue;
+                }
+                let name = match dep.extern_crate_name.is_empty() {
+                    true => it.crate_name(),
+                    false => dep.extern_crate_name.clone(),
+                };
+                let module = &unit.pkg_id;
+                let index =
+                    self.describe_wasm(&wasm, dep.index, module, crates, linked, &mut described)?;
+                crates[linked[&host]].deps.push((name, index));
             }
         }
-        cfg
+        Ok(())
+    }
+
+    /// Adds unit `at` of `wasm`, the graph for [`own_macro::WASM_TARGET`], to `crates`
+    /// described, as a library the module of the proc macro of the package `module` links
+    /// there alone, with what it links: where it is in them. What is in the host's graph too
+    /// is described as `linked` has it; what is not as `described` has it.
+    ///
+    /// [`own_macro::WASM_TARGET`]: super::own_macro::WASM_TARGET
+    fn describe_wasm(
+        &self,
+        wasm: &UnitGraph,
+        at: usize,
+        module: &str,
+        crates: &mut Vec<Described>,
+        linked: &FxHashMap<usize, usize>,
+        described: &mut FxHashMap<usize, usize>,
+    ) -> anyhow::Result<usize> {
+        if let Some(&it) = described.get(&at) {
+            return Ok(it);
+        }
+        let unit = &wasm.units[at];
+        let host = linked.keys().find(|&&it| {
+            let it = self.unit(it);
+            it.pkg_id == unit.pkg_id && it.target.name == unit.target.name
+        });
+        if let Some(host) = host {
+            return Ok(linked[host]);
+        }
+        let scripted = unit.dependencies.iter().any(|it| {
+            wasm.units.get(it.index).is_some_and(|it| it.is_run() && it.pkg_id == unit.pkg_id)
+        });
+        if scripted || unit.is_proc_macro() {
+            anyhow::bail!(
+                "the proc macro `{module}` links `{}` only when built for wasm32-wasip1, and it \
+                 is a proc macro or has a build script, which blaze builds and runs only for \
+                 the packages of the host's unit graph",
+                unit.pkg_id
+            );
+        }
+        let crate_name = unit.crate_name();
+        let index = crates.len();
+        crates.push(Described {
+            name: crate_name.clone(),
+            root: unit.target.src_path.clone(),
+            edition: unit.target.edition.clone(),
+            cfg: unit_cfg(unit, &[]),
+            env: self.manifest_env(&unit.target.src_path, &crate_name)?,
+            deps: Vec::new(),
+            proc_macro: None,
+            compiled_macro: false,
+            inputs: None,
+        });
+        described.insert(at, index);
+        for dep in &unit.dependencies {
+            let Some(it) = wasm.units.get(dep.index).filter(|it| it.is_linked()) else {
+                continue;
+            };
+            let name = match dep.extern_crate_name.is_empty() {
+                true => it.crate_name(),
+                false => dep.extern_crate_name.clone(),
+            };
+            let found = self.describe_wasm(wasm, dep.index, module, crates, linked, described)?;
+            crates[index].deps.push((name, found));
+        }
+        Ok(index)
+    }
+
+    /// Whether the manifest of unit `at`'s package has a `[target.'cfg(..)'.dependencies]`
+    /// table that [`own_macro::WASM_TARGET`] has and the unit's platform has not.
+    ///
+    /// [`own_macro::WASM_TARGET`]: super::own_macro::WASM_TARGET
+    fn has_wasm_only(&self, at: usize) -> anyhow::Result<bool> {
+        if let Some(&it) = lock(&self.wasm_only).get(&at) {
+            return Ok(it);
+        }
+        let manifest = &self.package(at)?.manifest;
+        let text =
+            std::fs::read_to_string(manifest).with_context(|| format!("reading {manifest}"))?;
+        let table: toml::Table =
+            toml::from_str(&text).with_context(|| format!("reading {manifest}"))?;
+        let wasm_cfg = cfgs(&said(&["--print", "cfg", "--target", super::own_macro::WASM_TARGET])?);
+        let platform = self.platform(at);
+        let host_cfg = cfgs(&platform.cfg.join("\n"));
+        let tables = table.get("target").and_then(toml::Value::as_table).into_iter().flatten();
+        let mut found = false;
+        for (key, value) in tables {
+            let Ok(target) = key.parse::<cargo_platform::Platform>() else { continue };
+            let deps = value.get("dependencies").and_then(toml::Value::as_table);
+            if deps.is_some_and(|it| !it.is_empty())
+                && target.matches(super::own_macro::WASM_TARGET, &wasm_cfg)
+                && !target.matches(&platform.triple, &host_cfg)
+            {
+                found = true;
+                break;
+            }
+        }
+        lock(&self.wasm_only).insert(at, found);
+        Ok(found)
+    }
+
+    /// The unit graph of the load's build with [`own_macro::WASM_TARGET`] as its host, the
+    /// platform its proc macros and what they link are built for.
+    ///
+    /// [`own_macro::WASM_TARGET`]: super::own_macro::WASM_TARGET
+    fn wasm_graph(&self) -> anyhow::Result<Arc<UnitGraph>> {
+        let made = self.wasm_graph.get_or_init(|| {
+            let target = super::own_macro::WASM_TARGET;
+            let printed =
+                said(&["--print", "cfg", "--target", target]).map_err(|it| format!("{it:#}"))?;
+            let cfg = atoms(&printed);
+            let selection = Selection { target: None, ..self.selection.clone() };
+            let asked = crate::plan::Asked { triple: target, cfg: &cfg, env: &self.extra_env };
+            UnitGraph::asked(&self.manifest, &selection, &asked).map_err(|it| format!("{it:#}"))
+        });
+        made.clone().map_err(|why| {
+            anyhow::anyhow!("making the build's unit graph for wasm32-wasip1: {why}")
+        })
+    }
+
+    /// The variables cargo sets for rustc of the crate `crate_name` whose root is `root`, of
+    /// the package whose manifest is the nearest above it: a package of a registry, which no
+    /// build script of the load ran for.
+    fn manifest_env(
+        &self,
+        root: &Path,
+        crate_name: &str,
+    ) -> anyhow::Result<BTreeMap<String, String>> {
+        let manifest = root
+            .ancestors()
+            .skip(1)
+            .map(|it| it.join("Cargo.toml"))
+            .find(|it| it.is_file())
+            .with_context(|| format!("no Cargo.toml above {}", root.display()))?;
+        let text = std::fs::read_to_string(&manifest)
+            .with_context(|| format!("reading {}", manifest.display()))?;
+        let table: toml::Table =
+            toml::from_str(&text).with_context(|| format!("reading {}", manifest.display()))?;
+        let package = table.get("package").and_then(toml::Value::as_table);
+        let package =
+            package.with_context(|| format!("{} has no [package]", manifest.display()))?;
+        let field = |name: &str| match package.get(name) {
+            Some(toml::Value::String(it)) => it.clone(),
+            Some(toml::Value::Array(it)) => {
+                it.iter().filter_map(toml::Value::as_str).collect::<Vec<_>>().join(":")
+            }
+            _ => String::new(),
+        };
+        let version = semver::Version::parse(&field("version"))
+            .with_context(|| format!("the version of {}", manifest.display()))?;
+        let mut env = BTreeMap::new();
+        let mut set = |name: &str, value: String| _ = env.insert(name.to_owned(), value);
+        set("CARGO", self.tools.cargo.display().to_string());
+        let dir = manifest.parent().unwrap_or(Path::new("/"));
+        set("CARGO_MANIFEST_DIR", dir.display().to_string());
+        set("CARGO_MANIFEST_PATH", manifest.display().to_string());
+        set("CARGO_PKG_VERSION", version.to_string());
+        set("CARGO_PKG_VERSION_MAJOR", version.major.to_string());
+        set("CARGO_PKG_VERSION_MINOR", version.minor.to_string());
+        set("CARGO_PKG_VERSION_PATCH", version.patch.to_string());
+        set("CARGO_PKG_VERSION_PRE", version.pre.to_string());
+        set("CARGO_PKG_NAME", field("name"));
+        set("CARGO_PKG_AUTHORS", field("authors"));
+        set("CARGO_PKG_DESCRIPTION", field("description"));
+        set("CARGO_PKG_HOMEPAGE", field("homepage"));
+        set("CARGO_PKG_REPOSITORY", field("repository"));
+        set("CARGO_PKG_LICENSE", field("license"));
+        set("CARGO_PKG_LICENSE_FILE", field("license-file"));
+        set("CARGO_PKG_RUST_VERSION", field("rust-version"));
+        set("CARGO_PKG_README", field("readme"));
+        set("CARGO_CRATE_NAME", crate_name.to_owned());
+        Ok(env)
     }
 
     /// The variables cargo sets for rustc of the unit's crate that its source can read with
@@ -570,24 +904,33 @@ impl<'a> Driver<'a> {
         Ok(env)
     }
 
-    fn ran(&self, at: usize) -> anyhow::Result<Arc<Ran>> {
-        let ran = lock(&self.made).runs.get(&at).cloned();
-        ran.with_context(|| format!("the build script of `{}` has not run", self.unit(at).pkg_id))
+    /// The run of build script `at` a crate described for a module (`wasm`), or for the host,
+    /// is compiled with ([`Self::run_for`]).
+    fn ran(&self, at: usize, wasm: bool) -> anyhow::Result<Arc<Ran>> {
+        let made = lock(&self.made);
+        let (ran, what) = match self.run_for(at, wasm) {
+            Task::WasmRun(_) => (made.wasm_runs.get(&at).cloned(), " for wasm32-wasip1"),
+            _ => (made.runs.get(&at).cloned(), ""),
+        };
+        let pkg = &self.unit(at).pkg_id;
+        ran.with_context(|| format!("the build script of `{pkg}` has not run{what}"))
     }
 
-    /// Adds the library of unit `at` to `crates`, described, and what it links: where it is
-    /// in them. `linked` has where each unit already is.
+    /// Adds the library of unit `at` to `crates`, described for a proc macro's module
+    /// (`wasm`) or for the host, and what it links: where it is in them. `linked` has where
+    /// each unit already is.
     fn describe(
         &self,
         at: usize,
         crates: &mut Vec<Described>,
         linked: &mut FxHashMap<usize, usize>,
+        wasm: bool,
     ) -> anyhow::Result<usize> {
         if let Some(&it) = linked.get(&at) {
             return Ok(it);
         }
         let unit = self.unit(at);
-        let ran = self.own_run(at).map(|it| self.ran(it)).transpose()?;
+        let ran = self.own_run(at).map(|it| self.ran(it, wasm)).transpose()?;
         let crate_name = unit.crate_name();
         let mut cfg = self.cfg(at);
         cfg.extend(ran.iter().flat_map(|it| it.output.cfgs.iter().cloned()));
@@ -611,17 +954,19 @@ impl<'a> Driver<'a> {
         let index = crates.len();
         crates.push(described);
         linked.insert(at, index);
-        let deps = self.linked_deps(at, crates, linked)?;
+        let deps = self.linked_deps(at, crates, linked, wasm)?;
         crates[index].deps = deps;
         Ok(index)
     }
 
-    /// Each library `at` links, by the name it links it under, described in `crates`.
+    /// Each library `at` links, by the name it links it under, described in `crates` for a
+    /// proc macro's module (`wasm`) or for the host.
     fn linked_deps(
         &self,
         at: usize,
         crates: &mut Vec<Described>,
         linked: &mut FxHashMap<usize, usize>,
+        wasm: bool,
     ) -> anyhow::Result<Vec<(String, usize)>> {
         let mut deps = Vec::new();
         for dep in &self.unit(at).dependencies {
@@ -630,7 +975,7 @@ impl<'a> Driver<'a> {
                     true => self.unit(dep.index).crate_name(),
                     false => dep.extern_crate_name.clone(),
                 };
-                deps.push((name, self.describe(dep.index, crates, linked)?));
+                deps.push((name, self.describe(dep.index, crates, linked, wasm)?));
             }
         }
         Ok(deps)
@@ -680,7 +1025,7 @@ impl<'a> Driver<'a> {
             inputs: None,
         }];
         let mut linked = FxHashMap::default();
-        crates[0].deps = self.linked_deps(at, &mut crates, &mut linked)?;
+        crates[0].deps = self.linked_deps(at, &mut crates, &mut linked, false)?;
         let made = Made {
             name: SCRIPT,
             proc_macro: false,
@@ -698,7 +1043,8 @@ impl<'a> Driver<'a> {
     fn proc_macro(&self, at: usize) -> anyhow::Result<PathBuf> {
         let unit = self.unit(at);
         let name = unit.crate_name();
-        let ran = self.own_run(at).map(|it| self.ran(it)).transpose()?;
+        let wasm = self.as_wasm(at);
+        let ran = self.own_run(at).map(|it| self.ran(it, wasm)).transpose()?;
         let mut cfg = self.cfg(at);
         cfg.extend(ran.iter().flat_map(|it| it.output.cfgs.iter().cloned()));
         let mut crates = vec![Described {
@@ -714,13 +1060,15 @@ impl<'a> Driver<'a> {
         }];
         let mut linked = FxHashMap::default();
         linked.insert(at, 0);
-        crates[0].deps = self.linked_deps(at, &mut crates, &mut linked)?;
+        crates[0].deps = self.linked_deps(at, &mut crates, &mut linked, wasm)?;
         let (prefix, suffix) = (std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX);
         let deps = self.own.join("deps");
         let stem = format!("{name}-{}", self.keys[at]);
-        let wasm = self.native.as_ref().is_some_and(|native| !native.contains(&name));
         if !wasm && super::own_macro::server().is_none() {
             anyhow::bail!("`{name}`: {}", super::own_macro::missing_server());
+        }
+        if wasm {
+            self.link_for_wasm(at, &mut crates, &linked)?;
         }
         let made = Made {
             name: &name,
@@ -758,6 +1106,7 @@ impl<'a> Driver<'a> {
         if made.wasm {
             digest.update(super::own_macro::MODULE_CFG.as_bytes());
         }
+        digest.update(own_script::generated_fingerprint(&described).map_err(anyhow::Error::msg)?);
         let digest = format!("{:x}", digest.finalize());
         let inputs =
             crates.iter().filter_map(|it| it.inputs.as_ref().map(|(info, _)| info.as_path()));
@@ -771,8 +1120,13 @@ impl<'a> Driver<'a> {
         write(&stamp, digest.as_bytes())
     }
 
-    /// Runs the build script of unit `at`, a `run-custom-build`, as cargo runs it.
-    fn run_script(&self, at: usize) -> anyhow::Result<Ran> {
+    /// Runs the build script of unit `at`, a `run-custom-build`, as cargo runs it: for the
+    /// unit's platform, or for [`own_macro::WASM_TARGET`] (`wasm`), as cargo runs it for a
+    /// library built for that target, for the module of a proc macro that links the library.
+    /// What it compiles of C is then of that target, as the module's link needs.
+    ///
+    /// [`own_macro::WASM_TARGET`]: super::own_macro::WASM_TARGET
+    fn run_script(&self, at: usize, wasm: bool) -> anyhow::Result<Ran> {
         let unit = self.unit(at);
         let package = self.package(at)?;
         let compiled = self.deps(at).find(|&it| self.unit(it).is_script());
@@ -781,7 +1135,7 @@ impl<'a> Driver<'a> {
         let exe = exe.context("the build script is not compiled yet")?;
         let mut dependencies = Vec::new();
         for dep in self.deps(at).filter(|&it| self.unit(it).is_run()) {
-            let ran = self.ran(dep)?;
+            let ran = self.ran(dep, wasm)?;
             let of = self.package(dep)?;
             dependencies.push(script::unit::Dependency::of(
                 &of.name,
@@ -789,9 +1143,14 @@ impl<'a> Driver<'a> {
                 &ran.output,
             ));
         }
-        let platform = self.platform(at);
+        let (platform, out_dir) = match wasm {
+            true => {
+                let dir = self.unit_dir(at).join(super::own_macro::WASM_TARGET);
+                (self.wasm_platform()?, dir.join("out"))
+            }
+            false => (self.platform(at), self.unit_dir(at).join("out")),
+        };
         let profile = &unit.profile;
-        let out_dir = self.unit_dir(at).join("out");
         let described = script::Unit {
             package: self.described_package(at)?,
             features: unit.features.clone(),
@@ -838,6 +1197,26 @@ impl<'a> Driver<'a> {
             anyhow::anyhow!("{}{}", failed.error.0, logged.collect::<String>())
         })?;
         Ok(Ran { out_dir, output })
+    }
+
+    /// The platform of the runs of build scripts for [`own_macro::WASM_TARGET`]: its cfgs as
+    /// rustc prints them, and none of the flags of the host's units, which a module is not
+    /// built with.
+    ///
+    /// [`own_macro::WASM_TARGET`]: super::own_macro::WASM_TARGET
+    fn wasm_platform(&self) -> anyhow::Result<&Platform> {
+        let made = self.wasm_platform.get_or_init(|| {
+            let target = super::own_macro::WASM_TARGET;
+            let printed =
+                said(&["--print", "cfg", "--target", target]).map_err(|it| format!("{it:#}"))?;
+            Ok(Platform {
+                triple: target.to_owned(),
+                cfg: printed.lines().map(str::to_owned).collect(),
+                rustflags: Vec::new(),
+                linker: None,
+            })
+        });
+        made.as_ref().map_err(|why| anyhow::anyhow!("the cfgs of wasm32-wasip1: {why}"))
     }
 
     /// The package of unit `at` as a run of its script reads it.
@@ -937,6 +1316,38 @@ fn quoted(value: &str) -> String {
 /// The cfgs of `rustc --print cfg`'s lines.
 fn cfgs(printed: &str) -> Vec<cargo_platform::Cfg> {
     printed.lines().filter_map(|it| it.parse().ok()).collect()
+}
+
+/// The cfgs of `rustc --print cfg`'s lines, as rust-analyzer has them.
+fn atoms(printed: &str) -> Vec<cfg::CfgAtom> {
+    let symbol = intern::Symbol::intern;
+    let atom = |line: &str| match line.split_once('=') {
+        Some((key, value)) => {
+            cfg::CfgAtom::KeyValue { key: symbol(key), value: symbol(value.trim_matches('"')) }
+        }
+        None => cfg::CfgAtom::Flag(symbol(line)),
+    };
+    printed.lines().filter(|it| !it.is_empty()).map(atom).collect()
+}
+
+/// The `--cfg`s rustc compiles `unit` with beside the target's, for a platform whose units
+/// cargo passes `rustflags`: its features, `debug_assertions` as its profile has it, and
+/// those of the flags.
+fn unit_cfg(unit: &Unit, rustflags: &[String]) -> Vec<String> {
+    let mut cfg: Vec<String> =
+        unit.features.iter().map(|it| format!("feature={}", quoted(it))).collect();
+    if unit.profile.debug_assertions {
+        cfg.push("debug_assertions".to_owned());
+    }
+    let mut flags = rustflags.iter().chain(unit.profile.rustflags.iter()).map(String::as_str);
+    while let Some(flag) = flags.next() {
+        if flag == "--cfg" {
+            cfg.extend(flags.next().map(str::to_owned));
+        } else if let Some(it) = flag.strip_prefix("--cfg=") {
+            cfg.push(it.to_owned());
+        }
+    }
+    cfg
 }
 
 /// The key of each unit of `graph`: what it is and the keys of what it depends on.

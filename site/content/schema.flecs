@@ -132,19 +132,9 @@ Pick { (With, flecs.core.OrderedChildren) }
 RfcIndex {}                             // the list of RFCs (children of site.rfcs)
 References {}                           // every reference the page cites, in order of first use
 // A container the build fills from the benchmark history in `dir` (a directory of .jsonl files, from the repo root):
-// gen/bench/ writes it as a Flecs script of Sections, Pickers and charts under this entity. Not read aloud.
+// gen/bench/ writes it as a Flecs script of Sections, Pickers and charts under this entity.
 struct BenchHistory(dir: string)
 BenchHistory { (With, flecs.core.OrderedChildren) }
-
-// The spoken version (renderer core spoken.rs; audio/README.md). Each block has a line derived from it by default:
-// prose without its markup, section titles as transitions, tables read row by row, code skipped. Say replaces a
-// block's line, and on a container (Section, Issue, Li, Ul, Ol) its whole subtree: the children are not read (Drama 3
-// directions like [warm] allowed). Silent drops the block and everything under it. On a page, Intro is said first
-// (default: the title) and Outro last.
-struct Say(text: string)
-struct Intro(text: string)
-struct Outro(text: string)
-Silent {}
 
 // A reference: a page elsewhere that a block cites.
 struct Ref(href: string, label: string, note: string)

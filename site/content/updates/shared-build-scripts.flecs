@@ -9,22 +9,17 @@ site {
       (Requires, site.learn.sharing)
       Title: {"Build scripts, shared"}
       Description: {"Update to lesson 5: a build script's kept run is found from any checkout, not only the one that ran it."}
-      Intro: {"[warm] An update to lesson five. Build scripts now share their work across checkouts."}
-      Outro: {"[warm] That's the update. A build script's kept run is found from any checkout, on CI, or through your team's remote."}
 
       Step before("Kept for one checkout") {
-        Say: {"Lesson five said blaze keeps its work in a store, and a team can share one. A build script's run was kept too, but only for the checkout that ran it. A second clone of the same project, or CI, ran every build script again."}
         P one("Lesson 5 said blaze keeps its work in a store you can share. A build script's run was kept too, but only for the checkout that ran it: a second clone, or CI, ran every build script again.")
       }
 
       Step now("Found from anywhere") {
-        Say: {"Now a build script's kept run is found from any checkout, on CI, or through a remote. On ripgrep, a second checkout with a warm store loads its workspace in about one second, where it took three."}
         P any("Now a build script's kept run is found from any checkout, on CI, or through a remote.")
         P rg("On ripgrep, a second checkout with a warm store loads its workspace in 1.0 s instead of 3.2 s.")
       }
 
       Step clone("A fresh clone") {
-        Silent
         Quiz q(prompt: "You clone a project your teammate already built, and use your team's remote cache. What do its build scripts do?") {
           Choice rerun("Each runs once, for your checkout.", "That was before: a run was kept for its own checkout alone.")
           Choice found("Their kept runs are found, so none runs again.", "As long as what they read is the same, the runs your teammate's build kept are found from your checkout too.") {
@@ -34,7 +29,6 @@ site {
       }
 
       Step source("Where it comes from") {
-        Say: {"This is on the canary channel."}
         Dim where("In canary since v0.20261028.9 ([#1255](https://github.com/indexable-inc/blaze/pull/1255)).")
       }
     }

@@ -246,54 +246,17 @@ main.c-live .c-compose .row > span { display: none; }
 	.chart { padding: 12px 12px 6px; }
 }
 
-/* Narration (client/listen.ts, audio/README.md): the player under the title, "play from here" beside each block's
-   comment button, the block being read and the word being said. */
-.listen { margin: 0.25em 0 2.25em; min-height: 36px; }
-.listen-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.listen button { box-sizing: border-box; height: 36px; border: 0; border-radius: 8px; background: var(--s-tint); color: var(--ink-1); font: inherit; font-size: 14px; cursor: pointer; }
-.listen button:hover { background: var(--bg-4); }
-.listen button:focus-visible, .say-btn:focus-visible { outline: 2px solid var(--ink-2); outline-offset: 2px; }
-.listen-play { display: inline-flex; align-items: center; gap: 8px; padding: 0 16px 0 13px; font-weight: 600; }
-.listen.playing .listen-play { background: var(--ink-1); color: var(--bg); }
-.listen.playing .listen-play:hover { background: var(--g-12); }
-.listen-skip { display: inline-flex; align-items: center; justify-content: center; width: 36px; padding: 0; }
-.listen-icon { width: 14px; height: 14px; fill: currentColor; }
-.listen-time { margin: 0 8px 0 4px; font-size: 14px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
-.listen-speed { display: inline-flex; padding: 2px; gap: 2px; border-radius: 8px; background: var(--s-tint); }
-.listen .listen-rate { height: 32px; padding: 0 8px; border-radius: 6px; background: transparent; color: var(--ink-3); font-size: 13px; font-variant-numeric: tabular-nums; }
-.listen .listen-rate:hover { background: var(--bg-4); color: var(--ink-1); }
-.listen .listen-rate[aria-pressed="true"] { background: var(--bg-4); color: var(--ink-1); font-weight: 600; }
-.listen-status { font-size: 13px; color: var(--ink-3); }
-.listen-credit { margin-left: auto; font-size: 12px; color: var(--ink-4); }
-[data-say] { position: relative; }
-.say-btn { position: absolute; left: -46px; top: 0.2em; display: inline-flex; align-items: center; justify-content: center; min-width: 30px; padding: 4px 8px; border: 0; border-radius: 8px; background: var(--s-tint); color: var(--ink-3); cursor: pointer; opacity: 0; transition: opacity 0.12s; }
-.say-btn:has(+ .c-btn) { left: -82px; }
-li > .say-btn { left: -66px; }
-li > .say-btn:has(+ .c-btn) { left: -102px; }
-.codeblock > .say-btn, .cmd > .say-btn, .ref > .say-btn { left: auto; right: 52px; top: 8px; }
-.say-btn .listen-icon { width: 10px; height: 10px; }
-[data-say]:hover > .say-btn, .say-btn:hover, .say-btn:focus-visible { opacity: 1; }
-.say-btn:hover { background: var(--bg-4); color: var(--ink-1); }
-
 /* Where the page has no left margin for them (client/lib/blockctl.ts sets main.gutter when it has), a block's
    controls float at its top-right corner over the text, still only for the block under the pointer; a block with
    comments keeps its count in the text instead. On a touch screen the controls show for the block last tapped
    (.ctl-open) and nowhere else. */
-main:not(.gutter) [data-block] > .c-btn, main:not(.gutter) [data-say] > .say-btn { left: auto; right: 0; top: -0.15em; border-radius: 8px; background: var(--pop-bg); box-shadow: var(--pop-ring), 0 4px 14px rgb(0 0 0 / 0.08); }
-main:not(.gutter) [data-say] > .say-btn:has(+ .c-btn) { right: 40px; }
-main:not(.gutter) [data-say] > .say-btn:has(+ .c-btn.has) { right: 0; }
+main:not(.gutter) [data-block] > .c-btn { left: auto; right: 0; top: -0.15em; border-radius: 8px; background: var(--pop-bg); box-shadow: var(--pop-ring), 0 4px 14px rgb(0 0 0 / 0.08); }
 main:not(.gutter) [data-block] > .c-btn.has { position: static; margin-left: 0.5em; vertical-align: 0.1em; background: none; box-shadow: none; }
-main:not(.gutter) :is(.codeblock, .cmd, .ref) > :is(.c-btn, .say-btn) { top: 8px; }
+main:not(.gutter) :is(.codeblock, .cmd, .ref) > .c-btn { top: 8px; }
 main:not(.gutter) :is(.codeblock, .ref) > .c-btn { right: 8px; }
-main:not(.gutter) :is(.codeblock, .cmd, .ref) > .say-btn { right: 52px; }
 @media (hover: none) {
-	.say-btn, .c-btn:not(.has, [aria-expanded=true]) { visibility: hidden; }
-	.ctl-open > .say-btn, .ctl-open > .c-btn, img.ctl-open + .c-btn { visibility: visible; opacity: 1; }
-}
-.say-now { border-radius: 6px; background: var(--s-tint); box-shadow: 0 0 0 6px var(--s-tint); transition: background 0.2s, box-shadow 0.2s; }
-::highlight(say-word) { background-color: var(--line-2); color: var(--ink-1); }
-@media (prefers-reduced-motion: reduce) {
-	.say-now, .say-btn { transition: none; }
+	.c-btn:not(.has, [aria-expanded=true]) { visibility: hidden; }
+	.ctl-open > .c-btn, img.ctl-open + .c-btn { visibility: visible; opacity: 1; }
 }
 
 /* A comment that arrived while the page was open (client/comments.ts refresh). */

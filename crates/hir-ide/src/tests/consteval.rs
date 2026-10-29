@@ -26,6 +26,7 @@ use crate::{
 };
 
 mod arch;
+mod const_ast;
 mod const_macro;
 mod const_traits;
 mod intrinsics;
@@ -3266,6 +3267,27 @@ fn memory_limit() {
 }
 
 #[test]
+fn inline_const_in_a_loop_is_evaluated_once() {
+    // 3000 copies of the block's 512 KiB would be past the default 1 GiB.
+    check_number(
+        r#"
+    const fn f() -> usize {
+        let mut i = 0;
+        let mut sum = 0;
+        while i < 3000 {
+            let a = const { [1u8; 1 << 19] };
+            sum += a[i] as usize;
+            i += 1;
+        }
+        sum
+    }
+    const GOAL: usize = f();
+    "#,
+        3000,
+    );
+}
+
+#[test]
 fn type_error() {
     check_fail(
         r#"
@@ -3378,4 +3400,10 @@ fn uninhabited_enum_discriminant_read() {
     "#,
         |e| matches!(e, ConstEvalError::MirEvalError(MirEvalError::UndefinedBehavior(_))),
     );
+}
+
+#[test]
+fn checked_u128_sub_without_i128_alignment() {
+    // The fixtures' data layout gives `u128` an alignment of 8, so `(u128, bool)` is 24 bytes.
+    check_number("const GOAL: u128 = (1 << 61) - 1;", (1i128 << 61) - 1);
 }

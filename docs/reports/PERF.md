@@ -1,3 +1,8 @@
+---
+status: record
+summary: Where blaze's time goes against cargo on three workspaces.
+date: 2026-10-20
+---
 # Where blaze's time goes
 
 Measurements of `blaze` against plain cargo on three pinned workspaces, what the daemon
@@ -151,6 +156,17 @@ and the client puts them together. With them:
   always, before). A daemon started by a profiled build profiles its worker's load; one
   already running starts profiling at the request, so what a worker started before then
   (spare workers, build scripts it ran already) is not in the profile.
+- A worker started directly (`blaze <crates> --watch`, or one build without it) with
+  `BLAZE_PROFILE=<dir>` puts its first build's profile together itself, as a client does:
+  from its start until it says `watching N files`, or until that one build ends. Each
+  parallel dispatch has a `parallel` span per thread (`worker`), one for the caller's own
+  share (`caller`) and one for its wait on the last thread (`join`), and each linker run a
+  `link` span.
+- `BLAZE_PROFILE_CONST=crate::module::NAME` with it follows one module-level constant: a
+  `const request` span is a wait for its value, and a `const eval` inside it is a run of its
+  query, both on the timeline however short; a request with none found it already computed.
+  Compare them with the threads of the same parallel dispatch, its join and the link. An
+  associated constant or one in a block has no such path and is not followed.
 - `harness/realbench.py` runs every warm build with `BLAZE_PROFILE` and keeps the breakdown of
   each row's median run; `realbench.py --table FILE` prints it under the results.
 

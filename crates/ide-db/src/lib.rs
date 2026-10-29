@@ -141,6 +141,10 @@ impl RootDatabase {
         self.files.included_sources()
     }
 
+    pub fn sources_included_by(&self) -> Vec<(base_db::Crate, vfs::AbsPathBuf)> {
+        self.files.sources_included_by()
+    }
+
     /// See [`base_db::Files::set_view`].
     pub fn set_view(
         &self,
@@ -245,13 +249,13 @@ impl SourceDatabase for RootDatabase {
         self.files.env_is_unset(krate, key);
     }
 
-    fn include_source(&self, path: base_db::AnchoredPath<'_>) {
+    fn include_source(&self, path: base_db::AnchoredPath<'_>, krate: base_db::Crate) {
         let root_id = self.file_source_root(path.anchor).source_root_id(self);
         let root = self.source_root(root_id).source_root(self);
         if let Some(anchor) = root.path_for_file(&path.anchor).and_then(|it| it.as_path())
             && let Some(parent) = anchor.parent()
         {
-            self.files.include_source(&parent.absolutize(path.path), root_id);
+            self.files.include_source(&parent.absolutize(path.path), root_id, krate);
         }
     }
 

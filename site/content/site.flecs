@@ -21,23 +21,14 @@ site {
     Nav: {"Course", 0}
     Icon: {"path"}
     (InGroup, nav.learn)
-    Intro: {"[warm, welcoming] Hey, welcome. [short pause] This is blaze: a Rust build that keeps cargo's commands and rebuilds an edit in milliseconds. The best way in is the short course right on this page."}
-    Outro: {"[warm] So, the short version: the same commands as cargo, one line to install, and five short lessons whenever you'd like to see how it works, with updates as blaze changes. Thanks for listening."}
     Tab: {"blaze: learn how Rust builds in milliseconds"}
     Description: {"A Rust build with cargo's commands that rebuilds an edit in milliseconds, and a short course on how it works: five lessons, one idea per screen, with questions as you go."}
 
-    Lede lede("Rebuild Rust in milliseconds, with the same commands as cargo.") {
-      Say: {"[curious] Here's the idea. You type blaze wherever you'd type cargo, and an edit is rebuilt in milliseconds."}
-    }
-    Command install("curl -fsSL https://ix.dev/blaze | sh") {
-      Silent
-    }
-    Dim then("Then `blaze run` in any Rust project. [Install](/install) has the other ways in and what you need; [Usage](/usage) has the day to day.") {
-      Say: {"[warm] Installing is the one line at the top: it fetches blaze, and the Rust it builds with. Then type blaze run in any Rust project. The install and usage pages have the rest."}
-    }
+    Lede lede("Rebuild Rust in milliseconds, with the same commands as cargo.")
+    Command install("curl -fsSL https://ix.dev/blaze | sh")
+    Dim then("Then `blaze run` in any Rust project. [Install](/install) has the other ways in and what you need; [Usage](/usage) has the day to day.")
 
     Section course(title: "How blaze works") {
-      Say: {"[warm] The heart of this page is a short course. Five lessons, a few minutes each, one idea per screen, and a question now and then to check it landed. You don't need to know anything about compilers; a little Rust is enough. [pause] It starts with what a build does and why an edit can still take a while. From there it branches: how blaze redoes only the functions that changed, and how it handles proc macros. Both lead to hermetic builds, and last, to sharing that work with your team. [calm] As blaze changes, short updates hang off the lesson they add to. The ones still on the canary channel, or behind a flag, sit in a section of their own further down. Your progress stays in your browser, the button at the top takes you to wherever you left off, and the What's new page lists every update, with the ones since your last visit marked."}
       P line("Five short lessons, a few minutes each: one idea per screen, and a question now and then to check it landed. No compiler knowledge needed; a little Rust is enough.")
       P branches("Some lessons build on others, so the path branches. As blaze changes, updates branch off the lesson they extend; [What's new](/updates) lists them all.")
       Course map {
@@ -48,7 +39,6 @@ site {
     }
 
     Section speed(title: "How fast") {
-      Say: {"[curious] So how fast is it? [breath] Take a workspace of two hundred crates, edit one function, and build. [matter-of-fact] In the main crate, cargo takes about one point eight seconds. blaze, four tenths. [pause] In a crate everything depends on, the painful case, cargo takes over six seconds. [excited] blaze, six tenths. [calm] That was measured once, by hand. The benchmark history page has every run on real projects, next to plain cargo."}
       Dim setup("Edit one function, then build. A generated 200-crate workspace on Linux x86-64 with 8 CPUs, median of three, measured once by hand.")
       Table numbers {
         Tr head { Th a("Edit"); Th b("cargo"); Th c("blaze") }
@@ -59,7 +49,6 @@ site {
     }
 
     Section credits(title: "Credits") {
-      Say: {"[warm, grateful] And credit where it's due. blaze includes code from rust-analyzer, Cranelift, LLVM and inkwell, salsa, object, Rust, and DioxusLabs' rustd. Thank you to the people who built them; none of them endorses blaze. It's made at ix, for den's native app, and designed in the open: the charter says what it holds to, the RFCs are designs still being argued about, and you can comment on any paragraph. [small laugh] And this site? It's Flecs scripts, rendered by a little Rust renderer compiled to wasm."}
       Dim thanks("blaze stands on the shoulders of giants. Thank you to the people who built [rust-analyzer](https://github.com/rust-lang/rust-analyzer), [Cranelift](https://cranelift.dev), [LLVM](https://llvm.org) and [inkwell](https://github.com/TheDan64/inkwell), [salsa](https://github.com/salsa-rs/salsa), [object](https://github.com/gimli-rs/object), [Rust](https://github.com/rust-lang/rust), and [rustd](https://github.com/DioxusLabs/rustd) (DioxusLabs), whose code blaze includes. None of these projects endorses blaze. Made at [ix](https://ix.dev) for den's native app. MIT or Apache-2.0. This site is [Flecs](https://github.com/SanderMertens/flecs) scripts, rendered by a Rust renderer compiled to wasm.")
       Dim open("Designed in the open: the [charter](/charter) says what blaze holds to, and [the RFCs](/rfcs) are designs still being argued about. Sign in with GitHub to comment on any paragraph.")
     }

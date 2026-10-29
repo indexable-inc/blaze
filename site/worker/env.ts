@@ -4,8 +4,6 @@ export interface Env {
 	DB: D1Database;
 	/** Who is on the site (worker/presence.ts): one object, named "site". */
 	PRESENCE: DurableObjectNamespace;
-	/** R2 bucket of narration files (`<sha>.webm`, audio/README.md). Unbound: they are static assets in dist/audio/. */
-	AUDIO?: R2Bucket;
 	/** The deployed Worker version (`version_metadata`); its id is part of the anonymous page cache key. */
 	CF_VERSION: WorkerVersionMetadata;
 	/** GitHub OAuth App client id. Empty: sign-in is off (503) and the comment UI hides the button. */

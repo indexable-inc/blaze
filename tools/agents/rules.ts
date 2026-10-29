@@ -24,7 +24,7 @@ type Rule = {
 
 const header = `# blaze
 
-How to build, test and change blaze: docs/contributing.md. What the harnesses check: docs/harness.md. These rules are generated from tools/agents/rules.ts (edit there, then \`bun tools/agents/rules.ts --write\`). Skills: .agents/skills/.`;
+How to build, test and change blaze: docs/contributing.md. Every doc: docs/README.md. What the harnesses check: docs/harness.md. These rules are generated from tools/agents/rules.ts (edit there, then \`bun tools/agents/rules.ts --write\`). Skills: .agents/skills/.`;
 
 export const rules = [
 	{
@@ -109,9 +109,10 @@ export const rules = [
 		link: "docs/contributing.md#credit",
 	},
 	{
-		id: "narration-is-a-script",
-		info: "Each page in `site/content/` has a spoken script written for the ear, not the article read aloud, and a change to a page changes its script in the same commit.",
-		link: "site/audio/README.md",
+		id: "docs-say-what-they-are",
+		info: "Every doc under `docs/` has front matter: `current` (kept true), `plan`, `record` (dated history) or `superseded` (naming its replacement). Trust current docs; read plans and records as of their date. A change that makes a current doc untrue fixes it or marks it superseded in the same change; `python3 tools/docs.py check` holds them to the tree.",
+		reason: "Andrew, 2026-10-28: docs should \"be structured or something so can say things are outdated filter those out\". Agents followed AGENTS.md's stale `vendor/rust-analyzer` after the front end moved to crates/.",
+		link: "docs/contributing.md#documents",
 	},
 	{
 		id: "scripts-take-typed-input",

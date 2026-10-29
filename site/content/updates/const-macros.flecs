@@ -9,17 +9,13 @@ site {
       (Requires, site.learn.macros)
       Title: {"Const macros"}
       Description: {"Update to lesson 3, experimental: a derive that is a function in your own package, expanded by blaze's const evaluator."}
-      Intro: {"[warm] An update to lesson three, and an experiment. A macro with no macro crate at all."}
-      Outro: {"[warm] That's the update. A const macro is a function in your own package, run by blaze's own evaluator, behind an experimental flag for now."}
 
       Step what("A macro in your own package") {
-        Say: {"In lesson three, a proc macro is a crate of its own, built and run as WebAssembly. A const macro is a function in a file of the package that uses it, and blaze's own const evaluator expands it, inside the compiler. No macro crate, no WebAssembly, no other process."}
         P crate("In lesson 3 a proc macro is a crate of its own, built and run as WebAssembly. A **const macro** is a function in a file of the package that uses it, expanded by blaze's own const evaluator, inside the compiler.")
         P none("No macro crate, no WebAssembly, no other process.")
       }
 
       Step on("Turning it on") {
-        Say: {"It's an experiment, so it's off unless your workspace asks for it, with two keys in Cargo dot toml. Cargo ignores both, and plain rustc stops with an error at the first use, rather than doing something else."}
         P keys("It is off unless the workspace asks, with two keys cargo ignores:")
         Code manifest("toml", `
           # the workspace's Cargo.toml
@@ -34,13 +30,11 @@ site {
       }
 
       Step stage("Stage 0") {
-        Say: {"For now a derive takes and returns text: a function from a string to a string. That's stage zero, not the final shape. And the edit loop is the point: with the macro's output edited, a rebuild took four hundredths of a second, against about one second with a proc-macro crate."}
         P text("For now a derive takes and returns text, `fn(&str) -> String`. That is stage 0, not the final API.")
         P fast("Edit what the macro writes, and the rebuild took 0.04 s, against about 1 s with a proc-macro crate.")
       }
 
       Step faster("Why faster?") {
-        Silent
         Quiz q(prompt: "Why does editing a const macro rebuild so much faster than editing a proc-macro crate?") {
           Choice skip("It skips expanding the code that uses the macro.", "Everything that uses an edited macro is expanded again either way.")
           Choice eval("No macro crate is compiled and loaded: blaze evaluates the function where it is.", "The evaluator is part of blaze, so an edited macro is just an edited function.") {
@@ -51,7 +45,6 @@ site {
       }
 
       Step source("Where it comes from") {
-        Say: {"This is behind the experimental flag, in canary releases. The design is in the docs folder, under const macros."}
         Dim where("Behind `experimental = [\"const-macros\"]` in canary since v0.20261028.9 ([#915](https://github.com/indexable-inc/blaze/pull/915), [#959](https://github.com/indexable-inc/blaze/pull/959)). The design: [docs/future/const-macros.md](https://github.com/indexable-inc/blaze/blob/main/docs/future/const-macros.md).")
       }
     }

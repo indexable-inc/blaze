@@ -19,8 +19,9 @@
         };
         # The one toolchain blaze is pinned to: the dated nightly in harness/toolchain
         # (`nightly-YYYY-MM-DD`, moved by harness/toolchain_bump.py, which also moves the
-        # rust-overlay input to one that has it). rust-src is the sysroot source rust-analyzer
-        # reads `core` from.
+        # rust-overlay input to one that has it). rust-src is for rust-analyzer in an editor of
+        # this repository; blaze reads none of it (its standard library is library/,
+        # docs/toolchain.md).
         pin = pkgs.lib.removePrefix "nightly-" (pkgs.lib.fileContents ./harness/toolchain);
         rust = pkgs.rust-bin.nightly.${pin}.default.override {
           extensions = [ "rust-src" ];
@@ -28,7 +29,7 @@
         # The same nightly with rustc_codegen_cranelift, for the setups bench.py compares with
         # (`--setups`, docs/benchmarks.md).
         nightly = pkgs.rust-bin.nightly.${pin}.default.override {
-          extensions = [ "rust-src" "rustc-codegen-cranelift-preview" ];
+          extensions = [ "rustc-codegen-cranelift-preview" ];
         };
         # The one LLVM the `llvm` feature builds against, for every build of it: the dev shells
         # here, CI (`.#llvm`, .github/actions/toolchain), the flake's `dist` and the release.
@@ -54,6 +55,13 @@
             installPhase = "cp -r . $out";
           };
         llvmEnv = { LLVM_SYS_231_PREFIX = "${llvm}"; };
+        # The Python workspace uses Nix's pinned interpreter on NixOS, where uv's downloaded
+        # interpreters cannot run. uv itself comes from the same flake.lock as the toolchain.
+        scripts = {
+          packages = [ pkgs.uv pkgs.python313 pkgs.nodejs ];
+          UV_PYTHON = "${pkgs.python313}/bin/python3";
+          UV_PYTHON_DOWNLOADS = "never";
+        };
         # What harness/bench.py runs in on the benchmark machine (docs/benchmarks.md): the
         # pinned toolchain, LLVM 23 for `--features llvm`, and the C side the projects' build
         # scripts use. Nothing here wraps rustc (no sccache) or replaces the default linker:
@@ -63,7 +71,9 @@
         bench = llvmEnv // {
           packages = [
             rust
-            pkgs.python3
+            pkgs.python313
+            pkgs.uv
+            pkgs.nodejs
             pkgs.git
             pkgs.pkg-config
             pkgs.openssl
@@ -85,6 +95,7 @@
             pkgs.dioxus-cli
           ];
           BLAZE_NIGHTLY = "${nightly}";
+          inherit (scripts) UV_PYTHON UV_PYTHON_DOWNLOADS;
           # A C compiler as a distribution ships it: the wrapper's _FORTIFY_SOURCE warns at the
           # -O0 of a debug build, which fails configure probes (jemalloc's, in fd).
           hardeningDisable = [ "all" ];
@@ -129,8 +140,11 @@
           '';
           installPhase = ''
             runHook preInstall
-            mkdir -p $out/bin
+            mkdir -p $out/bin $out/share/blaze
             cp shipped/* $out/bin/
+            # The standard library's source, which blaze finds above its programs
+            # (crates/blaze-cargo/src/cargo/toolchain/library.rs).
+            cp -r library $out/share/blaze/library
             runHook postInstall
           '';
         });
@@ -231,7 +245,8 @@
         # toolchain with libstdc++.a, so `cargo build --features llvm` links it in. Rust is
         # rustup at the pinned nightly: plain `cargo` is harness/toolchain's and `cargo +<toolchain>` works.
         devShells.default = pkgs.mkShell (llvmEnv // {
-          packages = [ pkgs.rustup pkgs.python3 llvm ];
+          packages = scripts.packages ++ [ pkgs.rustup llvm ];
+          inherit (scripts) UV_PYTHON UV_PYTHON_DOWNLOADS;
           RUSTUP_TOOLCHAIN = pkgs.lib.fileContents ./harness/toolchain;
           # As in the bench shell: the wrapper's _FORTIFY_SOURCE fails configure probes at -O0 in
           # the C code of the projects the harnesses build.
@@ -247,20 +262,27 @@
         # wasm-tools where the harnesses read objects, wasm-bindgen and node for web guests. The
         # targets are rustup's: `rustup target add wasm32-wasip1 wasm32-unknown-unknown`.
         devShells.wasm = pkgs.mkShell (llvmEnv // {
-          packages = [ pkgs.rustup pkgs.python3 llvm pkgs.wasmtime pkgs.wasm-tools pkgs.wasm-bindgen-cli pkgs.nodejs ];
+          packages = scripts.packages ++ [ pkgs.rustup llvm pkgs.wasmtime pkgs.wasm-tools pkgs.wasm-bindgen-cli ];
+          inherit (scripts) UV_PYTHON UV_PYTHON_DOWNLOADS;
           RUSTUP_TOOLCHAIN = pkgs.lib.fileContents ./harness/toolchain;
           hardeningDisable = [ "all" ];
         });
         devShells.bench = pkgs.mkShell bench;
+        # Python-only work needs neither LLVM nor a Rust toolchain.
+        devShells.scripts = pkgs.mkShell scripts;
         # What harness/bench.py and runbench.py measure bun in (bunprep.py, docs/research/bun.md):
-        # bun's own pinned nightly in place of blaze's (rust-src, which blaze reads `core` from), and
+        # bun's own pinned nightly in place of blaze's, for the cargo side (blaze ignores the pin
+        # and compiles its own library/), with rust-src, which bun's own build of its Rust
+        # (`-Zbuild-std`, run by bunprep.py's plan step) reads std from, and
         # what bun's own build of its C and C++ needs, as its flake.nix has it: LLVM 23 as the
         # C and C++ compiler, cmake, ninja, nasm (x86), go, a bun to run its build scripts, and on Linux lld.
         # blaze itself is built in the bench shell.
         devShells.bench-bun = (pkgs.mkShell.override { stdenv = pkgs.llvmPackages_23.stdenv; }) {
           packages = [
             (pkgs.rust-bin.nightly."2026-09-15".default.override { extensions = [ "rust-src" ]; })
-            pkgs.python3
+            pkgs.python313
+            pkgs.uv
+            pkgs.nodejs
             pkgs.git
             pkgs.curl
             pkgs.unzip
@@ -279,6 +301,7 @@
             pkgs.llvmPackages_23.lld
           ];
           hardeningDisable = [ "all" ];
+          inherit (scripts) UV_PYTHON UV_PYTHON_DOWNLOADS;
           shellHook = ''
             export CC=${pkgs.llvmPackages_23.clang}/bin/clang CXX=${pkgs.llvmPackages_23.clang}/bin/clang++
             export AR=${pkgs.llvmPackages_23.llvm}/bin/llvm-ar RANLIB=${pkgs.llvmPackages_23.llvm}/bin/llvm-ranlib

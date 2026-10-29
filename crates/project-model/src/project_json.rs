@@ -63,7 +63,7 @@ use crate::{ManifestPath, TargetKind};
 pub struct ProjectJson {
     /// e.g. `path/to/sysroot`
     pub(crate) sysroot: Option<AbsPathBuf>,
-    /// e.g. `path/to/sysroot/lib/rustlib/src/rust/library`
+    /// e.g. `$HOME/.blaze/library/<digest>/library`, blaze's `library/`
     pub(crate) sysroot_src: Option<AbsPathBuf>,
     /// A nested project describing the layout of the sysroot
     pub(crate) sysroot_project: Option<Box<ProjectJson>>,

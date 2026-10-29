@@ -125,7 +125,18 @@ describe("PUT", () => {
     expect(await str(head)).toBe("");
   });
 
-  for (const prefix of ["packs/", "keys/", "units/"]) {
+  it("stores and serves a run or shard of the key index under index/", async () => {
+    const bytes = enc("a shard of the index");
+    const h = await hexOf(bytes);
+    expect((await call("PUT", `/t/pub/v3/index/${h}`, { token: "pubWrite", body: bytes })).status).toBe(200);
+    const get = await call("GET", `/t/pub/v3/index/${h}`);
+    expect(get.status).toBe(200);
+    expect(await str(get)).toBe("a shard of the index");
+    expect((await call("GET", `/t/pub/v3/index/${h.toUpperCase()}`)).status).toBe(404);
+    expect((await call("POST", `/t/pub/v3/index/${h}?uploads`, { token: "pubWrite" })).status).toBe(405);
+  });
+
+  for (const prefix of ["packs/", "keys/", "index/", "units/"]) {
     it(`answers 422 and stores nothing when a ${prefix} body does not hash to its name`, async () => {
       const h = await hexOf(enc("claimed"));
       const name = prefix === "packs/" ? `packs/${h}.pack` : `${prefix}${h}`;

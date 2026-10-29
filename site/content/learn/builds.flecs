@@ -12,45 +12,36 @@ site {
       (InTheme, themes.basics)
       Title: {"What a build does"}
       Description: {"Lesson 1: what happens when you build Rust, and why a small edit can take seconds."}
-      Intro: {"[warm] Lesson one. What actually happens when you build Rust, and why a tiny edit can still make you wait."}
-      Outro: {"[warm] That's lesson one. Cargo runs rustc crate by crate, rustc reuses what it saved last time, and then everything is linked again. blaze stays running, redoes only the functions you changed, and patches them in. Next, we'll look at how it knows which ones."}
 
       Step source("From source to a program") {
-        Say: {"[calm] When you build, your Rust source becomes one program you can run. Two jobs make that happen. Compiling turns your code into machine code. Linking joins the pieces into one file. Tap Build on the screen to watch the trip."}
         P what("When you run `cargo build`, your Rust source becomes one program you can run. Two jobs make that happen: **compiling** turns code into machine code, and **linking** joins the pieces into one file.")
         Figure trip(piece: "pipeline", label: "Source goes to the compiler, the compiler's output goes to the linker, and the linker writes the program.")
       }
 
       Step crates("Crates") {
-        Say: {"Cargo hands your code to the Rust compiler, rustc, one crate per run. A crate is one library or one program: your app is a crate, and so is each dependency. For each crate, rustc starts up fresh, does its work, and exits."}
         P unit("Cargo hands your code to the Rust compiler, `rustc`, one **crate** per run. A crate is one library or one program: your app is a crate, and so is each of its dependencies.")
         P fresh("For each crate, `rustc` starts up fresh, does its work, and exits.")
       }
 
       Step notes("rustc keeps notes") {
-        Say: {"[thoughtful] But rustc doesn't start from nothing. In a normal dev build it saves notes on disk for each crate: what it worked out about your code, and the machine code it made, in groups of functions called codegen units. Next time, it checks the crate against those notes, and recompiles only the groups that changed. That's called incremental compilation, and it's on by default."}
         P saves("It doesn't start from nothing, though. In a dev build `rustc` saves notes on disk for each crate: what it worked out about your code, and the machine code it made, in groups of functions called **codegen units**.")
         P reuse("Next time it checks the crate against those notes and recompiles only the groups that changed. This is **incremental compilation**, on by default in the dev profile.")
       }
 
       Step uses("Crates use crates") {
-        Say: {"[curious] Crates use other crates. Here, app uses net and json, and both of those use core. Try tapping a crate to edit it, and watch which crates cargo runs rustc on again."}
         P graph("Crates use other crates. Here `app` uses `net` and `json`, and both of them use `core`. Tap a crate to edit it, and watch which crates cargo runs `rustc` on again.")
         Figure deps(piece: "crates", label: "Four crates: app uses net and json, and net and json both use core. Editing a crate lights it and every crate that uses it, which cargo runs rustc on again, then the program, which is linked again.")
       }
 
       Step typo("Which crates?") {
-        Silent
         Tap q(prompt: "You fix a typo in `json`. Which crates does cargo run `rustc` on again? Tap each one.", piece: "crates", right: "json,app", hint: "Start at json, then follow the arrows back to every crate that uses it.", why: "`json` changed, and `app` uses `json`, so `rustc` runs again for both, reusing what it can from its notes. `net` and `core` don't use `json`, so cargo leaves them alone.")
       }
 
       Step link("Then it all links again") {
-        Say: {"After compiling, the linker joins every crate into the one program file. And it does that again on every build: even a one-line change ends with linking the whole program, which takes a while for a big one."}
         P join("After compiling, the **linker** joins every crate into the one program file. It does that on every build: even a one-line change ends with linking the whole program again, which is slow for a big one.")
       }
 
       Step core_edit("Why is it slow?") {
-        Silent
         Quiz q(prompt: "You change one line in `core`, which every other crate uses. Why can the build still take a while?") {
           Choice careful("`rustc` recompiles just that line, but very carefully.", "`rustc` reuses work in groups of functions, not lines, and cargo runs it again for `core` and for each crate that uses it.")
           Choice ripple("Cargo runs `rustc` again for `core` and every crate that uses it, and then the whole program is linked.", "Each of those runs starts up, reloads its notes and checks its crate again, and the link redoes the whole program. Incremental compilation makes each run cheaper, not free.") {
@@ -61,20 +52,17 @@ site {
       }
 
       Step instead("blaze stays running") {
-        Say: {"[thoughtful] So here's what blaze does instead. It's a compiler that stays running. Rather than a fresh rustc for each crate, reloading its notes from disk, one blaze keeps your whole program in memory, already read and type-checked. When you save, it compiles only the functions you changed, one by one rather than in groups. Then, usually, it patches them into the program it already built, instead of linking everything again."}
         P stays("blaze is a compiler that stays running. Rather than a fresh `rustc` per crate reloading its notes from disk, one blaze keeps your whole program in memory, already read and type-checked, and when you save it compiles **only the functions you changed**, one by one rather than in groups.")
         Art art(piece: "incremental", label: "A lattice of dots. One dot changes, and only it and the few dots that depend on it light up and settle; the rest never move.")
         P patch("Then, usually, it patches them into the program it already built, instead of linking it all again.")
       }
 
       Step same("Same commands") {
-        Say: {"You still type cargo's commands, with blaze in place of cargo: blaze build, blaze run, blaze test. blaze build, run and test don't run rustc at all: blaze compiles the code itself. Plain cargo build, after blaze enable, still runs rustc for some crates, for now. On a two-hundred-crate workspace, an edit in the crate everything uses took six seconds with cargo, and six tenths of a second with blaze. That was measured once, by hand."}
         P commands("You still type cargo's commands, with `blaze` in place of `cargo`: `blaze build`, `blaze run`, `blaze test`. These don't run `rustc`: blaze compiles the code itself. (Plain `cargo build` after `blaze enable` still runs `rustc` for some crates, for now.)")
         Dim number("On a 200-crate workspace, an edit in the crate everything uses took 6.33 s with cargo and 0.60 s with blaze (measured once, by hand; [more runs](/bench)).")
       }
 
       Step save("What happens on save?") {
-        Silent
         Quiz q(prompt: "You save an edit to one function. What does blaze do?") {
           Choice faster("Runs `rustc` on that crate, only faster.", "`blaze build` doesn't run `rustc`: blaze compiles the code itself, and only what changed.")
           Choice all("Rebuilds every crate from scratch, in parallel.", "The point is to do less work, not the same work faster: functions you didn't touch are kept.")

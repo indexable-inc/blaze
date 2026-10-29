@@ -10,40 +10,32 @@ site {
       (Requires, site.learn.builds)
       Title: {"Only what changed"}
       Description: {"Lesson 2: how blaze rebuilds one function at a time, and patches it into your program."}
-      Intro: {"[warm] Lesson two. blaze rebuilds one function at a time. Let's see how it knows which functions an edit touched."}
-      Outro: {"[warm] That's lesson two. A body edit redoes one function; a signature edit means its callers get checked too; and the result is patched into your program, even a running one. Next up: proc macros."}
 
       Step functions("Down to functions") {
-        Say: {"Cargo reruns rustc for whole crates, and rustc reuses its work in groups of functions. blaze's smallest piece of work is a single function. Inside the running blaze, compiling a function is one small piece of work with a remembered result, and it's kept until that function, or something it uses, changes."}
         P unit("Cargo reruns `rustc` for whole crates, and `rustc` reuses its work in groups of functions. blaze's smallest piece of work is a single **function**.")
         P kept("Inside the running blaze, compiling a function is one small piece of work whose result is remembered, and kept until that function, or something it uses, changes.")
       }
 
       Step calls("Who calls whom") {
-        Say: {"[curious] Inside a crate, functions call each other. Here, main calls parse and print, and parse calls lex. Tap a function to edit its body, then switch to changing its signature, and compare what has to be redone."}
         P graph("Inside a crate, functions call each other. Here `main` calls `parse` and `print`, and `parse` calls `lex`. Tap a function to edit it, and switch between editing its body and changing its signature.")
         Figure fns(piece: "fns", label: "Four functions: main calls parse and print, parse calls lex. A body edit lights only that function; a signature change also lights the functions that call it.")
       }
 
       Step body("The body is private") {
-        Say: {"A function's body is the code between its braces. The code that calls it relies only on its signature: its name, what it takes, and what it gives back. So when only the body changes, nothing that calls it has to change."}
         P inside("A function's **body** is the code between its braces. Code that calls it relies only on its **signature**: its name, what it takes and what it gives back.")
         P so("So when only the body changes, nothing that calls it has to change.")
       }
 
       Step bugfix("Which functions?") {
-        Silent
         Tap q(prompt: "You fix a bug inside the body of `lex`. Which functions does blaze compile again? Tap each one.", piece: "fns", right: "lex", hint: "Did anything change that the callers of `lex` can see?", why: "Only `lex`. Its signature is the same, so `parse` calls it exactly as before, and nothing else needs redoing.")
       }
 
       Step signature("Signatures are seen") {
-        Say: {"[thoughtful] Now change what a function takes or returns, and every caller has to be checked again: code that called it the old way might not fit any more. Today, blaze rechecks more than just the real callers. Narrowing that down to exactly the callers is planned."}
         P seen("Change what a function takes or returns, and every caller has to be checked again: code that called it the old way may not fit any more.")
         Dim today("Today blaze rechecks more than just the real callers; narrowing it to exactly the callers is planned.")
       }
 
       Step param("A new parameter") {
-        Silent
         Quiz q(prompt: "You add a parameter to `lex`. Which other function now needs a look?") {
           Choice print("`print`, because it comes after `lex` on the screen.", "Where a function sits doesn't matter, only who calls whom. `print` never calls `lex`.")
           Choice none("None: only `lex` changed.", "That holds for a body edit. A parameter is part of the signature, and callers depend on it.")
@@ -54,24 +46,20 @@ site {
       }
 
       Step visible("A few bodies show through") {
-        Say: {"A few exceptions. Sometimes callers can see into the body: a const function, an async function or one that returns impl Trait, a body handed to a macro, or one that declares items of its own. Then a body edit counts as a signature edit."}
         P exception("A few exceptions: sometimes callers can see into the body, as with a `const fn`, an `async fn` or a function returning `impl Trait`, a body handed to a macro, or one that declares items. Then a body edit counts as a signature edit.")
       }
 
       Step splice("Patching, not linking") {
-        Say: {"Once the changed functions are compiled, blaze usually doesn't link the whole program again. It writes the new code at the end of the program file, and puts a jump at the start of the old version, so every caller lands in the new code. Tap Save to see it."}
         P append("Once the changed functions are compiled, blaze usually doesn't link the program again. It adds the new code at the end of the program file and writes a jump at the start of the old version, so every caller lands in the new code.")
         Figure patch(piece: "splice", label: "The program file as a column of functions. On save, a new lex is written at the end, and the old lex starts with a jump to it.")
       }
 
       Step live("Even while it runs") {
-        Say: {"[warm] One step further. A program that links blaze's live crate takes the changed functions while it's running, with its state intact: about twenty milliseconds from your save, and under a millisecond to swap them in. It's released on macOS on Apple silicon, and Linux and Windows support, on x86, is on main."}
         P running("A program that links blaze's `blaze-live` crate takes changed functions while it runs, state intact: about 20 ms from your save, and under a millisecond to swap them in.")
         Dim where("Released on macOS on Apple silicon; Linux x86-64 and Windows x86-64 support is on main, for the next release.")
       }
 
       Step game("What can it take live?") {
-        Silent
         Quiz q(prompt: "Your game links `blaze-live` and is running. Which edit can it take without restarting?") {
           Choice jump("A change to how one function works out the height of a jump.", "That's a body edit: the new function is swapped in while the game keeps running.") {
             Right

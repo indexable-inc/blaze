@@ -1,6 +1,10 @@
+---
+status: current
+summary: blaze's own borrow checker (hir-ty-borrowck): how it matches rustc's verdicts, how it is scored, what is left.
+---
 # The borrow checker
 
-blaze has its own borrow checker, the crate `hir-ty-borrowck` in the rust-analyzer subtree
+blaze has its own borrow checker, the crate `hir-ty-borrowck` in the front end
 (`crates/hir-ty-borrowck`, next to `hir-ty`). It checks the MIR rust-analyzer
 lowers, the same MIR the code generator compiles, and it is meant to give exactly rustc's
 verdict: the same errors, on the same lines, and none where rustc gives none. It gives

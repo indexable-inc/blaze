@@ -10,22 +10,17 @@ site {
       (Requires, site.learn.hermetic)
       Title: {"Sharing work"}
       Description: {"Lesson 5: blaze's store, sharing it with your team, and what's planned next."}
-      Intro: {"[warm] Lesson five, the last one. Where blaze keeps its work, and how that work can be shared."}
-      Outro: {"[warm] And that's the course. blaze compiles only what changed, runs build scripts and proc macros in a sandbox, files every result under a key, and can share those results with your team. [pause] Thanks for learning with us."}
 
       Step store("Your store") {
-        Say: {"Everything blaze compiles goes into a store on your disk: compiled functions, macro expansions, build script runs, the standard library, and, if you opt in, test passes. Every checkout of yours uses the same store."}
         P holds("Everything blaze compiles goes into a **store** on your disk: compiled functions, macro expansions, build-script runs, the standard library and, if you opt in, test passes.")
         P one("Every checkout of yours uses the same store.")
       }
 
       Step lookup("Look before you compile") {
-        Say: {"Each entry is filed under its key. Before compiling anything, blaze looks the key up: if it's already in the store, the work is already done."}
         P first("Each entry is filed under its key. Before compiling anything, blaze looks the key up: if it's in the store, the work is already done.")
       }
 
       Step branch("An old branch") {
-        Silent
         Quiz q(prompt: "You switch back to a branch you built yesterday, with the same blaze, and nothing on it has changed since. What happens to its functions?") {
           Choice again("It's compiled again, to be safe.", "Same inputs give the same key and the same result, so compiling again would only make the same thing.")
           Choice found("Each is found in the store under the same key, and used as is.", "Each crate's source hashes the same as yesterday, so every key matches again and yesterday's results are used.") {
@@ -36,14 +31,12 @@ site {
       }
 
       Step shared("A shared store") {
-        Say: {"[curious] A store can live somewhere else too: a shared folder, an S3 bucket, or blaze's cache server. Push sends your entries there, and pull brings other people's back. Set blaze remote, and blaze pulls when it starts and pushes as it goes, and no build waits on the network. Try it on the screen."}
         P where("A store can also live somewhere else: a shared folder, an S3 bucket or blaze's cache server. Pushing sends your entries there; pulling brings other people's back.")
         Figure flow(piece: "share", label: "Your laptop builds and pushes to a shared store; a teammate's build of the same code finds the work there instead of compiling it.")
         Dim auto("With `BLAZE_REMOTE` set, blaze pulls when it starts and pushes as it goes; no build waits on the network.")
       }
 
       Step teammate("A teammate's store") {
-        Silent
         Quiz q(prompt: "A teammate pushed their work. You pull, then build the same commit with the same blaze. What happens?") {
           Choice everything("blaze compiles everything again, because it was built on another machine.", "The machine isn't part of the key: the same blaze, target and source give the same key, and the same result.")
           Choice edits("You also get their uncommitted edits.", "Keys come from inputs. Different source gives different keys, so their edits never match your code.")
@@ -54,20 +47,17 @@ site {
       }
 
       Step trust("Names you can check") {
-        Say: {"The files a store sends are named by a hash of their bytes, so neither the store nor the network can swap them without it being noticed. But anyone who can write to a shared store could add wrong code under real keys. To stop that, a shared store's manifests can be signed, and blaze can refuse any that aren't signed by a key you trust."}
         P named("The files a store sends are named by a hash of their bytes, so neither the store nor the network can swap them unnoticed. But anyone who can write to a shared store could add wrong code under real keys.")
         Dim signed("To stop that, a shared store's manifests can be signed, and blaze can refuse any not signed by a key you trust.")
       }
 
       Step farm("Running work elsewhere") {
-        Say: {"[thoughtful] One thing blaze doesn't do: send long builds and test runs off to other machines. That's called remote execution, and it isn't built or designed yet. The shared store comes first. And today, blaze's own CI doesn't fill a shared store yet, either."}
         P goal("Sending long builds and test runs off to other machines is called **remote execution**. blaze doesn't do it.")
         Art art(piece: "remote", label: "One block sends work along lines to a column of blocks, each works for a while and sends its result back, and the results stack up beside the first block.")
         Dim planned("It isn't built or designed yet: the shared store comes first. blaze's own CI doesn't fill a shared store yet either.")
       }
 
       Step today("Which works today?") {
-        Silent
         Quiz q(prompt: "Which of these can blaze do today?") {
           Choice farm("Run your test suite on a farm of other machines.", "That's remote execution, which isn't built.")
           Choice push("Push compiled work to a shared store, and pull it back.", "Push and pull work today, to a shared folder, an S3 bucket or blaze's cache server.") {
@@ -77,7 +67,6 @@ site {
       }
 
       Step next("Where to go next") {
-        Say: {"[warm] That's the whole course. If you'd like to try it, installing is one line, and the usage page has the day to day. The course map, on the home page, shows what you've done."}
         P install("Installing is one line: `curl -fsSL https://ix.dev/blaze | sh`. [Install](/install) has the other ways in, [Usage](/usage) the day to day. The [course map](/) shows what you've done.")
       }
     }

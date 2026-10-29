@@ -1,3 +1,8 @@
+---
+status: plan
+summary: The no-rustc rule and the plan to remove every rustc use, step by step, with what is done.
+date: 2026-10-22
+---
 # blaze never runs rustc
 
 ## The rule
@@ -70,8 +75,31 @@ What it does not cover:
   line it works out itself, not with rustc's.
 - blaze's own executable, which is built with cargo and the pinned nightly's rustc. Building
   blaze with blaze is a later goal, not part of this rule.
-- The standard library's source (`rust-src`). It is source, and stays an input.
+- The standard library's source. It is source, and stays an input: blaze's own `library/`
+  ([toolchain.md](toolchain.md#the-standard-library-library)), not the nightly's `rust-src`.
 - Tools cargo runs that compile no Rust: rustfmt, the resolver, fetching.
+
+## What of the downloaded nightly is still read
+
+Since 2026-10-28 the standard library's source is blaze's `library/`, and no toolchain's
+`rust-src` is read or downloaded (nor its `src/llvm-project/libunwind`). blaze's own copy of
+`library/` comes from blaze's release (`library-<digest>.tar.xz`) and is checked against
+`library/DIGEST`. What is
+left of the download, each piece for a rustc site this plan removes:
+
+| Piece | Read by | Until |
+|---|---|---|
+| `rustc`: `bin/rustc`, `librustc_driver` | the first build of a workspace, the functions left to rustc, the reference loads of the harnesses; its file names in the keys of what rustc built (`cargo/keyed.rs`) | K, E, M |
+| `rustc`: `lib/rustlib/<host>/bin/rust-lld`, `gcc-ld` | blaze's link on ELF targets (`link.rs` `lld_dir`, `rust_lld`) | blaze's own lld or the system linker |
+| `rustc`: `libexec/rust-analyzer-proc-macro-srv` | proc macros rustc built | J1, J2 |
+| `cargo` | the first build, `cargo metadata` for a load, `--unit-graph` | blaze's resolver and fetcher, K, M |
+| `rust-std-<host>` | linking what rustc built; a build told ahead of cargo's reads its rlibs' metadata for its key (`built_library`, `library_identity`) | F, G |
+| `rust-std-wasm32-wasip1`: `lib/self-contained` | the WASI libc a proc macro's module links (`own_macro.rs`, `link.rs`) | blaze shipping wasi-libc |
+| `lib/rustlib/multirust-channel-manifest.toml` | `cargo --version`'s answer (`answers/own.rs`), the keys of what rustc built (`cargo/keyed.rs`) | K |
+
+The key of what blaze compiles of the standard library no longer reads the toolchain: it is
+`library=<digest>` (`library/DIGEST`, `blaze-engine` `source_identity`), where it was the
+channel manifest's commit and the `rustc_driver` file name.
 
 ## The end state
 
@@ -79,8 +107,8 @@ What "100%" means, piece by piece. Each piece is where one of today's uses goes.
 
 1. **The standard library is compiled by blaze.** `core`, `alloc`, `std`,
    `compiler_builtins`, `panic_unwind`, `panic_abort`, `unwind`, `proc_macro`, `test` and what
-   they depend on, from `rust-src`, kept in the store per target and profile like any other
-   crate. No rlib of the sysroot is read or linked.
+   they depend on, from blaze's `library/`, kept in the store per target and profile like any
+   other crate. No rlib of the sysroot is read or linked.
 2. **Proc macros are compiled by blaze and loaded by blaze.** The proc-macro crate and its
    dependencies (`syn`, `quote`, `proc-macro2`) are compiled by blaze into a library that
    rust-analyzer's proc-macro server, running inside blaze, loads. Not the toolchain's
@@ -151,8 +179,9 @@ The same goal seen from the machine blaze is installed on
 ([self-contained.md](self-contained.md), [#298](https://github.com/indexable-inc/blaze/issues/298)):
 installing is one `curl`, with no rustup, no toolchain pin and no cargo, and blaze resolves a
 project exactly as cargo does. Until K, J and M land, blaze keeps a toolchain of its own,
-private to it: the pinned nightly's `rustc`, `cargo`, `rust-std` (the host's and `wasm32-wasip1`'s) and
-`rust-src` as the Rust project publishes them (123 to 160 MB), each piece removed as the step that ends its use lands. A
+private to it: the pinned nightly's `rustc`, `cargo` and `rust-std` (the host's and
+`wasm32-wasip1`'s) as the Rust project publishes them (116 to 153 MB), each piece removed as the
+step that ends its use lands. A
 project's own pin does not change which Rust blaze builds with
 ([#269](https://github.com/indexable-inc/blaze/issues/269)). blaze's manifest reader, registry,
 resolver and unit graph (`crates/blaze-manifest`, `blaze-registry`, `blaze-resolve`,
@@ -460,7 +489,9 @@ of each host (x86-64 Linux's rustc links with its own lld, so its specs differ).
 knows the release by rustup's manifest in the sysroot, and adds what the arguments decide, as
 rustc does: `debug_assertions` from `-C debug-assertions` or the optimization level,
 `overflow_checks` and `ub_checks` as a nightly prints them (`RUSTC_BOOTSTRAP=-1` makes it
-answer as a stable release), `-C panic`, `--cfg`, `proc_macro`,
+answer as a stable release; a list of crates, as servo's `[env]` sets, allows unstable features
+for the `--crate-name` it names as `1` does and leaves the channel's default for any other, as
+rustc's `UnstableFeatures::from_environment` does), `-C panic`, `--cfg`, `proc_macro`,
 the sysroot and target libdir from where the toolchain is. A question with anything it does not
 model (`-C target-cpu`, `-C target-feature`, other `-Z` flags, a deployment target or SDK in the
 environment, a JSON target, another release, a host whose target specs it lacks) is asked of rustc
@@ -492,7 +523,8 @@ names another toolchain, which is what made main's no-op `blaze build` run 8 rus
 (4 questions through rustup's proxy, #833). `rustcsites.py`: 33 places to 27. rustup is not
 run either: loading a workspace took cargo from `rustup which cargo` and ran it through rustup's
 proxy, and ran `rustup component add rust-src` when the library's source was missing; the
-sysroot's own `bin/cargo` is run now, and a missing source is an error that says to add it.
+sysroot's own `bin/cargo` is run now, and a missing source is an error that names
+`BLAZE_LIBRARY` (no toolchain's `rust-src` is looked for).
 `rustcsites.py` counts the places that start rustup too: 29 to 28. The one left,
 `cargo/own_macro.rs`'s `rustup target add wasm32-wasip1`, installs WASI's libc for proc-macro
 modules when blaze's release has none; it asks nothing.
@@ -637,7 +669,7 @@ function to rustc but those step G removes ("no rustc symbol"). On Linux x86-64 
 
 **F. The standard library compiled by blaze.** ([#86](https://github.com/indexable-inc/blaze/issues/86)) `core`, `alloc`, `std`, `compiler_builtins`
 (with its intrinsics and `#[naked]` functions), `panic_unwind`, `panic_abort`, `unwind`,
-`proc_macro`, `test` and their dependencies, from `rust-src`, with std's own build script and
+`proc_macro`, `test` and their dependencies, from blaze's `library/` (no `rust-src`), with std's own build script and
 cfgs, kept in the store per target and profile and served by the remote. The harness's std
 tests (11 of 2,846 refused today) are the bar. Risk: lang items, intrinsics and
 `compiler_builtins` are where blaze has had least practice.
@@ -701,7 +733,9 @@ over ripgrep: 2.5 s against 0.25 s), and the native libraries the crates linked 
 `#[link(name, kind, modifiers, cfg)]`, read from their `extern` blocks, a crate's before those
 of the crates it depends on; no list of libraries is fixed. What the link leaves out it proves
 unreachable, so a stand-in left in the executable is a function the program can reach that
-blaze could not compile: blaze says how many after the link and fails on any.
+blaze could not compile: blaze says how many after the link and fails on any. Not yet on
+Windows: blaze's COFF objects have no COMDAT sections for `link.exe`'s `/OPT:REF` to take out,
+so every stand-in stays, and one says what blaze could not compile only when it is called.
 None is left in hello, the four `allblaze.py` programs or ripgrep. The rest of what rustc
 does around the link: the allocator shim calls the `#[global_allocator]`'s methods (through the
 four functions the attribute's expansion exports) or else std's defaults; the panic runtime is

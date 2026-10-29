@@ -97,9 +97,30 @@ fn engine() -> &'static Engine {
         let mut config = Config::new();
         config.cranelift_nan_canonicalization(true);
         config.parallel_compilation(true);
+        // A target given turns off Cranelift's reading of the host's CPU features, which
+        // would put them in `code_key` and part hosts of one kind (CI's runners are AMD and
+        // Intel) that should share machine code.
+        config.target(&target_lexicon::HOST.to_string()).expect("the host is a Wasmtime target");
+        for flag in CPU_FEATURES {
+            // SAFETY: each is a feature Wasmtime checks the host has before it runs code
+            // compiled with it, or (the return-address signing) what the host's ABI needs.
+            unsafe { config.cranelift_flag_enable(flag) };
+        }
         Engine::new(&config).expect("Wasmtime's configuration for proc macros")
     })
 }
+
+/// The CPU features machine code is compiled for, the same on every host of an arch: on
+/// x86-64 its v2 level, which every x86-64 CPU since 2009 has and which keeps the floating
+/// point Wasm needs off host calls; on arm64 none beyond the base but the return-address
+/// signing macOS requires.
+const CPU_FEATURES: &[&str] = if cfg!(target_arch = "x86_64") {
+    &["has_cmpxchg16b", "has_sse3", "has_ssse3", "has_sse41", "has_sse42", "has_popcnt"]
+} else if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+    &["sign_return_address", "sign_return_address_with_bkey"]
+} else {
+    &[]
+};
 
 /// The database a running expansion asks, for as long as it runs.
 #[derive(Clone, Copy)]
@@ -715,9 +736,10 @@ impl Wasm {
                     let module = Module::new(engine(), bytes()?).map_err(failed)?;
                     if stats {
                         eprintln!(
-                            "blaze: Cranelift compiled the proc-macro module {} in {:.1?}",
+                            "blaze: Cranelift compiled the proc-macro module {} in {:.1?}, none kept as {}",
                             path.display(),
-                            start.elapsed()
+                            start.elapsed(),
+                            file.display()
                         );
                     }
                     let code = module.serialize().map_err(failed)?;
@@ -981,8 +1003,9 @@ impl Session {
 
 /// What the store keeps the machine code of the module of `digest` under: the module's bytes
 /// and what Wasmtime says code must match to load (its version, its configuration, the
-/// target and the CPU features it compiled for), and nothing of the checkout, the build of
-/// blaze or the toolchain, so every checkout and every host of the same kind shares it.
+/// target and the CPU features it compiled for, [`CPU_FEATURES`] rather than the host's),
+/// and nothing of the checkout, the build of blaze or the toolchain, so every checkout and
+/// every host of the same kind shares it.
 fn code_key(digest: &[u8; 32]) -> [u8; 32] {
     use std::hash::Hash as _;
     struct Fields<'a>(&'a mut keyed::Key);

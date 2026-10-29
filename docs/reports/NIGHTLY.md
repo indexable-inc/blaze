@@ -1,3 +1,8 @@
+---
+status: record
+summary: blaze on the latest nightly: the 2026-10-25 handoff.
+date: 2026-10-26
+---
 # NIGHTLY: blaze on the latest nightly (2026-10-25 handoff)
 
 Andrew, 2026-10-25: "blaze should only support latest nightly"; "you can add features to ra

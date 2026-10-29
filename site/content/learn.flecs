@@ -25,9 +25,7 @@ site {
     Narrow
     Title: {"The course"}
     Description: {"The blaze course is on the home page."}
-    P moved("The course is on the [home page](/).") {
-      Silent
-    }
+    P moved("The course is on the [home page](/).")
     // Opened here so a lesson can require one whose file runs after its own (files run in path order).
     builds {}
     incremental {}

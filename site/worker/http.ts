@@ -150,7 +150,7 @@ const TRANSLATOR = '/js/translate-worker.js';
 
 /**
  * The Content-Security-Policy of the HTML the worker serves: scripts, styles and fetches from this origin only, avatars
- * from GitHub, narration audio (media-src) from this origin, forms posting back here.
+ * from GitHub, forms posting back here.
  * The chat translator's worker script (client/translate-worker.ts) alone also compiles WebAssembly and fetches the model
  * from Hugging Face (`translator`; a dedicated worker runs under its own script's policy).
  * Static files get the same policy through `assetHeaders` (a `_headers` file does not apply once every request runs the
@@ -163,7 +163,6 @@ export function csp({ translator = false } = {}): string {
 		"style-src 'self'",
 		"img-src 'self' https://avatars.githubusercontent.com https://github.com",
 		translator ? `connect-src 'self' ${HUGGING_FACE}` : "connect-src 'self'",
-		"media-src 'self'",
 		"frame-src 'none'",
 		"form-action 'self'",
 		"frame-ancestors 'none'",

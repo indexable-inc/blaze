@@ -471,6 +471,56 @@ impl tracing::Subscriber for Recorder {
     }
 }
 
+/// The variable naming one module-level constant, `crate::module::NAME`, whose every request
+/// and every run of its query the profile of a worker started directly keeps on its
+/// timeline, however short ([`const_request`], [`const_execution`]).
+pub const CONST_VAR: &str = "BLAZE_PROFILE_CONST";
+
+/// The constant [`CONST_VAR`] names, while profiling.
+pub fn followed_const() -> Option<&'static str> {
+    static FOLLOWED: OnceLock<Option<String>> = OnceLock::new();
+    let followed =
+        FOLLOWED.get_or_init(|| std::env::var(CONST_VAR).ok().filter(|it| !it.is_empty()));
+    followed.as_deref().filter(|_| on())
+}
+
+/// Notes a request for the followed constant from `start` to now: the caller's wait for it.
+pub fn const_request(start: Instant) {
+    noted_const("const request", start);
+}
+
+/// Notes a run of the followed constant's query from `start` to now: its evaluation.
+pub fn const_execution(start: Instant) {
+    noted_const("const eval", start);
+}
+
+fn noted_const(name: &'static str, start: Instant) {
+    let Some(followed) = followed_const() else { return };
+    let wall_ns = start.elapsed().as_nanos() as u64;
+    recorded(|it| {
+        it.phases.entry(name).or_default().add(wall_ns, 0);
+        it.subjects.entry((name, followed.into())).or_default().add(wall_ns, 0);
+        let event = Event {
+            name: name.to_owned(),
+            subject: Some(followed.to_owned()),
+            tid: it.tid,
+            start_us: us_of(start),
+            dur_us: wall_ns / 1000,
+            cpu_us: None,
+        };
+        it.events.push(event);
+    });
+}
+
+/// Runs the linker `command` as a span `link` of `name`, each attempt a span of its own.
+pub fn link_output(
+    command: &mut std::process::Command,
+    name: &str,
+) -> std::io::Result<std::process::Output> {
+    let _span = tracing::info_span!(target: "blaze", "link", subject = name).entered();
+    command.output()
+}
+
 /// A pass of the code generator under way: its time, less that of the passes under it, is
 /// added to the pass's row of `passes.tsv` when it is dropped.
 pub struct Pass {

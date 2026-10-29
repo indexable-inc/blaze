@@ -76,6 +76,7 @@ blaze-doc.workspace = true
 blaze-lints.workspace = true
 blaze-profile.workspace = true
 tracing.workspace = true
+blaze-graph.workspace = true
 blaze-protocol.workspace = true
 ide-db.workspace = true
 ide-diagnostics.workspace = true

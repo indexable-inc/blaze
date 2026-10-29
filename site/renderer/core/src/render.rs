@@ -133,9 +133,6 @@ struct Ctx<'a, 'w> {
     blocks: Vec<(String, String)>,
     scripts: Vec<&'static str>,
     discussion: &'a Discussion,
-    /// On a page with audio (an `Audio` value, set by the build): the blocks that have a spoken line. Each gets
-    /// ` data-say="<id>"`, which the player (client/listen.ts) highlights and plays from.
-    say: Option<std::collections::BTreeSet<String>>,
 }
 
 impl Ctx<'_, '_> {
@@ -146,15 +143,6 @@ impl Ctx<'_, '_> {
     fn inline(&mut self, t: &str, wher: &str) -> Result<String, String> {
         let refs = Refs { world: self.s.world, parent: self.s.refs, served: self.s.served };
         inline(t, &refs, wher, &mut self.cited)
-    }
-
-    /// ` data-say=".."` when the block has a spoken line on a page with audio.
-    fn say_attr(&self, n: Id) -> String {
-        let id = self.block_id(n);
-        match &self.say {
-            Some(set) if set.contains(&id) => format!(" data-say=\"{}\"", esc(&id)),
-            _ => String::new(),
-        }
     }
 
     fn script(&mut self, s: &'static str) {
@@ -181,9 +169,8 @@ struct Anchor {
 
 /// What a block a reader can comment on carries, after checking it has a name. Empty outside a Discussable page.
 fn anchor(n: Id, ctx: &mut Ctx, plain: &str) -> Result<Anchor, String> {
-    let say = ctx.say_attr(n);
     if !ctx.discussable {
-        return Ok(Anchor { attr: say, ..Anchor::default() });
+        return Ok(Anchor::default());
     }
     let e = ctx.e(n);
     if e.name.starts_with('#') {
@@ -201,7 +188,7 @@ fn anchor(n: Id, ctx: &mut Ctx, plain: &str) -> Result<Anchor, String> {
     }
     let w = ctx.s.world;
     Ok(Anchor {
-        attr: format!(" data-block=\"{}\"{say}", esc(&id)),
+        attr: format!(" data-block=\"{}\"", esc(&id)),
         button: comments::button(&id, w, n),
         thread: comments::thread(
             &id,
@@ -365,8 +352,7 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
         let html = highlighted(e).filter(|h| !h.is_empty()).unwrap_or_else(|| esc(&cmd));
         ctx.script("copy");
         return Ok(format!(
-            "<div class=\"cmd code-roles\"{}><pre class=\"hljs\"><code>{html}</code></pre><button type=\"button\" data-copy=\"{}\" aria-label=\"Copy command\">Copy</button></div>",
-            ctx.say_attr(n),
+            "<div class=\"cmd code-roles\"><pre class=\"hljs\"><code>{html}</code></pre><button type=\"button\" data-copy=\"{}\" aria-label=\"Copy command\">Copy</button></div>",
             esc(&cmd)
         ));
     }
@@ -524,8 +510,7 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
         let l = ctx.inline(&prose(&label), &path)?;
         ctx.script("learn");
         return Ok(format!(
-            "<figure class=\"diagram\" data-figure=\"{piece}\"{}><figcaption>{l}</figcaption></figure>",
-            ctx.say_attr(n)
+            "<figure class=\"diagram\" data-figure=\"{piece}\"><figcaption>{l}</figcaption></figure>"
         ));
     }
     if e.has_tag("Ul") || e.has_tag("Ol") {
@@ -1014,18 +999,7 @@ pub fn render(
         blocks: Vec::new(),
         scripts: Vec::new(),
         discussion,
-        say: None,
     };
-    // The build sets `Audio {manifest}` on a page whose generated audio matches its spoken lines (gen/build.ts).
-    let audio = match n.value("Audio").and_then(|v| v.get("manifest")) {
-        Some(crate::world::Scalar::Str(m)) if !m.is_empty() => Some(m.clone()),
-        _ => None,
-    };
-    if audio.is_some() {
-        let lines = crate::spoken::lines(s, page)?;
-        ctx.say = Some(lines.into_iter().map(|l| l.block).collect());
-        ctx.script("listen");
-    }
     let title = text(n, "Title");
     if title.is_empty() {
         return Err(format!("{}: a page needs a Title", n.path));
@@ -1116,23 +1090,11 @@ pub fn render(
         .collect::<Vec<_>>()
         .join("\n");
     let doc_attr = if talk { format!(" data-doc=\"{}\"", esc(&page.doc)) } else { String::new() };
-    let say_intro = if audio.is_some() {
-        format!(" data-say=\"{}\"", crate::spoken::INTRO)
-    } else {
-        String::new()
-    };
-    let listen = match &audio {
-        // The player (client/listen.ts) builds its controls in here; without JS it stays empty.
-        Some(m) => {
-            format!("\n<div class=\"listen\" data-audio=\"{}\"></div>", esc(&s.served.href(m)))
-        }
-        None => String::new(),
-    };
     // The home page's title is the logo, large; every other page has the docs' header: where it sits, the title,
     // the RFC line.
     let head = if n.has_tag("Hero") {
         format!(
-            "<header class=\"hero\"><h1 class=\"hero-logo\"{say_intro}><span class=\"sr\">{}</span>{}</h1>{listen}</header>",
+            "<header class=\"hero\"><h1 class=\"hero-logo\"><span class=\"sr\">{}</span>{}</h1></header>",
             esc(&title),
             crate::side::picture(s.world, s.site, s.served, "logo", "")
         )
@@ -1145,7 +1107,7 @@ pub fn render(
             String::new()
         };
         format!(
-            "<header class=\"head\">{}{glyph}<h1{say_intro}>{}</h1>{}{listen}</header>",
+            "<header class=\"head\">{}{glyph}<h1>{}</h1>{}</header>",
             crate::side::crumb(s.nav, page, s.served),
             esc(&title),
             meta(&ctx)?

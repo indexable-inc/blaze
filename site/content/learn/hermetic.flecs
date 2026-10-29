@@ -11,24 +11,19 @@ site {
       (Requires, site.learn.macros)
       Title: {"Hermetic builds"}
       Description: {"Lesson 4: what a hermetic build is, and how blaze names the work it keeps."}
-      Intro: {"[warm] Lesson four. Hermetic builds: what it means for a build to be sealed, and why that matters."}
-      Outro: {"[warm] That's lesson four. A sealed build depends only on its inputs, and every kept result is filed under a key made from them. Last lesson: sharing that work."}
 
       Step machine("It works on my machine") {
-        Say: {"[knowing] Builds can quietly depend on things nobody wrote down: a tool installed on your laptop, a file in your home folder, the network. Then the same code builds one way for you, and another way for a teammate."}
         P quietly("Builds can quietly depend on things nobody wrote down: a tool on your laptop, a file in your home folder, the network.")
         P differ("Then the same code builds one way for you and another way for a teammate.")
       }
 
       Step sealed("Sealed") {
-        Say: {"A hermetic build is sealed: it depends only on its declared inputs. For blaze, that's your source, your locked dependencies in Cargo dot lock, and blaze's pinned toolchain. That's the goal: nothing else on the machine gets in."}
         P only("A **hermetic** build is sealed: it depends only on its declared inputs. For blaze that's your source, your locked dependencies (`Cargo.lock`) and blaze's pinned toolchain.")
         Art art(piece: "hermetic", label: "A sealed box. Inside, the same three inputs make the same output on every loop; specks drift around outside and bounce off its wall, never getting in.")
         P nothing("That's the goal: nothing else on the machine gets in.")
       }
 
       Step promise("Two laptops") {
-        Silent
         Quiz q(prompt: "Two people build the same commit with blaze, on different laptops. What does a hermetic build promise them?") {
           Choice time("The same build time.", "Speed depends on the machine. Hermetic is about what comes out, not how long it takes.")
           Choice same("A program that behaves the same, because the inputs are the same.", "Same inputs in, the same program out, whatever else each laptop has installed.") {
@@ -39,31 +34,26 @@ site {
       }
 
       Step toolchain("One toolchain") {
-        Say: {"Your project might pin a Rust version in its rust toolchain file. blaze uses its own pinned nightly instead, whatever the project says. It downloads it once, and refuses any file whose hash doesn't match the one built into blaze."}
         P own("Your project may pin a Rust version in `rust-toolchain.toml`. blaze uses its own pinned nightly instead, whatever the project says.")
         P checked("It downloads it once, and refuses any file whose hash doesn't match the one built into blaze.")
       }
 
       Step key("Filed under a key") {
-        Say: {"[thoughtful] To keep a compiled function, blaze files it under a key: a hash of everything that could change the machine code that comes out. If any of that changes, the key changes, and the old copy just isn't found."}
         P hash("To keep a compiled function, blaze files it under a **key**: a hash of everything that could change the machine code that comes out.")
         P miss("If any of that changes, the key changes, and the old copy simply isn't found.")
       }
 
       Step inputs("What goes in the key?") {
-        Silent
         Tap q(prompt: "Tap the things that go into the key of a compiled function.", piece: "inputs", right: "name,source,opt,target,blaze", hint: "For each one, ask: could it change the machine code that comes out?", why: "The key holds the function's name and a hash of its whole crate's source, plus the optimisation level, the target and blaze's own build, so editing any line of the crate, or renaming the function, gives it a new key; the time of day and your user name stay out.")
       }
 
       Step close("Sealed where it matters") {
-        Say: {"Build scripts and proc macros, the parts that run your dependencies' code during a build, already run in a sandbox: no network, and no writes outside their own folder. Tests, which are sandboxed only if a workspace opts in for now, and Windows, which has no sandbox yet, are still to close. So blaze's builds aren't fully hermetic yet. [short pause] Where tests are sandboxed, a pass is kept too: with blaze tests set to affected, cargo blaze test runs only the tests that haven't passed with their inputs as they are now."}
         P today("Build scripts and proc macros, the parts that run your dependencies' code during a build, already run in a sandbox: no network, and no writes outside their own folder.")
         Dim left("Tests (sandboxed only if a workspace opts in, for now) and Windows (no sandbox yet) are still to close, so blaze's builds aren't fully hermetic yet.")
         Dim tests("Where tests are sandboxed, a pass is kept too: with `BLAZE_TESTS=affected`, `cargo blaze test` runs only the tests that haven't passed with their inputs as they are now.")
       }
 
       Step reuse("When is a copy safe?") {
-        Silent
         Quiz q(prompt: "A kept build result is safe to reuse when...") {
           Choice laptop("...it was built on the same laptop.", "That's what hermetic avoids: the machine shouldn't matter.")
           Choice recent("...it was built recently.", "Age doesn't matter. A year-old copy is right if the inputs match, and a fresh one is wrong if they don't.")

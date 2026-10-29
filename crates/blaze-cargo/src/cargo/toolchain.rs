@@ -5,11 +5,12 @@
 //! runs or asks a rustc to learn anything (docs/no-rustc.md). A project that needs another
 //! Rust pins another blaze (`[workspace.metadata.blaze] version`).
 //!
-//! The files of the release (its cargo, the source of its standard library, the standard
-//! library of each target) are found on disk with nothing run: rustup's copy of the release
-//! when it has one with `rust-src`, else blaze's own copy (`own.rs`), downloaded the first time
-//! neither is there.
+//! The files of the release (its cargo, rustc and lld, the standard library of each target)
+//! are found on disk with nothing run: rustup's copy of the release when it has one, else
+//! blaze's own copy (`own.rs`), downloaded the first time neither is there. The source of the
+//! standard library is not the release's: it is blaze's own `library/` ([`library`]).
 
+pub mod library;
 pub mod own;
 
 pub use own::home;
@@ -79,15 +80,15 @@ impl std::fmt::Display for Chosen {
     }
 }
 
-/// The files of blaze's release, found with nothing run: rustup's copy with the source of the
-/// standard library, else blaze's own when it is whole. `None` when neither is there.
+/// The files of blaze's release, found with nothing run: rustup's copy, else blaze's own when it
+/// is whole. `None` when neither is there.
 pub fn found() -> Option<Chosen> {
     if let Some(dir) = FOUND.get() {
         return Some(chosen_at(dir.clone()));
     }
     let ours = OURS.trim();
     let chosen = match rustup_home().and_then(|home| installed(&home, ours)) {
-        Some(dir) if with_library(&dir, ours).is_ok() => Chosen::Rustup(dir),
+        Some(dir) => Chosen::Rustup(dir),
         _ => {
             let release = own::Release::ours()?;
             let dir = release.dir()?;
@@ -121,12 +122,27 @@ pub fn sysroot() -> Option<PathBuf> {
 }
 
 /// Has the cargo, rustc and daemon of this command be blaze's release, downloading blaze's
-/// own copy of it when there is none ([`found`]). They are named in `CARGO`, `RUSTC`, `RUSTDOC`
-/// and `RUSTUP_TOOLCHAIN` and are first on `PATH`, for the processes this one starts and not
-/// the user's shell, whatever the user set them to or a toolchain file names. `Err` is why
-/// the command can't be built, said for the user to act on. Before any thread starts: it sets
-/// the environment.
+/// own copy of it when there is none ([`found`]), and the standard library's source be blaze's
+/// ([`library::fetch`], downloaded beside it when it is not here). They are named in `CARGO`,
+/// `RUSTC`, `RUSTDOC`, `RUSTUP_TOOLCHAIN` and [`library::VAR`] and are first on `PATH`, for
+/// the processes this one starts and not the user's shell, whatever the user set them to or a
+/// toolchain file names. `Err` is why the command can't be built, said for the user to act on.
+/// Before any thread starts: it sets the environment, once the threads it starts are done.
 pub fn settle() -> Result<Chosen, String> {
+    let library = std::thread::scope(|scope| {
+        let library = scope.spawn(library::fetch);
+        let chosen = release();
+        let library = library.join().unwrap_or_else(|_| Err("finding it panicked".to_owned()));
+        chosen.map(|chosen| (chosen, library))
+    });
+    let (chosen, library) = library?;
+    library::publish_fetched(&library?);
+    use_toolchain(chosen.dir());
+    Ok(chosen)
+}
+
+/// [`found`], else blaze's own copy of the release, downloaded.
+fn release() -> Result<Chosen, String> {
     let ours = OURS.trim();
     let chosen = match found() {
         Some(chosen) => chosen,
@@ -148,7 +164,6 @@ pub fn settle() -> Result<Chosen, String> {
             Chosen::Own(dir)
         }
     };
-    use_toolchain(chosen.dir());
     Ok(chosen)
 }
 
@@ -250,18 +265,6 @@ fn installed(home: &Path, release: &str) -> Option<PathBuf> {
         name[prefix.len()..].starts_with(std::env::consts::ARCH) && name.contains(os)
     };
     found.iter().find(|it| host(it)).or(found.first()).cloned()
-}
-
-/// `Ok` when the toolchain at `sysroot` has the source of its standard library, which the
-/// daemon compiles.
-fn with_library(sysroot: &Path, release: &str) -> Result<(), String> {
-    if sysroot.join("lib/rustlib/src/rust/library").is_dir() {
-        return Ok(());
-    }
-    Err(format!(
-        "Rust {release} has no source of its standard library, which blaze compiles: \
-         `rustup component add rust-src --toolchain {release}` adds it"
-    ))
 }
 
 #[cfg(test)]

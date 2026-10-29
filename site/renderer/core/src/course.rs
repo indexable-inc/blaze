@@ -1,5 +1,5 @@
 //! The course as a graph (content/schema.flecs: Lesson, Update, Theme, Requires, InTheme), laid out for the home
-//! page's path. Built once from the world; render.rs draws it, side.rs and spoken.rs read it.
+//! page's path. Built once from the world; render.rs draws it, side.rs reads it.
 //!
 //! - The nodes are the Lesson and Update pages under a Course's `(Lessons, page)` targets.
 //! - An edge `(Requires, page)` says which node to learn first. A node may require one in its own theme or an earlier

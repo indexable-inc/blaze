@@ -10,28 +10,22 @@ site {
       (Requires, site.learn.builds)
       Title: {"Proc macros"}
       Description: {"Lesson 3: what proc macros are, and why blaze runs them as sandboxed WebAssembly."}
-      Intro: {"[warm] Lesson three. Proc macros: little programs that run in the middle of your build, and why blaze puts them in a box."}
-      Outro: {"[warm] That's lesson three. A macro in a sealed box always gives the same answer, so its answer can be kept. Next: sealing the rest of the build."}
 
       Step what("Code that writes code") {
-        Say: {"A proc macro is a small Rust program that runs while your code compiles. Derive Serialize is one: it reads your struct, and writes the code that lets serde turn it into JSON, or another format."}
         P program("A **proc macro** is a small Rust program that runs while your code compiles.")
         P derive("`#[derive(Serialize)]` is one: it reads your struct and writes the code that lets serde turn it into JSON or another format.")
       }
 
       Step every("It runs every time its crate compiles") {
-        Say: {"The code a macro writes is code your crate needs, so the compiler has to run the macro before it can compile what's around it. Every use of a macro is one more run."}
         P before("The code a macro writes is code your crate needs, so the compiler has to run the macro before it can compile what's around it. Every use of a macro is one more run.")
       }
 
       Step keep("Why not keep the answer?") {
-        Say: {"[curious] If the same macro gets the same input, you'd like to keep its output and skip the run. But a normal proc macro is native code. It can read any file, check the clock, or use the network, so next time it might answer differently. Keeping what it wrote is a bet that it didn't."}
         P same("If the same macro gets the same input, you'd want to keep its output and skip the run.")
         P but("But a normal proc macro is native code: it can read any file, check the clock or use the network, so next time it might answer differently. Keeping what it wrote is a bet that it didn't.")
       }
 
       Step clock("A macro that reads the time") {
-        Silent
         Quiz q(prompt: "A macro reads the current time and writes it into your code. Why does that stop anyone keeping its output?") {
           Choice slow("Reading the time is slow.", "Speed isn't the problem. The problem is that a kept copy would hold an old time.")
           Choice changes("Run again, it would write something different, so a kept copy could be wrong.", "The output depends on something that isn't its input, so the same input no longer means the same output.") {
@@ -42,25 +36,21 @@ site {
       }
 
       Step sealed("A sealed box") {
-        Say: {"[thoughtful] So blaze builds each proc macro to WebAssembly, and runs it in a sandbox. Inside, the macro sees only its own package, read-only, and the variables cargo gives it. Its clock reads zero, and its random numbers are the same on every run."}
         P wasm("blaze builds each proc macro to **WebAssembly** and runs it in a sandbox.")
         P sees("Inside, the macro sees only its own package, read-only, and the variables cargo gives it. Its clock reads zero, and its random numbers are the same on every run.")
       }
 
       Step reach("What can it read?") {
-        Silent
         Tap q(prompt: "Tap everything a proc macro can read inside blaze's sandbox.", piece: "sandbox", right: "package,vars", hint: "It sees its own package and what cargo hands it. Nothing else.", why: "Its own package, read-only, and cargo's variables for the crate. Your home folder, the network and other crates' files are all outside the box.")
       }
 
       Step kept("Now the answer can be kept") {
-        Say: {"Sealed like that, an expansion is a pure function: the same macro with the same input gives the same output, every time. So blaze keeps each expansion in its store, and when the same input comes again, it uses the kept copy without running the macro. For now, only the same checkout finds those copies."}
         P pure("Sealed like that, an expansion is a **pure function**: the same macro with the same input gives the same output, every time.")
         Art art(piece: "cache", label: "A pattern goes into a sealed square and comes out changed, and a copy of the result is kept on a shelf above it. The same pattern arrives again, and the kept copy comes out without the square doing any work.")
         P reuse("So blaze keeps each expansion in its store and, when the same input comes again, uses the kept copy without running the macro. For now only the same checkout finds them.")
       }
 
       Step why_wasm("Why WebAssembly?") {
-        Silent
         Quiz q(prompt: "Why does blaze run proc macros as sandboxed WebAssembly?") {
           Choice speed("Because WebAssembly runs faster than native code.", "Usually it doesn't. The point is what the macro can't reach, not speed.")
           Choice langs("So macros can be written in other languages.", "They're still Rust macros, built from the same source. The sandbox is about what they can reach.")
@@ -71,7 +61,6 @@ site {
       }
 
       Step scripts("Build scripts too") {
-        Say: {"Build scripts, the build dot r s files, get the same idea, in an operating system sandbox. The machine is read-only to them, the only place they really write is their own output folder, and there's no network. That makes their runs safe to keep, too."}
         P too("`build.rs` scripts get the same idea, in an operating-system sandbox: the machine is read-only to them, the only place they really write is their own output folder, and there is no network. So their runs can be kept too.")
       }
     }
