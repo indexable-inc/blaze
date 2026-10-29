@@ -1714,10 +1714,13 @@ impl<'a> Plan<'_, 'a> {
         bytes.extend_from_slice(&shstrtab);
         bytes.resize(shoff as usize, 0);
         for h in &headers {
-            bytes.extend_from_slice(&(h[0] as u32).to_le_bytes());
-            bytes.extend_from_slice(&(h[1] as u32).to_le_bytes());
-            for field in &h[2..] {
-                bytes.extend_from_slice(&field.to_le_bytes());
+            for (i, field) in h.iter().enumerate() {
+                // sh_name, sh_type, sh_link and sh_info are 32 bits.
+                if matches!(i, 0 | 1 | 6 | 7) {
+                    bytes.extend_from_slice(&(*field as u32).to_le_bytes());
+                } else {
+                    bytes.extend_from_slice(&field.to_le_bytes());
+                }
             }
         }
         bytes[0x28..0x30].copy_from_slice(&shoff.to_le_bytes());

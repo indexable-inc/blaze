@@ -686,7 +686,7 @@ def facts(img: Image) -> dict[str, object]:
     return {
         "e_type": e.type,
         "entry": img.what(e.entry),
-        "PT_INTERP": e.data[interp[1]:interp[1] + interp[5]].rstrip(b"\0").decode() if interp else None,
+        "PT_INTERP": e.data[interp[2]:interp[2] + interp[5]].rstrip(b"\0").decode() if interp else None,
         "PT_TLS (filesz, memsz, align)": (tls[5], tls[6], tls[7]) if tls else None,
         "PT_GNU_STACK flags": stack[1] if stack else None,
         "PT_GNU_RELRO": segment(img, PT_GNU_RELRO) is not None,
