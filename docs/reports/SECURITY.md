@@ -1,3 +1,8 @@
+---
+status: record
+summary: Security review of the store, the remote and the daemon's boundaries.
+date: 2026-10-20
+---
 # Security review of the store, the remote and the daemon's boundaries
 
 Branch `blaze-security`, on top of `blaze-collate` at ce52276cf5, which has the S3 remote

@@ -1,3 +1,7 @@
+---
+status: current
+summary: Reading Cargo.toml and .cargo/config.toml as cargo does (blaze-manifest), compared with cargo by harness/resolve.py.
+---
 # Reading workspaces as cargo does
 
 blaze reads `Cargo.toml` and `.cargo/config.toml` itself, the way cargo reads them (ported
@@ -220,7 +224,7 @@ On an arm64 ix VM, 2026-10-27: 13 of 14 equal, 78 runs and 34,124 units, none di
 (zed 10,155, biome 6,016, bevy 4,625, nushell 3,649, cargo 2,322, helix 2,043, bat 1,586,
 axum 1,215, just 837, hyperfine 800, fd 499, ripgrep 332, the fixture 45). bun is refused by
 both, its vendored sources being made by its own build (`harness/bunprep.py`): cargo names the
-missing `vendor/lolhtml` first, blaze-metadata the missing `vendor/rust-argon2`, as it reads
+missing vendored lolhtml first, blaze-metadata the missing vendored rust-argon2, as it reads
 path packages in another order than cargo's resolver asks for them.
 
 The `ctdeps` part (named only: it builds what it compares) holds blaze's own build of a load's
@@ -255,7 +259,8 @@ package its own build makes (`harness/bunprep.py`).
 ## Decisions
 
 **cargo's schema crate, pinned.** `cargo-util-schemas = "=0.14.3"` is the version cargo 1.99.0
-is built with: its published source is the same, file for file, as `crates/cargo-util-schemas`
+is built with: its published source is the same, file for file, as
+[crates/cargo-util-schemas](https://github.com/rust-lang/cargo/tree/1.99.0/crates/cargo-util-schemas)
 in cargo's 1.99.0 tree. Using it means a manifest deserializes into exactly the types cargo's
 does and fails with exactly cargo's messages (package names, versions, `PackageIdSpec`, git
 references, lints), and the lock file and index types are there for blaze-resolve and

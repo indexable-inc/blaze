@@ -126,31 +126,58 @@ impl World {
         v
     }
 
-    /// A `Course` widget's lessons: those under its `(Lessons, <page>)` target, or under the page holding it.
-    pub fn course_source(&self, course: Id) -> Result<Id, String> {
+    /// The pages a `Course` widget's lessons and updates are under: its `(Lessons, <page>)` targets, or the page
+    /// holding it.
+    pub fn course_sources(&self, course: Id) -> Result<Vec<Id>, String> {
         let e = self.get(course);
-        match e.targets("Lessons").and_then(|t| t.first()) {
-            Some(path) => self
-                .lookup(path)
-                .ok_or_else(|| format!("{}: (Lessons, {path}) names nothing", e.path)),
-            None => e.parent.ok_or_else(|| format!("{}: Course has no parent", e.path)),
+        match e.targets("Lessons") {
+            Some(paths) if !paths.is_empty() => paths
+                .iter()
+                .map(|path| {
+                    self.lookup(path)
+                        .ok_or_else(|| format!("{}: (Lessons, {path}) names nothing", e.path))
+                })
+                .collect(),
+            _ => Ok(vec![e.parent.ok_or_else(|| format!("{}: Course has no parent", e.path))?]),
         }
     }
 
     /// The `Course` widget on a page (not looking into the page's child pages), if it has one.
     pub fn course_in(&self, page: Id) -> Option<Id> {
+        self.tagged_in(page, "Course")
+    }
+
+    /// The first block on a page with the tag `tag` (not looking into the page's child pages), if any.
+    pub fn tagged_in(&self, page: Id, tag: &str) -> Option<Id> {
         let mut todo: Vec<Id> = self.get(page).children.clone();
         while let Some(n) = todo.pop() {
             let e = self.get(n);
             if e.is_a("Page") {
                 continue;
             }
-            if e.has_tag("Course") {
+            if e.has_tag(tag) {
                 return Some(n);
             }
             todo.extend(e.children.iter().copied());
         }
         None
+    }
+
+    /// The course whose lessons or updates are under `parent`: the page holding its `Course` widget, and the graph.
+    pub fn course_of(
+        &self,
+        pages: &[crate::render::Page],
+        parent: Id,
+    ) -> Result<Option<(usize, crate::course::Course)>, String> {
+        for (i, p) in pages.iter().enumerate() {
+            if let Some(c) = self.course_in(p.node) {
+                let sources = self.course_sources(c)?;
+                if sources.contains(&parent) {
+                    return Ok(Some((i, crate::course::build(self, &sources)?)));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Every entity, parents before children.

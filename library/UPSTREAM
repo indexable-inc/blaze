@@ -1,8 +1,7 @@
 # blaze's standard library (library/) is the Rust project's at this commit, as the
 # nightly's rust-src has it: library/ of rust-lang/rust with the backtrace submodule,
 # std's third-party crates in vendor/ and .cargo/config.toml. Written by
-# harness/library.py from the nightly's channel manifest; blaze's own changes to it are
-# in PATCHES.md.
+# harness/library.py from the nightly's channel manifest.
 repo https://github.com/rust-lang/rust
 commit 16d1ffac17ad8b739e32483ac2e65fe7e1804977
 nightly nightly-2026-10-27

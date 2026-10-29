@@ -21,7 +21,7 @@ whose `blaze test` passes `tests` tests. A project is a repository at a pinned c
 and whose `blaze test` (with the arguments of `test`) passes. A private repository is fetched with GH_TOKEN. A project may have
 `env` for its builds, `seconds` for each command (default 3600), and `prepare`, a module of the
 harness whose `prepare(checkout)` gives the tree to build and the environment its builds need
-(bun: bunprep.py, its own build of its C and C++). Its `builds` are `blaze build` with `args` in
+(bun: bunprep.py, its own build of its C and C++; flox: floxprep.py, its Nix build's). Its `builds` are `blaze build` with `args` in
 the checkout's `dir` (a workspace of its own, as dynamo's Python bindings are), each then running
 `then` (`{target}` is that directory's target/<profile>) to print what it says. `macos` holds the
 fields that are otherwise on macOS, and `excluded` says what the corpus leaves out of a project

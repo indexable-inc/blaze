@@ -1,3 +1,7 @@
+---
+status: current
+summary: The harnesses that compare blaze with rustc, what each checks, and how CI runs them.
+---
 # The harnesses
 
 blaze is tested by comparison with rustc. Almost every script under `harness/` builds
@@ -165,6 +169,7 @@ writes them again.
 | `programs.py` | Two programs of one workspace built by one daemon. With `BLAZE_ALONE=1` rustc builds stand-ins for the workspace's crates and the daemon compiles every function of both programs, `main` too: under LLVM an edit of what both use has to reach each ([#63](https://github.com/indexable-inc/blaze/issues/63)) |
 | `worktrees.py` | Several checkouts of one workspace built by one daemon, edited independently |
 | `includes.py` | Edits to a file only `include!` names |
+| `staticcallbacks.py` | A `LazyLock` static whose initializer calls an `#[inline(always)]` helper of a dependency: an edit of a sibling of the helper, then of the helper itself, under one daemon, each printing what cargo's build prints (astral-experiments/blaze#83, #87) |
 | `latelisted.py` | What a file named by `include!` through a build script's variable declares is listed in its crate though the daemon reads the file only once the names are resolved, as bun's generated bindings are: an edit that adds a function then patches a few functions, not every one the file declares |
 | `rustsrc.py` | A toolchain without `rust-src` is turned down, saying how to install it |
 | `splices.py` | Edits that are hard on the splice: thread-locals, statics, vtables, function pointers, closures, panics, foreign calls. Counts how each step was linked |
@@ -365,7 +370,7 @@ for each platform, each on a machine of its own kind.
 | Workflow | Event | What runs | Wall time |
 |---|---|---|---|
 | `blaze.yaml` (`gate`) | pull request | on Linux x86-64: blaze builds blaze (`blaze build`) and tests it (`harness/unittests.py`, `blaze test`, only the tests the change reached), from the newest release and the store main pushed to blaze's remote; `harness/imports.py`, `harness/rustcsites.py` | 49 min on a store the release has not compiled into |
-| `blaze.yaml` (`warm`) | push to main | the same on Linux x86-64, AArch64 and macOS, every test, then a push of the store for the runs after it; and on Linux x86-64 the std cases of the smoke corpus (`harness/smoke.py`, [release.md](release.md#the-smoke-corpus): `blaze run` and `blaze test`, dev and `--release`) with the blaze blaze built, 17 to 30 min until [#899](https://github.com/indexable-inc/blaze/issues/899) (74 s with rustc's) | |
+| `blaze.yaml` (`warm`) | push to main | the same on Linux x86-64, AArch64 and macOS, every test, then a push of the store for the runs after it. Its `linux x64 / build` passing is what cuts a canary (`canary.yaml`); the whole run green, unit tests on every platform, is what stable needs besides the promotion gate ([release.md](release.md)). And on Linux x86-64 the std cases of the smoke corpus (`harness/smoke.py`, [release.md](release.md#the-smoke-corpus): `blaze run` and `blaze test`, dev and `--release`) with the blaze blaze built, 17 to 30 min until [#899](https://github.com/indexable-inc/blaze/issues/899) (74 s with rustc's) | |
 | `fmt.yaml` | push to main | `cargo fmt --all`, and a commit `fmt` when it changed a file | 2 min |
 | `train.yaml` | push to main, by hand | everything below, then a release or the train's issue | about 45 min |
 | `blaze.yaml` | a change the build and the unit tests do not read | the two scripts | 1 min |
@@ -375,14 +380,27 @@ change runs the two scripts alone. `.github/scripts/gate_changes.py` (the `chang
 those files, and why each: the crates (`crates/`, with their test data, the LLVM pin
 `crates/hir-ty-codegen/llvm.json` and the toolchain's `pins.txt`), the vendored crates
 (`vendor/`), `Cargo.toml`, `Cargo.lock`, `.cargo/`, `.rustfmt.toml` and `.clippy.toml`, the
-pinned nightly (`harness/toolchain`), `harness/unittests.py`, the flake (`flake.nix`,
-`flake.lock`), the release of blaze that builds blaze (`.github/blaze-version`, `install.sh`),
-`blaze.yaml`, `blaze-platform.yaml` and the actions they use (`toolchain`, `blaze`,
-`blaze-remote`, `rust-tests`); on a push to main, the smoke corpus too (`harness/smoke.py`,
+pinned nightly (`harness/toolchain`), `harness/unittests.py`, `.github/scripts/llvm.py`
+(which fetches the pinned LLVM), the release of blaze that builds blaze (`.github/blaze-version`,
+`install.sh`), `blaze.yaml`, `blaze-platform.yaml` and the actions they use (`toolchain`,
+`blaze`, `blaze-remote`, `rust-tests`); on a push to main, the smoke corpus too (`harness/smoke.py`,
 `harness/smoke/`), which the `warm` tier runs. It names what is code rather than what is not,
 so a new directory of documents, benches or harnesses runs no build; a list of files that
 cannot be had (a run by hand, a comparison of 300 files or more, GitHub refusing) counts as
 code. When the build or the unit tests start reading a new file, add it there.
+
+The build and the unit tests of the `gate` and `warm` tiers install no rustup and no Nix: a
+checkout, then `.github/actions/blaze`, which installs the release of blaze as a user does, with
+install.sh fetching its own Rust (the release's pinned `rustc`, `cargo`, `rust-std` and
+`rust-src`, into `~/.blaze/toolchains`,
+[self-contained.md](self-contained.md#blazes-own-toolchain-the-stopgap)), and for the build the
+pinned LLVM as a contributor outside Nix gets it
+([contributing.md](contributing.md#llvm-for---features-llvm)): `.github/scripts/llvm.py fetch`
+into `/usr/local/lib/blaze-llvm/<triple>`, checked against `crates/hir-ty-codegen/llvm.json`'s
+sha256, as `LLVM_SYS_231_PREFIX`. Neither is cached by CI. The C compiler, linker and libc are
+the runner's (gcc and glibc 2.39 on Ubuntu 24.04, Xcode's clang on macOS), so what the build and
+the tests link runs on the runner; the train's tiers still build with cargo in the flake's dev
+shell, against its glibc, and their harness jobs install Nix for that.
 
 A change reaches main through a **pull request** alone
 ([contributing.md](contributing.md#landing-a-change)), merged directly once `ci` passes on it;

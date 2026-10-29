@@ -4,6 +4,13 @@
     promote.py which '{"tag": ""}'
         the release promote.yaml tests: `tag`, or the newest dated release when it is empty;
         step outputs `tag`, `sha`, `prerelease`
+    promote.py tested '{"tag": "v0.YYYYMMDD.N", "sha": "<its commit>", "wait_minutes": 300}'
+        main's merge gate passed on the tag's commit: blaze.yaml's run on the push of that
+        commit to main ended green, the whole run, with its unit tests (`<platform> / tests`)
+        run and passed on Linux x86-64, Linux AArch64 and macOS. A canary is cut once that run's Linux x86-64 build passes, before
+        its tests; stable needs them. A run still going is waited for, at most `wait_minutes`;
+        no run, a red one, or one still going after that is an error naming the commit and the
+        run, and the release stays a canary
     promote.py promote '{"tag": "v0.YYYYMMDD.N", "run": "<run URL>", "bench": "<dir>"}'
         mark the release stable (not a prerelease) and Latest, unless a newer release is stable
         already; append the line saying so to its notes; the bench.py results under `bench`
@@ -30,7 +37,7 @@ The JSON is inline, a file's path, or `-` for stdin. The same tag is flipped: no
 again and no archive changes, so a version names the same bytes before and after. Needs gh (GH_TOKEN).
 Python 3.11+, stdlib.
 """
-import datetime, glob, json, os, re, subprocess, sys, tempfile, typing
+import datetime, glob, json, os, re, subprocess, sys, tempfile, time, typing
 from dataclasses import dataclass, fields
 
 REPO = os.environ.get("GITHUB_REPOSITORY", "indexable-inc/blaze")
@@ -41,6 +48,13 @@ DATED = re.compile(r"v(\d+)\.(\d+)\.(\d+)")
 @dataclass(frozen=True)
 class Which:
     tag: str = ""
+
+
+@dataclass(frozen=True)
+class Tested:
+    tag: str
+    sha: str
+    wait_minutes: int = 300
 
 
 @dataclass(frozen=True)
@@ -76,6 +90,12 @@ class Speed:
 
 
 POINTERS = "channels"
+# The merge gate, whose run on the push of a canary's commit to main stable needs green.
+GATE = ".github/workflows/blaze.yaml"
+# Its jobs that must have run and passed on that commit: a run that skipped them (a change to
+# nothing they read) is green without testing the commit.
+GATE_TESTS = ("linux x64 / tests", "linux arm64 / tests", "macos arm64 / tests")
+POLL_SECS = 120
 # bench.py counts no difference under 50 ms.
 FLOOR_SECS = 0.05
 
@@ -143,6 +163,40 @@ def which(tag):
         sys.exit(f"promote.py: no release {tag} (dated releases: {', '.join(sorted(known, key=key)[-5:])})")
     sha = gh("api", f"repos/{REPO}/commits/{tag}", "-q", ".sha").strip()
     output(tag=tag, sha=sha, prerelease=str(known[tag]["isPrerelease"]).lower())
+
+
+def tested(it):
+    """Exits unless main's merge gate on `it.sha` is green, after waiting for it to end."""
+    if not re.fullmatch(r"[0-9a-f]{40}", it.sha):
+        sys.exit(f"promote.py: field sha is a commit's full hash, not {it.sha!r}")
+    found = json.loads(gh("api", f"repos/{REPO}/actions/runs?head_sha={it.sha}&event=push&branch=main&per_page=20"))
+    runs = [r for r in found["workflow_runs"] if r["path"] == GATE]
+    if not runs:
+        sys.exit(f"promote.py: {it.tag} ({it.sha[:10]}) has no run of main's merge gate ({GATE} on a push to main), "
+                 "so its unit tests never ran on every platform; it stays a canary")
+    # A re-run keeps its run's id and status: the newest run of the newest attempt is the verdict.
+    gate = max(runs, key=lambda r: r["id"])
+    deadline = time.monotonic() + it.wait_minutes * 60
+    while gate["status"] != "completed":
+        if time.monotonic() >= deadline:
+            sys.exit(f"promote.py: main's merge gate on {it.sha[:10]} ({it.tag}) is still {gate['status']} after "
+                     f"{it.wait_minutes} min: {gate['html_url']}; it stays a canary until a run of promote.yaml after it is green")
+        print(f"main's merge gate on {it.sha[:10]} is {gate['status']}: {gate['html_url']}", flush=True)
+        time.sleep(POLL_SECS)
+        gate = json.loads(gh("api", f"repos/{REPO}/actions/runs/{gate['id']}"))
+    line = f"main's merge gate on {it.sha[:10]} ({it.tag}): {gate['conclusion']}, {gate['html_url']} (attempt {gate['run_attempt']})"
+    if path := os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(path, "a") as f:
+            f.write(f"- {line}\n")
+    if gate["conclusion"] != "success":
+        sys.exit(f"promote.py: {line}. Stable needs it green: re-run its failed jobs if they flaked, then "
+                 f"`gh workflow run promote.yaml -f tag={it.tag}`; {it.tag} stays a canary")
+    jobs = {j["name"]: j for j in json.loads(gh("api", f"repos/{REPO}/actions/runs/{gate['id']}/jobs?filter=latest&per_page=100"))["jobs"]}
+    if untested := [name for name in GATE_TESTS if jobs.get(name, {}).get("conclusion") != "success"]:
+        said = ", ".join(f"`{name}` {jobs[name]['conclusion'] if name in jobs else 'did not run'}" for name in untested)
+        sys.exit(f"promote.py: {line}, but not every platform's unit tests passed on that commit ({said}); "
+                 f"{it.tag} stays a canary")
+    print(f"{line}; {', '.join(GATE_TESTS)} passed")
 
 
 def promote(tag, run_url, bench):
@@ -283,6 +337,8 @@ def main():
     step, given = (args + [""])[:2] if len(args) <= 2 else ("", "")
     if step == "which":
         which(typed(Which, given).tag)
+    elif step == "tested":
+        tested(typed(Tested, given))
     elif step == "promote":
         it = typed(Promote, given)
         promote(it.tag, it.run, it.bench)

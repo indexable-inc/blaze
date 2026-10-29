@@ -101,6 +101,8 @@ HARNESSES = [
     # The assembler of a build of blaze without LLVM, which is the release's.
     ("core", ["asmedits.py"], {"BLAZE_ASSEMBLER": "cc"}, on("linux", "macos", backend="cranelift"), 1),
     ("core", ["includes.py"], {}, EVERYWHERE, 1),
+    # A lazy static's initializer inlines a dependency's helper, which is then edited.
+    ("core", ["staticcallbacks.py"], {}, on("linux", "macos"), None),
     ("core", ["latelisted.py"], {}, on("linux", "macos"), 1),
     ("core", ["rustsrc.py"], {}, EVERYWHERE, 1),
     # Each scenario runs rustc and rustdoc no more often than norustc/baseline.json says.
