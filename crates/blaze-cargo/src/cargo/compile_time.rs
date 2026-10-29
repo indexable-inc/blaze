@@ -24,7 +24,7 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Condvar, Mutex, MutexGuard},
+    sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock},
     time::SystemTime,
 };
 
@@ -79,8 +79,8 @@ pub fn build(
         .target_dir(Some(cargo.target_directory().as_ref()))
         .context("the load has no target directory of its own")?;
     let own = PathBuf::from(own.as_str()).join("compile-time");
-    let dir = manifest.parent().unwrap_or(Path::new("/"));
-    let mut driver = Driver::new(cargo, &graph, &toolchain, host, &own, dir, selection, config)?;
+    let mut driver =
+        Driver::new(cargo, &graph, &toolchain, host, &own, manifest, selection, config)?;
     driver.native = native;
     let ran = driver.run()?;
     Ok(driver.outputs(&ran))
@@ -142,6 +142,20 @@ struct Driver<'a> {
     /// the workspace expands natively (`own_macro::NATIVE_KEY`); `None` when every one is
     /// linked for blaze's server.
     native: Option<Vec<String>>,
+    /// The load's manifest, build and variables, as its unit graph was asked for.
+    manifest: PathBuf,
+    selection: Selection,
+    extra_env: FxHashMap<String, Option<String>>,
+    /// The unit graph of the build with [`own_macro::WASM_TARGET`] as its host, made once a
+    /// module links a crate with dependencies of that platform alone.
+    ///
+    /// [`own_macro::WASM_TARGET`]: super::own_macro::WASM_TARGET
+    wasm_graph: OnceLock<Result<Arc<UnitGraph>, String>>,
+    /// Whether the package of each unit has dependencies [`own_macro::WASM_TARGET`] has and
+    /// the host has not.
+    ///
+    /// [`own_macro::WASM_TARGET`]: super::own_macro::WASM_TARGET
+    wasm_only: Mutex<FxHashMap<usize, bool>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -180,10 +194,11 @@ impl<'a> Driver<'a> {
         toolchain: &'a Path,
         host: String,
         own: &'a Path,
-        dir: &Path,
+        manifest: &Path,
         selection: &Selection,
         config: &project_model::CargoConfig,
     ) -> anyhow::Result<Driver<'a>> {
+        let dir = manifest.parent().unwrap_or(Path::new("/"));
         let by_id: FxHashMap<String, Package> = cargo
             .packages()
             .map(|it| (crate::plan::package_named(&cargo[it].id.repr), it))
@@ -272,6 +287,11 @@ impl<'a> Driver<'a> {
             jobs: u32::try_from(jobs).unwrap_or(1),
             made: Mutex::new(Made_::default()),
             native: None,
+            manifest: manifest.to_owned(),
+            selection: selection.clone(),
+            extra_env: config.extra_env.clone(),
+            wasm_graph: OnceLock::new(),
+            wasm_only: Mutex::new(FxHashMap::default()),
         })
     }
 
@@ -505,22 +525,244 @@ impl<'a> Driver<'a> {
     /// The `--cfg`s rustc compiles the unit with beside the target's: its features,
     /// `debug_assertions` as its profile has it, and those of the flags.
     fn cfg(&self, at: usize) -> Vec<String> {
-        let unit = self.unit(at);
-        let mut cfg: Vec<String> =
-            unit.features.iter().map(|it| format!("feature={}", quoted(it))).collect();
-        if unit.profile.debug_assertions {
-            cfg.push("debug_assertions".to_owned());
+        unit_cfg(self.unit(at), &self.platform(at).rustflags)
+    }
+
+    /// Adds to `crates`, the description of the module of the proc macro of unit `at` with
+    /// where each unit is in it (`linked`), the libraries its crates link only when built for
+    /// [`own_macro::WASM_TARGET`]: a dependency of `cfg(target_os = "wasi")` (getrandom 0.2's
+    /// `wasi`), which the load's graph, of the host, has not. They are taken from the graph of
+    /// the build for that target, made only when a crate of the module has such dependencies.
+    ///
+    /// [`own_macro::WASM_TARGET`]: super::own_macro::WASM_TARGET
+    fn link_for_wasm(
+        &self,
+        at: usize,
+        crates: &mut Vec<Described>,
+        linked: &FxHashMap<usize, usize>,
+    ) -> anyhow::Result<()> {
+        let mut units: Vec<usize> = linked.keys().copied().collect();
+        units.sort_unstable();
+        let mut wanted = false;
+        for &it in &units {
+            wanted |= self.has_wasm_only(it)?;
         }
-        let flags = self.platform(at).rustflags.iter().chain(unit.profile.rustflags.iter());
-        let mut flags = flags.map(String::as_str);
-        while let Some(flag) = flags.next() {
-            if flag == "--cfg" {
-                cfg.extend(flags.next().map(str::to_owned));
-            } else if let Some(it) = flag.strip_prefix("--cfg=") {
-                cfg.push(it.to_owned());
+        if !wanted {
+            return Ok(());
+        }
+        let wasm = self.wasm_graph()?;
+        let unit = self.unit(at);
+        let same = |host: &Unit, wasm: &Unit| {
+            host.pkg_id == wasm.pkg_id
+                && host.target.name == wasm.target.name
+                && host.is_proc_macro() == wasm.is_proc_macro()
+                && wasm.is_linked()
+        };
+        let counterpart = wasm.units.iter().enumerate().filter(|(_, it)| same(unit, it));
+        let counterpart = counterpart.max_by_key(|(_, it)| it.features == unit.features);
+        let (first, _) = counterpart.with_context(|| {
+            format!("the graph of the build for wasm32-wasip1 has no proc macro `{}`", unit.pkg_id)
+        })?;
+        // Each unit of the host's graph in the module with its counterpart in `wasm`, and the
+        // units of `wasm` described here, by where they are in `crates`.
+        let mut queue = vec![(at, first)];
+        let mut paired = FxHashSet::default();
+        let mut described: FxHashMap<usize, usize> = FxHashMap::default();
+        while let Some((host, built)) = queue.pop() {
+            if !paired.insert(host) {
+                continue;
+            }
+            let host_deps: Vec<usize> =
+                self.deps(host).filter(|&it| self.unit(it).is_linked()).collect();
+            for dep in &wasm.units[built].dependencies {
+                let Some(it) = wasm.units.get(dep.index).filter(|it| it.is_linked()) else {
+                    continue;
+                };
+                if let Some(&mate) = host_deps.iter().find(|&&h| same(self.unit(h), it)) {
+                    queue.push((mate, dep.index));
+                    continue;
+                }
+                let name = match dep.extern_crate_name.is_empty() {
+                    true => it.crate_name(),
+                    false => dep.extern_crate_name.clone(),
+                };
+                let module = &unit.pkg_id;
+                let index =
+                    self.describe_wasm(&wasm, dep.index, module, crates, linked, &mut described)?;
+                crates[linked[&host]].deps.push((name, index));
             }
         }
-        cfg
+        Ok(())
+    }
+
+    /// Adds unit `at` of `wasm`, the graph for [`own_macro::WASM_TARGET`], to `crates`
+    /// described, as a library the module of the proc macro of the package `module` links
+    /// there alone, with what it links: where it is in them. What is in the host's graph too
+    /// is described as `linked` has it; what is not as `described` has it.
+    ///
+    /// [`own_macro::WASM_TARGET`]: super::own_macro::WASM_TARGET
+    fn describe_wasm(
+        &self,
+        wasm: &UnitGraph,
+        at: usize,
+        module: &str,
+        crates: &mut Vec<Described>,
+        linked: &FxHashMap<usize, usize>,
+        described: &mut FxHashMap<usize, usize>,
+    ) -> anyhow::Result<usize> {
+        if let Some(&it) = described.get(&at) {
+            return Ok(it);
+        }
+        let unit = &wasm.units[at];
+        let host = linked.keys().find(|&&it| {
+            let it = self.unit(it);
+            it.pkg_id == unit.pkg_id && it.target.name == unit.target.name
+        });
+        if let Some(host) = host {
+            return Ok(linked[host]);
+        }
+        let scripted = unit.dependencies.iter().any(|it| {
+            wasm.units.get(it.index).is_some_and(|it| it.is_run() && it.pkg_id == unit.pkg_id)
+        });
+        if scripted || unit.is_proc_macro() {
+            anyhow::bail!(
+                "the proc macro `{module}` links `{}` only when built for wasm32-wasip1, and it \
+                 is a proc macro or has a build script, which blaze builds for the host alone",
+                unit.pkg_id
+            );
+        }
+        let crate_name = unit.crate_name();
+        let index = crates.len();
+        crates.push(Described {
+            name: crate_name.clone(),
+            root: unit.target.src_path.clone(),
+            edition: unit.target.edition.clone(),
+            cfg: unit_cfg(unit, &[]),
+            env: self.manifest_env(&unit.target.src_path, &crate_name)?,
+            deps: Vec::new(),
+            proc_macro: None,
+            compiled_macro: false,
+            inputs: None,
+        });
+        described.insert(at, index);
+        for dep in &unit.dependencies {
+            let Some(it) = wasm.units.get(dep.index).filter(|it| it.is_linked()) else {
+                continue;
+            };
+            let name = match dep.extern_crate_name.is_empty() {
+                true => it.crate_name(),
+                false => dep.extern_crate_name.clone(),
+            };
+            let found = self.describe_wasm(wasm, dep.index, module, crates, linked, described)?;
+            crates[index].deps.push((name, found));
+        }
+        Ok(index)
+    }
+
+    /// Whether the manifest of unit `at`'s package has a `[target.'cfg(..)'.dependencies]`
+    /// table that [`own_macro::WASM_TARGET`] has and the unit's platform has not.
+    ///
+    /// [`own_macro::WASM_TARGET`]: super::own_macro::WASM_TARGET
+    fn has_wasm_only(&self, at: usize) -> anyhow::Result<bool> {
+        if let Some(&it) = lock(&self.wasm_only).get(&at) {
+            return Ok(it);
+        }
+        let manifest = &self.package(at)?.manifest;
+        let text =
+            std::fs::read_to_string(manifest).with_context(|| format!("reading {manifest}"))?;
+        let table: toml::Table =
+            toml::from_str(&text).with_context(|| format!("reading {manifest}"))?;
+        let wasm_cfg = cfgs(&said(&["--print", "cfg", "--target", super::own_macro::WASM_TARGET])?);
+        let platform = self.platform(at);
+        let host_cfg = cfgs(&platform.cfg.join("\n"));
+        let tables = table.get("target").and_then(toml::Value::as_table).into_iter().flatten();
+        let mut found = false;
+        for (key, value) in tables {
+            let Ok(target) = key.parse::<cargo_platform::Platform>() else { continue };
+            let deps = value.get("dependencies").and_then(toml::Value::as_table);
+            if deps.is_some_and(|it| !it.is_empty())
+                && target.matches(super::own_macro::WASM_TARGET, &wasm_cfg)
+                && !target.matches(&platform.triple, &host_cfg)
+            {
+                found = true;
+                break;
+            }
+        }
+        lock(&self.wasm_only).insert(at, found);
+        Ok(found)
+    }
+
+    /// The unit graph of the load's build with [`own_macro::WASM_TARGET`] as its host, the
+    /// platform its proc macros and what they link are built for.
+    ///
+    /// [`own_macro::WASM_TARGET`]: super::own_macro::WASM_TARGET
+    fn wasm_graph(&self) -> anyhow::Result<Arc<UnitGraph>> {
+        let made = self.wasm_graph.get_or_init(|| {
+            let target = super::own_macro::WASM_TARGET;
+            let printed =
+                said(&["--print", "cfg", "--target", target]).map_err(|it| format!("{it:#}"))?;
+            let cfg = atoms(&printed);
+            let selection = Selection { target: None, ..self.selection.clone() };
+            let asked = crate::plan::Asked { triple: target, cfg: &cfg, env: &self.extra_env };
+            UnitGraph::asked(&self.manifest, &selection, &asked).map_err(|it| format!("{it:#}"))
+        });
+        made.clone().map_err(|why| {
+            anyhow::anyhow!("making the build's unit graph for wasm32-wasip1: {why}")
+        })
+    }
+
+    /// The variables cargo sets for rustc of the crate `crate_name` whose root is `root`, of
+    /// the package whose manifest is the nearest above it: a package of a registry, which no
+    /// build script of the load ran for.
+    fn manifest_env(
+        &self,
+        root: &Path,
+        crate_name: &str,
+    ) -> anyhow::Result<BTreeMap<String, String>> {
+        let manifest = root
+            .ancestors()
+            .skip(1)
+            .map(|it| it.join("Cargo.toml"))
+            .find(|it| it.is_file())
+            .with_context(|| format!("no Cargo.toml above {}", root.display()))?;
+        let text = std::fs::read_to_string(&manifest)
+            .with_context(|| format!("reading {}", manifest.display()))?;
+        let table: toml::Table =
+            toml::from_str(&text).with_context(|| format!("reading {}", manifest.display()))?;
+        let package = table.get("package").and_then(toml::Value::as_table);
+        let package =
+            package.with_context(|| format!("{} has no [package]", manifest.display()))?;
+        let field = |name: &str| match package.get(name) {
+            Some(toml::Value::String(it)) => it.clone(),
+            Some(toml::Value::Array(it)) => {
+                it.iter().filter_map(toml::Value::as_str).collect::<Vec<_>>().join(":")
+            }
+            _ => String::new(),
+        };
+        let version = semver::Version::parse(&field("version"))
+            .with_context(|| format!("the version of {}", manifest.display()))?;
+        let mut env = BTreeMap::new();
+        let mut set = |name: &str, value: String| _ = env.insert(name.to_owned(), value);
+        set("CARGO", self.tools.cargo.display().to_string());
+        let dir = manifest.parent().unwrap_or(Path::new("/"));
+        set("CARGO_MANIFEST_DIR", dir.display().to_string());
+        set("CARGO_MANIFEST_PATH", manifest.display().to_string());
+        set("CARGO_PKG_VERSION", version.to_string());
+        set("CARGO_PKG_VERSION_MAJOR", version.major.to_string());
+        set("CARGO_PKG_VERSION_MINOR", version.minor.to_string());
+        set("CARGO_PKG_VERSION_PATCH", version.patch.to_string());
+        set("CARGO_PKG_VERSION_PRE", version.pre.to_string());
+        set("CARGO_PKG_NAME", field("name"));
+        set("CARGO_PKG_AUTHORS", field("authors"));
+        set("CARGO_PKG_DESCRIPTION", field("description"));
+        set("CARGO_PKG_HOMEPAGE", field("homepage"));
+        set("CARGO_PKG_REPOSITORY", field("repository"));
+        set("CARGO_PKG_LICENSE", field("license"));
+        set("CARGO_PKG_LICENSE_FILE", field("license-file"));
+        set("CARGO_PKG_RUST_VERSION", field("rust-version"));
+        set("CARGO_PKG_README", field("readme"));
+        set("CARGO_CRATE_NAME", crate_name.to_owned());
+        Ok(env)
     }
 
     /// The variables cargo sets for rustc of the unit's crate that its source can read with
@@ -721,6 +963,9 @@ impl<'a> Driver<'a> {
         let wasm = self.native.as_ref().is_some_and(|native| !native.contains(&name));
         if !wasm && super::own_macro::server().is_none() {
             anyhow::bail!("`{name}`: {}", super::own_macro::missing_server());
+        }
+        if wasm {
+            self.link_for_wasm(at, &mut crates, &linked)?;
         }
         let made = Made {
             name: &name,
@@ -937,6 +1182,38 @@ fn quoted(value: &str) -> String {
 /// The cfgs of `rustc --print cfg`'s lines.
 fn cfgs(printed: &str) -> Vec<cargo_platform::Cfg> {
     printed.lines().filter_map(|it| it.parse().ok()).collect()
+}
+
+/// The cfgs of `rustc --print cfg`'s lines, as rust-analyzer has them.
+fn atoms(printed: &str) -> Vec<cfg::CfgAtom> {
+    let symbol = intern::Symbol::intern;
+    let atom = |line: &str| match line.split_once('=') {
+        Some((key, value)) => {
+            cfg::CfgAtom::KeyValue { key: symbol(key), value: symbol(value.trim_matches('"')) }
+        }
+        None => cfg::CfgAtom::Flag(symbol(line)),
+    };
+    printed.lines().filter(|it| !it.is_empty()).map(atom).collect()
+}
+
+/// The `--cfg`s rustc compiles `unit` with beside the target's, for a platform whose units
+/// cargo passes `rustflags`: its features, `debug_assertions` as its profile has it, and
+/// those of the flags.
+fn unit_cfg(unit: &Unit, rustflags: &[String]) -> Vec<String> {
+    let mut cfg: Vec<String> =
+        unit.features.iter().map(|it| format!("feature={}", quoted(it))).collect();
+    if unit.profile.debug_assertions {
+        cfg.push("debug_assertions".to_owned());
+    }
+    let mut flags = rustflags.iter().chain(unit.profile.rustflags.iter()).map(String::as_str);
+    while let Some(flag) = flags.next() {
+        if flag == "--cfg" {
+            cfg.extend(flags.next().map(str::to_owned));
+        } else if let Some(it) = flag.strip_prefix("--cfg=") {
+            cfg.push(it.to_owned());
+        }
+    }
+    cfg
 }
 
 /// The key of each unit of `graph`: what it is and the keys of what it depends on.

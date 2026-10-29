@@ -517,11 +517,12 @@ pub mod mem {
 
     // region:transmute
     #[rustc_intrinsic]
-    pub fn transmute<Src, Dst>(src: Src) -> Dst;
+    pub const fn transmute<Src, Dst>(src: Src) -> Dst;
     // endregion:transmute
 
     // region:size_of
     #[rustc_intrinsic]
+    #[rustc_comptime]
     pub fn size_of<T>() -> usize;
     // endregion:size_of
 
@@ -1618,6 +1619,17 @@ pub mod option {
     // endregion:copy
 
     impl<T> Option<T> {
+        pub const fn is_some(&self) -> bool {
+            match self {
+                Some(_) => true,
+                None => false,
+            }
+        }
+
+        pub const fn is_none(&self) -> bool {
+            !self.is_some()
+        }
+
         pub const fn unwrap(self) -> T {
             match self {
                 Some(val) => val,
@@ -2056,6 +2068,9 @@ pub mod str {
         fn from_str(s: &str) -> Result<Self, Self::Err>;
     }
     impl str {
+        pub const fn as_bytes(&self) -> &[u8] {
+            unsafe { &*(self as *const str as *const [u8]) }
+        }
         pub fn parse<F: FromStr>(&self) -> Result<F, F::Err> {
             FromStr::from_str(self)
         }

@@ -52,13 +52,14 @@ is, `#![feature(...)]` included. A project that needs another Rust pins another 
 `cargo` still builds with the project's toolchain, in the same target directory: cargo keys
 what it builds by the rustc, so neither rebuilds the other's.
 
-Where the nightly's files come from, found with nothing run: rustup's `nightly-2026-10-27`
-with `rust-src`, when rustup has it (only as a copy of the same files; what rustup would pick
+Where the nightly's files come from, found with nothing run: rustup's `nightly-2026-10-27`,
+when rustup has it (only as a copy of the same files; what rustup would pick
 is not asked); else blaze's own copy in
 `~/.blaze/toolchains/nightly-2026-10-27-<host>` (`BLAZE_HOME` moves `~/.blaze`), laid out as rustup lays
 out a toolchain. blaze downloads its copy the first time it needs it, once, with a line on
-stderr while it does: rustc, cargo, the standard library and its source from the Rust project's
-own servers, 97 MB on macOS, 134 MB on Linux x86-64 and 118 MB on Linux ARM64 (548 MB on macOS
+stderr while it does: rustc, cargo and the built standard library from the Rust project's
+own servers (the standard library's source is blaze's own `library/`, a 6.0 MB archive from
+blaze's release, [toolchain.md](toolchain.md#the-standard-library-library)), 97 MB on macOS, 134 MB on Linux x86-64 and 118 MB on Linux ARM64 (548 MB on macOS
 and 710 MB on Linux x86-64 once unpacked). Each file's sha256 is built
 into blaze, from the nightly's published manifest (`harness/toolchain_pins.py` writes them into
 `crates/blaze-cargo/src/cargo/toolchain/pins.txt`), and a file with other bytes is refused. Concurrent

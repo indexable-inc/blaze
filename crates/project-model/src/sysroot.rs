@@ -352,7 +352,9 @@ impl Sysroot {
                 RustLibSrcWorkspace::Empty => true,
             };
             if !has_core {
-                let var_note = if env::var_os("RUST_SRC_PATH").is_some() {
+                let var_note = if env::var_os(BLAZE_LIBRARY).is_some() {
+                    " (it is blaze's, which `BLAZE_LIBRARY` names)"
+                } else if env::var_os("RUST_SRC_PATH").is_some() {
                     " (env var `RUST_SRC_PATH` is set and may be incorrect, try unsetting it)"
                 } else {
                     ", try running `rustup component add rust-src` to possibly fix this"
@@ -486,7 +488,16 @@ fn discover_sysroot_dir(
     Ok(AbsPathBuf::assert(Utf8PathBuf::from(stdout)))
 }
 
+/// blaze: the variable blaze names its own standard library's source in (`library/`,
+/// `blaze-cargo/src/cargo/toolchain/library.rs`), which every process of blaze has set, empty
+/// when blaze has none here. No toolchain's `rust-src` is read then.
+pub const BLAZE_LIBRARY: &str = "BLAZE_LIBRARY";
+
 fn discover_rust_lib_src_dir(sysroot_path: &AbsPathBuf) -> Option<AbsPathBuf> {
+    if let Some(named) = env::var_os(BLAZE_LIBRARY) {
+        let path = AbsPathBuf::try_from(named.to_str()?).ok()?;
+        return fs::metadata(path.join("core")).is_ok().then_some(path);
+    }
     if let Ok(path) = env::var("RUST_SRC_PATH") {
         if let Ok(path) = AbsPathBuf::try_from(path.as_str()) {
             let core = path.join("core");
@@ -507,6 +518,18 @@ fn discover_rust_lib_src_dir(sysroot_path: &AbsPathBuf) -> Option<AbsPathBuf> {
 /// (docs/no-rustc.md).
 fn rust_lib_src_dir_of(sysroot_path: &AbsPathBuf) -> Result<AbsPathBuf> {
     discover_rust_lib_src_dir(sysroot_path).ok_or_else(|| {
+        if let Some(named) = env::var_os(BLAZE_LIBRARY) {
+            let named = named.to_string_lossy();
+            return match named.is_empty() {
+                true => format_err!(
+                    "blaze has no source of the standard library here: `blaze toolchain` \
+                     downloads it, and {BLAZE_LIBRARY} can name a checkout's `library/`"
+                ),
+                false => format_err!(
+                    "{BLAZE_LIBRARY} names {named}, which has no standard library (no `core`)"
+                ),
+            };
+        }
         tracing::error!(%sysroot_path, "can't load standard library, try installing `rust-src`");
         format_err!(
             "\

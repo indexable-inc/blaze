@@ -59,6 +59,10 @@ experimental = ["const-hash", "const-fn-pointers"]
 - `const-fn-pointers`: calling a `fn` pointer in const. The nightly refuses it ("function
   pointer calls are not allowed in constant functions").
 
-blaze does not yet check const fn bodies against rustc's rules (issue #860): until that check
-exists, these programs are accepted without the opt-in, as is anything else the interpreter can
-run. The check refuses them unless the workspace opts in.
+blaze checks const bodies against rustc's `check_consts` rules (#914,
+`crates/hir-ty-mir/src/mir/const_check.rs`). That includes E0015 for a non-const call and
+rustc's refusal of a call to an intrinsic not declared `const`. Two gaps remain (issue #1440).
+The build does not yet fail on those errors: they are IDE diagnostics, so these programs, and
+any ordinary function called in a `const`, are accepted without the opt-in. And const stability
+is not checked: the nightly's atomics are `const` only under `#![feature(const_atomic)]`, which
+blaze does not ask for.

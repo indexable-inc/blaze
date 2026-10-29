@@ -1,0 +1,23 @@
+[package]
+name = "const-ast"
+version = "0.0.0"
+repository.workspace = true
+description = "Typed views over a flat syntax tree as const fns, for const macros (docs/future/const-macros.md)."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+# No dependencies: the const evaluator runs this crate's source as part of a const macro's
+# crate graph, so it is `no_std` and reads nothing but `core`.
+[dependencies]
+
+[dev-dependencies]
+syntax.workspace = true
+
+[lints]
+workspace = true

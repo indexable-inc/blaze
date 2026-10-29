@@ -102,7 +102,7 @@ pub(crate) fn once(project: &Path, krate: &str) -> anyhow::Result<Option<crate::
     crate::prepare_macro_sessions(&db);
     // The names of the standard library are what a build resolved and the store kept: a
     // probe's crate is a few lines, and std's names are most of what resolving it costs.
-    if let Some(toolchain) = crate::toolchain_identity(&vfs, &args.symbol_files) {
+    if let Some(toolchain) = crate::toolchain_identity(&args.symbol_files) {
         blaze_store::compiles_against(&toolchain);
     }
     let crates = crate::built_crates(&db, &args).unwrap_or_default();

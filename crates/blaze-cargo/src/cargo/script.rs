@@ -835,9 +835,10 @@ pub fn compiled_from_what_is_there(out_dir: &Path, workspace: &Path) -> bool {
     let Some(run_dir) = out_dir.parent() else { return false };
     let Ok(ran) = std::fs::read(run_dir.join(RAN)) else { return false };
     let Ok(ran) = serde_json::from_slice::<Ran>(&ran) else { return false };
-    let Some(linked) = ran.real.to_str().and_then(|it| it.strip_suffix(".real")) else {
-        return false;
-    };
+    let Some(real) = ran.real.to_str() else { return false };
+    // Cargo's script was moved aside to `.real`; one blaze compiled (`compile_time.rs`) is run
+    // where it was linked.
+    let linked = real.strip_suffix(".real").unwrap_or(real);
     let compiled = std::fs::metadata(&ran.real).and_then(|it| it.modified());
     let Ok(read) = std::fs::read_to_string(Path::new(linked).with_extension("d")) else {
         return false;
@@ -1292,6 +1293,29 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&source, "fn main() { }").unwrap();
         assert!(!compiled_from_what_is_there(&out_dir, workspace));
+    }
+
+    #[test]
+    fn a_script_blaze_compiled_newer_than_its_source_is_as_cargo_would_compile_it() {
+        let out_dir = ran("own", "fn made() {}");
+        let run_dir = out_dir.parent().unwrap();
+        let source = run_dir.join("build.rs");
+        std::fs::write(&source, "fn main() {}").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let at = run_dir.join(RAN);
+        let mut ran: Ran = serde_json::from_slice(&std::fs::read(&at).unwrap()).unwrap();
+        let exe = run_dir.join("build-script-build");
+        std::fs::copy(&ran.real, &exe).unwrap();
+        let written = std::fs::File::options().write(true).open(&exe).unwrap();
+        written.set_modified(SystemTime::now()).unwrap();
+        ran.real = exe.clone();
+        std::fs::write(&at, serde_json::to_vec(&ran).unwrap()).unwrap();
+        let info = format!("{}: {}\n", exe.display(), source.display());
+        std::fs::write(exe.with_extension("d"), info).unwrap();
+        assert!(compiled_from_what_is_there(&out_dir, run_dir));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&source, "fn main() { }").unwrap();
+        assert!(!compiled_from_what_is_there(&out_dir, run_dir));
     }
 
     #[test]

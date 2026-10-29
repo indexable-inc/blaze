@@ -107,11 +107,18 @@ pub fn detect_variant_from_bytes<'a>(
         }
         hir_def::layout::Variants::Multiple { tag, tag_encoding, variants, .. } => {
             let tag_size = tag.size(target_data_layout);
+            let signed = tag.is_signed();
             let size = tag_size.bytes_usize();
             let offset = layout.fields.offset(0).bytes_usize(); // The only field on enum variants is the tag field
             let tag = i128::from_le_bytes(pad16(&b[offset..offset + size], IsSigned::No));
             match tag_encoding {
                 TagEncoding::Direct => {
+                    // A direct tag is the discriminant, read as signed when its type is (a
+                    // `#[repr(i8)]` variant `= -1`), as the evaluator's `Discriminant` reads it.
+                    let tag = match signed {
+                        true => i128::from_le_bytes(pad16(&b[offset..offset + size], IsSigned::Yes)),
+                        false => tag,
+                    };
                     let (def, var_idx) = variants.indices().find_map(|var_idx| {
                         let def = e.enum_variants(db).variants[var_idx.0].0;
                         (db.const_eval_discriminant(def) == Ok(tag)).then_some((def, var_idx))
