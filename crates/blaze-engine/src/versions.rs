@@ -125,7 +125,7 @@ pub(crate) fn why_this_one() -> String {
     if let Some(by) = std::env::var_os(pin::PINNED_BY) {
         return format!("{this}, as {} pins it", Path::new(&by).display());
     }
-    let ours = pin::OURS;
+    let ours = std::hint::black_box(pin::OURS);
     let Some(manifest) = std::env::current_dir().ok().and_then(|it| pin::root_manifest(&it)) else {
         return format!("{this}, as no workspace is here to pin one");
     };
