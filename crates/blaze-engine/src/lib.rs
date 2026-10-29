@@ -9128,8 +9128,13 @@ fn run_holding(
                 // tell what changed.
                 let including = tree.including(&db);
                 if WatchedFile::include_sources(&mut files, &mut tree, &mut db) != Loaded::Nothing {
-                    let named: Vec<String> =
-                        including.iter().map(|&it| content::Contents::version(&db, it)).collect();
+                    let named: Vec<String> = including
+                        .iter()
+                        .map(|&it| {
+                            let name = it.extra_data(&db).display_name.as_ref();
+                            name.map_or_else(|| "?".to_owned(), ToString::to_string)
+                        })
+                        .collect();
                     eprintln!("included late, by {}", named.join(", "));
                     let crates = (!including.is_empty()).then_some(&including[..]);
                     known.touch(&db, crates);
