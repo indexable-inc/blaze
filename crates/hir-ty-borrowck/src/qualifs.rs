@@ -119,8 +119,15 @@ impl<'db> ValueCx<'_, 'db> {
                 exprs.iter().fold(Qualifs::default(), |acc, &it| acc.or(self.value(it, depth + 1)))
             }
             &Expr::Array(Array::Repeat { initializer, .. }) => self.value(initializer, depth + 1),
-            Expr::RecordLit { fields, spread: RecordSpread::None, .. } => {
-                let parts: Vec<_> = fields.iter().map(|it| it.expr).collect();
+            // The fields a spread fills are copied out of its base, so the base's qualifs bound
+            // theirs.
+            Expr::RecordLit { fields, spread, .. }
+                if !matches!(spread, RecordSpread::FieldDefaults) =>
+            {
+                let mut parts: Vec<_> = fields.iter().map(|it| it.expr).collect();
+                if let RecordSpread::Expr(base) = *spread {
+                    parts.push(base);
+                }
                 self.aggregate(ty, &parts, depth)
             }
             Expr::Call { callee, args }
