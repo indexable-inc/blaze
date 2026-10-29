@@ -7,10 +7,13 @@
 //! - `snapshot`: a world from a flecs-snapshot DAG-CBOR document, which is what hosts load.
 //! - `scripts` (feature `scripts`, native): the content scripts run in Flecs and snapshotted.
 //! - `render`, `inline`, `comments`: render/render.ts, widgets.ts, inline.ts and comments.ts.
+//! - `chart`: the charts (`RowChart`, `LineChart`) as HTML rows and inline SVG, and the `Picker`'s buttons.
+//! - `course`: the course path as a graph of lessons and updates, laid out in rows, columns and bands.
 //! - `side`, `icons`: the sidebar every page carries (sections, rows, the pager, the outline) and its icons.
-//! - `spoken`: a page's spoken version (the narration's lines), derived from its blocks or written with `Say`.
 
+pub mod chart;
 pub mod comments;
+pub mod course;
 pub mod icons;
 pub mod inline;
 pub mod js;
@@ -19,7 +22,6 @@ pub mod render;
 pub mod scripts;
 pub mod side;
 pub mod snapshot;
-pub mod spoken;
 pub mod text;
 pub mod world;
 
@@ -93,22 +95,9 @@ impl Site {
         self.pages.iter().find(|p| p.url == url)
     }
 
+    /// The page takes comments: block by block (`Discussable`), or on the page as a whole (every page not `Quiet`).
     pub fn is_discussable(&self, page: &Page) -> bool {
-        self.world.get(page.node).has_tag("Discussable")
-    }
-
-    /// The spoken lines of the page at `url` (`spoken.rs`), in order.
-    pub fn spoken(&self, url: &str) -> Result<Vec<spoken::Line>, String> {
-        let page = self.page(url).ok_or_else(|| format!("no page at {url}"))?;
-        let s = render::Site {
-            world: &self.world,
-            site: self.site,
-            pages: &self.pages,
-            nav: &self.nav,
-            refs: self.refs,
-            served: &self.served,
-        };
-        spoken::lines(&s, page)
+        crate::render::talks(self.world.get(page.node))
     }
 
     /// The page at `url` with `comments` spawned under their blocks for this render only, for `discussion`'s viewer.

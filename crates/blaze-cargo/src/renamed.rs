@@ -1,5 +1,5 @@
 //! The names blaze had before it was renamed from ra-jit (#270), which it no longer reads:
-//! scripts/rename.py leaves this file as it is.
+//! tools/rename.py leaves this file as it is.
 
 /// The prefix of the settings' names before the rename, now `BLAZE_`.
 const OLD: &str = "RA_JIT_";

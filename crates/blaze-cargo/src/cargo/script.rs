@@ -308,15 +308,8 @@ pub fn run_as_cargo_does(
         if let (Some(((store, shared), here)), Some(made), Some(mut reads)) = (keys, made, reads) {
             reads.extend(watched(&output.stdout, &cwd));
             let reads = kept_reads(reads, &real, &cwd, sysroot_of());
-            let unplaced: Option<Vec<String>> = reads
-                .iter()
-                .map(|it| String::from_utf8(places.unplace(it.as_bytes())).ok())
-                .collect();
             store.settled();
-            match made
-                .unplaced(&places)
-                .zip(unplaced.filter(|it| !it.iter().any(|it| places.marked(it.as_bytes()))))
-            {
+            match made.unplaced(&places).zip(places.unplaced_reads(&reads)) {
                 Some((made, reads)) => {
                     keyed::keep(store, &shared, &reads, &placed_now, &made.bytes())
                 }
@@ -445,7 +438,7 @@ const IN_VIEW: &str = "build script runs in their closure 1";
 /// prints or writes either: a run that the sandbox refused something fails, and a failed run
 /// is not kept. Nor does where blaze keeps its store, its traces and its statistics, or
 /// whether it checks the store's runs.
-pub const UNREAD: [&str; 13] = [
+pub const UNREAD: [&str; 14] = [
     "CARGO_MAKEFLAGS",
     "MAKEFLAGS",
     "MFLAGS",
@@ -456,6 +449,7 @@ pub const UNREAD: [&str; 13] = [
     sandboxed::VAR,
     "BLAZE_CACHE",
     "BLAZE_TRACE",
+    "BLAZE_TRACE_CONST",
     "BLAZE_STATS",
     "BLAZE_HOME",
     keyed::CHECK,
@@ -519,10 +513,11 @@ pub fn sysroot_of() -> Option<PathBuf> {
 }
 
 /// What of `reads`, the files a run of the script `real` in `cwd` read, its kept run is kept
-/// by. A file of the script's build, the toolchain (`sysroot`) or blaze is left out: the first key has
-/// the script and the toolchain, and the store keeps nothing across builds of blaze. A
-/// directory outside the package counts only as one: a program reaches those on its way to
-/// others (git, the loader, a search on PATH).
+/// by. A file of the script's build, the toolchain (`sysroot`), blaze or its store is left out:
+/// the first key has the script and the toolchain, the store keeps nothing across builds of
+/// blaze, and what blaze as the script's rustc reads of the store (the standard library's
+/// names) is what it would make without it. A directory outside the package counts only as
+/// one: a program reaches those on its way to others (git, the loader, a search on PATH).
 fn kept_reads(
     reads: Vec<String>,
     real: &Path,
@@ -531,7 +526,8 @@ fn kept_reads(
 ) -> Vec<String> {
     let blaze = std::env::current_exe().ok().and_then(|it| Some(it.parent()?.to_owned()));
     let script = real.parent().map(Path::to_owned);
-    let apart: Vec<PathBuf> = [sysroot, blaze, script].into_iter().flatten().collect();
+    let store = super::daemon::store();
+    let apart: Vec<PathBuf> = [sysroot, blaze, script, store].into_iter().flatten().collect();
     reads
         .into_iter()
         .filter(|it| !apart.iter().any(|dir| Path::new(it).starts_with(dir)))
@@ -588,6 +584,19 @@ impl Places {
             bytes = replaced(&bytes, mark, place);
         }
         bytes
+    }
+
+    /// `reads`, a run's read set, with what stands for each place in place of it, for a run in
+    /// any checkout or target directory to be found by. `None` when a path holds what stands
+    /// for a place already, and so could not be told from one in the place.
+    fn unplaced_reads(&self, reads: &[String]) -> Option<Vec<String>> {
+        reads
+            .iter()
+            .map(|it| match self.marked(it.as_bytes()) {
+                true => None,
+                false => String::from_utf8(self.unplace(it.as_bytes())).ok(),
+            })
+            .collect()
     }
 
     /// Whether `bytes` name a place.
@@ -827,9 +836,10 @@ pub fn compiled_from_what_is_there(out_dir: &Path, workspace: &Path) -> bool {
     let Some(run_dir) = out_dir.parent() else { return false };
     let Ok(ran) = std::fs::read(run_dir.join(RAN)) else { return false };
     let Ok(ran) = serde_json::from_slice::<Ran>(&ran) else { return false };
-    let Some(linked) = ran.real.to_str().and_then(|it| it.strip_suffix(".real")) else {
-        return false;
-    };
+    let Some(real) = ran.real.to_str() else { return false };
+    // Cargo's script was moved aside to `.real`; one blaze compiled (`compile_time.rs`) is run
+    // where it was linked.
+    let linked = real.strip_suffix(".real").unwrap_or(real);
     let compiled = std::fs::metadata(&ran.real).and_then(|it| it.modified());
     let Ok(read) = std::fs::read_to_string(Path::new(linked).with_extension("d")) else {
         return false;
@@ -1214,6 +1224,15 @@ mod tests {
             key(&other_package, &other_env, Some(&other_places))
         );
         assert_ne!(key(&package, &env, None), key(&other_package, &other_env, None));
+        let read = |package: &Path, out: &Path| {
+            let reads = [package.join("read.txt"), out.join("x.rs"), PathBuf::from("/etc/hosts")];
+            reads.map(|it| it.to_str().unwrap().to_owned()).to_vec()
+        };
+        let reads = places.unplaced_reads(&read(&package, &out));
+        assert!(reads.is_some(), "a run that read its package's files is kept for every checkout");
+        assert_eq!(reads, other_places.unplaced_reads(&read(&other_package, &other_out)));
+        let marked = String::from_utf8(places.unplace(package.as_os_str().as_encoded_bytes()));
+        assert_eq!(places.unplaced_reads(&[marked.unwrap()]), None);
         let named = |out: &Path, package: &Path| Kept {
             stdout: format!(
                 "cargo:rustc-link-search=native={}\ncargo:rerun-if-changed={}\n",
@@ -1275,6 +1294,29 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&source, "fn main() { }").unwrap();
         assert!(!compiled_from_what_is_there(&out_dir, workspace));
+    }
+
+    #[test]
+    fn a_script_blaze_compiled_newer_than_its_source_is_as_cargo_would_compile_it() {
+        let out_dir = ran("own", "fn made() {}");
+        let run_dir = out_dir.parent().unwrap();
+        let source = run_dir.join("build.rs");
+        std::fs::write(&source, "fn main() {}").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let at = run_dir.join(RAN);
+        let mut ran: Ran = serde_json::from_slice(&std::fs::read(&at).unwrap()).unwrap();
+        let exe = run_dir.join("build-script-build");
+        std::fs::copy(&ran.real, &exe).unwrap();
+        let written = std::fs::File::options().write(true).open(&exe).unwrap();
+        written.set_modified(SystemTime::now()).unwrap();
+        ran.real = exe.clone();
+        std::fs::write(&at, serde_json::to_vec(&ran).unwrap()).unwrap();
+        let info = format!("{}: {}\n", exe.display(), source.display());
+        std::fs::write(exe.with_extension("d"), info).unwrap();
+        assert!(compiled_from_what_is_there(&out_dir, run_dir));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&source, "fn main() { }").unwrap();
+        assert!(!compiled_from_what_is_there(&out_dir, run_dir));
     }
 
     #[test]

@@ -1,3 +1,8 @@
+---
+status: record
+summary: What blaze keeps on disk against cargo on four projects, part by part, and the store before and after zstd.
+date: 2026-10-23
+---
 # What blaze keeps on disk, against cargo
 
 2026-10-23. Measured on dev-aws-14 (c8a.48xlarge, `/home` on XFS, which shares blocks between

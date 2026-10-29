@@ -133,9 +133,6 @@ struct Ctx<'a, 'w> {
     blocks: Vec<(String, String)>,
     scripts: Vec<&'static str>,
     discussion: &'a Discussion,
-    /// On a page with audio (an `Audio` value, set by the build): the blocks that have a spoken line. Each gets
-    /// ` data-say="<id>"`, which the player (client/listen.ts) highlights and plays from.
-    say: Option<std::collections::BTreeSet<String>>,
 }
 
 impl Ctx<'_, '_> {
@@ -146,15 +143,6 @@ impl Ctx<'_, '_> {
     fn inline(&mut self, t: &str, wher: &str) -> Result<String, String> {
         let refs = Refs { world: self.s.world, parent: self.s.refs, served: self.s.served };
         inline(t, &refs, wher, &mut self.cited)
-    }
-
-    /// ` data-say=".."` when the block has a spoken line on a page with audio.
-    fn say_attr(&self, n: Id) -> String {
-        let id = self.block_id(n);
-        match &self.say {
-            Some(set) if set.contains(&id) => format!(" data-say=\"{}\"", esc(&id)),
-            _ => String::new(),
-        }
     }
 
     fn script(&mut self, s: &'static str) {
@@ -181,9 +169,8 @@ struct Anchor {
 
 /// What a block a reader can comment on carries, after checking it has a name. Empty outside a Discussable page.
 fn anchor(n: Id, ctx: &mut Ctx, plain: &str) -> Result<Anchor, String> {
-    let say = ctx.say_attr(n);
     if !ctx.discussable {
-        return Ok(Anchor { attr: say, ..Anchor::default() });
+        return Ok(Anchor::default());
     }
     let e = ctx.e(n);
     if e.name.starts_with('#') {
@@ -201,7 +188,7 @@ fn anchor(n: Id, ctx: &mut Ctx, plain: &str) -> Result<Anchor, String> {
     }
     let w = ctx.s.world;
     Ok(Anchor {
-        attr: format!(" data-block=\"{}\"{say}", esc(&id)),
+        attr: format!(" data-block=\"{}\"", esc(&id)),
         button: comments::button(&id, w, n),
         thread: comments::thread(
             &id,
@@ -267,19 +254,8 @@ fn status(e: &Entity) -> String {
 
 const REFERENCES: &str = "<!--references-->";
 
-/// The tags that render through a widget (render/widgets.ts), in the order the TS object lists them.
-const WIDGETS: [&str; 5] = ["RfcIndex", "References", "SignupForm", "BenchHistory", "Course"];
-
-const SIGNUP_FORM: &str = r#"<form method="POST" class="signup">
-<input type="hidden" name="ref" value="" />
-<label><span>Email</span><input name="email" type="email" required maxlength="254" autocomplete="email" /></label>
-<label><span>Company <em>Optional</em></span><input name="company" type="text" maxlength="200" autocomplete="organization" /></label>
-<label><span>Why do you want to use blaze? <em>Optional</em></span><textarea name="why" rows="3" maxlength="2000"></textarea></label>
-<div class="turnstile-slot"></div>
-<p class="error" role="alert" hidden></p>
-<button type="submit">Send</button>
-</form>
-<div class="sent" hidden><p class="lede">Thanks, got it.</p><p class="dim"><a href="{home}">Back to blaze</a></p></div>"#;
+/// The tags that render through a widget.
+const WIDGETS: [&str; 4] = ["RfcIndex", "References", "Course", "UpdateLog"];
 
 fn widget(tag: &str, n: Id, ctx: &mut Ctx) -> Result<String, String> {
     match tag {
@@ -312,19 +288,8 @@ fn widget(tag: &str, n: Id, ctx: &mut Ctx) -> Result<String, String> {
         }
         // Filled in once the whole page has rendered, so it lists citations made after it too.
         "References" => Ok(REFERENCES.into()),
-        "SignupForm" => {
-            ctx.script("updates");
-            Ok(SIGNUP_FORM.replace("{home}", &esc(&ctx.s.served.href("/"))))
-        }
-        "BenchHistory" => {
-            ctx.script("bench");
-            // gen/bench/ (TS, at build time) renders the charts; the build stores the HTML as the node's Baked value.
-            match ctx.e(n).value("Baked").and_then(|v| v.get("html")) {
-                Some(crate::world::Scalar::Str(h)) => Ok(h.clone()),
-                _ => Err(format!("{}: not baked (run the build)", ctx.e(n).path)),
-            }
-        }
         "Course" => course(n, ctx),
+        "UpdateLog" => update_log(n, ctx),
         _ => unreachable!("WIDGETS lists the tags"),
     }
 }
@@ -387,8 +352,7 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
         let html = highlighted(e).filter(|h| !h.is_empty()).unwrap_or_else(|| esc(&cmd));
         ctx.script("copy");
         return Ok(format!(
-            "<div class=\"cmd code-roles\"{}><pre class=\"hljs\"><code>{html}</code></pre><button type=\"button\" data-copy=\"{}\" aria-label=\"Copy command\">Copy</button></div>",
-            ctx.say_attr(n),
+            "<div class=\"cmd code-roles\"><pre class=\"hljs\"><code>{html}</code></pre><button type=\"button\" data-copy=\"{}\" aria-label=\"Copy command\">Copy</button></div>",
             esc(&cmd)
         ));
     }
@@ -475,6 +439,47 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
     if e.has("Quiz") {
         return quiz(n, ctx);
     }
+    for comp in ["RowChart", "LineChart"] {
+        if let Some(v) = e.value(comp) {
+            let note = prose(&field(Some(v), "note"));
+            let path = e.path.clone();
+            if comp == "LineChart" {
+                // The run under the pointer (client/chart.ts); the chart reads whole without it.
+                ctx.script("chart");
+            }
+            let note = ctx.inline(&note, &path)?;
+            let id = ctx.block_id(n);
+            let html = if comp == "RowChart" {
+                crate::chart::row_chart(ctx.s.world, n, &id, &note)?
+            } else {
+                crate::chart::line_chart(ctx.s.world, n, &id, &note)?
+            };
+            return Ok(html);
+        }
+    }
+    if e.has_tag("Charts") {
+        return Ok(format!("<div class=\"charts\">\n{}\n</div>", children(n, ctx)?));
+    }
+    if e.has("Picker") {
+        // Radio buttons and one panel per Pick; styles/site.css shows the checked one's.
+        let picks: Vec<Id> = e.children.clone();
+        for &p in &picks {
+            if !ctx.e(p).has("Pick") {
+                return Err(format!("{}: a Picker's children are Picks", ctx.e(p).path));
+            }
+        }
+        let id = ctx.block_id(n);
+        let buttons = crate::chart::picker_buttons(ctx.s.world, n, &id, &picks)?;
+        let mut panels = String::new();
+        for p in picks {
+            panels += &format!("<div class=\"panel\">\n{}\n</div>", children(p, ctx)?);
+        }
+        return Ok(format!("<div class=\"picker\">{buttons}{panels}</div>"));
+    }
+    if e.has("BenchHistory") {
+        // Filled by the build from the benchmark history (gen/bench/).
+        return Ok(format!("<div class=\"bench\">\n{}\n</div>", children(n, ctx)?));
+    }
     if let Some(v) = e.value("Tap") {
         // Tap the parts of a diagram: client/learn.ts draws the piece with its parts as buttons and checks the picks
         // against `right`. Without JS the answer is in the fold.
@@ -505,8 +510,7 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
         let l = ctx.inline(&prose(&label), &path)?;
         ctx.script("learn");
         return Ok(format!(
-            "<figure class=\"diagram\" data-figure=\"{piece}\"{}><figcaption>{l}</figcaption></figure>",
-            ctx.say_attr(n)
+            "<figure class=\"diagram\" data-figure=\"{piece}\"><figcaption>{l}</figcaption></figure>"
         ));
     }
     if e.has_tag("Ul") || e.has_tag("Ol") {
@@ -566,7 +570,7 @@ fn quiz(n: Id, ctx: &mut Ctx) -> Result<String, String> {
 }
 
 /// A lesson's steps, and the ids of its questions (Quiz and Tap blocks, as their path under the page): what the
-/// course map counts and client/learn.ts keeps answers under.
+/// course path counts and client/learn.ts keeps answers under.
 pub fn lesson_parts(world: &World, lesson: Id) -> (usize, Vec<String>) {
     fn walk(world: &World, n: Id, base: usize, out: &mut Vec<String>) {
         for &c in &world.get(n).children {
@@ -585,42 +589,227 @@ pub fn lesson_parts(world: &World, lesson: Id) -> (usize, Vec<String>) {
     (steps, quizzes)
 }
 
-/// The course map: each lesson under the page as a node on a path, numbered, with its line, steps and minutes. It is
-/// a list of links without JS; client/learn.ts lights each node with the reader's progress and adds the mastery meter.
+/// A lesson's or update's glyph: the drawing gen/glyphs.ts made for its `glyph`, baked onto the page by the build.
+fn glyph(ctx: &Ctx, lesson: Id) -> Result<String, String> {
+    match ctx.e(lesson).value("Baked").and_then(|v| v.get("html")) {
+        Some(crate::world::Scalar::Str(h)) if !h.is_empty() => Ok(h.clone()),
+        _ => Err(format!("{}: the glyph is not baked (run the build)", ctx.e(lesson).path)),
+    }
+}
+
+/// The check on a finished lesson's node.
+const DONE_MARK: &str = "<svg viewBox=\"0 0 12 12\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M3.2 6.3l1.9 1.9 3.7-4.1\"/></svg>";
+
+/// The end of the path: a check in pixel cells on a faint grid, as the lesson's "complete" screen draws it
+/// (client/learn.ts `seal`).
+fn end_seal() -> String {
+    const ON: [(u8, u8); 7] = [(1, 3), (2, 4), (3, 5), (4, 4), (5, 3), (6, 2), (7, 1)];
+    let mut cells = String::new();
+    for y in 0..7u8 {
+        for x in 0..9u8 {
+            let on = if ON.contains(&(x, y)) { " class=\"on\"" } else { "" };
+            cells += &format!("<rect x=\"{x}.1\" y=\"{y}.1\" width=\"0.8\" height=\"0.8\"{on}/>");
+        }
+    }
+    format!("<svg class=\"seal\" viewBox=\"0 0 9 7\" aria-hidden=\"true\">{cells}</svg>")
+}
+
+/// "4 steps · 2 min · 1 question" for a lesson or update.
+fn steps_line(world: &World, page: Id) -> (usize, Vec<String>, String) {
+    let (steps, quizzes) = lesson_parts(world, page);
+    // About 20 seconds a step: a short paragraph, or a question.
+    let minutes = (steps * 20).div_ceil(60).max(1);
+    let questions = match quizzes.len() {
+        0 => String::new(),
+        1 => " · 1 question".to_string(),
+        q => format!(" · {q} questions"),
+    };
+    (steps, quizzes, format!("{steps} steps · {minutes} min{questions}"))
+}
+
+/// The line above an update's title: "Update to lesson 2 · Oct 28".
+fn update_eyebrow(c: &crate::course::Course, i: usize, short: bool) -> String {
+    let crate::course::Kind::Update { date, .. } = &c.nodes[i].kind else { return String::new() };
+    let to = c.extends(i);
+    let what = if to.is_empty() { "Update".to_string() } else { format!("Update to {to}") };
+    format!("{what} · {}", crate::course::date(date, short))
+}
+
+/// The course path (course.rs lays it out): the way in (the first lesson, until client/learn.ts points it at the
+/// reader's next one), then each theme as a band under its heading, its lessons and updates as nodes on a grid of
+/// columns (`data-col`), each with its glyph, its eyebrow (Lesson 2; Update to lesson 4 · Oct 27), title, line, steps,
+/// minutes and questions, and the path's end. The edges are data on the course (`data-edges`: `from-to` by node index
+/// in page order, `:track` for one that crosses a divider), which client/learn.ts strokes between the pins it measures.
+/// Without JS it is a list of links per band on a plain dotted line.
 fn course(n: Id, ctx: &mut Ctx) -> Result<String, String> {
-    let source = ctx.s.world.course_source(n)?;
-    let lessons = ctx.s.world.lessons(source);
-    let first = lessons
-        .first()
-        .and_then(|&l| ctx.s.page_of(l))
+    let sources = ctx.s.world.course_sources(n)?;
+    let c = crate::course::build(ctx.s.world, &sources)
+        .map_err(|e| format!("{}: {e}", ctx.e(n).path))?;
+    let first = c
+        .lessons()
+        .next()
+        .and_then(|l| ctx.s.page_of(l.id))
         .ok_or_else(|| format!("{}: a Course with no lessons", ctx.e(n).path))?;
-    // The way in: the first lesson without JS; client/learn.ts points it at the reader's next one.
     let go = format!(
-        "<p class=\"course-go\"><a class=\"go\" href=\"{}\"><span class=\"k\">Start lesson 1</span><span class=\"t\">{}</span></a></p>",
+        "<div class=\"course-top\"><a class=\"course-go\" href=\"{}\"><span class=\"k\">Start lesson 1</span><span class=\"t\">{}</span></a></div>",
         esc(&ctx.s.served.href(&first.url)),
         esc(&text(ctx.e(first.node), "Title"))
     );
-    let mut items = String::new();
-    for (i, c) in lessons.into_iter().enumerate() {
-        let e = ctx.e(c);
-        let p =
-            ctx.s.page_of(c).ok_or_else(|| format!("{}: a Lesson that is not a page", e.path))?;
-        let (steps, quizzes) = lesson_parts(ctx.s.world, c);
-        // About 20 seconds a step: a short paragraph, or a question.
-        let minutes = (steps * 20).div_ceil(60).max(1);
-        let line = prose(&field(e.value("Lesson"), "line"));
-        items += &format!(
-            "<li class=\"node\" data-lesson=\"{}\" data-steps=\"{steps}\" data-quizzes=\"{}\"><a href=\"{}\"><span class=\"n\" aria-hidden=\"true\">{}</span><span class=\"body\"><span class=\"t\">{}</span><span class=\"l\">{}</span><span class=\"m\">{steps} steps · {minutes} min</span></span></a></li>",
-            esc(&e.name),
-            esc(&quizzes.join(" ")),
-            esc(&ctx.s.served.href(&p.url)),
-            i + 1,
-            esc(&text(e, "Title")),
-            esc(&line),
+    let mut bands = String::new();
+    for (b, theme) in c.themes.iter().enumerate() {
+        let mut items = String::new();
+        for (i, node) in c.nodes.iter().enumerate().filter(|(_, x)| x.theme == b) {
+            let e = ctx.e(node.id);
+            let p = ctx
+                .s
+                .page_of(node.id)
+                .ok_or_else(|| format!("{}: a lesson or update that is not a page", e.path))?;
+            let (steps, quizzes, meta) = steps_line(ctx.s.world, node.id);
+            let requires: Vec<&str> =
+                node.requires.iter().map(|&r| c.nodes[r].key.as_str()).collect();
+            let (cls, eyebrow, line, extra) = match &node.kind {
+                crate::course::Kind::Lesson(k) => {
+                    ("node", format!("Lesson {k}"), field(e.value("Lesson"), "line"), String::new())
+                }
+                crate::course::Kind::Update { date, version } => (
+                    "node update",
+                    format!(
+                        "{}<span class=\"new\" hidden>New</span>",
+                        esc(&update_eyebrow(&c, i, true))
+                    ),
+                    field(e.value("Update"), "line"),
+                    format!(" data-date=\"{}\" data-version=\"{}\"", esc(date), esc(version)),
+                ),
+            };
+            items += &format!(
+                "<li class=\"{cls}\" data-col=\"{}\" data-lesson=\"{}\" data-steps=\"{steps}\" data-quizzes=\"{}\" data-requires=\"{}\"{extra}><a href=\"{}\"><span class=\"pin\" aria-hidden=\"true\"><span class=\"disc\">{}</span><span class=\"badge\">{DONE_MARK}</span></span><span class=\"body\"><span class=\"n\">{eyebrow}</span><span class=\"t\">{}</span><span class=\"l\">{}</span><span class=\"m\">{meta}</span></span></a></li>",
+                node.col,
+                esc(&node.key),
+                esc(&quizzes.join(" ")),
+                esc(&requires.join(" ")),
+                esc(&ctx.s.served.href(&p.url)),
+                glyph(ctx, node.id)?,
+                esc(&text(e, "Title")),
+                esc(&prose(&line)),
+            );
+        }
+        let accent = if theme.accent.is_empty() {
+            String::new()
+        } else {
+            format!(" theme-{}", esc(&theme.accent))
+        };
+        bands += &format!(
+            "<section class=\"theme{accent}{}\" data-theme=\"{}\" aria-labelledby=\"theme-{}\"><header class=\"theme-head\"><span class=\"theme-k\">Section {}</span><h3 id=\"theme-{}\">{}</h3><p>{}</p></header><ol class=\"path\">{items}</ol></section>",
+            if theme.dashed { " dashed" } else { "" },
+            esc(&theme.name),
+            esc(&theme.name),
+            b + 1,
+            esc(&theme.name),
+            esc(&theme.title),
+            esc(&prose(&theme.line)),
         );
     }
+    let edges: Vec<String> = c
+        .edges
+        .iter()
+        .map(|e| match e.track {
+            Some(t) => format!("{}-{}:{t}", e.from, e.to),
+            None => format!("{}-{}", e.from, e.to),
+        })
+        .collect();
+    let lessons = c.lessons().count();
+    let end = format!(
+        "<div class=\"path-end\"><span class=\"pin\" aria-hidden=\"true\"><span class=\"disc\">{}</span></span><span class=\"body\"><span class=\"t\">The end of the course</span><span class=\"l\">After lesson {lessons}, you know how blaze builds. New updates show up in their section as blaze changes.</span></span></div>",
+        end_seal(),
+    );
     ctx.script("learn");
-    Ok(format!("{go}<ol class=\"course\">{items}</ol>"))
+    Ok(format!(
+        "<div class=\"course\" data-cols=\"{}\" data-tracks=\"{}\" data-edges=\"{}\">{go}{bands}{end}</div>",
+        c.cols,
+        c.tracks,
+        edges.join(" ")
+    ))
+}
+
+/// What's new: every update on the course, newest first, under its date: its glyph, version and theme's tag, title,
+/// line, and what it extends. client/learn.ts marks each one's state and the ones new since the reader's last visit.
+fn update_log(n: Id, ctx: &mut Ctx) -> Result<String, String> {
+    let path = ctx.e(n).path.clone();
+    let mut found = None;
+    for p in ctx.s.pages {
+        if let Some(cw) = ctx.s.world.course_in(p.node) {
+            let sources = ctx.s.world.course_sources(cw)?;
+            let c =
+                crate::course::build(ctx.s.world, &sources).map_err(|e| format!("{path}: {e}"))?;
+            if c.nodes.iter().any(|x| x.is_update()) {
+                found = Some((p.clone(), c));
+                break;
+            }
+        }
+    }
+    let (course_page, c) = found.ok_or_else(|| format!("{path}: no Course has an Update"))?;
+    let mut days = String::new();
+    let mut day: Option<String> = None;
+    let mut items = String::new();
+    let newest = c.updates_newest_first(ctx.s.world);
+    let keys: Vec<&str> = newest.iter().map(|x| x.key.as_str()).collect();
+    for node in newest {
+        let i = c.nodes.iter().position(|x| x.key == node.key).expect("a node of the course");
+        let crate::course::Kind::Update { date, version } = &node.kind else { continue };
+        if day.as_deref() != Some(date) {
+            if let Some(d) = day.take() {
+                days += &log_day(&d, &items);
+                items.clear();
+            }
+            day = Some(date.clone());
+        }
+        let e = ctx.e(node.id);
+        let p = ctx
+            .s
+            .page_of(node.id)
+            .ok_or_else(|| format!("{}: an Update that is not a page", e.path))?;
+        let (steps, quizzes, meta) = steps_line(ctx.s.world, node.id);
+        let theme = &c.themes[node.theme];
+        let tag = if theme.tag.is_empty() {
+            String::new()
+        } else {
+            let accent = if theme.accent.is_empty() {
+                String::new()
+            } else {
+                format!(" theme-{}", esc(&theme.accent))
+            };
+            format!(" · <span class=\"tag{accent}\">{}</span>", esc(&theme.tag))
+        };
+        let to = c.extends(i);
+        let to = if to.is_empty() { String::new() } else { format!("Extends {to} · ") };
+        items += &format!(
+            "<li class=\"node update\" data-lesson=\"{}\" data-steps=\"{steps}\" data-quizzes=\"{}\"><a href=\"{}\"><span class=\"pin\" aria-hidden=\"true\"><span class=\"disc\">{}</span><span class=\"badge\">{DONE_MARK}</span></span><span class=\"body\"><span class=\"n\"><span class=\"v\">v{}</span>{tag}<span class=\"new\" hidden>New</span></span><span class=\"t\">{}</span><span class=\"l\">{}</span><span class=\"m\">{to}{meta}</span></span></a></li>",
+            esc(&node.key),
+            esc(&quizzes.join(" ")),
+            esc(&ctx.s.served.href(&p.url)),
+            glyph(ctx, node.id)?,
+            esc(version),
+            esc(&text(e, "Title")),
+            esc(&prose(&field(e.value("Update"), "line"))),
+        );
+    }
+    if let Some(d) = day {
+        days += &log_day(&d, &items);
+    }
+    ctx.script("learn");
+    Ok(format!(
+        "<div class=\"ulog\" data-updates=\"{}\" data-course=\"{}\">{days}</div>",
+        esc(&keys.join(" ")),
+        esc(&ctx.s.served.href(&course_page.url))
+    ))
+}
+
+fn log_day(date: &str, items: &str) -> String {
+    format!(
+        "<section class=\"ulog-day\"><h2 class=\"ulog-date\"><time datetime=\"{}\">{}</time></h2><ol class=\"ulog-list\">{items}</ol></section>",
+        esc(date),
+        esc(&crate::course::date(date, false))
+    )
 }
 
 /// Every child of the table is a row and every child of a row a cell, comments included, as the TS has it.
@@ -693,6 +882,16 @@ fn meta(ctx: &Ctx) -> Result<String, String> {
     if let Some(num) = e.value("Number") {
         parts.push(format!("RFC {}", js::pad_zero(&js::string(num.get("value")), 4)));
     }
+    // An update: its date and version, as What's new lists it.
+    if let Some(u) = e.value("Update") {
+        let date = field(Some(u), "date");
+        parts.push(format!(
+            "<time datetime=\"{}\">{}</time>",
+            esc(&date),
+            esc(&crate::course::date(&date, false))
+        ));
+        parts.push(format!("<span class=\"mono\">v{}</span>", esc(&field(Some(u), "version"))));
+    }
     if e.targets("Status").is_some() {
         parts.push(status(e));
     }
@@ -718,52 +917,67 @@ fn meta(ctx: &Ctx) -> Result<String, String> {
     })
 }
 
-/// On a lesson page, what client/learn.ts needs on `<main>`: the lesson's name (its key in the reader's progress),
-/// its number, its line, its questions, and where the course map and the next lesson are.
+/// On a lesson or update page, what client/learn.ts needs on `<main>`: its key in the reader's progress, the line above
+/// its title on the player's cover, its line, its questions, where the course path is, and the next lesson (for a
+/// lesson) or What's new (for an update).
 fn lesson_attrs(ctx: &mut Ctx) -> Result<(&'static str, String), String> {
     let e = ctx.e(ctx.page.node);
-    let Some(v) = e.value("Lesson") else { return Ok(("", String::new())) };
+    let Some(v) = e.value("Lesson").or_else(|| e.value("Update")) else {
+        return Ok(("", String::new()));
+    };
     let line = prose(&field(Some(v), "line"));
-    let name = e.name.clone();
-    let parent = e.parent.ok_or("a Lesson has no parent")?;
-    // The course map is on the page whose Course widget lists this lesson's siblings (the home page).
-    let course = ctx
+    let path = e.path.clone();
+    let parent = e.parent.ok_or("a lesson has no parent")?;
+    // The course path is on the page whose Course widget lists this page's parent (the home page).
+    let (course_at, c) = ctx
         .s
-        .pages
-        .iter()
-        .find(|p| {
-            ctx.s
-                .world
-                .course_in(p.node)
-                .is_some_and(|c| ctx.s.world.course_source(c) == Ok(parent))
-        })
-        .ok_or_else(|| format!("{}: no page's Course lists this lesson", e.path))?;
-    let lessons = ctx.s.world.lessons(parent);
-    let at = lessons
-        .iter()
-        .position(|&l| l == ctx.page.node)
-        .expect("the page is one of its parent's lessons");
-    let next = match lessons.get(at + 1).and_then(|&l| ctx.s.page_of(l)) {
-        Some(p) => format!(
-            " data-next=\"{}\" data-next-title=\"{}\"",
-            esc(&ctx.s.served.href(&p.url)),
-            esc(&text(ctx.e(p.node), "Title"))
-        ),
-        None => String::new(),
+        .world
+        .course_of(ctx.s.pages, parent)?
+        .ok_or_else(|| format!("{path}: no page's Course lists this lesson"))?;
+    let course = &ctx.s.pages[course_at];
+    let i = c.nodes.iter().position(|x| x.id == ctx.page.node).expect("the page is on its course");
+    let node = &c.nodes[i];
+    let (eyebrow, next) = match &node.kind {
+        crate::course::Kind::Lesson(k) => {
+            let next = match c.lessons().nth(*k).and_then(|l| ctx.s.page_of(l.id)) {
+                Some(p) => format!(
+                    " data-next=\"{}\" data-next-title=\"{}\"",
+                    esc(&ctx.s.served.href(&p.url)),
+                    esc(&text(ctx.e(p.node), "Title"))
+                ),
+                None => String::new(),
+            };
+            (format!("Lesson {k}"), next)
+        }
+        // An update's way on is What's new, its parent page.
+        crate::course::Kind::Update { .. } => {
+            let log = ctx
+                .s
+                .page_of(parent)
+                .map(|p| format!(" data-log=\"{}\"", esc(&ctx.s.served.href(&p.url))))
+                .unwrap_or_default();
+            (update_eyebrow(&c, i, false), log)
+        }
     };
     let (_, quizzes) = lesson_parts(ctx.s.world, ctx.page.node);
+    let key = node.key.clone();
     ctx.script("learn");
     Ok((
         " lesson",
         format!(
-            " data-lesson=\"{}\" data-n=\"{}\" data-line=\"{}\" data-quizzes=\"{}\" data-course=\"{}\"{next}",
-            esc(&name),
-            at + 1,
+            " data-lesson=\"{}\" data-eyebrow=\"{}\" data-line=\"{}\" data-quizzes=\"{}\" data-course=\"{}\"{next}",
+            esc(&key),
+            esc(&eyebrow),
             esc(&line),
             esc(&quizzes.join(" ")),
             esc(&ctx.s.served.href(&course.url)),
         ),
     ))
+}
+
+/// Whether a page takes comments: block by block (`Discussable`, a Doc), or as a whole (any page not `Quiet`).
+pub fn talks(e: &crate::world::Entity) -> bool {
+    e.has_tag("Discussable") || !e.has_tag("Quiet")
 }
 
 /// One page. On a discussable page, comment entities under its blocks are drawn as threads, for `discussion`'s
@@ -774,7 +988,9 @@ pub fn render(
     discussion: &Discussion,
 ) -> Result<(String, Option<Blocks>), String> {
     let n = s.world.get(page.node);
+    // Comments per block on a Doc; every other page that talks has only the page's own thread.
     let discussable = n.has_tag("Discussable");
+    let talk = talks(n);
     let mut ctx = Ctx {
         s,
         page,
@@ -783,18 +999,7 @@ pub fn render(
         blocks: Vec::new(),
         scripts: Vec::new(),
         discussion,
-        say: None,
     };
-    // The build sets `Audio {manifest}` on a page whose generated audio matches its spoken lines (gen/build.ts).
-    let audio = match n.value("Audio").and_then(|v| v.get("manifest")) {
-        Some(crate::world::Scalar::Str(m)) if !m.is_empty() => Some(m.clone()),
-        _ => None,
-    };
-    if audio.is_some() {
-        let lines = crate::spoken::lines(s, page)?;
-        ctx.say = Some(lines.into_iter().map(|l| l.block).collect());
-        ctx.script("listen");
-    }
     let title = text(n, "Title");
     if title.is_empty() {
         return Err(format!("{}: a page needs a Title", n.path));
@@ -808,11 +1013,16 @@ pub fn render(
         body + &refs
     };
     let mut out_blocks = None;
-    if discussable {
+    if talk {
         ctx.script("comments");
+        let hint = if discussable {
+            "Comments on the page as a whole. To comment on one paragraph, use the button beside it."
+        } else {
+            "Questions, corrections, ideas: anything about this page."
+        };
         // The page's own comments, and those whose block is gone, are children of the page entity.
         body += &format!(
-            "\n<section class=\"discussion\" data-block=\"{PAGE_BLOCK}\"><h2>Discussion</h2><p class=\"dim\">Comments on the page as a whole. To comment on one paragraph, use the button beside it.</p>{}</section>{}",
+            "\n<section class=\"discussion\" id=\"discussion\" data-block=\"{PAGE_BLOCK}\"><h2>Discussion</h2><p class=\"dim\">{hint}</p>{}</section>{}",
             comments::thread(
                 PAGE_BLOCK, s.world, page.node, &page.doc, &page.url, discussion, s.served
             ),
@@ -879,31 +1089,25 @@ pub fn render(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let doc_attr =
-        if discussable { format!(" data-doc=\"{}\"", esc(&page.doc)) } else { String::new() };
-    let say_intro = if audio.is_some() {
-        format!(" data-say=\"{}\"", crate::spoken::INTRO)
-    } else {
-        String::new()
-    };
-    let listen = match &audio {
-        // The player (client/listen.ts) builds its controls in here; without JS it stays empty.
-        Some(m) => {
-            format!("\n<div class=\"listen\" data-audio=\"{}\"></div>", esc(&s.served.href(m)))
-        }
-        None => String::new(),
-    };
+    let doc_attr = if talk { format!(" data-doc=\"{}\"", esc(&page.doc)) } else { String::new() };
     // The home page's title is the logo, large; every other page has the docs' header: where it sits, the title,
     // the RFC line.
     let head = if n.has_tag("Hero") {
         format!(
-            "<header class=\"hero\"><h1 class=\"hero-logo\"{say_intro}><span class=\"sr\">{}</span>{}</h1>{listen}</header>",
+            "<header class=\"hero\"><h1 class=\"hero-logo\"><span class=\"sr\">{}</span>{}</h1></header>",
             esc(&title),
             crate::side::picture(s.world, s.site, s.served, "logo", "")
         )
     } else {
+        // A lesson's glyph above its title, as on its node on the course path (client/learn.ts moves it to the
+        // player's cover).
+        let glyph = if n.has("Lesson") || n.has("Update") {
+            format!("<span class=\"lesson-glyph\">{}</span>", glyph(&ctx, page.node)?)
+        } else {
+            String::new()
+        };
         format!(
-            "<header class=\"head\">{}<h1{say_intro}>{}</h1>{}{listen}</header>",
+            "<header class=\"head\">{}{glyph}<h1>{}</h1>{}</header>",
             crate::side::crumb(s.nav, page, s.served),
             esc(&title),
             meta(&ctx)?
@@ -921,6 +1125,11 @@ pub fn render(
         heads.push(("references".into(), "References".into()));
     }
     let toc = if n.has_tag("Wide") { String::new() } else { crate::side::toc(&heads) };
+    // The square icon (docs/brand/fire/icon.py); the dark one carries its own background, so it reads on any tab bar.
+    // The .ico and the 180px PNG for browsers and home screens that take no SVG.
+    let icon = esc(&s.served.href("/brand/blaze-icon-dark.svg"));
+    let ico = esc(&s.served.href("/brand/favicon.ico"));
+    let touch = esc(&s.served.href("/brand/blaze-icon-dark-180.png"));
     let html = format!(
         "<!doctype html>
 <html lang=\"en\">
@@ -929,6 +1138,9 @@ pub fn render(
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
 <meta name=\"color-scheme\" content=\"dark light\" />
 <title>{}</title>
+<link rel=\"icon\" href=\"{ico}\" sizes=\"32x32\" />
+<link rel=\"icon\" type=\"image/svg+xml\" href=\"{icon}\" />
+<link rel=\"apple-touch-icon\" href=\"{touch}\" />
 {description}
 {canonical}
 <link rel=\"stylesheet\" href=\"{css}\" />

@@ -5,8 +5,9 @@
 //! toolchain and this build of blaze, and sends them to a remote as the project
 //! `std-<target>-<build>`; the release workflow does that for each target and attaches what
 //! it sent to the release. A build of a release fetches that project once a store, beside
-//! the build and never waited for: the build compiles what has not arrived, and what has is
-//! found in the store. `BLAZE_STD_FROM` names another remote to fetch it from (`off` for
+//! the build, which does not wait for it: the build compiles what has not arrived, and what
+//! has is found in the store. Only the standard library of build scripts' builds, which is
+//! what it brings, is made once it is in. `BLAZE_STD_FROM` names another remote to fetch it from (`off` for
 //! none), and `fetch-public = false` in `[workspace.metadata.blaze]` of the root manifest
 //! turns the release's off.
 //!
@@ -80,24 +81,34 @@ pub(crate) fn fetch_public(dir: &Path) -> anyhow::Result<bool> {
 
 /// Fetches the standard library for `target` into the store on a thread of its own, when
 /// there is somewhere to fetch it from ([`source`] of the workspace at `root`) and this store
-/// has not fetched it before. Nothing waits for it: the build compiles what it needs from the
-/// start, and once the fetch is in, the store reads it, so what the build asks for after that
-/// is found rather than compiled. A fetch the build did not need is kept for the next one.
+/// has not fetched it before. The build does not wait for it: it compiles what it needs from
+/// the start, and once the fetch is in, the store reads it, so what the build asks for after
+/// that is found rather than compiled. The standard library of the scripts' builds waits for it
+/// ([`own_script::fetching`]), being what it brings. A fetch the build did not need is kept for
+/// the next one.
 pub(crate) fn fetch_ahead(target: &str, root: &Path) -> anyhow::Result<()> {
     let Some(from) = source(root)? else { return Ok(()) };
     let (Some(project), Some(store)) = (project(target), crate::cargo::daemon::store()) else {
         return Ok(());
     };
-    std::thread::spawn(move || match fetch(&store, &from, &project) {
-        Ok(()) => {
-            if let Some(store) = blaze_store::Store::global() {
-                store.refresh();
+    let fetching = own_script::fetching();
+    std::thread::spawn(move || {
+        let _fetching = fetching;
+        match fetch(&store, &from, &project) {
+            // A store opened before the toolchain is known is none for good; one opened after
+            // reads what was fetched when it opens.
+            Ok(()) => {
+                if blaze_store::toolchain().is_some()
+                    && let Some(store) = blaze_store::Store::global()
+                {
+                    store.refresh();
+                }
             }
-        }
-        Err(e) => {
-            let why = format!("{e:#}");
-            let why = why.lines().next().unwrap_or_default();
-            eprintln!("standard library: not fetched from {from}, built here: {why}");
+            Err(e) => {
+                let why = format!("{e:#}");
+                let why = why.lines().next().unwrap_or_default();
+                eprintln!("standard library: not fetched from {from}, built here: {why}");
+            }
         }
     });
     Ok(())
@@ -177,9 +188,8 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
     if !sysroot.join("lib/rustlib").is_dir() {
         anyhow::bail!("{} is not a toolchain: it has no lib/rustlib", sysroot.display());
     }
-    let mut identity = crate::installed_identity(&format!("{}/", sysroot.display()));
-    identity.sort_unstable();
-    blaze_store::compiles_against(&identity.join(" "));
+    crate::cargo::toolchain::library::fetch().map_err(anyhow::Error::msg)?;
+    blaze_store::compiles_against(&crate::source_identity().join(" "));
     let target = hir_ty_codegen::Target::selected().map_err(anyhow::Error::msg)?;
     let project = project(target.triple()).context("this program cannot be read")?;
     let dir = std::env::temp_dir().join(format!("blaze-std-{}", std::process::id()));

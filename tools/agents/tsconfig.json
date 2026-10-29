@@ -1,0 +1,16 @@
+// tools/agents/rules.ts, run by Bun. Checked with site/'s TypeScript and Bun types: `site/node_modules/.bin/tsc -p tools/agents`
+// after `bun install --cwd site` (CI's fmt job).
+{
+	"compilerOptions": {
+		"target": "esnext",
+		"lib": ["esnext"],
+		"module": "esnext",
+		"moduleResolution": "bundler",
+		"typeRoots": ["../../site/node_modules/@types"],
+		"types": ["bun"],
+		"strict": true,
+		"noEmit": true,
+		"skipLibCheck": true
+	},
+	"include": ["*.ts"]
+}

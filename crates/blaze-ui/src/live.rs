@@ -2,13 +2,19 @@
 
 use blaze_protocol::events::{CrateState, Record};
 
-use crate::{Build, CYAN, Change, DIM, GREEN, last_lines, paint, staying, took};
+use crate::{Build, CYAN, Change, DIM, GREEN, label, last_lines, paint, staying, took};
 
 /// The most crates the region lists by name; the rest under way are counted.
 const SHOWN: usize = 6;
 
 /// The most lines of the tree of crates ([`Live::tree`]).
 const TREE: usize = 10;
+
+/// The most functions compiling shown under a crate ([`Live::functions`]).
+const FUNCTIONS: usize = 3;
+
+/// How many half seconds the line of how busy the cores were shows ([`Live::cores`]).
+const SPARK: usize = 20;
 
 /// Clears the region and draws it again as records come and time passes. What it returns is
 /// written to the terminal as it is.
@@ -100,13 +106,121 @@ impl Live {
         out
     }
 
-    /// The region at `now_ns`: what is under way, with the time it has taken, and a count of
-    /// what is done. Each line fits the width, so the region is as many rows as lines.
+    /// What `blaze status` says of the build: the region at `now_ns` while it goes on, and
+    /// once it is over every kind of step it did and its last lines.
+    pub fn snapshot(&self, now_ns: u64) -> Vec<String> {
+        let Some(finished) = &self.build.finished else { return self.region(now_ns) };
+        let mut lines: Vec<String> = self.strip(finished.at_ns).into_iter().collect();
+        lines.extend(last_lines(finished, self.color, false));
+        lines
+    }
+
+    /// The region at `now_ns`: the command and how long it has taken, every kind of step so
+    /// far, what is under way with the time it has taken, and a count of what is done. Each
+    /// line fits the width, so the region is as many rows as lines.
+    ///
+    /// ```text
+    /// blaze build · cold: the store is empty                                     12.4s
+    /// ✓ workspace 0.31s  ✓ names 2.37s  ● build scripts 3/14 steps 2.10s
+    ///     Building anyhow, compiling its build script 1.20s · 3/14 steps
+    /// ```
     fn region(&self, now_ns: u64) -> Vec<String> {
         let build = &self.build;
         if build.finished.is_some() {
             return Vec::new();
         }
+        let mut lines = vec![self.header(now_ns)];
+        lines.extend(self.strip(now_ns));
+        lines.extend(self.cores(now_ns));
+        lines.extend(self.under_way(now_ns));
+        lines
+    }
+
+    /// `blaze build · cold: the store is empty`, and how long it has taken at the right.
+    fn header(&self, now_ns: u64) -> String {
+        let build = &self.build;
+        let mut left = format!("blaze {}", build.command.as_deref().unwrap_or("build"));
+        if let Some(why) = build.cache.as_ref().and_then(|it| it.cold.as_deref()) {
+            left.push_str(&format!(" \u{b7} cold: {why}"));
+        }
+        let right = took(now_ns);
+        let room = self.width.saturating_sub(right.chars().count() + 2);
+        let left: String = match left.chars().count() > room {
+            true => left.chars().take(room.saturating_sub(1)).chain(['\u{2026}']).collect(),
+            false => left,
+        };
+        let pad = self.width.saturating_sub(left.chars().count() + right.chars().count() + 1);
+        format!("{}{:pad$}{}", paint(GREEN, &left, self.color), "", paint(DIM, &right, self.color))
+    }
+
+    /// Each kind of step so far, done or under way, with its count and time; the first done
+    /// ones counted when they don't fit.
+    fn strip(&self, now_ns: u64) -> Option<String> {
+        let strip = self.build.strip(now_ns);
+        if strip.is_empty() {
+            return None;
+        }
+        let mark = |it: &crate::Strip| if it.running { "\u{25cf}" } else { "\u{2713}" };
+        let plain = |it: &crate::Strip| {
+            let count = it.count.as_ref().map(|it| format!(" {it}")).unwrap_or_default();
+            format!("{} {}{count} {}", mark(it), label(it.step), took(it.took_ns))
+        };
+        let texts: Vec<String> = strip.iter().map(plain).collect();
+        let counted =
+            |from: usize| if from > 0 { format!("\u{2713} {from} more  ") } else { String::new() };
+        let width = |from: usize| {
+            let shown: usize = texts[from..].iter().map(|it| it.chars().count() + 2).sum();
+            counted(from).chars().count() + shown - 2
+        };
+        let room = self.width.saturating_sub(1);
+        let mut first = 0;
+        while first + 1 < texts.len() && !strip[first].running && width(first) > room {
+            first += 1;
+        }
+        // Too narrow for even the last: its text alone, cut to the width.
+        if width(first) > room {
+            let line = counted(first) + &texts[first..].join("  ");
+            return Some(line.chars().take(room).collect());
+        }
+        let mut line = counted(first);
+        for (at, it) in strip.iter().enumerate().skip(first) {
+            if at > first {
+                line.push_str("  ");
+            }
+            let color = if it.running { CYAN } else { GREEN };
+            line.push_str(&paint(color, mark(it), self.color));
+            line.push_str(&texts[at][mark(it).len()..]);
+        }
+        Some(line)
+    }
+
+    /// How busy the worker's cores were over the last [`SPARK`] half seconds, and now:
+    /// `cores ▁▂▇█████▇▆▃▁▁▁ 1.0/16 busy`, so that a build on one core shows at once.
+    fn cores(&self, now_ns: u64) -> Option<String> {
+        const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        let build = &self.build;
+        let now = build.busy_at(now_ns)?;
+        let of = build.cores_of.max(1);
+        let spark: String = (0..SPARK)
+            .map(|at| {
+                let back = (SPARK - 1 - at) as u64 * 500_000_000;
+                match now_ns.checked_sub(back).and_then(|it| build.busy_at(it)) {
+                    Some(busy) => {
+                        let level =
+                            (u64::from(busy) * 7 + u64::from(of) * 50) / (u64::from(of) * 100);
+                        BLOCKS[level.min(7) as usize]
+                    }
+                    None => ' ',
+                }
+            })
+            .collect();
+        let rest = format!("{spark} {}.{}/{of} busy", now / 100, now % 100 / 10);
+        Some(self.fit(DIM, "cores", &rest))
+    }
+
+    /// The step under way and what it does, and the crates under way.
+    fn under_way(&self, now_ns: u64) -> Vec<String> {
+        let build = &self.build;
         let since = |began: u64| took(now_ns.saturating_sub(began));
         let mut totals = Vec::new();
         let crates = build.crates.len();
@@ -116,8 +230,12 @@ impl Live {
             totals.push(format!("{done}/{crates} crates"));
         }
         let fns = build.fns();
-        if fns.total > 0 {
+        // A crate whose total is not known yet counts in the done and not in the total.
+        let unknown = build.crates.iter().any(|it| it.fns.total == 0 && it.fns.done > 0);
+        if fns.total > 0 && !unknown {
             totals.push(format!("{}/{} fns", fns.done, fns.total));
+        } else if fns.done > 0 {
+            totals.push(format!("{} fns", fns.done));
         }
         // Between one step's end and the next one's start, the step that ended.
         let step = build.running().last().or_else(|| build.steps.last());
@@ -160,6 +278,8 @@ impl Live {
             };
             let rest = format!("{}{fns}  {}", krate.name, since(krate.began_ns));
             lines.push(self.fit(CYAN, &format!("{:>14}", branch), &rest));
+            let under = if at + 1 == shown && running.len() == shown { "" } else { "\u{2502}" };
+            lines.extend(self.functions(&krate.name, now_ns, &format!("{under:>13}")));
         }
         if running.len() > shown {
             let more = format!("{} more under way", running.len() - shown);
@@ -177,13 +297,13 @@ impl Live {
     /// The crates under way as a tree, from the program down what it waits for: each crate
     /// being resolved, checked or compiled with what it did so far and for how long, under
     /// the crates waiting for it; what is done is left out, and counted in the last line with
-    /// the longest chain so far.
+    /// what held the build up once the graph says it ([`Build::critical_path`]).
     ///
     /// ```text
     ///             anim waiting
     ///             ├─ wgpu  compiling 1201 fns  4.10s
     ///             └─ winit  resolving  0.80s
-    ///             98 done (40 up to date) · 2 under way · 21 waiting · longest chain 41.2s: anim ← wgpu
+    ///             98 done (40 up to date) · 2 under way · 21 waiting
     /// ```
     fn tree(&self, now_ns: u64) -> Vec<String> {
         let build = &self.build;
@@ -243,6 +363,16 @@ impl Live {
                 Some(_) => format!("{:13}{indent}{glyph}", ""),
             };
             lines.push(self.fit(CYAN, &word, &rest));
+            if it.is_busy() {
+                // Under the name, beside the branches its children hang from.
+                let under = match last {
+                    None => format!("{:12}", ""),
+                    Some(last) => {
+                        format!("{:13}{indent}{}", "", if last { "  " } else { "\u{2502} " })
+                    }
+                };
+                lines.extend(self.functions(&it.name, now_ns, &under));
+            }
             let mut deps: Vec<usize> = graph[node]
                 .deps
                 .iter()
@@ -294,6 +424,19 @@ impl Live {
         }
         lines.push(self.fit(DIM, &format!("{:12}", ""), &footer));
         lines
+    }
+
+    /// The functions of crate `krate` compiling longest ([`Build::compiling_of`]), the top
+    /// [`FUNCTIONS`] of them, each a line under the crate's starting with `under`.
+    ///
+    /// ```text
+    ///             ├─ regex_automata  compiling 7318 fns  2.55s
+    ///             │    regex_automata::meta::Regex::search 1.20s
+    /// ```
+    fn functions(&self, krate: &str, now_ns: u64, under: &str) -> Vec<String> {
+        let of = self.build.compiling_of(krate, now_ns);
+        let of = of.into_iter().take(FUNCTIONS);
+        of.map(|(name, ns)| self.fit(DIM, under, &format!("  {name} {}", took(ns)))).collect()
     }
 
     /// `word` painted and `rest` after it, cut to the width: a line that wrapped would be two

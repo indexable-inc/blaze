@@ -5,7 +5,7 @@
 use std::{
     path::PathBuf,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -13,7 +13,8 @@ use std::{
 use blaze_cargo::events::{COUNTED, node_ids, say};
 pub(crate) use blaze_cargo::events::{Counting, at, heard, idle, said_beside, within};
 pub(crate) use blaze_protocol::events::{Cache, CrateState, Step};
-use blaze_protocol::events::{Cause, Event, Fns, NodeKind};
+use blaze_protocol::events::{Cause, Event, Fns, NodeKind, SLOW_NS, Slow};
+use hir_ty_codegen::counted::Counted;
 use ide_db::base_db::Crate;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -123,26 +124,42 @@ pub(crate) fn crate_is(krate: Crate, state: CrateState) {
     }
 }
 
+/// Why the store has nothing for this blaze, when it can say so before a build: there is
+/// none, nothing was added to it, or another blaze added to it last, whose keys are not this
+/// one's.
+fn cold_ahead(store: Option<&blaze_store::Store>, this: &str) -> Option<String> {
+    let Some(store) = store else {
+        return Some(format!("there is no store ({})", blaze_cargo::cargo::daemon::no_store()));
+    };
+    match store.last_writer() {
+        // `other` is the `--version` line of the blaze that wrote last.
+        Some(other) if other != this => Some(format!("cache keys changed since {other}")),
+        Some(_) => None,
+        None => Some("the store is empty".to_owned()),
+    }
+}
+
+/// Says, as the workspace starts loading, why the build will find nothing in the store when
+/// the store says so already, so that the view says it is cold from the start. Nothing before
+/// the toolchain is known: a store opened then is none for good.
+pub(crate) fn cache_ahead() {
+    if !heard() || blaze_store::toolchain().is_none() {
+        return;
+    }
+    let cold = cold_ahead(blaze_store::Store::global(), &crate::version());
+    if let Some(cold) = cold {
+        say(Event::Cache { cache: Cache { found: 0, fetched: 0, compiled: 0, cold: Some(cold) } });
+    }
+}
+
 /// Says what the store had of the compile `stats` counted, and of one that found nothing in
 /// it, why; then has the store say this blaze added to it last.
 pub(crate) fn cache(stats: &hir_ty_codegen::BuildStats) {
     let store = blaze_store::Store::global();
     let this = crate::version();
     let (found, compiled) = (stats.reused as u64, stats.compiled as u64);
-    let cold = (compiled > 0 && found == 0).then(|| match store {
-        None => format!("there is no store ({})", blaze_cargo::cargo::daemon::no_store()),
-        Some(store) => match store.last_writer() {
-            Some(other) if other != this => {
-                let mut parts = other.split('-');
-                let release = parts.next().unwrap_or_default();
-                match parts.next() {
-                    Some(commit) => format!("cache keys changed since blaze {release} ({commit})"),
-                    None => format!("cache keys changed since blaze {release}"),
-                }
-            }
-            Some(_) => "the store has none of this build".to_owned(),
-            None => "the store is empty".to_owned(),
-        },
+    let cold = (compiled > 0 && found == 0).then(|| {
+        cold_ahead(store, &this).unwrap_or_else(|| "the store has none of this build".to_owned())
     });
     if let Some(store) = store.filter(|_| compiled > 0) {
         let _ = store.note_writer(&this);
@@ -151,28 +168,86 @@ pub(crate) fn cache(stats: &hir_ty_codegen::BuildStats) {
 }
 
 /// The compile of the functions of `krate`, from now until this is dropped: a
-/// [`Step::Codegen`], and every [`COUNTED`] the functions compiled so far.
+/// [`Step::Codegen`], and every [`COUNTED`] the functions compiled so far. It counts what is
+/// compiled on the thread it was made on, not what other programs' builds compile beside it.
 pub(crate) struct Compiling {
     counting: Option<(std::sync::Arc<AtomicBool>, std::thread::JoinHandle<()>)>,
+    counted: Option<hir_ty_codegen::counted::Counting>,
+}
+
+impl Compiling {
+    /// What the compile counted so far, for [`built`].
+    pub(crate) fn counted(&self) -> Option<Arc<Counted>> {
+        self.counted.as_ref().map(|it| it.counted().clone())
+    }
+}
+
+/// A build begins: the functions it compiles are kept track of when anyone hears it, to say
+/// the slow ones ([`Event::Compiling`], [`Event::Slowest`]).
+pub(crate) fn flights() {
+    hir_ty_codegen::flight::begin(heard());
+}
+
+/// The most functions compiling said of each crate, and of all.
+const FLYING_OF: usize = 3;
+const FLYING: usize = 24;
+
+/// The name of `krate`'s node, or `shown` when the build said no graph.
+fn node_name(names: Option<&FxHashMap<Crate, String>>, krate: Crate, shown: &str) -> String {
+    names.and_then(|it| it.get(&krate)).map_or_else(|| shown.to_owned(), String::clone)
+}
+
+/// The functions compiling for [`SLOW_NS`] or more, longest first, [`FLYING_OF`] of a crate.
+fn flying(shown: &str) -> Vec<Slow> {
+    let under_way = hir_ty_codegen::flight::under_way(std::time::Duration::from_nanos(SLOW_NS));
+    if under_way.is_empty() {
+        return Vec::new();
+    }
+    let names = crate::lock(&NAMES);
+    let mut of: FxHashMap<String, usize> = FxHashMap::default();
+    let mut flying = Vec::new();
+    for it in under_way {
+        let krate = node_name(names.as_ref(), it.krate, shown);
+        let count = of.entry(krate.clone()).or_default();
+        if *count < FLYING_OF {
+            *count += 1;
+            let ns = u64::try_from(it.took.as_nanos()).unwrap_or(u64::MAX);
+            flying.push(Slow { krate, name: it.name, ns });
+        }
+        if flying.len() == FLYING {
+            break;
+        }
+    }
+    flying
 }
 
 pub(crate) fn compiling(krate: &str) -> Compiling {
     at(Step::Codegen, Some(krate));
     if !heard() {
-        return Compiling { counting: None };
+        return Compiling { counting: None, counted: None };
     }
     let done = std::sync::Arc::new(AtomicBool::new(false));
-    *crate::lock(&COMPILED_FROM) = hir_ty_codegen::compiled_by_crate().into_iter().collect();
-    let counting = {
-        let (done, name) = (done.clone(), krate.to_owned());
-        let from = hir_ty_codegen::compiled_so_far();
+    let counting = hir_ty_codegen::counted::Counting::start();
+    let thread = {
+        let (done, name, counted) = (done.clone(), krate.to_owned(), counting.counted().clone());
         std::thread::spawn(move || {
             let (mut said, mut said_of) = (0, FxHashMap::default());
+            // Which functions were said compiling: how long each has is the view's to count.
+            let mut flown: Vec<(String, String)> = Vec::new();
+            let mut fly = |functions: Vec<Slow>| {
+                let now: Vec<(String, String)> =
+                    functions.iter().map(|it| (it.krate.clone(), it.name.clone())).collect();
+                if now != flown {
+                    flown = now;
+                    say(Event::Compiling { functions });
+                }
+            };
             while !done.load(Ordering::Relaxed) {
                 std::thread::park_timeout(COUNTED);
+                fly(flying(&name));
                 // Of each crate of the graph, once one was said; of the program alone else.
                 if crate::lock(&NAMES).is_some() {
-                    for (name, compiled) in compiled_by_name() {
+                    for (name, compiled) in compiled_by_name(&counted) {
                         if said_of.insert(name.clone(), compiled) != Some(compiled) {
                             let fns = Fns { total: 0, done: compiled, kept: 0 };
                             say(Event::Crate { name, state: CrateState::Running, fns });
@@ -180,31 +255,26 @@ pub(crate) fn compiling(krate: &str) -> Compiling {
                     }
                     continue;
                 }
-                let compiled = (hir_ty_codegen::compiled_so_far() - from) as u64;
+                let compiled = counted.compiles() as u64;
                 if compiled != said {
                     said = compiled;
                     let fns = Fns { total: 0, done: compiled, kept: 0 };
                     say(Event::Crate { name: name.clone(), state: CrateState::Running, fns });
                 }
             }
+            fly(Vec::new());
         })
     };
-    Compiling { counting: Some((done, counting)) }
+    Compiling { counting: Some((done, thread)), counted: Some(counting) }
 }
 
-/// [`hir_ty_codegen::compiled_by_crate`] when the compile began.
-static COMPILED_FROM: std::sync::LazyLock<Mutex<FxHashMap<Crate, usize>>> =
-    std::sync::LazyLock::new(Default::default);
-
-/// How many functions and instances the compile under way compiled of each crate of the
-/// graph that it compiled any of, by its name.
-fn compiled_by_name() -> Vec<(String, u64)> {
-    let from = crate::lock(&COMPILED_FROM).clone();
+/// How many functions and instances a compile compiled of each crate of the graph that it
+/// compiled any of, by its name.
+fn compiled_by_name(counted: &Counted) -> Vec<(String, u64)> {
     let names = crate::lock(&NAMES);
     let Some(names) = names.as_ref() else { return Vec::new() };
     let mut by_name: FxHashMap<String, u64> = FxHashMap::default();
-    for (krate, count) in hir_ty_codegen::compiled_by_crate() {
-        let compiled = count - from.get(&krate).copied().unwrap_or(0).min(count);
+    for (krate, compiled) in counted.compiles_by_crate() {
         if let Some(name) = names.get(&krate).filter(|_| compiled > 0) {
             *by_name.entry(name.clone()).or_default() += compiled as u64;
         }
@@ -225,14 +295,29 @@ impl Drop for Compiling {
 }
 
 /// Says what the build of `krate` came to, by the codegen's count, and of a build of an
-/// edit, of the files `edited`, which functions it compiled again and why.
+/// edit, of the files `edited`, which functions it compiled again and why. `counted` is what
+/// its [`Compiling`] counted, none when nothing was compiled.
 pub(crate) fn built(
     db: &dyn hir::db::HirDatabase,
     krate: &str,
     stats: &hir_ty_codegen::BuildStats,
     edited: Option<&FxHashMap<vfs::FileId, PathBuf>>,
+    counted: Option<&Counted>,
 ) {
     let (recompiled, all) = hir_ty_codegen::take_recompiled(db);
+    let slowest: Vec<Slow> = {
+        let names = crate::lock(&NAMES);
+        let slowest = hir_ty_codegen::flight::slowest().into_iter();
+        let slowest = slowest.map(|it| Slow {
+            krate: node_name(names.as_ref(), it.krate, krate),
+            ns: u64::try_from(it.took.as_nanos()).unwrap_or(u64::MAX),
+            name: it.name,
+        });
+        slowest.collect()
+    };
+    if !slowest.is_empty() {
+        say(Event::Slowest { functions: slowest });
+    }
     if let Some(edited) = edited {
         let count = (all - recompiled.len()) as u64;
         for it in recompiled {
@@ -256,7 +341,7 @@ pub(crate) fn built(
     };
     // Each crate with what was compiled of it, the program with what the store had too; of a
     // build from cold, every other crate of the graph is up to date.
-    let compiled = compiled_by_name();
+    let compiled = counted.map(compiled_by_name).unwrap_or_default();
     for (name, done) in &compiled {
         let kept = if name == krate { reused } else { 0 };
         let fns = Fns { total: done + kept, done: done + kept, kept };

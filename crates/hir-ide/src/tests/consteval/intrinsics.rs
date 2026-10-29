@@ -626,6 +626,453 @@ fn allocator() {
     );
 }
 
+const ALLOCATOR: &str = r#"
+        extern "Rust" {
+            #[rustc_allocator]
+            fn __rust_alloc(size: usize, align: usize) -> *mut u8;
+            #[rustc_deallocator]
+            fn __rust_dealloc(ptr: *mut u8, size: usize, align: usize);
+            #[rustc_reallocator]
+            fn __rust_realloc(ptr: *mut u8, old_size: usize, align: usize, new_size: usize) -> *mut u8;
+            #[rustc_allocator_zeroed]
+            fn __rust_alloc_zeroed(size: usize, align: usize) -> *mut u8;
+        }
+        #[rustc_intrinsic]
+        pub const unsafe fn const_allocate(size: usize, align: usize) -> *mut u8;
+        #[rustc_intrinsic]
+        pub const unsafe fn const_deallocate(ptr: *mut u8, size: usize, align: usize);
+        #[rustc_intrinsic]
+        pub const unsafe fn const_make_global(ptr: *mut u8) -> *const u8;
+"#;
+
+#[test]
+fn freed_memory_is_reused() {
+    // 1.5 GiB allocated in all, more than the 1 GiB an evaluation may use at once.
+    check_number(
+        &format!(
+            r#"
+        //- minicore: sized
+        {ALLOCATOR}
+        const GOAL: u8 = unsafe {{
+            let mut i = 0;
+            let mut sum = 0u8;
+            while i < 512 {{
+                let ptr = __rust_alloc(1 << 20, 8);
+                sum = sum + *ptr;
+                *ptr = 1;
+                let ptr = __rust_realloc(ptr, 1 << 20, 8, (1 << 20) + 1);
+                sum = sum + *ptr - 1;
+                __rust_dealloc(ptr, (1 << 20) + 1, 8);
+                i += 1;
+            }}
+            sum
+        }};
+        "#
+        ),
+        0,
+    );
+}
+
+#[test]
+fn a_grown_block_keeps_its_bytes() {
+    check_number(
+        &format!(
+            r#"
+        //- minicore: sized
+        {ALLOCATOR}
+        const GOAL: u32 = unsafe {{
+            let mut cap = 1;
+            let mut ptr = __rust_alloc(cap * 4, 4) as *mut u32;
+            let mut len = 0;
+            while len < 1000 {{
+                if len == cap {{
+                    ptr = __rust_realloc(ptr as *mut u8, cap * 4, 4, cap * 8) as *mut u32;
+                    cap *= 2;
+                }}
+                *(((ptr as usize) + len * 4) as *mut u32) = len as u32;
+                len += 1;
+            }}
+            let mut sum = 0;
+            let mut i = 0;
+            while i < len {{
+                sum += *(((ptr as usize) + i * 4) as *const u32);
+                i += 1;
+            }}
+            __rust_dealloc(ptr as *mut u8, cap * 4, 4);
+            sum
+        }};
+        "#
+        ),
+        999 * 1000 / 2,
+    );
+}
+
+#[test]
+fn stack_frames_are_freed() {
+    // 2 GiB of locals in all, of 1 MiB a call.
+    check_number(
+        r#"
+        //- minicore: fn
+        const fn f(i: usize) -> u8 {
+            let a = [7u8; 1 << 20];
+            a[i]
+        }
+        const GOAL: u32 = {
+            let g = |i: usize| {
+                let a = [1u8; 1 << 20];
+                a[i]
+            };
+            let mut i = 0;
+            let mut sum = 0u32;
+            while i < 1024 {
+                sum = sum + f(i) as u32 + g(i) as u32;
+                i += 1;
+            }
+            sum
+        };
+        "#,
+        1024 * 8,
+    );
+}
+
+#[test]
+fn a_constant_read_again_is_not_copied_again() {
+    // 2 GiB if every read of `K` copied it to the heap.
+    check_number(
+        r#"
+        //- minicore: index, slice
+        const K: [u32; 65536] = [3; 65536];
+        const GOAL: u32 = {
+            let mut i = 0;
+            let mut sum = 0u32;
+            while i < 8192 {
+                sum = sum + K[i];
+                i += 1;
+            }
+            sum
+        };
+        "#,
+        3 * 8192,
+    );
+}
+
+#[test]
+fn a_promoted_borrow_of_a_constant() {
+    // `&B` is promoted: `B` is copied from the heap to the heap, past the end of the stack.
+    check_number(
+        r#"
+        //- minicore: index, slice
+        struct Big([u8; 4096]);
+        impl Big {
+            const fn last(&self) -> u8 {
+                self.0[4095]
+            }
+        }
+        const B: Big = Big([7; 4096]);
+        const GOAL: u8 = B.last() + B.last();
+        "#,
+        14,
+    );
+}
+
+#[test]
+fn a_promoted_temporary_outlives_its_call() {
+    check_number(
+        r#"
+        //- minicore: index, slice
+        const fn f() -> &'static [u8; 3] {
+            &[1, 2, 3]
+        }
+        const fn g() -> u8 {
+            let a = [9u8; 64];
+            a[3]
+        }
+        const GOAL: u8 = {
+            let a = f();
+            let b = g();
+            let c = f();
+            a[2] * 10 + b + c[0]
+        };
+        "#,
+        40,
+    );
+}
+
+const INTEGER_LOG: &str = r#"
+        //- minicore: option, panic, assert, slice, index
+        #[rustc_intrinsic]
+        pub const unsafe fn unreachable() -> !;
+        #[rustc_intrinsic]
+        pub const unsafe fn assume(b: bool) {
+            if !b {
+                unsafe { unreachable() }
+            }
+        }
+        struct U64;
+        impl U64 {
+            const MAX: u64 = 18446744073709551615;
+        }
+        const fn less_than_5(val: u32) -> u32 {
+            const C1: u32 = 0b011_00000000000000000 - 10;
+            const C2: u32 = 0b100_00000000000000000 - 100;
+            const C3: u32 = 0b111_00000000000000000 - 1000;
+            const C4: u32 = 0b100_00000000000000000 - 10000;
+            (((val + C1) & (val + C2)) ^ ((val + C3) & (val + C4))) >> 17
+        }
+        const fn u64_impl(mut val: u64) -> u32 {
+            let mut log = 0;
+            if val >= 10_000_000_000 {
+                val /= 10_000_000_000;
+                log += 10;
+            }
+            if val >= 100_000 {
+                val /= 100_000;
+                log += 5;
+            }
+            log + less_than_5(val as u32)
+        }
+        const fn ilog10(val: u64) -> u32 {
+            let result = u64_impl(val);
+            unsafe { assume(result <= const { u64_impl(U64::MAX) }) };
+            result
+        }
+        const fn checked_ilog(s: u8, base: u8) -> Option<u32> {
+            if s <= 0 || base <= 1 {
+                None
+            } else if s < base {
+                Some(0)
+            } else {
+                let mut n = 1;
+                let mut r = base;
+                while r <= s / base {
+                    n += 1;
+                    r *= base;
+                }
+                Some(n)
+            }
+        }
+        const fn ilog(s: u8, base: u8) -> u32 {
+            assert!(base >= 2, "base of integer logarithm must be at least 2");
+            if let Some(log) = checked_ilog(s, base) {
+                log
+            } else {
+                panic!("argument of integer logarithm must be positive")
+            }
+        }
+        const DIG_TAB: &[u8] = b"0123456789abcdef";
+        const BASE: u8 = DIG_TAB.len() as u8;
+        const MAX_DIG_N: usize = ilog(255, BASE) as usize + 1;
+        const MAX_DEC_N: usize = ilog10(U64::MAX) as usize + 1;
+"#;
+
+/// `core::fmt::num`'s buffer lengths: `MAX.ilog10() + 1` digits, and `MAX.ilog(BASE) + 1` in a
+/// radix.
+#[test]
+fn integer_formatting_buffer_lengths() {
+    check_number(
+        &format!(
+            r#"{INTEGER_LOG}
+        const GOAL: usize = {{
+            let a: [u8; MAX_DEC_N] = [0; MAX_DEC_N];
+            let b: [u8; MAX_DIG_N] = [0; MAX_DIG_N];
+            MAX_DEC_N * 100 + MAX_DIG_N
+        }};
+        "#
+        ),
+        2002,
+    );
+}
+
+#[test]
+fn integer_log_max_dec_n() {
+    check_number(&format!("{INTEGER_LOG}\n        const GOAL: usize = MAX_DEC_N;\n"), 20);
+}
+
+#[test]
+fn integer_log_max_dig_n() {
+    check_number(&format!("{INTEGER_LOG}\n        const GOAL: usize = MAX_DIG_N;\n"), 2);
+}
+
+#[test]
+fn integer_log_base() {
+    check_number(&format!("{INTEGER_LOG}\n        const GOAL: u8 = BASE;\n"), 16);
+}
+
+#[test]
+fn integer_log_u64_impl() {
+    check_number(&format!("{INTEGER_LOG}\n        const GOAL: u32 = u64_impl(U64::MAX);\n"), 19);
+}
+
+#[test]
+fn integer_log_ilog10() {
+    check_number(&format!("{INTEGER_LOG}\n        const GOAL: u32 = ilog10(U64::MAX);\n"), 19);
+}
+
+#[test]
+fn integer_log_ilog() {
+    check_number(&format!("{INTEGER_LOG}\n        const GOAL: u32 = ilog(255, 16);\n"), 1);
+}
+
+/// `core::fmt::num_buffer`'s `type Buf = [MaybeUninit<u8>; i64::MAX.ilog10() as usize + 2]`, of
+/// the signed `ilog10`.
+#[test]
+fn signed_integer_log_in_a_type_alias() {
+    check_number(
+        &format!(
+            r#"{INTEGER_LOG}
+        struct I64(i64);
+        impl I64 {{
+            const MAX: I64 = I64(9223372036854775807);
+            const fn cast_unsigned(self) -> u64 {{
+                self.0 as u64
+            }}
+            const fn ilog10(self) -> u32 {{
+                if let Some(log) = self.checked_ilog10() {{
+                    log
+                }} else {{
+                    panic!("argument of integer logarithm must be positive")
+                }}
+            }}
+            const fn checked_ilog10(self) -> Option<u32> {{
+                int_log10_i64(self.0)
+            }}
+        }}
+        const fn int_log10_i64(val: i64) -> Option<u32> {{
+            if val > 0 {{
+                let result = u64_impl(I64(val).cast_unsigned());
+                unsafe {{ assume(result <= const {{ u64_impl(I64::MAX.cast_unsigned()) }}) }};
+                Some(result)
+            }} else {{
+                None
+            }}
+        }}
+        type Buf = [u8; I64::MAX.ilog10() as usize + 2];
+        const GOAL: usize = {{
+            let buf: Buf = [0; 20];
+            I64::MAX.ilog10() as usize + 2
+        }};
+        "#
+        ),
+        20,
+    );
+}
+
+#[test]
+fn inline_const_compared_by_reference() {
+    // `x <= const { .. }` borrows both sides for `PartialOrd::le`: the constant is the block's
+    // value, not a reference to a local of its own frame, which is gone once it returns.
+    check_number(
+        r#"
+        //- minicore: ord, copy
+        const fn small(x: u32) -> u32 {
+            if x <= const { 3u32 } { 1 } else { 2 }
+        }
+        const GOAL: u32 = small(5) * 10 + small(2);
+        "#,
+        21,
+    );
+}
+
+#[test]
+fn allocated_memory_may_not_be_in_the_value() {
+    for value in ["__rust_alloc(4, 1)", "&*__rust_alloc(4, 1)"] {
+        let ty = if value.starts_with('&') { "&u8" } else { "*const u8" };
+        check_fail(
+            &format!(
+                r#"
+        //- minicore: sized
+        {ALLOCATOR}
+        const GOAL: {ty} = unsafe {{ {value} }};
+        "#
+            ),
+            |e| {
+                matches!(
+                    e,
+                    ConstEvalError::MirEvalError(MirEvalError::HeapInValue {
+                        of_const_allocate: false
+                    })
+                )
+            },
+        );
+    }
+    // Behind other memory: the data of a vector.
+    check_fail(
+        &format!(
+            r#"
+        //- minicore: sized
+        {ALLOCATOR}
+        struct RawVec {{ ptr: *mut u8, cap: usize }}
+        const GOAL: (RawVec, usize) = unsafe {{ (RawVec {{ ptr: __rust_alloc(8, 1), cap: 8 }}, 0) }};
+        "#
+        ),
+        |e| {
+            matches!(
+                e,
+                ConstEvalError::MirEvalError(MirEvalError::HeapInValue {
+                    of_const_allocate: false
+                })
+            )
+        },
+    );
+}
+
+#[test]
+fn const_allocate_is_in_the_value_once_made_global() {
+    check_fail(
+        &format!(
+            r#"
+        //- minicore: sized
+        {ALLOCATOR}
+        const GOAL: &u8 = unsafe {{ &*const_allocate(4, 4) }};
+        "#
+        ),
+        |e| {
+            matches!(
+                e,
+                ConstEvalError::MirEvalError(MirEvalError::HeapInValue { of_const_allocate: true })
+            )
+        },
+    );
+    check_number(
+        &format!(
+            r#"
+        //- minicore: sized
+        {ALLOCATOR}
+        const X: &u8 = unsafe {{
+            let ptr = const_allocate(4, 4);
+            *ptr = 7;
+            &*const_make_global(ptr)
+        }};
+        const GOAL: u8 = *X;
+        "#
+        ),
+        7,
+    );
+}
+
+#[test]
+fn freeing_what_was_not_allocated() {
+    for body in [
+        "let ptr = __rust_alloc(4, 1); __rust_dealloc(ptr, 4, 1); __rust_dealloc(ptr, 4, 1);",
+        "let ptr = __rust_alloc(4, 1); __rust_dealloc(((ptr as usize) + 1) as *mut u8, 3, 1);",
+        "let ptr = __rust_alloc(4, 1); const_deallocate(ptr, 4, 1);",
+        "let ptr = const_allocate(4, 1); __rust_dealloc(ptr, 4, 1);",
+        "let mut x = 0u8; __rust_dealloc(&mut x, 1, 1);",
+        "let ptr = __rust_alloc(4, 1); const_make_global(ptr);",
+    ] {
+        check_fail(
+            &format!(
+                r#"
+        //- minicore: sized
+        {ALLOCATOR}
+        const GOAL: u8 = unsafe {{ {body} 0 }};
+        "#
+            ),
+            |e| matches!(e, ConstEvalError::MirEvalError(MirEvalError::UndefinedBehavior(_))),
+        );
+    }
+}
+
 #[test]
 fn unchecked_arithmetic() {
     let fixture = |goal: &str| {
@@ -872,6 +1319,48 @@ fn atomic() {
         };
         "#,
         660 + 1024,
+    );
+}
+
+#[test]
+fn atomic_with_const_generic_orderings() {
+    // The pinned nightly's spelling: the orderings are const generics, not name suffixes.
+    check_number(
+        r#"
+        //- minicore: copy
+        #[rustc_intrinsic]
+        pub fn atomic_load<T: Copy, const ORD: u8, const VOLATILE: bool>(src: *const T) -> T;
+        #[rustc_intrinsic]
+        pub fn atomic_store<T: Copy, const ORD: u8, const VOLATILE: bool>(dst: *mut T, val: T);
+        #[rustc_intrinsic]
+        pub fn atomic_xadd<T: Copy, U: Copy, const ORD: u8>(dst: *mut T, src: U) -> T;
+        #[rustc_intrinsic]
+        pub fn atomic_max<T: Copy, const ORD: u8>(dst: *mut T, src: T) -> T;
+        #[rustc_intrinsic]
+        pub fn atomic_min<T: Copy, const ORD: u8>(dst: *mut T, src: T) -> T;
+        #[rustc_intrinsic]
+        pub fn atomic_umin<T: Copy, const ORD: u8>(dst: *mut T, src: T) -> T;
+        #[rustc_intrinsic]
+        pub fn atomic_cxchg<T: Copy, const S: u8, const F: u8>(dst: *mut T, old: T, src: T) -> (T, bool);
+        #[rustc_intrinsic]
+        pub fn atomic_fence<const ORD: u8>();
+
+        const GOAL: i32 = {
+            let mut x = 5i32;
+            atomic_store::<i32, 4, false>(&mut x, 10);
+            atomic_xadd::<i32, i32, 4>(&mut x, 7);
+            atomic_fence::<4>();
+            let old = atomic_max::<i32, 4>(&mut x, -3);
+            let before = atomic_max::<i32, 4>(&mut x, 40);
+            let mut u = 7u32;
+            atomic_umin::<u32, 4>(&mut u, 3);
+            let mut n = -10i32;
+            atomic_min::<i32, 4>(&mut n, 5);
+            let (prev, ok) = atomic_cxchg::<i32, 4, 4>(&mut x, 40, 41);
+            atomic_load::<i32, 4, false>(&x) + old + before + u as i32 + n + prev + ok as i32
+        };
+        "#,
+        41 + 17 + 17 + 3 - 10 + 40 + 1,
     );
 }
 

@@ -3,6 +3,7 @@
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
+    collections::BTreeMap,
     iter, mem,
     ops::Range,
 };
@@ -41,6 +42,7 @@ use crate::{
     CallableDefId, ComplexMemoryMap, InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate,
     consteval::{self, ConstEvalError, try_const_usize},
     db::{AnonConstId, GeneralConstId, HirDatabase, InternedClosureId},
+    drop::{DropGlue, has_drop_glue},
     infer::PointerCast,
     layout::{Layout, LayoutError, RustcEnumVariantIdx, RustcFieldIdx},
     method_resolution::{is_dyn_method, lookup_impl_const},
@@ -182,15 +184,68 @@ struct Allocated {
     align: usize,
 }
 
+/// What made a block of the evaluation's heap, which says who may free it and whether the
+/// value of a constant may point into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// The evaluator itself: a constant it read, a literal, a static, a promoted temporary.
+    /// Nothing frees it, and a constant's value may point to it.
+    Evaluator,
+    /// The program's allocator (`__rust_alloc`, `Box::new`), freed by `__rust_dealloc`. A
+    /// constant's value may not point to it: the program would free it at run time.
+    Allocator,
+    /// `const_allocate`, freed by `const_deallocate`. A constant's value may point to it once
+    /// `const_make_global` has made it global.
+    ConstHeap { global: bool },
+}
+
+/// A block of the heap: the size and alignment it was asked for, the bytes it takes, of a
+/// size class ([`size_class`]) a freed block of the same class and alignment is reused for,
+/// and what made it.
+/// What is left of a drop ([`Evaluator::run_drop_glue_deep`]).
+enum DropStep<'db> {
+    /// The drop glue of a value: its type, where it is, and its metadata if unsized.
+    Glue(Ty<'db>, Address, Vec<u8>),
+    /// The `Drop` impl of a `Box`, once what it points to is dropped.
+    DropImpl(Ty<'db>, Address),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HeapBlock {
+    size: usize,
+    align: usize,
+    class: usize,
+    origin: Origin,
+}
+
+/// The bytes a heap block of `size` takes: a power of two, so a block freed by a `Vec` that
+/// grew is the one the next `Vec` of about that size gets.
+fn size_class(size: usize) -> usize {
+    size.max(8).checked_next_power_of_two().unwrap_or(usize::MAX)
+}
+
 pub struct Evaluator<'db> {
     db: &'db dyn HirDatabase,
     param_env: ParamEnvAndCrate<'db>,
     target_data_layout: &'db TargetDataLayout,
     stack: Vec<u8>,
     heap: Vec<u8>,
-    /// Every stack and heap allocation, in address order. A raw pointer in a constant
-    /// doesn't say how much memory it can reach, its allocation does.
-    allocations: [Vec<Allocated>; 2],
+    /// Every stack allocation, in address order. A raw pointer in a constant doesn't say how
+    /// much memory it can reach, its allocation does.
+    stack_allocations: Vec<Allocated>,
+    /// Every live block of the heap, by its offset in [`Self::heap`].
+    heap_blocks: BTreeMap<usize, HeapBlock>,
+    /// The offsets of freed heap blocks, by size class and alignment, for the next block of
+    /// that class and alignment.
+    free_blocks: FxHashMap<(usize, usize), Vec<usize>>,
+    /// Where a promoted temporary of a body (`&[1, 2]`) is: in the heap, as its borrow
+    /// outlives the call, once for every call of the body.
+    promoted: FxHashMap<(usize, LocalId), Address>,
+    /// Whether dropping a value of a type does anything ([`Self::has_drop_glue`]).
+    drop_glue: FxHashMap<Ty<'db>, bool>,
+    /// Where the value of a constant operand is, once read: the program never writes it, so
+    /// every use of the constant reads the same copy.
+    constants: FxHashMap<Either<Const<'db>, Allocation<'db>>, Interval>,
     code_stack: Vec<StackFrame<'db>>,
     /// The `callee` and `span` of the frame being run, which is not on `code_stack`.
     running: Option<(Option<FunctionId>, (MirSpan, InferBodyId<'db>))>,
@@ -528,7 +583,12 @@ impl<'db> Evaluator<'db> {
             target_data_layout,
             stack: vec![0],
             heap: vec![0],
-            allocations: Default::default(),
+            stack_allocations: Vec::new(),
+            heap_blocks: BTreeMap::new(),
+            free_blocks: FxHashMap::default(),
+            promoted: FxHashMap::default(),
+            drop_glue: FxHashMap::default(),
+            constants: FxHashMap::default(),
             code_stack: vec![],
             running: None,
             vtable_map: VTableMap::default(),
@@ -994,13 +1054,25 @@ impl<'db> Evaluator<'db> {
                     if self.limits_frames {
                         self.stack_depth_limit += 1;
                     }
-                    // We don't support const promotion, so we can't truncate the stack yet.
-                    let _ = my_stack_frame.prev_stack_ptr;
-                    // self.stack.truncate(my_stack_frame.prev_stack_ptr);
+                    self.free_stack(my_stack_frame.prev_stack_ptr);
                     current_block_idx = bb;
                 }
             }
         }
+    }
+
+    /// Gives back the stack above `len`, of the frames that returned: nothing points there
+    /// any more but what a dangling pointer would, as the temporaries whose borrows outlive
+    /// a call are in the heap ([`Self::promoted`]).
+    fn free_stack(&mut self, len: usize) {
+        self.truncate_stack(len);
+    }
+
+    fn truncate_stack(&mut self, len: usize) {
+        self.stack.truncate(len);
+        let end = Stack(len).to_usize();
+        let kept = self.stack_allocations.partition_point(|it| it.start < end);
+        self.stack_allocations.truncate(kept);
     }
 
     fn fill_locals_for_body(
@@ -1063,19 +1135,30 @@ impl<'db> Evaluator<'db> {
                     locals.ptr.insert(id, Interval { addr: Invalid(align), size });
                     continue;
                 }
+                if body.promoted_locals.iter().any(|&(it, _)| it == id) {
+                    let key = (std::ptr::from_ref(body) as usize, id);
+                    let addr = match self.promoted.get(&key) {
+                        Some(&addr) => addr,
+                        None => {
+                            let addr = self.heap_allocate(size, align)?;
+                            self.promoted.insert(key, addr);
+                            addr
+                        }
+                    };
+                    locals.ptr.insert(id, Interval { addr, size });
+                    continue;
+                }
                 while !stack_ptr.is_multiple_of(align) {
                     stack_ptr += 1;
                 }
                 let my_ptr = stack_ptr;
                 stack_ptr += size;
                 locals.ptr.insert(id, Interval { addr: Stack(my_ptr), size });
-                if size != 0 {
-                    self.allocations[0].push(Allocated {
-                        start: Stack(my_ptr).to_usize(),
-                        size,
-                        align,
-                    });
-                }
+                self.stack_allocations.push(Allocated {
+                    start: Stack(my_ptr).to_usize(),
+                    size,
+                    align,
+                });
             }
             stack_ptr - self.stack.len()
         };
@@ -1421,10 +1504,12 @@ impl<'db> Evaluator<'db> {
                                 }
                                 _ => (l128.wrapping_mul(r128), l128.checked_mul(r128).is_none()),
                             };
-                            // `(T, bool)`: the value, the flag, and padding to twice `T`.
+                            // `(T, bool)`: the value, the flag right after it, and padding to
+                            // `T`'s alignment, which the target sets (`u128`'s is 8 or 16).
+                            let align = self.layout(ty)?.align.abi.bytes() as usize;
                             let mut bytes = value.to_bytes();
                             bytes.push(u8::from(overflowed));
-                            bytes.resize(2 * lc.len(), 0);
+                            bytes.resize(bytes.len().next_multiple_of(align), 0);
                             Owned(bytes)
                         }
                         BinOp::Offset => not_supported!("offset binop"),
@@ -1970,13 +2055,30 @@ impl<'db> Evaluator<'db> {
             }
             OperandKind::Constant { konst, ty } => match self.placed(it, ty.as_ref(), locals)? {
                 Some(placed) => placed,
-                None => self.allocate_const_in_heap(locals, konst.as_ref())?,
+                None => {
+                    let konst = konst.as_ref();
+                    if let Some(&interval) = self.constants.get(&Either::Left(konst)) {
+                        return Ok(interval);
+                    }
+                    let interval = self.allocate_const_in_heap(locals, konst)?;
+                    if self.shares_one_copy(konst) {
+                        self.constants.insert(Either::Left(konst), interval);
+                    }
+                    interval
+                }
             },
             OperandKind::Allocation { allocation } => {
                 let allocation = allocation.as_ref();
                 match self.placed(it, allocation.ty, locals)? {
                     Some(placed) => placed,
-                    None => self.allocate_allocation_in_heap(locals, allocation)?,
+                    None => match self.constants.get(&Either::Right(allocation)) {
+                        Some(&interval) => interval,
+                        None => {
+                            let interval = self.allocate_allocation_in_heap(locals, allocation)?;
+                            self.constants.insert(Either::Right(allocation), interval);
+                            interval
+                        }
+                    },
                 }
             }
         })
@@ -2251,6 +2353,21 @@ impl<'db> Evaluator<'db> {
         }
     }
 
+    /// Whether every use of `konst` reads the same copy ([`Self::constants`]): not of a
+    /// static, which may be written, nor of an inline `const { .. }`, which is run again as
+    /// its `TypeId`s are this evaluation's ([`Self::inline_const_in_heap`]).
+    fn shares_one_copy(&self, konst: Const<'db>) -> bool {
+        match konst.kind() {
+            ConstKind::Value(_) => true,
+            ConstKind::Unevaluated(UnevaluatedConst { def, .. }) => match def.0 {
+                GeneralConstId::ConstId(_) => true,
+                GeneralConstId::StaticId(_) => false,
+                GeneralConstId::AnonConstId(it) => !it.is_inline_const(self.db),
+            },
+            _ => false,
+        }
+    }
+
     /// A `const { .. }` block met while evaluating is run by this evaluation, as one lowered in
     /// place was: the `TypeId`s it makes and compares are this evaluation's (`type_info::of`).
     fn inline_const_in_heap(
@@ -2269,12 +2386,14 @@ impl<'db> Evaluator<'db> {
             let name = GeneralConstId::AnonConstId(konst).name(self.db);
             MirEvalError::ConstEvalError(name, Box::new(ConstEvalError::MirLowerError(e)))
         })?;
+        let mark = self.stack.len();
         let result = self.interpret_mir(body, iter::empty(), None)?;
         let ty = body.locals[return_slot()].ty.as_ref();
         let align = self.size_align_of(ty, locals)?.map_or(1, |it| it.1);
         let addr = self.heap_allocate(result.size, align)?;
         let interval = Interval::new(addr, result.size);
         interval.write_from_interval(self, result)?;
+        self.free_stack(mark);
         Ok(interval)
     }
 
@@ -2452,7 +2571,7 @@ impl<'db> Evaluator<'db> {
                 self.stack.copy_within(src..src + r.size, dst)
             }
             (Heap(dst), Heap(src)) => {
-                if self.stack.len() < src + r.size || self.stack.len() < dst + r.size {
+                if self.heap.len() < src + r.size || self.heap.len() < dst + r.size {
                     return Err(oob());
                 }
                 self.heap.copy_within(src..src + r.size, dst)
@@ -2561,11 +2680,25 @@ impl<'db> Evaluator<'db> {
 
     /// The allocation `addr` is in.
     fn allocation_at(&self, addr: usize) -> Option<Allocated> {
-        self.allocations.iter().find_map(|allocations| {
-            let i = allocations.partition_point(|it| it.start <= addr);
-            let &allocation = allocations.get(i.checked_sub(1)?)?;
-            (addr - allocation.start < allocation.size).then_some(allocation)
-        })
+        match Address::from_usize(addr) {
+            Stack(_) => {
+                let i = self.stack_allocations.partition_point(|it| it.start <= addr);
+                let &allocation = self.stack_allocations.get(i.checked_sub(1)?)?;
+                (addr - allocation.start < allocation.size).then_some(allocation)
+            }
+            Heap(offset) => {
+                let (start, block) = self.heap_block_at(offset)?;
+                let start = Heap(start).to_usize();
+                Some(Allocated { start, size: block.size, align: block.align })
+            }
+            Invalid(_) => None,
+        }
+    }
+
+    /// The live heap block the heap offset `offset` is in, with where it starts.
+    fn heap_block_at(&self, offset: usize) -> Option<(usize, HeapBlock)> {
+        let (&start, &block) = self.heap_blocks.range(..=offset).next_back()?;
+        (offset - start < block.size).then_some((start, block))
     }
 
     /// Records in `map` what `addr` is known to be a multiple of: what its allocation was
@@ -2591,24 +2724,118 @@ impl<'db> Evaluator<'db> {
         Ok(())
     }
 
+    /// Memory of the evaluator's own ([`Origin::Evaluator`]), zeroed.
     fn heap_allocate(&mut self, size: usize, align: usize) -> Result<'db, Address> {
+        self.allocate(size, align, Origin::Evaluator)
+    }
+
+    /// A zeroed block of the heap: a freed one of its size class and alignment when there is
+    /// one, else one at the end.
+    fn allocate(&mut self, size: usize, align: usize, origin: Origin) -> Result<'db, Address> {
         if !align.is_power_of_two() || align > 10000 {
             return Err(MirEvalError::UndefinedBehavior(format!("Alignment {align} is invalid")));
         }
-        while !self.heap.len().is_multiple_of(align) {
-            self.heap.push(0);
+        if size == 0 {
+            // As a local of no size: aligned, of no block, so not where the next block starts.
+            return Ok(Invalid(align));
         }
-        self.check_memory(size)?;
-        let pos = self.heap.len();
-        self.heap.extend(std::iter::repeat_n(0, size));
-        if size != 0 {
-            self.allocations[1].push(Allocated {
-                start: Address::Heap(pos).to_usize(),
-                size,
-                align,
-            });
+        let class = size_class(size);
+        let pos = match self.free_blocks.get_mut(&(class, align)).and_then(Vec::pop) {
+            Some(pos) => {
+                self.heap[pos..pos + class].fill(0);
+                pos
+            }
+            None => {
+                let pos = self.heap.len().next_multiple_of(align);
+                self.check_memory((pos - self.heap.len()).saturating_add(class))?;
+                self.heap.resize(pos + class, 0);
+                pos
+            }
+        };
+        self.heap_blocks.insert(pos, HeapBlock { size, align, class, origin });
+        Ok(Heap(pos))
+    }
+
+    /// Frees the block `addr` starts, which `origin` made; `what` names the call, for its
+    /// error. As rustc's evaluation, freeing anything else is undefined behavior.
+    fn deallocate(&mut self, addr: Address, origin: Origin, what: &str) -> Result<'db, ()> {
+        let block = match addr {
+            Heap(pos) => self.heap_blocks.get(&pos).copied().map(|it| (pos, it)),
+            _ => None,
+        };
+        let Some((pos, block)) = block.filter(|(_, it)| it.origin == origin) else {
+            return Err(MirEvalError::UndefinedBehavior(format!(
+                "`{what}` of a pointer that is not the start of memory allocated by it"
+            )));
+        };
+        self.heap_blocks.remove(&pos);
+        self.free_blocks.entry((block.class, block.align)).or_default().push(pos);
+        Ok(())
+    }
+
+    /// `__rust_realloc`: the block grows or shrinks in place while it fits its size class,
+    /// else its bytes move to a new block and it is freed.
+    fn reallocate(&mut self, addr: Address, new_size: usize) -> Result<'db, Address> {
+        let block = match addr {
+            Heap(pos) => self.heap_blocks.get(&pos).copied().map(|it| (pos, it)),
+            _ => None,
+        };
+        let Some((pos, block)) = block.filter(|(_, it)| it.origin == Origin::Allocator) else {
+            return Err(MirEvalError::UndefinedBehavior(
+                "`__rust_realloc` of a pointer that is not the start of memory allocated by it"
+                    .to_owned(),
+            ));
+        };
+        if new_size != 0 && new_size <= block.class {
+            if new_size > block.size {
+                self.heap[pos + block.size..pos + new_size].fill(0);
+            }
+            self.heap_blocks.insert(pos, HeapBlock { size: new_size, ..block });
+            return Ok(addr);
         }
-        Ok(Address::Heap(pos))
+        let new = self.allocate(new_size, block.align, Origin::Allocator)?;
+        let kept = block.size.min(new_size);
+        Interval { addr: new, size: kept }
+            .write_from_interval(self, Interval { addr, size: kept })?;
+        self.deallocate(addr, Origin::Allocator, "__rust_realloc")?;
+        Ok(new)
+    }
+
+    /// `const_make_global`: the `const_allocate` block `addr` starts may be in the value of
+    /// a constant from now on, and is immutable.
+    fn make_global(&mut self, addr: Address) -> Result<'db, ()> {
+        let block = match addr {
+            Heap(pos) => self.heap_blocks.get_mut(&pos),
+            _ => None,
+        };
+        match block {
+            Some(HeapBlock { origin: origin @ Origin::ConstHeap { global: false }, .. }) => {
+                *origin = Origin::ConstHeap { global: true };
+                Ok(())
+            }
+            _ => Err(MirEvalError::UndefinedBehavior(
+                "`const_make_global` of a pointer that is not the start of memory \
+                 `const_allocate` allocated and nothing made global yet"
+                    .to_owned(),
+            )),
+        }
+    }
+
+    /// Refuses `addr` in the value of the constant: memory the program allocated, which it
+    /// would free at run time, or `const_allocate` memory not made global. rustc refuses the
+    /// latter alike ("encountered `const_allocate` pointer in final value that was not made
+    /// global"), and has no `Box` or `Vec` that allocates in a constant.
+    fn may_be_in_value(&self, addr: usize) -> Result<'db, ()> {
+        let Heap(offset) = Address::from_usize(addr) else { return Ok(()) };
+        match self.heap_block_at(offset) {
+            Some((_, HeapBlock { origin: Origin::Allocator, .. })) => {
+                Err(MirEvalError::HeapInValue { of_const_allocate: false })
+            }
+            Some((_, HeapBlock { origin: Origin::ConstHeap { global: false }, .. })) => {
+                Err(MirEvalError::HeapInValue { of_const_allocate: true })
+            }
+            _ => Ok(()),
+        }
     }
 
     fn detect_fn_trait(&self, def: FunctionId) -> Option<FnTrait> {
@@ -2731,6 +2958,7 @@ impl<'db> Evaluator<'db> {
                     }
                     return Ok(());
                 }
+                this.may_be_in_value(addr)?;
             }
             match ty.kind() {
                 // Nothing to find in these, and a large array of them is slow to walk.
@@ -2972,6 +3200,7 @@ impl<'db> Evaluator<'db> {
                 }
                 return Ok(());
             }
+            this.may_be_in_value(addr)?;
             let Some(Allocated { start, size, align }) = this.allocation_at(addr) else {
                 return Ok(());
             };
@@ -3266,6 +3495,7 @@ impl<'db> Evaluator<'db> {
                 args,
                 locals,
                 span,
+                None,
             ),
             _ => Err(MirEvalError::InternalError("function pointer to non function".into())),
         }
@@ -3280,6 +3510,7 @@ impl<'db> Evaluator<'db> {
         args: &[IntervalAndTy<'db>],
         locals: &Locals<'db>,
         span: MirSpan,
+        consumed: Option<Ty<'db>>,
     ) -> Result<'db, Option<StackFrame<'db>>> {
         let mir_body = super::optimize::interpreted_closure_body(
             self.db,
@@ -3288,15 +3519,18 @@ impl<'db> Evaluator<'db> {
             self.param_env.store(),
         )
         .map_err(|it| MirEvalError::MirLowerErrorForClosure(closure, it))?;
-        let closure_data =
-            if mir_body.locals[mir_body.param_locals[0]].ty.as_ref().as_reference().is_some() {
-                closure_data.addr.to_bytes().to_vec()
-            } else {
-                closure_data.get(self)?.to_owned()
-            };
+        let by_reference =
+            mir_body.locals[mir_body.param_locals[0]].ty.as_ref().as_reference().is_some();
+        let closure_addr = closure_data.addr;
+        let closure_data = if by_reference {
+            closure_addr.to_bytes().to_vec()
+        } else {
+            closure_data.get(self)?.to_owned()
+        };
         let arg_bytes = iter::once(Ok(closure_data))
             .chain(args.iter().map(|it| Ok(it.get(self)?.to_owned())))
             .collect::<Result<'db, Vec<_>>>()?;
+        let mark = self.stack.len();
         let interval = self
             .interpret_mir(mir_body, arg_bytes.into_iter().map(IntervalOrOwned::Owned), None)
             .map_err(|e| {
@@ -3306,6 +3540,15 @@ impl<'db> Evaluator<'db> {
                 )
             })?;
         destination.write_from_interval(self, interval)?;
+        // A `Fn` or `FnMut` closure called by value through `FnOnce::call_once` is dropped
+        // after the call, as rustc's `ClosureOnceShim` does: nothing else owns it then. One
+        // whose body takes it by value dropped it itself.
+        if let Some(closure_ty) = consumed
+            && by_reference
+        {
+            self.run_drop_glue_deep(closure_ty, locals, closure_addr, &[], span)?;
+        }
+        self.free_stack(mark);
         Ok(None)
     }
 
@@ -3504,6 +3747,7 @@ impl<'db> Evaluator<'db> {
                 callee: Some(def),
             }))
         } else {
+            let mark = self.stack.len();
             let called = Some((def, span, locals.body.owner));
             let result = self.interpret_mir(mir_body, arg_bytes, called).map_err(|e| {
                 MirEvalError::InFunction(
@@ -3512,6 +3756,7 @@ impl<'db> Evaluator<'db> {
                 )
             })?;
             destination.write_from_interval(self, result)?;
+            self.free_stack(mark);
             Ok(None)
         }
     }
@@ -3549,15 +3794,20 @@ impl<'db> Evaluator<'db> {
             TyKind::FnPtr(..) => {
                 self.exec_fn_pointer(func_data, destination, &args[1..], locals, target_bb, span)
             }
-            TyKind::Closure(closure, subst) => self.exec_closure(
-                closure.0,
-                func_data,
-                GenericArgs::new_from_slice(subst.as_closure().parent_args()),
-                destination,
-                &args[1..],
-                locals,
-                span,
-            ),
+            TyKind::Closure(closure, subst) => {
+                let consumed = (Some(def) == self.cached_fn_once_trait_func && func_ty == func.ty)
+                    .then_some(func_ty);
+                self.exec_closure(
+                    closure.0,
+                    func_data,
+                    GenericArgs::new_from_slice(subst.as_closure().parent_args()),
+                    destination,
+                    &args[1..],
+                    locals,
+                    span,
+                    consumed,
+                )
+            }
             _ => {
                 // try to execute the manual impl of `FnTrait` for structs (nightly feature used in std)
                 let arg0 = func;
@@ -3677,6 +3927,13 @@ impl<'db> Evaluator<'db> {
         self.run_drop_glue_deep(ty, locals, addr, &metadata, span)
     }
 
+    /// Drops the value of type `ty` at `addr`, as rustc's `drop_in_place::<ty>`: its `Drop`
+    /// impl, then its parts in order (a struct's or tuple's fields, a closure's captures, the
+    /// fields of the variant an enum holds, an array's or slice's elements). A `Box` drops what
+    /// it points to before its `Drop` frees it.
+    ///
+    /// The parts wait on a stack of steps rather than the native one: a list of a thousand
+    /// boxes is a thousand levels deep.
     fn run_drop_glue_deep(
         &mut self,
         ty: Ty<'db>,
@@ -3685,12 +3942,167 @@ impl<'db> Evaluator<'db> {
         metadata: &[u8],
         span: MirSpan,
     ) -> Result<'db, ()> {
-        let Some(drop_fn) = self.lang_items().Drop_drop else {
-            // in some tests we don't have drop trait in minicore, and
-            // we can ignore drop in them.
+        if self.lang_items().Drop_drop.is_none() {
             return Ok(());
-        };
+        }
+        let mut steps = vec![DropStep::Glue(ty, addr, metadata.to_vec())];
+        while let Some(step) = steps.pop() {
+            match step {
+                DropStep::Glue(ty, addr, metadata) => {
+                    self.drop_glue_step(ty, locals, addr, &metadata, span, &mut steps)?
+                }
+                DropStep::DropImpl(ty, addr) => self.call_drop_impl(ty, locals, addr, span)?,
+            }
+        }
+        Ok(())
+    }
 
+    /// One step of [`Self::run_drop_glue_deep`]: runs what comes first in dropping the value
+    /// and pushes the rest onto `steps`, last first.
+    fn drop_glue_step(
+        &mut self,
+        ty: Ty<'db>,
+        locals: &Locals<'db>,
+        addr: Address,
+        metadata: &[u8],
+        span: MirSpan,
+        steps: &mut Vec<DropStep<'db>>,
+    ) -> Result<'db, ()> {
+        if !self.has_drop_glue(ty) {
+            return Ok(());
+        }
+        // A field's declared type can be a projection (`Cow::Owned`'s `<B as ToOwned>::Owned`,
+        // `FlatMap`'s `Option<U::IntoIter>`), which `has_drop_glue` saw through.
+        let ty = match ty.kind() {
+            TyKind::Alias(..) => {
+                let normalized = ObligationCtxt::new(&self.infcx)
+                    .structurally_normalize_ty(
+                        &ObligationCause::dummy(),
+                        self.param_env.param_env,
+                        ty,
+                    )
+                    .map_err(|_| {
+                        MirEvalError::NotSupported(format!(
+                            "dropping {ty:?}, which does not normalize"
+                        ))
+                    })?;
+                if matches!(normalized.kind(), TyKind::Alias(..) | TyKind::Infer(..)) {
+                    not_supported!("dropping {ty:?}, which does not normalize");
+                }
+                normalized
+            }
+            _ => ty,
+        };
+        let mut parts = Vec::new();
+        match ty.kind() {
+            TyKind::Adt(adt_def, subst) => {
+                let id = adt_def.def_id();
+                if let AdtId::StructId(s) = id
+                    && StructSignature::of(self.db, s).flags.contains(StructFlags::IS_MANUALLY_DROP)
+                {
+                    return Ok(());
+                }
+                let layout = self.layout_adt(id, subst)?;
+                if adt_def.is_box() {
+                    let AdtId::StructId(s) = id else {
+                        not_supported!("a box that is not a struct")
+                    };
+                    let field_types = self.db.field_types(s.into());
+                    let Some((_, pointer)) = field_types.iter().next() else {
+                        not_supported!("a box with no pointer");
+                    };
+                    let pointer = pointer.ty().instantiate(self.interner(), subst).skip_norm_wip();
+                    let size = self.size_of_sized(pointer, locals, "pointer of a box")?;
+                    let offset = layout.fields.offset(0).bytes_usize();
+                    let bytes = self.read_memory(addr.offset(offset), size)?.to_vec();
+                    let (data, contents_metadata) = bytes.split_at(self.ptr_size());
+                    parts.push(DropStep::Glue(
+                        subst.type_at(0),
+                        Address::from_bytes(data)?,
+                        contents_metadata.to_vec(),
+                    ));
+                    parts.push(DropStep::DropImpl(ty, addr));
+                } else {
+                    self.call_drop_impl(ty, locals, addr, span)?;
+                }
+                let bytes;
+                let (variant, layout): (VariantId, Cow<'_, Layout>) = match id {
+                    AdtId::StructId(s) => (s.into(), Cow::Borrowed(&*layout)),
+                    AdtId::UnionId(_) => return Ok(()),
+                    AdtId::EnumId(e) => {
+                        bytes = self.read_memory(addr, layout.size.bytes_usize())?.to_vec();
+                        match detect_variant_from_bytes(
+                            &layout,
+                            self.db,
+                            self.target_data_layout,
+                            &bytes,
+                            e,
+                        ) {
+                            Some((variant, layout)) => (variant.into(), layout),
+                            None => not_supported!("dropping {ty:?}: no variant has its tag"),
+                        }
+                    }
+                };
+                let field_types = self.db.field_types(variant);
+                let fields = variant.fields(self.db).fields();
+                let last = fields.iter().count().checked_sub(1);
+                for (index, (field, _)) in fields.iter().enumerate() {
+                    let offset =
+                        layout.fields.offset(u32::from(field.into_raw()) as usize).bytes_usize();
+                    let ty =
+                        field_types[field].ty().instantiate(self.interner(), subst).skip_norm_wip();
+                    // The metadata of an unsized struct is its last field's (`RefCell<dyn FnMut()>`).
+                    let metadata = if Some(index) == last { metadata.to_vec() } else { Vec::new() };
+                    parts.push(DropStep::Glue(ty, addr.offset(offset), metadata));
+                }
+            }
+            TyKind::Tuple(fields) => self.field_steps(ty, fields.iter(), addr, &mut parts)?,
+            TyKind::Closure(_, args) => {
+                let upvars = args.as_closure().tupled_upvars_ty();
+                self.field_steps(ty, upvars.tuple_fields().iter(), addr, &mut parts)?;
+            }
+            TyKind::Array(inner, len) => {
+                let Some(len) = try_const_usize(self.db, len) else {
+                    not_supported!("dropping an array of no evaluated length");
+                };
+                self.element_steps(inner, len as usize, locals, addr, &mut parts)?;
+            }
+            TyKind::Slice(inner) => {
+                let len = from_bytes!(usize, metadata);
+                self.element_steps(inner, len, locals, addr, &mut parts)?;
+            }
+            TyKind::Dynamic(..) => {
+                if metadata.is_empty() {
+                    not_supported!("dropping {ty:?} with no vtable");
+                }
+                let concrete_ty = self.vtable_map.ty_of_bytes(metadata)?;
+                parts.push(DropStep::Glue(concrete_ty, addr, Vec::new()));
+            }
+            _ => not_supported!("drop glue of {ty:?}"),
+        }
+        steps.extend(parts.into_iter().rev());
+        Ok(())
+    }
+
+    /// Whether dropping a value of `ty` does anything, once per type.
+    fn has_drop_glue(&mut self, ty: Ty<'db>) -> bool {
+        if let Some(&it) = self.drop_glue.get(&ty) {
+            return it;
+        }
+        let it = has_drop_glue(&self.infcx, ty, self.param_env.param_env) != DropGlue::None;
+        self.drop_glue.insert(ty, it);
+        it
+    }
+
+    /// `<ty as Drop>::drop` on the value at `addr`, if `ty` has a `Drop` impl.
+    fn call_drop_impl(
+        &mut self,
+        ty: Ty<'db>,
+        locals: &Locals<'db>,
+        addr: Address,
+        span: MirSpan,
+    ) -> Result<'db, ()> {
+        let Some(drop_fn) = self.lang_items().Drop_drop else { return Ok(()) };
         let generic_args = GenericArgs::new_from_slice(&[ty.into()]);
         let (drop_impl, drop_args) = self.db.lookup_impl_method(
             ParamEnvAndCrate { param_env: self.param_env.param_env, krate: self.crate_id },
@@ -3699,13 +4111,14 @@ impl<'db> Evaluator<'db> {
         );
         if let Either::Left(drop_impl) = drop_impl
             && matches!(drop_impl.lookup(self.db).container, ItemContainerId::ImplId(_))
-            && let Ok(body) = super::optimize::interpreted_body(
+        {
+            let body = super::optimize::interpreted_body(
                 self.db,
                 drop_impl.into(),
                 drop_args.store(),
                 self.param_env.store(),
             )
-        {
+            .map_err(|it| MirEvalError::MirLowerError(drop_impl, it))?;
             self.exec_looked_up_function(
                 body,
                 locals,
@@ -3716,74 +4129,39 @@ impl<'db> Evaluator<'db> {
                 None,
             )?;
         }
-        match ty.kind() {
-            TyKind::Adt(adt_def, subst) => {
-                let id = adt_def.def_id();
-                match id {
-                    AdtId::StructId(s) => {
-                        let data = StructSignature::of(self.db, s);
-                        if data.flags.contains(StructFlags::IS_MANUALLY_DROP) {
-                            return Ok(());
-                        }
-                        let layout = self.layout_adt(id, subst)?;
-                        let variant_fields = s.fields(self.db);
-                        match variant_fields.shape {
-                            FieldsShape::Record | FieldsShape::Tuple => {
-                                let field_types = self.db.field_types(s.into());
-                                for (field, _) in variant_fields.fields().iter() {
-                                    let offset = layout
-                                        .fields
-                                        .offset(u32::from(field.into_raw()) as usize)
-                                        .bytes_usize();
-                                    let addr = addr.offset(offset);
-                                    let ty = field_types[field]
-                                        .ty()
-                                        .instantiate(self.interner(), subst)
-                                        .skip_norm_wip();
-                                    self.run_drop_glue_deep(ty, locals, addr, &[], span)?;
-                                }
-                            }
-                            FieldsShape::Unit => (),
-                        }
-                    }
-                    AdtId::UnionId(_) => (), // union fields don't need drop
-                    AdtId::EnumId(_) => (),
-                }
-            }
-            TyKind::Dynamic(..) => {
-                if !metadata.is_empty() {
-                    let concrete_ty = self.vtable_map.ty_of_bytes(metadata)?;
-                    self.run_drop_glue_deep(concrete_ty, locals, addr, &[], span)?;
-                }
-            }
-            TyKind::Bool
-            | TyKind::Char
-            | TyKind::Int(_)
-            | TyKind::Uint(_)
-            | TyKind::Float(_)
-            | TyKind::Tuple(_)
-            | TyKind::Array(_, _)
-            | TyKind::Slice(_)
-            | TyKind::RawPtr(_, _)
-            | TyKind::Ref(_, _, _)
-            | TyKind::Alias(..)
-            | TyKind::FnDef(_, _)
-            | TyKind::Str
-            | TyKind::Never
-            | TyKind::Closure(_, _)
-            | TyKind::Coroutine(_, _)
-            | TyKind::CoroutineClosure(..)
-            | TyKind::CoroutineWitness(_, _)
-            | TyKind::Foreign(_)
-            | TyKind::Error(_)
-            | TyKind::Param(_)
-            | TyKind::Placeholder(_)
-            | TyKind::FnPtr(..)
-            | TyKind::Bound(..)
-            | TyKind::Infer(..)
-            | TyKind::Pat(..)
-            | TyKind::UnsafeBinder(..) => (),
-        };
+        Ok(())
+    }
+
+    /// The drops of the fields of the tuple or closure `ty` at `addr`, of types `fields`, in order.
+    fn field_steps(
+        &mut self,
+        ty: Ty<'db>,
+        fields: impl Iterator<Item = Ty<'db>>,
+        addr: Address,
+        parts: &mut Vec<DropStep<'db>>,
+    ) -> Result<'db, ()> {
+        let layout = self.layout(ty)?;
+        for (i, field) in fields.enumerate() {
+            let offset = layout.fields.offset(i).bytes_usize();
+            parts.push(DropStep::Glue(field, addr.offset(offset), Vec::new()));
+        }
+        Ok(())
+    }
+
+    /// The drops of `len` elements of type `inner` from `addr` on, first to last.
+    fn element_steps(
+        &mut self,
+        inner: Ty<'db>,
+        len: usize,
+        locals: &Locals<'db>,
+        addr: Address,
+        parts: &mut Vec<DropStep<'db>>,
+    ) -> Result<'db, ()> {
+        if !self.has_drop_glue(inner) {
+            return Ok(());
+        }
+        let size = self.size_of_sized(inner, locals, "element to drop")?;
+        parts.extend((0..len).map(|i| DropStep::Glue(inner, addr.offset(i * size), Vec::new())));
         Ok(())
     }
 

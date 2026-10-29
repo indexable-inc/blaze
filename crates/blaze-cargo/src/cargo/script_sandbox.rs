@@ -177,6 +177,11 @@ fn with_own_rustc(
         env.iter().filter(|it| !OWN_RUSTC_FOR.contains(&it.0.as_str())).cloned().collect();
     env.push(("RUSTC".to_owned(), link));
     env.push((crate::as_rustc::TOOLCHAIN.to_owned(), rustc));
+    // What blaze as rustc compiles a probe against is blaze's library, as this process found it.
+    let library = super::toolchain::library::VAR;
+    env.retain(|it| it.0 != library);
+    let found = super::toolchain::library::dir().and_then(|it| it.to_str());
+    env.push((library.to_owned(), found.unwrap_or_default().to_owned()));
     Ok(env)
 }
 
@@ -275,6 +280,10 @@ pub fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
         readable.extend(sandboxed::workspace_root(script.cwd)?);
     }
     readable.extend(target_of(script.out_dir).map(Path::to_owned));
+    // The store, read-only as the sandbox has the rest of the machine, where it would be empty
+    // (one below `/tmp`): the blaze a script runs as its `rustc` reads the standard library's
+    // frozen maps from it, and without them makes them again, seconds a probe.
+    readable.extend(super::daemon::store().filter(|it| it.is_dir() && emptied(it)));
     // The programs cargo names, and the directories of `PATH`, where a sandbox has empty
     // directories: `RUSTC` is blaze's own, which may be built below `/dev/shm`.
     let var = |name: &str| env.iter().find(|it| it.0 == name).map(|it| it.1.as_str());

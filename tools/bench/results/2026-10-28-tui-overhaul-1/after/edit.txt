@@ -1,0 +1,8 @@
+--- frame 0
+blaze build                                                                                             0.10s
+     Waiting for the daemon 0.10s
+--- left on the screen (17 frames drawn)
+    Compiled rg: 2 fns compiled, 31218 kept in 0.56s
+     Rebuilt 1 fn: search (crates/core/main.rs edited); 0.76s
+   Compiling ripgrep v15.1.0 (/root/tui/tmp/tmp.BzJuEsbjKD/ripgrep)
+    Finished `dev` profile [blaze] target(s) in 0.78s

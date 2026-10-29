@@ -210,7 +210,22 @@ pub async fn retried(mut n: u32) -> &'static str {
     }
 }
 
+/// Capturing a copy of the argument leaves it live on the next trip around the loop.
+/// Reduced from uv's retry tests (astral-experiments/blaze#45).
+pub async fn capture_in_loop(limit: usize) -> Vec<usize> {
+    let mut values = Vec::new();
+    for _ in 0..2 {
+        pause().await;
+        values.push(std::hint::black_box(move || limit)());
+        let other = std::hint::black_box(929);
+        pause().await;
+        values.push(other);
+    }
+    values
+}
+
 pub fn run() {
+    println!("{:?}", block_on(capture_in_loop(2)));
     println!("{}", block_on(sums(1)));
     println!("{:?}", block_on(bound(3)));
     println!("{:?}", block_on(bound(0)));

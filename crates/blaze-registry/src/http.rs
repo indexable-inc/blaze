@@ -249,7 +249,9 @@ impl HyperHttp {
             .context("the machine's certificates cannot be read")?;
         let connector = roots.https_or_http().enable_http1().build();
         let client = Client::builder(TokioExecutor::new()).build(connector);
-        let user_agent = format!("blaze/{}", env!("CARGO_PKG_VERSION")).into();
+        // No version: this crate is under every build of blaze, and the release blaze is is told
+        // only to the engine (its build.rs), so that a release changes no crate below it.
+        let user_agent = "blaze (https://github.com/indexable-inc/blaze)".into();
         Ok(HyperHttp {
             runtime,
             client: Requests { client, user_agent, timeout },

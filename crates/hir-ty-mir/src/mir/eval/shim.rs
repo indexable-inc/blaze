@@ -17,8 +17,8 @@ use crate::{
     mir::eval::{
         Address, AdtId, Arc, Evaluator, FunctionId, GenericArgs, HasModule, Interval,
         IntervalAndTy, IntervalOrOwned, IsSigned, ItemContainerId, Layout, Locals, Lookup,
-        MirEvalError, MirSpan, Mutability, Result, Ty, TyKind, TypeIdOf, VTableOfBytes, VariantId,
-        from_bytes, not_supported, pad16, try_const_usize,
+        MirEvalError, MirSpan, Mutability, Origin, Result, Ty, TyKind, TypeIdOf, VTableOfBytes,
+        VariantId, from_bytes, not_supported, pad16, try_const_usize,
     },
     mir::location::{source_location_in_file, source_path, track_caller},
     next_solver::Region,
@@ -252,28 +252,28 @@ impl<'db> Evaluator<'db> {
                 };
                 let size = from_bytes!(usize, size.get(self)?);
                 let align = from_bytes!(usize, align.get(self)?);
-                let result = self.heap_allocate(size, align)?;
+                let result = self.allocate(size, align, Origin::Allocator)?;
                 destination.write_from_bytes(self, &result.to_bytes())?;
             }
-            _ if alloc_fn.contains(AttrFlags::RUSTC_DEALLOCATOR) => { /* no-op for now */ }
+            _ if alloc_fn.contains(AttrFlags::RUSTC_DEALLOCATOR) => {
+                let [ptr, ..] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "rustc_deallocator args are not provided".into(),
+                    ));
+                };
+                let ptr = Address::from_bytes(ptr.get(self)?)?;
+                self.deallocate(ptr, Origin::Allocator, "__rust_dealloc")?;
+            }
             _ if alloc_fn.contains(AttrFlags::RUSTC_REALLOCATOR) => {
-                let [ptr, old_size, align, new_size] = args else {
+                let [ptr, _old_size, _align, new_size] = args else {
                     return Err(MirEvalError::InternalError(
                         "rustc_allocator args are not provided".into(),
                     ));
                 };
-                let old_size = from_bytes!(usize, old_size.get(self)?);
                 let new_size = from_bytes!(usize, new_size.get(self)?);
-                if old_size >= new_size {
-                    destination.write_from_interval(self, ptr.interval)?;
-                } else {
-                    let ptr = Address::from_bytes(ptr.get(self)?)?;
-                    let align = from_bytes!(usize, align.get(self)?);
-                    let result = self.heap_allocate(new_size, align)?;
-                    Interval { addr: result, size: old_size }
-                        .write_from_interval(self, Interval { addr: ptr, size: old_size })?;
-                    destination.write_from_bytes(self, &result.to_bytes())?;
-                }
+                let ptr = Address::from_bytes(ptr.get(self)?)?;
+                let result = self.reallocate(ptr, new_size)?;
+                destination.write_from_bytes(self, &result.to_bytes())?;
             }
             _ => not_supported!("unknown alloc function"),
         }
@@ -1487,10 +1487,29 @@ impl<'db> Evaluator<'db> {
                 };
                 let size = from_bytes!(usize, size.get(self)?);
                 let align = from_bytes!(usize, align.get(self)?);
-                let result = self.heap_allocate(size, align)?;
+                let origin = Origin::ConstHeap { global: false };
+                let result = self.allocate(size, align, origin)?;
                 destination.write_from_bytes(self, &result.to_bytes())
             }
-            "const_deallocate" => Ok(()),
+            "const_deallocate" => {
+                let [ptr, ..] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "const_deallocate args are not provided".into(),
+                    ));
+                };
+                let ptr = Address::from_bytes(ptr.get(self)?)?;
+                let origin = Origin::ConstHeap { global: false };
+                self.deallocate(ptr, origin, "const_deallocate")
+            }
+            "const_make_global" => {
+                let [ptr] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "const_make_global args are not provided".into(),
+                    ));
+                };
+                self.make_global(Address::from_bytes(ptr.get(self)?)?)?;
+                destination.write_from_interval(self, ptr.interval)
+            }
             "caller_location" => {
                 let site = self.caller_site(locals, span)?;
                 let location = self.location_of(site, locals)?;
@@ -1501,7 +1520,7 @@ impl<'db> Evaluator<'db> {
                 let Some((size, align)) = self.size_align_of(ty, locals)? else {
                     not_supported!("unsized box initialization");
                 };
-                let addr = self.heap_allocate(size, align)?;
+                let addr = self.allocate(size, align, Origin::Allocator)?;
                 self.copy_from_interval(addr, args[0].interval)?;
                 destination.write_from_bytes(self, &addr.to_bytes()[..self.ptr_size()])
             }
@@ -1658,13 +1677,13 @@ impl<'db> Evaluator<'db> {
         _span: MirSpan,
     ) -> Result<'db, ()> {
         // We are a single threaded runtime with no UB checking and no optimization, so
-        // we can implement atomic intrinsics as normal functions.
-
-        if name.starts_with("singlethreadfence_") || name.starts_with("fence_") {
+        // we can implement atomic intrinsics as normal functions. The pinned nightly takes the
+        // orderings as const generics (`atomic_load::<T, ORD, VOLATILE>`); older names carried
+        // them as suffixes (`atomic_load_seqcst`).
+        let op = name.split('_').next().unwrap_or(name);
+        if matches!(op, "fence" | "singlethreadfence") {
             return Ok(());
         }
-
-        // The rest of atomic intrinsics have exactly one generic arg
 
         let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
             return Err(MirEvalError::InternalError(
@@ -1679,7 +1698,7 @@ impl<'db> Evaluator<'db> {
         let arg0_addr = Address::from_bytes(arg0.get(self)?)?;
         let arg0_interval =
             Interval::new(arg0_addr, self.size_of_sized(ty, locals, "atomic intrinsic type arg")?);
-        if name.starts_with("load_") {
+        if op == "load" {
             return destination.write_from_interval(self, arg0_interval);
         }
         let Some(arg1) = args.get(1) else {
@@ -1687,61 +1706,51 @@ impl<'db> Evaluator<'db> {
                 "atomic intrinsic arg1 is not provided".into(),
             ));
         };
-        if name.starts_with("store_") {
+        if op == "store" {
             return arg0_interval.write_from_interval(self, arg1.interval);
         }
-        if name.starts_with("xchg_") {
+        if op == "xchg" {
             destination.write_from_interval(self, arg0_interval)?;
             return arg0_interval.write_from_interval(self, arg1.interval);
         }
-        if name.starts_with("xadd_") {
+        let size = arg0_interval.size;
+        let signed = matches!(ty.kind(), TyKind::Int(_));
+        let read = |this: &Self, interval: Interval, sign: bool| -> Result<'db, u128> {
+            let bytes = interval.get(this)?;
+            Ok(u128::from_le_bytes(pad16(&bytes[..size.min(bytes.len())], sign.into())))
+        };
+        let combined = match op {
+            "xadd" | "xsub" | "and" | "nand" | "or" | "xor" | "umax" | "umin" => {
+                let lhs = read(self, arg0_interval, false)?;
+                let rhs = read(self, arg1.interval, false)?;
+                Some(match op {
+                    "xadd" => lhs.wrapping_add(rhs),
+                    "xsub" => lhs.wrapping_sub(rhs),
+                    "and" => lhs & rhs,
+                    "nand" => !(lhs & rhs),
+                    "or" => lhs | rhs,
+                    "xor" => lhs ^ rhs,
+                    "umax" => lhs.max(rhs),
+                    _ => lhs.min(rhs),
+                })
+            }
+            "max" | "min" => {
+                let lhs = read(self, arg0_interval, signed)? as i128;
+                let rhs = read(self, arg1.interval, signed)? as i128;
+                Some((if op == "max" { lhs.max(rhs) } else { lhs.min(rhs) }) as u128)
+            }
+            _ => None,
+        };
+        if let Some(ans) = combined {
             destination.write_from_interval(self, arg0_interval)?;
-            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, IsSigned::No));
-            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, IsSigned::No));
-            let ans = lhs.wrapping_add(rhs);
-            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
-        }
-        if name.starts_with("xsub_") {
-            destination.write_from_interval(self, arg0_interval)?;
-            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, IsSigned::No));
-            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, IsSigned::No));
-            let ans = lhs.wrapping_sub(rhs);
-            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
-        }
-        if name.starts_with("and_") {
-            destination.write_from_interval(self, arg0_interval)?;
-            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, IsSigned::No));
-            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, IsSigned::No));
-            let ans = lhs & rhs;
-            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
-        }
-        if name.starts_with("or_") {
-            destination.write_from_interval(self, arg0_interval)?;
-            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, IsSigned::No));
-            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, IsSigned::No));
-            let ans = lhs | rhs;
-            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
-        }
-        if name.starts_with("xor_") {
-            destination.write_from_interval(self, arg0_interval)?;
-            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, IsSigned::No));
-            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, IsSigned::No));
-            let ans = lhs ^ rhs;
-            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
-        }
-        if name.starts_with("nand_") {
-            destination.write_from_interval(self, arg0_interval)?;
-            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, IsSigned::No));
-            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, IsSigned::No));
-            let ans = !(lhs & rhs);
-            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
+            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..size]);
         }
         let Some(arg2) = args.get(2) else {
             return Err(MirEvalError::InternalError(
                 "atomic intrinsic arg2 is not provided".into(),
             ));
         };
-        if name.starts_with("cxchg_") || name.starts_with("cxchgweak_") {
+        if matches!(op, "cxchg" | "cxchgweak") {
             let dest = if arg1.get(self)? == arg0_interval.get(self)? {
                 arg0_interval.write_from_interval(self, arg2.interval)?;
                 (arg1.interval, true)

@@ -26,6 +26,7 @@ use crate::{
 };
 
 mod arch;
+mod const_ast;
 mod const_macro;
 mod const_traits;
 mod intrinsics;
@@ -510,7 +511,7 @@ fn overloaded_index() {
     check_number(
         r#"
     //- minicore: index
-    struct Foo;
+    struct Foo(i32, i32);
 
     impl core::ops::Index<usize> for Foo {
         type Output = i32;
@@ -526,15 +527,16 @@ fn overloaded_index() {
     impl core::ops::IndexMut<usize> for Foo {
         fn index_mut(&mut self, index: usize) -> &mut i32 {
             if index == 7 {
-                &mut 7
+                &mut self.0
             } else {
-                &mut 10
+                &mut self.1
             }
         }
     }
 
     const GOAL: i32 = {
-        (Foo[2]) + (Foo[7]) + (*&Foo[2]) + (*&Foo[7]) + (*&mut Foo[2]) + (*&mut Foo[7])
+        (Foo(7, 10)[2]) + (Foo(7, 10)[7]) + (*&Foo(7, 10)[2]) + (*&Foo(7, 10)[7])
+            + (*&mut Foo(7, 10)[2]) + (*&mut Foo(7, 10)[7])
     };
     "#,
         3417,
@@ -3377,4 +3379,10 @@ fn uninhabited_enum_discriminant_read() {
     "#,
         |e| matches!(e, ConstEvalError::MirEvalError(MirEvalError::UndefinedBehavior(_))),
     );
+}
+
+#[test]
+fn checked_u128_sub_without_i128_alignment() {
+    // The fixtures' data layout gives `u128` an alignment of 8, so `(u128, bool)` is 24 bytes.
+    check_number("const GOAL: u128 = (1 << 61) - 1;", (1i128 << 61) - 1);
 }

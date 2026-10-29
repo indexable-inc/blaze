@@ -13,6 +13,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Condvar, Mutex, PoisonError},
 };
 
 use serde_json::{Value, json};
@@ -265,9 +266,8 @@ fn compile_in(
     if let Some(why) = crate::unstable::refusal(asked.args) {
         return Err(format!("it is built with {why}"));
     }
-    let library = sysroot.join("lib/rustlib/src/rust/library");
-    if !library.is_dir() {
-        return Err("the toolchain has no source of the standard library".to_owned());
+    if let Err(why) = crate::cargo::toolchain::library::found() {
+        return Err(format!("blaze has no source of the standard library: {why}"));
     }
     let mut crates = Vec::new();
     let first = Described {
@@ -309,6 +309,64 @@ pub fn build_described(
 /// What the store keeps blaze's builds of build scripts and proc macros under in place of a
 /// toolchain, and the first field of each: what a build is made of is in its key.
 const BUILDS: &str = "build script and proc macro builds 1";
+
+/// Build-script output can be included by an expression that the dep-info does not list.
+/// Key both the local freshness stamp and the store lookup by the files below every
+/// described crate's OUT_DIR. In particular, rebuilding a proc macro must not retrieve the
+/// old module from the store after its generated constant changed.
+pub fn generated_fingerprint(described: &str) -> Result<[u8; 32], String> {
+    fn walk(
+        dir: &Path,
+        files: &mut Vec<PathBuf>,
+        visiting: &mut std::collections::BTreeSet<PathBuf>,
+    ) -> std::io::Result<()> {
+        let real = std::fs::canonicalize(dir)?;
+        if !visiting.insert(real.clone()) {
+            return Err(std::io::Error::other(format!(
+                "cyclic output directory {}",
+                dir.display()
+            )));
+        }
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            let metadata = std::fs::metadata(&path)?;
+            if metadata.is_dir() {
+                walk(&path, files, visiting)?;
+            } else if metadata.is_file() {
+                files.push(path);
+            } else {
+                return Err(std::io::Error::other(format!(
+                    "output {} is not a regular file",
+                    path.display()
+                )));
+            }
+        }
+        visiting.remove(&real);
+        Ok(())
+    }
+    let mut key = keyed::Key::new("generated compile-time inputs 1");
+    let described: serde_json::Value = serde_json::from_str(described)
+        .map_err(|why| format!("reading the compile-time description: {why}"))?;
+    let crates =
+        described["crates"].as_array().ok_or("the compile-time description has no crates")?;
+    for krate in crates {
+        let Some(out) = krate["env"].get("OUT_DIR") else { continue };
+        let out = out.as_str().ok_or("a compile-time crate has a non-string OUT_DIR")?;
+        let out = Path::new(out);
+        let mut files = Vec::new();
+        walk(out, &mut files, &mut std::collections::BTreeSet::new())
+            .map_err(|why| format!("reading build-script output {}: {why}", out.display()))?;
+        files.sort();
+        key.field(out.as_os_str().as_encoded_bytes());
+        for file in files {
+            let bytes = std::fs::read(&file)
+                .map_err(|why| format!("reading generated input {}: {why}", file.display()))?;
+            let relative = file.strip_prefix(out).map_err(|why| why.to_string())?;
+            key.field(relative.as_os_str().as_encoded_bytes()).field(&bytes);
+        }
+    }
+    Ok(key.done())
+}
 
 /// The file beside a build script blaze built that names what it was built from: the key
 /// of its build ([`keyed`]) and the digest of the executable, by a space. A run of the script
@@ -359,6 +417,7 @@ fn built(
     if made.wasm {
         first.field(super::own_macro::MODULE_CFG.as_bytes());
     }
+    first.field(&generated_fingerprint(described)?);
     let first = first.done();
     let store = store();
     let found = store.and_then(|it| keyed::find(it, &first, &keyed::digest));
@@ -508,11 +567,11 @@ fn links_proc_macro(crates: &[Described]) -> bool {
     })
 }
 
-/// The `rust-project.json` of `crates` over the standard library of `sysroot`.
+/// The `rust-project.json` of `crates` over blaze's standard library, for `sysroot`.
 pub fn description(sysroot: &Path, crates: &[Described]) -> String {
     json!({
         "sysroot": sysroot,
-        "sysroot_src": sysroot.join("lib/rustlib/src/rust/library"),
+        "sysroot_src": crate::cargo::toolchain::library::dir(),
         "crates": crates.iter().enumerate().map(|(at, it)| described(it, at == 0)).collect::<Vec<_>>(),
     })
     .to_string()
@@ -585,6 +644,33 @@ fn build(
     Ok(said)
 }
 
+/// How many fetches of the standard library a release ships are under way in this process
+/// ([`fetching`]).
+static FETCHING: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+/// A fetch of the standard library a release ships, under way while this is kept: the
+/// standard library of the scripts' builds is what it brings, so it is made once it is in
+/// ([`standard_library_once`]). A build that read the store while the fetch wrote it would
+/// find some of its packs and compile what is in the others.
+pub struct Fetching(());
+
+pub fn fetching() -> Fetching {
+    *FETCHING.0.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+    Fetching(())
+}
+
+impl Drop for Fetching {
+    fn drop(&mut self) {
+        *FETCHING.0.lock().unwrap_or_else(PoisonError::into_inner) -= 1;
+        FETCHING.1.notify_all();
+    }
+}
+
+fn fetched() {
+    let held = FETCHING.0.lock().unwrap_or_else(PoisonError::into_inner);
+    let _held = FETCHING.1.wait_while(held, |it| *it > 0);
+}
+
 /// Has the store `store` hold what every build of a script or proc macro takes from it before
 /// its own crates ([`build_nothing`]), once a store, build of blaze and toolchain of
 /// `sysroot`, building in `dir`. The builds cargo starts together in a cold build wait for the
@@ -597,6 +683,7 @@ fn standard_library_once(sysroot: &Path, store: &Path, dir: &Path) -> Result<(),
     once(&store.join(format!("scripts-std-{key}")), || {
         let of = Some("the standard library of build scripts");
         crate::events::within(blaze_protocol::events::Step::Std, of, || {
+            fetched();
             build_nothing(sysroot, dir, store, true).map(drop)
         })
     })
@@ -742,6 +829,27 @@ fn described(krate: &Described, member: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_compile_time_inputs_are_keyed_by_names_and_contents() {
+        let root = std::env::temp_dir().join(format!("blaze-generated-key-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        let description = json!({"crates": [{"env": {"OUT_DIR": root}}]}).to_string();
+        let key = || generated_fingerprint(&description).unwrap();
+        let file = root.join("nested/version.expr");
+        std::fs::write(&file, "7").unwrap();
+        let seven = key();
+        std::fs::write(&file, "7").unwrap();
+        assert_eq!(key(), seven, "an unchanged output rewritten by a script");
+        std::fs::write(&file, "9").unwrap();
+        assert_ne!(key(), seven, "an expression include missing from the dep-info changed");
+        std::fs::write(&file, "7").unwrap();
+        assert_eq!(key(), seven, "restoring generated contents can reuse the old build");
+        std::fs::rename(&file, root.join("nested/renamed.expr")).unwrap();
+        assert_ne!(key(), seven, "the generated file was renamed");
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(generated_fingerprint(&description).is_err(), "a missing OUT_DIR is an error");
+    }
 
     /// `mime_guess`'s build script sets `MIME_TYPES_GENERATED_PATH`, which its source reads with
     /// `env!`: the crate is described with it, from the script's output in either of cargo's

@@ -174,6 +174,7 @@ cases![
     line_continuation,
     static_in_static,
     type_id_of_fn,
+    type_id_shadowed_param,
     glob_of_root,
     std_in_root,
     unnamed_parameter,
@@ -205,4 +206,9 @@ cases![
     attr_on_prefix_expr,
     type_id_lifetime_constant,
     caller_through_track_caller,
+    forwarded_dyn_fn,
+    refined_future_error,
+    projected_self_variant,
+    enum_drop_across_await,
+    assert_spacing,
 ];

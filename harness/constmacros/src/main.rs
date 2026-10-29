@@ -5,7 +5,11 @@ pub trait Named {
     const NAME: &'static str;
 }
 
-#[derive(macros::Named)]
+pub trait Fields {
+    const FIELDS: &'static [&'static str];
+}
+
+#[derive(macros::Named, macros::Fields)]
 pub struct Point {
     pub x: i32,
     pub y: i32,
@@ -13,5 +17,5 @@ pub struct Point {
 
 fn main() {
     let point = Point { x: 1, y: 2 };
-    println!("{} {}", Point::NAME, point.x + point.y);
+    println!("{} {} {}", Point::NAME, point.x + point.y, Point::FIELDS.join(","));
 }

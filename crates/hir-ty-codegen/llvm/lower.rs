@@ -1214,6 +1214,18 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                     let selected = self.builder.build_select(condition, then, otherwise, "")?;
                     self.set(inst, selected);
                 }
+                Opcode::Fma if self.func.dfg.value_type(a).is_vector() => {
+                    // Cranelift's AArch64 vector fma is `fmla c, a, b`, LLVM's of the same
+                    // operands `fmla c, b, a`: which factor comes first decides which of two
+                    // NaNs comes out.
+                    let factors = match crate::Target::current().arch {
+                        crate::target::Arch::Aarch64 => [b, a],
+                        _ => [a, b],
+                    };
+                    let ty = self.ty(self.func.dfg.value_type(a))?;
+                    let args = [factors[0], factors[1], c].map(|it| self.basic(it).into());
+                    self.set(inst, self.intrinsic("llvm.fma", &[ty], &args)?);
+                }
                 Opcode::Fma => {
                     let args = [self.float(a)?, self.float(b)?, self.float(c)?];
                     let fused = self.float_intrinsic("llvm.fma", &args)?;

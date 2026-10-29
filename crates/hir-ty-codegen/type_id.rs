@@ -255,12 +255,25 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
             AdtId::EnumId(it) => &EnumSignature::of(db, it).name,
         };
         let module = adt.module(db);
-        let parent = if module.is_block_module(db) && !self.ours {
-            self.body_path(self.symbols.declared_in(adt)?)?
-        } else {
-            self.module(module)?
-        };
-        Some(parent.child(DefPathData::TypeNs(name.as_str())))
+        if module.is_block_module(db) && !self.ours {
+            return self.function_adt_path(self.symbols.declared_in(adt)?, name);
+        }
+        Some(self.module(module)?.child(DefPathData::TypeNs(name.as_str())))
+    }
+
+    /// An ADT declared in the body of `func`. rustc gives the function's type parameters
+    /// their paths before the items of its body, so one of the ADT's name comes first.
+    fn function_adt_path(
+        &mut self,
+        func: FunctionId,
+        name: &hir_expand::name::Name,
+    ) -> Option<Fingerprint> {
+        let earlier = FunctionSignature::of(self.db, func)
+            .generic_params
+            .iter_type_or_consts()
+            .filter_map(|(_, param)| param.type_param()?.name.as_ref())
+            .any(|param| param == name);
+        Some(self.body_path(func)?.child_at(DefPathData::TypeNs(name.as_str()), u32::from(earlier)))
     }
 
     /// An `impl`, which rustc tells from the others of its module by how many come before it.
@@ -304,25 +317,33 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
     fn function_path(&mut self, func: FunctionId) -> Option<Fingerprint> {
         let db = self.db;
         let name = &FunctionSignature::of(db, func).name;
+        let mut earlier = 0;
         let parent = match func.lookup(db).container {
             ItemContainerId::ModuleId(module) if module.is_block_module(db) && !self.ours => {
-                self.around_local(module.block(db)?, name)?
+                let around = self.around_local(module.block(db)?, name)?;
+                // A const parameter of the function around it has its path before the items
+                // of its body, so it comes first.
+                let params = &FunctionSignature::of(db, around).generic_params;
+                earlier = u32::from(params.iter_type_or_consts().any(|(_, param)| {
+                    param.const_param().is_some_and(|param| param.name == *name)
+                }));
+                self.body_path(around)?
             }
             ItemContainerId::ModuleId(module) => self.module(module)?,
             ItemContainerId::TraitId(trait_) => self.trait_path(trait_)?,
             ItemContainerId::ImplId(id) => self.impl_path(id)?,
             ItemContainerId::ExternBlockId(_) => return None,
         };
-        Some(parent.child(DefPathData::ValueNs(name.as_str())))
+        Some(parent.child_at(DefPathData::ValueNs(name.as_str()), earlier))
     }
 
     /// The function whose body declares, in `block`, the one function of it named `name`:
     /// rustc makes that function a child of this one, whichever block it is written in.
     fn around_local(
-        &mut self,
+        &self,
         block: hir_def::BlockIdLt<'db>,
         name: &hir_expand::name::Name,
-    ) -> Option<Fingerprint> {
+    ) -> Option<FunctionId> {
         let db = self.db;
         let (owner, _) = hir_ty_mir::mir::type_name::block_owner(db, block)?;
         let DefWithBodyId::FunctionId(around) = owner else { return None };
@@ -343,7 +364,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         if named_so.count() != 1 {
             return None;
         }
-        self.body_path(around)
+        Some(around)
     }
 
     /// The `DefPathHash` rustc gives a closure of a crate it compiled, which only code rustc

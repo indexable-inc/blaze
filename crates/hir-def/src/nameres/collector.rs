@@ -379,7 +379,8 @@ impl<'db> DefCollector<'db> {
         self.inject_prelude();
         self.inject_std_extern_crate();
 
-        if let Some(AttrsOrCfg::CfgDisabled(attrs)) = item_tree.top_level_attrs() {
+        let items = item_tree.top_level_items();
+        let items = if let Some(AttrsOrCfg::CfgDisabled(attrs)) = item_tree.top_level_attrs() {
             let (cfg_expr, _) = &**attrs;
             self.def_map.diagnostics.push(DefDiagnostic::unconfigured_code(
                 self.def_map.root,
@@ -387,8 +388,23 @@ impl<'db> DefCollector<'db> {
                 cfg_expr.clone(),
                 self.cfg_options.clone(),
             ));
-            return;
-        }
+            // rustc takes the crate's items away before it injects its test harness, so a
+            // test crate of `#![cfg(target_arch = "wasm32")]` still has a `main` that runs
+            // no tests. The module the compiler appended to the root is all that stays.
+            let root = self.db.file_text(file_id.file_id(self.db));
+            let appended = root.appended_root_module(self.db);
+            let Some(item) = appended.and_then(|name| {
+                items.last().filter(|&&item| {
+                    matches!(item_tree.index(item),
+                        ModItemKind::Mod(_, module) if module.name.as_str() == name)
+                })
+            }) else {
+                return;
+            };
+            std::slice::from_ref(item)
+        } else {
+            items
+        };
 
         let module_id = self.def_map.root;
         ModCollector {
@@ -399,7 +415,7 @@ impl<'db> DefCollector<'db> {
             item_tree,
             mod_dir: ModDir::root(),
         }
-        .collect_in_top_module(item_tree.top_level_items());
+        .collect_in_top_module(items);
         Arc::get_mut(&mut self.def_map.data).unwrap().shrink_to_fit();
     }
 
@@ -861,21 +877,17 @@ impl<'db> DefCollector<'db> {
             })
             .collect();
 
-        // Resolve all indeterminate resolved imports again
-        // As some of the macros will expand newly import shadowing partial resolved imports
-        // FIXME: We maybe could skip this, if we handle the indeterminate imports in `resolve_imports`
-        // correctly
+        // Macro expansion can expose a new binding or change the visibility of an existing
+        // one without adding a namespace. Revisit partial imports until their bindings settle.
         let mut indeterminate_imports = std::mem::take(&mut self.indeterminate_imports);
         indeterminate_imports.retain_mut(|(directive, partially_resolved)| {
-            let partially_resolved = partially_resolved.availability();
             directive.status = self.resolve_import(directive.module_id, &directive.import);
             match directive.status {
-                PartialResolvedImport::Indeterminate(import)
-                    if partially_resolved != import.availability() =>
-                {
+                PartialResolvedImport::Indeterminate(import) if import != *partially_resolved => {
+                    *partially_resolved = import;
                     self.record_resolved_import(directive);
                     res = ReachedFixedPoint::No;
-                    false
+                    true
                 }
                 PartialResolvedImport::Resolved(_) => {
                     self.record_resolved_import(directive);
@@ -2878,8 +2890,29 @@ impl ModCollector<'_, '_> {
                 // follows: syn 1's `#[macro_use] mod token` has `Token!` from
                 // `include!("await.rs")`, and its `mod op` names it with nothing imported.
                 let prelude = || {
+                    // A block's def map is collected after the def maps around it, so what the
+                    // name is there (the std prelude, or an item of the module holding the
+                    // block) it stays. clang-sys's `load_manually` has a `mod build` in its
+                    // body whose `include!`d `macro_rules!` its `mod dynamic` uses.
                     if def_map.block.is_some() {
-                        return None;
+                        let local_def_map = self
+                            .def_collector
+                            .crate_local_def_map
+                            .unwrap_or(&self.def_collector.local_def_map);
+                        return def_map
+                            .resolve_path_fp_with_macro(
+                                local_def_map,
+                                db,
+                                ResolveMode::Other,
+                                self.module_id,
+                                path,
+                                BuiltinShadowMode::Module,
+                                Some(MacroSubNs::Bang),
+                            )
+                            .resolved_def
+                            .take_macros()
+                            .filter(|&id| sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
+                            .map(|it| it.definition(db));
                     }
                     let (prelude, _) = def_map.prelude?;
                     if prelude.krate(db) == def_map.krate {

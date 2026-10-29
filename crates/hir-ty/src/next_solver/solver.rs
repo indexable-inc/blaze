@@ -150,7 +150,7 @@ impl<'db> SolverDelegate for SolverContext<'db> {
         let mut seen = rustc_hash::FxHashSet::default();
         regions
             .chain(types)
-            .filter(|it| it.0.as_region() != Some(it.1) && seen.insert(*it))
+            .filter(|it| it.0.as_region() != Some(it.1) && !says_nothing(it) && seen.insert(*it))
             .map(|it| (RegionConstraint::Outlives(it), VisibleForLeakCheck::Yes))
             .collect()
     }
@@ -438,5 +438,21 @@ impl<'db> SolverDelegate for SolverContext<'db> {
             }
             _ => None,
         }
+    }
+}
+
+/// Whether what proving a goal needs of an error region, a lifetime rust-analyzer could not
+/// lower, says nothing a caller asking for regions reads: it has no region of the body to be,
+/// and only one between it and a placeholder marks that placeholder unknown. Answered, such a
+/// need would make every coinductive cycle through the type it is in (an auto trait over a
+/// recursive type) differ from its first provisional answer and run again, and the reruns of
+/// nested cycles multiply.
+fn says_nothing<'db>(it: &OutlivesPredicate<DbInterner<'db>, GenericArg<'db>>) -> bool {
+    let placeholder = |it: Region<'db>| it.is_placeholder();
+    match it.0.as_region() {
+        Some(longer) => {
+            (longer.is_error() && !placeholder(it.1)) || (it.1.is_error() && !placeholder(longer))
+        }
+        None => it.1.is_error(),
     }
 }

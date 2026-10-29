@@ -1,3 +1,8 @@
+---
+status: record
+summary: blaze's compiler in the browser, a spike.
+date: 2026-10-20
+---
 # blaze in the browser
 
 This is the report for the `blaze-wasm` spike: can blaze's compiler run in a web page,
@@ -22,9 +27,8 @@ Linux VM; where a number comes from a single run it says so.
 
 ## How to run it
 
-    rustup component add rust-src
     cargo install wasm-bindgen-cli --version 0.2.122
-    crates/blaze-wasm/web/build.sh              # the compiler, and the source of core
+    crates/blaze-wasm/web/build.sh              # the compiler, and the source of core (from library/)
     crates/blaze-wasm/web/build-dioxus.sh       # the page itself and the packed Dioxus workspace, needs clang
     python3 -m http.server -d crates/blaze-wasm/web 8377
 

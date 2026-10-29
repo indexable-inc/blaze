@@ -1,3 +1,7 @@
+---
+status: current
+summary: How to build, test and change blaze: AI use, where new code goes, rules for code, working in parallel, landing.
+---
 # Contributing
 
 ## AI use
@@ -30,7 +34,12 @@ you send them, including fixes you find here and want to upstream.
     demo/                     small projects the harnesses and the scoreboard build
     docs/                     these documents
     docs/reports/             working reports, one per piece of work, as written at the time
-    SECURITY.md               what to know before sharing a store, and how to report a problem
+    tools/                    what builds, releases and measures blaze: agents/ (the agent rules
+                              AGENTS.md is generated from), nix/ (the flake's unit graphs), pgo/
+                              (the pinned PGO profiles), bench/ (recorded results), remote-cache/
+                              (the cache gateway Worker)
+    licenses/                 NOTICE and the license texts of code blaze includes
+    .github/SECURITY.md       what to know before sharing a store, and how to report a problem
     crates/hir-def/, hir-ty/, syntax/, parser/, ...
                               the front end: crates derived from rust-analyzer (below)
     crates/hir-ty-borrowck/   the borrow checker, a crate next to hir-ty (borrowck.md)
@@ -50,7 +59,7 @@ it was a module of `hir-ty`. The front end's crates depend on none of blaze's ma
 The front end's crates in `crates/` (`hir-ty`, `hir-def`, `hir-expand`, `syntax`, `parser`,
 `base-db`, `syntax-tree` and the rest) started as a fork of rust-analyzer (DioxusLabs' rustd branch
 merged with upstream master at `0b21bd6596`, with the MIR passes that make its MIR like rustc's
-on top: [mir-passes.md](mir-passes.md)); until 2026-10-28 they lived in `vendor/rust-analyzer`.
+on top: [mir-passes.md](mir-passes.md)); until 2026-10-28 they were a subtree under vendor/.
 They are no longer synced with upstream or with a fork repository, and keep rust-analyzer's crate
 names. Edit them, build and test from the root, and commit like any other file. A plain clone
 builds:
@@ -102,7 +111,7 @@ itself is built with that nightly (`cargo +"$(cat harness/toolchain)"`; in `nix 
 plain `cargo` is it), and so are the harnesses' reference builds. The pin is written in that
 one file; everything else reads it or is written from it:
 
-- `crates/blaze-cargo/src/cargo/toolchain/pins.txt` (by `harness/toolchain_pins.py --write`): the
+- `crates/blaze-cargo/src/cargo/toolchain/pins.txt` (by `harness/toolchain_pins.py '{"write": true}'`): the
   sha256 and size of each file blaze downloads as its own toolchain, the nightly's `rustc -V`
   line and its rust-lang/rust commit. A rustc is taken for the pinned one by that whole line,
   since every nightly of a release has the same number.
@@ -121,8 +130,8 @@ The daily workflow does this every day and opens the pull request
 ([toolchain.md, "The daily bump"](toolchain.md#the-daily-bump)); by hand it is for fixing what
 a nightly breaks, on the bump's branch `toolchain/bump`, or for trying a nightly:
 
-    python3 harness/toolchain_bump.py '{}'                      # the newest nightly blaze can use
-    python3 harness/toolchain_bump.py '{"date": "2026-11-02"}'  # or a given one
+    uv run --frozen python harness/toolchain_bump.py '{}'                      # the newest nightly blaze can use
+    uv run --frozen python harness/toolchain_bump.py '{"date": "2026-11-02"}'  # or a given one
 
 picks the nightly (the newest of the last two weeks whose manifest has every component blaze
 needs on every host it ships for, or the date given), writes `harness/toolchain` and
@@ -145,7 +154,7 @@ What it leaves to a person, and prints at the end:
    `rustc_abi`'s renamed layout calls, vectors of at most 128 bits passed in registers on
    x86-64 and AArch64, Windows x64's rule for zero-sized types, the `f16b` and `ppcf128`
    layouts, libtest's new entry `test_main_env_args` and the intrinsic `abort_immediate`.
-3. `python3 harness/toolchain_bump.py checks '{}'` in an ix VM, under Cranelift and under LLVM
+3. `uv run --frozen python harness/toolchain_bump.py checks '{}'` in an ix VM, under Cranelift and under LLVM
    (in `nix develop`, with `BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`). It builds
    blaze and runs, in parallel, what proves blaze and the nightly agree: `toolchain_pins.py`,
    `answers.py`, `macroserver.py`, the corpus with its `nightly` feature and `--layouts`, and
@@ -200,6 +209,18 @@ did about it in one line.
 
 When you report what you did, separate what you ran from what you inferred. The reports
 under `docs/reports/` do this and it is the reason they can be used.
+
+## Documents
+
+Every doc under `docs/` opens with front matter saying what it is (`tools/docs.py` has the
+fields): `current` (how blaze is now, kept true), `plan` (a design not fully built, dated),
+`record` (research, a report or a measurement, true on its date and never brought up to date) or
+`superseded` (with `superseded_by`, what replaced it). [docs/README.md](README.md) is the index,
+generated from it; superseded docs are left out. CI's `python3 tools/docs.py check` holds every
+doc's links, and a current doc's anchors, repository paths in backticks and `BLAZE_*` settings,
+against the tree, and every doc that code names. A change that makes a current doc
+untrue fixes it in the same change, or marks it superseded; `python3 tools/docs.py write`
+regenerates the index.
 
 ## Working in parallel
 
@@ -266,7 +287,7 @@ remove the worktree and the local branch
 
 `cargo build --release` is the build to work with: the harnesses, the gate and CI use it, and
 it rebuilds quickly after a change. What users get is one other build: the `dist` profile
-(thin LTO) optimized with the PGO profile `pgo/profiles.json` pins, built by
+(thin LTO) optimized with the PGO profile `tools/pgo/profiles.json` pins, built by
 `.github/scripts/build_release.py`. The release workflow runs that script, and the flake's
 `dist` runs it inside its derivation with the same profile fetched by its sha256.
 `cargo install --profile dist` builds the same profile without PGO, from the release after 0.1.0.
@@ -274,7 +295,7 @@ it rebuilds quickly after a change. What users get is one other build: the `dist
 
 The PGO profiles are trained by the `pgo` workflow, one per target on the runner its release
 is built on; it uploads them to the `pgo-profiles` release and commits their names and hashes
-to `pgo/profiles.json`. It runs by itself when Cargo.lock, a manifest or `harness/toolchain`
+to `tools/pgo/profiles.json`. It runs by itself when Cargo.lock, a manifest or `harness/toolchain`
 changes on main: a profile finds each function by its symbol, which carries a hash of the
 whole graph of crates, so after such a change the old one finds almost nothing (the build
 warns, and a release refuses). A profile trained on older code of the same crates still
@@ -290,10 +311,15 @@ and pinned by its sha256 in `crates/hir-ty-codegen/llvm.json`. The flake's dev s
 
     nix develop -c cargo build -p blaze-engine --release --features llvm
 
-Outside the shell, fetch the same archive and point the build at it:
+Outside the shell, fetch the same archive and point the build at it, as CI's merge gate does
+(`.github/actions/blaze`). It goes below `/usr/local/lib`: llvm-sys's build script names the
+prefix's `lib` to the linker, and a build script in blaze's sandbox may name only a system
+directory of libraries (`crates/blaze-cargo/src/cargo/directives.rs`, `SYSTEM`), so `blaze
+build` refuses a prefix in your home directory.
 
-    python3 .github/scripts/llvm.py fetch --target <triple> --dir ~/.cache/blaze-llvm
-    LLVM_SYS_231_PREFIX=~/.cache/blaze-llvm cargo build -p blaze-engine --release --features llvm
+    sudo mkdir -p /usr/local/lib/blaze-llvm && sudo chown "$USER" /usr/local/lib/blaze-llvm
+    python3 .github/scripts/llvm.py fetch --target <triple> --dir /usr/local/lib/blaze-llvm/<triple>
+    LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/<triple> blaze build -p blaze-engine --release --features llvm
 
 `build.rs` checks the prefix's `blaze-llvm.json` against the pin and stops otherwise: neither
 Homebrew's LLVM nor a distribution's is a source. LLVM is linked in statically, and on Linux so
