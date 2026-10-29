@@ -1,17 +1,38 @@
+---
+status: current
+summary: Releases: the canary and stable channels, how a release is cut and what gates promotion to stable.
+---
 # Releases: canary and stable
 
 blaze has two release channels, made of the same releases:
 
-- **canary** (opt-in): every release, as soon as it is built. A release is cut from a main whose
-  merge gate (`ci`) is green: the unit tests, the build, and the fast part of the smoke corpus
-  below. It is published as a GitHub *prerelease*.
-- **stable** (the default): a canary that then passed the heavy tests, unchanged. Promotion
-  builds nothing: the archives users get on stable are the bytes that were tested as canary.
+- **canary** (opt-in): every release, as soon as it is built. A release is cut from a commit of
+  main as soon as main's merge gate has built it on Linux x86-64 (the job `linux x64 / build`),
+  without waiting for the unit tests or the other platforms. It is published as a GitHub
+  *prerelease*.
+- **stable** (the default): a canary that then passed the heavy tests, unchanged, and whose
+  commit passed main's whole merge gate: its whole run green, with the unit tests on Linux
+  x86-64, Linux ARM64 and macOS. Promotion builds nothing: the archives users get on stable are the bytes that
+  were tested as canary.
 
 ## Versions
 
-A release is `v0.YYYYMMDD.N` (`0.YYYYMMDD.N` in Cargo.toml and `blaze --version`), N counting
-the releases of that day (UTC) from 0. `.github/scripts/train_release.py` picks the number.
+A release is `v0.YYYYMMDD.N` (`0.YYYYMMDD.N` in `blaze --version`), N counting the releases of
+that day (UTC) from 0. `.github/scripts/train_release.py` picks the number.
+
+The version is never committed. Cargo.toml's workspace version stays `0.0.0` on main: it is
+part of every crate's identity (`CARGO_PKG_VERSION`), so a version committed with each release
+made every build of main after it miss blaze's store and rebuild all of blaze. A release's
+build is told which release it is by `BLAZE_RELEASE` (the tag), which release.yaml sets and
+only `crates/blaze-engine/build.rs` reads, the one crate that changes with every commit anyway;
+the rest of blaze is asked through `blaze_cargo::engine`. It says
+
+    blaze 0.20261028.9 (fb82b09 2026-10-28)     a release: the version, the commit and its date (UTC)
+    blaze 0.0.0-dev (fb82b09)                   a build of the tree: no release, and no pin names it
+
+The version is the second field (`.github/actions/blaze` reads it). The binary does not know its
+channel: a canary is made stable unchanged. Where a manifest's version must be the release's
+(publishing to crates.io), `canary.py stamp` writes it into that job's checkout only.
 
 A version is one release on one tag, for good: **promotion flips that same release** from
 prerelease to stable and makes it GitHub's *Latest*. No second tag is made and no asset is
@@ -39,30 +60,35 @@ published as a full release and counts as stable.
 
 ## Cutting a canary
 
-Every green main is a canary, cheaply. `canary.yaml` runs when the merge gate's run on a push to
-main ends green (and hourly, and by hand): `.github/scripts/canary.py cut` tags the newest
-commit of main whose `ci` check is green (main moves faster than its gate, so that is seldom
-HEAD itself; it looks through main's first parents since the newest release) `v0.YYYYMMDD.N`
-through the API and dispatches `release.yaml` on the tag, when
+Every built main is a canary, cheaply. `canary.yaml` runs on each push to main (and hourly, and
+by hand): `.github/scripts/canary.py cut` waits for main's build of the push (the job `linux x64
+/ build` of the merge gate's run on it; when the push changed nothing the build reads, the
+newest commit of main that has a build), at most 90 minutes, and then tags the newest commit of
+main whose `linux x64 / build` passed (main moves faster than its build, so that is seldom HEAD
+itself; it looks through main's first parents since the newest release) `v0.YYYYMMDD.N` through
+the API and dispatches `release.yaml` on the tag. It does not wait for the unit tests, the other
+platforms (macOS often queues half an hour) or the rest of the run: stable does (below). The
+cut waits in canary.yaml, polling the job through the API, rather than being dispatched from
+the build job: that would need `actions: write` in `blaze-platform.yaml`, which pull requests
+and the train run too. It cuts when
 
-- something besides the docs (`docs/`, `site/`, `tools/agents/`, `*.md`) and the bots' own commits
+- something besides the docs (`docs/`, `site/`, `agents/`, `*.md`) and the bots' own commits
   changed from the newest release to that commit,
 - no `release-cut.yaml` is running and no `release.yaml` is building a release (a run on a
   branch is not one), and the newest release is at least 30
-  minutes old (`-f min-minutes=N` by hand). A green main inside that window is cut by the next
-  green push or the hourly run.
+  minutes old (`-f min-minutes=N` by hand). A build of main inside that window is cut by the
+  next push or the hourly run.
 
 No commit goes to main, so a cut never races a merge, and a canary is the bytes of a commit
-that passed the gate as it is. release.yaml stamps the tag's version into its own checkout
-(Cargo.toml's workspace version and the workspace's entries of Cargo.lock, `canary.py stamp`),
-so `blaze --version` and the archives' names are the tag's, and writes the notes: CHANGELOG.md's
-[Unreleased] and the title of each change merged since the previous release. Main's Cargo.toml
-keeps the version of the last release commit.
+main's gate built, as it is. release.yaml builds it with `BLAZE_RELEASE` set to the tag, so
+`blaze --version` and the archives' names are the tag's, and writes the notes (`canary.py
+notes`): the lines CHANGELOG.md's [Unreleased] gained since the previous release and the title
+of each change merged since then. [Unreleased] is never emptied: a release's notes are in its
+GitHub release, not in a section of CHANGELOG.md.
 
-`release-cut.yaml` (by hand, on main) or the release train's `release` job still cuts a release
-the old way: it commits `release: v0.YYYYMMDD.N` (the version, a CHANGELOG.md section, Cargo.lock,
-tools/nix/units) and tags it, and that release's notes are its CHANGELOG.md section. Both count every
-tag, so they never take the same number.
+`release-cut.yaml` (by hand, on main) or the release train's `release` job cuts a release of
+main's HEAD the same way (`train_release.py`): a tag through the API and release.yaml on it,
+no commit. Both count every tag, so they never take the same number.
 
 Either way `release.yaml` builds the archives on the tag for macOS (Apple silicon) and Linux
 (x86-64, ARM64) and publishes them as a prerelease with `SHA256SUMS`. PGO is off for now (#870):
@@ -89,7 +115,17 @@ published archives, installed with `install.sh --version <v>` as a user installs
   as the first, is not compared). Hosted runners are shared, so 25% is their noise and not a
   benchmark: docs/benchmarks.md's numbers come from the bench machines;
 - the train (`train.yaml`, every tier on every platform), dispatched on the tag: built from the
-  commit the archives were built from. A train on a tag releases nothing and opens no issue.
+  commit the archives were built from. A train on a tag releases nothing and opens no issue;
+- main's tests (`promote.py tested`): the merge gate's run on the push of the tag's commit to
+  main is green (the whole run: every job of it, the smoke corpus's std cases and the script
+  checks too), and its unit tests (`linux x64 / tests`, `linux arm64 / tests`, `macos arm64 /
+  tests`) ran and passed on that exact commit. The canary was cut before they finished, so the
+  job waits for the run while it is going, polling every two minutes for up to five hours, beside
+  the other jobs, which take longer. No run, a red run, a run that skipped the tests (a commit
+  that changed nothing they read, such as one `release-cut.yaml` cut at a docs-only HEAD) or one
+  still going after five hours fails the job with the commit and the run named, and the release
+  stays a canary. After re-running a flaked job of that run, `gh workflow run promote.yaml -f
+  tag=v...` tries again.
 
 When every job passes, `.github/scripts/promote.py` marks the release stable and *Latest*,
 appends to its notes the line `Promoted to stable on <date> after <run URL>`, and adds the
@@ -128,16 +164,18 @@ PATH for an installed release).
   those of the crates below gpui, since the whole suite with both builds is longer than a
   hosted runner's six hours), servo v0.7.0 (`--version`; the tests of crates without a window
   or a GPU), bun's Rust port (bun-v1.4.3, after `harness/bunprep.py` built its C and C++ in
-  `nix develop .#bench-bun`), and NVIDIA Dynamo v1.6.1 (the workspace, on macOS `dynamo-llm`
+  `nix develop .#bench-bun`), NVIDIA Dynamo v1.6.1 (the workspace, on macOS `dynamo-llm`
   without its Linux-only default feature; its Python bindings built and imported; the CPU-only
   vLLM mocker server's `--help`; its tests that need no GPU), Dmitriy Kovalenko's fff v0.11.0
   (the file finder formerly fff.nvim: its MCP server's `--version` and health check; the tests
-  of fff-search and the crates below it) and fframes v1.3.0 (a video rendering framework, with
+  of fff-search and the crates below it), fframes v1.3.0 (a video rendering framework, with
   the prebuilt static FFmpeg and Skia its build scripts download: its hello-world example's
-  timeline and one frame rendered to PNG on the CPU; the tests of the crates that need no GPU).
-  What a runner without a GPU cannot build or test is listed with why in the entry's
-  `excluded`, which smoke.py prints. Each is also measured against cargo (above); cargo builds
-  dynamo with its pinned Rust 1.96.1, which its users build with.
+  timeline and one frame rendered to PNG on the CPU; the tests of the crates that need no GPU)
+  and flox v1.19.2 (in the environment of flox's own package build, which
+  `harness/floxprep.py` takes from its flake: the CLI's `--version`; the tests of flox-core and
+  flox-config). What a runner without a GPU cannot build or test is listed with why in the
+  entry's `excluded`, which smoke.py prints. Each is also measured against cargo (above); cargo
+  builds dynamo with its pinned Rust 1.96.1, which its users build with.
 
 The std cases are the merge gate's; all four groups are the promotion gate. blaze itself is in
 the corpus but not measured against cargo here: how fast blaze builds blaze is the self-build's

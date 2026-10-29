@@ -1,3 +1,9 @@
+---
+status: superseded
+summary: What went in the rust-analyzer subtree and what stayed in crates/, from when the front end was a synced fork.
+date: 2026-10-21
+superseded_by: contributing.md#where-new-code-goes
+---
 # What goes in the rust-analyzer subtree, and what stays in crates/
 
 **Superseded in part, 2026-10-28** (Andrew: "We don't care about upstreaming rust-analyzer
@@ -15,7 +21,7 @@ rows in section 4. The rest of this text describes the tree before them. Read ag
 `0b21bd6596` (2026-10-20), so "blaze's changes to rust-analyzer" below means
 `git diff 0b21bd6596 main:vendor/rust-analyzer`.
 
-Each claim carries a mark, as in [research/](research/README.md): **(read)** checked in the
+Each claim carries a mark, as in [research/](research/): **(read)** checked in the
 code, a command's output or a document cited; **(reported)** someone else says so;
 **(unverified)** my inference or estimate. What was fetched or measured is in
 [upstream/architecture-split/](upstream/architecture-split/SOURCE.md).

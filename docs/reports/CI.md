@@ -1,3 +1,8 @@
+---
+status: record
+summary: Where CI's fast tier's time went, and the merge queue.
+date: 2026-10-22
+---
 # CI: where the fast tier's time went, and the merge queue (2026-10-22)
 
 What CI does is in [harness.md](../harness.md#ci). This is what I measured before changing it,

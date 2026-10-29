@@ -1,3 +1,8 @@
+---
+status: record
+summary: wasm32 as an emit target.
+date: 2026-10-20
+---
 # wasm32 as an emit target for blaze
 
 This is the report for the `blaze-wasm32-target` branch: the daemon runs natively and

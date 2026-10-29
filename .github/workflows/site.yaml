@@ -36,9 +36,6 @@ concurrency:
 jobs:
   site:
     runs-on: ubuntu-24.04
-    # Narration: manifests are checked in, the audio files live in R2 (site/audio/README.md), so pages keep their player.
-    env:
-      SITE_AUDIO_REMOTE: '1'
     defaults:
       run:
         working-directory: site

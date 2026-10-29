@@ -157,6 +157,20 @@
       "excluded": {
         "e2e (the frames of every example against snapshots), the Skia GPU renderer, the native player": "they need Vulkan or Metal and a display, or odiff from npm"
       }
+    },
+    "flox": {
+      "group": "apps",
+      "repo": "flox/flox",
+      "rev": "87d931382dc5c53f32af662c9611c6a58d669952",
+      "note": "v1.19.2, the environment manager built on Nix. floxprep.py takes the environment of flox's own package build from its flake (the variables its crates read with env!, OpenSSL, krb5 and libclang for GSSAPI's bindgen), every path of it from cache.nixos.org or cache.flox.dev, so the runner needs Nix. The program is the CLI, whose version is compiled in. Its tests are those of flox-core and flox-config, which need neither Nix nor the network.",
+      "prepare": "floxprep",
+      "env": { "FLOX_DISABLE_METRICS": "true" },
+      "seconds": 7200,
+      "runs": [{ "select": ["-p", "flox", "--bin", "flox"], "args": ["--version"], "stdout": "1.19.2\n" }],
+      "test": ["-p", "flox-core", "-p", "flox-config", "--features", "flox-core/tests"],
+      "excluded": {
+        "flox-rust-sdk, flox-manifest and flox's own tests": "they run Nix, reach FloxHub or the catalog, or read what `just build` made; flox's CI runs them in its Nix shell with its services"
+      }
     }
   }
 }

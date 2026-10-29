@@ -10,17 +10,16 @@ name: pgo
 # a profile finds a function by its symbol, which carries a hash of the whole graph of crates,
 # so after such a change the old profile finds almost nothing. Run it by hand when a build says
 # that many functions changed since the profile was trained, and before a release after large
-# changes to the code. The release train runs it on each release commit it makes, and the pin
-# job then tags the release.
-# PGO is off for now: releases build with `--no-pgo` (release.yaml) and are tagged by release-cut
-# itself, so this runs by hand only. To turn it back on, restore the push trigger:
+# changes to the code. A release's version is not committed (Cargo.toml stays `0.0.0`, and the
+# release is told only to blaze-engine's build, by `BLAZE_RELEASE`), so a release does not make a
+# profile stale.
+# PGO is off for now: releases build with `--no-pgo` (release.yaml), so this runs by hand only. To turn it back on, restore the push trigger:
 #   push: { branches: [main], paths: [Cargo.lock, "**/Cargo.toml", harness/toolchain,
 #           .github/scripts/build_release.py, crates/hir-ty-codegen/llvm.json] }
 on:
   workflow_dispatch:
 
-# A push replaces the run of the push before it, never a run by hand: the release train's
-# dispatch on a release commit (train_release.py) must finish, or its tag never comes.
+# A push replaces the run of the push before it, never a run by hand.
 concurrency:
   group: pgo-${{ github.event_name }}
   cancel-in-progress: ${{ github.event_name == 'push' }}
@@ -71,12 +70,9 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
-      # To start release.yaml on a release's tag.
-      actions: write
     steps:
       - uses: actions/checkout@v7
         with:
-          # The tags and the release commits, which `train_release.py tag` looks for.
           fetch-depth: 0
           # The ruleset on main refuses a push from the workflow's own token: this one is allowed
           # past it (docs/harness.md, "CI").
@@ -105,10 +101,3 @@ jobs:
             sleep 15
           done
           exit 1
-      # A release the train made (`release: v0.YYYYMMDD.N` on main) waits for profiles of its own crates:
-      # these are they, so it is tagged here, on the commit that pins them, and release.yaml runs
-      # on the tag (.github/scripts/train_release.py).
-      - name: Tag a release that waits for these profiles
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 .github/scripts/train_release.py tag --push

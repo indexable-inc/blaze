@@ -678,7 +678,7 @@ dependencies = [
 
 [[package]]
 name = "blaze-bench"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "blaze-store",
  "hir-ty-codegen",
@@ -687,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "blaze-build-script"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "jobserver",
  "libc",
@@ -712,7 +712,7 @@ version = "0.1.0"
 
 [[package]]
 name = "blaze-cargo"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "ar_archive_writer",
@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "blaze-doc"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "base-db",
@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "blaze-engine"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "blaze-cargo",
@@ -883,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "blaze-expand"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "base-db",
  "blaze-store",
@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "blaze-fmt"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "annotate-snippets",
  "anyhow",
@@ -925,11 +925,11 @@ dependencies = [
 
 [[package]]
 name = "blaze-fuzz"
-version = "0.20261028.9"
+version = "0.0.0"
 
 [[package]]
 name = "blaze-graph"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "blaze-protocol",
  "crossbeam-channel",
@@ -941,14 +941,14 @@ dependencies = [
 
 [[package]]
 name = "blaze-in-place"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "blaze-lints"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "annotate-snippets",
  "cfg",
@@ -972,7 +972,7 @@ version = "0.1.0"
 
 [[package]]
 name = "blaze-macro-wasm"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "base-db",
  "blaze-store",
@@ -992,7 +992,7 @@ dependencies = [
 
 [[package]]
 name = "blaze-manifest"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "annotate-snippets",
  "anyhow",
@@ -1014,7 +1014,7 @@ dependencies = [
 
 [[package]]
 name = "blaze-metadata"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "blaze-manifest",
@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "blaze-new"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "cargo-util-schemas",
@@ -1043,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "blaze-protocol"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "blaze-fuzz",
  "rustc-hash 2.1.2",
@@ -1052,7 +1052,7 @@ dependencies = [
 
 [[package]]
 name = "blaze-registry"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "blaze-manifest",
@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "blaze-resolve"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "blaze-source",
@@ -1100,7 +1100,7 @@ dependencies = [
 
 [[package]]
 name = "blaze-source"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "rustc-hash 2.1.2",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "blaze-splice"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "blaze-in-place",
@@ -1129,7 +1129,7 @@ dependencies = [
 
 [[package]]
 name = "blaze-store"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "blaze-fuzz",
  "crc32fast",
@@ -1143,7 +1143,7 @@ dependencies = [
 
 [[package]]
 name = "blaze-tree"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "blaze-manifest",
@@ -1154,14 +1154,14 @@ dependencies = [
 
 [[package]]
 name = "blaze-ui"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "blaze-protocol",
 ]
 
 [[package]]
 name = "blaze-units"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "blaze-manifest",
@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "blaze-wasi"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "wasmtime",
@@ -2556,7 +2556,7 @@ dependencies = [
 
 [[package]]
 name = "hir-ty-codegen"
-version = "0.20261028.9"
+version = "0.0.0"
 dependencies = [
  "base-db",
  "blaze-fuzz",
