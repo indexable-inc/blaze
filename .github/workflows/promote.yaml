@@ -168,7 +168,19 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ilammy/msvc-dev-cmd@v1
       - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal && rustup default "$tc"
+      # The releases cut before release.yaml had a Windows row (v0.20261029.7 is the newest of
+      # them) have no such archive, and a run of the gate against one (a pull request changing
+      # it takes the newest release) has nothing to try: that is said, not passed over. Every
+      # later release has it, and its absence fails the job.
+      - name: has a Windows archive
+        run: |
+          before=v0.20261029.7
+          if [ "$(printf '%s\n%s\n' "$TAG" "$before" | sort -V | head -n 1)" = "$TAG" ]; then
+            echo "::notice::$TAG is not newer than $before, the last release with no Windows archive: nothing to try"
+            echo "NO_ARCHIVE=1" >> "$GITHUB_ENV"
+          fi
       - name: download and check ${{ env.TAG }}
+        if: env.NO_ARCHIVE != '1'
         run: |
           mkdir -p "$RUNNER_TEMP/dl"
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*-x86_64-pc-windows-msvc.tar.gz*' --dir "$RUNNER_TEMP/dl"
@@ -177,6 +189,7 @@ jobs:
           tar xzf ./*.tar.gz
           echo "BLAZE_DIR=$(pwd)/$(ls -d blaze-*-x86_64-pc-windows-msvc)" >> "$GITHUB_ENV"
       - name: what it unpacked runs
+        if: env.NO_ARCHIVE != '1'
         run: |
           export PATH="$BLAZE_DIR:$PATH"
           blaze --version | tee /dev/stderr | grep -F "blaze ${TAG#v} "

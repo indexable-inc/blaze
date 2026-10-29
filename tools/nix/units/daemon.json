@@ -820,6 +820,7 @@
    {
     "dependencies": [
      "anyhow",
+     "ar_archive_writer",
      "blaze-cargo",
      "blaze-doc",
      "blaze-expand",
@@ -19644,6 +19645,10 @@
        "unit": "anyhow@1.0.104 lib anyhow build"
       },
       {
+       "name": "ar_archive_writer",
+       "unit": "ar_archive_writer@0.5.3 lib ar_archive_writer build"
+      },
+      {
        "name": "blaze_cargo",
        "unit": "blaze-cargo@0.0.0 lib blaze_cargo build"
       },
@@ -19897,6 +19902,10 @@
        "unit": "anyhow@1.0.104 lib anyhow build"
       },
       {
+       "name": "ar_archive_writer",
+       "unit": "ar_archive_writer@0.5.3 lib ar_archive_writer build"
+      },
+      {
        "name": "blaze_cargo",
        "unit": "blaze-cargo@0.0.0 lib blaze_cargo build"
       },
@@ -20148,6 +20157,10 @@
       {
        "name": "anyhow",
        "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "ar_archive_writer",
+       "unit": "ar_archive_writer@0.5.3 lib ar_archive_writer build"
       },
       {
        "name": "blaze_cargo",
@@ -20446,6 +20459,10 @@
       {
        "name": "anyhow",
        "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "ar_archive_writer",
+       "unit": "ar_archive_writer@0.5.3 lib ar_archive_writer build"
       },
       {
        "name": "blaze_cargo",
@@ -41134,6 +41151,10 @@
        "unit": "anyhow@1.0.104 lib anyhow build"
       },
       {
+       "name": "ar_archive_writer",
+       "unit": "ar_archive_writer@0.5.3 lib ar_archive_writer build"
+      },
+      {
        "name": "blaze_cargo",
        "unit": "blaze-cargo@0.0.0 lib blaze_cargo build"
       },
@@ -41387,6 +41408,10 @@
        "unit": "anyhow@1.0.104 lib anyhow build"
       },
       {
+       "name": "ar_archive_writer",
+       "unit": "ar_archive_writer@0.5.3 lib ar_archive_writer build"
+      },
+      {
        "name": "blaze_cargo",
        "unit": "blaze-cargo@0.0.0 lib blaze_cargo build"
       },
@@ -41638,6 +41663,10 @@
       {
        "name": "anyhow",
        "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "ar_archive_writer",
+       "unit": "ar_archive_writer@0.5.3 lib ar_archive_writer build"
       },
       {
        "name": "blaze_cargo",
@@ -41936,6 +41965,10 @@
       {
        "name": "anyhow",
        "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "ar_archive_writer",
+       "unit": "ar_archive_writer@0.5.3 lib ar_archive_writer build"
       },
       {
        "name": "blaze_cargo",
@@ -62497,6 +62530,10 @@
        "unit": "anyhow@1.0.104 lib anyhow build"
       },
       {
+       "name": "ar_archive_writer",
+       "unit": "ar_archive_writer@0.5.3 lib ar_archive_writer build"
+      },
+      {
        "name": "blaze_cargo",
        "unit": "blaze-cargo@0.0.0 lib blaze_cargo build"
       },
@@ -62750,6 +62787,10 @@
        "unit": "anyhow@1.0.104 lib anyhow build"
       },
       {
+       "name": "ar_archive_writer",
+       "unit": "ar_archive_writer@0.5.3 lib ar_archive_writer build"
+      },
+      {
        "name": "blaze_cargo",
        "unit": "blaze-cargo@0.0.0 lib blaze_cargo build"
       },
@@ -63001,6 +63042,10 @@
       {
        "name": "anyhow",
        "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "ar_archive_writer",
+       "unit": "ar_archive_writer@0.5.3 lib ar_archive_writer build"
       },
       {
        "name": "blaze_cargo",
@@ -63299,6 +63344,10 @@
       {
        "name": "anyhow",
        "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "ar_archive_writer",
+       "unit": "ar_archive_writer@0.5.3 lib ar_archive_writer build"
       },
       {
        "name": "blaze_cargo",
@@ -84014,6 +84063,10 @@
        "unit": "anyhow@1.0.104 lib anyhow build"
       },
       {
+       "name": "ar_archive_writer",
+       "unit": "ar_archive_writer@0.5.3 lib ar_archive_writer build"
+      },
+      {
        "name": "blaze_cargo",
        "unit": "blaze-cargo@0.0.0 lib blaze_cargo build"
       },
@@ -84267,6 +84320,10 @@
        "unit": "anyhow@1.0.104 lib anyhow build"
       },
       {
+       "name": "ar_archive_writer",
+       "unit": "ar_archive_writer@0.5.3 lib ar_archive_writer build"
+      },
+      {
        "name": "blaze_cargo",
        "unit": "blaze-cargo@0.0.0 lib blaze_cargo build"
       },
@@ -84518,6 +84575,10 @@
       {
        "name": "anyhow",
        "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "ar_archive_writer",
+       "unit": "ar_archive_writer@0.5.3 lib ar_archive_writer build"
       },
       {
        "name": "blaze_cargo",
@@ -84816,6 +84877,10 @@
       {
        "name": "anyhow",
        "unit": "anyhow@1.0.104 lib anyhow build"
+      },
+      {
+       "name": "ar_archive_writer",
+       "unit": "ar_archive_writer@0.5.3 lib ar_archive_writer build"
       },
       {
        "name": "blaze_cargo",

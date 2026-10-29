@@ -96,6 +96,10 @@ jobs:
           git config --global core.autocrlf false
           echo CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT=false >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
+      # typed_input (the scripts take JSON) needs Python 3.12; the oldest hosted Ubuntu has 3.10.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
       # link.exe and the Windows SDK, for blaze's build and for the programs blaze links.
       - if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
