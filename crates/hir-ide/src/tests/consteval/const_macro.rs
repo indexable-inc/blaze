@@ -173,7 +173,7 @@ pub const fn fields(item: &const_ast::Item) -> String {
     push_str(&mut out, " { const COUNT: usize = ");
     push(&mut out, b'0' + count as u8);
     push_str(&mut out, "; const NAME_LEN: usize = ");
-    push(&mut out, b'0' + text.len() as u8);
+    push(&mut out, b'0' + raw(text).len as u8);
     push_str(&mut out, "; const INPUT_SPAN: bool = ");
     push_str(&mut out, if span >= 3 && span != const_ast::NO_SPAN { "true" } else { "false" });
     push_str(&mut out, "; }");
