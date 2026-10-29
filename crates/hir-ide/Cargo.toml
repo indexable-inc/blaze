@@ -50,7 +50,6 @@ expect-test = "1.5.1"
 project-model.workspace = true
 
 # local deps
-const-ast.workspace = true
 test-utils.workspace = true
 test-fixture.workspace = true
 
