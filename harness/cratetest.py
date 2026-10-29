@@ -22,7 +22,7 @@ class TestFixture(Fixture):
             # The crate itself, built with `cfg(test)`: its `#[cfg(test)]` modules are the tests.
             super().__init__(crate_dir, [crate], ["--lib", "--profile", "test"],
                              touch=path)
-            self.blaze_args = ["--cfg-test"]
+            self.blaze_args = ["--unit-test"]
         else:
             # By its file: an example may have the name of the test.
             super().__init__(crate_dir, [crate, os.path.abspath(path)], ["--test", test], touch=path)

@@ -29,7 +29,6 @@ counted() { # toolchain-dir name
   rustup toolchain link "nr-$2" "$to"
 }
 counted "$TC-x86_64-unknown-linux-gnu" pin
-ls "$L/tc-pin/lib/rustlib/src/rust/library" >/dev/null
 
 cd "$L/src"
 CARGO_TARGET_DIR=$L/target "${pin[@]}" cargo "+$TC" build -p blaze-engine --release --bins 2>&1 | tail -3

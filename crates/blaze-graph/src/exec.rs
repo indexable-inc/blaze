@@ -4,8 +4,12 @@
 //! the machine runs nodes of it at once.
 
 use std::{
-    panic::{AssertUnwindSafe, catch_unwind},
-    sync::atomic::{AtomicU32, Ordering},
+    any::Any,
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    sync::{
+        Mutex, PoisonError,
+        atomic::{AtomicU32, Ordering},
+    },
     time::Instant,
 };
 
@@ -42,6 +46,10 @@ impl Did {
 /// Runs the build of `nodes` on `machine` to its end: `work` does a node's work on a thread of
 /// its pool, `said` hears every record as the machine says it, and `trace`, when given, gets
 /// every input the machine took, in order ([`crate::trace`]). Whether every node was done.
+///
+/// A node whose work panics fails, and once the build is over the panic goes on on the calling
+/// thread, as from a thread of [`std::thread::scope`]: a panic that unwinds on purpose, as
+/// salsa's cancellation does, reaches whoever catches it.
 pub fn drive<W>(
     machine: &mut Machine,
     nodes: Vec<Spec>,
@@ -56,16 +64,23 @@ where
     let now = || u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let config = machine.config();
     let (done_tx, done_rx) = unbounded::<(NodeId, Did, u64)>();
-    std::thread::scope(|scope| {
+    let first_panic: Mutex<Option<Box<dyn Any + Send>>> = Mutex::new(None);
+    let over = std::thread::scope(|scope| {
         let mut pools: Vec<Sender<NodeId>> = Vec::new();
         for threads in [config.io, config.work] {
             let (tx, rx): (Sender<NodeId>, Receiver<NodeId>) = unbounded();
             for _ in 0..threads {
-                let (rx, done_tx) = (rx.clone(), done_tx.clone());
+                let (rx, done_tx, first_panic) = (rx.clone(), done_tx.clone(), &first_panic);
                 scope.spawn(move || {
                     for id in rx {
-                        let did = catch_unwind(AssertUnwindSafe(|| work(id)))
-                            .unwrap_or_else(|panic| Did::failed(panicked(&*panic)));
+                        let did =
+                            catch_unwind(AssertUnwindSafe(|| work(id))).unwrap_or_else(|panic| {
+                                let did = Did::failed(panicked(&*panic));
+                                let mut first =
+                                    first_panic.lock().unwrap_or_else(PoisonError::into_inner);
+                                first.get_or_insert(panic);
+                                did
+                            });
                         if done_tx.send((id, did, now())).is_err() {
                             return;
                         }
@@ -79,7 +94,11 @@ where
         // The threads end once nothing more can be sent them, whether the build ended or not.
         drop(pools);
         over
-    })
+    });
+    if let Some(panic) = first_panic.into_inner().unwrap_or_else(PoisonError::into_inner) {
+        resume_unwind(panic);
+    }
+    over
 }
 
 fn run(
@@ -126,7 +145,7 @@ fn run(
     Ok(over.unwrap_or(false))
 }
 
-fn panicked(panic: &(dyn std::any::Any + Send)) -> String {
+fn panicked(panic: &(dyn Any + Send)) -> String {
     let what = panic
         .downcast_ref::<&str>()
         .copied()

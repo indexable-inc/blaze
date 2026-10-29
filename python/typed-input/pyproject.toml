@@ -1,0 +1,9 @@
+[project]
+name = "typed-input"
+version = "0"
+description = "A script's one typed JSON input (AGENTS.md rule scripts-take-typed-input)"
+requires-python = ">=3.13"
+
+[build-system]
+requires = ["uv_build>=0.9,<0.14"]
+build-backend = "uv_build"

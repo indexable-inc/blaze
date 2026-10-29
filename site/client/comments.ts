@@ -25,7 +25,7 @@
  */
 
 import { blockControls } from './lib/blockctl';
-import { COMMENTS, SAVE, THREADS, kept, onPage } from './lib/page';
+import { COMMENTS, SAVE, kept, onPage } from './lib/page';
 
 const PAGE_THREAD = 'block-_page';
 
@@ -190,7 +190,6 @@ function start(main: HTMLElement, signal: AbortSignal) {
 			oldButton.replaceWith(b);
 		}
 		setOpen(thread, true);
-		dispatchEvent(new Event(THREADS));
 	}
 
 	/**
@@ -223,7 +222,6 @@ function start(main: HTMLElement, signal: AbortSignal) {
 			}
 		}
 		count();
-		dispatchEvent(new Event(THREADS));
 	}
 
 	function mark(item: HTMLElement) {

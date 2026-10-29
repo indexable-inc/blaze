@@ -41,17 +41,38 @@ pub fn say(event: Event) {
     }
 }
 
-/// The step the process is at, which the next one ends.
-static AT: Mutex<Option<(Step, Option<String>)>> = Mutex::new(None);
+/// The step each thread of the process is at, which its next one ends. Of each thread: a
+/// worker builds programs side by side, each on a thread of its own, and one program's step
+/// does not end another's (a program's link went on until the next program began a step).
+static AT: Mutex<Vec<(std::thread::ThreadId, Step, Option<String>)>> = Mutex::new(Vec::new());
 
-/// Says the process is at `step`, of `of` when it is of one crate or program, and done
-/// with the one before.
+/// Takes the step this thread is at, and has it at `next` from now on.
+fn replace(next: Option<(Step, Option<String>)>) -> Option<(Step, Option<String>)> {
+    let thread = std::thread::current().id();
+    let mut at = crate::lock(&AT);
+    let was = at.iter().position(|it| it.0 == thread).map(|it| at.swap_remove(it));
+    if let Some((step, of)) = next {
+        at.push((thread, step, of));
+    }
+    was.map(|(_, step, of)| (step, of))
+}
+
+/// The step this thread is at.
+fn current() -> Option<(Step, Option<String>)> {
+    let thread = std::thread::current().id();
+    let at = crate::lock(&AT);
+    at.iter().find(|it| it.0 == thread).map(|(_, step, of)| (*step, of.clone()))
+}
+
+/// Says this thread of the process is at `step`, of `of` when it is of one crate or program,
+/// and done with the one it was at before.
 pub fn at(step: Step, of: Option<&str>) {
     let of = of.map(str::to_owned);
-    match crate::lock(&AT).replace((step, of.clone())) {
+    let waited = crate::lock(&AT).is_empty();
+    match replace(Some((step, of.clone()))) {
         Some((step, of)) => say(Event::Ended { step, of }),
         // At a step from waiting: how busy the process is is said from now on.
-        None if heard() => ticker().unpark(),
+        None if waited && heard() => ticker().unpark(),
         None => {}
     }
     say(Event::Started { step, of });
@@ -59,7 +80,7 @@ pub fn at(step: Step, of: Option<&str>) {
 
 /// Does `work` as `step` of `of`, and is at the step it was at before again after.
 pub fn within<T>(step: Step, of: Option<&str>, work: impl FnOnce() -> T) -> T {
-    let before = crate::lock(&AT).clone();
+    let before = current();
     at(step, of);
     let done = work();
     match before {
@@ -69,9 +90,10 @@ pub fn within<T>(step: Step, of: Option<&str>, work: impl FnOnce() -> T) -> T {
     done
 }
 
-/// Says the process is done with its step: it waits to be asked.
+/// Says this thread of the process is done with its step: once every thread is, the process
+/// waits to be asked.
 pub fn idle() {
-    if let Some((step, of)) = crate::lock(&AT).take() {
+    if let Some((step, of)) = replace(None) {
         say(Event::Ended { step, of });
     }
 }
@@ -79,14 +101,11 @@ pub fn idle() {
 /// How often a compile says how many functions it has compiled.
 pub const COUNTED: Duration = Duration::from_millis(100);
 
-/// The next id of a node of the build's graph ([`Event::Node`]) not said yet.
-static NODES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
 /// The first of `count` ids of nodes no other node of the process has: whatever says nodes
-/// takes them here, so the nodes of one graph and another's are told apart.
+/// takes them here or from [`blaze_graph::exec::ids`], which this is, so the nodes of one
+/// graph and another's are told apart.
 pub fn node_ids(count: usize) -> u32 {
-    let count = u32::try_from(count).unwrap_or(u32::MAX);
-    NODES.fetch_add(count, std::sync::atomic::Ordering::Relaxed)
+    blaze_graph::exec::ids(count)
 }
 
 /// A count of what a step does, said every [`COUNTED`] while it goes on, with what is taking
@@ -248,7 +267,7 @@ fn ticker() -> &'static std::thread::Thread {
                         .for_each(|it| it.tick(false));
                     !counts.is_empty()
                 };
-                let stepping = crate::lock(&AT).is_some();
+                let stepping = !crate::lock(&AT).is_empty();
                 if stepping {
                     cores();
                 }

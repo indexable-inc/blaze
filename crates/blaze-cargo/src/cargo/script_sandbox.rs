@@ -177,6 +177,11 @@ fn with_own_rustc(
         env.iter().filter(|it| !OWN_RUSTC_FOR.contains(&it.0.as_str())).cloned().collect();
     env.push(("RUSTC".to_owned(), link));
     env.push((crate::as_rustc::TOOLCHAIN.to_owned(), rustc));
+    // What blaze as rustc compiles a probe against is blaze's library, as this process found it.
+    let library = super::toolchain::library::VAR;
+    env.retain(|it| it.0 != library);
+    let found = super::toolchain::library::dir().and_then(|it| it.to_str());
+    env.push((library.to_owned(), found.unwrap_or_default().to_owned()));
     Ok(env)
 }
 

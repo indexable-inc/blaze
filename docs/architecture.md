@@ -1,3 +1,7 @@
+---
+status: current
+summary: A map of the code: the worker, the cargo drop-in, the splice, and how a build and an edit flow through them.
+---
 # How blaze works
 
 This is a map of the code for someone who wants to read or change it. Paths are those of the
@@ -381,9 +385,6 @@ first edits' splice fails: that is what splicing can't do, and an own base links
 such an edit still links in full, and the link takes the room for splices that the executable
 there wanted (`headerpad_ahead`), so it is not linked twice.
 
-`BLAZE_RUSTC_BASE=0` made the first build the daemon's own, and `harness/rustcbase.py` checked
-every kind of edit against cargo, until both went with the wrapper.
-
 An alternative wrapper exists in `stub.rs` (`BLAZE_WRAPS_RUSTC`), where rustc compiles only
 a stub for each workspace crate and all code is blaze's. It makes the first build faster,
 but a function blaze refuses then has no rustc copy to fall back on, so it is used by
@@ -400,5 +401,4 @@ targets. It is not written for Windows, and has not been checked on macOS. See
 
 `crates/blaze-wasm` is an experiment that builds the compiler itself for wasm and runs it in
 a web page. It is excluded from the workspace and is not part of the daemon. See
-[reports/WASM.md](reports/WASM.md). The website runs a small
-version of it: [playground.md](playground.md).
+[reports/WASM.md](reports/WASM.md).

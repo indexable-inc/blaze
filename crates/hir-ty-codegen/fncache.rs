@@ -217,35 +217,59 @@ pub fn tests_reach(
     walk.tests = true;
     let starts: Vec<u32> = roots.iter().map(|&it| walk.reach(Node::Root(it))).collect();
     let mut sealed: FxHashMap<u32, Sealed> = FxHashMap::default();
-    let mut spent = [std::time::Duration::ZERO; 4];
+    let mut spent = [std::time::Duration::ZERO; 5];
     let mut next = 0;
-    while let Some(node) = walk.nodes.get(next).map(|it| it.node.clone()) {
-        let at = next as u32;
-        next += 1;
-        let before = std::time::Instant::now();
-        let name = sealed_name(db, &names, &node);
-        spent[0] += before.elapsed();
-        let Some(name) = name else {
+    // In waves of the nodes found and not yet hashed: each is named and looked up in the
+    // store, the code of those to be hashed is compiled on every core, then they are hashed
+    // in the order found, which is all a hash depends on.
+    while next < walk.nodes.len() {
+        let wave: Vec<Node> = walk.nodes[next..].iter().map(|it| it.node.clone()).collect();
+        let mut looked = Vec::with_capacity(wave.len());
+        for node in &wave {
             let before = std::time::Instant::now();
-            walk.hash_node(at, &node);
-            spent[2] += before.elapsed();
-            continue;
-        };
-        let key = below_key(&header, &name);
-        let before = std::time::Instant::now();
-        let below = Below::known(store, &key);
-        spent[1] += before.elapsed();
-        if below.is_none() {
+            let name = sealed_name(db, &names, node);
+            spent[0] += before.elapsed();
+            let Some(name) = name else {
+                looked.push(None);
+                continue;
+            };
+            let key = below_key(&header, &name);
             let before = std::time::Instant::now();
-            walk.hash_node(at, &node);
-            spent[3] += before.elapsed();
-            walk.segments.pop();
+            let below = Below::known(store, &key);
+            spent[1] += before.elapsed();
+            looked.push(Some((name, key, below)));
         }
-        let mut hasher = rustc_stable_hash::StableSipHasher128::new();
-        (4u8, &name).hash(&mut hasher);
-        let type_id::Fingerprint(low, high) = hasher.finish();
-        walk.segments.push(u128::from(low) | u128::from(high) << 64);
-        sealed.insert(at, Sealed { key, below });
+        let hashed: Vec<&Node> = wave
+            .iter()
+            .zip(&looked)
+            .filter(|(_, looked)| matches!(looked, None | Some((_, _, None))))
+            .map(|(node, _)| node)
+            .filter(|node| !matches!(node, Node::Leaf(..)))
+            .collect();
+        let before = std::time::Instant::now();
+        compile_ahead(symbols, &hashed);
+        spent[4] += before.elapsed();
+        for (node, looked) in wave.iter().zip(looked) {
+            let at = next as u32;
+            next += 1;
+            let Some((name, key, below)) = looked else {
+                let before = std::time::Instant::now();
+                walk.hash_node(at, node);
+                spent[2] += before.elapsed();
+                continue;
+            };
+            if below.is_none() {
+                let before = std::time::Instant::now();
+                walk.hash_node(at, node);
+                spent[3] += before.elapsed();
+                walk.segments.pop();
+            }
+            let mut hasher = rustc_stable_hash::StableSipHasher128::new();
+            (4u8, &name).hash(&mut hasher);
+            let type_id::Fingerprint(low, high) = hasher.finish();
+            walk.segments.push(u128::from(low) | u128::from(high) << 64);
+            sealed.insert(at, Sealed { key, below });
+        }
     }
     took.push(("nodes", started.elapsed()));
     // One found later is mostly below one found earlier, and is then taken whole by it.
@@ -323,10 +347,11 @@ pub fn tests_reach(
         let steps: Vec<String> =
             took.iter().map(|(name, at)| format!("{name}={}", at.as_micros())).collect();
         eprintln!(
-            "tests-reach-steps-us: {} (naming={} store={} hashing={} sealed-hashing={}; {} roots, {} nodes, {} sealed)",
+            "tests-reach-steps-us: {} (naming={} store={} compiling={} hashing={} sealed-hashing={}; {} roots, {} nodes, {} sealed)",
             steps.join(" "),
             spent[0].as_micros(),
             spent[1].as_micros(),
+            spent[4].as_micros(),
             spent[2].as_micros(),
             spent[3].as_micros(),
             roots.len(),
@@ -335,6 +360,17 @@ pub fn tests_reach(
         );
     }
     reach
+}
+
+/// Compiles the code [`Walk::hash_node`] hashes of each of `nodes` on every core, for the
+/// queries to have it when the walk asks.
+fn compile_ahead(symbols: &dyn SymbolResolver, nodes: &[&Node]) {
+    symbols.in_parallel(nodes.len(), &|db, _, at| match nodes[at] {
+        Node::Root(func) => _ = compiled_root(db, *func),
+        Node::Instance(instance, env) => _ = compiled_instance(db, instance.clone(), env.clone()),
+        Node::Static(id) => _ = compiled_static(db, *id),
+        Node::Leaf(..) => {}
+    });
 }
 
 /// The nodes a walk from one node found, in the order found, each with where in `order` the

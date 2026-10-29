@@ -1,7 +1,7 @@
 //! blaze's own copy of the Rust release it builds with, for a machine with no rustup or whose
 //! rustup does not have that release (docs/self-contained.md, "blaze's own toolchain"). It is
-//! the release's `rustc`, `cargo`, `rust-std` and `rust-src` as the Rust project publishes them,
-//! each checked against the sha256 `pins.txt` has for it (`harness/toolchain_pins.py` writes
+//! the release's `rustc`, `cargo` and `rust-std` as the Rust project publishes them (the source
+//! of the standard library is blaze's own, `library.rs`), each checked against the sha256 `pins.txt` has for it (`harness/toolchain_pins.py` writes
 //! that from the release's manifest), and laid out in `~/.blaze/toolchains/<release>-<host>`
 //! as rustup lays out a toolchain, its records and channel manifest included, so that what
 //! reads a sysroot reads this one unchanged.
@@ -63,25 +63,21 @@ struct Pin {
 
 struct Component {
     package: &'static str,
-    /// `*` for one that is the same on every host, as `rust-src` is.
+    /// The target it is for: the host's, or `wasm32-wasip1` for the library proc macros build
+    /// against. Every package blaze pins is of one target, so its files are all named
+    /// `<package>-<version>-<target>`.
     target: &'static str,
     pin: Pin,
 }
 
 impl Component {
     fn file(&self, version: &str) -> String {
-        match self.target {
-            "*" => format!("{}-{version}.tar.xz", self.package),
-            target => format!("{}-{version}-{target}.tar.xz", self.package),
-        }
+        format!("{}-{version}-{}.tar.xz", self.package, self.target)
     }
 
     /// As rustup names it in a toolchain's records.
     fn name(&self) -> String {
-        match self.target {
-            "*" => self.package.to_owned(),
-            target => format!("{}-{target}", self.package),
-        }
+        format!("{}-{}", self.package, self.target)
     }
 }
 
@@ -144,7 +140,7 @@ pub fn rustc_version() -> &'static str {
     PINS.lines()
         .find_map(|it| it.strip_prefix("rustc "))
         .map(str::trim)
-        .expect("pins.txt has the rustc line: harness/toolchain_pins.py --write")
+        .expect("pins.txt has the rustc line: harness/toolchain_pins.py '{\"write\": true}'")
 }
 
 /// The commit of rust-lang/rust the toolchain blaze builds with was built from: what a
@@ -153,7 +149,7 @@ pub fn commit() -> &'static str {
     PINS.lines()
         .find_map(|it| it.strip_prefix("commit "))
         .map(str::trim)
-        .expect("pins.txt has the commit line: harness/toolchain_pins.py --write")
+        .expect("pins.txt has the commit line: harness/toolchain_pins.py '{\"write\": true}'")
 }
 
 /// The host's tuple, as the Rust project names its builds.
@@ -184,7 +180,6 @@ fn whole(dir: &Path) -> bool {
         format!("bin/cargo{exe}"),
         format!("bin/rustc{exe}"),
         "lib/rustlib/multirust-channel-manifest.toml".to_owned(),
-        "lib/rustlib/src/rust/library".to_owned(),
     ];
     needed.iter().all(|it| dir.join(it).exists())
 }
@@ -215,7 +210,7 @@ fn fetch_from(
         format!(
             "blaze builds with Rust {0}, which it downloads once, and the download failed. \
              Running the command again tries again, going on from where a download stopped; on \
-             a machine with no network, `rustup toolchain install {0} --component rust-src` \
+             a machine with no network, `rustup toolchain install {0}` \
              gives blaze the same Rust.\n  {e}",
             release.version
         )
@@ -576,7 +571,7 @@ fn lay_out(release: &Release, manifest: &[u8], toolchain: &Path) -> anyhow::Resu
             "\n[[components]]\npkg = \"{}\"\ntarget = \"{}\"\nis_extension = {}\n",
             component.package,
             component.target,
-            component.target == "*"
+            component.target != release.host
         );
         names.push(name);
     }
@@ -684,27 +679,27 @@ mod tests {
     /// A release of two packages, written as the Rust project's site has them into `dist`,
     /// and its pins.
     fn release(dist: &Path, rustc: &[u8]) -> Release {
-        let src = package(
-            "rust-src-9.9.9",
-            "rust-src",
-            &[("lib/rustlib/src/rust/library/core/lib.rs", "// core\n")],
-            &["lib/rustlib/src/rust"],
+        let wasm = package(
+            "rust-std-9.9.9-wasm32-wasip1",
+            "rust-std-wasm32-wasip1",
+            &[("lib/rustlib/wasm32-wasip1/lib/libcore.rlib", "core\n")],
+            &["lib/rustlib/wasm32-wasip1"],
         );
         let manifest = b"[pkg.rust]\ngit_commit_hash = \"abc\"\n";
         std::fs::create_dir_all(dist).unwrap();
         std::fs::write(dist.join("rustc-9.9.9-test-host.tar.xz"), rustc).unwrap();
-        std::fs::write(dist.join("rust-src-9.9.9.tar.xz"), &src).unwrap();
+        std::fs::write(dist.join("rust-std-9.9.9-wasm32-wasip1.tar.xz"), &wasm).unwrap();
         std::fs::write(dist.join("channel-rust-9.9.9.toml"), manifest).unwrap();
         let pins = format!(
             "# test\nrelease 9.9.9 2000-01-01 9.9.9\nrustc 9.9.9 (abc 2000-01-01)\nmanifest {} {}\n\
-             test-host rustc test-host {} {}\ntest-host rust-src * {} {}\n\
+             test-host rustc test-host {} {}\ntest-host rust-std wasm32-wasip1 {} {}\n\
              other-host rustc other-host {} 1\n",
             sha256(manifest),
             manifest.len(),
             sha256(rustc),
             rustc.len(),
-            sha256(&src),
-            src.len(),
+            sha256(&wasm),
+            wasm.len(),
             sha256(b"other"),
         );
         Release::read(pins.leak(), "test-host").unwrap()
@@ -736,7 +731,11 @@ mod tests {
     #[test]
     fn pins_are_of_the_host_and_the_release_blaze_builds_with() {
         let ours = Release::read(PINS, "x86_64-unknown-linux-gnu").unwrap();
-        assert_eq!(ours.version, super::super::OURS.trim(), "harness/toolchain_pins.py --write");
+        assert_eq!(
+            ours.version,
+            super::super::OURS.trim(),
+            "toolchain_pins.py '{{\"write\": true}}'"
+        );
         assert_eq!(ours.channel, "nightly");
         assert!(ours.rustc.contains("-nightly ("), "{}", ours.rustc);
         let names: Vec<_> = ours.components.iter().map(Component::name).collect();
@@ -747,15 +746,17 @@ mod tests {
                 "cargo-x86_64-unknown-linux-gnu",
                 "rust-std-x86_64-unknown-linux-gnu",
                 "rust-std-wasm32-wasip1",
-                "rust-src"
             ],
             "proc macros are built for wasm32-wasip1 (own_macro.rs), so its library is pinned"
         );
-        assert_eq!(ours.components[4].file(ours.channel), "rust-src-nightly.tar.xz");
+        assert!(
+            !names.iter().any(|it| it == "rust-src"),
+            "the standard library's source is blaze's library/, not the release's"
+        );
         assert!(Release::read(PINS, "riscv64gc-unknown-linux-gnu").is_none());
         for host in ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
         {
-            assert_eq!(Release::read(PINS, host).unwrap().components.len(), 5, "{host}");
+            assert_eq!(Release::read(PINS, host).unwrap().components.len(), 4, "{host}");
         }
     }
 
@@ -768,7 +769,7 @@ mod tests {
         fetched(&dist, &release, &dir).unwrap();
         assert!(complete(&release, &dir));
         let read = |path: &str| std::fs::read_to_string(dir.join(path)).unwrap();
-        assert_eq!(read("lib/rustlib/components"), "rustc-test-host\nrust-src\n");
+        assert_eq!(read("lib/rustlib/components"), "rustc-test-host\nrust-std-wasm32-wasip1\n");
         assert_eq!(
             read("lib/rustlib/manifest-rustc-test-host"),
             format!(
@@ -778,8 +779,8 @@ mod tests {
             )
         );
         assert_eq!(
-            read("lib/rustlib/manifest-rust-src"),
-            "file:lib/rustlib/src/rust/library/core/lib.rs\n"
+            read("lib/rustlib/manifest-rust-std-wasm32-wasip1"),
+            "file:lib/rustlib/wasm32-wasip1/lib/libcore.rlib\n"
         );
         assert_eq!(
             read("lib/rustlib/multirust-channel-manifest.toml"),
@@ -788,7 +789,7 @@ mod tests {
         assert_eq!(read("lib/rustlib/rust-installer-version"), "3");
         assert!(
             read("lib/rustlib/multirust-config.toml")
-                .contains("pkg = \"rust-src\"\ntarget = \"*\"\nis_extension = true")
+                .contains("pkg = \"rust-std\"\ntarget = \"wasm32-wasip1\"\nis_extension = true")
         );
         #[cfg(unix)]
         {
@@ -823,7 +824,6 @@ mod tests {
                 std::fs::create_dir_all(dir.join(path).parent().unwrap()).unwrap();
                 std::fs::write(dir.join(path), "").unwrap();
             }
-            std::fs::create_dir_all(dir.join("lib/rustlib/src/rust/library")).unwrap();
         };
         // The test release is channel 9.9.9 of 2000-01-01.
         whole("9.9.9-1999-12-31-test-host");

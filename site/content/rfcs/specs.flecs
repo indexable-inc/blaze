@@ -3,150 +3,92 @@ site {
   rfcs {
     specs : Rfc {
       Title: {"Inferred specs"}
-      Intro: {"[warm] RFC four: inferred specs. [short pause] The last RFC made proofs possible. This one asks: do you really have to write every spec yourself?"}
-      Outro: {"[warm] So, to recap. Inside a crate, proofs read the body, and no spec is needed. At boundaries, blaze infers one, cheapest tool first, and Lean checks every guess. It shows the spec in your editor and freezes it under the function's hash, like a lockfile. Callers depend on that record, and any weakening is a diff you accept, never a silent change. [breath] Thanks for listening."}
       Description: {"Most functions should not need a written spec. blaze infers one where a function meets its callers, records it by the function's content hash, and makes every change to it a visible diff."}
       Number: {4}
       (DependsOn, site.rfcs.capabilities)
       (DependsOn, site.rfcs.lean)
 
-      Lede summary("RFC 0003 lets a function say what it does with `requires` and `ensures`. This RFC makes most of those clauses unnecessary. Inside a crate, proofs read the body itself. Where a function meets callers it cannot see, blaze infers a spec, shows it in the editor, and records it by the function's content hash, like a lockfile. Callers depend on the record, not the body. An edit that weakens it shows up as a diff you accept, never as a silent change.") {
-        Say: {"[curious] RFC three lets a function say what it does, with requires and ensures. This one makes most of those clauses unnecessary. [pause] Inside a crate, proofs just read the body. Where a function meets callers it can't see, blaze infers a spec, shows it in your editor, and records it under the function's content hash, a bit like a lockfile. Callers depend on that record, not on the body. [confident] And an edit that weakens it shows up as a diff you accept. <emphasis>Never</emphasis> as a silent change."}
-      }
+      Lede summary("RFC 0003 lets a function say what it does with `requires` and `ensures`. This RFC makes most of those clauses unnecessary. Inside a crate, proofs read the body itself. Where a function meets callers it cannot see, blaze infers a spec, shows it in the editor, and records it by the function's content hash, like a lockfile. Callers depend on the record, not the body. An edit that weakens it shows up as a diff you accept, never as a silent change.")
 
       Section motivation(title: "Motivation") {
         P rust("Rust does not infer function signatures, on purpose. A signature is the contract with callers. If the compiler inferred it from the body, an edit to the body could change the API without anyone noticing. Rust lets this happen in one place, the auto traits of an `impl Trait` return type, and it is a known way to break callers.") {
-          Say: {"[thoughtful] First, why is this delicate? Rust doesn't infer function signatures, and that's on purpose. A signature is the contract with callers. If the compiler inferred it from the body, an edit to the body could change the API with nobody noticing. Rust lets that happen in exactly one place, the auto traits of an impl Trait return type, and it's a known way to break callers. [short pause] Specs are contracts too, so by the same argument you'd write them all by hand. But most functions are small. Take max, which just returns the bigger of two numbers. Its spec would only repeat the body. Writing it twice is noise, and the written copy is the one that goes stale."}
           (Cites, refs.rust_book_fns)
           (Cites, refs.rfc_impl_trait)
         }
-        P specs("Specs from RFC 0003 are contracts too, and the same argument says to write them all by hand. But most functions are small, and their spec says what the body already says. Writing it twice is noise, and the written copy is the one that goes stale.") {
-          Silent
-        }
+        P specs("Specs from RFC 0003 are contracts too, and the same argument says to write them all by hand. But most functions are small, and their spec says what the body already says. Writing it twice is noise, and the written copy is the one that goes stale.")
         Code max(lang: "rust", text: `fn max(a: u32, b: u32) -> u32 \{
-          Silent
             if a >= b \{ a } else \{ b }
         }`)
         P unison("Unison shows a way out. Its code is content-addressed: a definition is named by the hash of its content, and callers point at that hash. Types are inferred once, then stored with the definition and shown, not recomputed. A changed body is a new definition with a new hash, so it cannot silently change what an old caller was checked against.") {
-          Say: {"[curious] Unison shows a way out. Its code is named by the hash of its content. Types are inferred once, stored with the definition and shown, not recomputed. A changed body is a new definition with a new hash, so it can't silently change what an old caller was checked against. [short pause] That works because Unison has no source files: the codebase is a database, and text is just a view of it. In Rust the text file is the truth, so anything not written in it is invisible, and recomputed on every build. That's why Rust makes you write signatures out. [confident] So blaze takes the half it needs. Code stays in text, and inferred specs live in a store keyed by hash, printed next to the definition by the editor and the command line. [short pause] Infer them, show them, freeze them. Inference saves the writing. Freezing keeps the contract."}
           (Cites, refs.unison_idea)
         }
         P nofiles("This works because Unison has no source files. The codebase is a database of definitions, and text is only a view of it. Inferred facts are part of the stored definition, so you see them by looking the definition up, and the tool prints them as if they were written. In Rust the text file is the source of truth, so anything not written in it is invisible and gets recomputed on every build. That is why Rust asks you to write signatures out. blaze takes the Unison half it needs: the text stays the source for code, and inferred specs live in a store keyed by hash, which the editor and `blaze show` print next to the definition.") {
-          Silent
           (Cites, refs.unison_idea)
         }
-        P idea("This RFC applies the same idea to specs. Infer them, show them, and freeze them under the function's hash. Inference saves the writing. Freezing keeps the contract.") {
-          Silent
-        }
+        P idea("This RFC applies the same idea to specs. Infer them, show them, and freeze them under the function's hash. Inference saves the writing. Freezing keeps the contract.")
       }
 
       Section design(title: "Design sketch") {
-        H3 inside("Inside a crate, no spec") {
-          Say: {"[warm] So how does it work? Start inside a crate, where you need no spec at all. RFC three turns every function into a Lean definition, and a caller's proof can simply unfold it and reason about the body. A caller that needs max's result to be at least its first argument gets that by unfolding max, and a tactic does the rest. That's safe because the caller and the body are rebuilt together. When max changes, blaze rechecks every proof that unfolded it, in the same edit loop."}
-        }
+        H3 inside("Inside a crate, no spec")
         P unfold("RFC 0003 translates every function's MIR to a Lean definition. A caller's proof can unfold that definition and reason about the body directly. Within one crate, `max` needs no `ensures`: a caller that needs `max(a, b) >= a` gets it by unfolding `max`, and `omega` does the rest.") {
-          Silent
           (Cites, refs.aeneas)
         }
-        P cost("This works because the caller and the body are rebuilt together. When `max` changes, blaze rechecks every proof that unfolded it, in the same edit loop.") {
-          Silent
-        }
+        P cost("This works because the caller and the body are rebuilt together. When `max` changes, blaze rechecks every proof that unfolded it, in the same edit loop.")
 
-        H3 boundaries("At boundaries, infer") {
-          Say: {"[curious] Unfolding stops at boundaries. Public items, because a caller in another crate should depend on a promise, not today's body. Recursion, because unfolding never ends. Loops, which need invariants. And opaque code, like unsafe and foreign functions, where inference only proposes a spec for a person to accept. [pause] At each boundary, blaze infers with three tools, cheapest first. Abstract interpretation over a fixed set of domains: number ranges, how lengths relate to indices, whether something can be empty. Fast, and it always finishes. Then, for small bodies without loops, it runs the body symbolically and simplifies the result. [short pause] And for the rest, a language model reads the body and proposes clauses. Lean must prove each one, and anything it rejects is dropped. The model is a source of guesses, <emphasis>never</emphasis> of truth. [short pause] In the editor, inferred specs appear as grey hints after the signature, in the syntax you'd write, and one action turns a hint into real text."}
-        }
-        P where("Unfolding stops working at a boundary, where the body is not something a caller should see, or cannot be unfolded at all:") {
-          Silent
-        }
+        H3 boundaries("At boundaries, infer")
+        P where("Unfolding stops working at a boundary, where the body is not something a caller should see, or cannot be unfolded at all:")
         Ul where_list {
-          Silent
           Li pub("**`pub` items.** A caller in another crate should depend on a promise, not on today's body.")
           Li recursion("**Recursion.** Unfolding a recursive function does not terminate. It needs a spec to reason about calls to itself.")
           Li loops("**Loops.** A loop becomes a recursive function in Lean, so it needs an invariant, as in RFC 0003.")
           Li opaque("**Opaque code.** `unsafe` blocks, `extern` functions and FFI cannot be translated. Their specs are assumed, so inference here only proposes one for a person to accept.")
         }
-        P how("At each boundary, blaze infers a spec with three tools, cheapest first:") {
-          Silent
-        }
+        P how("At each boundary, blaze infers a spec with three tools, cheapest first:")
         Ol how_list {
-          Silent
           Li absint("**Abstract interpretation.** A fixed set of domains: integer intervals, relations between lengths and indices, and whether a pointer or `Option` can be empty. It is fast, always terminates, and gives facts like `result <= v.len()`.") { (Cites, refs.ikos) }
           Li sp("**Strongest postcondition.** For small, loop-free bodies, run the body symbolically and simplify what comes out. For `max`, this gives `result == if a >= b then a else b`.")
           Li llm("**Proposed by a language model.** For the rest, a model reads the body and proposes `ensures` clauses and loop invariants. Lean must prove each one. A proposal Lean rejects is dropped. The model is a source of guesses, never of truth.") { (Cites, refs.autospec); (Cites, refs.specgen) }
         }
-        P hints("The editor shows inferred specs as inlay hints, after the signature, in the same syntax as a written spec. They look like code the author could have typed, and one action turns a hint into written text.") {
-          Silent
-        }
+        P hints("The editor shows inferred specs as inlay hints, after the signature, in the same syntax as a written spec. They look like code the author could have typed, and one action turns a hint into written text.")
         Code max_hint(lang: "rust", text: `pub fn max(a: u32, b: u32) -> u32
             // inferred: ensures result >= a, result >= b, result == a || result == b
         \{
             if a >= b \{ a } else \{ b }
-        }`) {
-          Silent
-        }
+        }`)
 
-        H3 freeze("Freeze it") {
-          Say: {"[confident] Then you freeze it. An inferred spec is recorded, not recomputed. The record is keyed by the function's content hash, which covers its MIR and the recorded specs of what it calls, and it holds the spec and how it was found. The page shows the record for max: the hash of its body, its three promises, how they were found, and the proof Lean checked. [short pause] Together, the records work like cargo's lockfile: written and read by the tool, and changed only through a reviewed diff. Each one names its callees' records by hash, so two machines that agree on a hash agree on everything beneath it. [short pause] Callers in other crates depend on the record, not the body, and their proofs take its promises as given. So a body edit that keeps the spec changes nothing for them."}
-        }
-        P record("An inferred spec is recorded, not recomputed. The record is keyed by the function's content hash: the hash of its MIR and of the recorded specs of what it calls. It holds the spec and how it was found. The set of records works like `Cargo.lock`: it is written by the tool, read by the tool, and changes only as a reviewed diff.") {
-          Silent
-        }
+        H3 freeze("Freeze it")
+        P record("An inferred spec is recorded, not recomputed. The record is keyed by the function's content hash: the hash of its MIR and of the recorded specs of what it calls. It holds the spec and how it was found. The set of records works like `Cargo.lock`: it is written by the tool, read by the tool, and changes only as a reviewed diff.")
         Code lock(lang: "toml", text: `# specs.lock: one record per function at a boundary
         [spec."mycrate::max"]
         body    = "blake3:9f2c…"   # hash of the MIR and callee specs
         ensures = ["result >= a", "result >= b", "result == a || result == b"]
         found   = "strongest postcondition"
-        proof   = "blake3:41ab…"   # the Lean proof term, checked`) {
-          Silent
-        }
-        P blocks("Records are stored as content-addressed blocks. A record names its callees' records by hash, so the records form a Merkle DAG, and two machines that agree on a hash agree on everything under it. The store would be shaped like the rest of blaze's state: each record an entity, each dependency a pair pointing at a hash. That design belongs to its own RFC; this one needs only that records are immutable and addressed by hash.") {
-          Silent
-        }
+        proof   = "blake3:41ab…"   # the Lean proof term, checked`)
+        P blocks("Records are stored as content-addressed blocks. A record names its callees' records by hash, so the records form a Merkle DAG, and two machines that agree on a hash agree on everything under it. The store would be shaped like the rest of blaze's state: each record an entity, each dependency a pair pointing at a hash. That design belongs to its own RFC; this one needs only that records are immutable and addressed by hash.")
         P callers("Callers in other crates depend on the record, not the body. Their proofs use the recorded `ensures` as an axiom about the callee, and the proof cache keys on the record's hash. A body edit that keeps the spec changes nothing for them.") {
-          Silent
           (Cites, refs.fn_cache)
         }
 
-        H3 diffs("Edits that change the spec") {
-          Say: {"[serious] And when an edit changes the spec? blaze checks the recorded spec against the new body. Still holds? The record keeps it, with the new hash. Doesn't hold? blaze infers again, and shows you a diff. [short pause] The page's example: an edit to max breaks two of its three promises. The editor shows the old spec above the new one, and lists the two callers whose proofs relied on what was removed. [pause] You accept the diff, or fix the body. Accepting it flags every caller that used a removed promise, and their proofs fail until they're fixed. A spec that gets stronger is accepted without asking, since no caller can break. [confident] Nothing is ever silently wrong."}
-        }
-        P weaker("After an edit, blaze checks the recorded spec against the new body. If it still holds, the record keeps its spec and gets the new body hash. If it no longer holds, blaze infers again and shows the change as a diff on the spec:") {
-          Silent
-        }
+        H3 diffs("Edits that change the spec")
+        P weaker("After an edit, blaze checks the recorded spec against the new body. If it still holds, the record keeps its spec and gets the new body hash. If it no longer holds, blaze infers again and shows the change as a diff on the spec:")
         Code weaken(lang: "", text: `  pub fn max(a: u32, b: u32) -> u32
         -     // inferred: ensures result >= a, result >= b, result == a || result == b
         +     // inferred: ensures result >= a
           2 callers relied on the removed clauses:
             geom::clamp       uses result >= b
-            stats::running    uses result == a || result == b`) {
-          Silent
-        }
-        P accept("The author accepts the diff or fixes the body. Accepting it updates the record and flags every caller whose proof used a removed clause; their proofs fail until they are fixed. A spec that gets stronger is accepted without asking, since no caller can break. Nothing is ever silently wrong: a caller is checked against a spec that held for the body it calls, or the build says why not.") {
-          Silent
-        }
+            stats::running    uses result == a || result == b`)
+        P accept("The author accepts the diff or fixes the body. Accepting it updates the record and flags every caller whose proof used a removed clause; their proofs fail until they are fixed. A spec that gets stronger is accepted without asking, since no caller can break. Nothing is ever silently wrong: a caller is checked against a spec that held for the body it calls, or the build says why not.")
 
-        H3 written("A written spec wins") {
-          Say: {"[matter-of-fact] A written spec always wins. Write an ensures clause, and inference is off for it. It pins the promise: the body has to prove it, and breaking it is a proof failure, not a diff to accept. So write specs where the promise is part of your API, and let inference do the rest. Effects work the same way: a written effect pins what a function may touch. Whether unwritten ones get inferred is an open issue."}
-        }
-        P override("A written `ensures` turns inference off for that clause. It pins the promise: the body must prove it, and an edit that breaks it is a proof failure, not a diff to accept. Write a spec when the promise is part of the API, and let inference cover the rest.") {
-          Silent
-        }
+        H3 written("A written spec wins")
+        P override("A written `ensures` turns inference off for that clause. It pins the promise: the body must prove it, and an edit that breaks it is a proof failure, not a diff to accept. Write a spec when the promise is part of the API, and let inference cover the rest.")
         P effects("Effects follow the same rule. A written `/ Fs` pins what a function may touch. Whether an unwritten one is inferred and recorded the same way is an open issue below.") {
-          Silent
           (Cites, refs.koka)
         }
 
-        H3 strength("Which spec to infer") {
-          Say: {"[thoughtful] So which spec should it infer? The strongest spec of a function is its body. It says exactly what it does, and it's useless as a contract, because every edit would break someone. The weakest spec promises nothing, so no caller can use it. [short pause] Inference aims in between: the weakest spec that callers' proofs need, plus facts that are cheap and stable. Inside a workspace, blaze knows which facts callers used, and keeps those. It keeps ranges and length relations, which are short and rarely change. [short pause] But not the body restated. For max, the record holds those three promises, not the if and else."}
-        }
-        P strongest("The strongest spec of a function is its body: it says exactly what the function does. It is also useless as a contract. Every caller would depend on every detail, and every edit would be a breaking change. That is the problem Rust avoids by not inferring signatures.") {
-          Silent
-        }
-        P weakest("The weakest spec, `true`, promises nothing, and no caller can use it. Inference aims between them: the weakest spec that the callers' proofs need, plus facts that are cheap and stable, like bounds and lengths. Concretely:") {
-          Silent
-        }
+        H3 strength("Which spec to infer")
+        P strongest("The strongest spec of a function is its body: it says exactly what the function does. It is also useless as a contract. Every caller would depend on every detail, and every edit would be a breaking change. That is the problem Rust avoids by not inferring signatures.")
+        P weakest("The weakest spec, `true`, promises nothing, and no caller can use it. Inference aims between them: the weakest spec that the callers' proofs need, plus facts that are cheap and stable, like bounds and lengths. Concretely:")
         Ul strength_list {
-          Silent
           Li needs("**What callers use.** Inside a workspace, blaze knows which facts callers' proofs used. Those are kept.")
           Li cheap("**What the fixed domains give.** Intervals and length relations are short, and they rarely change when a body is refactored.")
           Li drop("**Not the body restated.** A clause that just repeats the body, like `result == if a >= b then a else b`, is shown in the editor but not recorded. For `max`, the recorded spec is the three clauses above, not the `if`.")
@@ -154,7 +96,6 @@ site {
       }
 
       Section buys(title: "What it buys") {
-        Say: {"[upbeat] So what does it buy? Proofs about ordinary code, without writing specs for it. Contracts that don't drift, because a recorded spec only changes through a diff someone accepted. Callers in other crates check against a small recorded promise, so a body edit that keeps it rechecks nothing. Review of behaviour: a pull request that weakens a public spec shows it, and names who it affects. [warm] And a safe job for language models: they propose, Lean checks, and only what's checked is kept."}
         Ul list {
           Li quiet("Proofs about ordinary code without writing specs for it.")
           Li stable("Contracts that do not drift: a recorded spec changes only through a diff someone accepted.")
@@ -165,7 +106,6 @@ site {
       }
 
       Section prior(title: "Prior art") {
-        Say: {"[calm] The prior art is on the page, with links. Unison, whose freezing of hashed code this follows. The type inference of ML, from Milner and Damas. OCaml, which infers a module's types but lets an interface file pin them, the same split as written specs over inferred ones. Rust's own rule that signatures are written, and its one leak through impl Trait. Liquid types and Flux, refinement types with inference. Facebook Infer, which scales by analysing each procedure on its own. Daikon's likely invariants, guesses a prover still has to check. The IKOS abstract interpreter. And recent work on language models proposing specs, with a verifier or tests deciding what stays."}
         Ul list {
           Li unison("[[unison_idea]]: code named by the hash of its content, typechecked once and stored. The freezing here follows it.")
           Li hm("[[milner]] and [[damas_milner]]: ML infers every type, and each well-typed term has a most general one.")
@@ -182,42 +122,34 @@ site {
 
       Section issues(title: "Open issues") {
         Issue stability(title: "Spec stability under refactors") {
-          Say: {"[curious] Now, the open issues. First, stability under refactors. A refactor that keeps behaviour can still change what inference finds: the model guesses differently, or a domain loses precision on the new shape. Keeping a recorded spec while it holds covers most of that. But when it no longer holds, and inference finds something different but no weaker, is that a diff to accept, or taken quietly? And checking no weaker is itself something Lean has to prove."}
           (Status, Open)
           P q("A refactor that keeps behaviour can still change what inference finds. The model proposes different clauses, or a domain loses precision on the new shape. The rule that a recorded spec is kept while it still holds covers most of this. But when it does not hold and inference finds something different but no weaker, is that a diff to accept, or accepted silently? And how is \"no weaker\" checked, when it is itself an implication Lean has to prove?")
         }
         Issue lockfile(title: "Where the records live") {
-          Say: {"Where do the records live? In the repo, as a file like the lockfile, reviewed in the same diff? Or in a codebase database, as Unison does, with the repo holding only a root hash? A file is easy to review and merge, but grows with every function. A database is compact, but needs its own tools for review and merging."}
           (Status, Open)
           P q("In the repository, as a file like `Cargo.lock`, so they are reviewed in the same diff? Or in a codebase database, as Unison keeps its code, with the repository holding only a root hash? A file is easy to review and merge but grows with every function. A database is compact but needs its own tools for review and for merges.") { (Cites, refs.unison_idea) }
         }
         Issue cost(title: "Cost of inference and caching") {
-          Say: {"[matter-of-fact] The cost of inference. Abstract interpretation is cheap. Symbolic execution grows with the body. A model call takes seconds and costs money. So inference should run once per body hash, cached in the same store as the records, and shared between machines. But when: at compile time, in the background like proofs, or only when a record is missing?"}
           (Status, Open)
           P q("Abstract interpretation is cheap. Strongest postconditions grow with the body. A model call takes seconds and costs money. Inference should run once per body hash and be cached in the same store as the records, shared between machines. Does it run at compile time, in the background like proofs in RFC 0003, or only when a record is missing?")
         }
         Issue nondeterminism(title: "Language models are not deterministic") {
-          Say: {"[wry] Language models aren't deterministic. Two runs on the same body can propose different specs. That's only acceptable because the checked result is recorded, and the build uses the record. But two developers inferring at the same time can still record different specs for one body. Who wins? And should model proposals be allowed only on public items, where a person reviews them?"}
           (Status, Open)
           P q("Two runs of the same model on the same body can propose different specs. That is acceptable only because the checked result is recorded and the record is what the build uses. Two developers who infer at the same time can still record different specs for the same body. Which one wins, and should model proposals be allowed only for `pub` items, where a person reviews the result?")
         }
         Issue semver(title: "Semver and editions") {
-          Say: {"Semver and editions. A weakened public spec is a breaking change, like a removed method. Should blaze refuse to publish one in a minor version, the way cargo-semver-checks refuses other breaks? And is a crate on an old edition, with no specs, treated as promising nothing, or inferred from source when it's first used?"}
           (Status, Open)
           P q("A weakened public spec is a breaking change, like a removed method. Should blaze refuse to publish one in a minor version, as cargo-semver-checks refuses other breaking changes? And how do records work across editions: is a crate on an old edition, with no specs, treated as having the spec `true`, or inferred from its source when it is first used?")
         }
         Issue effects(title: "Inferred effects") {
-          Say: {"[thoughtful] Inferred effects. RFC one writes effects in the signature, and they're even easier to infer than specs: just the union of what the callees use. So should unwritten ones be inferred and recorded too? Most code would become pure by record, with no annotations. But that undoes RFC one's point, that a signature says what a function may touch."}
           (Status, Open)
           P q("RFC 0001 writes effects in the signature, `fn f() -> T / Fs`. Effects are easier to infer than specs: they are the union of the callees' effects. Should a function with no `/` get its effects inferred and recorded the same way? That would make most code pure-by-record without annotations, but it undoes RFC 0001's point that a signature says what a function may touch.") { (Cites, refs.koka) }
         }
         Issue review(title: "Reading code when specs are not in the text") {
-          Say: {"Reading code when specs aren't in the text. A reviewer on GitHub sees no inlay hints, so a spec that lives only in the records is invisible in the body's diff. Options: render inferred specs in review tools, put a diff of the records in every pull request, or require written specs on public items and infer only below them."}
           (Status, Open)
           P q("A reviewer on GitHub sees no inlay hints. A spec that exists only in the records is invisible in the diff of the body. Options: render inferred specs into review tools, put a diff of the records in every pull request, or require written specs on `pub` items and infer only below them.")
         }
         Issue frames(title: "Frame conditions") {
-          Say: {"[thoughtful] And last, frame conditions. A spec also has to say what a function doesn't change. In safe Rust, ownership mostly answers that: a function can only change what it was lent mutably. Interior mutability, statics and unsafe code break that. How are frame conditions inferred and recorded for them, and is a missing one a weakening callers have to accept?"}
           (Status, Open)
           P q("A spec also has to say what a function does not change. In safe Rust, ownership answers most of this: a function can change only what it was given `&mut`. Interior mutability, statics and `unsafe` break that. How are frame conditions inferred and recorded for them, and is a missing frame condition a weakening that callers must accept?")
         }

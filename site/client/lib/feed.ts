@@ -1,18 +1,22 @@
 /**
  * The overlay feed, like Minecraft's chat: one stack of lines at the bottom left of the page, over the article, that
  * carries everything passing: chat messages (client/lib/chat.ts), who joined and who left (client/lib/presence.ts),
- * mentions of the reader and replies in their threads, a message the chat refused, and the site's own word (a new
- * version: client/lib/update.ts). It lives on `body`, outside what the client router swaps, so it outlives a page.
+ * mentions of the reader, a message the chat refused, and the site's own word (a new version: client/lib/update.ts,
+ * the translator's download: client/lib/chat.ts). It lives on `body`, outside what the client router swaps, so it
+ * outlives a page. It is the chat's only view: there is no other panel.
  *
- * A line shows for LINE_MS and fades; while the pointer is on the stack none fades. A chat line opens its message in
- * the chat panel, a join or a leave goes to the page they were on. Muting (the bell in the chat panel) keeps the
- * social lines (chat, joins, leaves) out, never what is for the reader (a mention, a reply in their thread, an error,
- * the site's word). Everything also goes into the feed's history (the last HISTORY lines), shown when it is open.
+ * A line shows for LINE_MS and fades; while the pointer is on the stack none fades. A chat line opens the history at
+ * it, a join or a leave goes to the page they were on. Muting (Mute, in the hint under the input) keeps the social
+ * lines (chat, joins, leaves) out, never what is for the reader (a mention, an error, the site's word). Everything
+ * also goes into the feed's history, shown when it is open: every chat message the tab has (client/lib/chat.ts takes
+ * them back), and the last HISTORY of the other lines.
  *
  * T, or Enter for readers whose T an extension takes (Vimium), when the key would type nothing and press nothing,
  * opens it: the history, scrollable, over the input at its foot (client/lib/chat.ts makes the input, `setInput`, and
  * decides what a line sent there does). Esc, a press outside it, or sending closes it. A phone has no T: a button at
- * the feed's foot opens it. Reduced motion: lines come and go without moving or fading.
+ * the feed's foot opens it, and so does the top line's Chat button (client/lib/presence.ts). In the open history a
+ * line can carry tools, shown on hover (always, on a touch screen): the reader's own message's Edit and Delete.
+ * Reduced motion: lines come and go without moving or fading.
  */
 
 import { tipOn } from './tip';
@@ -28,16 +32,21 @@ export type Line = {
 	face?: Element;
 	who?: string;
 	text: string;
+	/** The text as nodes (a chat message's links and mentions), in place of `text`. */
+	words?: Node[];
 	/** A quieter word after the text. */
 	note?: string;
-	/** For the reader: a mention of them, or a reply in a thread they are in (shown even muted, marked). */
-	tone?: 'mention' | 'yours';
-	/** A click goes there, or runs `open`. */
+	/** For the reader: a mention of them (shown even muted, marked). */
+	tone?: 'mention';
+	/** A click goes there. Without it, a click on a line with an `id` opens the history at that line. */
 	href?: string;
-	open?: () => void;
 	/** One button at the end of the line (a notice's "Reload now"). */
 	action?: { label: string; run: () => void };
-	/** Pops up now; false puts it in the history only (the chat's past, or a chat line while the panel is open). */
+	/** Buttons for the open history only (a message's Edit and Delete): an icon (`d`, a 16px path) or a word. */
+	tools?: { label: string; d?: string; tip?: string; run: () => void }[];
+	/** Being edited in the input below: marked in the history. */
+	editing?: boolean;
+	/** Pops up now; false puts it in the history only (the chat's past). */
 	live?: boolean;
 	/** Stays up until taken back, rather than fading. */
 	sticky?: boolean;
@@ -46,6 +55,7 @@ export type Line = {
 const LINE_MS = 10_000;
 /** After the pointer leaves the stack, lines due to fade get this much more. */
 const GRACE_MS = 2500;
+/** How many lines other than chat messages the history keeps (the chat's own are client/lib/chat.ts's to take back). */
 const HISTORY = 150;
 /** At most this many lines up at once while the feed is shut; older ones fade early. */
 const SHOWN = 6;
@@ -119,11 +129,11 @@ const social = (l: Line) => (l.kind === 'chat' || l.kind === 'join' || l.kind ==
 export const isOpen = () => root.classList.contains('open');
 
 function draw(l: Line): HTMLElement {
-	const clickable = !!(l.href || l.open);
 	const row: HTMLElement = l.href ? el('a', 'feed-line') : el('div', 'feed-line');
 	if (row instanceof HTMLAnchorElement && l.href) row.href = l.href;
 	row.classList.add(`feed-${l.kind}`);
 	if (l.tone) row.classList.add(l.tone);
+	if (l.editing) row.classList.add('editing');
 	if (l.face) {
 		const f = l.face;
 		if (f instanceof HTMLElement) delete f.dataset.tip;
@@ -131,7 +141,9 @@ function draw(l: Line): HTMLElement {
 	}
 	const words = el('span', 'feed-words');
 	if (l.who) words.append(el('b', '', l.who), ' ');
-	words.append(el('span', 'feed-text', l.text));
+	const text = el('span', 'feed-text', l.words ? '' : l.text);
+	if (l.words) text.append(...l.words);
+	words.append(text);
 	if (l.note) words.append(' ', el('span', 'feed-note', l.note));
 	row.append(words);
 	if (l.action) {
@@ -144,24 +156,33 @@ function draw(l: Line): HTMLElement {
 		});
 		row.append(b);
 	}
-	if (l.open && !l.href) {
-		row.tabIndex = 0;
-		row.setAttribute('role', 'button');
-		const go = () => {
-			l.open?.();
-			close();
-		};
-		row.addEventListener('click', (e) => {
-			if (!(e.target instanceof Element && e.target.closest('.feed-act'))) go();
-		});
-		row.addEventListener('keydown', (e) => {
-			if (e.key === 'Enter' || e.key === ' ') {
-				e.preventDefault();
-				go();
+	if (l.tools?.length) {
+		const box = el('span', 'feed-tools');
+		for (const t of l.tools) {
+			const b = el('button', t.d ? 'feed-tool' : 'feed-tool word', t.d ? '' : t.label);
+			b.type = 'button';
+			if (t.d) {
+				b.append(icon(t.d));
+				b.setAttribute('aria-label', t.label);
 			}
+			if (t.d || t.tip) tipOn(b, t.tip ?? t.label);
+			b.addEventListener('click', (e) => {
+				e.stopPropagation();
+				t.run();
+			});
+			box.append(b);
+		}
+		row.append(box);
+	}
+	if (l.href) row.classList.add('go');
+	else if (l.id) {
+		// A passing line opens the history at itself; in the open history it is just a line.
+		const id = l.id;
+		row.classList.add('jump');
+		row.addEventListener('click', (e) => {
+			if (!isOpen() && !(e.target instanceof Element && e.target.closest('button, a'))) openAt(id);
 		});
 	}
-	if (clickable) row.classList.add('go');
 	return row;
 }
 
@@ -186,7 +207,8 @@ export function push(l: Line): () => void {
 	const stick = near();
 	entries.splice(i, 0, e);
 	log.insertBefore(e.el, entries[i + 1]?.el ?? null);
-	while (entries.length > HISTORY) take(entries[0]);
+	const others = entries.filter((x) => x.line.kind !== 'chat');
+	for (const x of others.slice(0, Math.max(0, others.length - HISTORY))) take(x);
 	if (live) show(e);
 	if (stick || !isOpen()) log.scrollTop = log.scrollHeight;
 	return () => take(e);
@@ -231,9 +253,6 @@ function take(e: Entry): void {
 
 export const has = (id: string) => entries.some((e) => e.id === id);
 
-/** The input's field, once client/lib/chat.ts has made it. */
-export const input = () => foot.querySelector('textarea');
-
 /** Takes back the line with this id. */
 export function remove(id: string): void {
 	const e = entries.find((x) => x.id === id);
@@ -254,7 +273,18 @@ export function notice(title: string, text: string, opts: { ms?: number; icon?: 
 
 const near = () => log.scrollHeight - log.scrollTop - log.clientHeight < 40;
 
-/** Opens the history and the input (T, Enter, the phone's button), or puts the focus back in it. */
+/** Opens the history at line `id` (a chat line clicked, a mention), scrolled to it and lit for a moment. */
+export function openAt(id: string): void {
+	open();
+	const e = entries.find((x) => x.id === id);
+	if (!e || !isOpen()) return;
+	e.el.scrollIntoView({ block: 'center' });
+	e.el.classList.remove('lit');
+	void e.el.offsetWidth;
+	e.el.classList.add('lit');
+}
+
+/** Opens the history and the input (T, Enter, the phone's button, the top line's Chat), or puts the focus back in it. */
 export function open(): void {
 	if (foot.hidden) return;
 	if (!isOpen()) {
@@ -304,7 +334,7 @@ function keyDown(e: KeyboardEvent): void {
 	const t = e.target instanceof HTMLElement ? e.target : null;
 	if (t && (t.isContentEditable || t.closest('input, textarea, select, [contenteditable]'))) return;
 	if (e.key === 'Enter' && t?.closest('a[href], button, summary, [role="button"], [tabindex]')) return;
-	if (document.querySelector('dialog[open]') || document.body.classList.contains('chat-full') || foot.hidden) return;
+	if (document.querySelector('dialog[open]') || foot.hidden) return;
 	e.preventDefault();
 	open();
 }

@@ -65,6 +65,11 @@ pub struct Plan {
     pub shared: bool,
 }
 
+/// What a request to a worker says of a program that is the unit tests of its target
+/// ([`Plan::unit_test`]): its crate is the one of the root file with `cfg(test)`, which the
+/// target's own is not.
+pub const UNIT_TEST: &str = "unit-test";
+
 /// The file in a program's directory that says it is a program of tests, which the daemon
 /// starts in blaze's test harness. A program's own file is never named so, as rustc takes no
 /// `.` in a crate's name: a whole build links a program of tests in the same directory, and

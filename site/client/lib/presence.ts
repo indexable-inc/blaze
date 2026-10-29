@@ -4,10 +4,9 @@
  * is hidden; what comes back is everyone on the site, drawn three places:
  *
  * - the top line of the pane (`.topline`, made here, outside `.grid` so a swap keeps it; on a phone it sits in the
- *   phone bar instead): the page's discussion
- *   (its comment count, a jump to it) on a page that has one, the faces on this page (click: everyone on the site
- *   and where), the chat (client/lib/chat.ts, which rides this socket), and the reader: their GitHub avatar and login
- *   with Sign out, or Sign in with GitHub;
+ *   phone bar instead): Chat, which opens the feed's history and input as T does (client/lib/feed.ts; the chat itself
+ *   is client/lib/chat.ts, which rides this socket), the faces on this page (click: everyone on the site and where),
+ *   and the reader: their GitHub avatar and login with Sign out, or Sign in with GitHub;
  * - the sidebar: a small stack of faces on each page's row that someone else is reading, and when one of them says
  *   something in the chat, a speech bubble out of their face for a few seconds (`speak`);
  * - comments: when someone posts or deletes one, the worker says so here, and client/comments.ts refreshes the
@@ -25,6 +24,10 @@
  * hash, new every day): "Quiet Otter", and an otter's face (gen/animals.ts, compiled into one sprite by gen/build.ts)
  * in their hue, the colour of their cursor too (client/lib/cursors.ts). Someone whose tab is hidden is drawn faded
  * ("away").
+ *
+ * A crawler or other automation (the worker decides: worker/bots.ts) comes with `bot`, its name ("Googlebot"): it is
+ * drawn as the sprite's robot and named so, listed under "Crawlers" in the who-is-here list, not counted online, and
+ * gets no join or leave line and no pointer (the object refuses it one anyway).
  */
 
 import { tipOn } from './tip';
@@ -32,9 +35,9 @@ import * as chat from './chat';
 import * as cursors from './cursors';
 import * as feed from './feed';
 import * as update from './update';
-import { COMMENTS, LEAVE, PAGE, THREADS, onPage } from './page';
+import { COMMENTS, LEAVE, PAGE, onPage } from './page';
 
-type Who = { key: string; login: string | null; avatar: string | null };
+type Who = { key: string; login: string | null; avatar: string | null; bot?: string };
 type Person = Who & { country: string | null; since?: number; devices?: string[]; pages: { path: string; away: boolean }[] };
 type You = Who & { signIn: boolean };
 
@@ -59,7 +62,10 @@ const BAR_FACES = 5;
 
 let you: You | null = null;
 let people: Person[] = [];
+/** People on the site, bots left out, and the bots. */
 let total = 0;
+let bots = 0;
+const human = (p: Person) => !p.bot;
 
 /** The page this tab shows, as a site path (`/rfcs/capabilities`; the home page is `/`). */
 function sitePath(): string {
@@ -79,11 +85,11 @@ const ADJECTIVES = [
 	'Snappy', 'Sunny', 'Swift', 'Tidy', 'Witty', 'Zesty', 'Plucky', 'Cozy',
 ];
 /** The animals (gen/animals.ts, the one table of names and faces) and the sprite they are drawn in, from gen/build.ts. */
-declare const BLAZE_ANIMALS: { sprite: string; names: string[] };
+declare const BLAZE_ANIMALS: { sprite: string; names: string[]; robot: string };
 const ANIMALS = BLAZE_ANIMALS.names;
 const anonAnimal = (key: string) => ANIMALS[Math.floor((parseInt(key.slice(1, 7), 16) || 0) / ADJECTIVES.length) % ANIMALS.length];
 const anonName = (key: string) => `${ADJECTIVES[(parseInt(key.slice(1, 7), 16) || 0) % ADJECTIVES.length]} ${anonAnimal(key)}`;
-const name = (w: Who) => (w.login ? `@${w.login}` : anonName(w.key));
+const name = (w: Who) => (w.login ? `@${w.login}` : w.bot ? w.bot : anonName(w.key));
 const awayOn = (p: Person, path: string) => p.pages.filter((x) => x.path === path).every((x) => x.away);
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls = '', text = ''): HTMLElementTagNameMap[K] {
@@ -93,13 +99,13 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls = '', text = ''):
 	return e;
 }
 
-/** An anonymous reader's animal, from the sprite (its symbols are `animal-<name>`, gen/animals.ts `symbolId`). */
-function animalFace(key: string): SVGSVGElement {
+/** An anonymous reader's animal, from the sprite (its symbols are `animal-<name>`, gen/animals.ts `symbolId`); a bot's robot. */
+function animalFace(w: Who): SVGSVGElement {
 	const svg = document.createElementNS(SVG, 'svg');
 	svg.setAttribute('viewBox', '0 0 32 32');
 	svg.setAttribute('aria-hidden', 'true');
 	const use = document.createElementNS(SVG, 'use');
-	use.setAttribute('href', `${BASE}${BLAZE_ANIMALS.sprite}#animal-${anonAnimal(key).toLowerCase()}`);
+	use.setAttribute('href', `${BASE}${BLAZE_ANIMALS.sprite}#${w.bot ? BLAZE_ANIMALS.robot : `animal-${anonAnimal(w.key).toLowerCase()}`}`);
 	svg.append(use);
 	return svg;
 }
@@ -115,11 +121,15 @@ function face(w: Who, away = false): HTMLElement {
 		img.referrerPolicy = 'no-referrer';
 		img.loading = 'lazy';
 		f.append(img);
+	} else if (w.bot) {
+		// Steel, whoever it is (styles/shell.css): a bot has no hue of its own, as it has no pointer.
+		f.classList.add('animal', 'bot');
+		f.append(animalFace(w));
 	} else {
 		// The hue cursors.ts's `hueOf` gives the same key, so their face and their pointer match.
 		f.classList.add('animal');
 		f.style.setProperty('--h', ((parseInt(w.key.slice(1, 3), 16) || 0) * (360 / 256)).toFixed(0));
-		f.append(animalFace(w.key));
+		f.append(animalFace(w));
 	}
 	return f;
 }
@@ -163,8 +173,10 @@ function line(kind: 'join' | 'leave', p: Person, more: number): void {
 function announce(): void {
 	const now = Date.now();
 	const settling = known === null || now - connectedAt < SETTLE_MS;
-	const here = new Map(people.map((p) => [p.key, p]));
-	const fresh = settling ? [] : people.filter((p) => !known!.has(p.key) && !missing.has(p.key) && p.key !== you?.key && now - (p.since ?? 0) < ARRIVAL_MS);
+	// Bots come and go without a line.
+	const humans = people.filter(human);
+	const here = new Map(humans.map((p) => [p.key, p]));
+	const fresh = settling ? [] : humans.filter((p) => !known!.has(p.key) && !missing.has(p.key) && p.key !== you?.key && now - (p.since ?? 0) < ARRIVAL_MS);
 	// Back within LEAVE_MS (a reload, a reconnect): never gone.
 	for (const [k, m] of missing) {
 		if (!here.has(k)) continue;
@@ -172,7 +184,7 @@ function announce(): void {
 		missing.delete(k);
 	}
 	// Gone from a list cut short (more online than it carries) may only be out of it.
-	if (!settling && known && people.length >= total) {
+	if (!settling && known && humans.length >= total) {
 		for (const [k, p] of known) {
 			if (here.has(k) || k === you?.key || missing.has(k)) continue;
 			missing.set(k, { p, timer: setTimeout(() => left(k), LEAVE_MS) });
@@ -188,12 +200,12 @@ function announce(): void {
 function left(key: string): void {
 	const m = missing.get(key);
 	missing.delete(key);
-	if (!m || people.some((p) => p.key === key) || Date.now() - connectedAt < SETTLE_MS) return;
+	if (!m || people.some((p) => p.key === key && human(p)) || Date.now() - connectedAt < SETTLE_MS) return;
 	const now = Date.now();
 	if (now - lastLeave < ARRIVAL_GAP_MS) return;
 	lastLeave = now;
 	// Whoever else is gone by now goes in the same line.
-	const with_ = [...missing.entries()].filter(([k]) => !people.some((p) => p.key === k));
+	const with_ = [...missing.entries()].filter(([k]) => !people.some((p) => p.key === k && human(p)));
 	for (const [k, x] of with_) {
 		clearTimeout(x.timer);
 		missing.delete(k);
@@ -204,12 +216,15 @@ function left(key: string): void {
 // ---- The top line -------------------------------------------------------------------------------------------------
 
 const bar = el('div', 'topline');
-bar.setAttribute('aria-label', 'Discussion and who is here');
-const discussSlot = el('span', 'tl-discuss');
+bar.setAttribute('aria-label', 'Chat and who is here');
 const hereSlot = el('span', 'tl-here');
 const meSlot = el('span', 'tl-me');
-const chatSlot = el('span', 'tl-chatslot');
-chatSlot.append(chat.button);
+// Chat: the feed's history and input (client/lib/feed.ts), as T opens them.
+const chatBtn = el('button', 'tl-btn tl-chat');
+chatBtn.type = 'button';
+chatBtn.append(el('span', 'tl-bubble'), el('span', 'tl-label', 'Chat'));
+tipOn(chatBtn, feed.hint() ? 'Chat with everyone on the site (T)' : 'Chat with everyone on the site');
+chatBtn.addEventListener('click', () => feed.open());
 // Shut the sidebar for more room to read (a wide screen's; a phone's is a drawer already). Remembered per browser.
 const SIDE_SHUT = 'blaze.side.shut';
 const sideBtn = el('button', 'tl-btn tl-side');
@@ -235,7 +250,7 @@ try {
 }
 shutSide(wasShut, false);
 sideBtn.addEventListener('click', () => shutSide(!document.body.classList.contains('side-shut')));
-bar.append(sideBtn, discussSlot, el('span', 'tl-gap'), hereSlot, chatSlot, meSlot);
+bar.append(sideBtn, chatBtn, el('span', 'tl-gap'), hereSlot, meSlot);
 const list = el('div', 'tl-list');
 list.hidden = true;
 list.id = 'who-is-here';
@@ -258,30 +273,21 @@ function closeList(): void {
 	hereSlot.querySelector('button')?.setAttribute('aria-expanded', 'false');
 }
 
-/** The page's discussion: its comments, counted from the threads the page was rendered with. */
-function drawDiscuss(): void {
-	discussSlot.replaceChildren();
-	if (!document.querySelector('main #discussion')) return;
-	const n = document.querySelectorAll('main .c-item').length;
-	const a = el('a', 'tl-btn');
-	a.href = '#discussion';
-	tipOn(a, n === 0 ? 'Discuss this page' : `${n} comment${n === 1 ? '' : 's'} on this page`);
-	a.append(el('span', 'tl-bubble'), el('span', 'tl-label', n === 0 ? 'Discuss' : n === 1 ? 'comment' : 'comments'));
-	if (n > 0) a.insertBefore(el('span', 'tl-n', String(n)), a.lastChild);
-	discussSlot.append(a);
-}
-
 function drawHere(): void {
 	const path = sitePath();
-	const on = people.filter((p) => p.pages.some((x) => x.path === path));
+	const all = people.filter((p) => p.pages.some((x) => x.path === path));
+	// The people first; the bots' faces after them, not counted.
+	const on = all.filter(human);
+	const onBots = all.filter((p) => !human(p));
 	hereSlot.replaceChildren();
 	if (!you) return;
 	const b = el('button', 'tl-btn');
 	b.type = 'button';
 	b.setAttribute('aria-expanded', String(!list.hidden));
 	b.setAttribute('aria-controls', list.id);
-	b.append(el('span', 'tl-dot'), stack(on, BAR_FACES, path), el('span', 'tl-count', on.length <= 1 ? `${total} online` : `${on.length} here`));
-	tipOn(b, `${on.length} on this page, ${total} on the site${feed.hint() ? '. Press T or Enter to chat' : ''}`);
+	b.append(el('span', 'tl-dot'), stack([...on, ...onBots], BAR_FACES, path), el('span', 'tl-count', on.length <= 1 ? `${total} online` : `${on.length} here`));
+	const botsSaid = bots ? `, and ${bots === 1 ? 'a crawler' : `${bots} crawlers`}` : '';
+	tipOn(b, `${on.length} on this page, ${total} on the site${botsSaid}${feed.hint() ? '. Press T or Enter to chat' : ''}`);
 	b.addEventListener('click', (e) => {
 		e.stopPropagation();
 		if (!list.hidden) return closeList();
@@ -347,7 +353,7 @@ function drawList(): void {
 	// Here now first, then those with every tab in the background; you lead your group, the rest by who came first.
 	const active = (p: Person) => p.pages.some((x) => !x.away);
 	const order = (p: Person) => (active(p) ? 0 : 2) + (p.key === you?.key ? 0 : 1);
-	const sorted = [...people].sort((a, b) => order(a) - order(b) || (a.since ?? 0) - (b.since ?? 0));
+	const sorted = people.filter(human).sort((a, b) => order(a) - order(b) || (a.since ?? 0) - (b.since ?? 0));
 	const ul = el('ul');
 	let awayHead = false;
 	for (const p of sorted) {
@@ -356,50 +362,64 @@ function drawList(): void {
 			ul.append(el('li', 'tl-sub', 'In the background'));
 			awayHead = true;
 		}
-		const li = el('li', on ? '' : 'away');
-		const av = el('span', 'tl-av');
-		const dot = el('span', on ? 'dot on' : 'dot');
-		tipOn(dot, on ? 'Here now' : 'Every tab in the background');
-		av.append(face(p, !on), dot);
-		// The name (a GitHub link for the signed in, without the @: the list is of people, not handles), then where they
-		// are and how long they have been here, on a quieter line.
-		const top = el('span', 'tl-name');
-		const who = p.login ? el('a', 'who', p.login) : el('span', 'who', name(p));
-		if (who instanceof HTMLAnchorElement) {
-			who.href = `https://github.com/${encodeURIComponent(p.login!)}`;
-			who.rel = 'nofollow noopener';
-		}
-		top.append(who);
-		if (p.key === you?.key) top.append(el('span', 'tag', 'you'));
-		if (p.country) top.append(flag(p.country));
-		const meta = el('span', 'tl-meta');
-		const [front, ...rest] = p.pages;
-		if (front) {
-			const a = el('a', 'where', titleOf(front.path));
-			a.href = href(front.path);
-			meta.append(a);
-		}
-		if (rest.length) {
-			const more = el('span', 'more', `+${rest.length}`);
-			tipOn(more, rest.map((x) => titleOf(x.path)).join(', '));
-			meta.append(more);
-		}
-		const dev = devices(p);
-		if (dev) meta.append(dev);
-		if (p.since) {
-			const t = el('span', 'for', ago(p.since));
-			tipOn(t, `On the site since ${new Date(p.since).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`);
-			meta.append(t);
-		}
-		const body = el('span', 'tl-body');
-		body.append(top, meta);
-		li.append(av, body);
-		ul.append(li);
+		ul.append(row(p, on));
 	}
-	if (people.length < total) ul.append(el('li', 'tl-sub', `and ${total - people.length} more`));
+	// The bots apart, under their own heading, by who came first.
+	const crawlers = people.filter((p) => !human(p)).sort((a, b) => (a.since ?? 0) - (b.since ?? 0));
+	if (crawlers.length) {
+		const sub = el('li', 'tl-sub', 'Crawlers');
+		tipOn(sub, 'Search engines, link previews and other automation: welcome to read, not counted as people');
+		ul.append(sub);
+		for (const p of crawlers) ul.append(row(p, active(p)));
+	}
+	if (people.length < total + bots) ul.append(el('li', 'tl-sub', `and ${total + bots - people.length} more`));
 	list.append(ul);
 	const hint = feed.hint();
 	if (hint) list.append(hint);
+}
+
+/** One person (or bot) in the list: their face, name, and where they are and since when. */
+function row(p: Person, on: boolean): HTMLLIElement {
+	const li = el('li', `${on ? '' : 'away'}${p.bot ? ' bot' : ''}`.trim());
+	const av = el('span', 'tl-av');
+	const dot = el('span', on ? 'dot on' : 'dot');
+	tipOn(dot, on ? 'Here now' : 'Every tab in the background');
+	av.append(face(p, !on), dot);
+	// The name (a GitHub link for the signed in, without the @: the list is of people, not handles), then where they
+	// are and how long they have been here, on a quieter line.
+	const top = el('span', 'tl-name');
+	const who = p.login ? el('a', 'who', p.login) : el('span', 'who', name(p));
+	if (who instanceof HTMLAnchorElement) {
+		who.href = `https://github.com/${encodeURIComponent(p.login!)}`;
+		who.rel = 'nofollow noopener';
+	}
+	top.append(who);
+	if (p.key === you?.key) top.append(el('span', 'tag', 'you'));
+	if (p.bot) top.append(el('span', 'tag', 'bot'));
+	if (p.country) top.append(flag(p.country));
+	const meta = el('span', 'tl-meta');
+	const [front, ...rest] = p.pages;
+	if (front) {
+		const a = el('a', 'where', titleOf(front.path));
+		a.href = href(front.path);
+		meta.append(a);
+	}
+	if (rest.length) {
+		const more = el('span', 'more', `+${rest.length}`);
+		tipOn(more, rest.map((x) => titleOf(x.path)).join(', '));
+		meta.append(more);
+	}
+	const dev = p.bot ? null : devices(p);
+	if (dev) meta.append(dev);
+	if (p.since) {
+		const t = el('span', 'for', ago(p.since));
+		tipOn(t, `On the site since ${new Date(p.since).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`);
+		meta.append(t);
+	}
+	const body = el('span', 'tl-body');
+	body.append(top, meta);
+	li.append(av, body);
+	return li;
 }
 
 function drawMe(): void {
@@ -521,10 +541,9 @@ function draw(): void {
 	const path = sitePath();
 	cursors.setPeople(
 		path,
-		people.filter((p) => p.key !== you?.key && p.pages.some((x) => x.path === path)).map((p) => ({ key: p.key, login: p.login, avatar: p.avatar, away: awayOn(p, path) })),
+		people.filter((p) => human(p) && p.key !== you?.key && p.pages.some((x) => x.path === path)).map((p) => ({ key: p.key, login: p.login, avatar: p.avatar, away: awayOn(p, path) })),
 	);
 	mount();
-	drawDiscuss();
 	drawHere();
 	drawMe();
 	drawList();
@@ -573,11 +592,11 @@ function connect(): void {
 			chat.setYou(you);
 		}
 		else if (msg.t === 'here') {
-			const h = m as { people?: Person[]; total?: number };
+			const h = m as { people?: Person[]; total?: number; bots?: number };
 			people = Array.isArray(h.people) ? h.people : [];
-			total = typeof h.total === 'number' ? h.total : people.length;
+			bots = typeof h.bots === 'number' ? h.bots : people.filter((p) => !human(p)).length;
+			total = typeof h.total === 'number' ? h.total : people.length - bots;
 			announce();
-			chat.setOnline(total);
 			chat.setPeople(people);
 		} else return;
 		draw();
@@ -607,7 +626,6 @@ document.addEventListener('visibilitychange', () => {
 	connect();
 });
 addEventListener(PAGE, send);
-addEventListener(THREADS, drawDiscuss);
 document.addEventListener('keydown', (e) => {
 	if (e.key === 'Escape') closeList();
 });

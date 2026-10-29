@@ -1,0 +1,17 @@
+[package]
+name = "ce_toml"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["const"]
+const = []
+
+[dependencies]
+basic-toml = "0.1"
+serde_json = "1"
+
+[workspace]
+
+[workspace.metadata.blaze]
+const-eval = { steps = 100000000000 }

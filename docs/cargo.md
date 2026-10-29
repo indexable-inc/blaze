@@ -1,3 +1,7 @@
+---
+status: current
+summary: Every blaze command and setting: cargo's commands and flags, what a build does, sandboxing, manifests.
+---
 # Using blaze
 
 `blaze <command>` takes cargo's commands and flags (`blaze build`, `blaze test`, `blaze run`),
@@ -48,13 +52,14 @@ is, `#![feature(...)]` included. A project that needs another Rust pins another 
 `cargo` still builds with the project's toolchain, in the same target directory: cargo keys
 what it builds by the rustc, so neither rebuilds the other's.
 
-Where the nightly's files come from, found with nothing run: rustup's `nightly-2026-10-27`
-with `rust-src`, when rustup has it (only as a copy of the same files; what rustup would pick
+Where the nightly's files come from, found with nothing run: rustup's `nightly-2026-10-27`,
+when rustup has it (only as a copy of the same files; what rustup would pick
 is not asked); else blaze's own copy in
 `~/.blaze/toolchains/nightly-2026-10-27-<host>` (`BLAZE_HOME` moves `~/.blaze`), laid out as rustup lays
 out a toolchain. blaze downloads its copy the first time it needs it, once, with a line on
-stderr while it does: rustc, cargo, the standard library and its source from the Rust project's
-own servers, 97 MB on macOS, 134 MB on Linux x86-64 and 118 MB on Linux ARM64 (548 MB on macOS
+stderr while it does: rustc, cargo and the built standard library from the Rust project's
+own servers (the standard library's source is blaze's own `library/`, a 6.0 MB archive from
+blaze's release, [toolchain.md](toolchain.md#the-standard-library-library)), 97 MB on macOS, 134 MB on Linux x86-64 and 118 MB on Linux ARM64 (548 MB on macOS
 and 710 MB on Linux x86-64 once unpacked). Each file's sha256 is built
 into blaze, from the nightly's published manifest (`harness/toolchain_pins.py` writes them into
 `crates/blaze-cargo/src/cargo/toolchain/pins.txt`), and a file with other bytes is refused. Concurrent
@@ -105,14 +110,11 @@ the daemon served and how many went to cargo, with the reasons. `stop` ends the 
 other subcommand of cargo's is blaze's own, or fails saying blaze has none yet: none is passed
 to cargo, and no cargo plugin is run ([Every subcommand](#every-subcommand)).
 
-While a build or check waits for the daemon, the command shows what the worker is at
-(`crates/blaze-engine/src/progress.rs`): the worker writes a status word and its object to a
-`phase` file beside its socket (`Loading workspace`, `Resolving names`, `Compiling the
-functions of app`, `Checking 12 files`, `Linking app`), and the daemon sends it to the waiting
-command every 250 ms as a `Progress` line ahead of the answer. On a terminal that is one line
-with the seconds of the step, written over and cleared when the answer comes, shown once the
-wait passes half a second; off a terminal, one line for each step the command saw; with `-q`,
-nothing. `harness/experience.py` runs each cold build on a terminal and fails one that shows
+While a build or check waits for the daemon, the command shows what the worker is at: the
+worker sends events (`crates/blaze-protocol/src/events.rs`: each step as it starts and ends, and
+`Progress` counts within it), and `crates/blaze-ui` draws them (`Resolving names 2.40s (3/120
+crates)`). On a terminal that is a live view, cleared when the answer comes; off a terminal, one
+line for each step the command saw; with `-q`, nothing. `harness/experience.py` runs each cold build on a terminal and fails one that shows
 nothing for more than 1.5 s.
 
 ## What a build does
@@ -157,8 +159,11 @@ macros are still built and run as the daemon's load does (`target/rust-analyzer`
 `test` builds whole what cargo would test: each member's library, binaries and integration
 tests with `test = true`, the examples built beside them to see that they compile, and the
 binaries an integration test runs (`CARGO_BIN_EXE_<name>`), or what `--lib`, `--bin`,
-`--example` and one `--test` name. A worker that loads the workspace with `cfg(test)` builds
-the unit tests, one that loads it without builds the rest; a test's executable is
+`--example` and one `--test` name. One worker loads the workspace once, as `cargo test`
+builds it, and builds them all: each library and binary twice, without `cfg(test)` and as its
+unit tests with it, the integration tests with `cfg(test)`, and the examples without. Only an
+integration test or a benchmark is told `CARGO_BIN_EXE_<name>` of its package's binaries and
+`CARGO_TARGET_TMPDIR`, in its crate's own environment, as cargo tells them; a test's executable is
 `target/debug/deps/<name>-<kind>`. A unit test with `harness = false`, several `--test`s and
 the other target flags fail the build and say so. The doc tests come after, each example
 built by blaze with no cargo, rustc or rustdoc (below).
@@ -1027,8 +1032,8 @@ A new worktree still starts with a cargo build, because it has a target director
 own. What it saves is the daemon's side: the worktree joins the worker that is already
 loaded instead of loading the workspace again. With a ripgrep checkout loaded, the first
 `blaze build` in a new worktree of it was cargo's and took 16 s, the worktree showed
-as ready under the same worker, and the first edit there was built by the daemon in 0.4 s. A `blaze test` can use
-two workers, because unit tests are built with `cfg(test)` and integration tests without.
+as ready under the same worker, and the first edit there was built by the daemon in 0.4 s. A `blaze test` uses
+one worker: its unit tests and its integration tests are crates of one load.
 
 `blaze status` shows the daemon, its workers and their log files:
 

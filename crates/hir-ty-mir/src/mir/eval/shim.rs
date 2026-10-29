@@ -1677,13 +1677,13 @@ impl<'db> Evaluator<'db> {
         _span: MirSpan,
     ) -> Result<'db, ()> {
         // We are a single threaded runtime with no UB checking and no optimization, so
-        // we can implement atomic intrinsics as normal functions.
-
-        if name.starts_with("singlethreadfence_") || name.starts_with("fence_") {
+        // we can implement atomic intrinsics as normal functions. The pinned nightly takes the
+        // orderings as const generics (`atomic_load::<T, ORD, VOLATILE>`); older names carried
+        // them as suffixes (`atomic_load_seqcst`).
+        let op = name.split('_').next().unwrap_or(name);
+        if matches!(op, "fence" | "singlethreadfence") {
             return Ok(());
         }
-
-        // The rest of atomic intrinsics have exactly one generic arg
 
         let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
             return Err(MirEvalError::InternalError(
@@ -1698,7 +1698,7 @@ impl<'db> Evaluator<'db> {
         let arg0_addr = Address::from_bytes(arg0.get(self)?)?;
         let arg0_interval =
             Interval::new(arg0_addr, self.size_of_sized(ty, locals, "atomic intrinsic type arg")?);
-        if name.starts_with("load_") {
+        if op == "load" {
             return destination.write_from_interval(self, arg0_interval);
         }
         let Some(arg1) = args.get(1) else {
@@ -1706,61 +1706,51 @@ impl<'db> Evaluator<'db> {
                 "atomic intrinsic arg1 is not provided".into(),
             ));
         };
-        if name.starts_with("store_") {
+        if op == "store" {
             return arg0_interval.write_from_interval(self, arg1.interval);
         }
-        if name.starts_with("xchg_") {
+        if op == "xchg" {
             destination.write_from_interval(self, arg0_interval)?;
             return arg0_interval.write_from_interval(self, arg1.interval);
         }
-        if name.starts_with("xadd_") {
+        let size = arg0_interval.size;
+        let signed = matches!(ty.kind(), TyKind::Int(_));
+        let read = |this: &Self, interval: Interval, sign: bool| -> Result<'db, u128> {
+            let bytes = interval.get(this)?;
+            Ok(u128::from_le_bytes(pad16(&bytes[..size.min(bytes.len())], sign.into())))
+        };
+        let combined = match op {
+            "xadd" | "xsub" | "and" | "nand" | "or" | "xor" | "umax" | "umin" => {
+                let lhs = read(self, arg0_interval, false)?;
+                let rhs = read(self, arg1.interval, false)?;
+                Some(match op {
+                    "xadd" => lhs.wrapping_add(rhs),
+                    "xsub" => lhs.wrapping_sub(rhs),
+                    "and" => lhs & rhs,
+                    "nand" => !(lhs & rhs),
+                    "or" => lhs | rhs,
+                    "xor" => lhs ^ rhs,
+                    "umax" => lhs.max(rhs),
+                    _ => lhs.min(rhs),
+                })
+            }
+            "max" | "min" => {
+                let lhs = read(self, arg0_interval, signed)? as i128;
+                let rhs = read(self, arg1.interval, signed)? as i128;
+                Some((if op == "max" { lhs.max(rhs) } else { lhs.min(rhs) }) as u128)
+            }
+            _ => None,
+        };
+        if let Some(ans) = combined {
             destination.write_from_interval(self, arg0_interval)?;
-            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, IsSigned::No));
-            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, IsSigned::No));
-            let ans = lhs.wrapping_add(rhs);
-            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
-        }
-        if name.starts_with("xsub_") {
-            destination.write_from_interval(self, arg0_interval)?;
-            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, IsSigned::No));
-            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, IsSigned::No));
-            let ans = lhs.wrapping_sub(rhs);
-            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
-        }
-        if name.starts_with("and_") {
-            destination.write_from_interval(self, arg0_interval)?;
-            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, IsSigned::No));
-            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, IsSigned::No));
-            let ans = lhs & rhs;
-            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
-        }
-        if name.starts_with("or_") {
-            destination.write_from_interval(self, arg0_interval)?;
-            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, IsSigned::No));
-            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, IsSigned::No));
-            let ans = lhs | rhs;
-            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
-        }
-        if name.starts_with("xor_") {
-            destination.write_from_interval(self, arg0_interval)?;
-            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, IsSigned::No));
-            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, IsSigned::No));
-            let ans = lhs ^ rhs;
-            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
-        }
-        if name.starts_with("nand_") {
-            destination.write_from_interval(self, arg0_interval)?;
-            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, IsSigned::No));
-            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, IsSigned::No));
-            let ans = !(lhs & rhs);
-            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
+            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..size]);
         }
         let Some(arg2) = args.get(2) else {
             return Err(MirEvalError::InternalError(
                 "atomic intrinsic arg2 is not provided".into(),
             ));
         };
-        if name.starts_with("cxchg_") || name.starts_with("cxchgweak_") {
+        if matches!(op, "cxchg" | "cxchgweak") {
             let dest = if arg1.get(self)? == arg0_interval.get(self)? {
                 arg0_interval.write_from_interval(self, arg2.interval)?;
                 (arg1.interval, true)

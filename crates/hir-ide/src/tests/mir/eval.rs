@@ -368,6 +368,190 @@ fn main() {
 }
 
 #[test]
+fn drop_glue_of_a_long_list_of_boxes() {
+    // A level of native stack a node overflowed it: smoke's const_heap drops a list of 1000.
+    check_pass(
+        r#"
+//- minicore: drop, add, cell
+#![feature(lang_items)]
+
+use core::cell::Cell;
+
+fn should_not_reach() {
+    _ // FIXME: replace this function with panic when that works
+}
+
+#[rustc_intrinsic]
+#[rustc_intrinsic_must_be_overridden]
+pub fn box_new<T>(_x: T) -> Box<T>;
+
+#[lang = "owned_box"]
+pub struct Box<T: ?Sized> {
+    inner: *mut T,
+}
+
+struct X<'a>(&'a Cell<i32>);
+impl<'a> Drop for X<'a> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1)
+    }
+}
+
+enum List<'a> {
+    Cons(X<'a>, Box<List<'a>>),
+    Nil,
+}
+
+fn main() {
+    let s = Cell::new(0);
+    {
+        let mut list = List::Nil;
+        let mut i = 0;
+        while i < 100000 {
+            list = List::Cons(X(&s), box_new(list));
+            i += 1;
+        }
+    }
+    if s.get() != 100000 {
+        should_not_reach();
+    }
+}
+        "#,
+    );
+}
+
+#[test]
+fn drop_glue_of_closures_tuples_arrays_and_enums() {
+    // `Vec::extend_trusted` writes the length back in the `Drop` of a guard the closure it
+    // passes to `for_each` captures: a closure's captures are dropped with it.
+    check_pass(
+        r#"
+//- minicore: drop, add, option, cell, builtin_impls, fn
+
+use core::cell::Cell;
+
+fn should_not_reach() {
+    _ // FIXME: replace this function with panic when that works
+}
+
+struct X<'a>(&'a Cell<i32>);
+impl<'a> Drop for X<'a> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1)
+    }
+}
+
+fn twice<F: FnMut()>(mut f: F) {
+    f();
+    f();
+}
+
+fn main() {
+    let s = Cell::new(0);
+    let x = X(&s);
+    twice(move || {
+        let _ = &x;
+    });
+    if s.get() != 1 {
+        should_not_reach();
+    }
+    {
+        let _tuple = (X(&s), 5, X(&s));
+    }
+    if s.get() != 3 {
+        should_not_reach();
+    }
+    {
+        let _array = [X(&s), X(&s), X(&s)];
+    }
+    if s.get() != 6 {
+        should_not_reach();
+    }
+    {
+        let _some = Some(X(&s));
+        let _none: Option<X<'_>> = None;
+    }
+    if s.get() != 7 {
+        should_not_reach();
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn drop_glue_of_projections_consumed_closures_and_signed_tags() {
+    // Each drop appends its digit, so the order is checked too: a `Fn` closure called by value
+    // through `FnOnce::call_once` is dropped after the call (rustc's `ClosureOnceShim`), a field
+    // whose type is a projection is dropped as what it normalizes to, a `#[repr(i8)]` variant
+    // `= -1` is found by its signed tag, and fields go in order.
+    check_pass(
+        r#"
+//- minicore: drop, add, option, cell, builtin_impls, fn
+
+use core::cell::Cell;
+
+fn should_not_reach() {
+    _ // FIXME: replace this function with panic when that works
+}
+
+struct X<'a>(&'a Cell<i32>, i32);
+impl<'a> Drop for X<'a> {
+    fn drop(&mut self) {
+        // The value times ten, then the digit (minicore has no `Mul`).
+        let v = self.0.get();
+        let v2 = v + v;
+        let v8 = v2 + v2 + v2 + v2;
+        self.0.set(v8 + v2 + self.1)
+    }
+}
+
+fn once<F: FnOnce()>(f: F) {
+    f()
+}
+
+trait Tr<'a> {
+    type A;
+}
+impl<'a> Tr<'a> for () {
+    type A = X<'a>;
+}
+struct H<'a, T: Tr<'a>>(<T as Tr<'a>>::A);
+
+#[repr(i8)]
+enum E<'a> {
+    A(X<'a>) = -1,
+    B = 0,
+}
+
+fn main() {
+    let s = Cell::new(0);
+    let x = X(&s, 1);
+    once(move || {
+        let _ = &x;
+    });
+    if s.get() != 1 {
+        should_not_reach();
+    }
+    {
+        let _h: H<'_, ()> = H(X(&s, 2));
+    }
+    {
+        let _e = E::A(X(&s, 3));
+        let _b = E::B;
+    }
+    {
+        let _t = (X(&s, 4), X(&s, 5));
+    }
+    if s.get() != 12345 {
+        should_not_reach();
+    }
+}
+"#,
+    );
+}
+
+#[test]
 fn drop_in_place() {
     check_pass(
         r#"

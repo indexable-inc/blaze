@@ -151,8 +151,17 @@ struct Args {
     /// The program is a build script for wasm32-wasip1 whose commands run on the host: its
     /// standard library has blaze's `std::process` ([`run_tool_std`]).
     run_tool: bool,
-    /// Build the workspace's crates as `cargo test` does, with `cfg(test)`.
+    /// Load the workspace as `cargo test` builds it: with every crate of its build, each
+    /// library's and binary's unit tests a crate of their own with `cfg(test)`.
     cfg_test: bool,
+    /// The program is the unit tests of the target `krate` names, its crate with `cfg(test)`,
+    /// and not the target. Only of a `cfg_test` load, which has them.
+    unit_test: bool,
+    /// Where the build of the tests puts its programs and the directory it gives its
+    /// integration tests, which those are told as `CARGO_BIN_EXE_<name>` and
+    /// `CARGO_TARGET_TMPDIR`.
+    executables: Option<AbsPathBuf>,
+    scratch: Option<AbsPathBuf>,
     /// Run build scripts and build proc macros in a directory of blaze's own under the
     /// target directory, so that nothing here waits for a cargo that is building there.
     own_target: bool,
@@ -247,6 +256,8 @@ impl Args {
         let mut dep_info = None;
         let mut inputs = None;
         let mut cfg_test = false;
+        let mut unit_test = false;
+        let (mut executables, mut scratch) = (None, None);
         let mut dev_deps = false;
         let mut own_target = false;
         let mut scripts_from = None;
@@ -288,6 +299,13 @@ impl Args {
                 "--watch" => watch = true,
                 "--socket" => socket = Some(PathBuf::from(value()?)),
                 "--cfg-test" => cfg_test = true,
+                // A unit test is built of a load that has it.
+                "--unit-test" => {
+                    cfg_test = true;
+                    unit_test = true;
+                }
+                "--executables" => executables = Some(absolute(&arg, value()?)?),
+                "--scratch" => scratch = Some(absolute(&arg, value()?)?),
                 "--dev-deps" => dev_deps = true,
                 "--own-target" => own_target = true,
                 "--scripts-from" => scripts_from = Some(PathBuf::from(value()?)),
@@ -340,6 +358,9 @@ impl Args {
             library: false,
             run_tool,
             cfg_test,
+            unit_test,
+            executables,
+            scratch,
             own_target,
             scripts_from,
             selection: plan::Selection {
@@ -735,6 +756,11 @@ fn source_path(
     let source_root = db.file_source_root(file).source_root_id(db);
     let source_root = db.source_root(source_root).source_root(db);
     let path = source_root.path_for_file(&file)?.as_path()?.to_string();
+    // The library is named where it is, as in a toolchain, also when it is in the checkout
+    // built (blaze's own): what the store keeps of it is named as built (`library_sources`).
+    if cargo::toolchain::library::has(Path::new(&path)) {
+        return Some(path);
+    }
     let base = base.and_then(|base| Path::new(&path).strip_prefix(base).ok());
     let relative = Path::new(&path).strip_prefix(root).ok().or(base);
     Some(relative.map_or(path.clone(), |it| it.to_string_lossy().into_owned()))
@@ -1269,85 +1295,21 @@ impl Resolver<'_> {
     }
 }
 
-/// The commit of the toolchain installed at `toolchain`, which rustc puts in the names of the
-/// standard library's files: as rustup's manifest has it, or else as the built library does.
-///
-/// Kept while the manifest and the directory are as they were: rustup's manifest is a file of
-/// most of a megabyte, read on every build otherwise, a patch's too, and an update of the
-/// toolchain rewrites it in place.
-fn rustc_commit(toolchain: &str) -> Option<String> {
-    type Seen = (Option<std::time::SystemTime>, Option<std::time::SystemTime>);
-    static KNOWN: Mutex<Option<FxHashMap<String, (Seen, Option<String>)>>> = Mutex::new(None);
-    let rustlib = format!("{toolchain}lib/rustlib");
-    let modified = |path: &str| std::fs::metadata(path).and_then(|it| it.modified()).ok();
-    let seen =
-        (modified(&format!("{rustlib}/multirust-channel-manifest.toml")), modified(&rustlib));
-    if let Some((was, commit)) = lock(&KNOWN).get_or_insert_default().get(toolchain)
-        && *was == seen
-    {
-        return commit.clone();
-    }
-    let commit = commit_in_manifest(&rustlib);
-    lock(&KNOWN).get_or_insert_default().insert(toolchain.to_owned(), (seen, commit.clone()));
-    commit
-}
-
-/// The commit the channel manifest below `rustlib` names for the toolchain: its
-/// `git_commit_hash`, or, for a nightly's manifest, which names the commit only by the short
-/// hash in its version, the commit of blaze's own nightly when that version is its
-/// (`pins.txt`). Nothing rustc built is read for it (docs/no-rustc.md, step F): it used to be
-/// read out of the paths in the sysroot's `libstd` rlib.
-fn commit_in_manifest(rustlib: &str) -> Option<String> {
-    let manifest =
-        std::fs::read_to_string(format!("{rustlib}/multirust-channel-manifest.toml")).ok()?;
-    commit_of_manifest(&manifest, cargo::ours_says(), cargo::ours_commit())
-}
-
-/// What [`commit_in_manifest`] says of `manifest`, for a blaze whose own nightly's rustc says
-/// `ours` (`1.101.0-nightly (12433c307 2026-10-24)`) and was built from `commit`.
-fn commit_of_manifest(manifest: &str, ours: &str, commit: &str) -> Option<String> {
-    // The `[pkg.rust]` table's own keys, before its first subtable.
-    let rust: Vec<&str> = (manifest.lines().skip_while(|it| it.trim() != "[pkg.rust]").skip(1))
-        .take_while(|it| !it.trim_start().starts_with('['))
-        .collect();
-    let value = |key: &str| {
-        rust.iter().find_map(|line| {
-            let (name, value) = line.split_once('=')?;
-            (name.trim() == key).then(|| value.trim().trim_matches('"'))
-        })
-    };
-    if let Some(named) = value("git_commit_hash") {
-        return Some(named.to_owned());
-    }
-    (value("version")? == ours).then(|| commit.to_owned())
-}
-
-/// What tells the toolchain whose library was loaded from any other: the name of the built
-/// library the program links, its commit, and the name of its compiler, each of which has
-/// a hash of the toolchain in it, and what the metadata of its `core`, `alloc` and `std`
-/// says of each (`metadata_hash`). `None` when it has none of them.
-fn toolchain_identity(vfs: &vfs::Vfs, symbol_files: &[PathBuf]) -> Option<String> {
+/// What tells the standard library a build compiles against from any other: the digest of
+/// its source ([`source_identity`]), and, of a program rustc's library is linked into, the name
+/// of the built library it links and what the metadata of its `core`, `alloc` and `std` says
+/// of each (`metadata_hash`). `None` when it has none of them.
+fn toolchain_identity(symbol_files: &[PathBuf]) -> Option<String> {
     let mut identity = library_identity(symbol_files);
-    if let Some(toolchain) = &loaded_toolchain(vfs) {
-        identity.extend(installed_identity(toolchain));
-    }
+    identity.extend(source_identity());
     identity.sort_unstable();
     (!identity.is_empty()).then(|| identity.join(" "))
 }
 
-/// What [`toolchain_identity`] will say of a build with nothing of rustc's in the checkout at
-/// `project`, before it is loaded: the toolchain the load finds, as it finds it.
-fn toolchain_ahead(project: &Path, cargo_config: &CargoConfig) -> Option<String> {
-    let root = match &cargo_config.sysroot {
-        Some(RustLibSource::Path(toolchain)) => toolchain.clone(),
-        _ => {
-            let dir = AbsPathBuf::assert_utf8(std::env::current_dir().ok()?.join(project));
-            let sysroot = project_model::Sysroot::discover(&dir, &cargo_config.extra_env);
-            sysroot.root()?.to_owned()
-        }
-    };
-    let mut identity = installed_identity(&format!("{root}/"));
-    identity.sort_unstable();
+/// What [`toolchain_identity`] will say of a build with nothing of rustc's, before it is
+/// loaded: the source of the library it loads.
+fn toolchain_ahead() -> Option<String> {
+    let identity = source_identity();
     (!identity.is_empty()).then(|| identity.join(" "))
 }
 
@@ -1382,26 +1344,13 @@ fn library_identity(files: &[PathBuf]) -> Vec<String> {
     identity
 }
 
-/// The toolchain whose library sources were loaded, with a `/` at its end.
-fn loaded_toolchain(vfs: &vfs::Vfs) -> Option<String> {
-    vfs.iter().find_map(|(_, path)| {
-        let path = path.as_path()?.as_str().replace('\\', "/");
-        let (toolchain, _) = path.split_once("lib/rustlib/src/rust/")?;
-        Some(toolchain.to_owned())
-    })
-}
-
-/// What of [`toolchain_identity`] the toolchain installed at `toolchain` (with a `/` at its
-/// end) says: its commit and the name of its compiler. The whole of it for a build with
-/// nothing of rustc's, on any machine the toolchain is installed on.
-pub(crate) fn installed_identity(toolchain: &str) -> Vec<String> {
-    let mut identity: Vec<String> = rustc_commit(toolchain).into_iter().collect();
-    for dir in ["lib", "bin"] {
-        let Ok(entries) = std::fs::read_dir(format!("{toolchain}{dir}")) else { continue };
-        let names = entries.filter_map(|it| it.ok()?.file_name().into_string().ok());
-        identity.extend(names.filter(|it| it.contains("rustc_driver-")));
-    }
-    identity
+/// What of [`toolchain_identity`] the source of the standard library says: its digest
+/// (`library/DIGEST`), the same on any machine with that library. The whole of it for a build
+/// with nothing of rustc's. Nothing of the downloaded toolchain is: blaze compiles neither its
+/// `rust-src` nor with its rustc.
+pub(crate) fn source_identity() -> Vec<String> {
+    let library = cargo::toolchain::library::found();
+    library.map(|it| format!("library={}", it.digest)).into_iter().collect()
 }
 
 /// A hash of what the metadata of the crate in the rlib `archive` says it is: the header,
@@ -1434,10 +1383,10 @@ fn metadata_hash(archive: &[u8]) -> Option<String> {
     Some(hash[..8].iter().map(|it| format!("{it:02x}")).collect())
 }
 
-/// The built rlibs of [`LIBRARY`] of the toolchain whose library was loaded, for `triple`.
-fn built_library(vfs: &vfs::Vfs, triple: &str) -> Vec<PathBuf> {
-    let Some(toolchain) = loaded_toolchain(vfs) else { return Vec::new() };
-    library_in(&PathBuf::from(format!("{toolchain}lib/rustlib/{triple}/lib")))
+/// The built rlibs of [`LIBRARY`] of blaze's toolchain, for `triple`.
+fn built_library(triple: &str) -> Vec<PathBuf> {
+    let Some(toolchain) = cargo::toolchain::sysroot() else { return Vec::new() };
+    library_in(&toolchain.join(format!("lib/rustlib/{triple}/lib")))
 }
 
 /// The rlibs of [`LIBRARY`] in the directory of a toolchain's built library.
@@ -1456,25 +1405,59 @@ impl SymbolResolver for Resolver<'_> {
         if threads < 2 {
             return beside();
         }
+        let batch = trace::cold_batch(count);
+        let mut join = None;
         let next = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|scope| {
-            for _ in 0..threads {
-                let (db, next, parts) = (self.db.clone(), &next, self.parts());
-                scope.spawn(move || {
-                    let resolver = parts.over(&db);
-                    hir::attach_db(&db, || {
-                        loop {
-                            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if at >= count {
-                                break;
-                            }
-                            work(&db, &resolver, at);
-                        }
+        // What the threads compile, the build that asked counts.
+        let counted = hir_ty_codegen::counted::now();
+        // A worker's panic goes on as itself, a cancellation first: the scope would end in one
+        // of its own, which callers can't tell from a bug.
+        let stopped = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    let (db, next, parts) = (self.db.clone(), &next, self.parts());
+                    let counted = counted.clone();
+                    scope.spawn(move || {
+                        let _worker = trace::cold_span("worker", batch);
+                        let resolver = parts.over(&db);
+                        hir_ty_codegen::counted::within(counted, || {
+                            hir::attach_db(&db, || {
+                                loop {
+                                    let at =
+                                        next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if at >= count {
+                                        break;
+                                    }
+                                    work(&db, &resolver, at);
+                                }
+                            })
+                        })
                     })
-                });
+                })
+                .collect();
+            {
+                let _caller = trace::cold_span("caller", batch);
+                beside();
             }
-            beside();
+            // From when the caller is done to when the last thread is.
+            join = trace::cold_span("join", batch);
+            let mut stopped: Option<Box<dyn std::any::Any + Send>> = None;
+            for worker in workers {
+                let Err(panic) = worker.join() else { continue };
+                let cancelled = panic.is::<ide_db::base_db::salsa::Cancelled>();
+                if stopped
+                    .as_ref()
+                    .is_none_or(|it| cancelled && !it.is::<ide_db::base_db::salsa::Cancelled>())
+                {
+                    stopped = Some(panic);
+                }
+            }
+            stopped
         });
+        drop(join);
+        if let Some(panic) = stopped {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     fn source_path(&self, file: vfs::FileId) -> Option<String> {
@@ -1628,7 +1611,7 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn library_sources(&self) -> Option<hir_ty_codegen::LibrarySources> {
-        self.contents.library_sources(self.db)
+        self.contents.library_sources()
     }
 
     fn names_place(&self, bytes: &[u8]) -> bool {
@@ -2505,14 +2488,21 @@ fn crates_called(db: &RootDatabase, krate: &str, args: &Args) -> Vec<Crate> {
         })
         .map(|it| it.krate)
         .collect();
-    // Built as `cargo test` builds them, a library and its unit tests are two crates of one
-    // root file, the tests alone with `cfg(test)`: the crate asked for first is the program's,
-    // and the others are what it links.
+    // Built as `cargo test` builds them, a library or a binary and its unit tests are two
+    // crates of one root file, the tests alone with `cfg(test)`: the crate asked for first is
+    // the program's, its unit tests when it is those, and the others are what it links. An
+    // integration test has `cfg(test)` and is no target's unit tests.
     if args.cfg_test {
-        let tests = |it: &Crate| it.cfg(db).check_atom(&cfg::CfgAtom::Flag(intern::sym::test));
-        let first = *krate == args.krate;
-        if found.iter().any(|it| tests(it) == first) {
-            found.retain(|it| tests(it) == first);
+        let unit_tests = |it: &Crate| {
+            let data = ide_db::base_db::Crate::from(*it).data(db);
+            matches!(data.target_kind, TargetKind::Lib { .. } | TargetKind::Bin)
+                && it.cfg(db).check_atom(&cfg::CfgAtom::Flag(intern::sym::test))
+        };
+        // Unit tests asked for are those or none, never the target in their place: a load
+        // that has one copy of a crate gives it to what links it.
+        let wanted = *krate == args.krate && args.unit_test;
+        if wanted || found.iter().any(|it| !unit_tests(it)) {
+            found.retain(|it| unit_tests(it) == wanted);
         }
     }
     found
@@ -2696,21 +2686,40 @@ impl Checkouts {
         })
     }
 
-    /// The directories of the member packages of the checkout at `at`, and whether each is
-    /// of a procedural macro.
-    fn packages(&self, at: usize) -> Vec<(PathBuf, bool)> {
+    /// The directories of the member packages of the checkout at `at`, whether each is of a
+    /// procedural macro, and whether it has an integration test or a benchmark told a place in
+    /// the checkout (`CARGO_BIN_EXE_<name>`, `CARGO_TARGET_TMPDIR`), which another checkout
+    /// tells its own.
+    fn packages(&self, at: usize) -> Vec<(PathBuf, bool, bool)> {
         let ProjectWorkspaceKind::Cargo { cargo, .. } = &self.loaded.workspaces()[at].kind else {
             return Vec::new();
         };
+        let told = self.tells_places(at);
         cargo
             .packages()
             .filter(|&it| cargo[it].is_member)
             .map(|it| {
                 let package = &cargo[it];
                 let dir = AsRef::<Path>::as_ref(package.manifest.parent()).to_owned();
-                (dir, package.targets.iter().any(|&it| cargo[it].kind.is_proc_macro()))
+                let kinds = || package.targets.iter().map(|&it| cargo[it].kind);
+                let tests = kinds().any(|it| matches!(it, TargetKind::Test | TargetKind::Bench));
+                (dir, kinds().any(|it| it.is_proc_macro()), told && tests)
             })
             .collect()
+    }
+
+    /// Whether the integration tests and benchmarks of the checkout at `at` are told places in
+    /// it (`CARGO_BIN_EXE_<name>`, `CARGO_TARGET_TMPDIR` in its target directory), which those
+    /// of another checkout are told in that one.
+    fn tells_places(&self, at: usize) -> bool {
+        let ProjectWorkspaceKind::Cargo { cargo, .. } = &self.loaded.workspaces()[at].kind else {
+            return false;
+        };
+        let root = &self.roots[at].1;
+        [cargo.executables(), cargo.scratch()]
+            .into_iter()
+            .flatten()
+            .any(|it| AsRef::<Path>::as_ref(it).starts_with(root))
     }
 
     /// The packages of the checkout at `over` whose files are not those of the loaded one at
@@ -2720,10 +2729,11 @@ impl Checkouts {
         let base = &self.roots[base].1;
         let nested: FxHashSet<&Path> = packages.iter().map(|it| &*it.0).collect();
         // A procedural macro is rustc's to build: one that is not the same is another build.
+        // A test told a place in its checkout is the other checkout's own.
         packages
             .iter()
-            .filter(|(dir, proc_macro)| {
-                !proc_macro && !package_alike(dir, base, over, &nested, &self.compared)
+            .filter(|(dir, proc_macro, told)| {
+                !proc_macro && (*told || !package_alike(dir, base, over, &nested, &self.compared))
             })
             .map(|it| &it.0)
             .filter_map(|dir| Some(dir.strip_prefix(base).ok()?.to_owned()))
@@ -2775,6 +2785,7 @@ impl Checkouts {
             self.splits[at] = Some(Split { base: self.roots[base].1.clone(), own });
         }
         self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        *lock(&UNEDITED) = Unedited::of(self.loaded.workspaces());
         prepare_macro_sessions(db);
         Ok(())
     }
@@ -2795,8 +2806,11 @@ impl Checkouts {
         if overlay == Overlay::Never {
             return None;
         }
-        // One that shares packages with another has those where the other is.
-        let whole = self.roots.iter().zip(&self.splits).filter(|it| it.1.is_none()).map(|it| it.0);
+        // One that shares packages with another has those where the other is. Not one whose
+        // tests are told places in it: read over another, they would be told the other's.
+        let whole = (0..self.roots.len())
+            .filter(|&at| self.splits[at].is_none() && !self.tells_places(at))
+            .map(|at| &self.roots[at]);
         whole.into_iter().find_map(|(loaded, base)| {
             let inside = loaded.strip_prefix(base).ok()?;
             let mut over = project.clone();
@@ -2920,6 +2934,7 @@ impl Checkouts {
         }
         let workspaces_at = start.elapsed();
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        *lock(&UNEDITED) = Unedited::of(self.loaded.workspaces());
         prepare_macro_sessions(db);
         if std::env::var_os("BLAZE_STATS").is_some() {
             let files = start.elapsed() - workspaces_at;
@@ -3012,6 +3027,7 @@ impl Checkouts {
             self.debug[at] = self.debug[base].clone();
         }
         self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        *lock(&UNEDITED) = Unedited::of(self.loaded.workspaces());
         prepare_macro_sessions(db);
         failed
     }
@@ -3067,6 +3083,12 @@ fn pause_after_load() {
         eprintln!("load: paused");
         std::thread::sleep(Duration::from_millis(pause));
     }
+}
+
+/// The absolute path `flag` names.
+fn absolute(flag: &str, path: String) -> anyhow::Result<AbsPathBuf> {
+    AbsPathBuf::try_from(path.as_str())
+        .map_err(|it| anyhow::anyhow!("{flag} names a directory by its absolute path, not `{it}`"))
 }
 
 /// The directory cargo put the executables of the build in: the profile's directory the
@@ -3247,11 +3269,16 @@ fn workspace_at(
         if let Some(error) = workspace.sysroot.error().filter(|_| read) {
             anyhow::bail!("{}", error.trim_end());
         }
-        let toolchain =
-            workspace.sysroot.root().map_or("the toolchain".to_owned(), |it| it.to_string());
+        let named = std::env::var(cargo::toolchain::library::VAR).unwrap_or_default();
+        let named = match named.is_empty() {
+            true => "blaze".to_owned(),
+            false => format!("{} (`{}`)", named, cargo::toolchain::library::VAR),
+        };
         anyhow::bail!(
-            "{toolchain} has no source of the standard library, which blaze compiles from: \
-             `rustup component add rust-src` installs it"
+            "{named} has no source of the standard library, which blaze compiles from: \
+             `blaze toolchain` downloads blaze's, digest {} ({})",
+            cargo::toolchain::library::digest(),
+            cargo::toolchain::library::why_not()
         );
     }
     let mut debug = plan::Whole {
@@ -3476,7 +3503,7 @@ fn report_sharing(db: &RootDatabase) {
 
 fn resolve_crates(db: &RootDatabase, args: &Args, threads: usize) -> anyhow::Result<usize> {
     let crates = built_crates(db, args)?;
-    resolve_all(db, &crates, threads);
+    resolve_all(db, &crates, threads)?;
     Ok(crates.len())
 }
 
@@ -3524,66 +3551,109 @@ fn prepare_macro_sessions(db: &RootDatabase) {
     });
 }
 
-/// Resolves the names and finds the impls of `crates`, on `threads`.
-fn resolve_all(db: &RootDatabase, crates: &[ide_db::base_db::Crate], threads: usize) {
-    // A crate comes after its dependencies in the list: a thread that starts on one whose
-    // dependencies are not resolved resolves them itself, one after the other.
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let helping = std::sync::atomic::AtomicUsize::new(0);
+/// Resolves the names and finds the impls of `crates`, on `threads`: each crate is a node of a
+/// build graph (docs/driver.md) that runs once the crates it depends on are resolved, so no
+/// thread waits inside a query for another's. While fewer crates are ready than there are
+/// threads, the idle ones help with a crate's impls and files.
+fn resolve_all(
+    db: &RootDatabase,
+    crates: &[ide_db::base_db::Crate],
+    threads: usize,
+) -> anyhow::Result<()> {
+    use blaze_graph::{Config, Machine, NodeId, Pool, Spec, exec};
+    use blaze_protocol::events::NodeKind;
+    let first = exec::ids(crates.len());
+    let id = |at: usize| NodeId(first + at as u32);
+    let index: FxHashMap<ide_db::base_db::Crate, usize> =
+        crates.iter().enumerate().map(|(at, &krate)| (krate, at)).collect();
+    let nodes = crates
+        .iter()
+        .enumerate()
+        .map(|(at, &krate)| {
+            let mut deps: Vec<NodeId> = krate
+                .data(db)
+                .dependencies
+                .iter()
+                .filter_map(|dep| index.get(&dep.crate_id))
+                .map(|&it| id(it))
+                .collect();
+            deps.sort();
+            deps.dedup();
+            let name = krate.extra_data(db).display_name.as_ref();
+            let name = name.map(|it| it.to_string()).unwrap_or_default();
+            Spec { id: id(at), kind: NodeKind::Names, name, deps, pool: Pool::Work, cost: 1 }
+        })
+        .collect();
+    let threads = threads.max(1);
+    let mut machine = Machine::new(Config { io: 1, work: threads, keep_going: false })?;
+    // The threads at work: on a crate, or helping with one.
+    let busy = std::sync::atomic::AtomicUsize::new(0);
     let counting = events::Counting::new(events::Step::Resolve, crates.len(), threads);
-    std::thread::scope(|scope| {
-        for slot in 0..threads {
-            let db = db.clone();
-            let (next, helping, counting) = (&next, &helping, &counting);
-            scope.spawn(move || {
-                while let Some(&krate) =
-                    crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-                {
-                    let start = Instant::now();
-                    let before = memory::live();
-                    counting.on(slot, || crate_shown(&db, krate));
-                    events::crate_is(krate, events::CrateState::Resolving);
-                    hir::attach_db(&db, || {
-                        _ = hir::crate_def_map(&db, krate);
-                        let names = start.elapsed();
-                        let frozen = hir_ty::method_resolution::frozen::served(&db, krate);
-                        if !frozen {
-                            warm_impls(&db, krate, helping, threads);
-                        }
-                        _ = hir::TraitImpls::for_crate(&db, krate);
-                        // Which of its dependencies the crate names is read off its files,
-                        // and the first body inferred would wait for that of every crate.
-                        _ = hir::TraitImpls::for_crate_and_deps(&db, krate);
-                        if frozen {
-                            warm_files(&db, krate, helping, threads);
-                        } else if krate.data(&db).origin.is_lang() {
-                            // A build asks which functions written in the bodies of the
-                            // standard library share a path, which every body of the crate is
-                            // lowered for: threads are idle here, waiting for the crates that
-                            // come next.
-                            _ = declared_in(&db, krate.into());
-                        }
-                        if std::env::var_os("BLAZE_STATS").is_some() {
-                            let name = krate.extra_data(&db).display_name.as_ref();
-                            let name = name.map(|it| it.to_string()).unwrap_or_default();
-                            // What the heap grew by is this crate's when one thread resolves.
-                            let grew = memory::live().zip(before).map(|(now, before)| {
-                                let origin = &krate.data(&db).origin;
-                                format!(", {:+} bytes {origin:?}", now as i64 - before as i64)
-                            });
-                            eprintln!(
-                                "resolved {name}: names {names:.1?}, impls {:.1?}{}",
-                                start.elapsed() - names,
-                                grew.unwrap_or_default()
-                            );
-                        }
-                    });
-                    events::crate_is(krate, events::CrateState::Resolved);
-                    counting.done(slot);
-                }
-            });
-        }
-    });
+    // The slot a crate under way says what it works on in: at most `threads` are under way.
+    let free: Mutex<Vec<usize>> = Mutex::new((0..threads).rev().collect());
+    // `RootDatabase` is `Send` but not `Sync`: each node clones its own from this one.
+    let shared = Mutex::new(db.clone());
+    let work = |node: NodeId| {
+        let krate = crates[(node.0 - first) as usize];
+        let db = lock(&shared).clone();
+        let slot = lock(&free).pop().unwrap_or_default();
+        busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        counting.on(slot, || crate_shown(&db, krate));
+        events::crate_is(krate, events::CrateState::Resolving);
+        hir::attach_db(&db, || resolve_one(&db, krate, &busy, threads));
+        events::crate_is(krate, events::CrateState::Resolved);
+        counting.done(slot);
+        busy.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        lock(&free).push(slot);
+        blaze_graph::exec::Did::built()
+    };
+    // The crates' nodes are said by `events::graph`, with the names the build's view shows.
+    let ok = exec::drive(&mut machine, nodes, &work, &mut |_| {}, None)?;
+    anyhow::ensure!(ok, "resolving the names of a crate failed");
+    Ok(())
+}
+
+/// Resolves the names and finds the impls of `krate`, whose dependencies are resolved.
+fn resolve_one(
+    db: &RootDatabase,
+    krate: ide_db::base_db::Crate,
+    busy: &std::sync::atomic::AtomicUsize,
+    threads: usize,
+) {
+    let start = Instant::now();
+    let before = memory::live();
+    _ = hir::crate_def_map(db, krate);
+    let names = start.elapsed();
+    let frozen = hir_ty::method_resolution::frozen::served(db, krate);
+    if !frozen {
+        warm_impls(db, krate, busy, threads);
+    }
+    _ = hir::TraitImpls::for_crate(db, krate);
+    // Which of its dependencies the crate names is read off its files, and the first body
+    // inferred would wait for that of every crate.
+    _ = hir::TraitImpls::for_crate_and_deps(db, krate);
+    if frozen {
+        warm_files(db, krate, busy, threads);
+    } else if krate.data(db).origin.is_lang() {
+        // A build asks which functions written in the bodies of the standard library share a
+        // path, which every body of the crate is lowered for: threads are idle here, waiting
+        // for the crates that come next.
+        _ = declared_in(db, krate.into());
+    }
+    if std::env::var_os("BLAZE_STATS").is_some() {
+        let name = krate.extra_data(db).display_name.as_ref();
+        let name = name.map(|it| it.to_string()).unwrap_or_default();
+        // What the heap grew by is this crate's when one thread resolves.
+        let grew = memory::live().zip(before).map(|(now, before)| {
+            let origin = &krate.data(db).origin;
+            format!(", {:+} bytes {origin:?}", now as i64 - before as i64)
+        });
+        eprintln!(
+            "resolved {name}: names {names:.1?}, impls {:.1?}{}",
+            start.elapsed() - names,
+            grew.unwrap_or_default()
+        );
+    }
 }
 
 /// A crate as a person names it: its name, or `std` for the standard library's.
@@ -3604,11 +3674,11 @@ fn crate_shown(db: &RootDatabase, krate: ide_db::base_db::Crate) -> String {
 fn warm_impls(
     db: &RootDatabase,
     krate: ide_db::base_db::Crate,
-    helping: &std::sync::atomic::AtomicUsize,
+    busy: &std::sync::atomic::AtomicUsize,
     threads: usize,
 ) {
     let work = hir_ty::method_resolution::impl_work(db, krate);
-    on_idle_threads(db, &work, 64, helping, threads, |db, work| work.run(db));
+    on_idle_threads(db, &work, 64, busy, threads, |db, work| work.run(db));
 }
 
 /// Asks for the impls of each of `crates` on every core, without waiting for it. After an edit
@@ -3647,7 +3717,7 @@ fn verify_impls<'scope>(
 fn warm_files(
     db: &RootDatabase,
     krate: ide_db::base_db::Crate,
-    helping: &std::sync::atomic::AtomicUsize,
+    busy: &std::sync::atomic::AtomicUsize,
     threads: usize,
 ) {
     let def_map = hir_def::nameres::crate_def_map(db, krate);
@@ -3657,27 +3727,27 @@ fn warm_files(
         .filter_map(|(_, data)| data.origin.file_id())
         .filter(|&file| seen.insert(file))
         .collect();
-    on_idle_threads(db, &files, 4, helping, threads, |db, &file| {
+    on_idle_threads(db, &files, 4, busy, threads, |db, &file| {
         _ = hir::HirFileId::from(file).ast_id_map(db);
     });
 }
 
 /// Runs `run` on each of `work` here and on the threads no other crate has, one for each
-/// `per` items.
+/// `per` items. `busy` counts the threads at work, this one among them.
 fn on_idle_threads<T: Sync>(
     db: &RootDatabase,
     work: &[T],
     per: usize,
-    helping: &std::sync::atomic::AtomicUsize,
+    busy: &std::sync::atomic::AtomicUsize,
     threads: usize,
     run: impl Fn(&RootDatabase, &T) + Sync,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
     let wanted = (work.len() / per).min(threads - 1);
     let mut helpers = 0;
-    _ = helping.try_update(Relaxed, Relaxed, |busy| {
-        helpers = wanted.min(threads.saturating_sub(busy + 1));
-        Some(busy + helpers)
+    _ = busy.try_update(Relaxed, Relaxed, |now| {
+        helpers = wanted.min(threads.saturating_sub(now));
+        Some(now + helpers)
     });
     if helpers == 0 {
         return;
@@ -3696,7 +3766,7 @@ fn on_idle_threads<T: Sync>(
         }
         each(db);
     });
-    helping.fetch_sub(helpers, Relaxed);
+    busy.fetch_sub(helpers, Relaxed);
 }
 
 /// The functions of the crates being built, listed once and again for the crates an edit can
@@ -3770,7 +3840,7 @@ fn harness_main(db: &RootDatabase, functions: &[FunctionId]) -> Option<FunctionI
 /// Whether the program of `args` is one of tests, which starts in blaze's test harness where
 /// blaze writes one: a unit test, built with `cfg(test)`, or one the plan says is a test.
 fn of_tests(args: &Args) -> bool {
-    args.cfg_test || args.out.parent().is_some_and(|it| it.join(cargo::plan::TESTS).is_file())
+    args.unit_test || args.out.parent().is_some_and(|it| it.join(cargo::plan::TESTS).is_file())
 }
 
 /// Why the program of `args` is right only with blaze's test harness, when the plan says it
@@ -3959,7 +4029,12 @@ fn harnesses<'a>(
                 test_harness::module(db, krate, functions, &name)
             });
             let module = module.map(|it| it.text).unwrap_or_default();
-            let wanted = format!("{}{module}", test_harness::without(&text));
+            // rustc empties a crate whose root's `#![cfg(...)]` is false, its crate attributes
+            // too, and then writes its harness: such a root is the harness alone, with no tests,
+            // or the `#![cfg]` would leave the program without the harness's `main` too.
+            let configured_out = hir::attach_db(db, || krate.is_configured_out(db));
+            let kept = if configured_out { "" } else { test_harness::without(&text) };
+            let wanted = format!("{kept}{module}");
             if *text != *wanted {
                 texts.push((file, wanted));
             }
@@ -3970,9 +4045,15 @@ fn harnesses<'a>(
 
 /// Gives the files the texts [`harnesses`] wrote. The files.
 fn write_harnesses(db: &mut RootDatabase, texts: Vec<(vfs::FileId, String)>) -> Vec<vfs::FileId> {
-    use ide_db::base_db::salsa::Durability;
+    use ide_db::base_db::salsa::{Durability, Setter as _};
     for (file, text) in &texts {
         db.set_file_text_with_durability(*file, text, Durability::LOW);
+        // What the crate's `#![cfg]` leaves of a root it takes away.
+        let module = test_harness::appended(text);
+        let input = db.file_text(*file);
+        if input.appended_root_module(db) != module {
+            input.set_appended_root_module(db).with_durability(Durability::LOW).to(module);
+        }
     }
     prepare_macro_sessions(db);
     texts.into_iter().map(|it| it.0).collect()
@@ -4819,6 +4900,9 @@ fn std_unit_at(
         exe: None,
         shared: false,
         library: true,
+        // The unit is the standard library's crates, never the program's unit tests: asked as
+        // those, `crates_called` keeps only crates with `cfg(test)`, which no crate of it has.
+        unit_test: false,
         debug,
         ..args.clone()
     };
@@ -5091,6 +5175,9 @@ fn build(
     hold: Option<&dyn Fn() -> bool>,
 ) -> anyhow::Result<Option<Build>> {
     let start = Instant::now();
+    // What this build compiles, here and on the threads that work for it: not what builds of
+    // other programs compile beside it.
+    let counting = hir_ty_codegen::counted::Counting::start();
     let contents = &content::Contents::default();
     let resolver = Resolver::of(db, table, args, contents, listed)?;
     let hir_db: &dyn HirDatabase = db;
@@ -5226,17 +5313,24 @@ fn build(
             .map(|part| {
                 let (db, known, local, next) = (db.clone(), &*known, &local, &next);
                 let parts = resolver.parts();
+                let counted = Some(counting.counted().clone());
                 scope.spawn(move || {
                     PROBING.set(true);
                     let resolver = parts.over(&db);
-                    hir::attach_db(&db, || {
-                        while let Some(&krate) =
-                            local.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-                        {
-                            hir_ty::method_resolution::TraitImpls::for_crate(&db, krate.into());
-                            hir_ty::method_resolution::InherentImpls::for_crate(&db, krate.into());
-                        }
-                        known.stale(&db, Some(&resolver), part, threads)
+                    // What an edit changed is compiled again to tell what changed.
+                    hir_ty_codegen::counted::within(counted, || {
+                        hir::attach_db(&db, || {
+                            while let Some(&krate) =
+                                local.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                            {
+                                hir_ty::method_resolution::TraitImpls::for_crate(&db, krate.into());
+                                hir_ty::method_resolution::InherentImpls::for_crate(
+                                    &db,
+                                    krate.into(),
+                                );
+                            }
+                            known.stale(&db, Some(&resolver), part, threads)
+                        })
                     })
                 })
             })
@@ -5250,7 +5344,10 @@ fn build(
     let undoable = hold.is_some();
     let hold = hold.unwrap_or(&|| false);
     let unit = hir::attach_db(db, || {
-        CodegenUnit::compile_or_hold(hir_db, &resolver, roots, &denied, known, hold, undoable)
+        let counted = counting.counted();
+        CodegenUnit::compile_or_hold(
+            hir_db, &resolver, roots, &denied, known, hold, undoable, counted,
+        )
     })
     .map_err(anyhow::Error::msg)?;
     let Some(mut unit) = unit else { return Ok(None) };
@@ -5759,7 +5856,7 @@ fn packs_whole(args: &Args) -> bool {
 fn run_link(cmd: &str, binary: Option<&Path>, start: Instant, note: &str) -> anyhow::Result<()> {
     let aside = binary.and_then(|binary| Some((binary, linked_aside(cmd, binary)?)));
     let line = aside.as_ref().map_or(cmd, |(_, (line, _))| line);
-    let linked = shell(line).output();
+    let linked = trace::link_output(&mut shell(line), "link");
     let placed = match (&aside, &linked) {
         (Some((binary, (_, at))), Ok(linked)) if linked.status.success() => {
             std::fs::rename(at, binary)
@@ -5772,8 +5869,9 @@ fn run_link(cmd: &str, binary: Option<&Path>, start: Instant, note: &str) -> any
     }
     let linked = linked?;
     let status = linked.status;
-    let said = String::from_utf8_lossy(&linked.stderr).into_owned();
-    eprint!("{}{said}", String::from_utf8_lossy(&linked.stdout));
+    // `link.exe` says what failed on its standard output.
+    let said = [&linked.stdout, &linked.stderr].map(|it| String::from_utf8_lossy(it)).concat();
+    eprint!("{said}");
     eprintln!("link: {:.1?} ({status}{note})", start.elapsed());
     if !status.success() {
         return Err(LinkFailed { status, said }.into());
@@ -6526,7 +6624,8 @@ enum Watched {
 struct WatchedFile {
     file: Watched,
     path: PathBuf,
-    mtime: SystemTime,
+    /// `None` for one taken for a changed one, or an input that is not there.
+    mtime: Option<SystemTime>,
 }
 
 /// What [`WatchedFile::include_sources`] took in.
@@ -6538,6 +6637,54 @@ enum Loaded {
     New,
 }
 
+/// The registry directories the loaded workspaces' dependencies were installed in, their
+/// sysroots' sources, and the target directories of those workspaces: what
+/// [`WatchedFile::immutable`] does not watch. They are the directories themselves, not their
+/// names, since a package can have modules of its own in a directory named `registry`,
+/// `rustlib` or `target`.
+#[derive(Default)]
+struct Unedited {
+    installed: Vec<PathBuf>,
+    targets: Vec<PathBuf>,
+}
+
+static UNEDITED: Mutex<Unedited> =
+    Mutex::new(Unedited { installed: Vec::new(), targets: Vec::new() });
+
+impl Unedited {
+    fn of(workspaces: &[ProjectWorkspace]) -> Unedited {
+        let mut unedited = Unedited::default();
+        let install = |installed: &mut Vec<PathBuf>, dir: PathBuf| {
+            if !installed.contains(&dir) {
+                installed.push(dir);
+            }
+        };
+        for workspace in workspaces {
+            // Only the library's sources: the sysroot itself can be `/usr`, with projects below.
+            if let Some(library) = workspace.sysroot.rust_lib_src_root() {
+                install(&mut unedited.installed, PathBuf::from(library.to_string()));
+            }
+            // The sysroot's own dependencies are among the roots too, not only the workspace's.
+            for root in workspace.to_roots().into_iter().filter(|it| !it.is_local) {
+                for dir in root.include.iter().map(|it| PathBuf::from(it.to_string())) {
+                    // A registry by its layout, `<home>/registry/src/<index>/<package>`: a
+                    // directory only named `registry` above a vendored package can be the
+                    // project's own.
+                    let Some(home) = cargo::hermetic::cargo_home_of(&dir) else { continue };
+                    let registry = home.join("registry");
+                    if dir.starts_with(&registry) {
+                        install(&mut unedited.installed, registry);
+                    }
+                }
+            }
+            if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind {
+                unedited.targets.push(PathBuf::from(cargo.target_directory().to_string()));
+            }
+        }
+        unedited
+    }
+}
+
 impl WatchedFile {
     /// Whether the file is never written again: everything is watched but the sysroot, the
     /// registry, the Nix store (crates vendored by Nix, which `nix run` of the demo reads its
@@ -6546,10 +6693,27 @@ impl WatchedFile {
     /// file is looked at on every edit, so one too many is time on every keystroke.
     fn immutable(path: &Path) -> bool {
         let names: Vec<&str> = path.components().filter_map(|c| c.as_os_str().to_str()).collect();
-        let of_script = cargo::script::in_out_dir(path);
+        let unedited = lock(&UNEDITED);
         path.starts_with("/nix/store")
-            || names.iter().any(|&it| matches!(it, "rustlib" | "registry"))
-            || names.contains(&"target") && !of_script
+            || cargo::toolchain::library::has(path)
+            || unedited.installed.iter().any(|it| path.starts_with(it))
+            || WatchedFile::fetched(&names)
+            || unedited.targets.iter().any(|it| path.starts_with(it))
+                && !cargo::script::in_out_dir(path)
+    }
+
+    /// Whether a file is in what cargo fetched: `registry/src/<index>-<hash>/` or
+    /// `git/checkouts/<repository>-<hash>/`. A directory of the checkout that is only named
+    /// `registry` is edited like any other (cargo's own `src/cargo/sources/registry`).
+    fn fetched(names: &[&str]) -> bool {
+        let hashed = |name: &str| {
+            name.rsplit_once('-').is_some_and(|(_, hash)| {
+                hash.len() == 16 && hash.bytes().all(|it| it.is_ascii_hexdigit())
+            })
+        };
+        names.windows(3).any(|it| {
+            matches!((it[0], it[1]), ("registry", "src") | ("git", "checkouts")) && hashed(it[2])
+        })
     }
 
     /// `path` is what the file is known as, `on_disk` where it is read from.
@@ -6558,7 +6722,7 @@ impl WatchedFile {
             return None;
         }
         let mtime = std::fs::metadata(on_disk).ok()?.modified().ok()?;
-        Some(WatchedFile { file, path: path.to_owned(), mtime })
+        Some(WatchedFile { file, path: path.to_owned(), mtime: Some(mtime) })
     }
 
     /// The files of the VFS that are text. One that is not UTF-8 can only be named by an
@@ -6577,10 +6741,10 @@ impl WatchedFile {
             .filter_map(|(id, path)| {
                 let path: &Path = path.as_path()?.as_ref();
                 let mut watched = WatchedFile::new(Watched::Source(id), path, path)?;
-                if watched.mtime >= since
+                if watched.mtime.is_some_and(|at| at >= since)
                     && source_on_disk(path).is_ok_and(|text| *text != **db.file_text(id).text(db))
                 {
-                    watched.mtime = SystemTime::UNIX_EPOCH;
+                    watched.mtime = None;
                 }
                 Some(watched)
             })
@@ -6646,7 +6810,7 @@ impl WatchedFile {
             files.push(WatchedFile {
                 file: Watched::Included(path.clone()),
                 path: AsRef::<Path>::as_ref(&path).to_owned(),
-                mtime: mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+                mtime: mtime.ok(),
             });
             changed |= db.reload_included_file(&path);
         }
@@ -6699,6 +6863,9 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             library: args.library,
             run_tool: args.run_tool,
             cfg_test: args.cfg_test,
+            unit_test: args.unit_test,
+            executables: args.executables.clone(),
+            scratch: args.scratch.clone(),
             own_target: args.own_target,
             scripts_from: None,
             selection: args.selection.clone(),
@@ -6785,6 +6952,8 @@ struct Target {
     exe: Option<PathBuf>,
     /// `exe` is a shared library, a `cdylib` (#262).
     shared: bool,
+    /// It is the unit tests of the target `krate` names ([`Args::unit_test`]).
+    unit_test: bool,
     /// What its link takes that rustc compiled. Code rustc instantiated for one program is in
     /// that program's own objects, so another has to be told where its copies are. Empty for
     /// the files the daemon was started with.
@@ -6804,12 +6973,19 @@ impl Target {
             splice: args.splice.clone(),
             exe: args.exe.clone(),
             shared: args.shared,
+            unit_test: args.unit_test,
             symbol_files: args.symbol_files.clone(),
         }
     }
 
     fn is(&self, args: &Args) -> bool {
-        self.krate == args.krate && self.out == args.out
+        self.of_crate(args) && self.out == args.out
+    }
+
+    /// Whether `args` builds the crate this program does: a binary and its unit tests are two
+    /// programs of one root file.
+    fn of_crate(&self, args: &Args) -> bool {
+        self.krate == args.krate && self.unit_test == args.unit_test
     }
 
     /// The daemon's arguments, were it started for this program.
@@ -6824,8 +7000,15 @@ impl Target {
             splice,
             exe,
             shared,
+            unit_test,
             symbol_files,
         } = self;
+        // Only a load with `cfg(test)` has the crate of a target's unit tests.
+        anyhow::ensure!(
+            !unit_test || daemon.cfg_test,
+            "the unit tests of `{krate}` are asked of a worker that loaded the workspace \
+             without `cfg(test)`"
+        );
         let project = project.unwrap_or_else(|| daemon.project.clone());
         let Parts { root: checkout, base, members, debug, lints_capped, link_args } =
             checkouts.parts(&project)?;
@@ -6852,6 +7035,7 @@ impl Target {
             splice,
             exe,
             shared,
+            unit_test,
             symbol_files,
             ..daemon.clone()
         })
@@ -6862,7 +7046,12 @@ impl Target {
         let (mut krate, mut out, mut patch, mut link_cmd) = (None, None, None, None);
         let (mut project, mut splice, mut exe) = (None, None, None);
         let mut symbol_files = Vec::new();
+        let mut unit_test = false;
         while let Some(flag) = flags.next() {
+            if flag == "--unit-test" {
+                unit_test = true;
+                continue;
+            }
             let value = flags.next().with_context(|| format!("{flag} needs a value"))?;
             match flag.as_str() {
                 "--crate" => krate = Some(value),
@@ -6889,11 +7078,13 @@ impl Target {
                     splice,
                     exe,
                     shared: false,
+                    unit_test,
                     symbol_files,
                 }))
             }
             (None, None)
                 if patch.is_none()
+                    && !unit_test
                     && link_cmd.is_none()
                     && splice.is_none()
                     && exe.is_none()
@@ -6908,8 +7099,18 @@ impl Target {
 
     /// The fields after the request's name on its line, each after a tab. Empty is absent.
     fn parse(fields: &[&str]) -> Option<Target> {
-        let &[project, krate, out, patch, link_cmd, splice, exe, shared, ref symbol_files @ ..] =
-            fields
+        let &[
+            project,
+            krate,
+            out,
+            patch,
+            link_cmd,
+            splice,
+            exe,
+            shared,
+            unit_test,
+            ref symbol_files @ ..,
+        ] = fields
         else {
             return None;
         };
@@ -6925,6 +7126,7 @@ impl Target {
             splice: given(splice).map(PathBuf::from),
             exe: given(exe).map(PathBuf::from),
             shared: shared == "shared",
+            unit_test: unit_test == cargo::plan::UNIT_TEST,
             symbol_files: symbol_files.iter().map(PathBuf::from).collect(),
         })
     }
@@ -6947,7 +7149,7 @@ impl Target {
             None => self.krate.clone(),
         };
         let mut fields = format!(
-            "\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.project.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
             crates,
             self.out.display(),
@@ -6955,7 +7157,8 @@ impl Target {
             self.link_cmd.as_deref().unwrap_or_default(),
             self.splice.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
             self.exe.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
-            if self.shared { "shared" } else { "" }
+            if self.shared { "shared" } else { "" },
+            if self.unit_test { cargo::plan::UNIT_TEST } else { "" }
         );
         for file in &self.symbol_files {
             fields.push('\t');
@@ -7777,6 +7980,9 @@ pub fn main() -> anyhow::Result<()> {
         version: pin::OURS,
         version_line: env!("BLAZE_VERSION_LINE"),
     });
+    // Before anything that could start a thread: it sets the environment. After the engine
+    // is handed over: a library downloaded is the release's, which the engine's version names.
+    cargo::toolchain::library::publish();
     trace::began();
     renamed::refuse_old_settings();
     if let Some(sources) = option_env!("BLAZE_SOURCES") {
@@ -7902,7 +8108,46 @@ pub fn main() -> anyhow::Result<()> {
         return ask(request, Path::new(&socket), Target::from_flags(std::env::args().skip(3))?);
     }
     trace::install();
-    run(Args::parse(std::env::args().skip(1))?, None)
+    let args = Args::parse(std::env::args().skip(1))?;
+    // A worker the daemon started answers its builds' traces; one started directly has
+    // only its own to write its first build to.
+    if args.socket.is_none()
+        && std::env::var_os(cargo::daemon::ENDS_WITH_INPUT).is_none()
+        && trace::start_cold().is_some()
+    {
+        hir_ty::consteval::trace_consts_with(followed_const);
+    }
+    let result = run(args, None);
+    trace::finish_cold(if result.is_ok() { "complete" } else { "failed" });
+    result
+}
+
+/// Whether `def` is the constant `BLAZE_TRACE_CONST` names, `crate::module::NAME`: its
+/// crate, every module and its name, so one of the same name elsewhere, in an impl or in a
+/// block is not. What to note for it, a request or a run of its query.
+fn followed_const(
+    db: &dyn hir_ty::db::HirDatabase,
+    def: hir_def::ConstId,
+    executing: bool,
+) -> Option<fn(Instant)> {
+    use hir_def::{HasModule as _, Lookup as _, signatures::ConstSignature};
+    let mut path = trace::cold_const()?.rsplit("::");
+    if ConstSignature::of(db, def).name.as_ref()?.as_str() != path.next()? {
+        return None;
+    }
+    let ItemContainerId::ModuleId(mut module) = def.lookup(db).container else { return None };
+    while let Some(parent) = module.containing_module(db) {
+        // A block's module has no name, so no path names a constant in a block.
+        if module.name(db)?.as_str() != path.next()? {
+            return None;
+        }
+        module = parent;
+    }
+    let krate = def.krate(db).extra_data(db).display_name.as_ref()?.crate_name();
+    if krate.as_str() != path.next()? || path.next().is_some() {
+        return None;
+    }
+    Some(if executing { trace::const_execution } else { trace::const_request })
 }
 
 /// Compiles the crates `args` names on `threads` threads until `done`, giving up on what is
@@ -8035,7 +8280,13 @@ fn cargo_config(args: &Args) -> CargoConfig {
         // workspace does.
         extra_args: selected(&args),
         only_manifest_package: true,
-        executables: executables_of(&args.symbol_files),
+        // A whole build of tests says where it puts its programs; one over rustc's, where
+        // cargo put them.
+        executables: match &args.executables {
+            Some(dir) => Some(dir.clone()),
+            None => executables_of(&args.symbol_files),
+        },
+        scratch: args.scratch.clone(),
         own_metadata: cargo::metadata::own(&args.selection),
         // The build scripts and proc macros of a load in blaze's own target directory are
         // built and run by blaze (`cargo/compile_time.rs`), not `cargo check
@@ -8152,7 +8403,7 @@ impl Held {
         let all: Vec<ide_db::base_db::Crate> =
             Crate::all(&db).into_iter().map(Into::into).collect();
         // The spare starts with the daemon, which the first build starts as cargo does.
-        resolve_all(&db, &all, beside_cargo());
+        resolve_all(&db, &all, beside_cargo())?;
         eprintln!("spare: {} crates in {:.1?}", all.len(), start.elapsed());
         Ok(Held { db, vfs, checkouts })
     }
@@ -8657,7 +8908,7 @@ fn run_holding(
     let cargo_config = cargo_config(&args);
     if !ahead
         && args.symbol_files.is_empty()
-        && let Some(toolchain) = toolchain_ahead(&args.project, &cargo_config)
+        && let Some(toolchain) = toolchain_ahead()
     {
         blaze_store::compiles_against(&toolchain);
     }
@@ -8736,8 +8987,8 @@ fn run_holding(
     // What is compiled ahead is stored too, so the store is told the toolchain first. A build
     // told ahead of cargo's links the library of the toolchain that was loaded, or is not the
     // daemon's.
-    let library = ahead.then(|| built_library(&vfs, emits.triple()));
-    match toolchain_identity(&vfs, library.as_ref().unwrap_or(&args.symbol_files)) {
+    let library = ahead.then(|| built_library(emits.triple()));
+    match toolchain_identity(library.as_ref().unwrap_or(&args.symbol_files)) {
         Some(toolchain) => {
             blaze_store::compiles_against(&toolchain);
             if let Some(told) = blaze_store::toolchain().filter(|it| *it != toolchain) {
@@ -8939,10 +9190,11 @@ fn run_holding(
     let sysroot = checkouts.loaded.workspaces().first().and_then(|it| it.sysroot.root());
     let _ = SYSROOT.set(sysroot.map(|it| AsRef::<Path>::as_ref(it).to_owned()));
     let from_manifest;
+    // What the compile of the program counted, for what is said of it once it is built.
+    let mut counted = None;
     let cold = {
         if let Some(unit) = std_unit(&db, &table, &args, &listed)? {
             args.prebuilt = Some(unit);
-            known.not_counted();
         }
         if let Some((cmd, exe)) = own_link_line(&db, &args)? {
             (args.link_cmd, args.splice) = (Some(cmd), Some(exe));
@@ -8975,12 +9227,26 @@ fn run_holding(
             }
             None => {
                 fns::building();
-                let _compiling = events::compiling(&shown_crate(&db, &args));
+                let compiling = events::compiling(&shown_crate(&db, &args));
+                counted = compiling.counted();
                 let mut cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
-                // An `include!` in a body is first seen when the body is compiled.
+                // An `include!` in a body is first seen when the body is compiled. Only the
+                // crates that include the file, and what depends on them, compiled without
+                // it: touching every crate compiles all of a program from the store again to
+                // tell what changed.
+                let including = tree.including(&db);
                 if WatchedFile::include_sources(&mut files, &mut tree, &mut db) != Loaded::Nothing {
-                    known.touch(&db, None);
-                    listed.touch(&db, None);
+                    let named: Vec<String> = including
+                        .iter()
+                        .map(|&it| {
+                            let name = it.extra_data(&db).display_name.as_ref();
+                            name.map_or_else(|| "?".to_owned(), ToString::to_string)
+                        })
+                        .collect();
+                    eprintln!("included late, by {}", named.join(", "));
+                    let crates = (!including.is_empty()).then_some(&including[..]);
+                    known.touch(&db, crates);
+                    listed.touch(&db, crates);
                     cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
                 }
                 cold
@@ -9005,7 +9271,7 @@ fn run_holding(
             bail!("{why}");
         }
         if events::heard() {
-            events::built(&db, &shown_crate(&db, &args), &known.stats, None);
+            events::built(&db, &shown_crate(&db, &args), &known.stats, None, counted.as_deref());
             if !served {
                 events::cache(&known.stats);
             }
@@ -9116,12 +9382,16 @@ fn run_holding(
                 _ if again.as_ref() != Some(key) => {
                     eprintln!("manifest: not kept, the build loaded files its key was made without")
                 }
-                _ => match manifest::keep(&db, &args, key, &cold.wrote) {
-                    Ok(bytes) => eprintln!(
-                        "manifest: kept, {} files, {bytes} bytes ({:.1?})",
-                        cold.wrote.len(),
-                        start.elapsed()
-                    ),
+                _ => match manifest::keeping(&db, &args, key, &cold.wrote) {
+                    Ok(keeping) => {
+                        let (files, read) = (cold.wrote.len(), start.elapsed());
+                        keeping.settle(move |bytes, took| {
+                            eprintln!(
+                                "manifest: kept, {files} files, {bytes} bytes ({read:.1?} \
+                                 read, {took:.1?} kept beside what came next)"
+                            )
+                        });
+                    }
                     Err(why) => eprintln!("manifest: not kept: {why}"),
                 },
             }
@@ -9211,6 +9481,7 @@ fn run_holding(
         memo_capacities(&mut db)?;
     }
     memory::report(&mut db, "warm-up")?;
+    trace::finish_cold("watch ready");
     eprintln!("watching {} files", files.len());
     ide_db::executions::take(&db);
     // Requests wait here while a build is under way, and those that have come by the time it
@@ -9542,7 +9813,7 @@ fn run_holding(
                         }
                         // The checkouts read as one share its programs.
                         (Some(target), Some(view)) if shared => programs.iter().position(|it| {
-                            it.args.krate == target.krate && it.args.checkout == view.base
+                            target.of_crate(&it.args) && it.args.checkout == view.base
                         }),
                         (Some(_), _) => None,
                         (None, _) => Some(0),
@@ -9674,9 +9945,6 @@ fn run_holding(
                                 program.unbuilt.stale = false;
                                 program.whole = built.whole.clone();
                             }
-                            // Its first build counts what it compiles, not what the
-                            // programs before it did.
-                            program.known.not_counted();
                             let first = program.args.symbol_files == programs[0].args.symbol_files;
                             program.distrust_rustc(&db, &files, first.then_some(&as_compiled));
                             clients.push((programs.len(), (request, asked, stream)));
@@ -9903,25 +10171,30 @@ fn run_holding(
             }
             // A new file has no timestamp yet, so the pass below takes it for a changed one.
             for (file, path) in tree.added(&mut db).added {
-                files.push(WatchedFile {
-                    file: Watched::Source(file),
-                    path,
-                    mtime: SystemTime::UNIX_EPOCH,
-                });
+                files.push(WatchedFile { file: Watched::Source(file), path, mtime: None });
             }
             let before = touched.len() + gone.len();
             for (index, file) in files.iter_mut().enumerate() {
                 let on_disk = db.on_disk(&file.path);
                 let Ok(now) = std::fs::metadata(&on_disk).and_then(|m| m.modified()) else {
-                    if matches!(file.file, Watched::Source(_)) && gone.insert(index) {
-                        touched.remove(&index);
+                    let changed = match file.file {
+                        Watched::Source(_) => {
+                            touched.remove(&index);
+                            gone.insert(index)
+                        }
+                        // Still watched, so the input put back invalidates the macro again.
+                        Watched::Included(_) => {
+                            file.mtime.take().is_some() && touched.insert(index)
+                        }
+                    };
+                    if changed {
                         noticed.get_or_insert((Instant::now(), Duration::ZERO));
                     }
                     continue;
                 };
                 gone.remove(&index);
                 if switched.iter().any(|base| file.path.starts_with(base)) {
-                    file.mtime = now;
+                    file.mtime = Some(now);
                     let same = match file.file {
                         Watched::Source(id) => source_on_disk(&on_disk)
                             .is_ok_and(|text| *text == **db.file_text(id).text(&db)),
@@ -9931,11 +10204,11 @@ fn run_holding(
                         touched.insert(index);
                         noticed.get_or_insert((Instant::now(), Duration::ZERO));
                     }
-                } else if now != file.mtime {
-                    let was = std::mem::replace(&mut file.mtime, now);
+                } else if Some(now) != file.mtime {
+                    let was = file.mtime.replace(now);
                     // An editor that sent its text writes it after: the same text again.
                     let built = match file.file {
-                        Watched::Source(id) if was != SystemTime::UNIX_EPOCH => {
+                        Watched::Source(id) if was.is_some() => {
                             !sent.contains_key(&id)
                                 && source_on_disk(&on_disk)
                                     .is_ok_and(|text| *text == **db.file_text(id).text(&db))
@@ -10295,6 +10568,8 @@ fn run_holding(
                                     program.refused_in_codegen(answer)
                                 }));
                             end_link();
+                            // Each build's steps are of its own thread ([`events::at`]).
+                            events::idle();
                             answer.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
                         });
                         (at, build)
@@ -10471,9 +10746,9 @@ impl Settled {
             {
                 own.push((directory.to_owned(), written(directory)));
             }
-            own.push((path, Some(file.mtime)));
+            own.push((path, file.mtime));
         }
-        let others = Settled::others(files, base, |file| Some(file.mtime));
+        let others = Settled::others(files, base, |file| file.mtime);
         Settled { over: over.to_owned(), patch, link_cmd, own, others }
     }
 
@@ -10636,7 +10911,10 @@ impl Program {
                     as_compiled.get(inside).is_some_and(|was| **was == **text)
                 }
                 // No timestamp is a file taken for a changed one, which rustc did not read.
-                None => file.mtime != SystemTime::UNIX_EPOCH && file.mtime <= built?,
+                None => match file.mtime {
+                    Some(written) => written <= built?,
+                    None => false,
+                },
             })
         };
         let unread: Vec<vfs::FileId> = files
@@ -10791,7 +11069,8 @@ impl Program {
             && self.known.patches()
             && self.known.patching == other.known.patching
             && Arc::ptr_eq(&self.table, &other.table)
-            && (ours.cfg_test, &ours.selection) == (theirs.cfg_test, &theirs.selection)
+            && (ours.cfg_test, ours.unit_test, &ours.selection)
+                == (theirs.cfg_test, theirs.unit_test, &theirs.selection)
             && crates(ours).is_some_and(|it| Some(it) == crates(theirs))
     }
 
@@ -10957,6 +11236,7 @@ impl Program {
         eprint!("edit (apply {apply:.1?}): ");
         report(&warm);
         report_stats(&known.stats);
+        let counted = compiling.counted();
         drop(compiling);
         let edited_paths: FxHashMap<vfs::FileId, PathBuf> = edited
             .iter()
@@ -10965,7 +11245,7 @@ impl Program {
                 Some((*file, path.strip_prefix(&args.checkout).unwrap_or(path).to_owned()))
             })
             .collect();
-        events::built(db, &named, &known.stats, Some(&edited_paths));
+        events::built(db, &named, &known.stats, Some(&edited_paths), counted.as_deref());
         let reported = start.elapsed();
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
         let dated = start.elapsed();
@@ -11216,6 +11496,22 @@ mod tests {
     fn the_splice_names_statics_as_the_code_generator_does() {
         assert_eq!(splice::LASTING_STATIC, hir_ty_codegen::LASTING_STATIC);
         assert_eq!(splice::MOVED_STATIC, hir_ty_codegen::MOVED_STATIC);
+    }
+
+    #[test]
+    fn a_directory_of_the_checkout_named_registry_is_watched() {
+        let immutable = |path: &str| WatchedFile::immutable(Path::new(path));
+        let home = "/home/one/.cargo";
+        assert!(immutable(&format!(
+            "{home}/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.7.4/src/lib.rs"
+        )));
+        assert!(immutable(&format!(
+            "{home}/git/checkouts/gix-0f1c5b2bd2cb9a5e/1a2b3c4/src/lib.rs"
+        )));
+        assert!(!immutable("/ws/cargo/src/cargo/ops/registry/publish.rs"));
+        assert!(!immutable("/ws/cargo/src/cargo/sources/registry/index/mod.rs"));
+        assert!(!immutable("/ws/crates/registry/src/lib.rs"));
+        assert!(!immutable("/ws/crates/git/checkouts.rs"));
     }
 
     #[test]
@@ -11556,21 +11852,6 @@ mod user {
     }
 
     #[test]
-    fn the_commit_of_a_toolchain_is_the_one_its_channel_manifest_names() {
-        let ours = "1.101.0-nightly (12433c307 2026-10-24)";
-        let commit = "12433c307b5a497388ffe2f4e49dbf1ab8c71fa0";
-        let named = "[pkg.rust]\ngit_commit_hash = \"abc\"\n";
-        assert_eq!(commit_of_manifest(named, ours, commit).as_deref(), Some("abc"));
-        let nightly = format!(
-            "date = \"2026-10-25\"\n\n[pkg.cargo]\nversion = \"{ours}\"\n\n[pkg.rust]\nversion = \"{ours}\"\n\n[pkg.rust.target.x]\ngit_commit_hash = \"x\"\n"
-        );
-        assert_eq!(commit_of_manifest(&nightly, ours, commit).as_deref(), Some(commit));
-        let other = nightly.replace("2026-10-24)\"\n\n[pkg.rust.", "2026-10-23)\"\n\n[pkg.rust.");
-        assert_eq!(commit_of_manifest(&other, ours, commit), None);
-        assert_eq!(commit_of_manifest("[pkg.cargo]\nversion = \"1\"\n", ours, commit), None);
-    }
-
-    #[test]
     fn a_link_that_failed_says_what_the_linker_said_last() {
         let said = "note: one\n\nld: cannot find -lmissing\n  collect2: error: ld returned 1\n";
         assert_eq!(
@@ -11578,6 +11859,37 @@ mod user {
             "ld: cannot find -lmissing | collect2: error: ld returned 1"
         );
         assert_eq!(last_lines("", 2), "");
+    }
+
+    #[test]
+    fn package_sources_can_be_named_like_installed_sources_and_build_outputs() {
+        let ws = std::env::temp_dir().join("watch-paths");
+        let before = std::mem::replace(
+            &mut *lock(&UNEDITED),
+            Unedited {
+                installed: vec![
+                    ws.join(".cargo/registry"),
+                    ws.join("toolchain/lib/rustlib/src/rust/library"),
+                ],
+                targets: vec![ws.join("custom-output")],
+            },
+        );
+        for source in [
+            "src/registry/rule_set.rs",
+            "src/rustlib/mod.rs",
+            "src/target/opcode.rs",
+            "custom-output/debug/build/pkg-hash/out/generated.rs",
+        ] {
+            assert!(!WatchedFile::immutable(&ws.join(source)), "{source}");
+        }
+        for cached in [
+            ".cargo/registry/src/index/pkg/src/lib.rs",
+            "toolchain/lib/rustlib/src/rust/library/core/src/lib.rs",
+            "custom-output/debug/deps/old.rs",
+        ] {
+            assert!(WatchedFile::immutable(&ws.join(cached)), "{cached}");
+        }
+        *lock(&UNEDITED) = before;
     }
 
     #[test]
@@ -11603,7 +11915,7 @@ mod user {
         let files = WatchedFile::sources(&vfs, &db, read_from);
         let changed = |name: &str| {
             let file = files.iter().find(|it| it.path.ends_with(name)).unwrap();
-            file.mtime == SystemTime::UNIX_EPOCH
+            file.mtime.is_none()
         };
         assert!(!changed("same.rs"));
         assert!(changed("written.rs"));
@@ -11646,5 +11958,86 @@ mod user {
         assert!(held.is_poisoned());
         *lock(&held) += 1;
         assert_eq!(*lock(&held), 2);
+    }
+
+    /// A load of `cargo test`'s build has every crate of it, as one worker builds them all: a
+    /// binary and a library each without `cfg(test)` and as their unit tests, the unit tests
+    /// linking the library without, an example without `cfg(test)`, and only the integration
+    /// test told `CARGO_BIN_EXE_<name>` and `CARGO_TARGET_TMPDIR`.
+    #[cfg(unix)]
+    #[test]
+    fn a_load_of_the_tests_has_every_crate_cargo_test_builds() {
+        use project_model::{
+            CargoWorkspace, ManifestPath, ProjectWorkspace, ProjectWorkspaceKind, Sysroot,
+            WorkspaceBuildScripts,
+        };
+        project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
+        let json = include_str!("../../project-model/test_data/hello-world-metadata.json");
+        let meta: project_model::Metadata =
+            serde_json::from_str(&json.replace("$ROOT$", "/ROOT/")).unwrap();
+        let manifest = ManifestPath::try_from(AbsPathBuf::assert_utf8("/ROOT/".into())).unwrap();
+        let mut cargo = CargoWorkspace::new(meta, manifest, Default::default(), false);
+        cargo.set_executables(Some(AbsPathBuf::assert_utf8("/ROOT/target/debug".into())));
+        cargo.set_scratch(Some(AbsPathBuf::assert_utf8("/ROOT/target/tmp".into())));
+        let workspace = ProjectWorkspace {
+            kind: ProjectWorkspaceKind::Cargo {
+                cargo,
+                build_scripts: WorkspaceBuildScripts::default(),
+                rustc: Err(None),
+                error: None,
+            },
+            cfg_overrides: Default::default(),
+            sysroot: Sysroot::empty(),
+            rustc_cfg: Vec::new(),
+            toolchain: None,
+            target: Err("no target data".into()),
+            extra_includes: Vec::new(),
+            set_test: true,
+            const_eval: Default::default(),
+        };
+        let mut files = FxHashMap::default();
+        let (graph, _) = workspace.to_crate_graph(
+            &mut |path| {
+                let next = ide_db::FileId::from_raw(files.len() as u32 + 1);
+                Some(*files.entry(path.to_path_buf()).or_insert(next))
+            },
+            &Default::default(),
+        );
+        let test = cfg::CfgAtom::Flag(intern::sym::test);
+        let of = |name: &str, kind: TargetKind| -> Vec<_> {
+            graph
+                .iter()
+                .filter(|&it| graph[it].basic.target_kind == kind)
+                .filter(|&it| {
+                    let named = graph[it].extra.display_name.as_ref();
+                    named.is_some_and(|it| it.canonical_name().as_str() == name)
+                })
+                .collect()
+        };
+        let lib = TargetKind::Lib { is_proc_macro: false };
+        let tested = |it: ide_db::base_db::CrateBuilderId| graph[it].cfg_options.check_atom(&test);
+        let told = |it: ide_db::base_db::CrateBuilderId, var: &str| graph[it].env.get(var);
+        let libs = of("hello-world", lib);
+        let bins = of("hello-world", TargetKind::Bin);
+        let (examples, tests) = (of("an-example", TargetKind::Example), of("it", TargetKind::Test));
+        assert_eq!((libs.len(), bins.len(), examples.len(), tests.len()), (2, 2, 1, 1));
+        let library = *libs.iter().find(|&&it| !tested(it)).unwrap();
+        for unit in [&libs, &bins] {
+            assert_eq!(unit.iter().filter(|&&it| tested(it)).count(), 1, "{unit:?}");
+        }
+        for &bin in &bins {
+            let deps = &graph[bin].basic.dependencies;
+            assert!(deps.iter().any(|it| it.crate_id == library), "a binary links the library");
+        }
+        assert!(!tested(examples[0]) && tested(tests[0]));
+        assert_eq!(
+            told(tests[0], "CARGO_BIN_EXE_hello-world").as_deref(),
+            Some("/ROOT/target/debug/hello-world")
+        );
+        assert_eq!(told(tests[0], "CARGO_TARGET_TMPDIR").as_deref(), Some("/ROOT/target/tmp"));
+        for &it in libs.iter().chain(&bins).chain(&examples) {
+            assert_eq!(told(it, "CARGO_BIN_EXE_hello-world"), None);
+            assert_eq!(told(it, "CARGO_TARGET_TMPDIR"), None);
+        }
     }
 }
