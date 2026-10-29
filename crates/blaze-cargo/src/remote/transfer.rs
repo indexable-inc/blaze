@@ -51,6 +51,10 @@ impl Digest {
         }
         Some(Digest(digest))
     }
+
+    pub fn bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
 impl From<[u8; 32]> for Digest {

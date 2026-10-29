@@ -1,6 +1,6 @@
 // Found by edits.py: seed E1-7, edition 2021, backend cranelift. Reduced by hand.
 // The edit (regen.run): a second block with a function of the name the first block's has.
-// Again: edits.py check block-namesake.rs
+// Again: edits.py check '{"files": ["block-namesake.rs"]}'
 // refused: `pick` is not compiled by blaze and rustc's copy is from before the edit, build
 // with cargo: backend: Duplicate definition of identifier: _RNvNvNtCs6VGO1tlCAh9_2fz2c03run4pick
 mod c0 {

@@ -1,3 +1,8 @@
+---
+status: record
+summary: The three platform rounds as one implementation, with the CI run all platforms passed.
+date: 2026-10-20
+---
 # The three platform rounds as one implementation
 
 Branch `blaze-plat-abi2`. It began at 080a93e19d (the collated branch with

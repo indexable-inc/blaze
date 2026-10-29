@@ -23,6 +23,10 @@ struct Release {
     version: String,
     /// What `-vV` prints, with `{host}` for the host's tuple.
     verbose: String,
+    /// The warning of `-C target-feature=+{feature}` of a feature neither rustc nor LLVM has
+    /// of the target, with `{feature}` for its name.
+    #[serde(default)]
+    unknown_feature: Option<String>,
     targets: BTreeMap<String, Target>,
 }
 
@@ -59,6 +63,10 @@ struct Target {
     /// The cfgs besides `target_feature` a feature has: wasm's `atomics`, `target_has_threads`.
     #[serde(default)]
     feature_cfgs: BTreeMap<String, Vec<String>>,
+    /// The other features rustc or LLVM lists of the target (`--print target-features`).
+    /// One of none of these turns nothing on or off, with a warning.
+    #[serde(default)]
+    other_features: Vec<String>,
 }
 
 impl Target {
@@ -81,15 +89,25 @@ impl Target {
         specs.all(|it| it == spec).then_some(spec)
     }
 
+    /// Whether rustc or LLVM lists `name` as a feature of the target.
+    fn lists(&self, name: &str) -> bool {
+        self.features.contains_key(name)
+            || self.llvm_features.contains_key(name)
+            || self.features_off.contains_key(name)
+            || self.other_features.iter().any(|it| it == name)
+    }
+
     /// The `target_feature`s of `cpu` with `features` turned on (`true`) and off in order,
-    /// starting from `have`, the target's own; `None` for a CPU or feature rustc warns of or
-    /// does not have.
-    fn tuned(
+    /// starting from `have`, the target's own, and the features of `features` neither rustc
+    /// nor LLVM has, which change nothing and which rustc warns of, in order; `None` for a
+    /// CPU or feature rustc warns of otherwise or does not have, and where what is listed is
+    /// not recorded.
+    fn tuned<'a>(
         &self,
         have: Vec<String>,
         cpu: Option<(&str, Option<&str>)>,
-        features: &[(bool, &str)],
-    ) -> Option<Vec<String>> {
+        features: &[(bool, &'a str)],
+    ) -> Option<(Vec<String>, Vec<&'a str>)> {
         let own: Vec<String> = have.clone();
         let mut have: std::collections::BTreeSet<String> = match cpu {
             Some((name, _)) => {
@@ -138,10 +156,15 @@ impl Target {
         for (enable, name) in &host {
             apply(*enable, name, true)?;
         }
+        let mut unknown = Vec::new();
         for &(enable, name) in features {
+            if !self.other_features.is_empty() && !self.lists(name) {
+                unknown.push(name);
+                continue;
+            }
             apply(enable, name, false)?;
         }
-        Some(have.into_iter().collect())
+        Some((have.into_iter().collect(), unknown))
     }
 }
 
@@ -431,6 +454,30 @@ fn is_plain_cfg(cfg: &str) -> bool {
     plain_name && !builtin && plain_value
 }
 
+/// Whether rustc allows unstable features with `RUSTC_BOOTSTRAP` at `bootstrap`, for the crate
+/// `--crate-name` names, on a release whose channel allows them or not: rustc's
+/// `UnstableFeatures::from_environment`. `1`, or a list of crates that has this one, allows
+/// them; `-1` does not; another value, or one that is not text, leaves the channel's default.
+/// `None` for compiletest's `-allow-unstable-compiler-flags=`, which allows only the `-Z`
+/// flags it names.
+fn unstable_allowed(
+    bootstrap: Option<OsString>,
+    crate_name: Option<&str>,
+    channel_nightly: bool,
+) -> Option<bool> {
+    let Some(bootstrap) = bootstrap.and_then(|it| it.into_string().ok()) else {
+        return Some(channel_nightly);
+    };
+    let listed = |name: &str| bootstrap.split(',').any(|it| it == name);
+    Some(match bootstrap.as_str() {
+        it if it.starts_with("-allow-unstable-compiler-flags=") => return None,
+        "1" => true,
+        _ if crate_name.is_some_and(listed) => true,
+        "-1" => false,
+        _ => channel_nightly,
+    })
+}
+
 /// What rustc prints, answering.
 #[derive(Debug, PartialEq)]
 pub struct Answer {
@@ -463,15 +510,6 @@ pub fn answered(
     let args = args.iter().map(|it| it.to_str()).collect::<Option<Vec<_>>>()?;
     let toolchain = Toolchain::ours()?;
     let release = toolchain.release;
-    // Whether unstable features are allowed: always on a nightly (the toolchain blaze is
-    // pinned to), unless `RUSTC_BOOTSTRAP=-1` makes it act as a stable release; a list of
-    // crates is not answered.
-    let nightly = match var("RUSTC_BOOTSTRAP") {
-        None => release.version.contains("-nightly") || release.version.contains("-dev"),
-        Some(it) if it == "1" => true,
-        Some(it) if it == "-1" => false,
-        Some(_) => return None,
-    };
     if !args.is_empty()
         && args.iter().all(|it| matches!(*it, "-V" | "-v" | "-vV" | "--version" | "--verbose"))
     {
@@ -484,6 +522,8 @@ pub fn answered(
         return Some(Answer { stdout: text.into_bytes(), stderr: Vec::new() });
     }
     let given = Given::of(&args)?;
+    let channel_nightly = release.version.contains("-nightly") || release.version.contains("-dev");
+    let nightly = unstable_allowed(var("RUSTC_BOOTSTRAP"), given.crate_name, channel_nightly)?;
     if given.prints.is_empty() || (given.from_stdin && !stdin.trim_ascii().is_empty()) {
         return None;
     }
@@ -494,6 +534,7 @@ pub fn answered(
     let target = release.targets.get(tuple)?;
     let mut out = String::new();
     let mut dropped: Vec<&str> = Vec::new();
+    let mut unknown: Vec<&str> = Vec::new();
     for print in &given.prints {
         match *print {
             // Beside another print rustc stops before it links.
@@ -575,7 +616,8 @@ pub fn answered(
                     };
                     let own = cfgs.iter().filter_map(feature).collect();
                     let cpu = cpu.as_ref().map(|(name, host)| (name.as_str(), host.as_deref()));
-                    let tuned = target.tuned(own, cpu, &given.features)?;
+                    let (tuned, unlisted) = target.tuned(own, cpu, &given.features)?;
+                    unknown = unlisted;
                     cfgs.retain(|it| feature(it).is_none());
                     for feature in &tuned {
                         cfgs.extend(
@@ -629,16 +671,19 @@ pub fn answered(
         }
     }
     let mut warned = String::new();
-    if !dropped.is_empty() && !given.lints_capped && !given.warnings_hidden {
-        if given.diagnostics_set {
+    let count = unknown.len() + dropped.len();
+    if count > 0 && !given.lints_capped && !given.warnings_hidden {
+        if given.diagnostics_set || (!unknown.is_empty() && !dropped.is_empty()) {
             return None;
+        }
+        for feature in &unknown {
+            warned += &release.unknown_feature.as_ref()?.replace("{feature}", feature);
         }
         for kind in &dropped {
             warned += &format!(
                 "warning: dropping unsupported crate type `{kind}` for target `{tuple}`\n\n"
             );
         }
-        let count = dropped.len();
         warned +=
             &format!("warning: {count} warning{} emitted\n\n", if count == 1 { "" } else { "s" });
     }
@@ -769,6 +814,39 @@ mod tests {
         assert!(String::from_utf8(wasm).unwrap().contains("\"arch\": \"wasm32\""));
         let apple = spec("aarch64-apple-darwin", true).expect("an Apple spec under SDKROOT");
         assert_eq!(Some(apple), spec("aarch64-apple-darwin", false));
+    }
+
+    /// servo's `[env]` has `RUSTC_BOOTSTRAP` a list of its crates, which every build script
+    /// that asks `rustc --version` (libc's, rustversion's) is run with.
+    #[test]
+    fn a_list_of_crates_bootstrapped_is_rustcs() {
+        let told = |args: &str, bootstrap: &str| {
+            let args: Vec<OsString> = args.split_whitespace().map(OsString::from).collect();
+            answered(&args, &[], &|name| (name == "RUSTC_BOOTSTRAP").then(|| bootstrap.into()))
+        };
+        let servo = "crown,script,mozjs_sys";
+        for args in ["--version", "-vV"] {
+            assert!(told(args, servo).is_some(), "{args}");
+            assert_eq!(told(args, servo), told(args, "1"), "{args}");
+        }
+        let cfg = |name: &str, bootstrap: &str| {
+            let asked = format!("--crate-name {name} --print cfg -C debug-assertions=on");
+            let said = told(&asked, bootstrap).expect("--print cfg");
+            String::from_utf8(said.stdout).unwrap()
+        };
+        assert_eq!(cfg("script", servo), cfg("script", "1"));
+        assert_eq!(cfg("libc", servo), cfg("libc", "1"));
+        assert_eq!(cfg("libc", "1,"), cfg("libc", "1"));
+        assert!(cfg("libc", "-1").len() < cfg("libc", "1").len());
+        assert_eq!(cfg("script", "-1,script"), cfg("script", "1"));
+        let compiletest = told("--print cfg", "-allow-unstable-compiler-flags=threads");
+        assert!(compiletest.is_none());
+
+        assert_eq!(unstable_allowed(Some("script".into()), Some("script"), false), Some(true));
+        assert_eq!(unstable_allowed(Some("script".into()), Some("libc"), false), Some(false));
+        assert_eq!(unstable_allowed(Some("script".into()), None, true), Some(true));
+        assert_eq!(unstable_allowed(Some("-1".into()), Some("-1"), true), Some(true));
+        assert_eq!(unstable_allowed(None, None, false), Some(false));
     }
 
     #[test]

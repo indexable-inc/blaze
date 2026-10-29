@@ -140,11 +140,12 @@ pub fn ours_told(args: &[OsString], stdin: &[u8]) -> Option<own::Answer> {
     own::answered(args, stdin, &|name| std::env::var_os(name))
 }
 
-/// [`ours`] of text arguments, as text, failing with the question blaze has no answer to.
+/// What rustc prints to standard output for text arguments, as text, failing with the
+/// question blaze has no answer to; the warnings rustc prints with it are left out.
 pub fn ours_said(args: &[&str]) -> anyhow::Result<String> {
     let asked: Vec<OsString> = args.iter().map(OsString::from).collect();
-    let answer = ours(&asked, &[]).ok_or_else(|| no_answer(&asked))?;
-    Ok(String::from_utf8_lossy(&answer).trim().to_owned())
+    let answer = ours_told(&asked, &[]).ok_or_else(|| no_answer(&asked))?;
+    Ok(String::from_utf8_lossy(&answer.stdout).trim().to_owned())
 }
 
 /// [`own::answer`] of `program`, which is answered only as rustc: a driver of rustc's

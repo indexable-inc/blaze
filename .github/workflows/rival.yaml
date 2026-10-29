@@ -1,0 +1,154 @@
+# The rival score (harness/rival.py): our blaze (main), Astral's fork (astral-experiments/blaze,
+# main) and plain cargo, on uv, ruff and ty at the revisions Astral pins and on our corpus. Each
+# project is one job on a hosted runner; its three arms take turns on that runner, so the ratios
+# hold while the absolute seconds are a shared runner's (docs/harness.md: a dedicated machine's
+# numbers are the ones to publish; lane astral re-runs them on an ix VM). The report job merges
+# the projects into one README, which is the run's summary and the `rival` artifact; lane astral
+# copies it to tools/bench/results/<date>-rival/.
+name: rival
+on:
+  schedule:
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+    inputs:
+      ours:
+        description: "The ref measured as our blaze (a PR's branch, for its before/after against main's run)"
+        default: ""
+  pull_request:
+    paths: ["harness/rival.py", ".github/workflows/rival.yaml"]
+
+concurrency:
+  group: rival-${{ github.ref }}-${{ inputs.ours }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: build both blazes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    outputs:
+      ours: ${{ steps.commits.outputs.ours }}
+      astral: ${{ steps.commits.outputs.astral }}
+      astral_toolchain: ${{ steps.commits.outputs.astral_toolchain }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ours || (github.event_name == 'pull_request' && github.event.pull_request.base.sha) || github.sha }}
+          path: ours
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: astral-experiments/blaze
+          path: astral
+          persist-credentials: false
+      - id: commits
+        run: |
+          echo "ours=$(git -C ours rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "astral=$(git -C astral rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "astral_toolchain=$(cat astral/harness/toolchain)" >> "$GITHUB_OUTPUT"
+      - name: our blaze
+        working-directory: ours
+        run: |
+          tc=$(cat harness/toolchain)
+          rustup toolchain install "$tc" --profile minimal -c rust-src
+          cargo +"$tc" build --locked --release -p blaze-engine
+          mkdir -p ../bins/ours && find target/release -maxdepth 1 -type f -perm -u+x -exec cp {} ../bins/ours/ \;
+      - name: Astral's blaze
+        working-directory: astral
+        run: |
+          tc=$(cat harness/toolchain)
+          rustup toolchain install "$tc" --profile minimal -c rust-src
+          cargo +"$tc" build --locked --release -p ra-jit
+          mkdir -p ../bins/astral && find target/release -maxdepth 1 -type f -perm -u+x -exec cp {} ../bins/astral/ \;
+      - run: tar -czf bins.tar.gz bins
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bins
+          path: bins.tar.gz
+          retention-days: 2
+          compression-level: 0
+
+  measure:
+    name: rival (${{ matrix.project }})
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [uv, ruff, ty, ripgrep]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: bins
+      - name: toolchains
+        run: |
+          tar -xzf bins.tar.gz -C "$RUNNER_TEMP"
+          rustup toolchain install "$(cat harness/toolchain)" --profile minimal -c rust-src
+          rustup toolchain install "${{ needs.build.outputs.astral_toolchain }}" --profile minimal -c rust-src
+          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+            sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: measure
+        env:
+          OURS: ${{ needs.build.outputs.ours }}
+          ASTRAL: ${{ needs.build.outputs.astral }}
+          ASTRAL_TOOLCHAIN: ${{ needs.build.outputs.astral_toolchain }}
+          PROJECT: ${{ matrix.project }}
+        run: |
+          python3 - <<'PY' > "$RUNNER_TEMP/input.json"
+          import json, os
+          tmp, tc = os.environ["RUNNER_TEMP"], open("harness/toolchain").read().strip()
+          print(json.dumps(dict(
+              arms=[dict(name="ours", kind="blaze", bin=f"{tmp}/bins/ours", commit=os.environ["OURS"], env=dict(RUSTUP_TOOLCHAIN=tc)),
+                    dict(name="astral", kind="astral", bin=f"{tmp}/bins/astral", commit=os.environ["ASTRAL"],
+                         env=dict(RUSTUP_TOOLCHAIN=os.environ["ASTRAL_TOOLCHAIN"])),
+                    dict(name="cargo", kind="cargo", bin="", commit=tc, env=dict(RUSTUP_TOOLCHAIN=tc))],
+              projects=[os.environ["PROJECT"]], work=f"{tmp}/work", out="rival-out", runs=5, tests=True, interleave=False,
+              machine="GitHub ubuntu-24.04 hosted runner (x86_64, 4 vCPU, 16 GB, shared)")))
+          PY
+          python3 -u harness/rival.py "$RUNNER_TEMP/input.json"
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rival-${{ matrix.project }}
+          path: rival-out
+          retention-days: 14
+
+  report:
+    name: rival report
+    needs: measure
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: rival-*
+          path: parts
+      - run: |
+          mkdir -p rival/raw
+          for part in parts/*/; do
+            cp "$part"raw/* rival/raw/ 2>/dev/null || true
+            cat "$part"commands.txt >> rival/commands.txt 2>/dev/null || true
+            [ -f rival/host.json ] || cp "$part"host.json rival/host.json
+          done
+          python3 harness/rival.py report '{"out": "rival"}'
+          cat rival/README.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rival
+          path: rival
+          retention-days: 90

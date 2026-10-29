@@ -74,6 +74,7 @@ blaze-macro-wasm.workspace = true
 blaze-store.workspace = true
 blaze-doc.workspace = true
 blaze-lints.workspace = true
+blaze-graph.workspace = true
 blaze-protocol.workspace = true
 ide-db.workspace = true
 ide-diagnostics.workspace = true

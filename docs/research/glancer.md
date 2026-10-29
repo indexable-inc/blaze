@@ -1,3 +1,8 @@
+---
+status: record
+summary: Rust Glancer, matklad's three tiers, rustc's .rmeta MIR and salsa's persistence, and what they mean for blaze.
+date: 2026-10-21
+---
 # Rust Glancer, matklad's three tiers, and what they mean for blaze
 
 2026-10-21. What was fetched is in [docs/upstream/glancer/](../upstream/glancer/SOURCE.md). Each

@@ -1044,7 +1044,7 @@ fn download(url: &str) -> anyhow::Result<Option<Vec<u8>>> {
                 None => break,
             }
         }
-        anyhow::Ok(bytes)
+        anyhow::Ok(Some(bytes))
     })
 }
 

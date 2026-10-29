@@ -1,3 +1,7 @@
+---
+status: current
+summary: Tiers: hot functions of a live program compiled again with LLVM and swapped in while it runs.
+---
 # Tiers
 
 A program that takes edits with `blaze-live` is also made faster while it runs. The daemon

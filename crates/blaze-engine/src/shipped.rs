@@ -188,9 +188,8 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
     if !sysroot.join("lib/rustlib").is_dir() {
         anyhow::bail!("{} is not a toolchain: it has no lib/rustlib", sysroot.display());
     }
-    let mut identity = crate::installed_identity(&format!("{}/", sysroot.display()));
-    identity.sort_unstable();
-    blaze_store::compiles_against(&identity.join(" "));
+    crate::cargo::toolchain::library::fetch().map_err(anyhow::Error::msg)?;
+    blaze_store::compiles_against(&crate::source_identity().join(" "));
     let target = hir_ty_codegen::Target::selected().map_err(anyhow::Error::msg)?;
     let project = project(target.triple()).context("this program cannot be read")?;
     let dir = std::env::temp_dir().join(format!("blaze-std-{}", std::process::id()));

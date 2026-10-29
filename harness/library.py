@@ -11,12 +11,14 @@
     library.py merge '{"date": "2026-11-02"}'
         library/ moves to that nightly's standard library as a merge: upstream's changes from
         UPSTREAM's nightly to the new one are applied three-way to library/, so blaze's own
-        changes (PATCHES.md) are kept. A conflict stops with the files, which have conflict
-        markers then, and nothing else changed is undone. An empty date is harness/toolchain's.
-    library.py check '{}'
-        library/ is UPSTREAM's nightly's standard library but for the files PATCHES.md names and
-        UPSTREAM and PATCHES.md themselves: every other file is upstream's, byte for byte and
-        mode for mode, and none is missing or added.
+        changes are kept. A conflict stops with the files, which have conflict markers then,
+        and nothing else changed is undone. An empty date is harness/toolchain's.
+    library.py digest '{}'
+        writes library/DIGEST, the digest blaze knows the library by (the store's key of the
+        standard library; `toolchain/library.rs` computes the same): after any change to library/.
+    library.py archive '{"out": "<dir>"}'
+        writes <dir>/library-<digest>.tar.xz, the asset of a release a blaze without a checkout
+        downloads the library from once, checking its files against the digest.
 
 The JSON is inline, a file's path, or `-` for stdin. Downloads are kept in ~/.cache/blaze-library.
 Python 3.11+, stdlib and git.
@@ -29,9 +31,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 LIBRARY = os.path.join(ROOT, "library")
 UPSTREAM = os.path.join(LIBRARY, "UPSTREAM")
-PATCHES = os.path.join(LIBRARY, "PATCHES.md")
 # blaze's files in library/, which no nightly has.
-OURS = {"UPSTREAM", "PATCHES.md"}
+OURS = {"UPSTREAM", "DIGEST"}
+DIGEST = os.path.join(LIBRARY, "DIGEST")
 DIST = "https://static.rust-lang.org/dist"
 # Where rust-src has the library in its tarball.
 INSIDE = "rust-src-nightly/rust-src/lib/rustlib/src/rust/library/"
@@ -44,8 +46,13 @@ class Nightly:
 
 
 @dataclass(frozen=True)
-class Check:
+class Empty:
     pass
+
+
+@dataclass(frozen=True)
+class Archive:
+    out: str
 
 
 def typed(cls, text):
@@ -99,8 +106,7 @@ class Upstream:
             "# blaze's standard library (library/) is the Rust project's at this commit, as the\n"
             "# nightly's rust-src has it: library/ of rust-lang/rust with the backtrace submodule,\n"
             "# std's third-party crates in vendor/ and .cargo/config.toml. Written by\n"
-            "# harness/library.py from the nightly's channel manifest; blaze's own changes to it are\n"
-            "# in PATCHES.md.\n"
+            "# harness/library.py from the nightly's channel manifest.\n"
             "repo https://github.com/rust-lang/rust\n"
             f"commit {self.commit}\n"
             f"nightly {self.nightly}\n"
@@ -182,32 +188,29 @@ def files(root):
     return found
 
 
+def digest_of(root):
+    """The digest of the library at `root`: the sha256 of a line per file and link under it but
+    DIGEST, in the order of their paths' bytes, each `<kind> <sha256 of its bytes, or of where a
+    link points> <path>`, kind `file` or `link` (as crates/blaze-cargo's toolchain/library.rs
+    computes it). Whether a file is executable is not in it: Windows does not say."""
+    lines = []
+    for path, (kind, data) in sorted(files(root).items(), key=lambda it: it[0].encode()):
+        if path != "DIGEST":
+            kind = "link" if kind == "link" else "file"
+            lines.append(f"{kind} {hashlib.sha256(data).hexdigest()} {path}\n")
+    return hashlib.sha256("".join(lines).encode()).hexdigest()
+
+
+def write_digest():
+    digest = digest_of(LIBRARY)
+    open(DIGEST, "w").write(digest + "\n")
+    return digest
+
+
 def ours_kept():
     """blaze's files in library/, to put back over a fresh import."""
     return {name: open(os.path.join(LIBRARY, name), "rb").read()
             for name in OURS if os.path.isfile(os.path.join(LIBRARY, name))}
-
-
-PATCHES_TEXT = """# blaze's changes to the standard library
-
-library/ is the Rust project's standard library at the commit of blaze's nightly
-(UPSTREAM), unchanged but for the changes listed here. `python3 harness/library.py check '{}'`
-holds it to that: a file that differs from upstream and is not named below fails it.
-
-To change the standard library: edit it under library/, commit, and add an entry below in the
-same commit, naming each file it changes, what it changes and why. The daily bump moves
-library/ to the next nightly as a merge (`harness/library.py merge`), so the change is kept;
-a conflict stops the bump with an issue (docs/toolchain.md, "The daily bump").
-
-None yet.
-"""
-
-
-def patched():
-    """The files PATCHES.md names, as `library/<path>` in backticks."""
-    if not os.path.isfile(PATCHES):
-        return set()
-    return set(re.findall(r"`library/([^`\s]+)`", open(PATCHES).read()))
 
 
 def do_import(args):
@@ -221,9 +224,8 @@ def do_import(args):
     for name, data in kept.items():
         open(os.path.join(LIBRARY, name), "wb").write(data)
     open(UPSTREAM, "w").write(upstream.text())
-    if not os.path.isfile(PATCHES):
-        open(PATCHES, "w").write(PATCHES_TEXT)
-    print(f"library/ is the standard library of {upstream.nightly} (rust-lang/rust {upstream.commit[:9]})")
+    digest = write_digest()
+    print(f"library/ is the standard library of {upstream.nightly} (rust-lang/rust {upstream.commit[:9]}), digest {digest[:12]}")
 
 
 def git(*argv, check=True, input=None):
@@ -240,6 +242,7 @@ def do_merge(args):
     if new.commit == old.commit:
         print(f"library/ is already {new.nightly}'s ({new.commit[:9]})")
         open(UPSTREAM, "w").write(new.text())
+        write_digest()
         return
     with tempfile.TemporaryDirectory(prefix="blaze-library-") as work:
         unpack(old, os.path.join(work, "a"))
@@ -252,7 +255,7 @@ def do_merge(args):
         patch = diff.stdout
         if patch.strip():
             # The old side's blobs are in this repository (library/ was upstream's at old.commit
-            # but for PATCHES.md's files, whose upstream blobs its history has), so git merges
+            # but for blaze's own changes, whose upstream blobs its history has), so git merges
             # each file three-way and leaves conflict markers where both sides changed a line.
             # Its paths are a/a/<path> and b/b/<path>: -p2 leaves <path>.
             applied = git("apply", "--3way", "--whitespace=nowarn", "-p2", "--directory=library", "-",
@@ -264,36 +267,49 @@ def do_merge(args):
                 open(kept, "wb").write(patch)
                 sys.exit(
                     f"library.py: upstream's changes from {old.nightly} to {new.nightly} conflict with blaze's "
-                    f"changes to the standard library (library/PATCHES.md) in: {', '.join(conflicted) or '(see below)'}. "
+                    f"changes to the standard library in: {', '.join(conflicted) or '(see below)'}. "
                     f"Resolve the conflict markers there, `git add` them and finish the bump; upstream's whole "
                     f"change is {kept}. git apply said:\n{applied.stderr.decode()[-3000:]}")
     open(UPSTREAM, "w").write(new.text())
+    write_digest()
     print(f"library/ merged {old.nightly} ({old.commit[:9]}) -> {new.nightly} ({new.commit[:9]})")
 
 
-def do_check(args):
-    upstream = Upstream.read()
-    named = patched()
-    with tempfile.TemporaryDirectory(prefix="blaze-library-") as work:
-        unpack(upstream, os.path.join(work, "library"))
-        theirs = files(os.path.join(work, "library"))
-    ours = {path: it for path, it in files(LIBRARY).items() if path not in OURS}
-    differ = sorted(path for path in theirs.keys() & ours.keys() if theirs[path] != ours[path])
-    missing = sorted(theirs.keys() - ours.keys())
-    added = sorted(ours.keys() - theirs.keys())
-    unnamed = [p for p in differ + missing + added if p not in named]
-    for kind, paths in (("differs from upstream", differ), ("is missing", missing), ("is not upstream's", added)):
-        for path in paths:
-            print(f"library/{path} {kind}{'' if path in named else ' and PATCHES.md does not name it'}")
-    if unnamed:
-        sys.exit(f"library.py: library/ is not {upstream.nightly}'s standard library: {len(unnamed)} file(s) "
-                 f"changed that PATCHES.md does not name")
-    print(f"library/ is {upstream.nightly}'s standard library ({len(theirs)} files), "
-          f"{len(named & (set(differ) | set(missing) | set(added)))} patched")
+def do_digest(args):
+    print(f"library/DIGEST: {write_digest()}")
+
+
+def do_archive(args):
+    digest = open(DIGEST).read().strip()
+    if digest_of(LIBRARY) != digest:
+        sys.exit("library.py: library/DIGEST is not library/'s digest: `library.py digest '{}'` writes it")
+    os.makedirs(args.out, exist_ok=True)
+    out = os.path.join(args.out, f"library-{digest}.tar.xz")
+
+    def tidy(info):
+        info.uid = info.gid = 0
+        info.uname = info.gname = ""
+        info.mtime = 0
+        if info.isfile():
+            info.mode = 0o755 if info.mode & 0o100 else 0o644
+        elif info.isdir():
+            info.mode = 0o755
+        return info
+
+    with tarfile.open(out + ".part", "w:xz", preset=9) as tar:
+        for dir, subdirs, names in os.walk(LIBRARY):
+            subdirs.sort()
+            rel = os.path.relpath(dir, ROOT).replace(os.sep, "/")
+            tar.add(dir, arcname=rel, recursive=False, filter=tidy)
+            for name in sorted(names + [d for d in subdirs if os.path.islink(os.path.join(dir, d))]):
+                tar.add(os.path.join(dir, name), arcname=f"{rel}/{name}", recursive=False, filter=tidy)
+    os.replace(out + ".part", out)
+    print(out)
 
 
 def main():
-    commands = {"import": (Nightly, do_import), "merge": (Nightly, do_merge), "check": (Check, do_check)}
+    commands = {"import": (Nightly, do_import), "merge": (Nightly, do_merge), "digest": (Empty, do_digest),
+                "archive": (Archive, do_archive)}
     if len(sys.argv) not in (2, 3) or sys.argv[1] not in commands:
         sys.exit(f"usage: library.py {{{'|'.join(commands)}}} '<json>'\n\n{__doc__}")
     cls, run = commands[sys.argv[1]]

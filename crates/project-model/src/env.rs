@@ -59,6 +59,14 @@ pub(crate) fn inject_cargo_executables_env(
     }
 }
 
+/// `CARGO_TARGET_TMPDIR`, the directory cargo gives the integration tests and benchmarks of a
+/// build to write in.
+pub(crate) fn inject_cargo_scratch_env(env: &mut Env, cargo: &CargoWorkspace) {
+    if let Some(directory) = cargo.scratch() {
+        env.set("CARGO_TARGET_TMPDIR", directory.as_str());
+    }
+}
+
 pub(crate) fn inject_cargo_env(env: &mut Env, cargo_path: &Utf8Path) {
     env.set("CARGO", cargo_path.as_str());
 }

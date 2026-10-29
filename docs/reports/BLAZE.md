@@ -1,3 +1,8 @@
+---
+status: record
+summary: The early project plan and harness.
+date: 2026-10-20
+---
 # blaze: project plan and harness
 
 blaze is a build daemon that keeps a Rust workspace loaded in rust-analyzer's database and
@@ -5,7 +10,7 @@ compiles functions straight from RA's MIR with Cranelift. During the prototype r
 builds everything once, and it is the reference we test against. This file says what we are aiming for, how we know whether
 we are getting there, and how the work is split up.
 
-Current numbers live in [harness/SCOREBOARD.md](harness/SCOREBOARD.md). They are generated; this
+Current numbers live in harness/SCOREBOARD.md (since removed). They are generated; this
 file should not repeat them.
 
 ## 1. Goal

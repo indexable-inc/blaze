@@ -4,10 +4,15 @@
     "threads": { "group": "std", "tests": 2 },
     "thread_local": { "group": "std", "tests": 2 },
     "statics": { "group": "std", "tests": 2 },
+    "configured_out": { "group": "std", "tests": 1 },
     "envfs": { "group": "std", "tests": 2, "args": ["one", "two words"], "env": { "SMOKE_VAR": "smoke" } },
+    "const_heap": { "group": "std", "tests": 0 },
     "tokio_echo": { "group": "crates", "tests": 1 },
     "serde_json": { "group": "crates", "tests": 2 },
-    "derives": { "group": "crates", "tests": 3, "args": ["--count", "2", "--shout", "yes", "greet", "smoke"] }
+    "derives": { "group": "crates", "tests": 3, "args": ["--count", "2", "--shout", "yes", "greet", "smoke"] },
+    "ce_sha256": { "group": "crates", "tests": 0 },
+    "ce_toml": { "group": "crates", "tests": 0 },
+    "ce_inflate": { "group": "crates", "tests": 0 }
   },
   "projects": {
     "ripgrep": {

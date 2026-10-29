@@ -102,7 +102,7 @@ pub(crate) fn once(project: &Path, krate: &str) -> anyhow::Result<Option<crate::
     crate::prepare_macro_sessions(&db);
     // The names of the standard library are what a build resolved and the store kept: a
     // probe's crate is a few lines, and std's names are most of what resolving it costs.
-    if let Some(toolchain) = crate::toolchain_identity(&vfs, &args.symbol_files) {
+    if let Some(toolchain) = crate::toolchain_identity(&args.symbol_files) {
         blaze_store::compiles_against(&toolchain);
     }
     let crates = crate::built_crates(&db, &args).unwrap_or_default();
@@ -139,8 +139,8 @@ fn unresolved(db: &RootDatabase, file: vfs::FileId) -> Option<String> {
     })
 }
 
-/// A target of the workspace a check diagnoses: its root file, its kind and, of a library,
-/// whether it is checked as its unit tests, which are a crate of their own.
+/// A target of the workspace a check diagnoses: its root file, its kind and, of a library or
+/// a binary, whether it is checked as its unit tests, which are a crate of their own.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Picked {
     root: PathBuf,
@@ -150,8 +150,11 @@ struct Picked {
 
 impl Picked {
     fn of(root: PathBuf, kind: TargetKind, test: bool) -> Picked {
-        // Every other target is one crate, with `cfg(test)` or not as the load has it.
-        let test = test && kind == TargetKind::Lib { is_proc_macro: false };
+        // A library and a binary have their unit tests as a crate of their own (cargo's
+        // `checked_as_test`); every other target is one crate, with `cfg(test)` or not as the
+        // load has it.
+        let test =
+            test && matches!(kind, TargetKind::Lib { is_proc_macro: false } | TargetKind::Bin);
         Picked { root, kind, test }
     }
 }
@@ -225,6 +228,8 @@ struct Checker {
     ran: FxHashSet<vfs::FileId>,
     /// Where new source files of the crates checked would be.
     dirs: Vec<PathBuf>,
+    /// The target directories of the workspaces, where no new source file is looked for.
+    targets: Vec<PathBuf>,
     /// Every file loaded, by path.
     loaded: FxHashSet<PathBuf>,
     /// The manifests, the lock file and cargo's configuration, as they were when loaded.
@@ -258,9 +263,11 @@ impl Checker {
         let mut script_roots = FxHashSet::default();
         let mut local_roots = FxHashSet::default();
         let mut manifests = FxHashMap::default();
+        let mut targets = Vec::new();
         for workspace in checkouts.loaded.workspaces() {
             let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind else { continue };
             let root: &Path = cargo.workspace_root().as_ref();
+            targets.push(PathBuf::from(cargo.target_directory().to_string()));
             for file in ["Cargo.lock", ".cargo/config.toml", ".cargo/config"] {
                 manifests.insert(root.join(file), None);
             }
@@ -347,6 +354,7 @@ impl Checker {
             crates,
             ran,
             dirs: outer,
+            targets,
             loaded,
             manifests,
             sources: Sources { paths },
@@ -431,7 +439,9 @@ impl Checker {
                 return Some(format!("{} changed", path.display()));
             }
         }
-        if let Some(new) = self.dirs.iter().find_map(|dir| new_source(dir, &self.loaded)) {
+        if let Some(new) =
+            self.dirs.iter().find_map(|dir| new_source(dir, &self.loaded, &self.targets))
+        {
             return Some(format!("{} is new", new.display()));
         }
         let mut change = ChangeWithProcMacros::default();
@@ -440,10 +450,10 @@ impl Checker {
             let Some(now) = modified(&watched.path) else {
                 return Some(format!("{} is gone", watched.path.display()));
             };
-            if now == watched.mtime {
+            if Some(now) == watched.mtime {
                 continue;
             }
-            watched.mtime = now;
+            watched.mtime = Some(now);
             let Ok(text) = crate::source_on_disk(&watched.path) else {
                 return Some(format!("{} can't be read", watched.path.display()));
             };
@@ -500,18 +510,26 @@ fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|it| it.modified()).ok()
 }
 
-/// A Rust source file below `dir` that was not loaded. What a build made is not looked in.
-fn new_source(dir: &Path, loaded: &FxHashSet<PathBuf>) -> Option<PathBuf> {
+/// A Rust source file below `dir` that was not loaded. What a build made is not looked in:
+/// the workspaces' `targets`, and any other directory marked a cache by a `CACHEDIR.TAG`, as
+/// cargo marks each target directory (a stale one from before `CARGO_TARGET_DIR` was set, say,
+/// whose build-script output would never be loaded, so it would be new on every refresh). A
+/// directory that is only named `target` is looked in.
+fn new_source(dir: &Path, loaded: &FxHashSet<PathBuf>, targets: &[PathBuf]) -> Option<PathBuf> {
     let mut dirs = vec![dir.to_owned()];
     while let Some(dir) = dirs.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for entry in entries.flatten() {
+        let entries: Vec<_> = entries.flatten().collect();
+        if entries.iter().any(|it| it.file_name() == "CACHEDIR.TAG") {
+            continue;
+        }
+        for entry in entries {
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
             match entry.file_type() {
                 Ok(kind) if kind.is_dir() => {
-                    if !name.starts_with('.') && name != "target" {
+                    if !name.starts_with('.') && !targets.contains(&path) {
                         dirs.push(path);
                     }
                 }
@@ -521,4 +539,31 @@ fn new_source(dir: &Path, loaded: &FxHashSet<PathBuf>) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stale_target_directory_is_not_new_source_but_a_module_named_target_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let stale = root.join("target/debug/build/x-1/out");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(
+            root.join("target/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        std::fs::write(stale.join("bindings.rs"), "").unwrap();
+        let loaded: FxHashSet<PathBuf> = [root.join("lib.rs")].into_iter().collect();
+        std::fs::write(root.join("lib.rs"), "").unwrap();
+        assert_eq!(new_source(root, &loaded, &[]), None);
+
+        let module = root.join("src/target/opcode.rs");
+        std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+        std::fs::write(&module, "").unwrap();
+        assert_eq!(new_source(root, &loaded, &[]), Some(module));
+    }
 }

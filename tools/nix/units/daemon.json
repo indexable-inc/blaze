@@ -721,6 +721,7 @@
      "blaze-build-script",
      "blaze-cache",
      "blaze-fmt",
+     "blaze-graph",
      "blaze-in-place",
      "blaze-lints",
      "blaze-live",
@@ -736,6 +737,7 @@
      "blaze-ui",
      "blaze-units",
      "blaze-wasi",
+     "blaze-web",
      "cargo-platform",
      "cargo-util-schemas",
      "cargo_metadata",
@@ -821,6 +823,7 @@
      "blaze-cargo",
      "blaze-doc",
      "blaze-expand",
+     "blaze-graph",
      "blaze-lints",
      "blaze-live",
      "blaze-macro-wasm",
@@ -985,6 +988,7 @@
      "salsa",
      "sha2 0.10.9",
      "span",
+     "target-lexicon",
      "tt",
      "wasmtime"
     ],
@@ -1181,6 +1185,19 @@
      "wasmtime-wasi"
     ],
     "name": "blaze-wasi",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "base64",
+     "blaze-protocol",
+     "flate2",
+     "flecs-c",
+     "getrandom 0.3.4",
+     "rustc-hash 2.1.2",
+     "sha1 0.10.7"
+    ],
+    "name": "blaze-web",
     "version": "0.0.0"
    },
    {
@@ -1431,6 +1448,13 @@
     "name": "colored",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "2.2.0"
+   },
+   {
+    "dependencies": [
+     "syntax"
+    ],
+    "name": "const-ast",
+    "version": "0.0.0"
    },
    {
     "checksum": "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8",
@@ -2090,6 +2114,13 @@
     "version": "1.1.9"
    },
    {
+    "dependencies": [
+     "cc"
+    ],
+    "name": "flecs-c",
+    "version": "0.1.0"
+   },
+   {
     "checksum": "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1",
     "name": "fnv",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -2465,6 +2496,7 @@
    {
     "dependencies": [
      "base-db",
+     "const-ast",
      "cov-mark",
      "either",
      "expect-test",
@@ -2476,6 +2508,7 @@
      "itertools 0.15.0",
      "la-arena",
      "macros",
+     "parser",
      "project-model",
      "ra-ap-rustc_ast_ir",
      "ra-ap-rustc_pattern_analysis",
@@ -2488,6 +2521,7 @@
      "span",
      "stdx",
      "syntax",
+     "syntax-bridge",
      "test-fixture",
      "test-utils",
      "tracing",
@@ -6716,6 +6750,9 @@
     "blaze-fuzz": {
      "path": "crates/blaze-fuzz"
     },
+    "blaze-graph": {
+     "path": "crates/blaze-graph"
+    },
     "blaze-lints": {
      "path": "crates/blaze-lints"
     },
@@ -6749,6 +6786,9 @@
     "blaze-units": {
      "path": "crates/blaze-units"
     },
+    "blaze-web": {
+     "path": "crates/blaze-web"
+    },
     "camino": "1.2.2",
     "cargo_metadata": "0.23.1",
     "cfg": {
@@ -6757,6 +6797,10 @@
       "syntax"
      ],
      "path": "crates/cfg",
+     "version": "0.0.0"
+    },
+    "const-ast": {
+     "path": "crates/const-ast",
      "version": "0.0.0"
     },
     "crossbeam-channel": "0.5.15",
@@ -6773,6 +6817,9 @@
     },
     "either": "1.15.0",
     "expect-test": "1.5.1",
+    "flecs-c": {
+     "path": "vendor/flecs-c"
+    },
     "hashbrown": {
      "default-features": false,
      "features": [
@@ -8423,6 +8470,23 @@
    },
    "version": "0.0.0"
   },
+  "blaze-web@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "blaze's build page: the daemon serves the build, down to every function, on 127.0.0.1 (docs/web.md)",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-web",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-web",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
   "block-buffer@0.10.4": {
    "authors": "RustCrypto Developers",
    "description": "Buffer type for block processing of data",
@@ -8813,6 +8877,23 @@
     "kind": "registry"
    },
    "version": "2.2.0"
+  },
+  "const-ast@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "Typed views over a flat syntax tree as const fns, for const macros (docs/future/const-macros.md).",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "const-ast",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/const-ast",
+    "kind": "path"
+   },
+   "version": "0.0.0"
   },
   "const-oid@0.10.2": {
    "authors": "RustCrypto Developers",
@@ -9969,6 +10050,23 @@
     "kind": "registry"
    },
    "version": "1.1.9"
+  },
+  "flecs-c@0.1.0": {
+   "authors": "",
+   "description": "Flecs's amalgamated C (flecs/) built with cc, plus the declarations Rust calls it through",
+   "homepage": "",
+   "license": "MIT",
+   "license_file": "",
+   "links": "flecs",
+   "name": "flecs-c",
+   "readme": "",
+   "repository": "",
+   "rust_version": "",
+   "source": {
+    "dir": "vendor/flecs-c",
+    "kind": "path"
+   },
+   "version": "0.1.0"
   },
   "fnv@1.0.7": {
    "authors": "Alex Crichton <alex@alexcrichton.com>",
@@ -19176,6 +19274,10 @@
        "unit": "blaze-fmt@0.0.0 lib blaze_fmt build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_in_place",
        "unit": "blaze-in-place@0.0.0 lib blaze_in_place build"
       },
@@ -19234,6 +19336,10 @@
       {
        "name": "blaze_wasi",
        "unit": "blaze-wasi@0.0.0 lib blaze_wasi build"
+      },
+      {
+       "name": "blaze_web",
+       "unit": "blaze-web@0.0.0 lib blaze_web build"
       },
       {
        "name": "cargo_platform",
@@ -19558,6 +19664,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -19807,6 +19917,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -20054,6 +20168,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -20344,6 +20462,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -20729,6 +20851,47 @@
      "src": "src/lib.rs",
      "target": "blaze_fmt"
     },
+    "blaze-graph@0.0.0 lib blaze_graph build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.0.0 lib blaze_protocol build"
+      },
+      {
+       "name": "crossbeam_channel",
+       "unit": "crossbeam-channel@0.5.15 lib crossbeam_channel build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      },
+      {
+       "name": "serde_json",
+       "unit": "serde_json@1.0.150 lib serde_json build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-graph@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_graph"
+    },
     "blaze-in-place@0.0.0 lib blaze_in_place build": {
      "crate_type": "lib",
      "deps": [
@@ -20893,6 +21056,10 @@
       {
        "name": "span",
        "unit": "span@0.0.0 lib span build"
+      },
+      {
+       "name": "target_lexicon",
+       "unit": "target-lexicon@0.13.5 lib target_lexicon build"
       },
       {
        "name": "tt",
@@ -21612,6 +21779,108 @@
      "src": "src/lib.rs",
      "target": "blaze_wasi"
     },
+    "blaze-web@0.0.0 custom-build build-script-build build host": {
+     "crate_type": "bin",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "blaze-web@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "blaze-web@0.0.0 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "blaze-web@0.0.0 custom-build build-script-build build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "flecs-c@0.1.0 custom-build build-script-build run-custom-build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "blaze-web@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "blaze-web@0.0.0 lib blaze_web build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base64",
+       "unit": "base64@0.23.1 lib base64 build"
+      },
+      {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.0.0 lib blaze_protocol build"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "blaze-web@0.0.0 custom-build build-script-build run-custom-build"
+      },
+      {
+       "name": "flate2",
+       "unit": "flate2@1.1.9 lib flate2 build"
+      },
+      {
+       "name": "flecs_c",
+       "unit": "flecs-c@0.1.0 lib flecs_c build"
+      },
+      {
+       "name": "getrandom",
+       "unit": "getrandom@0.3.4 lib getrandom build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "sha1",
+       "unit": "sha1@0.10.7 lib sha1 build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-web@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_web"
+    },
     "block-buffer@0.10.4 lib block_buffer build": {
      "crate_type": "lib",
      "deps": [
@@ -22142,6 +22411,28 @@
      },
      "src": "src/lib.rs",
      "target": "cobs"
+    },
+    "const-ast@0.0.0 lib const_ast build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "source"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "const-ast@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "const_ast"
     },
     "const-oid@0.10.2 lib const_oid build": {
      "crate_type": "lib",
@@ -24349,6 +24640,87 @@
      "src": "src/lib.rs",
      "target": "flate2"
     },
+    "flecs-c@0.1.0 custom-build build-script-build build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "cc",
+       "unit": "cc@1.4.3 lib cc build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "rest"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "flecs-c@0.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "flecs-c@0.1.0 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "flecs-c@0.1.0 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "rest"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "flecs-c@0.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "flecs-c@0.1.0 lib flecs_c build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "flecs-c@0.1.0 custom-build build-script-build run-custom-build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "rest"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "flecs-c@0.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "flecs_c"
+    },
     "fnv@1.0.7 lib fnv build": {
      "crate_type": "lib",
      "deps": [],
@@ -25565,6 +25937,10 @@
        "unit": "base-db@0.0.0 lib base_db build"
       },
       {
+       "name": "const_ast",
+       "unit": "const-ast@0.0.0 lib const_ast build"
+      },
+      {
        "name": "cov_mark",
        "unit": "cov-mark@2.2.0 lib cov_mark build"
       },
@@ -25605,6 +25981,10 @@
        "unit": "macros@0.0.0 proc-macro macros build host"
       },
       {
+       "name": "parser",
+       "unit": "parser@0.0.0 lib parser build"
+      },
+      {
        "name": "ra_ap_rustc_ast_ir",
        "unit": "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build"
       },
@@ -25643,6 +26023,10 @@
       {
        "name": "stdx",
        "unit": "stdx@0.0.0 lib stdx build"
+      },
+      {
+       "name": "syntax_bridge",
+       "unit": "syntax-bridge@0.0.0 lib syntax_bridge build"
       },
       {
        "name": "syntax",
@@ -40380,6 +40764,10 @@
        "unit": "blaze-fmt@0.0.0 lib blaze_fmt build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_in_place",
        "unit": "blaze-in-place@0.0.0 lib blaze_in_place build"
       },
@@ -40438,6 +40826,10 @@
       {
        "name": "blaze_wasi",
        "unit": "blaze-wasi@0.0.0 lib blaze_wasi build"
+      },
+      {
+       "name": "blaze_web",
+       "unit": "blaze-web@0.0.0 lib blaze_web build"
       },
       {
        "name": "cargo_platform",
@@ -40762,6 +41154,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -41011,6 +41407,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -41258,6 +41658,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -41548,6 +41952,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -41933,6 +42341,47 @@
      "src": "src/lib.rs",
      "target": "blaze_fmt"
     },
+    "blaze-graph@0.0.0 lib blaze_graph build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.0.0 lib blaze_protocol build"
+      },
+      {
+       "name": "crossbeam_channel",
+       "unit": "crossbeam-channel@0.5.15 lib crossbeam_channel build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      },
+      {
+       "name": "serde_json",
+       "unit": "serde_json@1.0.150 lib serde_json build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-graph@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_graph"
+    },
     "blaze-in-place@0.0.0 lib blaze_in_place build": {
      "crate_type": "lib",
      "deps": [
@@ -42097,6 +42546,10 @@
       {
        "name": "span",
        "unit": "span@0.0.0 lib span build"
+      },
+      {
+       "name": "target_lexicon",
+       "unit": "target-lexicon@0.13.5 lib target_lexicon build"
       },
       {
        "name": "tt",
@@ -42816,6 +43269,108 @@
      "src": "src/lib.rs",
      "target": "blaze_wasi"
     },
+    "blaze-web@0.0.0 custom-build build-script-build build host": {
+     "crate_type": "bin",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "blaze-web@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "blaze-web@0.0.0 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "blaze-web@0.0.0 custom-build build-script-build build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "flecs-c@0.1.0 custom-build build-script-build run-custom-build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "blaze-web@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "blaze-web@0.0.0 lib blaze_web build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base64",
+       "unit": "base64@0.23.1 lib base64 build"
+      },
+      {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.0.0 lib blaze_protocol build"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "blaze-web@0.0.0 custom-build build-script-build run-custom-build"
+      },
+      {
+       "name": "flate2",
+       "unit": "flate2@1.1.9 lib flate2 build"
+      },
+      {
+       "name": "flecs_c",
+       "unit": "flecs-c@0.1.0 lib flecs_c build"
+      },
+      {
+       "name": "getrandom",
+       "unit": "getrandom@0.3.4 lib getrandom build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "sha1",
+       "unit": "sha1@0.10.7 lib sha1 build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-web@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_web"
+    },
     "block-buffer@0.10.4 lib block_buffer build": {
      "crate_type": "lib",
      "deps": [
@@ -43326,6 +43881,28 @@
      },
      "src": "src/lib.rs",
      "target": "cobs"
+    },
+    "const-ast@0.0.0 lib const_ast build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "source"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "const-ast@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "const_ast"
     },
     "const-oid@0.10.2 lib const_oid build": {
      "crate_type": "lib",
@@ -45478,6 +46055,87 @@
      "src": "src/lib.rs",
      "target": "flate2"
     },
+    "flecs-c@0.1.0 custom-build build-script-build build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "cc",
+       "unit": "cc@1.4.3 lib cc build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "rest"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "flecs-c@0.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "flecs-c@0.1.0 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "flecs-c@0.1.0 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "rest"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "flecs-c@0.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "flecs-c@0.1.0 lib flecs_c build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "flecs-c@0.1.0 custom-build build-script-build run-custom-build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "rest"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "flecs-c@0.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "flecs_c"
+    },
     "fnv@1.0.7 lib fnv build": {
      "crate_type": "lib",
      "deps": [],
@@ -46669,6 +47327,10 @@
        "unit": "base-db@0.0.0 lib base_db build"
       },
       {
+       "name": "const_ast",
+       "unit": "const-ast@0.0.0 lib const_ast build"
+      },
+      {
        "name": "cov_mark",
        "unit": "cov-mark@2.2.0 lib cov_mark build"
       },
@@ -46709,6 +47371,10 @@
        "unit": "macros@0.0.0 proc-macro macros build host"
       },
       {
+       "name": "parser",
+       "unit": "parser@0.0.0 lib parser build"
+      },
+      {
        "name": "ra_ap_rustc_ast_ir",
        "unit": "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build"
       },
@@ -46747,6 +47413,10 @@
       {
        "name": "stdx",
        "unit": "stdx@0.0.0 lib stdx build"
+      },
+      {
+       "name": "syntax_bridge",
+       "unit": "syntax-bridge@0.0.0 lib syntax_bridge build"
       },
       {
        "name": "syntax",
@@ -61457,6 +62127,10 @@
        "unit": "blaze-fmt@0.0.0 lib blaze_fmt build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_in_place",
        "unit": "blaze-in-place@0.0.0 lib blaze_in_place build"
       },
@@ -61515,6 +62189,10 @@
       {
        "name": "blaze_wasi",
        "unit": "blaze-wasi@0.0.0 lib blaze_wasi build"
+      },
+      {
+       "name": "blaze_web",
+       "unit": "blaze-web@0.0.0 lib blaze_web build"
       },
       {
        "name": "cargo_platform",
@@ -61839,6 +62517,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -62088,6 +62770,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -62335,6 +63021,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -62625,6 +63315,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -63010,6 +63704,47 @@
      "src": "src/lib.rs",
      "target": "blaze_fmt"
     },
+    "blaze-graph@0.0.0 lib blaze_graph build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.0.0 lib blaze_protocol build"
+      },
+      {
+       "name": "crossbeam_channel",
+       "unit": "crossbeam-channel@0.5.15 lib crossbeam_channel build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      },
+      {
+       "name": "serde_json",
+       "unit": "serde_json@1.0.150 lib serde_json build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-graph@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_graph"
+    },
     "blaze-in-place@0.0.0 lib blaze_in_place build": {
      "crate_type": "lib",
      "deps": [
@@ -63174,6 +63909,10 @@
       {
        "name": "span",
        "unit": "span@0.0.0 lib span build"
+      },
+      {
+       "name": "target_lexicon",
+       "unit": "target-lexicon@0.13.5 lib target_lexicon build"
       },
       {
        "name": "tt",
@@ -63893,6 +64632,108 @@
      "src": "src/lib.rs",
      "target": "blaze_wasi"
     },
+    "blaze-web@0.0.0 custom-build build-script-build build host": {
+     "crate_type": "bin",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "blaze-web@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "blaze-web@0.0.0 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "blaze-web@0.0.0 custom-build build-script-build build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "flecs-c@0.1.0 custom-build build-script-build run-custom-build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "blaze-web@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "blaze-web@0.0.0 lib blaze_web build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base64",
+       "unit": "base64@0.23.1 lib base64 build"
+      },
+      {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.0.0 lib blaze_protocol build"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "blaze-web@0.0.0 custom-build build-script-build run-custom-build"
+      },
+      {
+       "name": "flate2",
+       "unit": "flate2@1.1.9 lib flate2 build"
+      },
+      {
+       "name": "flecs_c",
+       "unit": "flecs-c@0.1.0 lib flecs_c build"
+      },
+      {
+       "name": "getrandom",
+       "unit": "getrandom@0.3.4 lib getrandom build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "sha1",
+       "unit": "sha1@0.10.7 lib sha1 build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-web@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_web"
+    },
     "block-buffer@0.10.4 lib block_buffer build": {
      "crate_type": "lib",
      "deps": [
@@ -64423,6 +65264,28 @@
      },
      "src": "src/lib.rs",
      "target": "cobs"
+    },
+    "const-ast@0.0.0 lib const_ast build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "source"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "const-ast@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "const_ast"
     },
     "const-oid@0.10.2 lib const_oid build": {
      "crate_type": "lib",
@@ -66661,6 +67524,87 @@
      "src": "src/lib.rs",
      "target": "flate2"
     },
+    "flecs-c@0.1.0 custom-build build-script-build build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "cc",
+       "unit": "cc@1.4.3 lib cc build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "rest"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "flecs-c@0.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "flecs-c@0.1.0 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "flecs-c@0.1.0 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "rest"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "flecs-c@0.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "flecs-c@0.1.0 lib flecs_c build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "flecs-c@0.1.0 custom-build build-script-build run-custom-build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "rest"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "flecs-c@0.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "flecs_c"
+    },
     "fnv@1.0.7 lib fnv build": {
      "crate_type": "lib",
      "deps": [],
@@ -67877,6 +68821,10 @@
        "unit": "base-db@0.0.0 lib base_db build"
       },
       {
+       "name": "const_ast",
+       "unit": "const-ast@0.0.0 lib const_ast build"
+      },
+      {
        "name": "cov_mark",
        "unit": "cov-mark@2.2.0 lib cov_mark build"
       },
@@ -67917,6 +68865,10 @@
        "unit": "macros@0.0.0 proc-macro macros build host"
       },
       {
+       "name": "parser",
+       "unit": "parser@0.0.0 lib parser build"
+      },
+      {
        "name": "ra_ap_rustc_ast_ir",
        "unit": "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build"
       },
@@ -67955,6 +68907,10 @@
       {
        "name": "stdx",
        "unit": "stdx@0.0.0 lib stdx build"
+      },
+      {
+       "name": "syntax_bridge",
+       "unit": "syntax-bridge@0.0.0 lib syntax_bridge build"
       },
       {
        "name": "syntax",
@@ -82688,6 +83644,10 @@
        "unit": "blaze-fmt@0.0.0 lib blaze_fmt build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_in_place",
        "unit": "blaze-in-place@0.0.0 lib blaze_in_place build"
       },
@@ -82746,6 +83706,10 @@
       {
        "name": "blaze_wasi",
        "unit": "blaze-wasi@0.0.0 lib blaze_wasi build"
+      },
+      {
+       "name": "blaze_web",
+       "unit": "blaze-web@0.0.0 lib blaze_web build"
       },
       {
        "name": "cargo_platform",
@@ -83070,6 +84034,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -83319,6 +84287,10 @@
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_lints",
        "unit": "blaze-lints@0.0.0 lib blaze_lints build"
       },
@@ -83566,6 +84538,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -83856,6 +84832,10 @@
       {
        "name": "blaze_expand",
        "unit": "blaze-expand@0.0.0 lib blaze_expand build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_lints",
@@ -84241,6 +85221,47 @@
      "src": "src/lib.rs",
      "target": "blaze_fmt"
     },
+    "blaze-graph@0.0.0 lib blaze_graph build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.0.0 lib blaze_protocol build"
+      },
+      {
+       "name": "crossbeam_channel",
+       "unit": "crossbeam-channel@0.5.15 lib crossbeam_channel build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.228 lib serde build"
+      },
+      {
+       "name": "serde_json",
+       "unit": "serde_json@1.0.150 lib serde_json build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-graph@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_graph"
+    },
     "blaze-in-place@0.0.0 lib blaze_in_place build": {
      "crate_type": "lib",
      "deps": [
@@ -84405,6 +85426,10 @@
       {
        "name": "span",
        "unit": "span@0.0.0 lib span build"
+      },
+      {
+       "name": "target_lexicon",
+       "unit": "target-lexicon@0.13.5 lib target_lexicon build"
       },
       {
        "name": "tt",
@@ -85124,6 +86149,108 @@
      "src": "src/lib.rs",
      "target": "blaze_wasi"
     },
+    "blaze-web@0.0.0 custom-build build-script-build build host": {
+     "crate_type": "bin",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "blaze-web@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "blaze-web@0.0.0 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "blaze-web@0.0.0 custom-build build-script-build build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "flecs-c@0.1.0 custom-build build-script-build run-custom-build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "blaze-web@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "blaze-web@0.0.0 lib blaze_web build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base64",
+       "unit": "base64@0.23.1 lib base64 build"
+      },
+      {
+       "name": "blaze_protocol",
+       "unit": "blaze-protocol@0.0.0 lib blaze_protocol build"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "blaze-web@0.0.0 custom-build build-script-build run-custom-build"
+      },
+      {
+       "name": "flate2",
+       "unit": "flate2@1.1.9 lib flate2 build"
+      },
+      {
+       "name": "flecs_c",
+       "unit": "flecs-c@0.1.0 lib flecs_c build"
+      },
+      {
+       "name": "getrandom",
+       "unit": "getrandom@0.3.4 lib getrandom build"
+      },
+      {
+       "name": "rustc_hash",
+       "unit": "rustc-hash@2.1.2 lib rustc_hash build"
+      },
+      {
+       "name": "sha1",
+       "unit": "sha1@0.10.7 lib sha1 build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-web@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_web"
+    },
     "block-buffer@0.10.4 lib block_buffer build": {
      "crate_type": "lib",
      "deps": [
@@ -85634,6 +86761,28 @@
      },
      "src": "src/lib.rs",
      "target": "cobs"
+    },
+    "const-ast@0.0.0 lib const_ast build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "source"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "const-ast@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "const_ast"
     },
     "const-oid@0.10.2 lib const_oid build": {
      "crate_type": "lib",
@@ -87817,6 +88966,87 @@
      "src": "src/lib.rs",
      "target": "flate2"
     },
+    "flecs-c@0.1.0 custom-build build-script-build build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "cc",
+       "unit": "cc@1.4.3 lib cc build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "rest"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "flecs-c@0.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "flecs-c@0.1.0 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "flecs-c@0.1.0 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "rest"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "flecs-c@0.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "flecs-c@0.1.0 lib flecs_c build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "flecs-c@0.1.0 custom-build build-script-build run-custom-build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "rest"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "flecs-c@0.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "flecs_c"
+    },
     "fnv@1.0.7 lib fnv build": {
      "crate_type": "lib",
      "deps": [],
@@ -89008,6 +90238,10 @@
        "unit": "base-db@0.0.0 lib base_db build"
       },
       {
+       "name": "const_ast",
+       "unit": "const-ast@0.0.0 lib const_ast build"
+      },
+      {
        "name": "cov_mark",
        "unit": "cov-mark@2.2.0 lib cov_mark build"
       },
@@ -89048,6 +90282,10 @@
        "unit": "macros@0.0.0 proc-macro macros build host"
       },
       {
+       "name": "parser",
+       "unit": "parser@0.0.0 lib parser build"
+      },
+      {
        "name": "ra_ap_rustc_ast_ir",
        "unit": "ra-ap-rustc_ast_ir@0.166.0 lib ra_ap_rustc_ast_ir build"
       },
@@ -89086,6 +90324,10 @@
       {
        "name": "stdx",
        "unit": "stdx@0.0.0 lib stdx build"
+      },
+      {
+       "name": "syntax_bridge",
+       "unit": "syntax-bridge@0.0.0 lib syntax_bridge build"
       },
       {
        "name": "syntax",

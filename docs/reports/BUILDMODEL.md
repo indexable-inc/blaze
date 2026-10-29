@@ -1,3 +1,8 @@
+---
+status: record
+summary: Cargo's build model in blaze: units, profiles and plans.
+date: 2026-10-20
+---
 # Cargo's build model in blaze
 
 Branch `blaze-build-model`. The head has `blaze-collate-next` 1b022ff6f2 merged in (before

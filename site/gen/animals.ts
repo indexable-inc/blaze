@@ -40,6 +40,9 @@ export const ellipse = (tone: Tone, cx: number, cy: number, rx: number, ry: numb
 	};
 };
 export const circle = (tone: Tone, cx: number, cy: number, r: number, pair = false) => ellipse(tone, cx, cy, r, r, 0, pair);
+/** A rectangle with corners rounded by `r`. */
+export const rrect = (tone: Tone, x: number, y: number, w: number, h: number, r: number, pair = false): Shape =>
+	path(tone, `M${pts(x + r, y)}H${r2(x + w - r)}Q${pts(x + w, y, x + w, y + r)}V${r2(y + h - r)}Q${pts(x + w, y + h, x + w - r, y + h)}H${r2(x + r)}Q${pts(x, y + h, x, y + h - r)}V${r2(y + r)}Q${pts(x, y, x + r, y)}Z`, pair);
 
 /** A ring of `n` bumps (`depth` deep) around a circle, from angle `from` to `to` (degrees, 0 = right, clockwise). */
 function bumpy(tone: Tone, cx: number, cy: number, r: number, n: number, depth: number, pointed: boolean, from = 0, to = 360): Shape {
@@ -578,6 +581,23 @@ export const ANIMALS: { name: string; draw: Part }[] = [
 
 if (ANIMALS.length !== 32) throw new Error(`gen/animals.ts: ${ANIMALS.length} animals, want 32`);
 
+/**
+ * The face of a crawler or other automation (worker/bots.ts): a robot, drawn in the same kit and tone slots, but not one
+ * of ANIMALS, so no person is ever drawn as one. styles/shell.css gives `.face.bot` its own steel tones.
+ */
+export const ROBOT: { name: string; draw: Part } = {
+	name: 'Robot',
+	draw: animal(
+		[line('a2', 1.3, 'M16 4.8V8.6'), circle('a3', 16, 4.2, 1.7)],
+		[rrect('a2', 3.2, 14.4, 3.4, 7.2, 1.2, true)],
+		[rrect('a1', 5.6, 8.2, 20.8, 19.6, 4.6)],
+		[rrect('a2', 8.4, 11.6, 15.2, 9.6, 3.2)],
+		eyes.dot({ dx: 3.9, y: 16.4, r: 2.1, tone: 'a3' }),
+		[rrect('a3', 11.4, 22.6, 9.2, 2.9, 1.1)],
+		[line('a2', 0.8, 'M14.1 22.9V25.2M16 22.9V25.2M17.9 22.9V25.2')],
+	),
+};
+
 /** The symbol id of an animal: `animal-otter`. */
 export const symbolId = (name: string) => `animal-${name.toLowerCase()}`;
 
@@ -633,8 +653,8 @@ export function animalSvg(draw: Part): string {
 	return out;
 }
 
-/** The sprite: every animal as a `<symbol>`. */
+/** The sprite: every animal, and the robot, as a `<symbol>`. */
 export function sprite(): string {
-	const symbols = ANIMALS.map((a) => `<symbol id="${symbolId(a.name)}" viewBox="0 0 32 32">${animalSvg(a.draw)}</symbol>`);
+	const symbols = [...ANIMALS, ROBOT].map((a) => `<symbol id="${symbolId(a.name)}" viewBox="0 0 32 32">${animalSvg(a.draw)}</symbol>`);
 	return `<svg xmlns="http://www.w3.org/2000/svg">${symbols.join('')}</svg>\n`;
 }

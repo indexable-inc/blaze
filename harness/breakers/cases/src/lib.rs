@@ -174,6 +174,7 @@ cases![
     line_continuation,
     static_in_static,
     type_id_of_fn,
+    type_id_shadowed_param,
     glob_of_root,
     std_in_root,
     unnamed_parameter,

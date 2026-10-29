@@ -3,7 +3,7 @@
 // from the body itself. A closure is named by its place among the closures of its body, so the
 // patch calls the base's `caught::<{closure#0}>`, which nothing the patch compiled reached
 // before: the new code of the closure behind it has to come with it, or the old one runs.
-// Again: edits.py check closure-called-again.rs
+// Again: edits.py check '{"files": ["closure-called-again.rs"]}'
 mod c0 {
     use super::*;
     pub fn run() {

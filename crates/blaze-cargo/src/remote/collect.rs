@@ -24,7 +24,7 @@ use super::{
 };
 
 /// The directories of a remote whose objects a list names.
-const NAMED: [&str; 3] = ["packs/", "keys/", "units/"];
+const NAMED: [&str; 4] = ["packs/", "keys/", "units/", "index/"];
 
 /// How long an object is given.
 pub struct Ages {
@@ -89,6 +89,11 @@ pub async fn collect(remote: &Remote, ages: &Ages) -> anyhow::Result<String> {
     let mut collected = Collected::default();
     let packs = by_name(remote.list("packs/").await?);
     for manifest in remote.list("manifests/").await? {
+        // An index names packs of its manifest, and a push takes out what that no longer
+        // lists.
+        if manifest.name.ends_with(super::index::SUFFIX) {
+            continue;
+        }
         delist(remote, &manifest.name, &packs, ages, &mut collected).await?;
     }
     sweep(remote, ages, &mut collected).await?;
@@ -211,6 +216,10 @@ async fn named(remote: &Remote) -> anyhow::Result<BTreeSet<String>> {
     let mut named = BTreeSet::new();
     for list in remote.list("manifests/").await? {
         let lines = lines_of(remote, &list.name).await?;
+        if list.name.ends_with(super::index::SUFFIX) {
+            named.extend(super::index::named(remote, &lines).await?);
+            continue;
+        }
         for (pack, listed) in Manifest::parse(&lines).0 {
             named.insert(listed.object(&pack).0);
             named.insert(keys_object(&listed.keys));
