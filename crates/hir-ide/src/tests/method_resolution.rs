@@ -1461,6 +1461,73 @@ fn f() {
     );
 }
 
+/// macro_rules_attribute-proc_macro 0.2's `CollectVec`, whose one impl is in its own default
+/// method: rustc sees an impl wherever it is written.
+#[test]
+fn trait_impl_in_a_default_method_of_its_trait() {
+    check_types(
+        r#"
+//- minicore: iterator
+trait CollectVec: IntoIterator + Sized {
+    fn vec(self) -> u16 {
+        impl<T: IntoIterator> CollectVec for T {}
+        0
+    }
+}
+
+struct S;
+impl Tr for S {}
+trait Tr {
+    const C: () = {
+        impl S {
+            fn inherent(&self) -> u32 { 0 }
+        }
+    };
+}
+
+fn f(it: core::option::Option<u8>) {
+    it.vec();
+  //^^^^^^^^ u16
+    S.inherent();
+  //^^^^^^^^^^^^ u32
+}
+    "#,
+    );
+}
+
+/// macro_rules_attribute-proc_macro's `CollectVec`, whose blanket impl is in the body of the
+/// trait's own default method, and an inherent impl in a trait's default constant.
+#[test]
+fn impls_in_a_traits_default_bodies() {
+    check_types(
+        r#"
+struct S;
+
+trait CollectVec: Sized {
+    fn vec(self) -> u16 {
+        impl<T> CollectVec for T {}
+        0
+    }
+}
+
+trait Tr {
+    const C: () = {
+        impl S {
+            fn method(&self) -> u32 { 0 }
+        }
+    };
+}
+
+fn f() {
+    S.vec();
+  //^^^^^^^ u16
+    S.method();
+  //^^^^^^^^^^ u32
+}
+    "#,
+    );
+}
+
 #[test]
 fn inherent_impl_in_unnamed_const() {
     check_types(
