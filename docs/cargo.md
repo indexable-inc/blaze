@@ -136,8 +136,8 @@ build, which says which and why; nothing is handed to cargo or rustc:
 What blaze does not build yet fails the same way, saying what: the targets `--bins`,
 `--examples`, `--tests`, `--benches` and `--all-targets` pick, several `--target`s,
 `--target-dir`, `--message-format`, `-Z`, and `--build-plan` and `--unit-graph`, and a
-library whose crate types include `staticlib` or `dylib` when the build would write it (a
-plain `build`, or `--lib`): blaze does not link one yet, and says which
+library whose crate types include `dylib` when the build would write it (a plain `build`,
+or `--lib`): blaze does not link one yet, and says which
 ([#262](https://github.com/indexable-inc/blaze/issues/262)). A library's `cdylib` (a native
 Node addon, a Python extension, a plugin) is a program of the build: a plain `build` or
 `--lib` links it as a shared library at cargo's path (`target/debug/lib<name>.so`, `.dylib`
@@ -146,7 +146,14 @@ names with `#[no_mangle]` or `#[export_name]` and nothing else, with the package
 `cargo:rustc-link-arg` and `cargo:rustc-cdylib-link-arg`. Each build after an edit compiles
 what changed on what the worker loaded and links the library again; it is not spliced, so an
 exported function an edit adds is exported. A host that loaded the library (node, python)
-loads it again to see the edit. A build of other libraries alone (`--lib`, or a workspace with
+loads it again to see the edit. A library's `staticlib` (dynamo's C API) is built as its
+`cdylib` would be, and that shared library is linked beside it, which leaves out what its
+exports do not reach: a function blaze cannot compile that they reach fails the build. It is
+written at cargo's path (`target/debug/lib<name>.a`), and holds blaze's objects of what the
+exports reach, the standard library's object, and, as rustc bundles them, the members of each static
+native library the crates link (a build script's `rustc-link-lib=static=`, a `#[link]` of
+`kind = "static"`) but one that says `-bundle`. What they link shared is for the program that
+links the archive to name, as with rustc's. A build of other libraries alone (`--lib`, or a workspace with
 no program) is the daemon's check of them: blaze writes no `rlib` for cargo, and says what it
 finds.
 
@@ -355,7 +362,8 @@ it (blaze or rustc), and the daemon's own reruns of one, runs in the sandbox tes
 one place a script is run. A script is given, of what cargo gave it, what cargo sets for
 scripts (`CARGO_*`, `DEP_*`, `OUT_DIR`, `TARGET`, `PROFILE`, ...), the C compiler's and
 pkg-config's variables (`CC`, `CFLAGS_<target>`, `PKG_CONFIG_PATH`, `NIX_CFLAGS_COMPILE`,
-`CPATH`, `SOURCE_DATE_EPOCH`, ...), `PATH`, `HOME`, `LANG` and the rest tests are given, and
+`CPATH`, `SOURCE_DATE_EPOCH`, ...), bindgen's (`LIBCLANG_PATH`, `CLANG_PATH`,
+`LLVM_CONFIG_PATH`, `BINDGEN_EXTRA_CLANG_ARGS_<target>`), `PATH`, `HOME`, `LANG` and the rest tests are given, and
 what the root manifest's `build-script-env` names, and what it says it reads
 (`cargo:rerun-if-env-changed=OPENSSL_DIR`) as cargo has it; what else the shell had is not
 there. A run that said it reads a variable it was not given saw it unset, so the script runs
@@ -382,14 +390,20 @@ A script that fails having been refused a write or a connection says so under it
 
     note: the build script of `sys-crate` failed in the sandbox, which refused it writing `/home/me/ws/sys-crate/src/bindings.rs` (the machine is read-only in a sandbox); if it needs that, run it outside: `unsandboxed-build-scripts = ["sys-crate"]` under `[workspace.metadata.blaze.sandbox]` in /home/me/ws/Cargo.toml (or `build-script = false` under `[package.metadata.blaze.sandbox]` in its own manifest, for a package of the workspace), or `BLAZE_SANDBOX=off` for every build script and test of the command
 
-A script that downloads a prebuilt library (`v8`, `ort-sys`, `webrtc-sys`) is given it
-instead, pinned as Nix pins a fixed-output derivation. `blaze lock --fetches` (`--target
-<triple>` for each target, the host's by default) works out each download of the workspace's
-resolve, keeps its bytes in blaze's store by their sha256 and writes them into
-`Cargo.fetches.lock` beside `Cargo.lock`, by the package's name, version and `Cargo.lock`
-checksum (commit it). A build writes the store's copy below the target directory and sets the
-crate's own variable for a local copy to it; a missing or stale entry fails the build, naming
-the command, and nothing is downloaded. The crates blaze knows and their variables are
+A script that downloads a prebuilt library (`v8`, `ort-sys`, `webrtc-sys`, `skia-bindings`,
+`ffmpeg-sys-fframes`) is given it instead, pinned as Nix pins a fixed-output derivation.
+`blaze lock --fetches` (`--target <triple>` for each target, the host's by default) works out
+each download of the workspace's resolve, keeps its bytes in blaze's store by their sha256 and
+writes them into `Cargo.fetches.lock` beside `Cargo.lock`, by the package's name, version and
+`Cargo.lock` checksum and the features that pick it (commit it). A download that depends on
+features is locked for those of one build with that build's `-p`, `--workspace` or `--exclude`
+(and `--tests` for `blaze test`'s), each feature set an entry of its own. A build writes the
+store's copy below the target directory and sets the crate's own variable for a local copy to
+it; a missing or stale entry fails the build, naming the command, and nothing is downloaded.
+A script that clones a repository (`ffmpeg-sys-fframes`' FFmpeg, for the feature sets it has
+no prebuilt one of) is given the locked tarball of its branch as a git repository of one
+commit, which git's `url.<repository>.insteadOf` (`GIT_CONFIG_COUNT`) makes its clone of the
+address. The crates blaze knows and their variables are
 `OVERRIDES` in `crates/blaze-cargo/src/cargo/fetches.rs`; a script refused the network that it does
 not know is told which variable an entry there would set.
 
@@ -630,6 +644,17 @@ store like a build script's. The macro's `proc_macro` crate is a shim
 `syn`, `quote` and `proc-macro2` build unchanged. A module is linked with the wasi-libc of
 the toolchain's `wasm32-wasip1` target. When the toolchain does not have that target, blaze
 runs `rustup target add wasm32-wasip1` for it, once.
+
+In blaze's own target directory, the build script of each library a module links runs again
+for the module, as cargo runs it for a library built for `wasm32-wasip1`: `TARGET` and the
+`CARGO_CFG_*` are that target's, with an `OUT_DIR` of its own (`wasm32-wasip1/out` beside the
+host's), and the `DEP_*` of the other scripts' runs for it. What it compiles of C is then
+WebAssembly, as the module's link needs: zstd-sys compiles zstd with clang for it (a C
+compiler with a `wasm32` backend, and llvm-ar, as cc-rs takes them; `CC_wasm32_wasip1` and
+`AR_wasm32_wasip1` name others). The script of a crate that links `proc_macro` (a proc
+macro, proc-macro2), which is not told it is on WASI, runs as for the host, as for rustc's
+build of a proc macro. What the load reads of a package stays the run for the host.
+`harness/wasmcmacro.py` holds a macro that calls such C to cargo's expansion.
 
 A module sees only what cargo documents for a proc macro:
 
@@ -1051,6 +1076,17 @@ second, over that, the daemon stops the worker asked longest ago, and the next b
 workspace is cargo's while a worker loads it again. A worker that is answering or loading is
 never stopped, nor is the one asked last, nor any while a program takes live edits.
 
+A worker whose first build compiled from cold holds about twice what one started from the
+store holds: 4.4 GB against 2.3 GB for a 94-crate program, and 5.2 GB against 2.2 GB once
+edited, whose edits it also built in 1.9 s against 0.23 s, expanding again the macros it did
+not yet know to keep no state
+([#1299](https://github.com/indexable-inc/blaze/issues/1299)). Once the store has all that
+build kept, the worker writes `settles` beside its socket; after it has gone 10 s unasked,
+and while no program takes live edits, the daemon lets it go and starts a worker from the
+store in its place, which keeps the old one's log as `log.cold`. A build asked meanwhile
+waits for the new worker as for any that loads. A worker of several checkouts is not
+swapped.
+
 A client and a daemon built from different sources do not talk to each other. A daemon that
 gets a build request from another version stops its workers and exits, and the client
 starts its own.
@@ -1171,6 +1207,7 @@ started it. To change one, run `blaze stop` first.
 | `BLAZE_HOME` | the daemon's directory (also read by every client) | see above |
 | `BLAZE_IDLE_SECS` | seconds without a request before the daemon exits; 0 is never | 1800 |
 | `BLAZE_MEMORY_MAX` | the most the workers hold together, a size such as `6G`, or `off` | half the machine's memory (on Linux, or of what its control group allows) |
+| `BLAZE_MEMORY_BUDGET` | the limit of the memory budget the daemon says at start (`memory budget:` in its log; [memory-budget.md](memory-budget.md)), a size such as `12G`, or `off`; the budget is that less what other processes hold and a reserve of 5% (at least 512 MB) | the machine's memory, or the fewest its control groups' `memory.max` and `memory.high` allow |
 | `BLAZE_SPARE` | `ready` keeps a spare worker with the library loaded at all times, for the next project; `0` starts none, and a workspace loads once cargo has built it | a spare for each build of a new workspace, as it begins |
 | `BLAZE_OWN_BASE_MEMORY` | the most a worker may hold while it builds its own base in the background, a size such as `40G`, past which it gives that base up and edits patch rustc's executable; `off` is no bound | a quarter of the machine's memory (on Linux, or of what its control group allows) |
 | `BLAZE_LRU` | how many values of the queries a build in full holds the most of a worker keeps once the build is over, `mir=N,runtime=N,compiled=N,inlinable=N` (lowered MIR, runtime and monomorphized MIR, each instance's code, bodies to inline); 0 keeps every value. One let go is computed again when an edit asks for it ([#261](https://github.com/indexable-inc/blaze/issues/261)) | `mir=2048,runtime=2048,compiled=16384,inlinable=8192` |

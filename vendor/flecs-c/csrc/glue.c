@@ -1,6 +1,7 @@
 /* The things Rust would otherwise have to mirror flecs's large structs for: setting the OS
  * API hooks (ecs_os_api_t), listing children and roots (ecs_iter_t, ecs_query_desc_t), and the sizes of the structs Rust does
  * mirror, for a test that compares them on every target. */
+#include <float.h>
 #include <stddef.h>
 #include "flecs.h"
 
@@ -456,8 +457,8 @@ static void glue_range_ctor(void *ptr, int32_t count, const ecs_type_info_t *ti)
     (void)ti;
     double *r = ptr;
     for (int32_t i = 0; i < count; i++) {
-        r[2 * i] = -__DBL_MAX__;
-        r[2 * i + 1] = __DBL_MAX__;
+        r[2 * i] = -DBL_MAX;
+        r[2 * i + 1] = DBL_MAX;
     }
 }
 

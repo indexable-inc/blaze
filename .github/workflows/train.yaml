@@ -19,8 +19,8 @@
 # When it runs on pushes to main (off for now, see `on:`), one train runs at a time; a push while it runs waits, and a
 # newer push replaces the one waiting, so the train runs on the newest commit of main as soon
 # as the one before is done. A run cancelled by each push (`cancel-in-progress`) would never end
-# while main takes a merge every few minutes, and a train takes about 45. The group is per ref:
-# a train run by hand on a branch (contributing.md: before landing what the fast tier does not
+# while main takes a merge every few minutes, and a train takes about 45. Trains on release tags share one group (below);
+# any other ref has a group of its own: a train run by hand on a branch (contributing.md: before landing what the fast tier does not
 # cover) neither waits behind main's nor takes the place of main's waiting one.
 name: train
 # By hand only for now (2026-10-27): on every push it never finished (a run waited hours on
@@ -29,8 +29,11 @@ name: train
 on:
   workflow_dispatch:
 
+# Every train on a release tag shares one group: one runs at a time, and a newer tag's train
+# replaces the one waiting, so the train always moves on to the newest release once the running
+# one ends, and two releases' trains never share the runners.
 concurrency:
-  group: train-${{ github.ref }}
+  group: ${{ startsWith(github.ref, 'refs/tags/') && 'train-tags' || format('train-{0}', github.ref) }}
   cancel-in-progress: false
 
 permissions:

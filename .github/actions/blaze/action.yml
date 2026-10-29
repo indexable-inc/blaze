@@ -6,9 +6,14 @@
 # (crates/hir-ty-codegen/llvm.json), fetched by its sha256 and named by LLVM_SYS_231_PREFIX, for
 # a build of the `llvm` feature. No Nix: the C compiler and linker are the runner's own (gcc and
 # glibc on Ubuntu, Xcode's clang on macOS), so what the build links runs on the runner as it is.
-# The remote's project is the job's, the platform's and the release's: what one release of blaze
-# compiled is no use to the next, and a project's manifest only grows, so each release starts
-# one of its own.
+# The remote's project is the job's, the platform's, and what the store's keys are made with
+# (`blaze-engine cache build`: the store's format and the hash of every source blaze is compiled
+# from, its pinned nightly and LLVM among them), not the release. A key already holds all of
+# those, so the name only picks which packs are worth pulling, never what a key finds: two
+# releases built from the same crates, as most of the release train's are, share their store, and
+# a release whose sources changed starts a project of its own, as its keys would miss every older
+# pack anyway and a project's manifest only grows. A project with no manifest yet pulls nothing;
+# no run reads another project's.
 name: blaze
 description: the release of blaze .github/blaze-version names, its toolchain, and the store main's runs pushed
 inputs:
@@ -34,10 +39,11 @@ runs:
         if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
           sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
         fi
-    # The release .github/blaze-version names, not the newest canary: a store is of one release,
-    # and canaries come every 40 minutes, sooner than a cold run (about an hour) ends and pushes,
-    # so with the newest every run would be cold. A pull request that changes the file moves
-    # the gate to that release; it and main's next run are cold once.
+    # The release .github/blaze-version names, not the newest canary: canaries come every 40
+    # minutes, sooner than a cold run (about an hour) ends and pushes, so with the newest every
+    # run whose canary changed blaze's sources would be cold. A pull request that moves the gate
+    # to a release built from other sources, and main's next run, are cold once; one that moves
+    # it to a release of the same sources keeps the store.
     - name: blaze (the release .github/blaze-version names)
       id: install
       shell: bash
@@ -56,7 +62,9 @@ runs:
         # BLAZE_CACHE_MAX"), so a warm run still rebuilt what they held. A runner's disk lives
         # for one job, so nothing needs collecting.
         echo "BLAZE_CACHE_MAX=off" >> "$GITHUB_ENV"
-        echo "project=blaze-$RUNNER_OS-$RUNNER_ARCH-$JOB-$version" | tee -a "$GITHUB_OUTPUT"
+        build=$(blaze-engine cache build) || { echo "::error::blaze-engine cache build failed: blaze $version cannot say what its store keys are made with"; exit 1; }
+        [[ "$build" =~ ^[0-9a-f]{16}$ ]] || { echo "::error::blaze-engine cache build said '$build', not sixteen hex digits"; exit 1; }
+        echo "project=blaze-$RUNNER_OS-$RUNNER_ARCH-$JOB-$build" | tee -a "$GITHUB_OUTPUT"
     # The pinned LLVM, as a contributor outside Nix gets it (docs/contributing.md, "LLVM for
     # `--features llvm`"): llvm.py fetches the archive llvm.json names for this host, checks its
     # sha256 and unpacks it; crates/hir-ty-codegen/build.rs refuses any other prefix. Below
@@ -78,7 +86,7 @@ runs:
         sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
         python3 .github/scripts/llvm.py fetch --target "$triple" --dir "/usr/local/lib/blaze-llvm/$triple"
         echo "LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/$triple" >> "$GITHUB_ENV"
-    # A cold store (a new release, or a project main has not pushed yet) builds blaze in about
+    # A cold store (a release of other sources, or a project main has not pushed yet) builds blaze in about
     # 28 GB, more than a hosted runner's 16 (rcache, #664): swap lets that run finish, slowly,
     # where it would be killed, and the warm runs after it never touch it.
     - name: swap

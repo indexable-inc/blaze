@@ -102,6 +102,8 @@ tar = "0.4.44"
 # The zips build scripts download, unpacked where a crate's variable names a directory
 # (`cargo/fetches.rs`): deflate on flate2, which is in the tree already.
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+# The `.tar.gz` files build scripts download (FFmpeg's source, `cargo/fetches.rs`).
+flate2 = "1.1.9"
 zstd = "0.13.3"
 # The `.tar.xz` files of blaze's own toolchain (`cargo/toolchain/own.rs`): in Rust, within 1.3x
 # of liblzma's time on rustc's 84 MB.

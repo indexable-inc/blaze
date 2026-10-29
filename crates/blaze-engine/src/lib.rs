@@ -137,6 +137,9 @@ struct Args {
     /// `exe` is a shared library of the crate asked for, as a proc macro's is
     /// (docs/no-rustc.md, step J2), not an executable.
     shared: bool,
+    /// `exe` is the archive of a `staticlib`, with `shared`: what the shared library would
+    /// have, archived ([`link::archive`]).
+    staticlib: bool,
     /// Where to write, after `exe` is linked, the dep-info rustc would have of the crate asked
     /// for: the files of its modules, as cargo reads them to know when to build it again.
     dep_info: Option<PathBuf>,
@@ -252,6 +255,7 @@ impl Args {
         let mut prebuilt = None;
         let mut exe = None;
         let mut shared = false;
+        let mut staticlib = false;
         let mut run_tool = false;
         let mut dep_info = None;
         let mut inputs = None;
@@ -293,6 +297,7 @@ impl Args {
                 "--prebuilt" => prebuilt = Some(PathBuf::from(value()?)),
                 "--exe" => exe = Some(PathBuf::from(value()?)),
                 "--shared" => shared = true,
+                "--staticlib" => staticlib = true,
                 "--run-tool" => run_tool = true,
                 "--dep-info" => dep_info = Some(PathBuf::from(value()?)),
                 "--inputs" => inputs = Some(PathBuf::from(value()?)),
@@ -332,6 +337,9 @@ impl Args {
         if shared && exe.is_none() {
             bail!("--shared says what --exe links, and there is no --exe");
         }
+        if staticlib && !shared {
+            bail!("--staticlib archives what --shared links, and there is no --shared");
+        }
         if run_tool && target.as_deref() != Some(RUN_TOOL_TARGET) {
             bail!("--run-tool is for build scripts compiled for --target {RUN_TOOL_TARGET}");
         }
@@ -353,6 +361,7 @@ impl Args {
             prebuilt,
             exe,
             shared,
+            staticlib,
             dep_info,
             inputs,
             library: false,
@@ -2934,14 +2943,15 @@ impl Checkouts {
         }
         let workspaces_at = start.elapsed();
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        let added_at = start.elapsed();
         *lock(&UNEDITED) = Unedited::of(self.loaded.workspaces());
         prepare_macro_sessions(db);
         if std::env::var_os("BLAZE_STATS").is_some() {
-            let files = start.elapsed() - workspaces_at;
             eprintln!(
-                "load-us: workspaces={} files={}",
+                "load-us: workspaces={} files={} sessions={}",
                 workspaces_at.as_micros(),
-                files.as_micros()
+                (added_at - workspaces_at).as_micros(),
+                (start.elapsed() - added_at).as_micros()
             );
         }
         self.roots.extend(roots);
@@ -5006,21 +5016,36 @@ fn link_executable(
     });
     let exports = exports.transpose()?;
     blaze_macro_wasm::flush();
+    // A `staticlib` is linked as the `cdylib` of it would be, beside it, which leaves out
+    // what its exports do not reach: the stand-ins left are what a program linking the
+    // archive can reach, and a link that fails is one that program's would.
+    let linked = match args.staticlib {
+        true => {
+            let mut beside = exe.as_os_str().to_owned();
+            beside.push(".shared");
+            PathBuf::from(beside)
+        }
+        false => exe.to_path_buf(),
+    };
     let took = link::executable(
         db,
         &program,
         &objects,
         sysroot,
-        exe,
+        &linked,
         exports.as_deref(),
         &args.link_args,
         args.debug.level,
     )
     .map_err(|it| refused_linked(it, args))?;
-    let stand_ins = link::stand_ins(exe)?;
+    let stand_ins = link::stand_ins(&linked);
+    if args.staticlib {
+        _ = std::fs::remove_file(&linked);
+    }
+    let stand_ins = stand_ins?;
     eprintln!(
         "linked {} in {took:.1?}, {} functions in it blaze could not compile",
-        exe.display(),
+        linked.display(),
         stand_ins.len()
     );
     // What the link kept of the stand-ins is what the program can reach, the standard
@@ -5034,6 +5059,10 @@ fn link_executable(
             cargo::whole::without_hashes(it)
         });
         bail!("{}", refused_error(&args.krate, stand_ins.len(), said));
+    }
+    if args.staticlib {
+        let took = link::archive(db, &program, &objects, exe)?;
+        eprintln!("archived {} in {took:.1?}", exe.display());
     }
     Ok(())
 }
@@ -6670,7 +6699,7 @@ impl Unedited {
                     // A registry by its layout, `<home>/registry/src/<index>/<package>`: a
                     // directory only named `registry` above a vendored package can be the
                     // project's own.
-                    let Some(home) = cargo::hermetic::cargo_home_of(&dir) else { continue };
+                    let Some(home) = cargo::home::cargo_home_of(&dir) else { continue };
                     let registry = home.join("registry");
                     if dir.starts_with(&registry) {
                         install(&mut unedited.installed, registry);
@@ -6858,6 +6887,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             prebuilt: args.prebuilt.clone(),
             exe: args.exe.clone(),
             shared: args.shared,
+            staticlib: args.staticlib,
             dep_info: None,
             inputs: None,
             library: args.library,
@@ -6952,6 +6982,8 @@ struct Target {
     exe: Option<PathBuf>,
     /// `exe` is a shared library, a `cdylib` (#262).
     shared: bool,
+    /// `exe` is the archive of a `staticlib`, with `shared` ([`Args::staticlib`]).
+    staticlib: bool,
     /// It is the unit tests of the target `krate` names ([`Args::unit_test`]).
     unit_test: bool,
     /// What its link takes that rustc compiled. Code rustc instantiated for one program is in
@@ -6973,6 +7005,7 @@ impl Target {
             splice: args.splice.clone(),
             exe: args.exe.clone(),
             shared: args.shared,
+            staticlib: args.staticlib,
             unit_test: args.unit_test,
             symbol_files: args.symbol_files.clone(),
         }
@@ -7000,6 +7033,7 @@ impl Target {
             splice,
             exe,
             shared,
+            staticlib,
             unit_test,
             symbol_files,
         } = self;
@@ -7035,6 +7069,7 @@ impl Target {
             splice,
             exe,
             shared,
+            staticlib,
             unit_test,
             symbol_files,
             ..daemon.clone()
@@ -7078,6 +7113,7 @@ impl Target {
                     splice,
                     exe,
                     shared: false,
+                    staticlib: false,
                     unit_test,
                     symbol_files,
                 }))
@@ -7125,7 +7161,8 @@ impl Target {
             link_cmd: given(link_cmd),
             splice: given(splice).map(PathBuf::from),
             exe: given(exe).map(PathBuf::from),
-            shared: shared == "shared",
+            shared: shared == "shared" || shared == "staticlib",
+            staticlib: shared == "staticlib",
             unit_test: unit_test == cargo::plan::UNIT_TEST,
             symbol_files: symbol_files.iter().map(PathBuf::from).collect(),
         })
@@ -7157,7 +7194,11 @@ impl Target {
             self.link_cmd.as_deref().unwrap_or_default(),
             self.splice.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
             self.exe.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
-            if self.shared { "shared" } else { "" },
+            match (self.shared, self.staticlib) {
+                (true, true) => "staticlib",
+                (true, false) => "shared",
+                (false, _) => "",
+            },
             if self.unit_test { cargo::plan::UNIT_TEST } else { "" }
         );
         for file in &self.symbol_files {
@@ -9190,6 +9231,9 @@ fn run_holding(
     let sysroot = checkouts.loaded.workspaces().first().and_then(|it| it.sysroot.root());
     let _ = SYSROOT.set(sysroot.map(|it| AsRef::<Path>::as_ref(it).to_owned()));
     let from_manifest;
+    // Whether the store is keeping the program as this build compiled it from cold: a worker
+    // started once it has settled would load it from there.
+    let mut kept = false;
     // What the compile of the program counted, for what is said of it once it is built.
     let mut counted = None;
     let cold = {
@@ -9231,9 +9275,9 @@ fn run_holding(
                 counted = compiling.counted();
                 let mut cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
                 // An `include!` in a body is first seen when the body is compiled. Only the
-                // crates that include the file, and what depends on them, compiled without
-                // it: touching every crate compiles all of a program from the store again to
-                // tell what changed.
+                // crates that named the file, and what depends on them, compiled without it:
+                // touching every crate compiles all of a program from the store again to tell
+                // what changed.
                 let including = tree.including(&db);
                 if WatchedFile::include_sources(&mut files, &mut tree, &mut db) != Loaded::Nothing {
                     let named: Vec<String> = including
@@ -9243,10 +9287,14 @@ fn run_holding(
                             name.map_or_else(|| "?".to_owned(), ToString::to_string)
                         })
                         .collect();
+                    if including.is_empty() {
+                        bail!(
+                            "a file an `include!` or a module named was loaded late, with no crate noted as naming it"
+                        );
+                    }
                     eprintln!("included late, by {}", named.join(", "));
-                    let crates = (!including.is_empty()).then_some(&including[..]);
-                    known.touch(&db, crates);
-                    listed.touch(&db, crates);
+                    known.touch(&db, Some(&including));
+                    listed.touch(&db, Some(&including));
                     cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
                 }
                 cold
@@ -9384,6 +9432,7 @@ fn run_holding(
                 }
                 _ => match manifest::keeping(&db, &args, key, &cold.wrote) {
                     Ok(keeping) => {
+                        kept = true;
                         let (files, read) = (cold.wrote.len(), start.elapsed());
                         keeping.settle(move |bytes, took| {
                             eprintln!(
@@ -9554,6 +9603,18 @@ fn run_holding(
         builds.unasked.push(0);
     } else if programs[0].dehydrate() {
         builds.unasked.push(0);
+    } else if kept
+        && let Some(socket) = &programs[0].args.socket
+        && let Some(store) = blaze_store::Store::global()
+    {
+        // Once the store has it all, the daemon starts a worker from it in this one's place,
+        // which holds what a warm start holds (`Daemon::settle`).
+        let settles = cargo::daemon::settles_beside(socket);
+        store.settle_with(move || {
+            if let Err(why) = std::fs::write(&settles, b"") {
+                eprintln!("{}: {why}", settles.display());
+            }
+        });
     }
     // How many times running each checkout that is read as a loaded one has been long to turn
     // to or from.

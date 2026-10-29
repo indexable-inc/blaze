@@ -871,7 +871,7 @@ fn relative_file(
     let call_site = lookup.kind.file_id().original_file_respecting_includes(db).file_id(db);
     let path = AnchoredPath { anchor: call_site, path: path_str };
     let res: FileId = db.resolve_path(path).ok_or_else(|| {
-        db.include_source(path);
+        db.include_source(path, lookup.krate);
         ExpandError::other(err_span, format!("failed to load file `{path_str}`"))
     })?;
     // Prevent include itself
