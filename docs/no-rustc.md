@@ -489,7 +489,9 @@ of each host (x86-64 Linux's rustc links with its own lld, so its specs differ).
 knows the release by rustup's manifest in the sysroot, and adds what the arguments decide, as
 rustc does: `debug_assertions` from `-C debug-assertions` or the optimization level,
 `overflow_checks` and `ub_checks` as a nightly prints them (`RUSTC_BOOTSTRAP=-1` makes it
-answer as a stable release), `-C panic`, `--cfg`, `proc_macro`,
+answer as a stable release; a list of crates, as servo's `[env]` sets, allows unstable features
+for the `--crate-name` it names as `1` does and leaves the channel's default for any other, as
+rustc's `UnstableFeatures::from_environment` does), `-C panic`, `--cfg`, `proc_macro`,
 the sysroot and target libdir from where the toolchain is. A question with anything it does not
 model (`-C target-cpu`, `-C target-feature`, other `-Z` flags, a deployment target or SDK in the
 environment, a JSON target, another release, a host whose target specs it lacks) is asked of rustc
