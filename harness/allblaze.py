@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """allblaze.py: programs with nothing rustc built in them (docs/no-rustc.md, steps F and G).
 
-Eight programs, a hello, one that uses collections, `catch_unwind`, threads, channels,
+Nine programs, a hello, one that uses collections, `catch_unwind`, threads, channels,
 formatting, a file and an uncaught panic, one with a `#[global_allocator]` of its own, one
 built with `panic = "abort"`, one with a static of proc-macro clients as J2 writes it, one
 of 128-bit atomics raced by threads, one of the paths of `split_paths_ref` and the XDG
-directories, and one of the FMA wrappers of `core::arch::x86_64` on NaNs, are built by blaze with every crate its own, the standard library included,
+directories, one of the FMA wrappers of `core::arch::x86_64` on NaNs, and one of the
+`TypeId`s of methods of `impl`s macros make, are built by blaze with every crate its own, the standard library included,
 and linked by blaze (`--exe`): the native libraries are the ones the crates' `#[link]`s ask
 for, and nothing it could not compile may be left in the executable. A shared library is
 linked too (`--exe` with `--shared`), loaded with `dlopen` and called as cargo's `cdylib` of
@@ -254,11 +255,16 @@ fn main() {
 # each by the code around it: there they are rustc's, here those of blaze's standard library.
 FMA = (open(os.path.join(HERE, "breakers/cases/src/fma_feature_nans.rs")).read()
        + 'fn main() {\n    println!("{:?}", run());\n}\n')
+# The breaker of the `TypeId` of a method of an `impl` a macro makes, `NonZero<u8>`'s among
+# them, which only a standard library built before the program leaves without a hash.
+TYPE_IDS = (open(os.path.join(HERE, "breakers/cases/src/type_id_of_macro_impl.rs")).read()
+            + 'fn main() {\n    println!("{:?}", run());\n}\n')
 # (program, its source, the runs to compare: the arguments of each, its panic strategy)
 PROGRAMS = [("hello", HELLO, [["a", "b"]], "unwind"), ("rich", RICH, [[], ["fail"]], "unwind"),
             ("counting", ALLOC, [[]], "unwind"), ("abort", ABORT, [[], ["fail"]], "abort"),
             ("macros", MACROS, [[]], "unwind"), ("atomics", ATOMICS, [[]], "unwind"),
-            ("paths", PATHS, [[]], "unwind"), ("fma", FMA, [[]], "unwind")]
+            ("paths", PATHS, [[]], "unwind"), ("fma", FMA, [[]], "unwind"),
+            ("typeids", TYPE_IDS, [[]], "unwind")]
 # A shared library, as J2 links a proc macro's (`--exe` with `--shared`): its function
 # allocates, formats, keeps a thread-local and catches a panic, which the allocator shim, the
 # library's TLS and the unwinder have to be right for, loaded into a process blaze did not link.

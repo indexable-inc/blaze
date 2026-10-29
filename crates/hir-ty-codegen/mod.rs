@@ -449,7 +449,9 @@ pub trait SymbolResolver {
         _ = adt;
         None
     }
-    /// How many `impl`s of its module rustc numbers before this one.
+    /// How many `impl`s of its module rustc numbers before this one, or, in a build with
+    /// nothing of rustc's, a number that tells it from the others of its module the same way
+    /// in every build.
     fn impl_place(&self, id: hir_def::ImplId) -> Option<u32> {
         _ = id;
         None

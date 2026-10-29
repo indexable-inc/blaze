@@ -1687,17 +1687,27 @@ impl SymbolResolver for Resolver<'_> {
         let db = self.db;
         let it = hir::Impl::from(id);
         let source = it.source(db)?;
-        // FIXME: where rustc puts the `impl`s a macro makes among the ones written out.
-        if source.file_id.is_macro() {
+        let made = source.file_id.is_macro();
+        // Where rustc puts the `impl`s a macro makes depends on the order it expands them in,
+        // which this does not follow. With nothing of rustc's the crate's hash is blaze's own,
+        // so there is no hash of rustc's to agree with: there they come after the ones written
+        // out, in the order the module lists them, the same in every build of the source.
+        if made && !self.table.is_empty() {
             return None;
         }
         let start = |it: &hir::InFile<ast::Impl>| it.value.syntax().text_range().start();
-        let mut earlier = 0;
-        for other in it.module(db).impl_defs(db) {
-            let other = other.source(db)?;
+        let (mut earlier, mut written, mut made_earlier, mut seen) = (0, 0, 0, false);
+        for other_id in it.module(db).impl_defs(db) {
+            let other = other_id.source(db)?;
             // rustc numbers what a module has written out before what its macros and derives
             // make, which it only has once they are expanded.
             if other.file_id.is_macro() {
+                seen |= other_id == it;
+                made_earlier += u32::from(!seen);
+                continue;
+            }
+            written += 1;
+            if made {
                 continue;
             }
             if other.file_id != source.file_id {
@@ -1705,7 +1715,10 @@ impl SymbolResolver for Resolver<'_> {
             }
             earlier += u32::from(start(&other) < start(&source));
         }
-        Some(earlier)
+        match made {
+            true => seen.then_some(written + made_earlier),
+            false => Some(earlier),
+        }
     }
 
     fn nothing_of_rustc(&self) -> bool {
