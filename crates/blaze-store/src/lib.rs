@@ -47,7 +47,8 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard,
+        RwLockWriteGuard,
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime},
@@ -345,22 +346,94 @@ pub type FetchMissing = Box<
         + Sync,
 >;
 
-static FETCH_MISSING: OnceLock<FetchMissing> = OnceLock::new();
+/// What the store asks for the keys it lacks, by name, in the order they were named: a
+/// build's remote and the remotes of the closures its build scripts run with.
+static FETCH_MISSING: Mutex<Vec<(String, Asker)>> = Mutex::new(Vec::new());
+static FETCH_NAMED: Condvar = Condvar::new();
 
-/// How the fetch of a missing key failed, until the build it failed takes it.
-static FAILED: Mutex<Option<String>> = Mutex::new(None);
-
-/// Has the store of this process ask `fetch` for the keys it lacks, from now on. A process
-/// has one store, and only the first call counts.
-pub fn fetch_missing_with(fetch: FetchMissing) {
-    _ = FETCH_MISSING.set(fetch);
+#[derive(Clone)]
+enum Asker {
+    /// It is being opened: a key the store lacks waits for it.
+    Coming,
+    Ready(Arc<FetchMissing>),
+    /// It could not be opened: a key the store lacks fails the build with this.
+    Never(String),
 }
 
-/// How a fetch of a key the store lacked failed since this was last asked, if one did: the
-/// build that asked for the key fails with it. Until it is taken, no key is asked for again,
-/// so a build whose remote failed ends soon and fails rather than wait on it key by key.
+fn askers() -> MutexGuard<'static, Vec<(String, Asker)>> {
+    FETCH_MISSING.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn name_asker(name: &str, asker: Asker) {
+    let mut askers = askers();
+    match askers.iter_mut().find(|(it, _)| it == name) {
+        Some((_, was)) => *was = asker,
+        None => askers.push((name.to_owned(), asker)),
+    }
+    FETCH_NAMED.notify_all();
+}
+
+/// Has the store of this process ask `fetch` for the keys it lacks, from now on, as `name`:
+/// in place of what was named so before, after what other names were.
+pub fn fetch_missing_with(name: &str, fetch: FetchMissing) {
+    name_asker(name, Asker::Ready(Arc::new(fetch)));
+}
+
+/// What will ask for keys as `name` is being opened: a key the store lacks waits until it
+/// is, or until [`fetch_missing_never`] says it cannot be. The opening must end in one or
+/// the other.
+pub fn fetch_missing_coming(name: &str) {
+    name_asker(name, Asker::Coming);
+}
+
+/// What was to ask for keys as `name` cannot: a key the store lacks fails the build with
+/// `why` rather than compile what it would have brought.
+pub fn fetch_missing_never(name: &str, why: String) {
+    name_asker(name, Asker::Never(why));
+}
+
+/// What asked for keys as `name` asks no more.
+pub fn fetch_missing_forget(name: &str) {
+    askers().retain(|(it, _)| it != name);
+    FETCH_NAMED.notify_all();
+}
+
+/// What to ask for a key the store lacks, once none is being opened; or how one failed.
+fn ask_for_missing() -> Result<Vec<Arc<FetchMissing>>, String> {
+    let mut askers = askers();
+    while askers.iter().any(|(_, it)| matches!(it, Asker::Coming)) {
+        askers = FETCH_NAMED.wait(askers).unwrap_or_else(PoisonError::into_inner);
+    }
+    (askers.iter())
+        .map(|(name, it)| match it {
+            Asker::Ready(fetch) => Ok(fetch.clone()),
+            Asker::Never(why) => Err(format!("{name}: {why}")),
+            Asker::Coming => unreachable!("waited for"),
+        })
+        .collect()
+}
+
+/// How a fetch of a key the store lacked failed in this build, if one did: the build fails
+/// with it once it is over, whatever else asked for the key did. Until the next build
+/// starts ([`build_starts`]), no key is asked for again, so a build whose remote failed ends
+/// soon rather than wait on it key by key.
+static FAILED: Mutex<Option<String>> = Mutex::new(None);
+
+/// A build starts: a failure of one before it is not its own.
+pub fn build_starts() {
+    if let Some(why) = take_failure() {
+        eprintln!("store: a failure of the build before is dropped: {why}");
+    }
+}
+
+/// How a fetch for this build failed, if one did, taken: the build that takes it fails.
 pub fn take_failure() -> Option<String> {
     FAILED.lock().unwrap_or_else(PoisonError::into_inner).take()
+}
+
+/// How a fetch for this build failed, if one did, left for the build's end to take.
+pub fn failure() -> Option<String> {
+    FAILED.lock().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
 fn failed() -> bool {
@@ -1340,6 +1413,13 @@ pub fn write_file_whole(to: &Path, bytes: &[u8]) -> io::Result<()> {
     write_whole(to, &[bytes], false)
 }
 
+/// [`write_file_whole`] of a file in a store's directory that is for the user alone, as the
+/// directories above it that are missing are made: what a store keeps tells what was built.
+pub fn write_private_whole(to: &Path, bytes: &[u8]) -> io::Result<()> {
+    private::create_dir(to.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
+    write_whole(to, &[bytes], true)
+}
+
 pub struct Store {
     dir: StoreDir,
     identity: Identity,
@@ -2011,34 +2091,44 @@ impl Store {
         if let Some(place) = known() {
             return Some(place);
         }
-        let fetch = FETCH_MISSING.get()?;
         if failed() {
             return None;
         }
+        let askers = match ask_for_missing() {
+            Ok(askers) => askers,
+            Err(why) => {
+                fail(why);
+                return None;
+            }
+        };
+        // Packs are named by their hashes, so what one brought is never another's to bring.
         let mut tried = Vec::new();
-        loop {
-            match fetch(key, &tried) {
-                Ok(None) => return None,
-                Ok(Some(pack)) => {
-                    self.refresh();
-                    if let Some(place) = known() {
-                        return Some(place);
+        for fetch in askers {
+            loop {
+                match fetch(key, &tried) {
+                    Ok(None) => break,
+                    Ok(Some(pack)) => {
+                        self.refresh();
+                        if let Some(place) = known() {
+                            return Some(place);
+                        }
+                        if tried.contains(&pack) || !self.holds_pack(&pack) {
+                            fail(format!(
+                                "{} was brought in for a key, and the store cannot read it",
+                                named(&pack)
+                            ));
+                            return None;
+                        }
+                        tried.push(pack);
                     }
-                    if tried.contains(&pack) {
-                        fail(format!(
-                            "{} was brought in twice for a key it does not hold",
-                            named(&pack)
-                        ));
+                    Err(why) => {
+                        fail(why);
                         return None;
                     }
-                    tried.push(pack);
-                }
-                Err(why) => {
-                    fail(why);
-                    return None;
                 }
             }
         }
+        None
     }
 
     /// Where the index of a sealed pack says the value of a key as it is on disk is, the pack
@@ -2048,6 +2138,15 @@ impl Store {
         (candidates.into_iter())
             .filter(|(pack, _)| !pack.changed.load(Ordering::Relaxed))
             .find_map(|(pack, entry)| pack.place(entry, key))
+    }
+
+    /// Whether the sealed pack `pack` (by its hash) is one this store has read and can read.
+    fn holds_pack(&self, pack: &[u8; 32]) -> bool {
+        let sealed = self.sealed();
+        let number = sealed.named.get(&named(pack));
+        number
+            .and_then(|it| sealed.packs.get(it))
+            .is_some_and(|it| !it.changed.load(Ordering::Relaxed))
     }
 
     /// As [`check_packs`], of the packs this store has read, several at a time.

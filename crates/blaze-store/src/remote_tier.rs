@@ -24,7 +24,9 @@
 //!
 //! A listed pack that no run covers (pushed by a blaze from before the index, or between a
 //! push's manifest and its index) is found through its key list, which names every key of
-//! the pack in full: that is complete, only larger. A pack the store has needs no list.
+//! the pack in full: that is complete, only larger. That a pack is in the store when the
+//! look is taken does not spare its list: the store may let it go, or fail to read it, before
+//! a key of it is asked for.
 
 use std::sync::Arc;
 
@@ -138,61 +140,41 @@ pub struct Tier {
     runs: Vec<Named>,
     /// The packs the manifest lists with this build's format.
     listed: FxHashMap<Hash, Listed>,
-    /// Packs the store had when the look was taken: their keys are found without the tier.
-    here: FxHashSet<Hash>,
     /// The runs read, which outlive a renewal while the root still names them.
     parsed: FxHashMap<Hash, Arc<Run>>,
     /// The shards read, by their hash.
     shards: FxHashMap<Hash, Arc<Shard>>,
-    /// Once every run is read: the listed packs no run covers and the store lacks, whose
-    /// key lists are read instead.
+    /// Once every run is read: the listed packs no run covers, whose key lists are read
+    /// instead.
     uncovered: Option<Vec<Hash>>,
-    /// The keys of those whose lists were read, and the pack of each.
-    loose: FxHashMap<[u8; KEY], u32>,
-    loose_packs: Vec<Hash>,
-    loose_read: FxHashSet<Hash>,
-    /// How many bytes of key lists have been read, and the most that may be.
-    loose_bytes: u64,
+    /// The keys of each of those whose list was read: a key several hold is in each.
+    loose: FxHashMap<Hash, FxHashSet<[u8; KEY]>>,
+    /// The most bytes the lists in `loose` may be in all.
     loose_max: u64,
 }
 
 impl Tier {
-    /// The tier for a root, the packs its manifest lists with this build's format, and the
-    /// packs the store has. Key lists of uncovered packs are read to `loose_max` bytes in
-    /// all; past that a lookup is an error.
-    pub fn new(
-        root: &Root,
-        listed: impl IntoIterator<Item = Listed>,
-        here: impl IntoIterator<Item = Hash>,
-        loose_max: u64,
-    ) -> Tier {
+    /// The tier for a root and the packs its manifest lists with this build's format. Key
+    /// lists of uncovered packs are read to `loose_max` bytes in all; past that a lookup is
+    /// an error.
+    pub fn new(root: &Root, listed: impl IntoIterator<Item = Listed>, loose_max: u64) -> Tier {
         let mut tier = Tier {
             runs: Vec::new(),
             listed: FxHashMap::default(),
-            here: FxHashSet::default(),
             parsed: FxHashMap::default(),
             shards: FxHashMap::default(),
             uncovered: None,
             loose: FxHashMap::default(),
-            loose_packs: Vec::new(),
-            loose_read: FxHashSet::default(),
-            loose_bytes: 0,
             loose_max,
         };
-        tier.renew(root, listed, here);
+        tier.renew(root, listed);
         tier
     }
 
     /// A new look at the project, keeping what was read that it still names.
-    pub fn renew(
-        &mut self,
-        root: &Root,
-        listed: impl IntoIterator<Item = Listed>,
-        here: impl IntoIterator<Item = Hash>,
-    ) {
+    pub fn renew(&mut self, root: &Root, listed: impl IntoIterator<Item = Listed>) {
         self.runs = root.runs.iter().rev().cloned().collect();
         self.listed = listed.into_iter().map(|it| (it.pack, it)).collect();
-        self.here = here.into_iter().collect();
         let named: FxHashSet<Hash> = self.runs.iter().map(|it| it.run).collect();
         self.parsed.retain(|run, _| named.contains(run));
         let shards: FxHashSet<Hash> =
@@ -200,20 +182,17 @@ impl Tier {
         self.shards.retain(|shard, _| shards.contains(shard));
         self.uncovered = None;
         self.settle();
-        // What was read of lists of packs that are still uncovered is kept.
-        if let Some(uncovered) = &self.uncovered {
-            let still: FxHashSet<&Hash> = uncovered.iter().collect();
-            let packs = &self.loose_packs;
-            self.loose.retain(|_, at| still.contains(&packs[*at as usize]));
-            self.loose_read.retain(|it| still.contains(it));
-        } else {
-            self.loose.clear();
-            self.loose_read.clear();
+        // The lists of packs that are still uncovered are kept; until every run is read,
+        // which packs those are is not known.
+        match &self.uncovered {
+            Some(uncovered) => self.loose.retain(|pack, _| uncovered.binary_search(pack).is_ok()),
+            None => self.loose.clear(),
         }
-        if self.loose.is_empty() {
-            self.loose_packs.clear();
-            self.loose_bytes = 0;
-        }
+    }
+
+    /// How many bytes the key lists read come to.
+    fn loose_bytes(&self) -> u64 {
+        self.loose.values().map(|keys| (keys.len() * KEY) as u64).sum()
     }
 
     /// Works out the uncovered packs once every run is read.
@@ -224,10 +203,8 @@ impl Tier {
         }
         let covered: FxHashSet<&Hash> =
             self.parsed.values().flat_map(|run| run.packs().iter()).collect();
-        let mut uncovered: Vec<Hash> = (self.listed.keys())
-            .filter(|pack| !covered.contains(pack) && !self.here.contains(*pack))
-            .copied()
-            .collect();
+        let mut uncovered: Vec<Hash> =
+            (self.listed.keys()).filter(|pack| !covered.contains(pack)).copied().collect();
         uncovered.sort_unstable();
         self.uncovered = Some(uncovered);
     }
@@ -243,7 +220,7 @@ impl Tier {
         }
         let mut wants = Vec::new();
         for pack in self.uncovered.iter().flatten() {
-            if !self.loose_read.contains(pack) {
+            if !self.loose.contains_key(pack) {
                 let listed = &self.listed[pack];
                 wants.push(Want::Keys { pack: *pack, keys: listed.keys, most: listed.size });
             }
@@ -275,8 +252,10 @@ impl Tier {
         for (run, shard) in shards {
             run.holders(shard, key).for_each(&mut hold);
         }
-        if let Some(at) = self.loose.get(key) {
-            hold(&self.loose_packs[*at as usize]);
+        for pack in self.uncovered.iter().flatten() {
+            if self.loose.get(pack).is_some_and(|keys| keys.contains(key)) {
+                hold(pack);
+            }
         }
         Lookup::Holders(holders)
     }
@@ -309,26 +288,20 @@ impl Tier {
             Want::Keys { pack, .. } => {
                 let wanted =
                     self.uncovered.as_ref().is_some_and(|it| it.binary_search(&pack).is_ok());
-                if !wanted || self.loose_read.contains(&pack) {
+                if !wanted || self.loose.contains_key(&pack) {
                     return Ok(());
                 }
                 if bytes.len() % KEY != 0 {
                     return Err(Unusable(format!("{name} is {} bytes, not keys", bytes.len())));
                 }
-                self.loose_bytes += bytes.len() as u64;
-                if self.loose_bytes > self.loose_max {
+                if self.loose_bytes() + bytes.len() as u64 > self.loose_max {
                     return Err(Unusable(format!(
                         "the key lists of the packs no run of the index covers are over {} \
                          bytes: a push of a blaze that writes the index covers them",
                         self.loose_max
                     )));
                 }
-                let at = self.loose_packs.len() as u32;
-                self.loose_packs.push(pack);
-                for key in bytes.as_chunks::<KEY>().0 {
-                    self.loose.entry(*key).or_insert(at);
-                }
-                self.loose_read.insert(pack);
+                self.loose.insert(pack, bytes.as_chunks::<KEY>().0.iter().copied().collect());
             }
         }
         Ok(())
@@ -430,7 +403,7 @@ mod tests {
         let listed: Vec<Listed> = (1..=4)
             .map(|n| listed(&mut remote, n, &keys[(n as usize - 1) * 1000..][..1000]))
             .collect();
-        let mut tier = Tier::new(&root, listed, [], u64::MAX);
+        let mut tier = Tier::new(&root, listed, u64::MAX);
         let (holders, fetched) = remote.find(&mut tier, &keys[0]).unwrap();
         assert_eq!(holders, vec![pack(1)]);
         // Both runs, the key list of the pack no run covers, and the key's shard of each.
@@ -455,18 +428,27 @@ mod tests {
         let root = Root { runs: vec![old, new], other: Vec::new() };
         // Pack 2 was taken out of the manifest, or is of another format.
         let listed = [1, 3].map(|n| listed(&mut remote, n, &keys));
-        let mut tier = Tier::new(&root, listed, [], u64::MAX);
+        let mut tier = Tier::new(&root, listed, u64::MAX);
         assert_eq!(remote.find(&mut tier, &keys[7]).unwrap().0, vec![pack(3), pack(1)]);
     }
 
     #[test]
-    fn a_pack_the_store_has_needs_no_key_list() {
+    fn a_key_stays_found_while_an_uncovered_pack_holds_it() {
         let keys: Vec<_> = (0..100).map(key).collect();
         let mut remote = Remote::default();
-        let listed = [listed(&mut remote, 1, &keys[..50]), listed(&mut remote, 2, &keys[50..])];
-        let mut tier = Tier::new(&Root::default(), listed, [pack(1)], u64::MAX);
-        assert_eq!(remote.find(&mut tier, &keys[0]).unwrap(), (vec![], 1));
-        assert_eq!(remote.find(&mut tier, &keys[60]).unwrap(), (vec![pack(2)], 0));
+        // Packs 1 and 2 hold the same keys, and no run covers either.
+        let both = [listed(&mut remote, 1, &keys), listed(&mut remote, 2, &keys)];
+        let mut tier = Tier::new(&Root::default(), both, u64::MAX);
+        assert_eq!(remote.find(&mut tier, &keys[3]).unwrap(), (vec![pack(1), pack(2)], 2));
+        // Pack 1 is taken out of the manifest as redundant: pack 2 still holds the keys,
+        // and its list, read before, is not read again.
+        tier.renew(&Root::default(), [both[1]]);
+        assert_eq!(remote.find(&mut tier, &keys[3]).unwrap(), (vec![pack(2)], 0));
+        // What was read of pack 1 no longer counts against the most there may be.
+        let mut tier = Tier::new(&Root::default(), both, (keys.len() * KEY) as u64);
+        assert!(remote.find(&mut tier, &keys[3]).is_err());
+        tier.renew(&Root::default(), [both[1]]);
+        assert_eq!(remote.find(&mut tier, &keys[3]).unwrap(), (vec![pack(2)], 1));
     }
 
     #[test]
@@ -481,7 +463,7 @@ mod tests {
         let (_, shard) = run.shards().next().unwrap();
         let mut broken = Remote(remote.0.clone());
         broken.0.remove(&shard);
-        let mut tier = Tier::new(&root, listed, [], u64::MAX);
+        let mut tier = Tier::new(&root, listed, u64::MAX);
         let missing = (0..100).map(key).find(|it| run.shard(run.slot(it)) == Some(shard)).unwrap();
         let e = broken.find(&mut tier, &missing).unwrap_err();
         assert!(e.0.contains(&remote_index::hex(&shard)), "{e}");
@@ -494,8 +476,7 @@ mod tests {
         assert!(e.0.contains("hash to"), "{e}");
         // A run that is not of the packs its root line says is refused.
         let lying = Named { packs: 2, ..named };
-        let mut tier =
-            Tier::new(&Root { runs: vec![lying], other: Vec::new() }, listed, [], u64::MAX);
+        let mut tier = Tier::new(&Root { runs: vec![lying], other: Vec::new() }, listed, u64::MAX);
         let e = remote.find(&mut tier, &keys[0]).unwrap_err();
         assert!(e.0.contains("not of the packs"), "{e}");
     }
@@ -509,10 +490,10 @@ mod tests {
         let listed3 = listed(&mut remote, 3, &keys[200..]);
         let all = [listed(&mut remote, 1, &keys[..100]), listed(&mut remote, 2, &keys[100..200])];
         let root = Root { runs: vec![first.clone()], other: Vec::new() };
-        let mut tier = Tier::new(&root, [all[0]], [], u64::MAX);
+        let mut tier = Tier::new(&root, [all[0]], u64::MAX);
         assert_eq!(remote.find(&mut tier, &keys[0]).unwrap().0, vec![pack(1)]);
         let root = Root { runs: vec![first, second], other: Vec::new() };
-        tier.renew(&root, [all[0], all[1], listed3], []);
+        tier.renew(&root, [all[0], all[1], listed3]);
         // The first run and its shard are kept; the second run, its shard and the key
         // list of pack 3 are read.
         assert_eq!(remote.find(&mut tier, &keys[0]).unwrap(), (vec![pack(1)], 3));
@@ -525,7 +506,7 @@ mod tests {
         let keys: Vec<_> = (0..100).map(key).collect();
         let mut remote = Remote::default();
         let listed = [listed(&mut remote, 1, &keys)];
-        let mut tier = Tier::new(&Root::default(), listed, [], 32 * 99);
+        let mut tier = Tier::new(&Root::default(), listed, 32 * 99);
         assert!(remote.find(&mut tier, &keys[0]).unwrap_err().0.contains("key lists"));
     }
 }

@@ -23,7 +23,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, bail};
@@ -47,6 +47,72 @@ pub fn root_at(project: &str) -> String {
 /// Where a run or a shard is: under the hash of its bytes.
 pub fn object(hash: &Hash) -> String {
     format!("index/{}", format::hex(hash))
+}
+
+/// The directory of a store where its lookups note, by project, the shards of runs they
+/// found gone or not what their names say: lines of `<run> <slot>`. Every lookup of a key
+/// such a shard would hold fails, and a merge reads the shards of only the runs it merges,
+/// so the next push from the store reads each noted shard again and takes its run out if
+/// it still cannot be used.
+const BROKEN: &str = "remote-index-broken";
+
+fn broken_at(store: &Path, project: &str) -> PathBuf {
+    store.join(BROKEN).join(project)
+}
+
+/// Notes that the shard in `slot` of the run `run` of `project`'s index could not be used.
+pub fn note_broken(store: &Path, project: &str, run: &Hash, slot: usize) -> std::io::Result<()> {
+    let at = broken_at(store, project);
+    let line = format!("{} {slot}", format::hex(run));
+    let mut text = match std::fs::read_to_string(&at) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    if text.lines().any(|it| it == line) {
+        return Ok(());
+    }
+    text += &line;
+    text.push('\n');
+    blaze_store::write_private_whole(&at, text.as_bytes())
+}
+
+/// The shards the store's lookups noted as broken: see [`BROKEN`].
+fn noted_broken(store: &Path, project: &str) -> anyhow::Result<BTreeSet<(Hash, usize)>> {
+    let at = broken_at(store, project);
+    let text = match std::fs::read_to_string(&at) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(e) => return Err(anyhow::Error::from(e).context(at.display().to_string())),
+    };
+    let parse = |line: &str| {
+        let (run, slot) = line.split_once(' ')?;
+        Some((*Digest::parse(run)?.bytes(), slot.parse().ok()?))
+    };
+    (text.lines())
+        .map(|line| parse(line).with_context(|| format!("{}: `{line}`", at.display())))
+        .collect()
+}
+
+/// Takes `handled` out of what the store's lookups noted as broken.
+fn clear_broken(store: &Path, project: &str, handled: &BTreeSet<(Hash, usize)>) {
+    if handled.is_empty() {
+        return;
+    }
+    let at = broken_at(store, project);
+    let left: String = match noted_broken(store, project) {
+        Ok(noted) => (noted.difference(handled))
+            .map(|(run, slot)| format!("{} {slot}\n", format::hex(run)))
+            .collect(),
+        Err(e) => return eprintln!("remote: {e:#}"),
+    };
+    let cleared = match left.is_empty() {
+        true => std::fs::remove_file(&at),
+        false => blaze_store::write_private_whole(&at, left.as_bytes()),
+    };
+    if let Err(e) = cleared {
+        eprintln!("remote: {}: the broken shards it notes are not cleared: {e}", at.display());
+    }
 }
 
 /// The bytes of the run or shard `hash` names, or why there are none to use: not there,
@@ -192,30 +258,28 @@ pub async fn update(
             }
         }
     }
-    // A shard that is gone fails every lookup of a key it would hold (`tier.rs`), and a
-    // merge reads the shards of only the runs it merges: so every push asks after the shards
-    // of the runs it keeps (one request each, without their bytes), and a run with one gone
-    // is taken out and what it covered indexed again.
-    let shards = kept.iter().enumerate().flat_map(|(at, (_, run))| {
-        run.shards().map(move |(slot, hash)| (at, slot, hash, run.shard_max(slot)))
+    // The shards the store's lookups found broken (see [`BROKEN`]), read again: a run whose
+    // shard still cannot be used is taken out, and what it covered indexed again.
+    let noted = noted_broken(store, project)?;
+    let again = noted.iter().filter_map(|(run, slot)| {
+        let at = kept.iter().position(|(named, _)| named.run == *run)?;
+        Some((at, *slot, kept[at].1.shard(*slot)?))
     });
-    let asked = stream::iter(shards.map(|(at, slot, hash, most)| async move {
-        let found = remote.found(&object(&hash)).await?;
-        let gone = !found.is_some_and(|it| it.len <= most);
-        anyhow::Ok(gone.then_some((at, slot, hash)))
+    let kept_ref = &kept;
+    let asked = stream::iter(again.map(|(at, slot, hash)| async move {
+        let read = shard(remote, &kept_ref[at].1, slot, &hash).await?;
+        anyhow::Ok(read.err().map(|why| (at, why)))
     }));
     let gone: Vec<_> = asked.buffer_unordered(remote.jobs()).try_collect().await?;
-    let gone: BTreeMap<usize, (usize, Hash)> =
-        gone.into_iter().flatten().map(|(at, slot, hash)| (at, (slot, hash))).collect();
+    let gone: BTreeMap<usize, String> = gone.into_iter().flatten().collect();
     if !gone.is_empty() {
         let mut at = 0;
         kept.retain(|(named, _)| {
             at += 1;
-            let Some((slot, hash)) = gone.get(&(at - 1)) else { return true };
+            let Some(why) = gone.get(&(at - 1)) else { return true };
             eprintln!(
-                "remote: the index of `{project}` names a run whose shard {slot}, {}, is not \
-                 there: it is taken out, and what it covered is indexed again",
-                object(hash)
+                "remote: the index of `{project}` names a run with a shard that cannot be used \
+                 ({why}): it is taken out, and what it covered is indexed again"
             );
             replaced.insert(named.run);
             false
@@ -278,6 +342,7 @@ pub async fn update(
     };
     if made.is_none() && replaced.is_empty() {
         let said = format!("index of `{project}`: {} runs, nothing to add", kept.len());
+        clear_broken(store, project, &noted);
         return Ok((said, failed));
     }
     let added = match &made {
@@ -309,6 +374,7 @@ pub async fn update(
         root.lines()
     };
     remote.extend_list(&name, rewrite).await?;
+    clear_broken(store, project, &noted);
     let mut said = format!("index of `{project}`: {indexed} packs indexed");
     if !merged.is_empty() {
         said += &format!(", {} runs merged", merged.len());

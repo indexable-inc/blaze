@@ -58,8 +58,8 @@ use gateway::Gateway;
 pub use https::{Https, next as https_next};
 use s3::{S3, Written};
 use signed::{NotRewritten, Trust, Turns, Unremembered};
-use transfer::{Body, Object, TooLong, Version};
 use tier::Tiered;
+use transfer::{Body, Object, TooLong, Version};
 pub use transfer::{Digest, Fetched, Room, Traffic};
 
 /// How often a list is read again and written again after another machine wrote first.
@@ -1246,6 +1246,22 @@ pub fn runtime() -> anyhow::Result<Runtime> {
     Ok(runtime.worker_threads(2).thread_name("blaze-remote").enable_all().build()?)
 }
 
+/// The name the store knows the build's own remote by when it asks for a key it lacks:
+/// the remotes of closures are known by their projects.
+const BUILD: &str = "the build's remote";
+
+/// `BLAZE_REMOTE_LAZY`: packs are left on the remote until a build asks for a key of theirs.
+fn lazy() -> bool {
+    std::env::var_os("BLAZE_REMOTE_LAZY").is_some_and(|it| it != "0")
+}
+
+/// Whether the build reads through a remote: [`lazy`], with a store and a remote to read.
+fn lazy_from_env() -> bool {
+    lazy()
+        && std::env::var_os("BLAZE_CACHE").is_some()
+        && std::env::var("BLAZE_REMOTE").is_ok_and(|it| !it.is_empty() && it != "off")
+}
+
 /// The remote the daemon keeps its store in step with: `BLAZE_REMOTE`, and the project
 /// `BLAZE_PROJECT` names in it.
 pub struct Shared {
@@ -1258,13 +1274,46 @@ pub struct Shared {
     /// How often what the daemon compiled is sent while it runs, if on a schedule at all.
     push_every: Option<Duration>,
     asked: Arc<keeper::Asked>,
+    /// What the store knows this remote by when it asks for a key it lacks.
+    hook: String,
 }
 
 impl Shared {
+    /// With `BLAZE_REMOTE_LAZY` and a remote, has the store wait for the remote
+    /// [`Self::from_env`] opens rather than compile what it lacks before it is: called before
+    /// the build starts, and [`Self::from_env`] then called.
+    pub fn coming_from_env() {
+        match lazy_from_env() {
+            true => blaze_store::fetch_missing_coming(BUILD),
+            // What a build before this read through is not this one's.
+            false => blaze_store::fetch_missing_forget(BUILD),
+        }
+    }
+
     /// `None` without a store or a remote, or with `BLAZE_REMOTE=off`. A remote that
     /// cannot be reached is not an error to the build, unless [`required`]: it compiles
-    /// what it would have fetched, and its `Finished` line says so.
+    /// what it would have fetched, and its `Finished` line says so. With `BLAZE_REMOTE_LAZY`
+    /// it is: what the store lacks fails the build.
     pub fn from_env() -> anyhow::Result<Option<Shared>> {
+        // What waits for the remote is not left waiting, however its opening ends: an
+        // opened one is asked once it pulls.
+        let opened = std::panic::catch_unwind(Self::opened_from_env);
+        if lazy_from_env() && !matches!(opened, Ok(Ok(Some(_)))) {
+            let why = match &opened {
+                Ok(Err(e)) => format!("{e:#}"),
+                Err(_) => "opening it panicked".to_owned(),
+                Ok(_) => "it was not opened".to_owned(),
+            };
+            blaze_store::fetch_missing_never(BUILD, why);
+        }
+        match opened.unwrap_or_else(|panic| std::panic::resume_unwind(panic)) {
+            Err(e) if required() => Err(e.context("BLAZE_REMOTE_REQUIRED is set")),
+            Err(_) => Ok(None),
+            opened => opened,
+        }
+    }
+
+    fn opened_from_env() -> anyhow::Result<Option<Shared>> {
         let Some(store) = std::env::var_os("BLAZE_CACHE").map(PathBuf::from) else {
             return Ok(None);
         };
@@ -1276,19 +1325,25 @@ impl Shared {
             let project = project_name(std::env::var("BLAZE_PROJECT").ok())?;
             let push_every = keeper::push_every_from_env()?;
             let remote = Arc::new(runtime.block_on(Remote::open(&remote, &store))?);
-            let lazy = std::env::var_os("BLAZE_REMOTE_LAZY").is_some_and(|it| it != "0");
-            let (runtime, asked) = (Arc::new(runtime), Arc::default());
-            Ok(Shared { store: store.clone(), remote, project, runtime, lazy, push_every, asked })
+            let (runtime, asked, hook) = (Arc::new(runtime), Arc::default(), BUILD.to_owned());
+            let lazy = lazy();
+            Ok(Shared {
+                store: store.clone(),
+                remote,
+                project,
+                runtime,
+                lazy,
+                push_every,
+                asked,
+                hook,
+            })
         });
         match opened {
             Ok(shared) => Ok(Some(shared)),
             Err(e) => {
                 eprintln!("remote: {e:#}");
                 note_down(&store, &remote, Some(&e));
-                match required() {
-                    true => Err(e.context("BLAZE_REMOTE_REQUIRED is set")),
-                    false => Ok(None),
-                }
+                Err(e)
             }
         }
     }
@@ -1301,10 +1356,12 @@ impl Shared {
     pub fn lazily(store: &Path, spec: &str, project: &str) -> anyhow::Result<Shared> {
         let runtime = runtime()?;
         let remote = Arc::new(runtime.block_on(Remote::open(spec, store))?);
+        let project = project_name(Some(project.to_owned()))?;
         Ok(Shared {
             store: store.to_owned(),
             remote,
-            project: project_name(Some(project.to_owned()))?,
+            hook: project.clone(),
+            project,
             runtime: Arc::new(runtime),
             lazy: true,
             push_every: None,
@@ -1330,7 +1387,10 @@ impl Shared {
             (tiered, held)
         });
         let asked = self.asked.clone();
-        blaze_store::fetch_missing_with(Box::new(move |key, tried| asked.fetch(key, tried)));
+        blaze_store::fetch_missing_with(
+            &self.hook,
+            Box::new(move |key, tried| asked.fetch(key, tried)),
+        );
         let done = self.runtime.block_on(async {
             self.asked.see(self.manifest_now().await);
             match loading {
@@ -1925,7 +1985,7 @@ pub mod tests {
 
     /// A store that lacks a key fetches the pack that holds it through the index, or through
     /// its key list when no run covers it, and a shard that is gone fails the lookup, naming
-    /// it, until a push takes its run out.
+    /// it, until a push from the store that found it gone takes its run out.
     #[test]
     fn a_store_reads_through_the_index() {
         blaze_store::compiles_against("remote tier test");
@@ -1953,10 +2013,15 @@ pub mod tests {
         std::fs::write(&root, &indexed).unwrap();
         // Read as another machine reads it, which has seen no turn of the lists.
         let tiered = |name: &str| {
-            let reader = Remote::in_dir(&dir, &dir.join(name).join("kept"), taking_unsigned(), 1 << 30);
+            let reader =
+                Remote::in_dir(&dir, &dir.join(name).join("kept"), taking_unsigned(), 1 << 30);
             let store = dir.join(name);
-            let (tiered, held) =
-                tier::Tiered::new(&store, Arc::new(reader), Arc::new(runtime().unwrap()), "default");
+            let (tiered, held) = tier::Tiered::new(
+                &store,
+                Arc::new(reader),
+                Arc::new(runtime().unwrap()),
+                "default",
+            );
             (wait(tiered.load(held)), tiered, store)
         };
         let (said, reader, store) = tiered("fresh");
@@ -1979,16 +2044,19 @@ pub mod tests {
         let run = wait(index::run(&remote, named)).unwrap().unwrap();
         let (_, shard) = run.shards().next().unwrap();
         std::fs::remove_file(dir.join(index::object(&shard))).unwrap();
-        let (pack, keys) = packs.iter().find(|(pack, _)| run.packs().contains(pack.bytes())).unwrap();
+        let (pack, keys) =
+            packs.iter().find(|(pack, _)| run.packs().contains(pack.bytes())).unwrap();
         let key = keys.iter().find(|key| run.shard(run.slot(key)) == Some(shard)).unwrap();
-        let (_, reader, _) = tiered("broken");
+        let (_, reader, broken) = tiered("broken");
         let e = wait(tier::find(&reader, key)).unwrap_err();
         assert!(format!("{e:#}").contains(&index::object(&shard)), "{e:#}");
-        // The next push takes the run out and indexes its packs again: of a machine that
-        // did not see the root put back.
+        assert!(broken.join("remote-index-broken").join("default").exists());
+        // The next push from the store that noted it takes the run out and indexes its packs
+        // again: of a machine that did not see the root put back.
         let pusher = Remote::in_dir(&dir, &dir.join("mending"), taking_unsigned(), 1 << 30);
-        let said = wait(push(&dir.join("a"), &pusher, "default")).unwrap();
+        let said = wait(push(&broken, &pusher, "default")).unwrap();
         assert!(said.contains("4 packs indexed"), "{said}");
+        assert!(!broken.join("remote-index-broken").join("default").exists());
         let (_, reader, _) = tiered("mended");
         assert_eq!(wait(tier::find(&reader, key)).unwrap().last(), Some(pack));
         _ = std::fs::remove_dir_all(&dir);

@@ -8794,6 +8794,10 @@ fn run_holding(
 
     // What other machines compiled is fetched beside the build, which never waits for it: the
     // store reads what arrived once it is in, and the build finds it from then on.
+    // A build's own failures to fetch are its own, and with BLAZE_REMOTE_LAZY what the store
+    // lacks waits for the remote to be opened rather than compile before it is.
+    blaze_store::build_starts();
+    remote::Shared::coming_from_env();
     let shared = std::thread::spawn(|| {
         let shared = remote::Shared::from_env()?;
         if let Some(shared) = &shared {
@@ -9276,6 +9280,10 @@ fn run_holding(
         }
         (None, None) => {}
     }
+    // A key the remote could not bring fails the build that lacked it, whatever lacked it.
+    if let Some(why) = blaze_store::take_failure() {
+        anyhow::bail!("the store's remote failed: {why}");
+    }
     let out_of_date = hir::attach_db(&db, || known.out_of_date(&db));
     if let Some((edited, sources)) = &rewritten {
         let why = hir::attach_db(&db, || {
@@ -9432,6 +9440,8 @@ fn run_holding(
     // The programs whose tests blaze's harness lists, by their object.
     let mut harnessed: FxHashSet<PathBuf> = FxHashSet::default();
     loop {
+        // A rebuild's failures to fetch are its own: the one before was refused for its own.
+        blaze_store::build_starts();
         if WatchedFile::unwatched(&files, &db) || tree.includes_more(&db) {
             builds.settle(&mut db, &mut programs)?;
         }

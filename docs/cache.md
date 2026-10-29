@@ -230,9 +230,11 @@ is still checked to be in the manifest, and the key in the pack. The format is i
 `crates/blaze-store/src/remote_index.rs`. A daemon with `BLAZE_REMOTE_LAZY` reads through it
 (below); what it fetches is decided in `crates/blaze-store/src/remote_tier.rs`.
 
-A push also asks after every shard of the runs it keeps, one request each without the
-bytes, and takes out a run with a shard that is gone, indexing what it covered again: a
-lookup that needs a shard that is gone fails rather than miss, and only a push mends it.
+A lookup that needs a shard that is gone, or is not what its name says, fails rather than
+miss, and notes the shard in the store (`remote-index-broken/<project>`). The next push from
+that store reads each noted shard again, and takes out a run whose shard still cannot be used,
+indexing what it covered again; a push asks after no other shard, and a merge reads the
+shards of only the runs it merges.
 
 **Real AWS S3 has not been run.** Everything was measured against MinIO and SeaweedFS on
 the same machine over loopback. The client is the AWS SDK, so the code is the same, but
@@ -264,11 +266,16 @@ A key a build lacks is looked up in the key's shard of each run, newest run firs
 are fetched once and kept in the store's directory, under `remote-index/<project>/`, as are runs);
 the pack a run names for it is fetched, checked and kept, and the key looked for in it,
 and in the next pack named if it is not there. A listed pack that no run covers is found
-by its key list. The thread that asked waits for all of it, however long it takes. A key
-no listed pack holds is compiled. A lookup that cannot be answered (the remote cannot be
-reached, an object is gone or does not hash to its name, a pack is larger than
+by its key list, whether or not the store has the pack now. The thread that asked waits for
+all of it, however long it takes, and a key the build asks for while the remote is still
+being opened waits for that too. A key no listed pack holds is compiled. A lookup that fails
+reads the root and the manifest again once and tries again, as what it failed on may be what
+a collection took out after a merge. One that still cannot be answered (the remote cannot be
+reached or opened, an object is gone or does not hash to its name, a pack is larger than
 `BLAZE_CACHE_MAX`) fails the build, naming what failed, whatever `BLAZE_REMOTE_REQUIRED`
 says: what it would have fetched is not compiled in its place. The next build asks again.
+A read of the root and the manifest that fails once they were read leaves the look from
+before.
 Only `BLAZE_REMOTE_REQUIRED` has the first build wait for the pull,
 since its failure is then the build's. A connection that is not made within 2 seconds fails,
 as a network that is down does. A daemon killed with SIGKILL pushes nothing on its way out;

@@ -1098,7 +1098,7 @@ impl CodegenUnit {
             }
             // A key the store lacked and its remote could not be asked for, or could not
             // bring: what was compiled in its place is not this build's to give.
-            if let Some(why) = store::take_failure() {
+            if let Some(why) = store::failure() {
                 return Err(CodegenError::Refused(format!("the store's remote failed: {why}")));
             }
             if cg.misfit {

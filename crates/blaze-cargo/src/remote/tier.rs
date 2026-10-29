@@ -8,19 +8,23 @@
 //! What to fetch is decided by `blaze_store::remote_tier`, which is pure; this reads the
 //! objects it asks for and fetches the packs it names. The root of the index and the
 //! manifest are read once, when the daemon starts and when the manifest has changed since
-//! (`keeper.rs`), never per key. Runs and shards are named by the hash of their bytes, so
+//! (`keeper.rs`), never per key, unless a lookup fails: it reads them again once, as what it
+//! failed on may be what a collection took out after a merge, and tries again before it
+//! fails. Runs and shards are named by the hash of their bytes, so
 //! they are kept in the store's directory (`remote-index/<project>/`), checked against their
 //! names when read back, and never asked of the remote again; those the root no longer names
 //! are removed when it is read. Lookups
 //! from many threads share what each fetches: an object is asked for once however many
-//! lookups need it, and the objects one lookup needs are asked for together.
+//! lookups need it, and the objects one lookup needs are asked for together. A shard that
+//! is gone or not what its name says is noted in the store, for its next push to mend
+//! (`index.rs`).
 
 use std::{
     future::Future,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -28,7 +32,7 @@ use blaze_store::{
     FORMAT as STORE_FORMAT, limit_for,
     remote_index::{self as format, Hash, Root},
     remote_tier::{self, Lookup, Tier, Want},
-    write_file_whole,
+    write_private_whole,
 };
 use futures_util::{StreamExt, TryStreamExt, stream};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -38,8 +42,7 @@ use tokio::{
 };
 
 use super::{
-    Digest, Fetched, Listed, Manifest, Remote, claim, fetch_pack, index, local_packs, note_down,
-    pack_file, transfer,
+    Digest, Fetched, Listed, Manifest, Remote, fetch_pack, index, note_down, pack_file, transfer,
 };
 
 /// The directory of the store that keeps the runs and shards read.
@@ -58,7 +61,8 @@ pub(super) enum State {
         /// The most bytes the store may hold, which a pack it is to keep cannot be over.
         limit: u64,
     },
-    /// They could not be read: every lookup fails with this.
+    /// They could not be read when first asked for: every lookup fails with this. Once
+    /// read, a later read that fails leaves what was read before.
     Failed(String),
 }
 
@@ -71,9 +75,12 @@ pub struct Tiered {
     state: Arc<RwLock<State>>,
     /// What is being fetched, by its hash: a run, a shard, a key list or a pack.
     fetching: Mutex<FxHashMap<Hash, Arc<OnceCell<Result<(), String>>>>>,
-    /// Whether a lookup failed since one was last asked for: the store asks for none until
-    /// the build that failed takes the failure, so the next one is of a build after it.
+    /// Whether a lookup failed since one was last asked for: the store asks for none more in
+    /// the build that failed, so the next is of a build after it, or of one at once with it.
     failed: AtomicBool,
+    /// How many times the root and the manifest were read: a lookup that failed reads them
+    /// again only if no other did since it started.
+    loads: AtomicU64,
 }
 
 impl Tiered {
@@ -95,6 +102,7 @@ impl Tiered {
             state,
             fetching: Mutex::default(),
             failed: AtomicBool::new(false),
+            loads: AtomicU64::new(0),
         };
         (Arc::new(tiered), held)
     }
@@ -105,17 +113,16 @@ impl Tiered {
         &self,
         mut held: OwnedRwLockWriteGuard<State>,
     ) -> anyhow::Result<String> {
-        let before = std::mem::replace(&mut *held, State::Loading);
-        match self.look(before).await {
-            Ok((state, said)) => {
-                *held = state;
-                Ok(said)
-            }
-            Err(e) => {
-                *held = State::Failed(format!("{e:#}"));
-                Err(e)
-            }
+        let done = self.look(&mut held).await;
+        match &done {
+            Ok(_) => _ = self.loads.fetch_add(1, Ordering::Relaxed),
+            Err(e) if matches!(*held, State::Ready { .. }) => eprintln!(
+                "remote: the index of `{}` is looked up as it was read before: {e:#}",
+                self.project
+            ),
+            Err(e) => *held = State::Failed(format!("{e:#}")),
         }
+        done
     }
 
     /// [`Self::load`] once more: the manifest has changed, or the last read failed.
@@ -124,14 +131,23 @@ impl Tiered {
         self.load(held).await
     }
 
-    async fn look(&self, before: State) -> anyhow::Result<(State, String)> {
+    /// [`Self::reload`], unless the root and the manifest were read again since they had
+    /// been read `loads` times.
+    async fn reload_since(&self, loads: u64) {
+        let held = self.state.clone().write_owned().await;
+        if self.loads.load(Ordering::Relaxed) == loads {
+            // Said by `load`, and the lookup says why it reads again.
+            _ = self.load(held).await;
+        }
+    }
+
+    async fn look(&self, held: &mut State) -> anyhow::Result<String> {
         let project = &self.project;
         // The root before the manifest: every pack a run covers was listed before the run
         // was written, so the manifest read after lists it, unless a collection took it out.
         let lines = self.remote.read_list(&index::root_at(project)).await?;
         let root = Root::parse(&lines.unwrap_or_default());
         let manifest = Manifest::fetch(&self.remote, project).await?.unwrap_or_default();
-        let here = local_packs(&claim(&self.store, false).await?)?;
         let limit = limit_for(&self.store).map_err(anyhow::Error::msg)?.unwrap_or(u64::MAX);
         let listed: FxHashMap<Digest, Listed> =
             manifest.0.into_iter().filter(|(_, it)| it.format == STORE_FORMAT).collect();
@@ -141,14 +157,17 @@ impl Tiered {
             keys: *it.keys.bytes(),
             size: it.size.min(object_max),
         });
-        let here = here.iter().map(|it| *it.bytes());
-        let mut tier = match before {
+        // Nothing awaits between taking the old look out and putting the new one in.
+        let tier = match std::mem::replace(held, State::Loading) {
             State::Ready { mut tier, .. } => {
-                tier.renew(&root, packs, here);
+                tier.renew(&root, packs);
                 tier
             }
-            _ => Tier::new(&root, packs, here, object_max),
+            _ => Tier::new(&root, packs, object_max),
         };
+        let count = listed.len();
+        *held = State::Ready { tier, listed, limit };
+        let State::Ready { tier, .. } = held else { unreachable!("just put in") };
         // Every lookup reads every run first: read them now, so that a run that cannot be
         // had fails here, and so that what is kept of the old ones can be cleared.
         let runs: Vec<Want> = match tier.lookup(&[0; 32]) {
@@ -170,12 +189,11 @@ impl Tiered {
         }
         self.clear_kept(tier.named()).await;
         let (runs, uncovered) = tier.counts();
-        let mut said =
-            format!("the index of `{project}`: {runs} runs over {} packs listed", listed.len());
+        let mut said = format!("the index of `{project}`: {runs} runs over {count} packs listed");
         if let Some(uncovered) = uncovered.filter(|it| *it != 0) {
             said += &format!(", {uncovered} of them not indexed, found by their key lists");
         }
-        Ok((State::Ready { tier, listed, limit }, said))
+        Ok(said)
     }
 
     /// An error of a lookup, naming the remote and the project.
@@ -215,33 +233,42 @@ impl Tiered {
         let most = want.most().min(self.remote.object_max);
         let read = self.remote.read_small(&name, most).await.map_err(|e| format!("{e:#}"))?;
         let Some((bytes, _)) = read else {
+            self.note_broken(want);
             return Err(match want {
                 Want::Keys { pack, .. } => {
                     format!("{name}, the key list of {}.pack, is not there", Digest::from(*pack))
                 }
                 _ => format!(
-                    "{name} of the index is not there: the next push takes out the run that \
-                     names it"
+                    "{name} of the index is not there: the next push from this store takes \
+                     out the run that names it"
                 ),
             });
         };
         if let Err(why) = check(&bytes) {
             self.remote.traffic.rejected.fetch_add(1, Ordering::Relaxed);
+            self.note_broken(want);
             return Err(why.0);
         }
         if want.is_index() {
-            let (kept, bytes) = (kept, bytes.clone());
-            let wrote = tokio::task::spawn_blocking(move || {
-                std::fs::create_dir_all(kept.parent().expect("in a directory"))?;
-                write_file_whole(&kept, &bytes)
+            // Kept beside the lookup, which does not wait for the disk: a copy that is not
+            // whole is not what its name says, and is read from the remote again.
+            let bytes = bytes.clone();
+            _ = tokio::task::spawn_blocking(move || {
+                if let Err(e) = write_private_whole(&kept, &bytes) {
+                    eprintln!("remote: {name} is not kept: {e}");
+                }
             });
-            match wrote.await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => eprintln!("remote: {name} is not kept: {e}"),
-                Err(e) => eprintln!("remote: {name} is not kept: {e}"),
-            }
         }
         Ok(bytes)
+    }
+
+    /// Notes a shard that is gone or not what its name says for the next push from this
+    /// store to mend (`index.rs`); runs and key lists need no note.
+    fn note_broken(&self, want: &Want) {
+        let Want::Shard { run, slot, .. } = *want else { return };
+        if let Err(e) = index::note_broken(&self.store, &self.project, &run, slot) {
+            eprintln!("remote: a broken shard of `{}` is not noted: {e}", self.project);
+        }
     }
 
     /// Removes the runs and shards the store keeps that are not in `named`.
@@ -294,10 +321,14 @@ impl Tiered {
     async fn read(&self, want: Want) -> Result<(), String> {
         self.once(*want.hash(), async {
             let bytes = self.bytes_of(&want, |bytes| remote_tier::check(&want, bytes)).await?;
-            match &mut *self.state.write().await {
+            let taken = match &mut *self.state.write().await {
                 State::Ready { tier, .. } => tier.take(&want, &bytes).map_err(|why| why.0),
                 _ => Ok(()),
+            };
+            if taken.is_err() {
+                self.note_broken(&want);
             }
+            taken
         })
         .await
     }
@@ -352,16 +383,34 @@ impl Tiered {
     /// directory: see the module.
     async fn lookup(&self, key: [u8; 32], tried: Vec<Hash>) -> Result<Option<Hash>, String> {
         if self.failed.swap(false, Ordering::Relaxed) {
-            // A build after the one that failed: the remote may be back.
+            // A build after one that failed: the remote may be back, and what failed may be
+            // what the root named then.
             self.remote.traffic.try_again();
+            self.reload_since(self.loads.load(Ordering::Relaxed)).await;
+        }
+        let mut again = true;
+        loop {
+            let loads = self.loads.load(Ordering::Relaxed);
+            let found = self.look_up(&key, &tried).await;
             let failed = matches!(&*self.state.read().await, State::Failed(_));
-            if failed && let Err(e) = self.reload().await {
-                return Err(format!("{e:#}"));
+            match found {
+                Err(why) if again && !failed => {
+                    eprintln!(
+                        "remote: {why}: the index is read again, and the key looked up again"
+                    );
+                    again = false;
+                    self.reload_since(loads).await;
+                }
+                found => return found,
             }
         }
+    }
+
+    /// [`Self::lookup`] in the look as it is.
+    async fn look_up(&self, key: &[u8; 32], tried: &[Hash]) -> Result<Option<Hash>, String> {
         loop {
             let step = match &*self.state.read().await {
-                State::Ready { tier, .. } => tier.lookup(&key),
+                State::Ready { tier, .. } => tier.lookup(key),
                 State::Failed(why) => return Err(why.clone()),
                 State::Loading => return Err("the index was never read".to_owned()),
             };
