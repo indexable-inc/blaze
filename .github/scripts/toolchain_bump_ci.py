@@ -172,6 +172,9 @@ def prepare(date):
     if changed:
         # With no bump open the branch is the workflow's alone, left by a run that stopped.
         run("git", "push", "-q", *([] if pr else ["--force"]), "origin", f"HEAD:refs/heads/{BRANCH}")
+        # library.py merge made the new nightly's snapshot of the standard library, the next merge's base.
+        if run("git", "rev-parse", "-q", "--verify", "refs/heads/upstream/library", check=False).strip():
+            run("git", "push", "-q", "origin", "refs/heads/upstream/library:refs/heads/upstream/library")
     output(changed=str(changed).lower(), pin=now, was=was)
 
 
