@@ -368,6 +368,59 @@ fn main() {
 }
 
 #[test]
+fn drop_glue_of_a_long_list_of_boxes() {
+    // A level of native stack a node overflowed it: smoke's const_heap drops a list of 1000.
+    check_pass(
+        r#"
+//- minicore: drop, add, cell
+#![feature(lang_items)]
+
+use core::cell::Cell;
+
+fn should_not_reach() {
+    _ // FIXME: replace this function with panic when that works
+}
+
+#[rustc_intrinsic]
+#[rustc_intrinsic_must_be_overridden]
+pub fn box_new<T>(_x: T) -> Box<T>;
+
+#[lang = "owned_box"]
+pub struct Box<T: ?Sized> {
+    inner: *mut T,
+}
+
+struct X<'a>(&'a Cell<i32>);
+impl<'a> Drop for X<'a> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1)
+    }
+}
+
+enum List<'a> {
+    Cons(X<'a>, Box<List<'a>>),
+    Nil,
+}
+
+fn main() {
+    let s = Cell::new(0);
+    {
+        let mut list = List::Nil;
+        let mut i = 0;
+        while i < 100000 {
+            list = List::Cons(X(&s), box_new(list));
+            i += 1;
+        }
+    }
+    if s.get() != 100000 {
+        should_not_reach();
+    }
+}
+        "#,
+    );
+}
+
+#[test]
 fn drop_glue_of_closures_tuples_arrays_and_enums() {
     // `Vec::extend_trusted` writes the length back in the `Drop` of a guard the closure it
     // passes to `for_each` captures: a closure's captures are dropped with it.

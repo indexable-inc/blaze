@@ -202,6 +202,14 @@ enum Origin {
 /// A block of the heap: the size and alignment it was asked for, the bytes it takes, of a
 /// size class ([`size_class`]) a freed block of the same class and alignment is reused for,
 /// and what made it.
+/// What is left of a drop ([`Evaluator::run_drop_glue_deep`]).
+enum DropStep<'db> {
+    /// The drop glue of a value: its type, where it is, and its metadata if unsized.
+    Glue(Ty<'db>, Address, Vec<u8>),
+    /// The `Drop` impl of a `Box`, once what it points to is dropped.
+    DropImpl(Ty<'db>, Address),
+}
+
 #[derive(Debug, Clone, Copy)]
 struct HeapBlock {
     size: usize,
@@ -3922,6 +3930,9 @@ impl<'db> Evaluator<'db> {
     /// impl, then its parts in order (a struct's or tuple's fields, a closure's captures, the
     /// fields of the variant an enum holds, an array's or slice's elements). A `Box` drops what
     /// it points to before its `Drop` frees it.
+    ///
+    /// The parts wait on a stack of steps rather than the native one: a list of a thousand
+    /// boxes is a thousand levels deep.
     fn run_drop_glue_deep(
         &mut self,
         ty: Ty<'db>,
@@ -3930,7 +3941,33 @@ impl<'db> Evaluator<'db> {
         metadata: &[u8],
         span: MirSpan,
     ) -> Result<'db, ()> {
-        if self.lang_items().Drop_drop.is_none() || !self.has_drop_glue(ty) {
+        if self.lang_items().Drop_drop.is_none() {
+            return Ok(());
+        }
+        let mut steps = vec![DropStep::Glue(ty, addr, metadata.to_vec())];
+        while let Some(step) = steps.pop() {
+            match step {
+                DropStep::Glue(ty, addr, metadata) => {
+                    self.drop_glue_step(ty, locals, addr, &metadata, span, &mut steps)?
+                }
+                DropStep::DropImpl(ty, addr) => self.call_drop_impl(ty, locals, addr, span)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// One step of [`Self::run_drop_glue_deep`]: runs what comes first in dropping the value
+    /// and pushes the rest onto `steps`, last first.
+    fn drop_glue_step(
+        &mut self,
+        ty: Ty<'db>,
+        locals: &Locals<'db>,
+        addr: Address,
+        metadata: &[u8],
+        span: MirSpan,
+        steps: &mut Vec<DropStep<'db>>,
+    ) -> Result<'db, ()> {
+        if !self.has_drop_glue(ty) {
             return Ok(());
         }
         // A field's declared type can be a projection (`Cow::Owned`'s `<B as ToOwned>::Owned`,
@@ -3953,20 +3990,7 @@ impl<'db> Evaluator<'db> {
             }
             _ => ty,
         };
-        // One level per `Box` or field: a long list of boxes goes deep.
-        stdx::ensure_sufficient_stack(|| {
-            self.run_drop_glue_deep_normalized(ty, locals, addr, metadata, span)
-        })
-    }
-
-    fn run_drop_glue_deep_normalized(
-        &mut self,
-        ty: Ty<'db>,
-        locals: &Locals<'db>,
-        addr: Address,
-        metadata: &[u8],
-        span: MirSpan,
-    ) -> Result<'db, ()> {
+        let mut parts = Vec::new();
         match ty.kind() {
             TyKind::Adt(adt_def, subst) => {
                 let id = adt_def.def_id();
@@ -3987,15 +4011,15 @@ impl<'db> Evaluator<'db> {
                     let offset = layout.fields.offset(0).bytes_usize();
                     let bytes = self.read_memory(addr.offset(offset), size)?.to_vec();
                     let (data, contents_metadata) = bytes.split_at(self.ptr_size());
-                    self.run_drop_glue_deep(
+                    parts.push(DropStep::Glue(
                         subst.type_at(0),
-                        locals,
                         Address::from_bytes(data)?,
-                        contents_metadata,
-                        span,
-                    )?;
+                        contents_metadata.to_vec(),
+                    ));
+                    parts.push(DropStep::DropImpl(ty, addr));
+                } else {
+                    self.call_drop_impl(ty, locals, addr, span)?;
                 }
-                self.call_drop_impl(ty, locals, addr, span)?;
                 let bytes;
                 let (variant, layout): (VariantId, Cow<'_, Layout>) = match id {
                     AdtId::StructId(s) => (s.into(), Cow::Borrowed(&*layout)),
@@ -4022,34 +4046,35 @@ impl<'db> Evaluator<'db> {
                         layout.fields.offset(u32::from(field.into_raw()) as usize).bytes_usize();
                     let ty = field_types[field].ty().instantiate(self.interner(), subst).skip_norm_wip();
                     // The metadata of an unsized struct is its last field's (`RefCell<dyn FnMut()>`).
-                    let metadata = if Some(index) == last { metadata } else { &[] };
-                    self.run_drop_glue_deep(ty, locals, addr.offset(offset), metadata, span)?;
+                    let metadata = if Some(index) == last { metadata.to_vec() } else { Vec::new() };
+                    parts.push(DropStep::Glue(ty, addr.offset(offset), metadata));
                 }
             }
-            TyKind::Tuple(fields) => self.drop_fields(ty, fields.iter(), locals, addr, span)?,
+            TyKind::Tuple(fields) => self.field_steps(ty, fields.iter(), addr, &mut parts)?,
             TyKind::Closure(_, args) => {
                 let upvars = args.as_closure().tupled_upvars_ty();
-                self.drop_fields(ty, upvars.tuple_fields().iter(), locals, addr, span)?;
+                self.field_steps(ty, upvars.tuple_fields().iter(), addr, &mut parts)?;
             }
             TyKind::Array(inner, len) => {
                 let Some(len) = try_const_usize(self.db, len) else {
                     not_supported!("dropping an array of no evaluated length");
                 };
-                self.drop_elements(inner, len as usize, locals, addr, span)?;
+                self.element_steps(inner, len as usize, locals, addr, &mut parts)?;
             }
             TyKind::Slice(inner) => {
                 let len = from_bytes!(usize, metadata);
-                self.drop_elements(inner, len, locals, addr, span)?;
+                self.element_steps(inner, len, locals, addr, &mut parts)?;
             }
             TyKind::Dynamic(..) => {
                 if metadata.is_empty() {
                     not_supported!("dropping {ty:?} with no vtable");
                 }
                 let concrete_ty = self.vtable_map.ty_of_bytes(metadata)?;
-                self.run_drop_glue_deep(concrete_ty, locals, addr, &[], span)?;
+                parts.push(DropStep::Glue(concrete_ty, addr, Vec::new()));
             }
             _ => not_supported!("drop glue of {ty:?}"),
         }
+        steps.extend(parts.into_iter().rev());
         Ok(())
     }
 
@@ -4101,39 +4126,36 @@ impl<'db> Evaluator<'db> {
         Ok(())
     }
 
-    /// Drops the fields of the tuple or closure `ty` at `addr`, of types `fields`, in order.
-    fn drop_fields(
+    /// The drops of the fields of the tuple or closure `ty` at `addr`, of types `fields`, in order.
+    fn field_steps(
         &mut self,
         ty: Ty<'db>,
         fields: impl Iterator<Item = Ty<'db>>,
-        locals: &Locals<'db>,
         addr: Address,
-        span: MirSpan,
+        parts: &mut Vec<DropStep<'db>>,
     ) -> Result<'db, ()> {
         let layout = self.layout(ty)?;
         for (i, field) in fields.enumerate() {
             let offset = layout.fields.offset(i).bytes_usize();
-            self.run_drop_glue_deep(field, locals, addr.offset(offset), &[], span)?;
+            parts.push(DropStep::Glue(field, addr.offset(offset), Vec::new()));
         }
         Ok(())
     }
 
-    /// Drops `len` elements of type `inner` from `addr` on, first to last.
-    fn drop_elements(
+    /// The drops of `len` elements of type `inner` from `addr` on, first to last.
+    fn element_steps(
         &mut self,
         inner: Ty<'db>,
         len: usize,
         locals: &Locals<'db>,
         addr: Address,
-        span: MirSpan,
+        parts: &mut Vec<DropStep<'db>>,
     ) -> Result<'db, ()> {
         if !self.has_drop_glue(inner) {
             return Ok(());
         }
         let size = self.size_of_sized(inner, locals, "element to drop")?;
-        for i in 0..len {
-            self.run_drop_glue_deep(inner, locals, addr.offset(i * size), &[], span)?;
-        }
+        parts.extend((0..len).map(|i| DropStep::Glue(inner, addr.offset(i * size), Vec::new())));
         Ok(())
     }
 
