@@ -51,6 +51,8 @@ memmap2 = "0.9"
 wasmparser = { version = "0.236", default-features = false, features = ["std"] }
 wasm-encoder = { version = "0.244", default-features = false, features = ["std"] }
 object = { version = "0.37", default-features = false, features = ["read", "write", "std", "archive", "elf", "macho", "coff", "pe", "wasm"] }
+# The archive of a `staticlib`, as rustc writes it.
+ar_archive_writer = "0.5.3"
 rustc-demangle = "0.1.28"
 # Where rustc's object says a static LLVM split up is (`symbols::whole_in_dwarf`).
 gimli = { version = "0.33", default-features = false, features = ["read", "std"] }

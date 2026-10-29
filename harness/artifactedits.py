@@ -58,6 +58,34 @@ pub extern "C" fn top_value() -> u32 {
     dep::value()
 }
 """
+# `staticlib-native`: what a build script compiles of C, linked `static`, is in the archive,
+# as rustc bundles it: the C program is linked with the archive alone.
+NATIVE_EXPORT = """unsafe extern "C" {
+    fn native_zero() -> u32;
+}
+
+#[no_mangle]
+pub extern "C" fn top_value() -> u32 {
+    dep::value() + unsafe { native_zero() }
+}
+"""
+NATIVE_C = "unsigned native_zero(void) { return 0; }\n"
+NATIVE_BUILD = """use std::{env, path::PathBuf, process::Command};
+
+fn main() {
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let object = out.join("native.o");
+    let compiled = Command::new("cc").args(["-fPIC", "-c", "native.c", "-o"]).arg(&object).status();
+    assert!(compiled.unwrap().success(), "compiling native.c");
+    let archive = out.join("libnative.a");
+    let _ = std::fs::remove_file(&archive);
+    let archived = Command::new("ar").arg("crs").arg(&archive).arg(&object).status();
+    assert!(archived.unwrap().success(), "archiving native.o");
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=native");
+    println!("cargo:rerun-if-changed=native.c");
+}
+"""
 C_MAIN = """#include <stdio.h>
 unsigned top_value(void);
 int main(void) { printf("%u\\n", top_value()); return 0; }
@@ -84,7 +112,8 @@ CASES = {
     "bin": (None, "top", "built", {}),
     "cdylib": (["cdylib"], f"{'lib' if sys.platform != 'win32' else ''}top{DLL}", "built", {}),
     "dylib": (["dylib"], f"libtop{DLL}", "refused", {}),
-    "staticlib": (["staticlib"], "libtop.a", "refused", {}),
+    "staticlib": (["staticlib"], "libtop.a", "built", {}),
+    "staticlib-native": (["staticlib"], "libtop.a", "built", {}),
     "flags": (None, "top", "built", {"RUSTC_BOOTSTRAP": "1"}),
 }
 
@@ -100,6 +129,10 @@ def write_case(ws, name):
     if crate_types:
         top += f"[lib]\ncrate-type = {crate_types!r}\n\n".replace("'", '"')
         files["top/src/lib.rs"] = EXPORT
+        if name == "staticlib-native":
+            files["top/src/lib.rs"] = NATIVE_EXPORT
+            files["top/native.c"] = NATIVE_C
+            files["top/build.rs"] = NATIVE_BUILD
     elif name == "flags":
         files["top/src/main.rs"] = (
             'fn main() {\n    println!("{} {}", dep::value(), cfg!(tokio_unstable));\n}\n'
@@ -121,7 +154,7 @@ def computed(name, artifact, scratch):
     if CASES[name][0] is None:
         ran = subprocess.run([artifact], capture_output=True, text=True, timeout=60)
         return ran.stdout.strip() if ran.returncode == 0 else f"exit {ran.returncode}: {ran.stderr[-300:]}"
-    if name == "staticlib":
+    if name.startswith("staticlib"):
         exe = os.path.join(scratch, "c-main")
         main = os.path.join(scratch, "main.c")
         with open(main, "w") as out:

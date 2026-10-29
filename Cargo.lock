@@ -822,6 +822,7 @@ name = "blaze-engine"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "ar_archive_writer",
  "blaze-cargo",
  "blaze-doc",
  "blaze-expand",
