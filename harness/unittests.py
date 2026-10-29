@@ -16,7 +16,9 @@ its tests failed. `ide-diagnostics` is the daemon's errors (its diagnostics are 
 `hir-ide` is rust-analyzer's type inference with its own tests; the ones in OPEN are what the
 fork does differently from upstream that its expectations have not caught up with.
 """
-import dataclasses, json, os, re, subprocess, sys, typing
+import dataclasses, json, os, re, shutil, subprocess, sys, threading, time, typing
+
+import memory
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CRATES = [
@@ -74,11 +76,59 @@ DOCTESTS = re.compile(r"^\s+Doc-tests (\w+)")
 RESULT = re.compile(r"^test (\S+)(?: - .*)? \.\.\. (ok|FAILED|ignored)")
 
 
-def run(command, cwd, env, seen, failed):
-    """Runs one `cargo test`, adding its tests to seen and failed; returns its exit status and
-    whether any of its tests failed."""
+class Watch:
+    """What the machine and the run's processes hold, said every `EVERY` seconds while the run
+    runs, and the most of it: a hosted runner that runs out of memory and swap is shut down
+    with nothing in the log ("The runner has received a shutdown signal"), and these lines
+    are the last it has."""
+
+    EVERY = 30
+
+    def __init__(self, pid, dirs):
+        self.sampler = memory.Sampler(interval=1.0).add(pid)
+        self.dirs, self.peak, self.at_peak, self._stop = dirs, 0, None, threading.Event()
+        self.began = time.monotonic()
+
+    def line(self):
+        machine = memory.system_mb()
+        if machine:
+            held = machine["used"] + machine["swap_used"]
+            if held > self.peak:
+                self.peak, self.at_peak = held, machine
+        gb = lambda mb: f"{mb / 1024:.1f}"
+        said = [f"memory at {(time.monotonic() - self.began) / 60:.0f} min:"]
+        if machine:
+            said.append(f"machine {gb(machine['used'])}/{gb(machine['total'])} GB, swap {gb(machine['swap_used'])}/{gb(machine['swap_total'])} GB;")
+        said.append(f"the run's processes {gb(self.sampler.peak_mb)} GB at most;")
+        said.append("disk free " + ", ".join(f"{d} {shutil.disk_usage(d).free / 2**30:.0f} GB" for d in self.dirs if os.path.isdir(d)) + ";")
+        said.append("largest " + ", ".join(f"{name}[{pid}] {gb(rss)}+{gb(swap)} GB" for rss, swap, pid, name in memory.largest_processes(4)))
+        return " ".join(said)
+
+    def _loop(self):
+        while not self._stop.wait(self.EVERY):
+            print(self.line(), flush=True)
+
+    def __enter__(self):
+        self.sampler.start()
+        threading.Thread(target=self._loop, daemon=True).start()
+        return self
+
+    def __exit__(self, *_):
+        self._stop.set()
+        self.sampler.stop()
+        print(self.line(), flush=True)
+
+
+def run(command, cwd, env, seen, failed, watch_dirs):
+    """Runs one `cargo test`, adding its tests to seen and failed; returns its exit status,
+    whether any of its tests failed and its `Watch`."""
     print(" ".join(command), flush=True)
     proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+    with Watch(proc.pid, watch_dirs) as watch:
+        return *read(proc, seen, failed), watch
+
+
+def read(proc, seen, failed):
     binary, any_failed = "?", False
     for line in proc.stdout:
         # Flushed: a pipe's buffer (128 KiB from Python 3.14) held a whole build's lines until
@@ -143,8 +193,16 @@ def main():
     if not plain:
         env.setdefault("RUST_MIN_STACK", str(16 << 20))
     seen, failed = set(), set()
-    status, any_failed = run(command, ROOT, env, seen, failed)
+    watch_dirs = [ROOT, *(d for d in [os.environ.get("BLAZE_CACHE"), "/mnt"] if d)]
+    status, any_failed, watch = run(command, ROOT, env, seen, failed, watch_dirs)
     sys.stdout.flush()
+    took = (time.monotonic() - watch.began) / 60
+    peak = f"{watch.peak / 1024:.1f} GB of memory and swap in use on the machine at most" if watch.at_peak else "no memory reading on this platform"
+    said = f"`{' '.join(command[:2])}`: {took:.0f} min, {peak}, {watch.sampler.peak_mb / 1024:.1f} GB resident in the run's processes at most"
+    print(said, flush=True)
+    if os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+            f.write(f"### Unit tests\n\n{said}\n\n")
     unsure = set() if plain else UNSURE_BLAZE
     new, fixed, gone = sorted(failed - open_ - unsure), sorted(open_ & seen - failed), sorted(open_ - seen)
     print(f"\n{len(seen)} tests, {len(failed)} failed, {len(open_ & failed)} of them known (OPEN in harness/unittests.py)")
