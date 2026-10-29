@@ -111,7 +111,7 @@ itself is built with that nightly (`cargo +"$(cat harness/toolchain)"`; in `nix 
 plain `cargo` is it), and so are the harnesses' reference builds. The pin is written in that
 one file; everything else reads it or is written from it:
 
-- `crates/blaze-cargo/src/cargo/toolchain/pins.txt` (by `harness/toolchain_pins.py --write`): the
+- `crates/blaze-cargo/src/cargo/toolchain/pins.txt` (by `harness/toolchain_pins.py '{"write": true}'`): the
   sha256 and size of each file blaze downloads as its own toolchain, the nightly's `rustc -V`
   line and its rust-lang/rust commit. A rustc is taken for the pinned one by that whole line,
   since every nightly of a release has the same number.

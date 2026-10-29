@@ -756,6 +756,11 @@ fn source_path(
     let source_root = db.file_source_root(file).source_root_id(db);
     let source_root = db.source_root(source_root).source_root(db);
     let path = source_root.path_for_file(&file)?.as_path()?.to_string();
+    // The library is named where it is, as in a toolchain, also when it is in the checkout
+    // built (blaze's own): what the store keeps of it is named as built (`library_sources`).
+    if cargo::toolchain::library::has(Path::new(&path)) {
+        return Some(path);
+    }
     let base = base.and_then(|base| Path::new(&path).strip_prefix(base).ok());
     let relative = Path::new(&path).strip_prefix(root).ok().or(base);
     Some(relative.map_or(path.clone(), |it| it.to_string_lossy().into_owned()))
@@ -1290,85 +1295,21 @@ impl Resolver<'_> {
     }
 }
 
-/// The commit of the toolchain installed at `toolchain`, which rustc puts in the names of the
-/// standard library's files: as rustup's manifest has it, or else as the built library does.
-///
-/// Kept while the manifest and the directory are as they were: rustup's manifest is a file of
-/// most of a megabyte, read on every build otherwise, a patch's too, and an update of the
-/// toolchain rewrites it in place.
-fn rustc_commit(toolchain: &str) -> Option<String> {
-    type Seen = (Option<std::time::SystemTime>, Option<std::time::SystemTime>);
-    static KNOWN: Mutex<Option<FxHashMap<String, (Seen, Option<String>)>>> = Mutex::new(None);
-    let rustlib = format!("{toolchain}lib/rustlib");
-    let modified = |path: &str| std::fs::metadata(path).and_then(|it| it.modified()).ok();
-    let seen =
-        (modified(&format!("{rustlib}/multirust-channel-manifest.toml")), modified(&rustlib));
-    if let Some((was, commit)) = lock(&KNOWN).get_or_insert_default().get(toolchain)
-        && *was == seen
-    {
-        return commit.clone();
-    }
-    let commit = commit_in_manifest(&rustlib);
-    lock(&KNOWN).get_or_insert_default().insert(toolchain.to_owned(), (seen, commit.clone()));
-    commit
-}
-
-/// The commit the channel manifest below `rustlib` names for the toolchain: its
-/// `git_commit_hash`, or, for a nightly's manifest, which names the commit only by the short
-/// hash in its version, the commit of blaze's own nightly when that version is its
-/// (`pins.txt`). Nothing rustc built is read for it (docs/no-rustc.md, step F): it used to be
-/// read out of the paths in the sysroot's `libstd` rlib.
-fn commit_in_manifest(rustlib: &str) -> Option<String> {
-    let manifest =
-        std::fs::read_to_string(format!("{rustlib}/multirust-channel-manifest.toml")).ok()?;
-    commit_of_manifest(&manifest, cargo::ours_says(), cargo::ours_commit())
-}
-
-/// What [`commit_in_manifest`] says of `manifest`, for a blaze whose own nightly's rustc says
-/// `ours` (`1.101.0-nightly (12433c307 2026-10-24)`) and was built from `commit`.
-fn commit_of_manifest(manifest: &str, ours: &str, commit: &str) -> Option<String> {
-    // The `[pkg.rust]` table's own keys, before its first subtable.
-    let rust: Vec<&str> = (manifest.lines().skip_while(|it| it.trim() != "[pkg.rust]").skip(1))
-        .take_while(|it| !it.trim_start().starts_with('['))
-        .collect();
-    let value = |key: &str| {
-        rust.iter().find_map(|line| {
-            let (name, value) = line.split_once('=')?;
-            (name.trim() == key).then(|| value.trim().trim_matches('"'))
-        })
-    };
-    if let Some(named) = value("git_commit_hash") {
-        return Some(named.to_owned());
-    }
-    (value("version")? == ours).then(|| commit.to_owned())
-}
-
-/// What tells the toolchain whose library was loaded from any other: the name of the built
-/// library the program links, its commit, and the name of its compiler, each of which has
-/// a hash of the toolchain in it, and what the metadata of its `core`, `alloc` and `std`
-/// says of each (`metadata_hash`). `None` when it has none of them.
-fn toolchain_identity(vfs: &vfs::Vfs, symbol_files: &[PathBuf]) -> Option<String> {
+/// What tells the standard library a build compiles against from any other: the digest of
+/// its source ([`source_identity`]), and, of a program rustc's library is linked into, the name
+/// of the built library it links and what the metadata of its `core`, `alloc` and `std` says
+/// of each (`metadata_hash`). `None` when it has none of them.
+fn toolchain_identity(symbol_files: &[PathBuf]) -> Option<String> {
     let mut identity = library_identity(symbol_files);
-    if let Some(toolchain) = &loaded_toolchain(vfs) {
-        identity.extend(installed_identity(toolchain));
-    }
+    identity.extend(source_identity());
     identity.sort_unstable();
     (!identity.is_empty()).then(|| identity.join(" "))
 }
 
-/// What [`toolchain_identity`] will say of a build with nothing of rustc's in the checkout at
-/// `project`, before it is loaded: the toolchain the load finds, as it finds it.
-fn toolchain_ahead(project: &Path, cargo_config: &CargoConfig) -> Option<String> {
-    let root = match &cargo_config.sysroot {
-        Some(RustLibSource::Path(toolchain)) => toolchain.clone(),
-        _ => {
-            let dir = AbsPathBuf::assert_utf8(std::env::current_dir().ok()?.join(project));
-            let sysroot = project_model::Sysroot::discover(&dir, &cargo_config.extra_env);
-            sysroot.root()?.to_owned()
-        }
-    };
-    let mut identity = installed_identity(&format!("{root}/"));
-    identity.sort_unstable();
+/// What [`toolchain_identity`] will say of a build with nothing of rustc's, before it is
+/// loaded: the source of the library it loads.
+fn toolchain_ahead() -> Option<String> {
+    let identity = source_identity();
     (!identity.is_empty()).then(|| identity.join(" "))
 }
 
@@ -1403,26 +1344,13 @@ fn library_identity(files: &[PathBuf]) -> Vec<String> {
     identity
 }
 
-/// The toolchain whose library sources were loaded, with a `/` at its end.
-fn loaded_toolchain(vfs: &vfs::Vfs) -> Option<String> {
-    vfs.iter().find_map(|(_, path)| {
-        let path = path.as_path()?.as_str().replace('\\', "/");
-        let (toolchain, _) = path.split_once("lib/rustlib/src/rust/")?;
-        Some(toolchain.to_owned())
-    })
-}
-
-/// What of [`toolchain_identity`] the toolchain installed at `toolchain` (with a `/` at its
-/// end) says: its commit and the name of its compiler. The whole of it for a build with
-/// nothing of rustc's, on any machine the toolchain is installed on.
-pub(crate) fn installed_identity(toolchain: &str) -> Vec<String> {
-    let mut identity: Vec<String> = rustc_commit(toolchain).into_iter().collect();
-    for dir in ["lib", "bin"] {
-        let Ok(entries) = std::fs::read_dir(format!("{toolchain}{dir}")) else { continue };
-        let names = entries.filter_map(|it| it.ok()?.file_name().into_string().ok());
-        identity.extend(names.filter(|it| it.contains("rustc_driver-")));
-    }
-    identity
+/// What of [`toolchain_identity`] the source of the standard library says: its digest
+/// (`library/DIGEST`), the same on any machine with that library. The whole of it for a build
+/// with nothing of rustc's. Nothing of the downloaded toolchain is: blaze compiles neither its
+/// `rust-src` nor with its rustc.
+pub(crate) fn source_identity() -> Vec<String> {
+    let library = cargo::toolchain::library::found();
+    library.map(|it| format!("library={}", it.digest)).into_iter().collect()
 }
 
 /// A hash of what the metadata of the crate in the rlib `archive` says it is: the header,
@@ -1455,10 +1383,10 @@ fn metadata_hash(archive: &[u8]) -> Option<String> {
     Some(hash[..8].iter().map(|it| format!("{it:02x}")).collect())
 }
 
-/// The built rlibs of [`LIBRARY`] of the toolchain whose library was loaded, for `triple`.
-fn built_library(vfs: &vfs::Vfs, triple: &str) -> Vec<PathBuf> {
-    let Some(toolchain) = loaded_toolchain(vfs) else { return Vec::new() };
-    library_in(&PathBuf::from(format!("{toolchain}lib/rustlib/{triple}/lib")))
+/// The built rlibs of [`LIBRARY`] of blaze's toolchain, for `triple`.
+fn built_library(triple: &str) -> Vec<PathBuf> {
+    let Some(toolchain) = cargo::toolchain::sysroot() else { return Vec::new() };
+    library_in(&toolchain.join(format!("lib/rustlib/{triple}/lib")))
 }
 
 /// The rlibs of [`LIBRARY`] in the directory of a toolchain's built library.
@@ -1683,7 +1611,7 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn library_sources(&self) -> Option<hir_ty_codegen::LibrarySources> {
-        self.contents.library_sources(self.db)
+        self.contents.library_sources()
     }
 
     fn names_place(&self, bytes: &[u8]) -> bool {
@@ -3341,11 +3269,16 @@ fn workspace_at(
         if let Some(error) = workspace.sysroot.error().filter(|_| read) {
             anyhow::bail!("{}", error.trim_end());
         }
-        let toolchain =
-            workspace.sysroot.root().map_or("the toolchain".to_owned(), |it| it.to_string());
+        let named = std::env::var(cargo::toolchain::library::VAR).unwrap_or_default();
+        let named = match named.is_empty() {
+            true => "blaze".to_owned(),
+            false => format!("{} (`{}`)", named, cargo::toolchain::library::VAR),
+        };
         anyhow::bail!(
-            "{toolchain} has no source of the standard library, which blaze compiles from: \
-             `rustup component add rust-src` installs it"
+            "{named} has no source of the standard library, which blaze compiles from: \
+             `blaze toolchain` downloads blaze's, digest {} ({})",
+            cargo::toolchain::library::digest(),
+            cargo::toolchain::library::why_not()
         );
     }
     let mut debug = plan::Whole {
@@ -4053,7 +3986,12 @@ fn harnesses<'a>(
                 test_harness::module(db, krate, functions, &name)
             });
             let module = module.map(|it| it.text).unwrap_or_default();
-            let wanted = format!("{}{module}", test_harness::without(&text));
+            // rustc empties a crate whose root's `#![cfg(...)]` is false, its crate attributes
+            // too, and then writes its harness: such a root is the harness alone, with no tests,
+            // or the `#![cfg]` would leave the program without the harness's `main` too.
+            let configured_out = hir::attach_db(db, || krate.is_configured_out(db));
+            let kept = if configured_out { "" } else { test_harness::without(&text) };
+            let wanted = format!("{kept}{module}");
             if *text != *wanted {
                 texts.push((file, wanted));
             }
@@ -5888,8 +5826,9 @@ fn run_link(cmd: &str, binary: Option<&Path>, start: Instant, note: &str) -> any
     }
     let linked = linked?;
     let status = linked.status;
-    let said = String::from_utf8_lossy(&linked.stderr).into_owned();
-    eprint!("{}{said}", String::from_utf8_lossy(&linked.stdout));
+    // `link.exe` says what failed on its standard output.
+    let said = [&linked.stdout, &linked.stderr].map(|it| String::from_utf8_lossy(it)).concat();
+    eprint!("{said}");
     eprintln!("link: {:.1?} ({status}{note})", start.elapsed());
     if !status.success() {
         return Err(LinkFailed { status, said }.into());
@@ -6712,6 +6651,7 @@ impl WatchedFile {
     fn immutable(path: &Path) -> bool {
         let unedited = lock(&UNEDITED);
         path.starts_with("/nix/store")
+            || cargo::toolchain::library::has(path)
             || unedited.installed.iter().any(|it| path.starts_with(it))
             || unedited.targets.iter().any(|it| path.starts_with(it))
                 && !cargo::script::in_out_dir(path)
@@ -7981,6 +7921,9 @@ pub fn main() -> anyhow::Result<()> {
         version: pin::OURS,
         version_line: env!("BLAZE_VERSION_LINE"),
     });
+    // Before anything that could start a thread: it sets the environment. After the engine
+    // is handed over: a library downloaded is the release's, which the engine's version names.
+    cargo::toolchain::library::publish();
     trace::began();
     renamed::refuse_old_settings();
     if let Some(sources) = option_env!("BLAZE_SOURCES") {
@@ -8906,7 +8849,7 @@ fn run_holding(
     let cargo_config = cargo_config(&args);
     if !ahead
         && args.symbol_files.is_empty()
-        && let Some(toolchain) = toolchain_ahead(&args.project, &cargo_config)
+        && let Some(toolchain) = toolchain_ahead()
     {
         blaze_store::compiles_against(&toolchain);
     }
@@ -8985,8 +8928,8 @@ fn run_holding(
     // What is compiled ahead is stored too, so the store is told the toolchain first. A build
     // told ahead of cargo's links the library of the toolchain that was loaded, or is not the
     // daemon's.
-    let library = ahead.then(|| built_library(&vfs, emits.triple()));
-    match toolchain_identity(&vfs, library.as_ref().unwrap_or(&args.symbol_files)) {
+    let library = ahead.then(|| built_library(emits.triple()));
+    match toolchain_identity(library.as_ref().unwrap_or(&args.symbol_files)) {
         Some(toolchain) => {
             blaze_store::compiles_against(&toolchain);
             if let Some(told) = blaze_store::toolchain().filter(|it| *it != toolchain) {
@@ -9228,10 +9171,23 @@ fn run_holding(
                 let compiling = events::compiling(&shown_crate(&db, &args));
                 counted = compiling.counted();
                 let mut cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
-                // An `include!` in a body is first seen when the body is compiled.
+                // An `include!` in a body is first seen when the body is compiled. Only the
+                // crates that include the file, and what depends on them, compiled without
+                // it: touching every crate compiles all of a program from the store again to
+                // tell what changed.
+                let including = tree.including(&db);
                 if WatchedFile::include_sources(&mut files, &mut tree, &mut db) != Loaded::Nothing {
-                    known.touch(&db, None);
-                    listed.touch(&db, None);
+                    let named: Vec<String> = including
+                        .iter()
+                        .map(|&it| {
+                            let name = it.extra_data(&db).display_name.as_ref();
+                            name.map_or_else(|| "?".to_owned(), ToString::to_string)
+                        })
+                        .collect();
+                    eprintln!("included late, by {}", named.join(", "));
+                    let crates = (!including.is_empty()).then_some(&including[..]);
+                    known.touch(&db, crates);
+                    listed.touch(&db, crates);
                     cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
                 }
                 cold
@@ -11818,21 +11774,6 @@ mod user {
         assert!(links_core("cc @/t/link.args"));
         assert!(links_core("cc /sysroot/lib/libstd-44675f186029a4cd.so"));
         assert!(!links_core(lto));
-    }
-
-    #[test]
-    fn the_commit_of_a_toolchain_is_the_one_its_channel_manifest_names() {
-        let ours = "1.101.0-nightly (12433c307 2026-10-24)";
-        let commit = "12433c307b5a497388ffe2f4e49dbf1ab8c71fa0";
-        let named = "[pkg.rust]\ngit_commit_hash = \"abc\"\n";
-        assert_eq!(commit_of_manifest(named, ours, commit).as_deref(), Some("abc"));
-        let nightly = format!(
-            "date = \"2026-10-25\"\n\n[pkg.cargo]\nversion = \"{ours}\"\n\n[pkg.rust]\nversion = \"{ours}\"\n\n[pkg.rust.target.x]\ngit_commit_hash = \"x\"\n"
-        );
-        assert_eq!(commit_of_manifest(&nightly, ours, commit).as_deref(), Some(commit));
-        let other = nightly.replace("2026-10-24)\"\n\n[pkg.rust.", "2026-10-23)\"\n\n[pkg.rust.");
-        assert_eq!(commit_of_manifest(&other, ours, commit), None);
-        assert_eq!(commit_of_manifest("[pkg.cargo]\nversion = \"1\"\n", ours, commit), None);
     }
 
     #[test]

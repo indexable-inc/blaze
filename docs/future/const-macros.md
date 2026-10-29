@@ -7,7 +7,8 @@ date: 2026-10-28
 
 Status: design. Stage 0 of the prototype ([below](#the-prototype-stage-0)) is on main behind
 `experimental = ["const-macros"]`: the evaluator call and expander (#915), and the manifest key
-and loading (#959). Nothing here is on by default. Issues: #859 (hermetic build graph), #860 (purity as a front-end query), #867
+and loading (#959). Of stage 2 ([below](#stage-2-the-item-as-a-flat-tree-through-const-views),
+#1441), the const views are on main and not yet given to macros. Nothing here is on by default. Issues: #859 (hermetic build graph), #860 (purity as a front-end query), #867
 (const traits, const closures, const heap, step budget), #863 (the build graph's `map`).
 
 ## What it is
@@ -266,6 +267,45 @@ What stage 0 does not do yet:
   new `#[proc_macro_derive]` function needs a reload.
 - Every output token gets the call site's span. Errors point at the derive, not into the
   macro's output.
+
+## Stage 2: the item as a flat tree, through const views
+
+#1441. A const macro is given the item as blaze's own flat syntax tree (`syntax-tree`'s
+`flat.rs`) and reads it through typed views, instead of a token stream it parses itself. The
+plan, a pull request a step:
+
+1. **Const views** (on main): `crates/const-ast`, a `no_std` crate with no dependencies. A
+   `Tree` is four slices, each element's kind (with a token bit), the number after its
+   subtree, its span index and a token's text: plain data a host writes into the evaluator's
+   heap once (`repr(C)`). The views (`Item::as_struct`, `Struct::field_list`,
+   `RecordField::ty`, `Variant::const_arg`, `Attr::path`, `Attr::as_simple_call`,
+   `GenericParamList::generic_params`, `WherePred::ty`, `Type::as_ref`, `Path::segment`, and
+   the rest of items, structs, enums, unions, fields, variants, attributes, generics, types
+   and paths) are `syntax::ast`'s nodes and accessors of the same names, as `const fn`s over
+   the slices. `HasName`, `HasAttrs`, `HasVisibility` and `HasGenericParams` are inherent
+   methods, since a const fn can't call a trait's method yet, and children are cursors with a
+   `const fn next` (`while let Some(field) = fields.next()`), which implement `Iterator` too.
+   A macro never sees a kind's number: they are in `kinds.rs`, private, checked against
+   `SyntaxKind` by a test that rewrites them (`UPDATE_EXPECT=1`), so a grammar change changes
+   the views, and through `cache_code` every expansion that used them. Tested two ways: every
+   view and accessor against `syntax::ast`'s on every node of `library/core`, `library/alloc`,
+   salsa and the crate itself (`const_ast::tests`), and what a derive reads through them, folded
+   into one number, evaluated by blaze's const evaluator against the same code compiled, on real
+   files and on one with every kind of node the views read (`hir-ide`'s
+   `consteval::const_ast`). Running them in the evaluator found it laying out an overflowing
+   `u128` operation's `(u128, bool)` as twice a `u128` where the target aligns `u128` to 8;
+   it now pads to the alignment.
+2. The expander passes the flat input to a macro that takes `&const_ast::Item`: the input's
+   token tree parsed back to a flat tree (so it is what a proc macro is given: cfg-stripped,
+   the derive itself taken out), each token's span as its index in the call's span table, and
+   `const-ast` itself in the macro crate's graph, from blaze's own copy, so the host and the
+   views agree on the layout and the kinds.
+3. The evaluator's call memo, keyed by (`cache_code` of the callee, the hashes of its
+   arguments; a view's is its slice's and spans'), for calls whose arguments include a view
+   and whose callee is in the macro file, measured on a derive over a large struct: edit one
+   field and count the evaluations.
+4. A real derive ported, cold, warm and edit times against its proc-macro version, as in the
+   stage-0 table below.
 
 ## Later
 

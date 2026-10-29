@@ -45,6 +45,8 @@ LIBRARY = ["--crate-name", "word", "--edition=2021", "src/lib.rs", "--error-form
            "--check-cfg", "cfg(feature, values(\"default\"))", "-C", "metadata=d4ed28d9543870f2",
            "-C", "extra-filename=-c55bb0b8e8b3f5b4", "--out-dir", "target/debug/deps",
            "-L", "dependency=target/debug/deps", "-O", "--print", "cfg"]
+# A feature no target has, of whose warning blaze keeps rustc's text.
+UNLISTED = "blazeunlisted"
 UI_FLAGS = ["--print", "link-args", "-C", "save-temps", "-C", "link-dead-code", "--cap-lints", "allow",
             "-L", "native=/nowhere", "--cfg", "e2024"]
 
@@ -132,8 +134,16 @@ def features_of(rust, t, base):
             if have not in sets:
                 sets.append(have)
             cpus[name] = sets.index(have)
+    other = sorted(set(rustcs + llvms) - set(features) - set(llvm) - set(off))
     return {"features": features, "llvm_features": llvm, "features_off": off, "feature_cfgs": feature_cfgs,
-            "cpus": cpus, "cpu_features": sets}
+            "cpus": cpus, "cpu_features": sets, "other_features": other}
+
+
+def unknown_feature(rust):
+    """rustc's warning of a feature the target has not, with `{feature}` for its name."""
+    code, _, err = ask([rust, "--print", "cfg", "-C", f"target-feature=+{UNLISTED}"], {"RUSTC_BOOTSTRAP": "1"})
+    assert code == 0 and err.endswith("warning: 1 warning emitted\n\n"), err
+    return err.removesuffix("warning: 1 warning emitted\n\n").replace(UNLISTED, "{feature}")
 
 
 def write():
@@ -142,7 +152,8 @@ def write():
     host = next(line.split(": ", 1)[1] for line in verbose.splitlines() if line.startswith("host: "))
     old = json.load(open(DATA)) if os.path.exists(DATA) else {"targets": {}}
     data = {"version": verbose.splitlines()[0].removeprefix("rustc "),
-            "verbose": verbose.replace(f"host: {host}\n", "host: {host}\n"), "targets": {}}
+            "verbose": verbose.replace(f"host: {host}\n", "host: {host}\n"),
+            "unknown_feature": unknown_feature(rust), "targets": {}}
     if old.get("version") != data["version"]:
         old = {"targets": {}}
     nightly = {"RUSTC_BOOTSTRAP": "1"}
@@ -239,6 +250,9 @@ def features_asked(rust):
         "aarch64": ["-C", "target-cpu=neoverse-n1", "-C", "target-feature=-aes,+sve2"],
         "wasm32": ["-C", "target-feature=+simd128,+relaxed-simd", "-C", "target-feature=-simd128"],
     }
+    # Of another architecture: rustc warns of each and turns nothing on (buildmodel's
+    # rustflags_target_feature on an AArch64 host).
+    unlisted = {"x86_64": "+neon,-sve2", "aarch64": "+avx2,+fma", "wasm32": "+avx2"}
     yield ["--print", "cfg", "-C", "target-cpu=native"]
     yield ["--print", "cfg", "-C", "target-cpu=native", "-C", "target-feature=-neon,+avx2"]
     for target in TARGETS:
@@ -254,13 +268,19 @@ def features_asked(rust):
             yield ["--print", "cfg", "-C", f"target-feature=-{name}", *t]
             yield ["--print", "cfg", "-C", "opt-level=3", "-C", f"target-feature=+{name},-{names[0]}", *t]
         yield ["--print", "cfg", *combined[target.split("-")[0]], *t]
+        arch = target.split("-")[0]
+        yield ["--print", "cfg", "-C", f"target-feature={unlisted[arch]}", *t]
+        yield ["--print", "cfg", "-C", f"target-feature={unlisted[arch]}", "-A", "warnings", *t]
+        yield ["--print", "cfg", "-C", "opt-level=3", *combined[arch], "-C", f"target-feature={unlisted[arch]}", *t]
 
 
 def must_answer(warned):
     """Whether what rustc warns of is only a kind of crate the target does not have, which
-    cargo's probe of every target meets and blaze answers as rustc does."""
+    cargo's probe of every target meets, or features it has not: blaze answers those as rustc does."""
     lines = [line for line in warned.splitlines() if line.strip()]
-    return all(line.startswith("warning: dropping unsupported crate type") or
+    return all(line.startswith(("warning: dropping unsupported crate type",
+                                "warning: unknown and unstable feature specified for `-Ctarget-feature`",
+                                "  |", "  = ")) or
                (line.startswith("warning: ") and line.endswith((" warning emitted", " warnings emitted")))
                for line in lines)
 

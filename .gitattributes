@@ -11,5 +11,5 @@ vendor/proc-macro-srv/crates/proc-macro-srv-cli/README.md -text
 
 crates/test-utils/bench_data/** binary
 
-# The standard library is upstream's bytes (harness/library.py check), not blaze's code.
+# The standard library is upstream's bytes with blaze's changes (harness/library.py), not blaze's code.
 library/** -text linguist-vendored
