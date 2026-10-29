@@ -984,6 +984,7 @@
      "salsa",
      "sha2 0.10.9",
      "span",
+     "target-lexicon",
      "tt",
      "wasmtime"
     ],
@@ -20888,6 +20889,10 @@
       {
        "name": "span",
        "unit": "span@0.0.0 lib span build"
+      },
+      {
+       "name": "target_lexicon",
+       "unit": "target-lexicon@0.13.5 lib target_lexicon build"
       },
       {
        "name": "tt",
@@ -42090,6 +42095,10 @@
        "unit": "span@0.0.0 lib span build"
       },
       {
+       "name": "target_lexicon",
+       "unit": "target-lexicon@0.13.5 lib target_lexicon build"
+      },
+      {
        "name": "tt",
        "unit": "tt@0.0.0 lib tt build"
       },
@@ -63161,6 +63170,10 @@
       {
        "name": "span",
        "unit": "span@0.0.0 lib span build"
+      },
+      {
+       "name": "target_lexicon",
+       "unit": "target-lexicon@0.13.5 lib target_lexicon build"
       },
       {
        "name": "tt",
@@ -84388,6 +84401,10 @@
       {
        "name": "span",
        "unit": "span@0.0.0 lib span build"
+      },
+      {
+       "name": "target_lexicon",
+       "unit": "target-lexicon@0.13.5 lib target_lexicon build"
       },
       {
        "name": "tt",
