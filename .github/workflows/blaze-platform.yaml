@@ -83,7 +83,10 @@ jobs:
     # hour on macOS's 7 GB runner (the 16-minute step of 4-cpu Linux had not ended at 48). Long
     # enough for that one run to finish and push, which the runs after it then pull.
     # Room after the test step's own limit for main's push, which keeps what was compiled.
-    timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 170 }}
+    # Main's push runs get close to the hosted runner's 6-hour cap: a cold store's 20 release
+    # test binaries ran past 150 minutes on 2026-10-28, and only main pushes what they compiled,
+    # so a pull request's run is warm only once one of main's has finished.
+    timeout-minutes: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 355 || startsWith(inputs.os, 'macos') && 240 || 170 }}
     # The remote's write token and signing key, for the push of blaze.yaml's runs on main alone
     # (the train, on main too, pushes nothing). A called workflow sees a secret only when its
     # caller passes it, environment secrets too: blaze.yaml calls this with `secrets: inherit`.
@@ -114,7 +117,7 @@ jobs:
       # on 2026-10-28, which cancelled the push after them, so no run after it found them
       # compiled. Run out here, the step fails and main's push still runs.
       - if: env.BLAZE == 'true'
-        timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 220 || 150 }}
+        timeout-minutes: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 335 || startsWith(inputs.os, 'macos') && 220 || 150 }}
         run: $PYTHON harness/unittests.py
       - if: env.BLAZE != 'true'
         run: $PYTHON harness/unittests.py --cargo
