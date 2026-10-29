@@ -1,3 +1,8 @@
+---
+status: record
+summary: Build scripts under WASI, an experiment, on the bench corpus.
+date: 2026-10-27
+---
 # Build scripts under WASI: the bench corpus
 
 An experiment, off by default ([docs/cargo.md](../cargo.md#build-scripts-under-wasi-an-experiment-off-by-default)

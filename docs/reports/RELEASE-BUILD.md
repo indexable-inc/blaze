@@ -1,3 +1,8 @@
+---
+status: record
+summary: How the release binaries are built, and whether blaze can build them.
+date: 2026-10-20
+---
 # How the release binaries are built
 
 Branch `build-profile`, from main at 40ddac92ab, 2026-10-21. The question was whether blaze is

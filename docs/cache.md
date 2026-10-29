@@ -1,3 +1,7 @@
+---
+status: current
+summary: The disk store every daemon shares and the remote (a directory or S3) machines push to and pull from.
+---
 # The disk store and the remote
 
 blaze keeps compiled functions in memory while a daemon runs. Two more layers keep them
