@@ -33,7 +33,7 @@ use crate::{
     },
     env::{
         cargo_config_env, inject_cargo_env, inject_cargo_executables_env, inject_cargo_package_env,
-        inject_rustc_tool_env,
+        inject_cargo_scratch_env, inject_rustc_tool_env,
     },
     project_json::{Crate, CrateArrayIdx},
     sysroot::RustLibSrcWorkspace,
@@ -500,7 +500,14 @@ impl ProjectWorkspace {
         if let Some(error) = cargo.const_macros_error() {
             anyhow::bail!("{error}");
         }
+        if has_const_macros(&cargo) && sysroot.root().is_none() {
+            anyhow::bail!(
+                "{cargo_toml} has const macros, whose crate depends on blaze's copy of \
+                 `const-ast` in the sysroot, and no sysroot was found"
+            );
+        }
         cargo.set_executables(config.executables.clone());
+        cargo.set_scratch(config.scratch.clone());
         if let Ok(Some(loaded_sysroot)) = &loaded_sysroot {
             tracing::info!(src_root = ?sysroot.rust_lib_src_root(), root = %loaded_sysroot, "Loaded sysroot");
         }
@@ -1333,6 +1340,63 @@ fn project_json_to_crate_graph(
     res
 }
 
+/// The name a package's const macros depend on blaze's copy of `const-ast` by, the views they
+/// read a flat syntax tree with (`hir_ide::const_macro::CONST_AST_NAME`).
+pub const CONST_AST_CRATE: &str = "const_ast";
+
+/// Whether a package of `cargo` has const macros.
+fn has_const_macros(cargo: &CargoWorkspace) -> bool {
+    cargo.packages().any(|pkg| matches!(cargo[pkg].const_macros, Some(Ok(_))))
+}
+
+/// Where the crate graph of a workspace of `sysroot` has blaze's copy of `const-ast`, the crate
+/// every package's const macros depend on: a directory of the sysroot that is not on disk, whose
+/// files the loader is given the text of (`hir_ide::const_macro::CONST_AST`).
+pub fn const_ast_dir(sysroot: &Sysroot) -> Option<AbsPathBuf> {
+    Some(sysroot.root()?.join("lib/rustlib/blaze/const-ast"))
+}
+
+impl ProjectWorkspace {
+    /// [`const_ast_dir`] of the workspace, when a package of it has const macros.
+    pub fn const_ast_dir(&self) -> Option<AbsPathBuf> {
+        match &self.kind {
+            ProjectWorkspaceKind::Cargo { cargo, .. } if has_const_macros(cargo) => {
+                const_ast_dir(&self.sysroot)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The crate of blaze's copy of `const-ast` ([`const_ast_dir`]): `no_std`, of `core` alone.
+fn const_ast_crate(
+    crate_graph: &mut CrateGraphBuilder,
+    load: FileLoader<'_>,
+    sysroot: &Sysroot,
+    cfg_options: &CfgOptions,
+    public_deps: &SysrootPublicDeps,
+    crate_ws_data: Arc<CrateWorkspaceData>,
+) -> Option<CrateBuilderId> {
+    let dir = const_ast_dir(sysroot)?;
+    let file_id = load(&dir.join("lib.rs"))?;
+    let krate = crate_graph.add_crate_root(
+        file_id,
+        Edition::Edition2024,
+        Some(CrateDisplayName::from_canonical_name(CONST_AST_CRATE)),
+        None,
+        cfg_options.clone(),
+        None,
+        Env::default(),
+        CrateOrigin::Library { repo: None, name: Symbol::intern(CONST_AST_CRATE) },
+        Vec::new(),
+        TargetKind::Lib { is_proc_macro: false },
+        Arc::new(dir),
+        crate_ws_data,
+    );
+    public_deps.add_to_crate_graph(crate_graph, krate);
+    Some(krate)
+}
+
 fn cargo_to_crate_graph(
     load: FileLoader<'_>,
     rustc: Option<&(CargoWorkspace, WorkspaceBuildScripts)>,
@@ -1362,10 +1426,12 @@ fn cargo_to_crate_graph(
     let mut pkg_to_lib_crate = FxHashMap::default();
     let mut pkg_crates = FxHashMap::default();
     let mut const_macro_crates = FxHashMap::default();
+    let mut const_ast = None;
     let workspace_proc_macro_cwd = Arc::new(cargo.workspace_root().to_path_buf());
-    // As cargo builds them, the unit tests of a library are a crate of their own, its root
-    // file with `cfg(test)` and its dev-dependencies, which nothing depends on; every other
-    // crate links the library built without them. Each such crate, by the library's.
+    // As cargo builds them for `cargo test`, the unit tests of a library or a binary are a
+    // crate of their own, its root file with `cfg(test)` and its dev-dependencies, which
+    // nothing depends on; every other crate links the library built without them, and an
+    // integration test runs the binary built without them. Each such crate, by the target's.
     let unit_tests_apart = set_test && sysroot_as_built() && !cargo.is_sysroot();
     let mut unit_tests: FxHashSet<CrateBuilderId> = FxHashSet::default();
 
@@ -1415,7 +1481,7 @@ fn cargo_to_crate_graph(
                 // https://github.com/rust-lang/rust-analyzer/issues/11300
                 continue;
             }
-            let &TargetData { ref name, kind, ref root, .. } = &cargo[tgt];
+            let &TargetData { ref name, kind, ref root, tested, .. } = &cargo[tgt];
 
             let Some(file_id) = load(root) else { continue };
 
@@ -1470,11 +1536,21 @@ fn cargo_to_crate_graph(
                 }
                 crate_id
             };
-            // A proc macro is loaded by the server, not linked, so its cfg is no other crate's.
+            // A library and a binary are built without `cfg(test)`, which is what the others
+            // link and what an integration test runs, and their unit tests apart. A proc macro
+            // is loaded by the server, not linked, so its cfg is no other crate's.
             let apart = unit_tests_apart
                 && pkg_data.is_local
-                && matches!(kind, TargetKind::Lib { is_proc_macro: false });
-            let crate_id = match apart {
+                && matches!(kind, TargetKind::Lib { is_proc_macro: false } | TargetKind::Bin);
+            // Of `cargo test`, cargo builds a build script, and an example that is not tests
+            // (`test = true`), as `cargo build` does, without `cfg(test)`.
+            let untested = unit_tests_apart
+                && pkg_data.is_local
+                && match kind {
+                    TargetKind::Example => !tested,
+                    kind => kind == TargetKind::BuildScript,
+                };
+            let crate_id = match apart || untested {
                 true => add(crate_graph, proc_macros, options(false)),
                 false => {
                     // Cargo builds a test target, and nothing else of the package, as a test.
@@ -1502,11 +1578,14 @@ fn cargo_to_crate_graph(
             // Add sysroot deps first so that a lib target named `core` etc. can overwrite them.
             public_deps.add_to_crate_graph(crate_graph, from);
 
-            // Add dep edge of all targets to the package's lib target
+            // Add dep edge of all targets to the package's lib target. A library's unit tests
+            // are the library and do not link it; a binary's do, as the binary does.
+            let library_tests =
+                unit_tests.contains(&from) && matches!(kind, TargetKind::Lib { .. });
             if let Some((to, name)) = lib_tgt.clone()
                 && to != from
                 && kind != TargetKind::BuildScript
-                && !unit_tests.contains(&from)
+                && !library_tests
             {
                 // (build script can not depend on its library target)
 
@@ -1560,6 +1639,19 @@ fn cargo_to_crate_graph(
             if let Some(proc_macro) = libproc_macro {
                 add_proc_macro_dep(crate_graph, macros, proc_macro, true);
             }
+            let const_ast = *const_ast.get_or_insert_with(|| {
+                const_ast_crate(
+                    crate_graph,
+                    &mut *load,
+                    sysroot,
+                    &cfg_options,
+                    &public_deps,
+                    crate_ws_data.clone(),
+                )
+            });
+            if let Some(const_ast) = const_ast {
+                add_dep(crate_graph, macros, CrateName::new(CONST_AST_CRATE).unwrap(), const_ast);
+            }
             for &(from, kind) in pkg_crates.get(&pkg).into_iter().flatten() {
                 if kind != TargetKind::BuildScript {
                     add_dep(crate_graph, from, CrateName::normalize_dashes(name), macros);
@@ -1602,11 +1694,12 @@ fn cargo_to_crate_graph(
                 {
                     continue;
                 }
-                // Those are its unit tests' alone.
+                // Those are its unit tests' alone: cargo builds a library or a binary that is
+                // not a test without them.
                 if dep.kind == DepKind::Dev
                     && unit_tests_apart
                     && cargo[pkg].is_local
-                    && matches!(kind, TargetKind::Lib { is_proc_macro: false })
+                    && matches!(kind, TargetKind::Lib { is_proc_macro: false } | TargetKind::Bin)
                     && !unit_tests.contains(&from)
                 {
                     continue;
@@ -1888,6 +1981,7 @@ fn add_target_crate_root(
     inject_rustc_tool_env(&mut env, cargo_crate_name, kind);
     if matches!(kind, TargetKind::Test | TargetKind::Bench) {
         inject_cargo_executables_env(&mut env, cargo, pkg);
+        inject_cargo_scratch_env(&mut env, cargo);
     }
 
     if let Some(envs) = build_data.map(|(it, _)| &it.envs) {

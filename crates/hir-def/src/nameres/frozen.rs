@@ -2088,7 +2088,7 @@ impl Dec<'_> {
             let Some(found) = found else {
                 let anchor = krate.data(self.db).root_file_id;
                 let path = if path.starts_with(OUT) { &full } else { &path };
-                self.db.include_source(base_db::AnchoredPath { anchor, path });
+                self.db.include_source(base_db::AnchoredPath { anchor, path }, krate);
                 not_loaded.get_or_insert_with(|| format!("{full} is not loaded"));
                 continue;
             };

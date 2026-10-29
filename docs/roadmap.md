@@ -1,3 +1,8 @@
+---
+status: plan
+summary: blaze-next, the floor of an edit for agents: content-addressed VFS, VM forks, sans-IO core, the agent API.
+date: 2026-10-24
+---
 # blaze-next: the floor of an edit, for agents
 
 2026-10-24. Status: design; the implementation is on the `blaze-next` branch. Written against

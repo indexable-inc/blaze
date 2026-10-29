@@ -676,13 +676,21 @@ fn impl_holders(db: &dyn HirDatabase, krate: Crate, scope: &ItemScope) -> Vec<De
         _ => None,
     });
     holders.extend(declared);
-    let in_impls =
-        scope.impls().flat_map(|it| &it.impl_items(db).items).filter_map(|(_, item)| match *item {
-            AssocItemId::FunctionId(it) if holds(it) => Some(DefWithBodyId::from(it)),
-            AssocItemId::ConstId(it) if local => Some(DefWithBodyId::from(it)),
-            _ => None,
-        });
-    holders.extend(in_impls);
+    let item = |item: &AssocItemId| match *item {
+        AssocItemId::FunctionId(it) if holds(it) => Some(DefWithBodyId::from(it)),
+        AssocItemId::ConstId(it) if local => Some(DefWithBodyId::from(it)),
+        _ => None,
+    };
+    let in_impls = scope.impls().flat_map(|it| &it.impl_items(db).items);
+    holders.extend(in_impls.filter_map(|(_, it)| item(it)));
+    // An impl in a trait's default method or constant is as global as any other
+    // (macro_rules_attribute's `impl<T: IntoIterator> CollectVec for T {}` in `CollectVec::vec`).
+    let traits = scope.declarations().filter_map(|def| match def {
+        ModuleDefId::TraitId(it) => Some(it),
+        _ => None,
+    });
+    let in_traits = traits.flat_map(|it| &it.trait_items(db).items);
+    holders.extend(in_traits.filter_map(|(_, it)| item(it)));
     holders
 }
 

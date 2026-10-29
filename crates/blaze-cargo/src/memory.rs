@@ -46,39 +46,67 @@ pub fn held_by(pid: u32) -> Option<u64> {
 /// the process to however much the machine has.
 #[cfg(not(target_os = "macos"))]
 pub fn of_the_machine() -> Option<u64> {
+    Some(limit()?.bytes)
+}
+
+/// The most memory the processes of this one may hold, and what says so.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Limit {
+    pub bytes: u64,
+    /// The file under `/sys/fs/cgroup` that allows the fewest, or None for the machine's memory.
+    pub group: Option<String>,
+}
+
+/// [`of_the_machine`], with the control group's file that sets it.
+#[cfg(not(target_os = "macos"))]
+pub fn limit() -> Option<Limit> {
     let total = kilobytes(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal:")?;
     let groups = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
     let allowed = allowed_by(&groups, |file| {
         std::fs::read_to_string(Path::new("/sys/fs/cgroup").join(file)).ok()
     });
-    Some(allowed.map_or(total, |it| it.min(total)))
+    Some(match allowed {
+        Some((bytes, file)) if bytes < total => Limit { bytes, group: Some(file) },
+        _ => Limit { bytes: total, group: None },
+    })
+}
+
+/// [`of_the_machine`]: macOS has no control groups.
+#[cfg(target_os = "macos")]
+pub fn limit() -> Option<Limit> {
+    Some(Limit { bytes: of_the_machine()?, group: None })
 }
 
 /// The fewest bytes the control groups of `/proc/self/cgroup` (`groups`) and the groups they
-/// are in allow, `read` reading a file under `/sys/fs/cgroup`: `memory.max` in version 2,
-/// where `max` allows any, and `memory/…/memory.limit_in_bytes` in version 1.
+/// are in allow, and the file that says so, `read` reading a file under `/sys/fs/cgroup`:
+/// `memory.max` and `memory.high` in version 2, where `max` allows any (past `memory.high`
+/// the kernel throttles and reclaims, which is as good as out of memory for a build), and
+/// `memory/…/memory.limit_in_bytes` in version 1.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
-fn allowed_by(groups: &str, read: impl Fn(&str) -> Option<String>) -> Option<u64> {
+fn allowed_by(groups: &str, read: impl Fn(&str) -> Option<String>) -> Option<(u64, String)> {
     groups
         .lines()
         .filter_map(|line| {
             let (_, line) = line.split_once(':')?;
             let (controllers, path) = line.split_once(':')?;
-            let (under, file) = match controllers {
-                "" => ("", "memory.max"),
+            let (under, files): (_, &[&str]) = match controllers {
+                "" => ("", &["memory.max", "memory.high"]),
                 _ if controllers.split(',').any(|it| it == "memory") => {
-                    ("memory/", "memory.limit_in_bytes")
+                    ("memory/", &["memory.limit_in_bytes"])
                 }
                 _ => return None,
             };
             let mut at = path.trim_matches('/');
-            let mut fewest: Option<u64> = None;
+            let mut fewest: Option<(u64, String)> = None;
             loop {
                 let dir = if at.is_empty() { String::new() } else { format!("{at}/") };
-                if let Some(bytes) = read(&format!("{under}{dir}{file}"))
-                    .and_then(|it| it.trim().parse::<u64>().ok())
-                {
-                    fewest = Some(fewest.map_or(bytes, |it| it.min(bytes)));
+                for file in files {
+                    let file = format!("{under}{dir}{file}");
+                    if let Some(bytes) = read(&file).and_then(|it| it.trim().parse::<u64>().ok())
+                        && fewest.as_ref().is_none_or(|it| bytes < it.0)
+                    {
+                        fewest = Some((bytes, file));
+                    }
                 }
                 if at.is_empty() {
                     break fewest;
@@ -87,6 +115,86 @@ fn allowed_by(groups: &str, read: impl Fn(&str) -> Option<String>) -> Option<u64
             }
         })
         .min()
+}
+
+/// What blaze may hold on this machine, all of its processes together (docs/memory-budget.md):
+/// the [`limit`], or what `BLAZE_MEMORY_BUDGET` says, less what other processes hold and a
+/// reserve for the kernel and the page cache. Swap is not counted: a build that needs it does
+/// not fit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Budget {
+    pub bytes: u64,
+    pub limit: u64,
+    /// Where `limit` comes from, for a person to read.
+    pub from: String,
+    pub others: u64,
+    pub reserve: u64,
+}
+
+/// The setting of [`Budget`]'s limit: a size, or `off` for none.
+pub const BUDGET: &str = "BLAZE_MEMORY_BUDGET";
+
+/// The share of the limit kept back, one part in this many, and at least [`RESERVE_LEAST`].
+const RESERVE_SHARE: u64 = 20;
+const RESERVE_LEAST: u64 = 512 << 20;
+
+impl Budget {
+    /// The budget now, with `own` the bytes blaze's processes hold (left out of what others
+    /// hold); None with `BLAZE_MEMORY_BUDGET=off` or where the system says nothing of memory.
+    pub fn now(own: u64) -> Result<Option<Budget>, String> {
+        let setting = std::env::var(BUDGET).ok();
+        let (limit, from) = match setting.as_deref() {
+            Some("off") => return Ok(None),
+            Some(text) => match blaze_store::parse_size(text) {
+                Some(bytes) => (bytes, format!("{BUDGET}={text}")),
+                None => return Err(format!("{BUDGET}=`{text}` is neither a size nor `off`")),
+            },
+            None => match limit() {
+                Some(Limit { bytes, group: Some(file) }) => {
+                    (bytes, format!("/sys/fs/cgroup/{file}"))
+                }
+                Some(Limit { bytes, group: None }) => (bytes, "the machine's memory".to_owned()),
+                None => return Ok(None),
+            },
+        };
+        let others = in_use().map_or(0, |it| it.saturating_sub(own));
+        Ok(Some(Budget::of(limit, from, others)))
+    }
+
+    fn of(limit: u64, from: String, others: u64) -> Budget {
+        let reserve = (limit / RESERVE_SHARE).max(RESERVE_LEAST);
+        let bytes = limit.saturating_sub(others).saturating_sub(reserve);
+        Budget { bytes, limit, from, others, reserve }
+    }
+}
+
+impl std::fmt::Display for Budget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let gb = |it: u64| it as f64 / f64::from(1 << 30);
+        write!(
+            f,
+            "{:.1} GB: {:.1} GB ({}), less {:.1} GB other processes hold and {:.1} GB kept back",
+            gb(self.bytes),
+            gb(self.limit),
+            self.from,
+            gb(self.others),
+            gb(self.reserve)
+        )
+    }
+}
+
+/// Bytes of memory in use on the machine: all but what the kernel could hand out without
+/// swapping (`MemAvailable`).
+#[cfg(not(target_os = "macos"))]
+fn in_use() -> Option<u64> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    Some(kilobytes(&info, "MemTotal:")?.saturating_sub(kilobytes(&info, "MemAvailable:")?))
+}
+
+/// Not read on macOS yet: what other processes hold counts as nothing there.
+#[cfg(target_os = "macos")]
+fn in_use() -> Option<u64> {
+    None
 }
 
 /// Bytes of memory the machine has.
@@ -244,14 +352,18 @@ mod tests {
             ("user.slice/memory.max", "8589934592\n"),
             ("user.slice/run.scope/memory.max", "2147483648\n"),
         ]);
-        assert_eq!(allowed_by("0::/user.slice/run.scope\n", unit), Some(2 << 30));
+        let bytes = |it: Option<(u64, String)>| it.map(|it| it.0);
+        assert_eq!(
+            allowed_by("0::/user.slice/run.scope\n", &unit),
+            Some((2 << 30, "user.slice/run.scope/memory.max".to_owned()))
+        );
         let above = files(&[("a/memory.max", "1073741824\n"), ("a/b/memory.max", "max\n")]);
-        assert_eq!(allowed_by("0::/a/b\n", above), Some(1 << 30));
+        assert_eq!(bytes(allowed_by("0::/a/b\n", above)), Some(1 << 30));
         let container = files(&[("memory.max", "4294967296\n")]);
-        assert_eq!(allowed_by("0::/\n", container), Some(4 << 30));
+        assert_eq!(bytes(allowed_by("0::/\n", container)), Some(4 << 30));
         let v1 = files(&[("memory/docker/c1/memory.limit_in_bytes", "536870912\n")]);
         assert_eq!(
-            allowed_by("5:cpu,cpuacct:/docker/c1\n4:memory:/docker/c1\n", v1),
+            bytes(allowed_by("5:cpu,cpuacct:/docker/c1\n4:memory:/docker/c1\n", v1)),
             Some(512 << 20)
         );
         assert_eq!(
@@ -259,6 +371,30 @@ mod tests {
             None
         );
         assert_eq!(allowed_by("", files(&[])), None);
+    }
+
+    #[test]
+    fn a_groups_high_mark_limits_as_its_max_does() {
+        let files = |file: &str| match file {
+            "ci.slice/memory.max" => Some("8589934592\n".to_owned()),
+            "ci.slice/memory.high" => Some("6442450944\n".to_owned()),
+            _ => None,
+        };
+        assert_eq!(
+            allowed_by("0::/ci.slice\n", files),
+            Some((6 << 30, "ci.slice/memory.high".to_owned()))
+        );
+    }
+
+    #[test]
+    fn the_budget_is_the_limit_less_others_and_a_reserve() {
+        let budget = Budget::of(16 << 30, "the machine's memory".to_owned(), 1 << 30);
+        // 5% of 16 GB is 0.8 GB, over the 512 MB least.
+        assert_eq!(budget.reserve, (16 << 30) / 20);
+        assert_eq!(budget.bytes, (16 << 30) - (1 << 30) - (16 << 30) / 20);
+        let small = Budget::of(2 << 30, "BLAZE_MEMORY_BUDGET=2G".to_owned(), 0);
+        assert_eq!(small.reserve, 512 << 20);
+        assert_eq!(Budget::of(256 << 20, String::new(), 0).bytes, 0);
     }
 
     #[test]

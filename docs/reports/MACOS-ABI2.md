@@ -1,3 +1,8 @@
+---
+status: record
+summary: macOS arm64: the remaining ABI and backend gaps.
+date: 2026-10-20
+---
 # macOS arm64: the remaining ABI and backend gaps
 
 Branch `blaze-macos-abi2`, cut from `blaze-collate` at 6d12f21c86. Everything under

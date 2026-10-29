@@ -1,0 +1,28 @@
+{
+ "machine": "GitHub ubuntu-24.04 hosted runner (x86_64, 4 vCPU, 16 GB, shared)",
+ "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+ "cpus": 4,
+ "affinity": 4,
+ "memory": "MemTotal:       16367524 kB",
+ "cargo": "cargo 1.101.0-nightly (cad07cf8e 2026-10-23)",
+ "date": "2026-10-28T21:15:58Z",
+ "arms": [
+  {
+   "name": "ours",
+   "kind": "blaze",
+   "commit": "a16b45c0477d17f3de440ae9167b0acc8581e886"
+  },
+  {
+   "name": "astral",
+   "kind": "astral",
+   "commit": "70c9a8178b4ed0f5dab4db59b4c2c9494bcd2460"
+  },
+  {
+   "name": "cargo",
+   "kind": "cargo",
+   "commit": "nightly-2026-10-27"
+  }
+ ],
+ "runs": 5,
+ "interleave": false
+}

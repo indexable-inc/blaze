@@ -1,3 +1,8 @@
+---
+status: record
+summary: A daemon's start on a warm store (#41): where helix's 105 s went and what brought it to 38 s.
+date: 2026-10-24
+---
 # A daemon's start on a warm store, with nothing of rustc's
 
 2026-10-24, for [#41](https://github.com/indexable-inc/blaze/issues/41) (the workspace's own

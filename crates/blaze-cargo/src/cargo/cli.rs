@@ -213,6 +213,10 @@ pub enum Asked {
     Why(Vec<String>),
     /// `watch`: every build the daemon does, as it does it, until interrupted.
     Watch,
+    /// `ui`: where the build page is, opened in the browser unless `--no-open`.
+    Ui {
+        open: bool,
+    },
     /// blaze's own toolchain, downloaded first when it has none; with `--path`, its directory
     /// alone, for the installer to link.
     Toolchain {
@@ -298,6 +302,7 @@ impl Asked {
             ("stop", _) => Asked::Stop,
             ("why", _) => Asked::Why(rest.to_vec()),
             ("watch", _) => Asked::Watch,
+            ("ui", _) => Asked::Ui { open: !rest.iter().any(|it| it == "--no-open") },
             ("toolchain", _) => Asked::Toolchain { path: rest.iter().any(|it| it == "--path") },
             ("lock", _) => Asked::Lock(rest.to_vec()),
             ("pin", _) => Asked::Pin(rest.to_vec()),

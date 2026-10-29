@@ -1,0 +1,142 @@
+{
+ "arm": "cosmos",
+ "run": 2,
+ "setup": {
+  "prep": {
+   "fetchMs": 21.40000000037253,
+   "parseMs": 65.5,
+   "layoutMs": 69,
+   "nodes": 80000,
+   "edges": 300000,
+   "modules": 7071
+  },
+  "readyMs": 866.8999999999069,
+  "firstFrameMs": 1170.8999999999069,
+  "renderer": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (LLVM 10.0.0) (0x0000C0DE)), SwiftShader driver)"
+ },
+ "settle": {
+  "definition": "alpha < 0.001 (cosmos onSimulationEnd); and mean step per tick < 0.0005 of the layout diagonal",
+  "alphaEndMs": null,
+  "ticks": 34,
+  "progress": 0.0323742711634235,
+  "ticksToAlphaEndEstimate": 1050,
+  "stepSettledMs": 142840.3999999999,
+  "stepSettledTicks": 34,
+  "capped": true,
+  "lastStepRatio": 0.00021971547829995787,
+  "trace": [
+   [
+    142840,
+    34,
+    0.0002197
+   ]
+  ]
+ },
+ "memory_after_settle": {
+  "usedJSHeapMB": 73.28013324737549,
+  "totalJSHeapMB": 75.65552616119385
+ },
+ "rss_after_settle_mb": 1404.2890625,
+ "panzoom": {
+  "frames": 7,
+  "seconds": 12.076100000000093,
+  "fps": 0.5796573397040391,
+  "p50ms": 16.5,
+  "p95ms": 4047.2999999998137,
+  "maxMs": 4047.2999999998137,
+  "rendererRafCalls": 20,
+  "rendererRafMsPerCall": 0.20499999998137355
+ },
+ "live": {
+  "frames": 5,
+  "seconds": 12.231,
+  "fps": 0.40879731828959204,
+  "p50ms": 16.5,
+  "p95ms": 8139.899999999907,
+  "maxMs": 8139.899999999907,
+  "rendererRafCalls": 3,
+  "rendererRafMsPerCall": 1.0666666667287548,
+  "updates": 18,
+  "updateMeanMs": 592.6388888888889
+ },
+ "live_moving": {
+  "frames": 3,
+  "seconds": 11.91430000000028,
+  "fps": 0.25179825923469523,
+  "p50ms": 4023.899999999907,
+  "p95ms": 4056.3000000002794,
+  "maxMs": 4056.3000000002794,
+  "rendererRafCalls": 8,
+  "rendererRafMsPerCall": 0.2124999999650754,
+  "updates": 10,
+  "updateMeanMs": 1117.4300000000744
+ },
+ "sim_only": {
+  "steps": 10,
+  "msPerStep": 328.82000000001864
+ },
+ "memory_end": {
+  "usedJSHeapMB": 130.39778327941895,
+  "totalJSHeapMB": 135.58131980895996
+ },
+ "rss_end_mb": 1621.98828125,
+ "problems": {
+  "violations": [],
+  "errors": [
+   "ResizeObserver loop completed with undelivered notifications."
+  ]
+ },
+ "console": [
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+  "warning: WebGL: too many errors, no more errors will be reported to the console for this context."
+ ],
+ "wall_s": 218.4442162513733
+}

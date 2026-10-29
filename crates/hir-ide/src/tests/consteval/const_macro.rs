@@ -15,12 +15,9 @@ use crate::{
     const_macro::ConstMacroExpander, mir_pretty::MirEvalErrorPretty as _, test_db::TestDB,
 };
 
-/// A macro crate with the derive `Named`, which reads the name of the struct it is given and
-/// implements `Named` for it with `LEN`, that name's length. Its `String` is the three words
-/// the standard library's is, made with `const_allocate`, the nightly's const heap.
-const MACROS: &str = r#"
-//- minicore: sized, copy, derive, transmute
-//- /macros.rs crate:proc-macro:macros
+/// What a macro crate's derive writes its output with: a `String` that is the three words the
+/// standard library's is, made with `const_allocate`, the nightly's const heap.
+const STRING: &str = r#"
 #[rustc_intrinsic]
 const unsafe fn const_allocate(size: usize, align: usize) -> *mut u8;
 
@@ -55,7 +52,11 @@ const fn is_ident(byte: u8) -> bool {
     byte == b'_' || (byte >= b'a' && byte <= b'z') || (byte >= b'A' && byte <= b'Z')
         || (byte >= b'0' && byte <= b'9')
 }
+"#;
 
+/// The derive `Named` of stage 0, which reads the name of the struct it is given as text and
+/// implements `Named` for it with `LEN`, that name's length.
+const NAMED: &str = r#"
 #[proc_macro_derive(Named)]
 pub const fn named(input: &str) -> String {
     let input = raw(input);
@@ -91,7 +92,10 @@ pub const fn named(input: &str) -> String {
 #[test]
 fn a_const_derive_generates_an_impl() {
     let fixture = format!(
-        "{MACROS}
+        "//- minicore: sized, copy, derive, transmute
+//- /macros.rs crate:proc-macro:macros
+{STRING}
+{NAMED}
 //- /main.rs crate:main deps:macros
 pub trait Named {{ const LEN: usize; }}
 
@@ -101,43 +105,16 @@ pub struct Point {{ x: i32, y: i32 }}
 const GOAL: usize = <Point as Named>::LEN;
 "
     );
-    let mut fixture = ChangeFixture::parse(&fixture);
-    let graph = fixture.change.source_change.crate_graph.as_ref().expect("a crate graph");
-    let macros = graph
-        .iter()
-        .find(|&id| graph[id].basic.target_kind.is_proc_macro())
-        .expect("the macro crate");
-    let root = graph[macros].basic.root_file_id;
-    let expander = expander_of(root);
-    fixture.change.proc_macros.get_or_insert_default().insert(
-        macros,
-        Ok(vec![ProcMacro {
-            name: expander.name.clone(),
-            kind: ProcMacroKind::CustomDerive,
-            expander: Arc::new(expander),
-            disabled: false,
-        }]),
-    );
-    let file_id = *fixture.files.last().expect("the main crate's file");
-    let mut db = TestDB::default();
-    fixture.change.apply(&mut db);
-    let file_id = EditionedFileId::from_span_file_id(&db, file_id);
-    crate::const_macro::enable(&db);
+    let (db, file_id, root) = load(&fixture, "Named");
     crate::attach_db(&db, || {
-        let (krate, func) = expander_of(root).function(&db).expect("the macro's function");
-        let output =
-            crate::mir::call_with_strs(&db, func, &["pub struct Point { x : i32 , y : i32 }"])
-                .unwrap_or_else(|e| {
-                    let mut text = String::new();
-                    let target = crate::display::DisplayTarget::from_crate(&db, krate);
-                    _ = e.pretty_print(
-                        &mut text,
-                        &db,
-                        |file, range| format!("{file:?} {range:?}"),
-                        target,
-                    );
-                    panic!("calling the macro: {text}");
-                });
+        let (krate, func) = expander_of(root, "Named").function(&db).expect("the macro's function");
+        let input = crate::mir::MacroArg::Str("pub struct Point { x : i32 , y : i32 }");
+        let output = crate::mir::call_const_macro(&db, func, &[input]).unwrap_or_else(|e| {
+            let mut text = String::new();
+            let target = crate::display::DisplayTarget::from_crate(&db, krate);
+            _ = e.pretty_print(&mut text, &db, |file, range| format!("{file:?} {range:?}"), target);
+            panic!("calling the macro: {text}");
+        });
         assert_eq!(output, "impl Named for Point { const LEN: usize = 5; }");
         let goal = eval_goal(&db, file_id).unwrap_or_else(|e| {
             let main = *base_db::all_crates(&db).last().expect("the main crate");
@@ -147,8 +124,154 @@ const GOAL: usize = <Point as Named>::LEN;
     });
 }
 
-fn expander_of(root: span::FileId) -> ConstMacroExpander {
-    ConstMacroExpander { root, name: Symbol::intern("Named"), kind: ProcMacroKind::CustomDerive }
+/// A fixture whose macro crate depends on `const_ast` and defines `macros`, and whose crate
+/// `main` is `main`. `const_ast`'s files are blaze's to the byte, each ending in a newline.
+fn with_const_ast(macros: &str, main: &str) -> String {
+    let [(_, lib), (_, kinds), (_, views)] = crate::const_macro::CONST_AST;
+    format!(
+        "//- minicore: sized, copy, clone, derive, option, result, slice, index, coerce_unsized, str, iterator, panic, transmute
+//- /const_ast/lib.rs crate:const_ast
+{lib}//- /const_ast/kinds.rs
+{kinds}//- /const_ast/views.rs
+{views}//- /macros.rs crate:proc-macro:macros deps:const_ast
+{STRING}
+{macros}
+//- /main.rs crate:main deps:macros
+{main}"
+    )
+}
+
+/// The derive `Fields` of stage 2, given the item as a flat tree: it implements `Fields` with
+/// the struct's name, how many fields it has, and whether the name's span is one of the input's
+/// (after the three sites in the span table).
+const FIELDS: &str = r#"
+#[proc_macro_derive(Fields)]
+pub const fn fields(item: &const_ast::Item) -> String {
+    let mut out = String { ptr: unsafe { const_allocate(256, 1) }, cap: 256, len: 0 };
+    let (name, count) = match item.as_struct() {
+        Some(adt) => (
+            adt.name(),
+            match adt.field_list() {
+                Some(const_ast::FieldList::RecordFieldList(list)) => list.fields().count(),
+                _ => 0,
+            },
+        ),
+        None => (None, 0),
+    };
+    let (text, span) = match name {
+        Some(name) => (
+            name.text(),
+            match name.token() {
+                Some(token) => token.span(),
+                None => 0,
+            },
+        ),
+        None => ("", 0),
+    };
+    push_str(&mut out, "impl Fields for ");
+    push_str(&mut out, text);
+    push_str(&mut out, " { const COUNT: usize = ");
+    push(&mut out, b'0' + count as u8);
+    push_str(&mut out, "; const NAME_LEN: usize = ");
+    push(&mut out, b'0' + raw(text).len as u8);
+    push_str(&mut out, "; const INPUT_SPAN: bool = ");
+    push_str(&mut out, if span >= 3 && span != const_ast::NO_SPAN { "true" } else { "false" });
+    push_str(&mut out, "; }");
+    out
+}
+"#;
+
+#[test]
+fn a_const_derive_reads_the_item_through_the_views() {
+    let fixture = with_const_ast(
+        FIELDS,
+        "pub trait Fields { const COUNT: usize; const NAME_LEN: usize; const INPUT_SPAN: bool; }
+
+#[derive(macros::Fields)]
+pub struct Point {
+    x: i32,
+    #[allow(unused)]
+    pub y: i32,
+    pub(crate) z: [u8; 4],
+}
+
+const GOAL: usize = <Point as Fields>::COUNT * 100
+    + <Point as Fields>::NAME_LEN * 10
+    + <Point as Fields>::INPUT_SPAN as usize;
+",
+    );
+    assert_eq!(goal(&fixture, "Fields")[..], 351usize.to_le_bytes()[..]);
+}
+
+#[test]
+fn a_const_macro_takes_str_or_item() {
+    let fixture = with_const_ast(
+        "#[proc_macro_derive(Fields)]
+pub const fn fields(item: &u8) -> String {
+    String { ptr: 0 as *mut u8, cap: 0, len: 0 }
+}",
+        "pub trait Fields {}
+
+#[derive(macros::Fields)]
+pub struct Point;
+",
+    );
+    let (db, _, _) = load(&fixture, "Fields");
+    crate::attach_db(&db, || {
+        let main = *base_db::all_crates(&db).last().expect("the main crate");
+        let derives = derives(&db, main);
+        assert!(
+            derives.contains(
+                "a parameter of the const macro `Fields` is `&u8`; it takes `&str` or \
+                 `&const_ast::Item`"
+            ),
+            "{derives}"
+        );
+    });
+}
+
+/// A database of `fixture`, whose macro crate has the derive `name`, the file of its last
+/// crate, and the macro crate's root.
+fn load(fixture: &str, name: &str) -> (TestDB, EditionedFileId, span::FileId) {
+    let mut fixture = ChangeFixture::parse(fixture);
+    let graph = fixture.change.source_change.crate_graph.as_ref().expect("a crate graph");
+    let macros = graph
+        .iter()
+        .find(|&id| graph[id].basic.target_kind.is_proc_macro())
+        .expect("the macro crate");
+    let root = graph[macros].basic.root_file_id;
+    let expander = expander_of(root, name);
+    fixture.change.proc_macros.get_or_insert_default().insert(
+        macros,
+        Ok(vec![ProcMacro {
+            name: expander.name.clone(),
+            kind: ProcMacroKind::CustomDerive,
+            expander: Arc::new(expander),
+            disabled: false,
+        }]),
+    );
+    let file_id = *fixture.files.last().expect("the last crate's file");
+    let mut db = TestDB::default();
+    fixture.change.apply(&mut db);
+    let file_id = EditionedFileId::from_span_file_id(&db, file_id);
+    crate::const_macro::enable(&db);
+    (db, file_id, root)
+}
+
+/// `GOAL` of the last file of `fixture`, whose macro crate has the derive `name`.
+fn goal(fixture: &str, name: &str) -> Vec<u8> {
+    let (db, file_id, _) = load(fixture, name);
+    crate::attach_db(&db, || match eval_goal(&db, file_id) {
+        Ok(goal) => goal.memory.to_vec(),
+        Err(e) => {
+            let main = *base_db::all_crates(&db).last().expect("the main crate");
+            panic!("evaluating GOAL: {}\n{}", pretty_print_err(e, &db), derives(&db, main));
+        }
+    })
+}
+
+fn expander_of(root: span::FileId, name: &str) -> ConstMacroExpander {
+    ConstMacroExpander { root, name: Symbol::intern(name), kind: ProcMacroKind::CustomDerive }
 }
 
 /// What the derives of `krate` expanded to, and why they did not, for a failure to say.

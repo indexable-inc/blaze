@@ -1,3 +1,8 @@
+---
+status: record
+summary: The rename from ra-jit and cargo blaze to blaze (#270), and what tools/rename.py changes.
+date: 2026-10-28
+---
 # The rename from ra-jit (#270)
 
 blaze was called ra-jit until 2026-10-24, and `cargo blaze` was its command until 2026-10-28.

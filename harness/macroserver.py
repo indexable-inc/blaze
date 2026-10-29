@@ -245,15 +245,10 @@ def closure(meta, units, name):
 
 
 def std_source():
-    """The toolchain's `library` directory, whose crates rust-analyzer loads as the standard
-    library's."""
-    toolchain = open(os.path.join(HERE, "toolchain")).read().strip()
-    home = os.environ.get("RUSTUP_HOME", os.path.expanduser("~/.rustup"))
-    found = glob.glob(os.path.join(home, "toolchains", f"{toolchain}-*", "lib", "rustlib",
-                                   "src", "rust", "library"))
-    if not found:
-        raise SystemExit(f"FAIL: no source of the standard library of {toolchain} in {home}")
-    return os.path.realpath(found[0])
+    """The `library/` blaze reads (`BLAZE_LIBRARY`, which `main` sets to this checkout's), whose
+    crates rust-analyzer loads as the standard library's: no toolchain's `rust-src` is read
+    (docs/toolchain.md)."""
+    return os.environ["BLAZE_LIBRARY"]
 
 
 def with_std(crates, panic="unwind"):
@@ -487,6 +482,9 @@ def main():
     # library's unit, and the package whole, which names its crates, must not take code from
     # the store that calls into the unit (#328). An app's builds have stores of their own.
     os.environ["BLAZE_CACHE"] = os.path.join(work, "store")
+    # The library a crate of it is named by the root file of (`with_std`) is the one blaze
+    # reads: this checkout's, in place, into the run's own store.
+    os.environ.setdefault("BLAZE_LIBRARY", os.path.join(os.path.dirname(HERE), "library"))
     passed = False
     try:
         server, said = built_server(work)
@@ -548,7 +546,7 @@ def main():
 
         env = {"BLAZE_PROC_MACRO_COMPARE": server, "BLAZE_PROC_MACRO_LIBS": libs}
         # With its tests, whose `#[tokio::test]` is another attribute.
-        ran, took = blaze(root, ["macrouse"], os.path.join(work, "macrouse.o"), "--cfg-test",
+        ran, took = blaze(root, ["macrouse"], os.path.join(work, "macrouse.o"), "--unit-test",
                            env=env)
         counts = compared(ran.stderr)
         calls, derives, attrs, bangs, differed, failed, unloaded = (

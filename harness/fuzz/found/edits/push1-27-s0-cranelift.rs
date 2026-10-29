@@ -1,6 +1,6 @@
 // Found by edits.py: seed push1-27-s0-cranelift, edition 2021, backend cranelift.
 // The edit (regen.fn): c3 from fn4
-// Again: edits.py check push1-27-s0-cranelift.rs
+// Again: edits.py check '{"files": ["push1-27-s0-cranelift.rs"]}'
 // step 1: refused: Error: daemon: cargo: a build of fz panicked: assertion `left == right` failed: Can't change TLS data object to normal or in the opposite way   left: false  right: true
 // At 39d79a5b, x86-64 (#291): the patch numbered a thread-local of its own as the base had numbered
 // a static it imports. By e843203e this program's numbers no longer meet, but the clash could still.

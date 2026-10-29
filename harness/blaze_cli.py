@@ -169,7 +169,7 @@ MODES = {"blaze": "`blaze`"}
 # What cargo and `blaze` print about the build, which is not the program's output.
 # cargo's status words, then blaze's own steps' (crates/blaze-ui), right-aligned to 12 columns.
 STATUS = re.compile(r"^\s*((Compiling|Checking|Finished|Running|Downloading|Downloaded|Blocking|Waiting|Locking|Updating|Adding|Fresh|Dirty|Doc-tests)\b|blaze:|warning:|`blaze why` says more$)"
-                    r"|^(?=[ \w-]{12} )\s+(Loading|Loaded|Fetching|Fetched|Resolving|Resolved|Compiled|Linking|Linked|Checked|Testing|Tested|Ran|Rebuilt|Finishing|Took|Cache|Chain|Building|Built|Storing|Stored|Optimizing|Optimized) ")
+                    r"|^(?=[ \w-]{12} )\s+(Loading|Loaded|Fetching|Fetched|Resolving|Resolved|Compiled|Linking|Linked|Checked|Testing|Tested|Ran|Rebuilt|Finishing|Took|Slowest|Cache|Chain|Building|Built|Storing|Stored|Optimizing|Optimized) ")
 
 
 def base_env(home):
@@ -341,7 +341,10 @@ def test_results(ran):
     # the failures from the list at the end, and the totals say the rest.
     failed = [name for listed in re.findall(r"^failures:\n((?:    \S.*\n)+)", names, re.M) for name in listed.split("\n")]
     kept = getattr(ran, "kept", [])
-    tests = collections.Counter([(name, "ran") for name in re.findall(r"^test (.+?) \.\.\. ", names, re.M) + kept] + [(name.strip(), "FAILED") for name in failed if name])
+    # libtest prints a test's mode after its name (`name - should panic ... ok`); the name
+    # of a kept pass is without it.
+    shown = re.findall(r"^test (.+?)(?: - (?:should panic|compile fail|compilation))? \.\.\. ", names, re.M)
+    tests = collections.Counter([(name, "ran") for name in shown + kept] + [(name.strip(), "FAILED") for name in failed if name])
     ended = re.findall(r"^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; \d+ filtered out", ran.stdout, re.M)
     passed, failing, ignored, measured = (sum(int(it[at]) for it in ended) for at in range(1, 5))
     totals = (sum(it[0] != "ok" for it in ended), passed + len(kept), failing, ignored, measured)
@@ -1412,9 +1415,13 @@ def cbor(value):
     raise TypeError(value)
 
 
+# The daemon answers a message of another schema as one of another version (`Restart`).
+SCHEMA = int(re.search(r"^pub const SCHEMA: u32 = (\d+);", open(os.path.join(ROOT, "crates/blaze-protocol/src/lib.rs")).read(), re.M)[1])
+
+
 def framed(body):
     """A request as the daemon reads one: a frame of a `blaze_protocol::Message`."""
-    item = cbor({"schema": 1, "id": 1, "body": body})
+    item = cbor({"schema": SCHEMA, "id": 1, "body": body})
     return (len(item).to_bytes(4, "big") + item).hex()
 
 LISTEN = "import os, socket, sys\ns = socket.socket(socket.AF_UNIX)\ns.bind(sys.argv[1])\nos.chmod(sys.argv[1], 0o666)\ns.listen()\nprint('listening', flush=True)\ns.settimeout(20)\ntry:\n    c, _ = s.accept()\n    c.settimeout(5)\n    print('heard:', len(c.recv(65536)))\nexcept OSError as e:\n    print('heard: nothing,', e)\n"

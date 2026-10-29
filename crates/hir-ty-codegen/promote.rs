@@ -26,11 +26,13 @@ struct Part {
 pub(super) fn promote(func: &mut ir::Function, kept: impl Iterator<Item = StackSlot>) {
     let mut escaped: FxHashSet<StackSlot> = kept.collect();
     let mut slot_of: FxHashMap<Value, StackSlot> = FxHashMap::default();
+    let mut parts: FxHashMap<StackSlot, FxHashMap<(i32, ir::Type), Part>> = FxHashMap::default();
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             if let InstructionData::StackAddr { stack_slot, offset, .. } = func.dfg.insts[inst] {
                 if i32::from(offset) == 0 {
                     slot_of.insert(func.dfg.first_result(inst), stack_slot);
+                    parts.entry(stack_slot).or_default();
                 } else {
                     escaped.insert(stack_slot);
                 }
@@ -42,7 +44,6 @@ pub(super) fn promote(func: &mut ir::Function, kept: impl Iterator<Item = StackS
     }
     let slot =
         |func: &ir::Function, value: Value| slot_of.get(&func.dfg.resolve_aliases(value)).copied();
-    let mut parts: FxHashMap<StackSlot, FxHashMap<(i32, ir::Type), Part>> = FxHashMap::default();
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             match func.dfg.insts[inst] {
@@ -87,8 +88,12 @@ pub(super) fn promote(func: &mut ir::Function, kept: impl Iterator<Item = StackS
         if spans.windows(2).any(|it| it[0].1 > it[1].0) {
             continue;
         }
+        let mut unused = true;
         for part in parts.into_values() {
-            let [store] = *part.stores.as_slice() else { continue };
+            let [store] = *part.stores.as_slice() else {
+                unused = false;
+                continue;
+            };
             let InstructionData::Store { args: [stored, _], .. } = func.dfg.insts[store] else {
                 continue;
             };
@@ -104,9 +109,17 @@ pub(super) fn promote(func: &mut ir::Function, kept: impl Iterator<Item = StackS
                 func.dfg.change_to_alias(loaded, stored);
                 func.layout.remove_inst(load);
             }
-            if !read {
+            if read {
+                unused = false;
+            } else {
                 func.layout.remove_inst(store);
             }
+        }
+        if unused {
+            // Cranelift reserves even unreferenced explicit slots in the machine frame.
+            let data = &mut func.sized_stack_slots[slot];
+            data.size = 0;
+            data.align_shift = 0;
         }
     }
 }
@@ -127,4 +140,36 @@ fn dominator_tree(func: &ir::Function) -> DominatorTree {
         UNTIMED.with(|_| ());
     }
     DominatorTree::with_function(func, &ControlFlowGraph::with_function(func))
+}
+
+#[test]
+fn only_fully_promoted_slots_release_their_storage() {
+    use cranelift_codegen::ir::{AbiParam, InstBuilder, StackSlotData, StackSlotKind, types::I64};
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+    let mut func = ir::Function::new();
+    func.signature.returns.push(AbiParam::new(I64));
+    let mut context = FunctionBuilderContext::new();
+    let mut builder = FunctionBuilder::new(&mut func, &mut context);
+    let block = builder.create_block();
+    builder.switch_to_block(block);
+    builder.seal_block(block);
+    let slots = [(); 3].map(|()| {
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 64, 4))
+    });
+    let addrs = slots.map(|slot| builder.ins().stack_addr(I64, slot, 0));
+    let value = builder.ins().iconst(I64, 7);
+    for addr in addrs {
+        builder.ins().store(super::MEM, value, addr, 0);
+    }
+    let loaded = builder.ins().load(I64, super::MEM, addrs[0], 0);
+    builder.ins().store(super::MEM, loaded, addrs[2], 0);
+    builder.ins().return_(&[loaded]);
+    builder.finalize(super::target().unwrap().frontend_config());
+
+    let [promoted, debugger, multiple_stores] = slots;
+    promote(&mut func, [debugger].into_iter());
+    assert_eq!(func.sized_stack_slots[promoted].size, 0);
+    assert_eq!(func.sized_stack_slots[debugger].size, 64);
+    assert_eq!(func.sized_stack_slots[multiple_stores].size, 64);
 }

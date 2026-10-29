@@ -1,6 +1,6 @@
 //! The functions each build puts in the program, said as [`Event::Functions`] records beside the
 //! process's socket as the codegen puts them in the object ([`hir_ty_codegen::watch`]): what
-//! the build page draws (docs/web.md).
+//! the build page draws (https://github.com/indexable-inc/blaze/pull/1341).
 
 use std::sync::Arc;
 

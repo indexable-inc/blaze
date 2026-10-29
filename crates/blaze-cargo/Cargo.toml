@@ -59,9 +59,11 @@ blaze-lints.workspace = true
 blaze-manifest.workspace = true
 blaze-metadata.workspace = true
 blaze-new.workspace = true
+blaze-graph.workspace = true
 blaze-protocol.workspace = true
 blaze-tree.workspace = true
 blaze-ui.workspace = true
+blaze-web.workspace = true
 blaze-units.workspace = true
 blaze-resolve = { path = "../blaze-resolve" }
 blaze-registry = { path = "../blaze-registry" }
@@ -100,6 +102,8 @@ tar = "0.4.44"
 # The zips build scripts download, unpacked where a crate's variable names a directory
 # (`cargo/fetches.rs`): deflate on flate2, which is in the tree already.
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+# The `.tar.gz` files build scripts download (FFmpeg's source, `cargo/fetches.rs`).
+flate2 = "1.1.9"
 zstd = "0.13.3"
 # The `.tar.xz` files of blaze's own toolchain (`cargo/toolchain/own.rs`): in Rust, within 1.3x
 # of liblzma's time on rustc's 84 MB.

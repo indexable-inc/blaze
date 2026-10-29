@@ -134,14 +134,16 @@ impl Docs {
         // Check whether the range is from the outline, the inline, or both.
         let source_map = if let Some((outline_mod_file, outline_mod_end)) = self.outline_mod {
             if let Some(first_inline) = self.docs_source_map.get(outline_mod_end) {
-                if string_range.end() <= first_inline.string_offset {
+                // An empty range where the inline starts is in the inline: the outline can have
+                // no lines at all.
+                if string_range.start() >= first_inline.string_offset {
+                    // The range is completely in the inline.
+                    &self.docs_source_map[outline_mod_end..]
+                } else if string_range.end() <= first_inline.string_offset {
                     // The range is completely in the outline.
                     file = outline_mod_file;
                     inner_docs_start = self.outline_inner_docs_start;
                     &self.docs_source_map[..outline_mod_end]
-                } else if string_range.start() >= first_inline.string_offset {
-                    // The range is completely in the inline.
-                    &self.docs_source_map[outline_mod_end..]
                 } else {
                     // The range is combined from the outline and the inline - cannot map it back.
                     return None;
@@ -1107,6 +1109,16 @@ mod tests {
         // Both `foo` and `bar` map back past the stripped ` * ` decoration.
         assert_eq!(mapped(0, 3), Some((in_file(range(7, 10)), IsInnerDoc::No)));
         assert_eq!(mapped(4, 7), Some((in_file(range(14, 17)), IsInnerDoc::No)));
+    }
+
+    #[test]
+    fn empty_outline_source_map() {
+        // A module in its own file with no docs at its `mod`: the outline has no lines.
+        let mut docs = comment_docs("/**\n * foo\n * bar\n */");
+        docs.outline_mod = Some((docs.inline_file, 0));
+        let at = |offset| TextRange::empty(TextSize::new(offset));
+        let mapped = docs.find_ast_range(at(0));
+        assert_eq!(mapped, Some((InFile::new(docs.inline_file, at(7)), IsInnerDoc::No)));
     }
 
     /// Extracts the docs of the first string in `source`, as if it were a `#[doc = "..."]` value.

@@ -37,12 +37,16 @@ let
 
   # The manifest directory of a workspace-local package, cut down to what the crate reads so that
   # editing anything else in the repo does not change the unit.
-  # crates/blaze-cargo include_str!s harness/toolchain.
+  # crates/blaze-cargo include_str!s harness/toolchain and library/{DIGEST,UPSTREAM}.
   pathSource = p:
-    let d = p.source.dir; in
+    let
+      d = p.source.dir;
+      library = lib.optionals (d == "crates/blaze-cargo")
+        (map (f: repo + "/library/${f}") [ "DIGEST" "UPSTREAM" ]);
+    in
     "${lib.fileset.toSource {
       root = repo;
-      fileset = lib.fileset.unions [ (repo + "/${d}") (repo + "/harness/toolchain") ];
+      fileset = lib.fileset.unions ([ (repo + "/${d}") (repo + "/harness/toolchain") ] ++ library);
     }}/${d}";
 
   pkgSrc = lib.mapAttrs
@@ -118,8 +122,8 @@ let
     // lib.optionalAttrs (builtins.elem i checked.roots || u.pkg == (U (builtins.head checked.roots)).pkg) { CARGO_PRIMARY_PACKAGE = "1"; }
     // lib.optionalAttrs (p.links != null) { CARGO_MANIFEST_LINKS = p.links; }
     # `blaze-engine --version` and the daemon's log name the commit, as the flake's `daemon` does
-    # (blaze-cargo's build script reads it).
-    // lib.optionalAttrs (p.name == "blaze-cargo" && gitSha != "") { BLAZE_GIT_SHA = gitSha; };
+    # (blaze-engine's build script reads it).
+    // lib.optionalAttrs (p.name == "blaze-engine" && gitSha != "") { BLAZE_GIT_SHA = gitSha; };
 
   mk = i:
     let

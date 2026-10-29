@@ -103,7 +103,7 @@ PROJECTS = {
             struct=field("crates/printer/src/jsont.rs", "pub(crate) struct SubMatch<'a> {", [("crates/printer/src/json.rs", "jsont::SubMatch {")]),
         ),
         test=["--workspace"],
-        # The toolchain's own library source, which is pinned with it.
+        # The standard library's source, blaze's library/, which its digest pins.
         runtime=dict(bin="rg", args=["-uuu", "--sort", "path", "-c", r"\w+_unchecked\(|unsafe \{", "{library}"]),
     ),
     "cargo": dict(
@@ -245,6 +245,40 @@ PROJECTS = {
         ),
         test=["-p", "servo-url"],
     ),
+    # Astral's Python package manager, 92 crates of its own; what astral-experiments/blaze
+    # tested its fork on. On main 7f4e04dcc8 its cold build fails: getrandom's
+    # `getrandom_inner` in the wasm proc macro `const-random-macro` is
+    # `UnresolvedMethod("map_err")`.
+    "uv": dict(
+        repo="astral-sh/uv", tag="0.13.6", rev="329bf9448afd9f9088d14a4d57fbc61eb454f117",
+        build=["-p", "uv", "--bin", "uv"], run=["--version"], named=True,
+        edits=dict(
+            body=body("crates/uv/src/lib.rs", "pub async fn run(cli: Cli, global_initialization: GlobalInitialization) -> Result<ExitStatus> {"),
+            leaf=body("crates/uv-normalize/src/package_name.rs", "    pub fn as_str(&self) -> &str {"),
+            generic=body("crates/uv-fs/src/path.rs", "pub fn normalize_path<'path>(path: impl Into<Cow<'path, Path>>) -> Cow<'path, Path> {"),
+        ),
+        test=["-p", "uv-normalize", "-p", "uv-pep440"],
+    ),
+    # Astral's Python linter and its type checker share one workspace, built a binary each.
+    "ruff": dict(
+        repo="astral-sh/ruff", tag="0.17.3", rev="ba65abf8ba7bfbcc059f7fb9712be5ba9cab6abc",
+        build=["-p", "ruff", "--bin", "ruff"], run=["--version"], named=True,
+        edits=dict(
+            body=body("crates/ruff/src/main.rs", "fn main() -> ExitCode {"),
+            leaf=body("crates/ruff_text_size/src/range.rs", "    pub const fn len(self) -> TextSize {"),
+            generic=body("crates/ruff_python_ast/src/visitor.rs", "pub fn walk_stmt<'a, V: Visitor<'a> + ?Sized>(visitor: &mut V, stmt: &'a Stmt) {"),
+        ),
+        test=["-p", "ruff_text_size", "-p", "ruff_python_parser"],
+    ),
+    "ty": dict(
+        repo="astral-sh/ruff", tag="0.17.3", rev="ba65abf8ba7bfbcc059f7fb9712be5ba9cab6abc",
+        build=["-p", "ty", "--bin", "ty"], run=["--version"], named=True,
+        edits=dict(
+            body=body("crates/ty_python_semantic/src/types.rs", "pub fn check_types(db: &dyn Db, file: ProgramFile<'_>) -> Vec<Diagnostic> {"),
+            leaf=body("crates/ruff_text_size/src/range.rs", "    pub const fn len(self) -> TextSize {"),
+        ),
+        test=["-p", "ty_python_semantic", "--lib"],
+    ),
     # 1.25M lines of Rust in 103 crates, with the C and C++ of a JavaScript runtime (bun's port
     # from Zig, docs/research/bun.md). Its own build makes the C and C++ once per revision
     # (bunprep.py), and its pinned nightly builds the Rust. Measured only when named.
@@ -296,11 +330,14 @@ PROJECTS = {
         ),
         test=["-p", "fff-query-parser", "-p", "fff-grep", "-p", "fff-search"],
     ),
-    # A video rendering framework: its hello-world example's renderer, over FFmpeg (a prebuilt
-    # static one ffmpeg-sys-fframes downloads) and Skia. The run is one frame by the CPU
-    # backend. Its build scripts need nasm and libclang: measured only when named.
+    # A video rendering framework: its hello-world example's renderer, over FFmpeg and Skia,
+    # which its build scripts download (a prebuilt Skia; FFmpeg's source for the example's
+    # codecs, a prebuilt FFmpeg for the tests'): `fetches` locks them for both. The run is one
+    # frame by the CPU backend. Its build scripts need nasm and libclang: measured only when named.
     "fframes": dict(
         repo="dmtrKovalenko/fframes", tag="v1.3.0", rev="69174f0187b5d8e92329246898f70250b59f08f2", named=True,
+        fetches=[["-p", "hello-world-example"],
+                 ["--tests", "-p", "fframes", "-p", "fframes-media", "-p", "webvtt-parser", "-p", "fframes-media-dir-macro"]],
         build=["-p", "hello-world-example", "--bin", "hello_world_example_bin"],
         run=["--renderer", "cpu", "svg", "1s"],
         edits=dict(
@@ -311,6 +348,23 @@ PROJECTS = {
                          "    pub fn get_scene_info<T: crate::Scene>(&self, scene: &T) -> Option<&crate::SceneInfo> {"),
         ),
         test=["-p", "fframes", "-p", "fframes-media", "-p", "webvtt-parser", "-p", "fframes-media-dir-macro"],
+    ),
+    # The environment manager built on Nix: its CLI over the SDK, the manifest and the catalog
+    # client. Its crates read Nix store paths at compile time, which floxprep.py takes from its
+    # flake: measured only when named.
+    "flox": dict(
+        repo="flox/flox", tag="v1.19.2", rev="87d931382dc5c53f32af662c9611c6a58d669952",
+        prepare="floxprep", env=dict(FLOX_DISABLE_METRICS="true"),
+        build=["-p", "flox", "--bin", "flox"], run=["--version"],
+        edits=dict(
+            body=body("cli/flox/src/main.rs", "fn main() -> ExitCode {"),
+            # Defined in the manifest crate, called from the CLI's `upgrade`.
+            signature=parameter("cli/flox-manifest/src/parsed/v1_10_0/package_descriptor.rs", "package_identifier", "&str", "cli/**/*.rs"),
+            leaf=body("cli/flox-core/src/floxhub.rs", "    pub fn api_url_str(&self) -> String {"),
+            generic=[("cli/flox-rust-sdk/src/utils/mod.rs", "    let mut serialized = serde_json::to_string_pretty(value)?;",
+                      "    let _bench_edit = 1u32;\n    let mut serialized = serde_json::to_string_pretty(value)?;")],
+        ),
+        test=["-p", "flox-core", "-p", "flox-config", "--features", "flox-core/tests"],
     ),
     # A game: built, not run (it opens a window). Its own code is small; the engine is ~400 crates.
     "bevy": dict(
@@ -687,6 +741,12 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
     SO_FAR[name, backend] = (phases, wrong, ours)
     build, run = spec.get("build", []), spec.get("run")
     subprocess.run(["cargo", "fetch"], cwd=ws, env=env, capture_output=True)
+    # What its build scripts download, for each feature set a build of it picks it by.
+    for selection in spec.get("fetches", []):
+        _, locked = ours.cargo("lock", "--fetches", *selection)
+        if locked.returncode != 0:
+            raise Failed(f"{name} {backend}: `blaze lock --fetches {' '.join(selection)}` failed:\n"
+                         f"{locked.stderr[-3000:]}")
 
     def others():
         """Every setup builds what plain cargo just built: its seconds by name."""
@@ -909,12 +969,9 @@ def test_suite(name, spec, ours, theirs, ws, wrong):
 
 
 def library():
-    """The source of the toolchain's standard library, which is pinned with the toolchain."""
-    sysroot = subprocess.run(["rustc", "--print", "sysroot"], capture_output=True, text=True,
-                             env=dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN), check=True).stdout.strip()
-    library = os.path.join(sysroot, "lib/rustlib/src/rust/library")
-    # A nix toolchain is a tree of symlinks to its rust-src, and ripgrep searches no symlinked file.
-    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(os.path.join(library, "core/src/lib.rs")))))
+    """The source of the standard library blaze compiles, `library/` of this checkout, which its
+    digest pins: no toolchain's `rust-src` is read (docs/toolchain.md)."""
+    return os.path.join(ROOT, "library")
 
 
 def runtime(name, spec, theirs, ws, build, runs, wrong):

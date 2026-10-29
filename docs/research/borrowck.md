@@ -1,3 +1,8 @@
+---
+status: record
+summary: rustc's NLL and Polonius, rust-analyzer's removed borrowck, and what blaze builds.
+date: 2026-10-20
+---
 # Borrow checking for blaze: rustc's NLL, Polonius, and what to build
 
 Date: 2026-10-20. Pinned rustc: nightly-2026-10-09, rust-lang/rust

@@ -15,6 +15,7 @@ use anyhow::Context as _;
 use sha2::{Digest as _, Sha256};
 
 use super::closure::{self, StorePath};
+use super::home::cargo_home_of;
 use crate::sandbox::{Bind, View};
 
 /// The table of system libraries by crate, shipped with blaze.
@@ -368,18 +369,6 @@ fn hidden_in(package: &Path, out_dir: &Path) -> Vec<PathBuf> {
         hidden.push(git);
     }
     hidden
-}
-
-/// Where cargo keeps the package in `dir` when it is a registry's or a git dependency's: the
-/// cargo home above its `registry/src` or `git/checkouts`.
-pub fn cargo_home_of(dir: &Path) -> Option<PathBuf> {
-    dir.ancestors().find_map(|it| {
-        let parent = it.parent()?;
-        let name = it.file_name()?;
-        let below = (name == "src" && parent.file_name()? == "registry")
-            || (name == "checkouts" && parent.file_name()? == "git");
-        below.then(|| parent.parent().map(Path::to_owned)).flatten()
-    })
 }
 
 /// The directories of `env`'s `DEP_` variables that are `OUT_DIR`s of other packages' runs:

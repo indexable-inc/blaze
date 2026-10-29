@@ -228,6 +228,12 @@ impl ItemTree {
         self.attrs.last().filter(|(id, _)| *id == ModItemId::TOP_OWNER).map(|(_, attrs)| attrs)
     }
 
+    /// Whether the file's own `#![cfg(...)]` is false. A crate whose root it is is empty, as
+    /// rustc leaves one: none of its items and none of its crate attributes.
+    pub fn configured_out(&self) -> bool {
+        matches!(self.top_level_attrs(), Some(AttrsOrCfg::CfgDisabled(_)))
+    }
+
     #[inline]
     pub(crate) fn attrs(&self, of: ModItemId) -> Option<&AttrsOrCfg> {
         self.attrs.binary_search_by_key(&of, |(id, _)| *id).ok().map(|index| &self.attrs[index].1)
