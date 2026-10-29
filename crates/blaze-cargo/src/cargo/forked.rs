@@ -77,9 +77,10 @@ pub fn options(package_dir: &Path) -> anyhow::Result<Options> {
                     toml::Value::Float(it) => *it,
                     _ => return Err(wrong("`timeout` is a number of seconds")),
                 };
-                out.timeout = Some(seconds_of(seconds).ok_or_else(|| {
-                    wrong("`timeout` is a number of seconds more than 0")
-                })?);
+                out.timeout = Some(
+                    seconds_of(seconds)
+                        .ok_or_else(|| wrong("`timeout` is a number of seconds more than 0"))?,
+                );
             }
             other => {
                 return Err(wrong(&format!(
@@ -125,8 +126,15 @@ pub fn refused_flag(args: &[String]) -> Option<String> {
     while let Some(arg) = args.next() {
         let flag = arg.split_once('=').map_or(arg.as_str(), |it| it.0);
         match flag {
-            "--exact" | "--ignored" | "--include-ignored" | "--exclude-should-panic" | "-q"
-            | "--quiet" | "--nocapture" | "--no-capture" | "--show-output" => {}
+            "--exact"
+            | "--ignored"
+            | "--include-ignored"
+            | "--exclude-should-panic"
+            | "-q"
+            | "--quiet"
+            | "--nocapture"
+            | "--no-capture"
+            | "--show-output" => {}
             "--skip" | "--test-threads" | "--color" if flag != arg => {}
             "--skip" | "--test-threads" | "--color" => {
                 args.next()?;
@@ -191,7 +199,9 @@ mod tests {
         write("[package]\nname = \"a\"\n");
         let it = options(&dir).unwrap();
         assert!(!it.threads && it.timeout.is_none());
-        write("[package]\nname = \"a\"\n[package.metadata.blaze.tests]\nthreads = true\ntimeout = 2.5\n");
+        write(
+            "[package]\nname = \"a\"\n[package.metadata.blaze.tests]\nthreads = true\ntimeout = 2.5\n",
+        );
         let it = options(&dir).unwrap();
         assert!(it.threads && it.timeout == Some(Duration::from_millis(2500)));
         write("[package]\nname = \"a\"\n[package.metadata.blaze.tests]\nthread = true\n");
@@ -204,14 +214,32 @@ mod tests {
     #[test]
     fn the_report_reads_as_libtests() {
         let ran = vec![
-            Ran { name: "b".into(), end: End::Failed(None), output: b"boom\n".to_vec(), took: Duration::ZERO },
+            Ran {
+                name: "b".into(),
+                end: End::Failed(None),
+                output: b"boom\n".to_vec(),
+                took: Duration::ZERO,
+            },
             Ran { name: "a".into(), end: End::Passed, output: Vec::new(), took: Duration::ZERO },
         ];
         let shown = Shown { terse: false, colored: false, passed_output: false };
-        let text = report(&ran, &[("c".into(), String::new())], 2, &BTreeMap::new(), Duration::ZERO, &shown);
-        assert!(text.contains("running 3 tests\ntest a ... ok\ntest b ... FAILED\ntest c ... ignored\n"));
+        let text = report(
+            &ran,
+            &[("c".into(), String::new())],
+            2,
+            &BTreeMap::new(),
+            Duration::ZERO,
+            &shown,
+        );
+        assert!(
+            text.contains(
+                "running 3 tests\ntest a ... ok\ntest b ... FAILED\ntest c ... ignored\n"
+            )
+        );
         assert!(text.contains("\n---- b stdout ----\nboom\n"));
         assert!(text.contains("\nfailures:\n    b\n"));
-        assert!(text.contains("test result: FAILED. 1 passed; 1 failed; 1 ignored; 0 measured; 2 filtered out;"));
+        assert!(text.contains(
+            "test result: FAILED. 1 passed; 1 failed; 1 ignored; 0 measured; 2 filtered out;"
+        ));
     }
 }

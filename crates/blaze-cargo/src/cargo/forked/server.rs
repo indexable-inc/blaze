@@ -84,7 +84,10 @@ impl Server {
                 }
                 Some(("e", count)) => total = count.parse().ok(),
                 Some(("f", why)) => {
-                    anyhow::bail!("the tests of {} can't run, each in a process: {why}", program.display())
+                    anyhow::bail!(
+                        "the tests of {} can't run, each in a process: {why}",
+                        program.display()
+                    )
                 }
                 _ => anyhow::bail!("{} said `{line}` as its tests' fork server", program.display()),
             }
@@ -244,10 +247,10 @@ pub fn schedule(
     let mut ended: BTreeSet<usize> = BTreeSet::new();
     let jobs = jobs.max(1);
     let finish_job = |job: usize,
-                          servers: &mut Vec<Server>,
-                          jobs_of: &mut Vec<Job>,
-                          ended: &mut BTreeSet<usize>,
-                          done: &mut dyn FnMut(usize, Job, bool)| {
+                      servers: &mut Vec<Server>,
+                      jobs_of: &mut Vec<Job>,
+                      ended: &mut BTreeSet<usize>,
+                      done: &mut dyn FnMut(usize, Job, bool)| {
         if !ended.insert(job) {
             return;
         }
@@ -352,12 +355,15 @@ pub fn schedule(
                 }
                 let keys: Vec<(usize, u32)> =
                     running.keys().filter(|it| it.0 == server).copied().collect();
-                keys.into_iter().filter_map(|key| running.remove(&key)).map(|it| (it, None)).collect()
+                keys.into_iter()
+                    .filter_map(|key| running.remove(&key))
+                    .map(|it| (it, None))
+                    .collect()
             }
         };
         for (it, status) in ended_now {
             let took = it.started.elapsed();
-            let output = read_output(&it.output);
+            let output = own_output(&read_output(&it.output));
             let end = match (it.killed, status) {
                 (Some(limit), _) => End::TimedOut(limit),
                 (None, None) => End::Failed(Some("its fork server ended".to_owned())),
@@ -398,6 +404,29 @@ fn read_output(file: &File) -> Vec<u8> {
     out
 }
 
+/// What a test wrote of what its process wrote: all but libtest's own report of the one test,
+/// which the child gives as JSON lines (`--format json`) so it is told apart from the test's
+/// output whatever that is. libtest's line follows a test's last write, which may not end
+/// its line.
+fn own_output(written: &[u8]) -> Vec<u8> {
+    const LIBTESTS: &[u8] = b"{ \"type\": \"";
+    let mut out = Vec::with_capacity(written.len());
+    for line in written.split_inclusive(|&it| it == b'\n') {
+        let text = line.strip_suffix(b"\n").unwrap_or(line);
+        let libtests = (0..text.len()).rev().find(|&at| {
+            text[at..].starts_with(LIBTESTS)
+                && serde_json::from_slice::<serde_json::Value>(&text[at..]).is_ok_and(|it| {
+                    matches!(it.get("type").and_then(|it| it.as_str()), Some("suite" | "test"))
+                })
+        });
+        match libtests {
+            Some(at) => out.extend_from_slice(&text[..at]),
+            None => out.extend_from_slice(line),
+        }
+    }
+    out
+}
+
 /// How a process that ended with the wait status `status` did: libtest exits 0 when its test
 /// passed and 101 when it failed.
 fn ended_with(status: i32) -> End {
@@ -413,13 +442,16 @@ fn ended_with(status: i32) -> End {
     }
     if libc::WIFSIGNALED(status) {
         let signal = libc::WTERMSIG(status);
-        return End::Failed(Some(format!("its process was killed by signal {signal}{}", match signal {
-            libc::SIGSEGV => " (SIGSEGV)",
-            libc::SIGABRT => " (SIGABRT)",
-            libc::SIGBUS => " (SIGBUS)",
-            libc::SIGKILL => " (SIGKILL)",
-            _ => "",
-        })));
+        return End::Failed(Some(format!(
+            "its process was killed by signal {signal}{}",
+            match signal {
+                libc::SIGSEGV => " (SIGSEGV)",
+                libc::SIGABRT => " (SIGABRT)",
+                libc::SIGBUS => " (SIGBUS)",
+                libc::SIGKILL => " (SIGKILL)",
+                _ => "",
+            }
+        )));
     }
     End::Failed(Some(format!("its process ended with the status {status}")))
 }
@@ -437,11 +469,12 @@ impl Shown {
     pub fn of(args: &[String], quiet: bool) -> Shown {
         use std::io::IsTerminal as _;
         let has = |names: &[&str]| args.iter().any(|it| names.contains(&it.as_str()));
-        let color = args.iter().enumerate().find_map(|(at, it)| match it.strip_prefix("--color=") {
-            Some(value) => Some(value.to_owned()),
-            None if it == "--color" => args.get(at + 1).cloned(),
-            None => None,
-        });
+        let color =
+            args.iter().enumerate().find_map(|(at, it)| match it.strip_prefix("--color=") {
+                Some(value) => Some(value.to_owned()),
+                None if it == "--color" => args.get(at + 1).cloned(),
+                None => None,
+            });
         let colored = match color.as_deref() {
             Some("always") => true,
             Some("never") => false,
@@ -472,7 +505,8 @@ pub fn report(
         true => format!("\x1b[{code}m{text}\x1b[0m"),
         false => text.to_owned(),
     };
-    let (ok, failed, ignored_word) = (paint("32", "ok"), paint("31", "FAILED"), paint("33", "ignored"));
+    let (ok, failed, ignored_word) =
+        (paint("32", "ok"), paint("31", "FAILED"), paint("33", "ignored"));
     let mut lines: Vec<(&str, String)> = Vec::new();
     let mut failures: Vec<&Ran> = Vec::new();
     let mut passed = 0;
@@ -530,7 +564,8 @@ pub fn report(
         }
     };
     if shown.passed_output {
-        let passes: Vec<&Ran> = ran.iter().filter(|it| !failures.iter().any(|f| f.name == it.name)).collect();
+        let passes: Vec<&Ran> =
+            ran.iter().filter(|it| !failures.iter().any(|f| f.name == it.name)).collect();
         if !passes.is_empty() {
             out.push_str("\nsuccesses:\n");
             for it in &passes {
@@ -547,7 +582,9 @@ pub fn report(
         out.push_str("\nfailures:\n");
         for it in &failures {
             let why = match &it.end {
-                End::TimedOut(limit) => Some(format!("blaze: it took more than its {:.1} s", limit.as_secs_f64())),
+                End::TimedOut(limit) => {
+                    Some(format!("blaze: it took more than its {:.1} s", limit.as_secs_f64()))
+                }
                 End::Failed(Some(why)) => Some(format!("blaze: {why}")),
                 _ => failed_too.get(&it.name).map(|why| format!("blaze: {why}")),
             };
@@ -594,3 +631,25 @@ pub fn scratch() -> PathBuf {
     std::env::temp_dir().join(format!("blaze-test-output-{}", std::process::id()))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tests_output_is_what_it_wrote_without_libtests_report() {
+        let written = concat!(
+            "{ \"type\": \"suite\", \"event\": \"started\", \"test_count\": 1 }\n",
+            "{ \"type\": \"test\", \"event\": \"started\", \"name\": \"tests::fails\" }\n",
+            "some output\n",
+            "{ \"type\": \"not libtest's\" }\n",
+            "thread 'tests::fails' panicked at src/lib.rs:7:51:\n",
+            "no newline",
+            "{ \"type\": \"test\", \"name\": \"tests::fails\", \"event\": \"failed\" }\n",
+            "{ \"type\": \"suite\", \"event\": \"failed\", \"passed\": 0, \"failed\": 1 }\n",
+        );
+        assert_eq!(
+            String::from_utf8(own_output(written.as_bytes())).unwrap(),
+            "some output\n{ \"type\": \"not libtest's\" }\nthread 'tests::fails' panicked at src/lib.rs:7:51:\nno newline"
+        );
+    }
+}

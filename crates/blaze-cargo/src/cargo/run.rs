@@ -165,7 +165,10 @@ pub fn started(command: &mut Command) -> std::io::Result<std::process::Child> {
 }
 
 /// Starts `command`, which runs `program` (itself, or in a sandbox), as [`started`] does.
-pub(super) fn started_running(command: &mut Command, program: &Path) -> std::io::Result<std::process::Child> {
+pub(super) fn started_running(
+    command: &mut Command,
+    program: &Path,
+) -> std::io::Result<std::process::Child> {
     #[cfg(unix)]
     let _unwritten = crate::splice::unwritten(program);
     #[cfg(not(unix))]
@@ -410,7 +413,8 @@ pub fn tests(
             Pick::Some { names, .. } => names.as_deref(),
             Pick::Asked => None,
         };
-        let ended = Settling { ran, failed: ended_badly, failures: failures.as_deref(), counted: counts };
+        let ended =
+            Settling { ran, failed: ended_badly, failures: failures.as_deref(), counted: counts };
         settle(&pick, results.as_mut(), &mut tally, &mut report, test, &ended, record.as_deref());
         if ended_badly {
             failed.push(rerun_flags(test));
@@ -465,7 +469,6 @@ pub fn tests(
         }
     }
 }
-
 
 /// A program of tests whose tests run each in a process of its own ([`forked`]), once the
 /// programs whose tests run as libtest's threads have run.
@@ -616,7 +619,8 @@ fn each_in_a_process(deferred: &[Deferred<'_>], each: &mut Each<'_, '_>) -> anyh
             filtered: inside.total.saturating_sub(inside.tests.len()),
             sandboxes: Vec::new(),
         };
-        let mut job = forked::Job { servers: Vec::new(), left: 0, timeout: d.timeout, ran: Vec::new() };
+        let mut job =
+            forked::Job { servers: Vec::new(), left: 0, timeout: d.timeout, ran: Vec::new() };
         let mut out_names = Vec::new();
         for (index, it) in inside.tests.iter().enumerate() {
             if d.picked.as_ref().is_some_and(|picked| !picked.contains(&it.name)) {
@@ -641,7 +645,10 @@ fn each_in_a_process(deferred: &[Deferred<'_>], each: &mut Each<'_, '_>) -> anyh
                     say::status(
                         each.asked.flags.quiet,
                         "Unsandboxed",
-                        &format!("{name}: taken out of the sandbox in {}", d.opt_out.manifest.display()),
+                        &format!(
+                            "{name}: taken out of the sandbox in {}",
+                            d.opt_out.manifest.display()
+                        ),
                     );
                 }
                 let Some(&index) = by_name.get(name.as_str()) else { continue };
@@ -675,7 +682,8 @@ fn each_in_a_process(deferred: &[Deferred<'_>], each: &mut Each<'_, '_>) -> anyh
                     let denied = sandboxed::denied(lines, &d.shown, d.opt_out);
                     unknown |= denied.unknown;
                     for name in denied.tests {
-                        failed_too.insert(name, "the sandbox denied it what is said above".to_owned());
+                        failed_too
+                            .insert(name, "the sandbox denied it what is said above".to_owned());
                     }
                 }
             }
@@ -715,7 +723,15 @@ fn each_in_a_process(deferred: &[Deferred<'_>], each: &mut Each<'_, '_>) -> anyh
                 failures: known.then_some(failures.as_slice()),
                 counted: Some(ran.len()),
             };
-            settle(&d.pick, each.results.as_mut(), each.tally, each.report, d.test, &ended, record.as_deref());
+            settle(
+                &d.pick,
+                each.results.as_mut(),
+                each.tally,
+                each.report,
+                d.test,
+                &ended,
+                record.as_deref(),
+            );
             if ended_badly {
                 each.failed.push(rerun_flags(d.test));
             }
@@ -749,9 +765,7 @@ fn settle(
 ) {
     let (ended_badly, failures, counts) = (ended.failed, &ended.failures, ended.counted);
     let mut found_flaky = BTreeSet::new();
-    if let (Pick::Some { names, total, keys, cached, .. }, Some(results)) =
-        (pick, results)
-    {
+    if let (Pick::Some { names, total, keys, cached, .. }, Some(results)) = (pick, results) {
         let flaky = keys.settle(
             results,
             &affected::Ended {

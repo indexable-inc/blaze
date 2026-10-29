@@ -666,6 +666,10 @@ const SERVER: &str = r#"
                             "--test-threads=1",
                             "--nocapture",
                             "--color=never",
+                            "-Z",
+                            "unstable-options",
+                            "--format",
+                            "json",
                         ]
                         .iter()
                         .map(|it| self::std::string::String::from(*it))
