@@ -103,7 +103,7 @@ PROJECTS = {
             struct=field("crates/printer/src/jsont.rs", "pub(crate) struct SubMatch<'a> {", [("crates/printer/src/json.rs", "jsont::SubMatch {")]),
         ),
         test=["--workspace"],
-        # The toolchain's own library source, which is pinned with it.
+        # The standard library's source, blaze's library/, which its digest pins.
         runtime=dict(bin="rg", args=["-uuu", "--sort", "path", "-c", r"\w+_unchecked\(|unsafe \{", "{library}"]),
     ),
     "cargo": dict(
@@ -960,12 +960,9 @@ def test_suite(name, spec, ours, theirs, ws, wrong):
 
 
 def library():
-    """The source of the toolchain's standard library, which is pinned with the toolchain."""
-    sysroot = subprocess.run(["rustc", "--print", "sysroot"], capture_output=True, text=True,
-                             env=dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN), check=True).stdout.strip()
-    library = os.path.join(sysroot, "lib/rustlib/src/rust/library")
-    # A nix toolchain is a tree of symlinks to its rust-src, and ripgrep searches no symlinked file.
-    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(os.path.join(library, "core/src/lib.rs")))))
+    """The source of the standard library blaze compiles, `library/` of this checkout, which its
+    digest pins: no toolchain's `rust-src` is read (docs/toolchain.md)."""
+    return os.path.join(ROOT, "library")
 
 
 def runtime(name, spec, theirs, ws, build, runs, wrong):

@@ -194,6 +194,13 @@ impl Loaded {
         let mut proc_macros = FxHashMap::default();
         let mut members = Vec::new();
         for ws in &self.workspaces {
+            // blaze's copy of `const-ast`, which const macros depend on, is in no folder on disk.
+            if let Some(dir) = ws.const_ast_dir() {
+                for (name, text) in ide_db::const_macro::CONST_AST {
+                    let path = vfs::VfsPath::from(dir.join(name));
+                    vfs.set_file_contents(path, Some(text.as_bytes().to_vec()));
+                }
+            }
             let (other, mut paths) = ws.to_crate_graph(
                 &mut |path: &AbsPath| {
                     let path = vfs::VfsPath::from(path.to_path_buf());

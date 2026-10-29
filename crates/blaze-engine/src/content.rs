@@ -1,5 +1,6 @@
-//! What a crate of a checkout is, by what is written in it: two checkouts with the same
-//! sources have the same crate, and what was compiled for one is the code of the other.
+//! What a crate of a checkout is, by what is written in it and the identity it is built
+//! with: two checkouts with the same sources and identities have the same crate, and what
+//! was compiled for one is the code of the other.
 
 pub(crate) use blaze_cargo::content::hex;
 
@@ -71,19 +72,14 @@ impl Contents {
         self.cargo_home.get_or_init(found).clone()
     }
 
-    /// Where the standard library's sources are installed, and the `/rustc/<commit>` they
-    /// were built in, when the toolchain they are in tells its commit.
-    pub(crate) fn library_sources(&self, db: &RootDatabase) -> Option<LibrarySources> {
-        const INSTALLED: &str = "lib/rustlib/src/rust";
+    /// Where the standard library's sources are, blaze's `library/`, and where they were
+    /// built, `/rustc/<commit>/library` for the commit of rust-lang/rust the library is a copy
+    /// of (`library/UPSTREAM`): rustc names them so in what it built from them.
+    pub(crate) fn library_sources(&self) -> Option<LibrarySources> {
         let found = || {
-            let crates = ide_db::base_db::all_crates(db);
-            let of_library = crates.iter().filter(|it| it.data(db).origin.is_lang());
-            let mut roots = of_library.filter_map(|&it| crate::crate_root_file(db, it.into()));
-            let toolchain =
-                roots.find_map(|it| Some(it.to_str()?.split_once(INSTALLED)?.0.to_owned()))?;
-            let commit = crate::rustc_commit(&toolchain)?;
-            let here = format!("{toolchain}{INSTALLED}");
-            Some(LibrarySources { here, built_in: format!("/rustc/{commit}") })
+            let library = crate::cargo::toolchain::library::found().ok()?;
+            let here = library.dir.to_str()?.to_owned();
+            Some(LibrarySources { here, built_in: format!("/rustc/{}/library", library.commit) })
         };
         self.library.get_or_init(found).clone()
     }
@@ -118,7 +114,13 @@ impl Contents {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"blaze crate 3");
+        field(b"blaze crate 4");
+        // The crate's identity is in what is compiled of it (a `TypeId` of one of its types),
+        // so code stored for it is of that identity alone, whatever its sources are.
+        match stable_crate_id(krate) {
+            Some(id) => field(&id.to_le_bytes()),
+            None => field(&[]),
+        }
         let name = krate.extra_data(db).display_name.as_ref().map(|it| it.to_string());
         field(name.unwrap_or_default().as_bytes());
         field(format!("{:?} {}", data.edition, data.target_kind.is_proc_macro()).as_bytes());

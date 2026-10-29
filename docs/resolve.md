@@ -179,8 +179,8 @@ the sharing pass decides whether the debuginfo of a host unit is lowered. Packag
 checked against the packages of `Cargo.lock`, as cargo checks them against the workspace's
 resolve.
 
-The `sysroot` part is the standard library's workspace in the toolchain
-(`lib/rustlib/src/rust/library`), read in its directory (whose `.cargo/config.toml` replaces
+The `sysroot` part is the standard library's workspace, blaze's `library/` (`BLAZE_LIBRARY`,
+[toolchain.md](toolchain.md#the-standard-library-library)), read in its directory (whose `.cargo/config.toml` replaces
 crates.io with `library/vendor`) as rust-analyzer's `Sysroot::load_workspace` asks for it:
 `--features sysroot/backtrace`, cargo told it is a nightly, `--no-deps` and full, with no
 `--filter-platform` and with each target of `harness/answers.py`. cargo reads the full metadata

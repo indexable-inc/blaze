@@ -812,7 +812,7 @@ def platform_doc(name, result, stored):
                 run = result["results"][key]["runtime"]
                 cell = lambda r: f"{seconds(r['median_s'])} ({seconds(r['min_s'])} to {seconds(r['max_s'])})" + (
                     f"; {megabytes(r['peak_mb'])}, {r['size_mb']} MB" if r.get("peak_mb") is not None else "")
-                command = " ".join(run["command"]).replace("{library}", "<the toolchain's library source>").replace("|", "\\|")
+                command = " ".join(run["command"]).replace("{library}", "<blaze's library/>").replace("|", "\\|")
                 lines.append(f"| {project_name(key, result['results'][key])} | `{command}` | {cell(run['blaze'])} | "
                              f"{cell(run['cargo debug'])} | {cell(run['cargo release'])} |")
         lines.append("")

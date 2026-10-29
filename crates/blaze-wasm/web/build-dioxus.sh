@@ -23,7 +23,11 @@ out=target/wasm32-unknown-unknown/release
 rm -rf ../pkg/dioxus
 wasm-bindgen "$out/playground.wasm" --target web --keep-lld-exports --out-dir ../pkg/dioxus --out-name playground
 
-"$tool" pack . app ../pkg/dioxus.pack
+# The pack's `core` is the source of the std this toolchain built the program with, which it
+# links: that toolchain's rust-src, named as blaze's library is (BLAZE_LIBRARY), since blaze's
+# front end reads no rust-src of its own accord: it is read here because plain cargo built the
+# program.
+BLAZE_LIBRARY="$(rustc --print sysroot)/lib/rustlib/src/rust/library" "$tool" pack . app ../pkg/dioxus.pack
 "$tool" host "$out/playground.wasm" ../pkg/dioxus.pack
 
 # Two things wasm-bindgen's JavaScript needs for a module nothing was removed from: the names

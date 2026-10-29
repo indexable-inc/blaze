@@ -29,6 +29,7 @@ How blaze is now. Kept true: CI checks their links, paths and settings against t
 - [tiers.md](tiers.md): Tiers: hot functions of a live program compiled again with LLVM and swapped in while it runs.
 - [toolchain.md](toolchain.md): blaze's own pinned nightly: what it is, how it is fetched and checked, and the daily bump.
 - [usage.md](usage.md): Getting started: using blaze on a project, in short.
+- [web.md](web.md): The build page blaze ui serves: every function of the build drawn live on the GPU, from a Flecs world of the program.
 
 ## Plans
 

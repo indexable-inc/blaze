@@ -472,8 +472,9 @@ def compare_profiles(case, blaze, cargo_home, host):
 
 def sysroot_library():
     rustc = ["rustc", CARGO[1]] if len(CARGO) > 1 and CARGO[1].startswith("+") else ["rustc"]
-    sysroot = subprocess.run(rustc + ["--print", "sysroot"], capture_output=True, text=True, check=True).stdout.strip()
-    return rustc, os.path.join(sysroot, "lib", "rustlib", "src", "rust", "library")
+    # blaze's library/, the standard library's only source blaze reads, not a toolchain's
+    # rust-src (docs/toolchain.md).
+    return rustc, os.path.join(ROOT, "library")
 
 
 def sysroot_cases():
@@ -496,7 +497,7 @@ def build_metadata_example():
 
 
 def compare_sysroot(case, blaze, cargo_home):
-    """cargo's and blaze's metadata of the toolchain's library, asked as rust-analyzer asks."""
+    """cargo's and blaze's metadata of blaze's library/, asked as rust-analyzer asks."""
     rustc, library = sysroot_library()
     result = dict(name=case["name"], part="sysroot")
     manifest = os.path.join(library, "Cargo.toml")
@@ -510,7 +511,7 @@ def compare_sysroot(case, blaze, cargo_home):
         cargo_env = dict(env)
         cargo_args = args + platform
         if not case["no_deps"]:
-            # rust-analyzer's copy of the lock file, so that the toolchain's is never written.
+            # rust-analyzer's copy of the lock file, so that library/'s is never written.
             copy = os.path.join(work, "Cargo.lock")
             shutil.copyfile(os.path.join(library, "Cargo.lock"), copy)
             cargo_env["CARGO_RESOLVER_LOCKFILE_PATH"] = copy

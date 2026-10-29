@@ -7,11 +7,11 @@ whether that went up against another build. A toolchain bump must not make more 
     stdcount.py --bin new/blaze --toolchain nightly-B --base old/blaze --base-toolchain nightly-A
 
 Each build compiles hello world's whole program with an empty store and BLAZE_STD_FROM=off, so
-the standard library of its toolchain's rust-src is compiled in the process, and reads the line
-`standard library: N crates, compiled C of T fns`: refused is T - C, and the reasons are the
-counted lines the build prints for them. With --base the second build is measured the same way,
-and the run fails when the first refuses more than the base. rustup has to have the toolchains,
-with rust-src. Python 3, stdlib only.
+the standard library of its own library/ (the checkout it was built in has it, docs/toolchain.md)
+is compiled in the process, and reads the line `standard library: N crates, compiled C of T
+fns`: refused is T - C, and the reasons are the counted lines the build prints for them. With
+--base the second build is measured the same way, and the run fails when the first refuses more
+than the base. rustup has to have the toolchains. Python 3, stdlib only.
 """
 import argparse, collections, json, os, re, subprocess, sys, tempfile
 
@@ -27,8 +27,6 @@ def sysroot(toolchain):
 def measure(binary, toolchain, keep=None):
     """{crates, compiled, total, refused, reasons} of one build of hello world by `binary`."""
     root = sysroot(toolchain)
-    if not os.path.isdir(os.path.join(root, "lib/rustlib/src/rust/library")):
-        sys.exit(f"error: stdcount: {toolchain} has no rust-src: rustup component add rust-src --toolchain {toolchain}")
     with tempfile.TemporaryDirectory(prefix="stdcount-") as work:
         project = os.path.join(work, "p")
         os.makedirs(os.path.join(project, "src"))
