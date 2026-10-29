@@ -41,13 +41,15 @@ syntax.workspace = true
 span.workspace = true
 hir-ty.workspace = true
 hir-ty-mir.workspace = true
+const-ast = { workspace = true, features = ["source"] }
+parser.workspace = true
+syntax-bridge.workspace = true
 
 [dev-dependencies]
 expect-test = "1.5.1"
 project-model.workspace = true
 
 # local deps
-const-ast.workspace = true
 test-utils.workspace = true
 test-fixture.workspace = true
 

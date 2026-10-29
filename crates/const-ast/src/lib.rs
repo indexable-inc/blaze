@@ -34,6 +34,15 @@ mod tests;
 
 pub use views::*;
 
+/// The crate's files, by their path from its root: what blaze puts in a const macro's crate
+/// graph, so that the views a macro reads its input with are the code that wrote the input.
+#[cfg(feature = "source")]
+pub const SOURCE: [(&str, &str); 3] = [
+    ("lib.rs", include_str!("lib.rs")),
+    ("kinds.rs", include_str!("kinds.rs")),
+    ("views.rs", include_str!("views.rs")),
+];
+
 /// Set on the kind of an element that is a token. A node and a token can have the same
 /// kind (`ERROR`), so whether an element is a token is said, not read from its kind.
 pub const TOKEN: u16 = 1 << 15;

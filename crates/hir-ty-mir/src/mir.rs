@@ -29,7 +29,9 @@ mod transform;
 pub mod type_name;
 
 pub use eval::{
-    Evaluator, interpret_mir, macro_call::call_with_strs, render_const_using_debug_impl,
+    Evaluator, interpret_mir,
+    macro_call::{FlatInput, MacroArg, call_const_macro},
+    render_const_using_debug_impl,
 };
 pub use lower::is_builtin_index;
 pub use lower::{

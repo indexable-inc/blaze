@@ -19,5 +19,9 @@ doctest = false
 [dev-dependencies]
 syntax.workspace = true
 
+[features]
+# `SOURCE`, the crate's own files, for a host to put in a const macro's crate graph.
+source = []
+
 [lints]
 workspace = true

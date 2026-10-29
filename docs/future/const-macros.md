@@ -324,7 +324,7 @@ wasm instance:
   in its result is already a `FunctionId` (or a closure's id and its captures). When it ran
   as wasm, the pointer is a table slot. blaze built the module, so it maps the slot to the
   function itself, as #863 already requires.
-- The call: `call_with_strs`, generalised from text to the graph's value encoding (bytes in,
+- The call: `call_const_macro`, generalised from text to the graph's value encoding (bytes in,
   bytes out). Each input is written into the evaluator's heap, and the result is read back
   from the returned words. Whether `f` is const is the purity query's answer, not its
   signature's.
