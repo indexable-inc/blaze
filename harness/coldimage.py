@@ -381,13 +381,13 @@ class Image:
         sym = self.dynsym[index]
         return f"{sym.name}@{sym.version}" if sym.version else sym.name
 
-    def slot(self, addr: int, depth: int) -> str:
+    def slot(self, addr: int, depth: int, size: int = 16) -> str:
         """What a slot of 8 bytes holds once loaded."""
         if addr in self.dynrel:
             r_type, sym, addend = self.dynrel[addr]
             m = self.elf.machine
             if r_type == RELATIVE[m]:
-                return self.what(addend, depth + 1)
+                return self.what(addend, depth + 1, size)
             if r_type in BIND[m] or r_type == ABS64[m]:
                 return self.import_name(sym) + (f"+{addend:#x}" if addend else "")
             if r_type == TPOFF64[m]:
@@ -409,7 +409,7 @@ class Image:
             raise Failed(f"{self.label}: the stub at {addr:#x} is not `adrp; ldr`: {code.hex()}")
         return self.slot(adrp_page(adrp, addr) + ((ldr >> 10) & 0xFFF) * 8, depth)
 
-    def what(self, addr: int, depth: int = 0) -> str:
+    def what(self, addr: int, depth: int = 0, size: int = 16) -> str:
         """What is at `addr`, without its address: a symbol and an offset into it, what a slot
         or a stub holds, or for what has no symbol, its section and its first bytes."""
         sec = self.section_at(addr)
@@ -432,7 +432,7 @@ class Image:
             return f"the end of {sec.name}"
         if depth > 1:
             return f"in {sec.name}"
-        end = min(addr + 16, sec.addr + sec.size)
+        end = min(addr + size, sec.addr + sec.size)
         words = []
         for at in range(addr, end, 8):
             if at in self.dynrel:
@@ -469,9 +469,23 @@ A_TLS = set(range(512, 574))  # the thread-local relocations, TLSGD to TLSDESC
 A_NONE = 0
 
 
-def reached(img: Image, base: int, rel: tuple[int, int, int, int], target_name: str, pairs: dict) -> str | None:
+def reached(img: Image, base: int, rel: tuple[int, int, int, int], target_name: str, size: int, empty: str | None, pairs: dict) -> str | None:
     """What one relocation reaches in `img`, its section at `base`; None for one whose meaning
-    is in the bytes alone (thread-locals), which the byte comparison checks."""
+    is in the bytes alone (thread-locals), which the byte comparison checks. A target with no
+    symbol in the image is told by its first `size` bytes: past them a merged constant's
+    neighbours are each linker's own. A load through a slot of the GOT reaches what the load a
+    linker relaxed it to does. A target in an empty section (`.tm_clone_table`) is where each
+    linker put that section, whatever else starts there."""
+
+    def at(addr: int) -> str:
+        out = img.elf.section(empty) if empty else None
+        if out is not None and addr == out.addr:
+            return f"the empty {empty}"
+        return img.what(addr, 0, size)
+
+    def slot(addr: int) -> str:
+        return img.slot(addr, -1, size)
+
     offset, r_type, _, addend = rel
     p = base + offset
     if img.elf.machine == 62:
@@ -479,7 +493,7 @@ def reached(img: Image, base: int, rel: tuple[int, int, int, int], target_name: 
             return None
         if r_type in (X_PC32, X_PLT32):
             (field,) = struct.unpack("<i", img.read(p, 4))
-            return img.what(p + field - addend)
+            return at(p + field - addend)
         if r_type in (X_GOTPCREL, X_GOTPCRELX, X_REX_GOTPCRELX):
             # The opcode and ModRM byte before the field.
             op = img.read(p - 2, 2)
@@ -487,26 +501,26 @@ def reached(img: Image, base: int, rel: tuple[int, int, int, int], target_name: 
             # relaxes them.
             if op[0] == 0x8B or op in (b"\xff\x15", b"\xff\x25") or op[0] in (0x81, 0x83) and op[1] & 0xC7 == 0x05:
                 (field,) = struct.unpack("<i", img.read(p, 4))
-                return img.slot(p + field - addend, 0)
+                return slot(p + field - addend)
             if op[0] == 0x8D or op == b"\x67\xe8":
                 (field,) = struct.unpack("<i", img.read(p, 4))
-                return img.what(p + field - addend)
+                return at(p + field - addend)
             if op[0] == 0xE9:
                 # `jmp *x@GOTPCREL(%rip)` relaxed to `jmp x; nop`: the field is a byte earlier.
                 (field,) = struct.unpack("<i", img.read(p - 1, 4))
-                return img.what(p + 3 + field)
+                return at(p + 3 + field)
             raise Failed(f"{img.label}: a GOTPCREL relocation at {p:#x} after {op.hex()}, which coldimage.py does not read")
         if r_type == X_64:
-            return img.slot(p, 0) if p in img.dynrel else img.what(img.u64(p) - addend)
+            return slot(p) if p in img.dynrel else at(img.u64(p) - addend)
         if r_type == X_PC64:
             (field,) = struct.unpack("<q", img.read(p, 8))
-            return img.what(p + field - addend)
+            return at(p + field - addend)
         raise Failed(f"{img.label}: x86-64 relocation type {r_type} ({target_name}), which coldimage.py does not read")
     (word,) = struct.unpack("<I", img.read(p, 4)) if r_type not in (A_ABS64, A_PREL64) else (0,)
     if r_type == A_NONE or r_type in A_TLS:
         return None
     if r_type in A_CALL:
-        return img.what(p + sext(word & 0x3FFFFFF, 26) * 4 - addend)
+        return at(p + sext(word & 0x3FFFFFF, 26) * 4 - addend)
     if r_type in (A_PAGE, A_GOT_PAGE):
         pairs[(rel[2], addend, r_type)] = adrp_page(word, p)
         return "page"
@@ -514,26 +528,26 @@ def reached(img: Image, base: int, rel: tuple[int, int, int, int], target_name: 
         page = pairs.get((rel[2], addend, A_PAGE))
         if page is None:
             raise Failed(f"{img.label}: a low-12 relocation at {p:#x} ({target_name}) with no page before it")
-        return img.what(page + (((word >> 10) & 0xFFF) << A_LO12[r_type]) - addend)
+        return at(page + (((word >> 10) & 0xFFF) << A_LO12[r_type]) - addend)
     if r_type == A_GOT_LO12:
         page = pairs.get((rel[2], addend, A_GOT_PAGE))
         if page is None:
             raise Failed(f"{img.label}: a GOT low-12 relocation at {p:#x} ({target_name}) with no page before it")
         if word & 0xFFC00000 == 0xF9400000:
-            return img.slot(page + ((word >> 10) & 0xFFF) * 8 - addend, 0)
+            return slot(page + ((word >> 10) & 0xFFF) * 8 - addend)
         if word & 0xFF800000 == 0x91000000:
-            return img.what(page + ((word >> 10) & 0xFFF) - addend)
+            return at(page + ((word >> 10) & 0xFFF) - addend)
         if word & 0x9F000000 == 0x10000000:
             # lld's `adrp; ldr` through the GOT relaxed to `nop; adr`.
-            return img.what(p + sext(((word >> 5) & 0x7FFFF) << 2 | (word >> 29) & 3, 21) - addend)
+            return at(p + sext(((word >> 5) & 0x7FFFF) << 2 | (word >> 29) & 3, 21) - addend)
         raise Failed(f"{img.label}: a GOT low-12 relocation at {p:#x} on {word:#010x}, which coldimage.py does not read")
     if r_type == A_ABS64:
-        return img.slot(p, 0) if p in img.dynrel else img.what(img.u64(p) - addend)
+        return slot(p) if p in img.dynrel else at(img.u64(p) - addend)
     if r_type == A_PREL32:
-        return img.what(p + sext(word, 32) - addend)
+        return at(p + sext(word, 32) - addend)
     if r_type == A_PREL64:
         (field,) = struct.unpack("<q", img.read(p, 8))
-        return img.what(p + field - addend)
+        return at(p + field - addend)
     raise Failed(f"{img.label}: AArch64 relocation type {r_type} ({target_name}), which coldimage.py does not read")
 
 
@@ -606,7 +620,10 @@ def compare_sections(objects: list[Elf], ours: Image, lld: Image) -> list[str]:
             mask.update(masked(obj.machine, rel[0], rel[1]))
             target = syms[rel[2]] if rel[2] < len(syms) else None
             name = (target.name or f"section {obj.sections[target.shndx].name}") if target else "?"
-            got = [reached(img, base, rel, name, pair) for img, base, pair in zip((ours, lld), bases, pairs)]
+            size = target.size if target and target.type != STT_SECTION and target.size else 16
+            home = obj.sections[target.shndx] if target and 0 < target.shndx < len(obj.sections) else None
+            empty = home.name if home is not None and home.size == 0 else None
+            got = [reached(img, base, rel, name, size, empty, pair) for img, base, pair in zip((ours, lld), bases, pairs)]
             checked += 1
             if got[0] != got[1]:
                 diffs.append(f"{anchor.name}+{rel[0] - anchor.value:#x} (type {rel[1]}, to {name}{rel[3]:+#x}): "
