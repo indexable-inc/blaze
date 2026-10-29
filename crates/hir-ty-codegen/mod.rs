@@ -6180,11 +6180,23 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         };
         let waiting = std::collections::VecDeque::new();
         let mut ready = Ready { ahead: &ahead, work: work_to_do, progress, waiting };
+        /// Has no more roots come to the threads however the one beside them ends: unwound, as
+        /// a write to the database cancels it, too, or the threads wait for roots forever and
+        /// the scope that joins them never ends.
+        struct Closing<'a>(&'a std::sync::Mutex<Ahead>, &'a Waits);
+        impl Drop for Closing<'_> {
+            fn drop(&mut self) {
+                let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                state.open = false;
+                state.stopped |= std::thread::panicking();
+                drop(state);
+                self.1.0.notify_all();
+                self.1.1.notify_all();
+            }
+        }
         self.symbols.in_parallel_beside(threads, &work, &mut || {
+            let _closing = Closing(&ahead, &waits);
             beside(self, Some(&mut ready));
-            ahead.lock().unwrap_or_else(|e| e.into_inner()).open = false;
-            work_to_do.notify_all();
-            progress.notify_all();
         });
         self.ahead = ahead.into_inner().unwrap_or_else(|e| e.into_inner()).seen;
     }
