@@ -11,7 +11,8 @@ use vfs::{AbsPath, AbsPathBuf};
 
 /// The description of `krate` and every crate it depends on but the sysroot's, `krate` first,
 /// over the sysroot at `sysroot`. A proc macro it depends on is named by its library in
-/// `libraries`. `None` when a crate's root is not a file of the machine.
+/// `libraries`. `None` when a crate's root is not a file of the machine, or the graph has a
+/// sysroot but no `core` of blaze's library.
 pub(crate) fn description(
     graph: &CrateGraphBuilder,
     vfs: &vfs::Vfs,
@@ -85,15 +86,13 @@ pub(crate) fn description(
     if let Some(sysroot) = sysroot {
         out["sysroot"] = json!(sysroot.to_string());
         // The library the graph was loaded with: `library/` above `core/src/lib.rs`, which is
-        // blaze's own and not the toolchain's.
-        let core = graph
-            .iter()
-            .find(|it| matches!(graph[*it].basic.origin, CrateOrigin::Lang(LangCrateOrigin::Core)));
-        let library = core.and_then(|it| {
-            let root = vfs.file_path(graph[it].basic.root_file_id);
-            Some(root.as_path()?.parent()?.parent()?.parent()?.to_owned())
-        });
-        let library = library.unwrap_or_else(|| sysroot.join("lib/rustlib/src/rust/library"));
+        // blaze's own and not the toolchain's. A graph without `core` has no description: the
+        // toolchain's `rust-src` is never named in its place.
+        let core = graph.iter().find(|it| {
+            matches!(graph[*it].basic.origin, CrateOrigin::Lang(LangCrateOrigin::Core))
+        })?;
+        let root = vfs.file_path(graph[core].basic.root_file_id);
+        let library = root.as_path()?.parent()?.parent()?.parent()?.to_owned();
         out["sysroot_src"] = json!(library.to_string());
     }
     Some(out.to_string())

@@ -66,6 +66,8 @@ RUST = "https://github.com/rust-lang/rust"
 CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "blaze-bump")
 HOSTS = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
          "x86_64-pc-windows-msvc"]
+# rust-src is not blaze's (it compiles its own library/): the bump imports library/ from it
+# (library.py merge), and rustc's side of the harnesses names std's files where it installs.
 COMPONENTS = ["rustc", "cargo", "rust-std", "rust-src", "llvm-tools-preview", "rustfmt-preview",
               "clippy-preview", "rust-analyzer-preview", "rustc-codegen-cranelift-preview"]
 # Where the old pin is written down besides harness/toolchain and pins.txt.
@@ -362,6 +364,8 @@ async def bump(date):
         else:
             print("note: nix is not on PATH: run `nix flake update rust-overlay` where it is")
         if shutil.which("rustup"):
+            # For rustc's side of the harnesses and an editor's rust-analyzer; blaze reads no
+            # rust-src.
             group.create_task(run("rustup", "rustup", "toolchain", "install", name, "--profile", "minimal",
                                   "-c", "rust-src", "-c", "llvm-tools", "-c", "rustfmt", "-c", "clippy",
                                   bound=1200))

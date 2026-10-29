@@ -63,8 +63,8 @@ fn mode() -> Option<Mode> {
 }
 
 /// Where a crate's source is when it is one that cannot change: the part of the path from
-/// the standard library's source (`library/...`, blaze's or a toolchain's), the registry's or
-/// a git checkout's on.
+/// the standard library's source (`library/...`, blaze's: no toolchain's `rust-src` is read),
+/// the registry's or a git checkout's on.
 fn immutable(path: &str) -> Option<&str> {
     if let Some(dir) = crate::cargo::toolchain::library::dir().and_then(|it| it.to_str())
         && let Some(rest) = path.strip_prefix(dir)
@@ -72,7 +72,7 @@ fn immutable(path: &str) -> Option<&str> {
     {
         return Some(&path[dir.len() - "library".len()..]);
     }
-    ["/lib/rustlib/src/rust/", "/registry/src/", "/git/checkouts/"]
+    ["/registry/src/", "/git/checkouts/"]
         .iter()
         .find_map(|marker| path.find(marker).map(|at| &path[at + marker.len()..]))
 }

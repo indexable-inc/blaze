@@ -3701,6 +3701,14 @@ fn implemented_fn_method(
     fn_methods.contains(&Some(method)).then_some(method)
 }
 
+/// The trait's declaration of `func`, a method of a trait impl; `func` itself otherwise.
+fn declared_method(db: &dyn HirDatabase, func: FunctionId) -> FunctionId {
+    let ItemContainerId::ImplId(impl_) = func.lookup(db).container else { return func };
+    let Some(trait_ref) = db.impl_trait(impl_) else { return func };
+    let name = &FunctionSignature::of(db, func).name;
+    trait_ref.skip_binder().def_id.0.trait_items(db).method_by_name(name).unwrap_or(func)
+}
+
 /// The instance that is the `poll` of the future `ty`, when that is one of an `async` block.
 fn coroutine_instance<'db>(
     db: &'db dyn HirDatabase,
@@ -13963,15 +13971,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             unsupported!("vtable method without a receiver");
         };
         // A by-value `self` reaches the method through a pointer and needs a shim, unless the
-        // method takes it through a pointer too.
+        // method takes it through a pointer too. rustc's shim (`ShimKind::VTable`) is of the
+        // trait's method, so one that tracks its caller only in the impl is given the place of
+        // the trait's declaration by the shim however `self` is passed.
         if receiver.as_ref() == self_ty {
             let layout = self.layout(self_ty)?;
             let mode = self.pass_mode(&layout, false)?;
-            if !matches!(mode, PassMode::Indirect) {
-                if track_caller(db, callee) {
-                    unsupported!("vtable method taking `self` by value that tracks its caller");
+            if !matches!(mode, PassMode::Indirect) || track_caller(db, callee) {
+                let mut sig = self.body_signature(body)?;
+                if track_caller(db, func) {
+                    sig.params.push(AbiParam::new(ptr()));
                 }
-                let sig = Self::by_pointer(&self.body_signature(body)?, mode);
+                let sig = Self::by_pointer(&sig, mode);
                 return self.cg.callee(
                     InstanceDef::VtableShim(callee),
                     callee_args,
@@ -14312,13 +14323,22 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return self.spread_shim(func, args, method);
         }
         let body = self.body_types(InstanceDef::Fn(func), args)?;
-        let sig = self.body_signature(body)?;
+        let mut sig = self.body_signature(body)?;
         let Some(receiver) = body.params.first() else {
             unsupported!("vtable method without a receiver");
         };
         let layout = self.layout(receiver.as_ref())?;
         let mode = self.pass_mode(&layout, false)?;
-        self.call_by_pointer(func, args, &sig, mode, &layout)
+        // The shim is handed the caller's place when the trait's declaration tracks it, and
+        // passes it on; otherwise a method that tracks it is given the declaration's place, the
+        // span of rustc's shim.
+        let declared = declared_method(self.cg.db, func);
+        let handed = track_caller(self.cg.db, declared);
+        if handed {
+            sig.params.push(AbiParam::new(ptr()));
+        }
+        let placed = (!handed && track_caller(self.cg.db, func)).then_some(declared);
+        self.call_by_pointer(func, args, &sig, mode, &layout, placed)
     }
 
     /// What the vtable slot for an `Fn`-trait method written for a type, whose body is
@@ -14408,7 +14428,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// The body of a shim that is handed a pointer to the receiver of `callee`, which takes
-    /// it by value as `mode` says.
+    /// it by value as `mode` says, and, with `placed`, the place that function is declared
+    /// as its caller's.
     fn call_by_pointer(
         &mut self,
         callee: FunctionId,
@@ -14416,6 +14437,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         sig: &Signature,
         mode: PassMode,
         layout: &Layout,
+        placed: Option<FunctionId>,
     ) -> Result<()> {
         self.builder.func.signature = Self::by_pointer(sig, mode);
         let entry = self.builder.create_block();
@@ -14426,11 +14448,20 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let Some(&receiver) = params.get(sret as usize) else {
             unsupported!("shim for a receiver that is not passed");
         };
-        let callee = self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, sig)?;
+        let mut callee_sig = sig.clone();
+        if placed.is_some() {
+            callee_sig.params.push(AbiParam::new(ptr()));
+        }
+        let callee = self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &callee_sig)?;
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
         let mut values = Vec::new();
         self.pass(mode, receiver, layout, &mut values);
         params.splice(sret as usize..sret as usize + 1, values);
+        if let Some(declared) = placed {
+            let location = self.cg.declaration(declared);
+            let location = self.cg.declare_data_in_func(location, self.builder.func);
+            params.push(self.builder.ins().symbol_value(ptr(), location));
+        }
         let results = self.invoke(callee, &params);
         self.builder.ins().return_(&results);
         Ok(())

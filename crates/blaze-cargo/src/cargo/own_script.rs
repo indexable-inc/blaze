@@ -323,7 +323,8 @@ pub fn generated_fingerprint(described: &str) -> Result<[u8; 32], String> {
         let real = std::fs::canonicalize(dir)?;
         if !visiting.insert(real.clone()) {
             return Err(std::io::Error::other(format!(
-                "cyclic output directory {}", dir.display()
+                "cyclic output directory {}",
+                dir.display()
             )));
         }
         for entry in std::fs::read_dir(dir)? {
@@ -335,7 +336,8 @@ pub fn generated_fingerprint(described: &str) -> Result<[u8; 32], String> {
                 files.push(path);
             } else {
                 return Err(std::io::Error::other(format!(
-                    "output {} is not a regular file", path.display()
+                    "output {} is not a regular file",
+                    path.display()
                 )));
             }
         }
@@ -345,7 +347,8 @@ pub fn generated_fingerprint(described: &str) -> Result<[u8; 32], String> {
     let mut key = keyed::Key::new("generated compile-time inputs 1");
     let described: serde_json::Value = serde_json::from_str(described)
         .map_err(|why| format!("reading the compile-time description: {why}"))?;
-    let crates = described["crates"].as_array().ok_or("the compile-time description has no crates")?;
+    let crates =
+        described["crates"].as_array().ok_or("the compile-time description has no crates")?;
     for krate in crates {
         let Some(out) = krate["env"].get("OUT_DIR") else { continue };
         let out = out.as_str().ok_or("a compile-time crate has a non-string OUT_DIR")?;

@@ -19,8 +19,9 @@
         };
         # The one toolchain blaze is pinned to: the dated nightly in harness/toolchain
         # (`nightly-YYYY-MM-DD`, moved by harness/toolchain_bump.py, which also moves the
-        # rust-overlay input to one that has it). rust-src is the sysroot source rust-analyzer
-        # reads `core` from.
+        # rust-overlay input to one that has it). rust-src is for rust-analyzer in an editor of
+        # this repository; blaze reads none of it (its standard library is library/,
+        # docs/toolchain.md).
         pin = pkgs.lib.removePrefix "nightly-" (pkgs.lib.fileContents ./harness/toolchain);
         rust = pkgs.rust-bin.nightly.${pin}.default.override {
           extensions = [ "rust-src" ];
@@ -28,7 +29,7 @@
         # The same nightly with rustc_codegen_cranelift, for the setups bench.py compares with
         # (`--setups`, docs/benchmarks.md).
         nightly = pkgs.rust-bin.nightly.${pin}.default.override {
-          extensions = [ "rust-src" "rustc-codegen-cranelift-preview" ];
+          extensions = [ "rustc-codegen-cranelift-preview" ];
         };
         # The one LLVM the `llvm` feature builds against, for every build of it: the dev shells
         # here, CI (`.#llvm`, .github/actions/toolchain), the flake's `dist` and the release.
@@ -270,7 +271,9 @@
         # Python-only work needs neither LLVM nor a Rust toolchain.
         devShells.scripts = pkgs.mkShell scripts;
         # What harness/bench.py and runbench.py measure bun in (bunprep.py, docs/research/bun.md):
-        # bun's own pinned nightly in place of blaze's (rust-src, which blaze reads `core` from), and
+        # bun's own pinned nightly in place of blaze's, for the cargo side (blaze ignores the pin
+        # and compiles its own library/), with rust-src, which bun's own build of its Rust
+        # (`-Zbuild-std`, run by bunprep.py's plan step) reads std from, and
         # what bun's own build of its C and C++ needs, as its flake.nix has it: LLVM 23 as the
         # C and C++ compiler, cmake, ninja, nasm (x86), go, a bun to run its build scripts, and on Linux lld.
         # blaze itself is built in the bench shell.

@@ -747,6 +747,7 @@ dependencies = [
  "dunce",
  "ed25519-dalek",
  "find-msvc-tools",
+ "flate2",
  "futures-util",
  "getrandom 0.3.4",
  "hir-ty-codegen",
@@ -821,9 +822,11 @@ name = "blaze-engine"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "ar_archive_writer",
  "blaze-cargo",
  "blaze-doc",
  "blaze-expand",
+ "blaze-graph",
  "blaze-lints",
  "blaze-live",
  "blaze-macro-wasm",

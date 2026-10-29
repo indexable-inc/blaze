@@ -208,6 +208,13 @@ def about_rustc():
     yield ["-V"], {}, ""
     yield ["--version"], {}, ""
     yield ["--version", "--verbose"], {}, ""
+    # servo's `[env]` has a list of its crates, which its build scripts asking rustc are given.
+    crates = {"RUSTC_BOOTSTRAP": "crown,script,mozjs_sys"}
+    for args in (["-vV"], ["--version"]):
+        yield args, crates, ""
+    for name in ("script", "libc"):
+        for variables in (crates, {"RUSTC_BOOTSTRAP": "-1,script"}, {"RUSTC_BOOTSTRAP": "1,"}):
+            yield ["--crate-name", name, "--print", "cfg", "-C", "debug-assertions=yes"], variables, ""
     yield PROBE, {}, ""
     yield LIBRARY, {}, ""
     yield LIBRARY, nightly, ""

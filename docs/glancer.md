@@ -459,6 +459,16 @@ then, while nobody asks, makes the build a start without one would (the checkout
 the store), which holds the patch base: its first edit is a patch, as `storetracked.py`'s
 restart on the same checkout and store checks.
 
+blaze's own tree never hits the manifest: `crates/blaze-engine/build.rs` puts the commit and a
+hash of the tree into `env!`, so every commit changes those functions. There, a fresh machine
+mostly paid for a late `include!` (`rustversion`'s `version.expr`, included in a body). A file
+that loads after the first build used to have every crate built again. Against a patch base from
+the store, that meant 311,088 functions through LLVM and 145 s of revalidation on the gate's
+build. Only the crates recorded as naming the file are touched now (#1479, #1510). The rebuild
+went from 94.0 s to 3.5 s, and the functions compiled with no edit from 355,042 to 812
+(`harness/freshwarm.py blaze`; tools/bench/results/2026-10-29-freshwarm-blaze has the method,
+both arms' reports and what is left).
+
 ### Item 4: a flat syntax tree for files nobody edits
 
 Its own lane (#42); the measurements and the design are in

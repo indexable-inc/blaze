@@ -63,25 +63,21 @@ struct Pin {
 
 struct Component {
     package: &'static str,
-    /// `*` for one that is the same on every host, as `rust-src` is.
+    /// The target it is for: the host's, or `wasm32-wasip1` for the library proc macros build
+    /// against. Every package blaze pins is of one target, so its files are all named
+    /// `<package>-<version>-<target>`.
     target: &'static str,
     pin: Pin,
 }
 
 impl Component {
     fn file(&self, version: &str) -> String {
-        match self.target {
-            "*" => format!("{}-{version}.tar.xz", self.package),
-            target => format!("{}-{version}-{target}.tar.xz", self.package),
-        }
+        format!("{}-{version}-{}.tar.xz", self.package, self.target)
     }
 
     /// As rustup names it in a toolchain's records.
     fn name(&self) -> String {
-        match self.target {
-            "*" => self.package.to_owned(),
-            target => format!("{}-{target}", self.package),
-        }
+        format!("{}-{}", self.package, self.target)
     }
 }
 
@@ -575,7 +571,7 @@ fn lay_out(release: &Release, manifest: &[u8], toolchain: &Path) -> anyhow::Resu
             "\n[[components]]\npkg = \"{}\"\ntarget = \"{}\"\nis_extension = {}\n",
             component.package,
             component.target,
-            component.target == "*"
+            component.target != release.host
         );
         names.push(name);
     }
@@ -683,27 +679,27 @@ mod tests {
     /// A release of two packages, written as the Rust project's site has them into `dist`,
     /// and its pins.
     fn release(dist: &Path, rustc: &[u8]) -> Release {
-        let src = package(
-            "rust-src-9.9.9",
-            "rust-src",
-            &[("lib/rustlib/src/rust/library/core/lib.rs", "// core\n")],
-            &["lib/rustlib/src/rust"],
+        let wasm = package(
+            "rust-std-9.9.9-wasm32-wasip1",
+            "rust-std-wasm32-wasip1",
+            &[("lib/rustlib/wasm32-wasip1/lib/libcore.rlib", "core\n")],
+            &["lib/rustlib/wasm32-wasip1"],
         );
         let manifest = b"[pkg.rust]\ngit_commit_hash = \"abc\"\n";
         std::fs::create_dir_all(dist).unwrap();
         std::fs::write(dist.join("rustc-9.9.9-test-host.tar.xz"), rustc).unwrap();
-        std::fs::write(dist.join("rust-src-9.9.9.tar.xz"), &src).unwrap();
+        std::fs::write(dist.join("rust-std-9.9.9-wasm32-wasip1.tar.xz"), &wasm).unwrap();
         std::fs::write(dist.join("channel-rust-9.9.9.toml"), manifest).unwrap();
         let pins = format!(
             "# test\nrelease 9.9.9 2000-01-01 9.9.9\nrustc 9.9.9 (abc 2000-01-01)\nmanifest {} {}\n\
-             test-host rustc test-host {} {}\ntest-host rust-src * {} {}\n\
+             test-host rustc test-host {} {}\ntest-host rust-std wasm32-wasip1 {} {}\n\
              other-host rustc other-host {} 1\n",
             sha256(manifest),
             manifest.len(),
             sha256(rustc),
             rustc.len(),
-            sha256(&src),
-            src.len(),
+            sha256(&wasm),
+            wasm.len(),
             sha256(b"other"),
         );
         Release::read(pins.leak(), "test-host").unwrap()
@@ -773,7 +769,7 @@ mod tests {
         fetched(&dist, &release, &dir).unwrap();
         assert!(complete(&release, &dir));
         let read = |path: &str| std::fs::read_to_string(dir.join(path)).unwrap();
-        assert_eq!(read("lib/rustlib/components"), "rustc-test-host\nrust-src\n");
+        assert_eq!(read("lib/rustlib/components"), "rustc-test-host\nrust-std-wasm32-wasip1\n");
         assert_eq!(
             read("lib/rustlib/manifest-rustc-test-host"),
             format!(
@@ -783,8 +779,8 @@ mod tests {
             )
         );
         assert_eq!(
-            read("lib/rustlib/manifest-rust-src"),
-            "file:lib/rustlib/src/rust/library/core/lib.rs\n"
+            read("lib/rustlib/manifest-rust-std-wasm32-wasip1"),
+            "file:lib/rustlib/wasm32-wasip1/lib/libcore.rlib\n"
         );
         assert_eq!(
             read("lib/rustlib/multirust-channel-manifest.toml"),
@@ -793,7 +789,7 @@ mod tests {
         assert_eq!(read("lib/rustlib/rust-installer-version"), "3");
         assert!(
             read("lib/rustlib/multirust-config.toml")
-                .contains("pkg = \"rust-src\"\ntarget = \"*\"\nis_extension = true")
+                .contains("pkg = \"rust-std\"\ntarget = \"wasm32-wasip1\"\nis_extension = true")
         );
         #[cfg(unix)]
         {

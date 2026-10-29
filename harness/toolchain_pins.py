@@ -73,7 +73,7 @@ def pins():
             if not built.get("available"):
                 sys.exit(f"{package} is not built for {target} in Rust {RELEASE}")
             url = built["xz_url"]
-            want = f"{DIST}/{date}/{package}-{CHANNEL}{'' if target == '*' else '-' + target}.tar.xz"
+            want = f"{DIST}/{date}/{package}-{CHANNEL}-{target}.tar.xz"
             if url != want:
                 sys.exit(f"{package} for {target} is at {url}, where blaze looks for {want}")
             lines.append(f"{host} {package} {target} {built['xz_hash']} {size(url)}")

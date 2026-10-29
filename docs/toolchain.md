@@ -42,6 +42,13 @@ the standard library is part of a compiler.
   `blaze toolchain --path` prints its directory.
 - **The standard library's source** is not the toolchain's `rust-src`, which blaze neither
   downloads nor reads: it is blaze's own `library/` ([below](#the-standard-library-library)).
+  A rustup toolchain that has `rust-src` is used without it, `RUST_SRC_PATH` is not read,
+  and a process of blaze's front end with no `BLAZE_LIBRARY` stops with an error naming it
+  rather than looking for a `rust-src` (`crates/project-model/src/sysroot.rs`). Where
+  `rust-src` is still installed it is for something that is not blaze: rustc's side of the
+  harnesses (`.github/actions/toolchain`, [harness.md](harness.md#running-them)), rust-analyzer
+  in an editor of this repository (the dev shell of `flake.nix`), and `harness/library.py`,
+  which imports `library/` from the nightly's `rust-src` tarball.
 - **Who uses it:** cargo, rustc and the daemon that blaze starts (`CARGO`, `RUSTC`, `RUSTDOC`,
   `RUSTUP_TOOLCHAIN`, `PATH` for its own processes), whatever they were set to. The user's
   `cargo`, `rustc` and pins are untouched, and blaze reads none of them.
@@ -138,8 +145,11 @@ of blaze is told where it is in `BLAZE_LIBRARY`, the first of:
 - `~/.blaze/library/<digest>/library`, which blaze makes once, beside the toolchain's
   download: copied from the checkout it was built in when that has the same library, else
   downloaded as the release's `library-<digest>.tar.xz` (6.0 MB, `harness/library.py
-  archive` writes it, the release workflow attaches it), or from where `BLAZE_LIBRARY_FROM`
-  names. Whichever way it came it is checked against the digest file by file. A checkout's own
+  archive` writes it, the release workflow attaches it). `BLAZE_LIBRARY_FROM` names another
+  place to get it from (an address or a directory with that archive, or a library to copy),
+  taken over the checkout too: `harness/libraryfetch.py` installs from an archive served
+  locally that way, so the release's download is tried before a tag ships. Whichever way it
+  came it is checked against the digest file by file. A checkout's own
   `library/` is never read in place: what the store keeps of a crate whose data names the
   checkout being built is that checkout's alone, and the standard library's is everyone's.
 

@@ -141,7 +141,7 @@ jobs:
 
   # The standard library's refusals with the bump's build (the train's) and with the build of the
   # main commit the bump is on (toolchain/base's train, which the verdict compares jobs with),
-  # each with its own nightly's rust-src. main's newest build would count main's std fixes
+  # each with the library/ it was built with. main's newest build would count main's std fixes
   # since then against the bump.
   std:
     name: std refusals
@@ -188,7 +188,7 @@ jobs:
           BUMP_TOOLCHAIN: ${{ steps.base.outputs.bump }}
         run: |
           for side in new base; do tar -xf "$RUNNER_TEMP/$side/blaze.tar" -C "$RUNNER_TEMP/$side"; done
-          for tc in "$BUMP_TOOLCHAIN" "$BASE_TOOLCHAIN"; do rustup toolchain install "$tc" --profile minimal -c rust-src; done
+          for tc in "$BUMP_TOOLCHAIN" "$BASE_TOOLCHAIN"; do rustup toolchain install "$tc" --profile minimal; done
           python3 harness/stdcount.py --bin "$RUNNER_TEMP/new/blaze-engine" --toolchain "$BUMP_TOOLCHAIN" \
             --base "$RUNNER_TEMP/base/blaze-engine" --base-toolchain "$BASE_TOOLCHAIN" --json "$RUNNER_TEMP/std.json" || true
       - uses: actions/upload-artifact@v7

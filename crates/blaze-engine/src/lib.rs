@@ -137,6 +137,9 @@ struct Args {
     /// `exe` is a shared library of the crate asked for, as a proc macro's is
     /// (docs/no-rustc.md, step J2), not an executable.
     shared: bool,
+    /// `exe` is the archive of a `staticlib`, with `shared`: what the shared library would
+    /// have, archived ([`link::archive`]).
+    staticlib: bool,
     /// Where to write, after `exe` is linked, the dep-info rustc would have of the crate asked
     /// for: the files of its modules, as cargo reads them to know when to build it again.
     dep_info: Option<PathBuf>,
@@ -252,6 +255,7 @@ impl Args {
         let mut prebuilt = None;
         let mut exe = None;
         let mut shared = false;
+        let mut staticlib = false;
         let mut run_tool = false;
         let mut dep_info = None;
         let mut inputs = None;
@@ -293,6 +297,7 @@ impl Args {
                 "--prebuilt" => prebuilt = Some(PathBuf::from(value()?)),
                 "--exe" => exe = Some(PathBuf::from(value()?)),
                 "--shared" => shared = true,
+                "--staticlib" => staticlib = true,
                 "--run-tool" => run_tool = true,
                 "--dep-info" => dep_info = Some(PathBuf::from(value()?)),
                 "--inputs" => inputs = Some(PathBuf::from(value()?)),
@@ -332,6 +337,9 @@ impl Args {
         if shared && exe.is_none() {
             bail!("--shared says what --exe links, and there is no --exe");
         }
+        if staticlib && !shared {
+            bail!("--staticlib archives what --shared links, and there is no --shared");
+        }
         if run_tool && target.as_deref() != Some(RUN_TOOL_TARGET) {
             bail!("--run-tool is for build scripts compiled for --target {RUN_TOOL_TARGET}");
         }
@@ -353,6 +361,7 @@ impl Args {
             prebuilt,
             exe,
             shared,
+            staticlib,
             dep_info,
             inputs,
             library: false,
@@ -2934,14 +2943,15 @@ impl Checkouts {
         }
         let workspaces_at = start.elapsed();
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        let added_at = start.elapsed();
         *lock(&UNEDITED) = Unedited::of(self.loaded.workspaces());
         prepare_macro_sessions(db);
         if std::env::var_os("BLAZE_STATS").is_some() {
-            let files = start.elapsed() - workspaces_at;
             eprintln!(
-                "load-us: workspaces={} files={}",
+                "load-us: workspaces={} files={} sessions={}",
                 workspaces_at.as_micros(),
-                files.as_micros()
+                (added_at - workspaces_at).as_micros(),
+                (start.elapsed() - added_at).as_micros()
             );
         }
         self.roots.extend(roots);
@@ -3503,7 +3513,7 @@ fn report_sharing(db: &RootDatabase) {
 
 fn resolve_crates(db: &RootDatabase, args: &Args, threads: usize) -> anyhow::Result<usize> {
     let crates = built_crates(db, args)?;
-    resolve_all(db, &crates, threads);
+    resolve_all(db, &crates, threads)?;
     Ok(crates.len())
 }
 
@@ -3551,66 +3561,109 @@ fn prepare_macro_sessions(db: &RootDatabase) {
     });
 }
 
-/// Resolves the names and finds the impls of `crates`, on `threads`.
-fn resolve_all(db: &RootDatabase, crates: &[ide_db::base_db::Crate], threads: usize) {
-    // A crate comes after its dependencies in the list: a thread that starts on one whose
-    // dependencies are not resolved resolves them itself, one after the other.
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let helping = std::sync::atomic::AtomicUsize::new(0);
+/// Resolves the names and finds the impls of `crates`, on `threads`: each crate is a node of a
+/// build graph (docs/driver.md) that runs once the crates it depends on are resolved, so no
+/// thread waits inside a query for another's. While fewer crates are ready than there are
+/// threads, the idle ones help with a crate's impls and files.
+fn resolve_all(
+    db: &RootDatabase,
+    crates: &[ide_db::base_db::Crate],
+    threads: usize,
+) -> anyhow::Result<()> {
+    use blaze_graph::{Config, Machine, NodeId, Pool, Spec, exec};
+    use blaze_protocol::events::NodeKind;
+    let first = exec::ids(crates.len());
+    let id = |at: usize| NodeId(first + at as u32);
+    let index: FxHashMap<ide_db::base_db::Crate, usize> =
+        crates.iter().enumerate().map(|(at, &krate)| (krate, at)).collect();
+    let nodes = crates
+        .iter()
+        .enumerate()
+        .map(|(at, &krate)| {
+            let mut deps: Vec<NodeId> = krate
+                .data(db)
+                .dependencies
+                .iter()
+                .filter_map(|dep| index.get(&dep.crate_id))
+                .map(|&it| id(it))
+                .collect();
+            deps.sort();
+            deps.dedup();
+            let name = krate.extra_data(db).display_name.as_ref();
+            let name = name.map(|it| it.to_string()).unwrap_or_default();
+            Spec { id: id(at), kind: NodeKind::Names, name, deps, pool: Pool::Work, cost: 1 }
+        })
+        .collect();
+    let threads = threads.max(1);
+    let mut machine = Machine::new(Config { io: 1, work: threads, keep_going: false })?;
+    // The threads at work: on a crate, or helping with one.
+    let busy = std::sync::atomic::AtomicUsize::new(0);
     let counting = events::Counting::new(events::Step::Resolve, crates.len(), threads);
-    std::thread::scope(|scope| {
-        for slot in 0..threads {
-            let db = db.clone();
-            let (next, helping, counting) = (&next, &helping, &counting);
-            scope.spawn(move || {
-                while let Some(&krate) =
-                    crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-                {
-                    let start = Instant::now();
-                    let before = memory::live();
-                    counting.on(slot, || crate_shown(&db, krate));
-                    events::crate_is(krate, events::CrateState::Resolving);
-                    hir::attach_db(&db, || {
-                        _ = hir::crate_def_map(&db, krate);
-                        let names = start.elapsed();
-                        let frozen = hir_ty::method_resolution::frozen::served(&db, krate);
-                        if !frozen {
-                            warm_impls(&db, krate, helping, threads);
-                        }
-                        _ = hir::TraitImpls::for_crate(&db, krate);
-                        // Which of its dependencies the crate names is read off its files,
-                        // and the first body inferred would wait for that of every crate.
-                        _ = hir::TraitImpls::for_crate_and_deps(&db, krate);
-                        if frozen {
-                            warm_files(&db, krate, helping, threads);
-                        } else if krate.data(&db).origin.is_lang() {
-                            // A build asks which functions written in the bodies of the
-                            // standard library share a path, which every body of the crate is
-                            // lowered for: threads are idle here, waiting for the crates that
-                            // come next.
-                            _ = declared_in(&db, krate.into());
-                        }
-                        if std::env::var_os("BLAZE_STATS").is_some() {
-                            let name = krate.extra_data(&db).display_name.as_ref();
-                            let name = name.map(|it| it.to_string()).unwrap_or_default();
-                            // What the heap grew by is this crate's when one thread resolves.
-                            let grew = memory::live().zip(before).map(|(now, before)| {
-                                let origin = &krate.data(&db).origin;
-                                format!(", {:+} bytes {origin:?}", now as i64 - before as i64)
-                            });
-                            eprintln!(
-                                "resolved {name}: names {names:.1?}, impls {:.1?}{}",
-                                start.elapsed() - names,
-                                grew.unwrap_or_default()
-                            );
-                        }
-                    });
-                    events::crate_is(krate, events::CrateState::Resolved);
-                    counting.done(slot);
-                }
-            });
-        }
-    });
+    // The slot a crate under way says what it works on in: at most `threads` are under way.
+    let free: Mutex<Vec<usize>> = Mutex::new((0..threads).rev().collect());
+    // `RootDatabase` is `Send` but not `Sync`: each node clones its own from this one.
+    let shared = Mutex::new(db.clone());
+    let work = |node: NodeId| {
+        let krate = crates[(node.0 - first) as usize];
+        let db = lock(&shared).clone();
+        let slot = lock(&free).pop().unwrap_or_default();
+        busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        counting.on(slot, || crate_shown(&db, krate));
+        events::crate_is(krate, events::CrateState::Resolving);
+        hir::attach_db(&db, || resolve_one(&db, krate, &busy, threads));
+        events::crate_is(krate, events::CrateState::Resolved);
+        counting.done(slot);
+        busy.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        lock(&free).push(slot);
+        blaze_graph::exec::Did::built()
+    };
+    // The crates' nodes are said by `events::graph`, with the names the build's view shows.
+    let ok = exec::drive(&mut machine, nodes, &work, &mut |_| {}, None)?;
+    anyhow::ensure!(ok, "resolving the names of a crate failed");
+    Ok(())
+}
+
+/// Resolves the names and finds the impls of `krate`, whose dependencies are resolved.
+fn resolve_one(
+    db: &RootDatabase,
+    krate: ide_db::base_db::Crate,
+    busy: &std::sync::atomic::AtomicUsize,
+    threads: usize,
+) {
+    let start = Instant::now();
+    let before = memory::live();
+    _ = hir::crate_def_map(db, krate);
+    let names = start.elapsed();
+    let frozen = hir_ty::method_resolution::frozen::served(db, krate);
+    if !frozen {
+        warm_impls(db, krate, busy, threads);
+    }
+    _ = hir::TraitImpls::for_crate(db, krate);
+    // Which of its dependencies the crate names is read off its files, and the first body
+    // inferred would wait for that of every crate.
+    _ = hir::TraitImpls::for_crate_and_deps(db, krate);
+    if frozen {
+        warm_files(db, krate, busy, threads);
+    } else if krate.data(db).origin.is_lang() {
+        // A build asks which functions written in the bodies of the standard library share a
+        // path, which every body of the crate is lowered for: threads are idle here, waiting
+        // for the crates that come next.
+        _ = declared_in(db, krate.into());
+    }
+    if std::env::var_os("BLAZE_STATS").is_some() {
+        let name = krate.extra_data(db).display_name.as_ref();
+        let name = name.map(|it| it.to_string()).unwrap_or_default();
+        // What the heap grew by is this crate's when one thread resolves.
+        let grew = memory::live().zip(before).map(|(now, before)| {
+            let origin = &krate.data(db).origin;
+            format!(", {:+} bytes {origin:?}", now as i64 - before as i64)
+        });
+        eprintln!(
+            "resolved {name}: names {names:.1?}, impls {:.1?}{}",
+            start.elapsed() - names,
+            grew.unwrap_or_default()
+        );
+    }
 }
 
 /// A crate as a person names it: its name, or `std` for the standard library's.
@@ -3631,11 +3684,11 @@ fn crate_shown(db: &RootDatabase, krate: ide_db::base_db::Crate) -> String {
 fn warm_impls(
     db: &RootDatabase,
     krate: ide_db::base_db::Crate,
-    helping: &std::sync::atomic::AtomicUsize,
+    busy: &std::sync::atomic::AtomicUsize,
     threads: usize,
 ) {
     let work = hir_ty::method_resolution::impl_work(db, krate);
-    on_idle_threads(db, &work, 64, helping, threads, |db, work| work.run(db));
+    on_idle_threads(db, &work, 64, busy, threads, |db, work| work.run(db));
 }
 
 /// Asks for the impls of each of `crates` on every core, without waiting for it. After an edit
@@ -3674,7 +3727,7 @@ fn verify_impls<'scope>(
 fn warm_files(
     db: &RootDatabase,
     krate: ide_db::base_db::Crate,
-    helping: &std::sync::atomic::AtomicUsize,
+    busy: &std::sync::atomic::AtomicUsize,
     threads: usize,
 ) {
     let def_map = hir_def::nameres::crate_def_map(db, krate);
@@ -3684,27 +3737,27 @@ fn warm_files(
         .filter_map(|(_, data)| data.origin.file_id())
         .filter(|&file| seen.insert(file))
         .collect();
-    on_idle_threads(db, &files, 4, helping, threads, |db, &file| {
+    on_idle_threads(db, &files, 4, busy, threads, |db, &file| {
         _ = hir::HirFileId::from(file).ast_id_map(db);
     });
 }
 
 /// Runs `run` on each of `work` here and on the threads no other crate has, one for each
-/// `per` items.
+/// `per` items. `busy` counts the threads at work, this one among them.
 fn on_idle_threads<T: Sync>(
     db: &RootDatabase,
     work: &[T],
     per: usize,
-    helping: &std::sync::atomic::AtomicUsize,
+    busy: &std::sync::atomic::AtomicUsize,
     threads: usize,
     run: impl Fn(&RootDatabase, &T) + Sync,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
     let wanted = (work.len() / per).min(threads - 1);
     let mut helpers = 0;
-    _ = helping.try_update(Relaxed, Relaxed, |busy| {
-        helpers = wanted.min(threads.saturating_sub(busy + 1));
-        Some(busy + helpers)
+    _ = busy.try_update(Relaxed, Relaxed, |now| {
+        helpers = wanted.min(threads.saturating_sub(now));
+        Some(now + helpers)
     });
     if helpers == 0 {
         return;
@@ -3723,7 +3776,7 @@ fn on_idle_threads<T: Sync>(
         }
         each(db);
     });
-    helping.fetch_sub(helpers, Relaxed);
+    busy.fetch_sub(helpers, Relaxed);
 }
 
 /// The functions of the crates being built, listed once and again for the crates an edit can
@@ -4963,21 +5016,36 @@ fn link_executable(
     });
     let exports = exports.transpose()?;
     blaze_macro_wasm::flush();
+    // A `staticlib` is linked as the `cdylib` of it would be, beside it, which leaves out
+    // what its exports do not reach: the stand-ins left are what a program linking the
+    // archive can reach, and a link that fails is one that program's would.
+    let linked = match args.staticlib {
+        true => {
+            let mut beside = exe.as_os_str().to_owned();
+            beside.push(".shared");
+            PathBuf::from(beside)
+        }
+        false => exe.to_path_buf(),
+    };
     let took = link::executable(
         db,
         &program,
         &objects,
         sysroot,
-        exe,
+        &linked,
         exports.as_deref(),
         &args.link_args,
         args.debug.level,
     )
     .map_err(|it| refused_linked(it, args))?;
-    let stand_ins = link::stand_ins(exe)?;
+    let stand_ins = link::stand_ins(&linked);
+    if args.staticlib {
+        _ = std::fs::remove_file(&linked);
+    }
+    let stand_ins = stand_ins?;
     eprintln!(
         "linked {} in {took:.1?}, {} functions in it blaze could not compile",
-        exe.display(),
+        linked.display(),
         stand_ins.len()
     );
     // What the link kept of the stand-ins is what the program can reach, the standard
@@ -4991,6 +5059,10 @@ fn link_executable(
             cargo::whole::without_hashes(it)
         });
         bail!("{}", refused_error(&args.krate, stand_ins.len(), said));
+    }
+    if args.staticlib {
+        let took = link::archive(db, &program, &objects, exe)?;
+        eprintln!("archived {} in {took:.1?}", exe.display());
     }
     Ok(())
 }
@@ -6627,7 +6699,7 @@ impl Unedited {
                     // A registry by its layout, `<home>/registry/src/<index>/<package>`: a
                     // directory only named `registry` above a vendored package can be the
                     // project's own.
-                    let Some(home) = cargo::hermetic::cargo_home_of(&dir) else { continue };
+                    let Some(home) = cargo::home::cargo_home_of(&dir) else { continue };
                     let registry = home.join("registry");
                     if dir.starts_with(&registry) {
                         install(&mut unedited.installed, registry);
@@ -6815,6 +6887,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             prebuilt: args.prebuilt.clone(),
             exe: args.exe.clone(),
             shared: args.shared,
+            staticlib: args.staticlib,
             dep_info: None,
             inputs: None,
             library: args.library,
@@ -6909,6 +6982,8 @@ struct Target {
     exe: Option<PathBuf>,
     /// `exe` is a shared library, a `cdylib` (#262).
     shared: bool,
+    /// `exe` is the archive of a `staticlib`, with `shared` ([`Args::staticlib`]).
+    staticlib: bool,
     /// It is the unit tests of the target `krate` names ([`Args::unit_test`]).
     unit_test: bool,
     /// What its link takes that rustc compiled. Code rustc instantiated for one program is in
@@ -6930,6 +7005,7 @@ impl Target {
             splice: args.splice.clone(),
             exe: args.exe.clone(),
             shared: args.shared,
+            staticlib: args.staticlib,
             unit_test: args.unit_test,
             symbol_files: args.symbol_files.clone(),
         }
@@ -6957,6 +7033,7 @@ impl Target {
             splice,
             exe,
             shared,
+            staticlib,
             unit_test,
             symbol_files,
         } = self;
@@ -6992,6 +7069,7 @@ impl Target {
             splice,
             exe,
             shared,
+            staticlib,
             unit_test,
             symbol_files,
             ..daemon.clone()
@@ -7035,6 +7113,7 @@ impl Target {
                     splice,
                     exe,
                     shared: false,
+                    staticlib: false,
                     unit_test,
                     symbol_files,
                 }))
@@ -7082,7 +7161,8 @@ impl Target {
             link_cmd: given(link_cmd),
             splice: given(splice).map(PathBuf::from),
             exe: given(exe).map(PathBuf::from),
-            shared: shared == "shared",
+            shared: shared == "shared" || shared == "staticlib",
+            staticlib: shared == "staticlib",
             unit_test: unit_test == cargo::plan::UNIT_TEST,
             symbol_files: symbol_files.iter().map(PathBuf::from).collect(),
         })
@@ -7114,7 +7194,11 @@ impl Target {
             self.link_cmd.as_deref().unwrap_or_default(),
             self.splice.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
             self.exe.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
-            if self.shared { "shared" } else { "" },
+            match (self.shared, self.staticlib) {
+                (true, true) => "staticlib",
+                (true, false) => "shared",
+                (false, _) => "",
+            },
             if self.unit_test { cargo::plan::UNIT_TEST } else { "" }
         );
         for file in &self.symbol_files {
@@ -8360,7 +8444,7 @@ impl Held {
         let all: Vec<ide_db::base_db::Crate> =
             Crate::all(&db).into_iter().map(Into::into).collect();
         // The spare starts with the daemon, which the first build starts as cargo does.
-        resolve_all(&db, &all, beside_cargo());
+        resolve_all(&db, &all, beside_cargo())?;
         eprintln!("spare: {} crates in {:.1?}", all.len(), start.elapsed());
         Ok(Held { db, vfs, checkouts })
     }
@@ -9147,6 +9231,9 @@ fn run_holding(
     let sysroot = checkouts.loaded.workspaces().first().and_then(|it| it.sysroot.root());
     let _ = SYSROOT.set(sysroot.map(|it| AsRef::<Path>::as_ref(it).to_owned()));
     let from_manifest;
+    // Whether the store is keeping the program as this build compiled it from cold: a worker
+    // started once it has settled would load it from there.
+    let mut kept = false;
     // What the compile of the program counted, for what is said of it once it is built.
     let mut counted = None;
     let cold = {
@@ -9188,9 +9275,9 @@ fn run_holding(
                 counted = compiling.counted();
                 let mut cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
                 // An `include!` in a body is first seen when the body is compiled. Only the
-                // crates that include the file, and what depends on them, compiled without
-                // it: touching every crate compiles all of a program from the store again to
-                // tell what changed.
+                // crates that named the file, and what depends on them, compiled without it:
+                // touching every crate compiles all of a program from the store again to tell
+                // what changed.
                 let including = tree.including(&db);
                 if WatchedFile::include_sources(&mut files, &mut tree, &mut db) != Loaded::Nothing {
                     let named: Vec<String> = including
@@ -9200,10 +9287,14 @@ fn run_holding(
                             name.map_or_else(|| "?".to_owned(), ToString::to_string)
                         })
                         .collect();
+                    if including.is_empty() {
+                        bail!(
+                            "a file an `include!` or a module named was loaded late, with no crate noted as naming it"
+                        );
+                    }
                     eprintln!("included late, by {}", named.join(", "));
-                    let crates = (!including.is_empty()).then_some(&including[..]);
-                    known.touch(&db, crates);
-                    listed.touch(&db, crates);
+                    known.touch(&db, Some(&including));
+                    listed.touch(&db, Some(&including));
                     cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
                 }
                 cold
@@ -9341,6 +9432,7 @@ fn run_holding(
                 }
                 _ => match manifest::keeping(&db, &args, key, &cold.wrote) {
                     Ok(keeping) => {
+                        kept = true;
                         let (files, read) = (cold.wrote.len(), start.elapsed());
                         keeping.settle(move |bytes, took| {
                             eprintln!(
@@ -9511,6 +9603,18 @@ fn run_holding(
         builds.unasked.push(0);
     } else if programs[0].dehydrate() {
         builds.unasked.push(0);
+    } else if kept
+        && let Some(socket) = &programs[0].args.socket
+        && let Some(store) = blaze_store::Store::global()
+    {
+        // Once the store has it all, the daemon starts a worker from it in this one's place,
+        // which holds what a warm start holds (`Daemon::settle`).
+        let settles = cargo::daemon::settles_beside(socket);
+        store.settle_with(move || {
+            if let Err(why) = std::fs::write(&settles, b"") {
+                eprintln!("{}: {why}", settles.display());
+            }
+        });
     }
     // How many times running each checkout that is read as a loaded one has been long to turn
     // to or from.

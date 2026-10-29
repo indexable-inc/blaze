@@ -21,11 +21,15 @@ whose `blaze test` passes `tests` tests. A project is a repository at a pinned c
 and whose `blaze test` (with the arguments of `test`) passes. A private repository is fetched with GH_TOKEN. A project may have
 `env` for its builds, `seconds` for each command (default 3600), and `prepare`, a module of the
 harness whose `prepare(checkout)` gives the tree to build and the environment its builds need
-(bun: bunprep.py, its own build of its C and C++; flox: floxprep.py, its Nix build's). Its `builds` are `blaze build` with `args` in
-the checkout's `dir` (a workspace of its own, as dynamo's Python bindings are), each then running
-`then` (`{target}` is that directory's target/<profile>) to print what it says. `macos` holds the
-fields that are otherwise on macOS, and `excluded` says what the corpus leaves out of a project
-and why (printed with its results), so that the list shrinks.
+(bun: bunprep.py, its own build of its C and C++; flox: floxprep.py, its Nix build's), and
+`fetches`, the selections (`-p`s, `--tests`) `blaze lock --fetches` records its build scripts'
+downloads for first, one per feature set they pick it by (fframes'). A project's `dir` is where
+in the checkout its workspace is (codex: `codex-rs`): its runs, tests and builds start there.
+Its `builds` are `blaze build` with `args` in that directory's `dir` (a workspace of its own, as
+dynamo's Python bindings are), each then running `then` (`{target}` is that directory's
+target/<profile>) to print what it says. `macos` holds the fields that are otherwise on macOS,
+and `excluded` says what the corpus leaves out of a project and why (printed with its results),
+so that the list shrinks.
 
 Groups: `std` (no dependencies: the merge gate's, every pull request), `crates` (from
 crates.io), `projects` (a project's default), and `apps` (the large applications, each in a job
@@ -262,6 +266,9 @@ class Smoke:
                 return
             env.update(prepared)
             print(f"ok       {name} prepare ({time.monotonic() - began:.1f} s)", flush=True)
+        if "dir" in spec:
+            cwd = os.path.join(cwd, spec["dir"])
+            clone = f"{clone} && cd {spec['dir']}"
         seconds = spec.get("seconds", PROJECT_SECS)
         places = {"{work}": out_dir, "{input}": os.path.join(out_dir, "input.txt")}
         if "input" in spec:
@@ -284,6 +291,10 @@ class Smoke:
                 return None
             return judge
 
+        for i, selection in enumerate(spec.get("fetches", [])):
+            argv = ["lock", "--fetches", *selection]
+            self.check(f"{name} lock {i}", [self.blaze, *argv], cwd, env, seconds, judged({}),
+                       f"{clone} && {shown(['blaze', *argv], spec.get('env'))}", spec.get("open"))
         for profile in self.profiles:
             p = self.profile_args(profile)
             for i, step in enumerate(spec.get("builds", [])):

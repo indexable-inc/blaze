@@ -17,8 +17,8 @@ never made). Each build is hello world's whole program, which starts from the st
 
     netdown.py --bin target/release/blaze-engine [--toolchain nightly-YYYY-MM-DD]
 
-rustup has to have the toolchain (harness/toolchain by default), with rust-src. Python 3,
-stdlib only.
+rustup has to have the toolchain (harness/toolchain by default); the standard library is
+blaze's library/, not its rust-src. Python 3, stdlib only.
 """
 import argparse, http.server, os, re, shutil, socket, subprocess, sys, tempfile, threading, time
 
