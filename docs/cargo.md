@@ -364,8 +364,9 @@ private; a test that makes raw system calls, or tampers with the interposer in i
 gets past the recording and the private writes but not Seatbelt's read-only machine or its
 network rule; a sandbox inside the sandbox fails with `EPERM`.
 
-What it costs, measured with `harness/sandboxbench.py` (one sandbox per executable against a
-process per test, which blaze used before and dropped):
+What it costs, measured with `harness/sandboxbench.py`. This table is from before each test ran
+in a process of its own, so its 600-test rows are libtest's threads in one process (what
+`BLAZE_TEST_PROCESSES=one` runs now), and its last row a sandbox started for each test:
 
 | | Linux x86-64 (dev host, 16 cores) | macOS (M5 Max, 8 at a time, loaded) |
 |---|---|---|
@@ -379,7 +380,21 @@ process per test, which blaze used before and dropped):
 
 A sandbox per test executable costs one launch, about 8 ms on Linux, whatever its number of
 tests, and about 25 ms on macOS (mostly the fork, Seatbelt and dyld); a sandbox per test cost
-the 600-test library ten to thirty times as much, so there is none. On
+the 600-test library ten to thirty times as much, so there is none: the fork server forks in
+the executable's one sandbox instead. Measured again on Linux arm64 (an ix VM, 16 cores), the
+test phase of the 600-test library:
+
+| | libtest's threads, one process | a process per test |
+|---|---|---|
+| `BLAZE_SANDBOX=off` | 14 ms | 54 ms |
+| sandboxed, `all` | 35 ms | 76 ms |
+| sandboxed, `verify` (every test run and its reads recorded) | 0.82 s | 0.90 s |
+| a sandbox per test, 16 at a time | | 0.62 s |
+
+A fork per test adds about 0.07 ms of wall time a test, a sandbox per test about 1 ms. On
+blaze's own unit tests (every crate in `harness/unittests.py` but `blaze-cargo`, Cranelift,
+3,322 passing, 17 failing), the scheduler over every executable at once outweighs it: 123 s
+against 197 s as libtest's threads (medians of three). On
 macOS a stat under the interposer goes from 0.8 to 1.1 µs, and to 3 to 5 µs on a workspace
 whose overlay has been written.
 
