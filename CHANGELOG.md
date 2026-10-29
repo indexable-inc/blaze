@@ -124,6 +124,10 @@ since the release before and the title of each change merged since.
 
 ### Fixed
 
+- A proc macro built as WebAssembly links C its libraries' build scripts compiled: each of those
+  scripts runs again for `wasm32-wasip1`, so zstd-sys compiles zstd for it, and zed's
+  `include_flate_codegen` no longer links the host's `libzstd.a` (docs/cargo.md, "Proc macros
+  run as WebAssembly").
 - Build scripts run on a stock Ubuntu 23.10 or later, where AppArmor keeps a user from making a
   user namespace: every crate with a build script failed with `the sandbox could not be made:
   /proc/self/setgroups: Permission denied`. Where no user namespace can be made, the sandbox is

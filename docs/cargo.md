@@ -638,6 +638,17 @@ store like a build script's. The macro's `proc_macro` crate is a shim
 the toolchain's `wasm32-wasip1` target. When the toolchain does not have that target, blaze
 runs `rustup target add wasm32-wasip1` for it, once.
 
+In blaze's own target directory, the build script of each library a module links runs again
+for the module, as cargo runs it for a library built for `wasm32-wasip1`: `TARGET` and the
+`CARGO_CFG_*` are that target's, with an `OUT_DIR` of its own (`wasm32-wasip1/out` beside the
+host's), and the `DEP_*` of the other scripts' runs for it. What it compiles of C is then
+WebAssembly, as the module's link needs: zstd-sys compiles zstd with clang for it (a C
+compiler with a `wasm32` backend, and llvm-ar, as cc-rs takes them; `CC_wasm32_wasip1` and
+`AR_wasm32_wasip1` name others). The script of a crate that links `proc_macro` (a proc
+macro, proc-macro2), which is not told it is on WASI, runs as for the host, as for rustc's
+build of a proc macro. What the load reads of a package stays the run for the host.
+`harness/wasmcmacro.py` holds a macro that calls such C to cargo's expansion.
+
 A module sees only what cargo documents for a proc macro:
 
 - Its package's directory, read-only, at `/blaze/package`: `CARGO_MANIFEST_DIR` names it, and
