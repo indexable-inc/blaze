@@ -13,6 +13,10 @@ since the release before and the title of each change merged since.
 
 - promote.yaml: OpenAI's Codex CLI (rust-v0.165.0, its codex-rs workspace) in the gate to stable; smoke.py and bench.py take a project's `dir`, the workspace's place in its checkout.
 
+### Changed
+
+- Releases: a canary is cut as soon as main's Linux x86-64 build of a commit passes, without waiting for the unit tests; stable now also needs main's merge gate on that commit green, with the unit tests run and passed on Linux x86-64, Linux ARM64 and macOS (docs/release.md).
+
 ## [0.20261028.9] - 2026-10-28
 
 ### Merged

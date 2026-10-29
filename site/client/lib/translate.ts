@@ -2,12 +2,12 @@
  * Chat messages in another language than the reader's, translated in the browser (client/translate-worker.ts runs
  * HY-MT1.5-1.8B on WebGPU). Only on a computer: a phone or tablet, a browser without WebGPU, a slow or metered
  * connection, little memory or little free storage never downloads the model. Nothing downloads until a message
- * needs translating and the reader has chatted (sent a message) or asked (a message's Translate button), and then
+ * needs translating and the reader has chatted (sent a message) or asked (a feed line's Translate), and then
  * once: the model and the runtime stay in Cache Storage, and once there it translates without asking.
  *
  * A message's language comes from the browser's LanguageDetector when it has one (Chrome), else from its script
  * (Han, kana, Hangul, Cyrillic, Arabic, ...), so without the detector Latin-script languages go untranslated.
- * `localStorage['blaze.translate'] = 'off'` turns it off; the progress line's Stop does that.
+ * `localStorage['blaze.translate'] = 'off'` turns it off; Stop on the download's line in the feed does that.
  */
 
 import { modelFile } from './hymt';
@@ -70,7 +70,7 @@ export const languageName = (code: string) => {
 	}
 };
 
-export function off(): boolean {
+function off(): boolean {
 	try {
 		return localStorage.getItem(OFF_KEY) === 'off';
 	} catch {

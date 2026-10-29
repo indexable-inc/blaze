@@ -1,12 +1,19 @@
+---
+status: current
+summary: Releases: the canary and stable channels, how a release is cut and what gates promotion to stable.
+---
 # Releases: canary and stable
 
 blaze has two release channels, made of the same releases:
 
-- **canary** (opt-in): every release, as soon as it is built. A release is cut from a main whose
-  merge gate (`ci`) is green: the unit tests, the build, and the fast part of the smoke corpus
-  below. It is published as a GitHub *prerelease*.
-- **stable** (the default): a canary that then passed the heavy tests, unchanged. Promotion
-  builds nothing: the archives users get on stable are the bytes that were tested as canary.
+- **canary** (opt-in): every release, as soon as it is built. A release is cut from a commit of
+  main as soon as main's merge gate has built it on Linux x86-64 (the job `linux x64 / build`),
+  without waiting for the unit tests or the other platforms. It is published as a GitHub
+  *prerelease*.
+- **stable** (the default): a canary that then passed the heavy tests, unchanged, and whose
+  commit passed main's whole merge gate: its whole run green, with the unit tests on Linux
+  x86-64, Linux ARM64 and macOS. Promotion builds nothing: the archives users get on stable are the bytes that
+  were tested as canary.
 
 ## Versions
 
@@ -53,21 +60,27 @@ published as a full release and counts as stable.
 
 ## Cutting a canary
 
-Every green main is a canary, cheaply. `canary.yaml` runs when the merge gate's run on a push to
-main ends green (and hourly, and by hand): `.github/scripts/canary.py cut` tags the newest
-commit of main whose `ci` check is green (main moves faster than its gate, so that is seldom
-HEAD itself; it looks through main's first parents since the newest release) `v0.YYYYMMDD.N`
-through the API and dispatches `release.yaml` on the tag, when
+Every built main is a canary, cheaply. `canary.yaml` runs on each push to main (and hourly, and
+by hand): `.github/scripts/canary.py cut` waits for main's build of the push (the job `linux x64
+/ build` of the merge gate's run on it; when the push changed nothing the build reads, the
+newest commit of main that has a build), at most 90 minutes, and then tags the newest commit of
+main whose `linux x64 / build` passed (main moves faster than its build, so that is seldom HEAD
+itself; it looks through main's first parents since the newest release) `v0.YYYYMMDD.N` through
+the API and dispatches `release.yaml` on the tag. It does not wait for the unit tests, the other
+platforms (macOS often queues half an hour) or the rest of the run: stable does (below). The
+cut waits in canary.yaml, polling the job through the API, rather than being dispatched from
+the build job: that would need `actions: write` in `blaze-platform.yaml`, which pull requests
+and the train run too. It cuts when
 
 - something besides the docs (`docs/`, `site/`, `agents/`, `*.md`) and the bots' own commits
   changed from the newest release to that commit,
 - no `release-cut.yaml` is running and no `release.yaml` is building a release (a run on a
   branch is not one), and the newest release is at least 30
-  minutes old (`-f min-minutes=N` by hand). A green main inside that window is cut by the next
-  green push or the hourly run.
+  minutes old (`-f min-minutes=N` by hand). A build of main inside that window is cut by the
+  next push or the hourly run.
 
 No commit goes to main, so a cut never races a merge, and a canary is the bytes of a commit
-that passed the gate as it is. release.yaml builds it with `BLAZE_RELEASE` set to the tag, so
+main's gate built, as it is. release.yaml builds it with `BLAZE_RELEASE` set to the tag, so
 `blaze --version` and the archives' names are the tag's, and writes the notes (`canary.py
 notes`): the lines CHANGELOG.md's [Unreleased] gained since the previous release and the title
 of each change merged since then. [Unreleased] is never emptied: a release's notes are in its
@@ -102,7 +115,17 @@ published archives, installed with `install.sh --version <v>` as a user installs
   as the first, is not compared). Hosted runners are shared, so 25% is their noise and not a
   benchmark: docs/benchmarks.md's numbers come from the bench machines;
 - the train (`train.yaml`, every tier on every platform), dispatched on the tag: built from the
-  commit the archives were built from. A train on a tag releases nothing and opens no issue.
+  commit the archives were built from. A train on a tag releases nothing and opens no issue;
+- main's tests (`promote.py tested`): the merge gate's run on the push of the tag's commit to
+  main is green (the whole run: every job of it, the smoke corpus's std cases and the script
+  checks too), and its unit tests (`linux x64 / tests`, `linux arm64 / tests`, `macos arm64 /
+  tests`) ran and passed on that exact commit. The canary was cut before they finished, so the
+  job waits for the run while it is going, polling every two minutes for up to five hours, beside
+  the other jobs, which take longer. No run, a red run, a run that skipped the tests (a commit
+  that changed nothing they read, such as one `release-cut.yaml` cut at a docs-only HEAD) or one
+  still going after five hours fails the job with the commit and the run named, and the release
+  stays a canary. After re-running a flaked job of that run, `gh workflow run promote.yaml -f
+  tag=v...` tries again.
 
 When every job passes, `.github/scripts/promote.py` marks the release stable and *Latest*,
 appends to its notes the line `Promoted to stable on <date> after <run URL>`, and adds the
@@ -141,16 +164,21 @@ PATH for an installed release).
   those of the crates below gpui, since the whole suite with both builds is longer than a
   hosted runner's six hours), servo v0.7.0 (`--version`; the tests of crates without a window
   or a GPU), bun's Rust port (bun-v1.4.3, after `harness/bunprep.py` built its C and C++ in
-  `nix develop .#bench-bun`), and NVIDIA Dynamo v1.6.1 (the workspace, on macOS `dynamo-llm`
+  `nix develop .#bench-bun`), NVIDIA Dynamo v1.6.1 (the workspace, on macOS `dynamo-llm`
   without its Linux-only default feature; its Python bindings built and imported; the CPU-only
-  vLLM mocker server's `--help`; its tests that need no GPU), fff v0.11.0 and fframes v1.3.0
-  (their entries say what runs), and OpenAI's Codex CLI rust-v0.165.0 (its workspace
-  `codex-rs`, the entry's `dir`; `codex --version`; the tests of codex-apply-patch,
-  codex-protocol, codex-execpolicy and codex-features, which need no model, network or
-  credentials). What a runner without a GPU cannot build or test is listed with why in the
-  entry's `excluded`, which smoke.py prints. Each is also
-  measured against cargo (above); cargo builds dynamo and codex with their pinned Rust (1.96.1
-  and 1.99.1), which their users build with.
+  vLLM mocker server's `--help`; its tests that need no GPU), Dmitriy Kovalenko's fff v0.11.0
+  (the file finder formerly fff.nvim: its MCP server's `--version` and health check; the tests
+  of fff-search and the crates below it), fframes v1.3.0 (a video rendering framework, with
+  the prebuilt static FFmpeg and Skia its build scripts download: its hello-world example's
+  timeline and one frame rendered to PNG on the CPU; the tests of the crates that need no GPU),
+  flox v1.19.2 (in the environment of flox's own package build, which
+  `harness/floxprep.py` takes from its flake: the CLI's `--version`; the tests of flox-core and
+  flox-config) and OpenAI's Codex CLI rust-v0.165.0 (its workspace `codex-rs`, the entry's
+  `dir`; `codex --version`; the tests of codex-apply-patch, codex-protocol, codex-execpolicy
+  and codex-features, which need no model, network or credentials). What a runner without a
+  GPU cannot build or test is listed with why in the entry's `excluded`, which smoke.py prints.
+  Each is also measured against cargo (above); cargo builds dynamo and codex with their pinned
+  Rust (1.96.1 and 1.99.1), which their users build with.
 
 The std cases are the merge gate's; all four groups are the promotion gate. blaze itself is in
 the corpus but not measured against cargo here: how fast blaze builds blaze is the self-build's

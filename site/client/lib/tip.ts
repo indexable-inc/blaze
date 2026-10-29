@@ -37,8 +37,16 @@ function target(n: EventTarget | null): HTMLElement | null {
 
 let watch: ReturnType<typeof setInterval> | undefined;
 
+/** A tip that only repeats what is in full view on the element (a sidebar row's own name) says nothing: not shown. */
+function needless(t: HTMLElement, text: string): boolean {
+	const squash = (v: string) => v.replace(/\s+/g, ' ').trim().toLowerCase();
+	if (!squash(t.innerText).includes(squash(text))) return false;
+	for (const e of [t, ...t.querySelectorAll<HTMLElement>('*')]) if (e.scrollWidth > e.clientWidth + 1) return false;
+	return true;
+}
+
 function show(t: HTMLElement): void {
-	if (!t.isConnected || !t.dataset.tip) return;
+	if (!t.isConnected || !t.dataset.tip || needless(t, t.dataset.tip)) return;
 	// Redrawn away (the presence lists redraw on every change): go with it.
 	clearInterval(watch);
 	watch = setInterval(() => {

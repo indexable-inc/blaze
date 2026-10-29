@@ -21,12 +21,13 @@ whose `blaze test` passes `tests` tests. A project is a repository at a pinned c
 and whose `blaze test` (with the arguments of `test`) passes. A private repository is fetched with GH_TOKEN. A project may have
 `env` for its builds, `seconds` for each command (default 3600), and `prepare`, a module of the
 harness whose `prepare(checkout)` gives the tree to build and the environment its builds need
-(bun: bunprep.py, its own build of its C and C++). A project's `dir` is where in the checkout its
-workspace is (codex: `codex-rs`): its runs, tests and builds start there. Its `builds` are `blaze
-build` with `args` in that directory's `dir` (a workspace of its own, as dynamo's Python bindings
-are), each then running `then` (`{target}` is that directory's target/<profile>) to print what it
-says. `macos` holds the fields that are otherwise on macOS, and `excluded` says what the corpus
-leaves out of a project and why (printed with its results), so that the list shrinks.
+(bun: bunprep.py, its own build of its C and C++; flox: floxprep.py, its Nix build's). A
+project's `dir` is where in the checkout its workspace is (codex: `codex-rs`): its runs, tests
+and builds start there. Its `builds` are `blaze build` with `args` in that directory's `dir` (a
+workspace of its own, as dynamo's Python bindings are), each then running `then` (`{target}` is
+that directory's target/<profile>) to print what it says. `macos` holds the fields that are
+otherwise on macOS, and `excluded` says what the corpus leaves out of a project and why (printed
+with its results), so that the list shrinks.
 
 Groups: `std` (no dependencies: the merge gate's, every pull request), `crates` (from
 crates.io), `projects` (a project's default), and `apps` (the large applications, each in a job
