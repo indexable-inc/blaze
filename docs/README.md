@@ -29,11 +29,14 @@ How blaze is now. Kept true: CI checks their links, paths and settings against t
 - [tiers.md](tiers.md): Tiers: hot functions of a live program compiled again with LLVM and swapped in while it runs.
 - [toolchain.md](toolchain.md): blaze's own pinned nightly: what it is, how it is fetched and checked, and the daily bump.
 - [usage.md](usage.md): Getting started: using blaze on a project, in short.
+- [web.md](web.md): The build page blaze ui serves: every function of the build drawn live on the GPU, from a Flecs world of the program.
 
 ## Plans
 
 Designs not (fully) built, newest first.
 
+- [unit-keys.md](unit-keys.md) (2026-10-29): The store is never wholly cold: each record keyed by what its value depends on, so a new pin or a sandbox change reuses what it did not change.
+- [memory-budget.md](memory-budget.md) (2026-10-29): Memory as a scheduled budget: blaze reads the machine's real limit, admits work by its measured peak, sheds caches under pressure and stops with an error naming what cannot fit, never swapping a machine to death.
 - [linker.md](linker.md) (2026-10-28): blaze's own linker: one patch engine with a lasting layout, writing to a running process or an executable, replacing cc, lld, ld64 and link.exe.
 - [future/const-macros.md](future/const-macros.md) (2026-10-28): Const macros: proc macros written inline as const fn, run by the const evaluator. Stage 0 is experimental.
 - [driver.md](driver.md) (2026-10-28): The build driver as a graph that does no IO: what is wrong with the serial driver and what replaces it.

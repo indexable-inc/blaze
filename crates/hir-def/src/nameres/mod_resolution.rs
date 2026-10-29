@@ -1,6 +1,6 @@
 //! This module resolves `mod foo;` declaration to file.
 use arrayvec::ArrayVec;
-use base_db::{AnchoredPath, SourceDatabase};
+use base_db::{AnchoredPath, Crate, SourceDatabase};
 use hir_expand::{EditionedFileId, name::Name};
 
 use crate::HirFileId;
@@ -59,6 +59,7 @@ impl ModDir {
     pub(super) fn resolve_declaration(
         &self,
         db: &dyn SourceDatabase,
+        krate: Crate,
         file_id: HirFileId,
         name: &Name,
         attr_path: Option<&str>,
@@ -100,10 +101,10 @@ impl ModDir {
         }
         // A `#[path]` can name a file outside the package, which its source root does not have.
         for candidate in &candidate_files {
-            db.include_source(AnchoredPath {
-                anchor: orig_file_id.file_id(db),
-                path: candidate.as_str(),
-            });
+            db.include_source(
+                AnchoredPath { anchor: orig_file_id.file_id(db), path: candidate.as_str() },
+                krate,
+            );
         }
         Err(candidate_files.into_iter().collect())
     }

@@ -52,6 +52,12 @@ pub fn shape() -> usize {
     std::mem::size_of::<kdep::Shape>()
 }
 
+/// rustc's `StableCrateId` of this crate is in the hash, and `-C metadata` is in that.
+pub fn identity() -> String {
+    pub struct Marker;
+    format!("{:?}", std::any::TypeId::of::<Marker>())
+}
+
 pub fn described() -> String {
     kdep::describe::<(u8, u32)>()
 }

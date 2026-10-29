@@ -64,8 +64,7 @@ pub const SYSTEM: [&str; 11] = [
 ];
 
 /// The link arguments a script may give, whole: what changes how the output is linked, never
-/// which program links it or what it loads. `-ObjC` keeps every member of the archives already
-/// linked that defines an Objective-C class or category (codex-cli's script on macOS).
+/// which program links it or what it loads.
 pub const LINK_ARGS: [&str; 16] = [
     "-pthread",
     "-rdynamic",
@@ -81,6 +80,7 @@ pub const LINK_ARGS: [&str; 16] = [
     "-Wl,-undefined,dynamic_lookup",
     "-Wl,-dead_strip",
     "-Wl,-headerpad_max_install_names",
+    // Apple's: load every member of an archive that defines an Objective-C class or category.
     "-ObjC",
     "-Wl,-ObjC",
 ];
@@ -338,6 +338,7 @@ mod tests {
     #[test]
     fn link_args_are_the_list_and_rpaths_where_search_may_go() {
         let stdout = "cargo:rustc-link-arg=-pthread\n\
+                      cargo:rustc-link-arg=-ObjC\n\
                       cargo:rustc-link-arg-bins=-Wl,-rpath,$ORIGIN/../lib\n\
                       cargo:rustc-link-arg=-Wl,-rpath,/nix/store/abc-libva/lib\n\
                       cargo:rustc-cdylib-link-arg=-Wl,-soname,libx.so.1\n\

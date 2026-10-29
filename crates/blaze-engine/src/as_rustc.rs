@@ -228,7 +228,7 @@ impl<'a> Probe<'a> {
         let project = dir.path().join("rust-project.json");
         let described = serde_json::json!({
             "sysroot": sysroot,
-            "sysroot_src": sysroot.join("lib/rustlib/src/rust/library"),
+            "sysroot_src": crate::cargo::toolchain::library::dir(),
             "crates": [{
                 "display_name": name,
                 "root_module": root,

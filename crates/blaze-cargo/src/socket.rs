@@ -16,7 +16,7 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 #[cfg(windows)]
 use uds_windows::{UnixListener, UnixStream};
 
@@ -85,6 +85,8 @@ impl Served {
     /// moved to `socket` once only the user can connect to it: at no time is it somewhere
     /// others reach with the mode the umask gave it, whatever directory `socket` is in.
     pub fn bind(socket: &Path) -> Result<Served, NotServed> {
+        #[cfg(unix)]
+        SocketAddr::from_pathname(socket).map_err(|error| too_long(socket, error))?;
         let lock = private_file(OpenOptions::new().write(true).create(true), &lock_of(socket))?;
         if lock.try_lock().is_err() {
             return Err(NotServed::Taken);
@@ -96,6 +98,37 @@ impl Served {
         }
         private_dir(&made_in)?;
         let made = made_in.join("s");
+        #[cfg(unix)]
+        let listener = match SocketAddr::from_pathname(&made) {
+            Ok(address) => UnixListener::bind_addr(&address)?,
+            Err(_) => {
+                use std::os::unix::fs::{DirBuilderExt as _, symlink};
+
+                // The address fits, but the one it is made at first does not. It is made in
+                // the same directory through a short name, so the rename stays atomic.
+                let tmp = Path::new("/tmp");
+                let nonce = getrandom::u64().map_err(|e| io::Error::other(e.to_string()))?;
+                let short = tmp.join(format!(".blaze-{nonce:016x}"));
+                let through = || -> io::Result<UnixListener> {
+                    let target = std::path::absolute(&made_in)?;
+                    not_swapped_under(tmp)?;
+                    std::fs::DirBuilder::new().mode(0o700).create(&short)?;
+                    let alias = short.join("d");
+                    let bound =
+                        symlink(target, &alias).and_then(|()| UnixListener::bind(alias.join("s")));
+                    let _ = std::fs::remove_dir_all(&short);
+                    bound
+                };
+                through().map_err(|error| {
+                    let (socket, short) = (socket.display(), short.display());
+                    io::Error::new(
+                        error.kind(),
+                        format!("binding {socket} through {short}: {error}"),
+                    )
+                })?
+            }
+        };
+        #[cfg(windows)]
         let listener = UnixListener::bind(&made).map_err(|error| too_long(&made, error))?;
         only_the_user_connects(&made)?;
         std::fs::rename(&made, socket)?;
@@ -451,6 +484,23 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("blaze-socket-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn a_socket_can_use_the_full_unix_address_length() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let mut name = String::from("s");
+        while SocketAddr::from_pathname(dir.path().join(&name)).is_ok() {
+            name.push('s');
+        }
+        let overlong = dir.path().join(&name);
+        name.pop();
+        let socket = dir.path().join(name);
+        let _served = Served::bind(&socket).unwrap();
+        assert!(UnixStream::connect(&socket).is_ok());
+        assert_eq!(std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(matches!(Served::bind(&overlong), Err(NotServed::Failed(error))
+            if error.kind() == io::ErrorKind::InvalidInput));
     }
 
     #[test]

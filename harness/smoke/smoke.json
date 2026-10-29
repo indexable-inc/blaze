@@ -4,10 +4,15 @@
     "threads": { "group": "std", "tests": 2 },
     "thread_local": { "group": "std", "tests": 2 },
     "statics": { "group": "std", "tests": 2 },
+    "configured_out": { "group": "std", "tests": 1 },
     "envfs": { "group": "std", "tests": 2, "args": ["one", "two words"], "env": { "SMOKE_VAR": "smoke" } },
+    "const_heap": { "group": "std", "tests": 0 },
     "tokio_echo": { "group": "crates", "tests": 1 },
     "serde_json": { "group": "crates", "tests": 2 },
-    "derives": { "group": "crates", "tests": 3, "args": ["--count", "2", "--shout", "yes", "greet", "smoke"] }
+    "derives": { "group": "crates", "tests": 3, "args": ["--count", "2", "--shout", "yes", "greet", "smoke"] },
+    "ce_sha256": { "group": "crates", "tests": 0 },
+    "ce_toml": { "group": "crates", "tests": 0 },
+    "ce_inflate": { "group": "crates", "tests": 0 }
   },
   "projects": {
     "ripgrep": {
@@ -143,10 +148,12 @@
       "group": "apps",
       "repo": "dmtrKovalenko/fframes",
       "rev": "69174f0187b5d8e92329246898f70250b59f08f2",
-      "note": "v1.3.0, a video rendering framework. System libraries from its README and CI (main.yml): the codecs FFmpeg links, nasm and libclang for ffmpeg-sys-fframes, fontconfig. Its build scripts download a prebuilt static FFmpeg (ffmpeg-sys-fframes) and Skia (skia-bindings) from GitHub. The program is its hello-world example's renderer: the timeline, and one frame rendered to PNG by the CPU backend. Its tests are its CI's on Windows, the crates that need no GPU.",
+      "note": "v1.3.0, a video rendering framework. System libraries from its README and CI (main.yml): the codecs FFmpeg links, nasm and libclang for ffmpeg-sys-fframes, fontconfig. Its build scripts download a prebuilt Skia (skia-bindings) and FFmpeg (ffmpeg-sys-fframes): a prebuilt static one for the tests' features, its source (a git clone of release/9.0) for the example's codecs, which have none; `fetches` has blaze lock them for both builds. The program is its hello-world example's renderer: the timeline, and one frame rendered to PNG by the CPU backend. Its tests are its CI's on Windows, the crates that need no GPU.",
       "apt": ["clang", "libasound2-dev", "libclang-dev", "libfontconfig1-dev", "libopus-dev", "libvpx-dev", "libx264-dev", "libx265-dev",
               "nasm", "ninja-build", "pkg-config", "yasm"],
-      "brew": ["nasm", "ninja", "opus", "pkg-config", "x264", "x265"],
+      "brew": ["libvpx", "nasm", "ninja", "opus", "pkg-config", "x264", "x265"],
+      "fetches": [["-p", "hello-world-example"],
+                  ["--tests", "-p", "fframes", "-p", "fframes-media", "-p", "webvtt-parser", "-p", "fframes-media-dir-macro"]],
       "seconds": 7200,
       "runs": [
         { "select": ["-p", "hello-world-example", "--bin", "hello_world_example_bin"], "args": ["timeline"], "contains": "1920x1080 @ 30 fps, 900 frames (30.00s)" },
@@ -162,7 +169,7 @@
       "group": "apps",
       "repo": "flox/flox",
       "rev": "87d931382dc5c53f32af662c9611c6a58d669952",
-      "note": "v1.19.2, the environment manager built on Nix. floxprep.py takes the environment of flox's own package build from its flake (the variables its crates read with env!, OpenSSL, krb5 and libclang for GSSAPI's bindgen), every path of it from cache.nixos.org or cache.flox.dev, so the runner needs Nix. The program is the CLI, whose version is compiled in. Its tests are those of flox-core and flox-config, which need neither Nix nor the network.",
+      "note": "v1.19.2, the environment manager built on Nix. floxprep.py takes the environment of flox's own package build from its flake (the variables its crates read with env!, OpenSSL, krb5 and libclang for GSSAPI's bindgen), every path of it from cache.nixos.org or cache.flox.dev, so the runner needs Nix. floxprep.py also names factory-api-v1 in `unsandboxed-build-scripts`: its build script writes its OpenAPI client into its own src/. The program is the CLI, whose version is compiled in. Its tests are those of flox-core and flox-config, which need neither Nix nor the network.",
       "prepare": "floxprep",
       "env": { "FLOX_DISABLE_METRICS": "true" },
       "seconds": 7200,

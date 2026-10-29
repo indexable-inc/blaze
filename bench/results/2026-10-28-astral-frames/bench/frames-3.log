@@ -1,0 +1,15 @@
+ripgrep cranelift (/root/ax/bin/frames/blaze-engine; work /root/ax/bench/frames-3)
+  standard library for cranelift, as a release ships it: 19.9s
+  cold 1/1  blaze 16.92s + ready 0.01s  cargo 4.05s  
+  cold       blaze   16.934s  cargo    4.054s  peak blaze   3219 MB  cargo   1871 MB  daemon   2432 MB  daemon  
+  no-op      blaze    0.006s  cargo    0.024s  peak blaze   2293 MB  cargo     37 MB  daemon   2293 MB  daemon  
+  body       blaze    0.117s  cargo    0.895s  peak blaze   2332 MB  cargo    589 MB  daemon   2019 MB  daemon  spliced
+  signature  blaze    0.066s  cargo    0.578s  peak blaze   2053 MB  cargo    624 MB  daemon   2018 MB  daemon  spliced
+  leaf       blaze    0.029s  cargo    0.819s  peak blaze   2047 MB  cargo    655 MB  daemon   2017 MB  daemon  spliced
+  generic    blaze    0.033s  cargo    0.979s  peak blaze   2052 MB  cargo    598 MB  daemon   2019 MB  daemon  spliced
+  struct     blaze    0.046s  cargo    0.685s  peak blaze   2054 MB  cargo    633 MB  daemon   2021 MB  daemon  spliced
+  newfn      blaze    0.127s  cargo    0.716s  peak blaze   2356 MB  cargo    591 MB  daemon   2021 MB  daemon  spliced
+  warm store 1/1  blaze 6.30s + ready 0.01s  peak 1970 MB  daemon 1471 MB
+  store 342 MB, 342 MB of it not stored by a project before
+  runtime    blaze 2.220s 194 MB  cargo debug 0.383s 194 MB  cargo release 0.042s 194 MB
+wrote /root/ax/out/2026-10-28-astral-frames/frames-3.json; wrong: 0; failed: none

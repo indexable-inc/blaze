@@ -31,3 +31,20 @@ pub fn set(engine: Engine) {
 pub fn get() -> &'static Engine {
     ENGINE.get().expect("blaze-engine's main hands over the engine before any command runs")
 }
+
+/// An engine for this crate's own tests, which have no blaze-engine to hand one over: what
+/// needs the engine's code fails, and the version is a build of the tree's.
+#[cfg(test)]
+pub fn for_tests() {
+    fn none(_: &[String]) -> anyhow::Result<i32> {
+        anyhow::bail!("no engine in blaze-cargo's tests")
+    }
+    set(Engine {
+        doc: none,
+        stand_ins: |_| anyhow::bail!("no engine in blaze-cargo's tests"),
+        pin: none,
+        why_this_one: String::new,
+        version: "0.0.0-dev",
+        version_line: "blaze 0.0.0-dev",
+    });
+}
