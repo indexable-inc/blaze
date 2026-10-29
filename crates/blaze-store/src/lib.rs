@@ -413,10 +413,10 @@ fn ask_for_missing() -> Result<Vec<Arc<FetchMissing>>, String> {
         .collect()
 }
 
-/// How a fetch of a key the store lacked failed in this build, if one did: the build fails
-/// with it once it is over, whatever else asked for the key did. Until the next build
-/// starts ([`build_starts`]), no key is asked for again, so a build whose remote failed ends
-/// soon rather than wait on it key by key.
+/// How a fetch of a key the store lacked failed, if one did and no build has taken it: the
+/// build that takes it fails with it, whatever else asked for the key did. Until then no key
+/// is asked for again, rather than wait on a remote that failed key by key, and nothing
+/// compiled is added to the store.
 static FAILED: Mutex<Option<String>> = Mutex::new(None);
 
 /// A build starts: a failure of one before it is not its own.
@@ -2403,7 +2403,9 @@ impl Store {
     }
 
     fn insert_on_disk(&self, key: [u8; KEY], value: &[u8]) {
-        if self.found(&key).is_some() {
+        // What is compiled while a fetch has failed may be what the remote would have
+        // brought: kept, a later build would take it as if it had been fetched.
+        if failed() || self.found(&key).is_some() {
             return;
         }
         let Ok(len) = u32::try_from(value.len()) else { return };

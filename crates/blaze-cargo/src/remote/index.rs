@@ -77,7 +77,8 @@ pub fn note_broken(store: &Path, project: &str, run: &Hash, slot: usize) -> std:
     blaze_store::write_private_whole(&at, text.as_bytes())
 }
 
-/// The shards the store's lookups noted as broken: see [`BROKEN`].
+/// The shards the store's lookups noted as broken: see [`BROKEN`]. A line that is not a note
+/// is said and left out: the lookup that needs the shard notes it again.
 fn noted_broken(store: &Path, project: &str) -> anyhow::Result<BTreeSet<(Hash, usize)>> {
     let at = broken_at(store, project);
     let text = match std::fs::read_to_string(&at) {
@@ -89,9 +90,14 @@ fn noted_broken(store: &Path, project: &str) -> anyhow::Result<BTreeSet<(Hash, u
         let (run, slot) = line.split_once(' ')?;
         Some((*Digest::parse(run)?.bytes(), slot.parse().ok()?))
     };
-    (text.lines())
-        .map(|line| parse(line).with_context(|| format!("{}: `{line}`", at.display())))
-        .collect()
+    let noted = text.lines().filter_map(|line| {
+        let note = parse(line);
+        if note.is_none() {
+            eprintln!("remote: {}: `{line}` is not a note of a broken shard", at.display());
+        }
+        note
+    });
+    Ok(noted.collect())
 }
 
 /// Takes `handled` out of what the store's lookups noted as broken.

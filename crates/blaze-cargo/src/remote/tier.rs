@@ -113,10 +113,12 @@ impl Tiered {
         &self,
         mut held: OwnedRwLockWriteGuard<State>,
     ) -> anyhow::Result<String> {
+        let was_ready = matches!(*held, State::Ready { .. });
         let done = self.look(&mut held).await;
         match &done {
             Ok(_) => _ = self.loads.fetch_add(1, Ordering::Relaxed),
-            Err(e) if matches!(*held, State::Ready { .. }) => eprintln!(
+            // A run the new look names and could not read fails the lookups that need it.
+            Err(e) if was_ready => eprintln!(
                 "remote: the index of `{}` is looked up as it was read before: {e:#}",
                 self.project
             ),
@@ -239,8 +241,8 @@ impl Tiered {
                     format!("{name}, the key list of {}.pack, is not there", Digest::from(*pack))
                 }
                 _ => format!(
-                    "{name} of the index is not there: the next push from this store takes \
-                     out the run that names it"
+                    "{name} of the index is not there: a push from a store that found it so \
+                     takes out the run that names it"
                 ),
             });
         };

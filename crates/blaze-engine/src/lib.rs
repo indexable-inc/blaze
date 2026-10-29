@@ -70,8 +70,8 @@ use hir_def::{
     expr_store::Body, item_scope::ItemScope,
 };
 use hir_ty_codegen::{
-    Backend, CodegenError, CodegenUnit, ContentId, ParallelWork, Rejections, Roots, SymbolResolver,
-    exported_static, exported_symbol, linked_symbol, tier as codegen_tier,
+    Backend, CodegenError, CodegenUnit, ContentId, ParallelWork, Rejections, Roots, STORE_FAILED,
+    SymbolResolver, exported_static, exported_symbol, linked_symbol, tier as codegen_tier,
 };
 use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
@@ -8906,7 +8906,11 @@ fn run_holding(
     if args.out.is_dir() {
         let texts = harnesses(&db, [&args], None);
         write_harnesses(&mut db, texts);
-        return build_batch(&db, args);
+        let built = build_batch(&db, args);
+        if let Some(why) = blaze_store::take_failure() {
+            anyhow::bail!("{}{why}", hir_ty_codegen::STORE_FAILED);
+        }
+        return built;
     }
 
     pause_after_load();
@@ -9265,6 +9269,12 @@ fn run_holding(
         events::at(events::Step::Remote, None);
         shared = pulled(pulling)?;
     }
+    // A key the remote could not bring fails the build that lacked it, whatever lacked it,
+    // and what the build made is not sent. A daemon's is taken by the answer of the build
+    // of a program it serves next (`Program::refused_in_codegen`).
+    if once && let Some(why) = blaze_store::take_failure() {
+        anyhow::bail!("{}{why}", hir_ty_codegen::STORE_FAILED);
+    }
     match (shared, pulling) {
         (Some(shared), _) if once => {
             blaze_store::settled();
@@ -9279,10 +9289,6 @@ fn run_holding(
             });
         }
         (None, None) => {}
-    }
-    // A key the remote could not bring fails the build that lacked it, whatever lacked it.
-    if let Some(why) = blaze_store::take_failure() {
-        anyhow::bail!("the store's remote failed: {why}");
     }
     let out_of_date = hir::attach_db(&db, || known.out_of_date(&db));
     if let Some((edited, sources)) = &rewritten {
@@ -9440,8 +9446,6 @@ fn run_holding(
     // The programs whose tests blaze's harness lists, by their object.
     let mut harnessed: FxHashSet<PathBuf> = FxHashSet::default();
     loop {
-        // A rebuild's failures to fetch are its own: the one before was refused for its own.
-        blaze_store::build_starts();
         if WatchedFile::unwatched(&files, &db) || tree.includes_more(&db) {
             builds.settle(&mut db, &mut programs)?;
         }
@@ -10727,23 +10731,30 @@ impl Program {
     /// Takes a build that code generation refused (`CodegenError::Refused`: what it would
     /// link would not be the program the source says) as that build's refusal, not the
     /// worker's error, as [`Program::panicked`] does: the clients are told why and the worker
-    /// stays. Nothing else is built in its place.
+    /// stays. Nothing else is built in its place. A key the store's remote could not bring,
+    /// for this build or another the daemon runs beside it, fails the build: what was
+    /// compiled in its place is not given, and cargo does not build it either.
     fn refused_in_codegen(
         &mut self,
         answer: anyhow::Result<Result<String, Refused>>,
     ) -> anyhow::Result<Result<String, Refused>> {
-        let why = match &answer {
-            Err(error) => match error.downcast_ref::<CodegenError>() {
+        let fetch = blaze_store::take_failure().map(|why| format!("{STORE_FAILED}{why}"));
+        let why = match (&answer, fetch) {
+            (_, Some(why)) => why,
+            (Err(error), None) => match error.downcast_ref::<CodegenError>() {
                 Some(CodegenError::Refused(why)) => why.clone(),
                 _ => return answer,
             },
-            Ok(_) => return answer,
+            (Ok(_), None) => return answer,
         };
         self.known.start_again();
         self.unbuilt.stale = true;
         (self.wrote, self.whole) = (None, None);
         eprintln!("refused: {why}");
-        Ok(Err(Refused::Cargos(why)))
+        match why.starts_with(STORE_FAILED) {
+            true => Ok(Err(Refused::Error(errors::Said::one(errors::of_none(&why))))),
+            false => Ok(Err(Refused::Cargos(why))),
+        }
     }
 
     /// Notes the crates rustc did not compile from the files this program is of, when it joins

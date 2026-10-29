@@ -178,6 +178,10 @@ mod wasm_object;
 pub mod watch;
 mod x86;
 
+/// What a [`CodegenError::Refused`] begins with when a key the store lacked could not be
+/// fetched from its remote: an error of the build, never a reason to build it another way.
+pub const STORE_FAILED: &str = "the store's remote failed: ";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodegenError {
     /// The function uses something this backend can't compile yet; fall back to rustc.
@@ -1099,7 +1103,7 @@ impl CodegenUnit {
             // A key the store lacked and its remote could not be asked for, or could not
             // bring: what was compiled in its place is not this build's to give.
             if let Some(why) = store::failure() {
-                return Err(CodegenError::Refused(format!("the store's remote failed: {why}")));
+                return Err(CodegenError::Refused(format!("{STORE_FAILED}{why}")));
             }
             if cg.misfit {
                 // What was read of the entry that did not fit, and of those that call it.
