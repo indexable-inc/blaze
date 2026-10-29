@@ -219,9 +219,9 @@ pub fn tests_reach(
     let mut sealed: FxHashMap<u32, Sealed> = FxHashMap::default();
     let mut spent = [std::time::Duration::ZERO; 5];
     let mut next = 0;
-    // In waves of the nodes found and not yet hashed: what each is is looked up, the code of
-    // those to be hashed is compiled on every core, then they are hashed in the order found,
-    // which is all a hash depends on.
+    // In waves of the nodes found and not yet hashed: each is named and looked up in the
+    // store, the code of those to be hashed is compiled on every core, then they are hashed
+    // in the order found, which is all a hash depends on.
     while next < walk.nodes.len() {
         let wave: Vec<Node> = walk.nodes[next..].iter().map(|it| it.node.clone()).collect();
         let mut looked = Vec::with_capacity(wave.len());
@@ -244,6 +244,7 @@ pub fn tests_reach(
             .zip(&looked)
             .filter(|(_, looked)| matches!(looked, None | Some((_, _, None))))
             .map(|(node, _)| node)
+            .filter(|node| !matches!(node, Node::Leaf(..)))
             .collect();
         let before = std::time::Instant::now();
         compile_ahead(symbols, &hashed);

@@ -1478,24 +1478,43 @@ impl SymbolResolver for Resolver<'_> {
             return beside();
         }
         let next = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|scope| {
-            for _ in 0..threads {
-                let (db, next, parts) = (self.db.clone(), &next, self.parts());
-                scope.spawn(move || {
-                    let resolver = parts.over(&db);
-                    hir::attach_db(&db, || {
-                        loop {
-                            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if at >= count {
-                                break;
+        // A worker's panic goes on as itself, a cancellation first: the scope would end in one
+        // of its own, which callers can't tell from a bug.
+        let stopped = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    let (db, next, parts) = (self.db.clone(), &next, self.parts());
+                    scope.spawn(move || {
+                        let resolver = parts.over(&db);
+                        hir::attach_db(&db, || {
+                            loop {
+                                let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if at >= count {
+                                    break;
+                                }
+                                work(&db, &resolver, at);
                             }
-                            work(&db, &resolver, at);
-                        }
+                        })
                     })
-                });
-            }
+                })
+                .collect();
             beside();
+            let mut stopped: Option<Box<dyn std::any::Any + Send>> = None;
+            for worker in workers {
+                let Err(panic) = worker.join() else { continue };
+                let cancelled = panic.is::<ide_db::base_db::salsa::Cancelled>();
+                if stopped
+                    .as_ref()
+                    .is_none_or(|it| cancelled && !it.is::<ide_db::base_db::salsa::Cancelled>())
+                {
+                    stopped = Some(panic);
+                }
+            }
+            stopped
         });
+        if let Some(panic) = stopped {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     fn source_path(&self, file: vfs::FileId) -> Option<String> {
