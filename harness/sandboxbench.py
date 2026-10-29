@@ -232,9 +232,16 @@ async def main():
                 argvs.append(argv)
             return await timed(argvs, parallel, cwd=pkg, env=env)
 
+        forgotten = iter(range(1 << 30))
+
         async def command(more, forget=False):
             if forget:
                 forget_passed([pkg, home])
+                # A hermetic test's pass is kept in the store too, under a key of the
+                # environment it is given: a variable new to each run is given every test.
+                passed = ",".join(filter(None, [env.get("BLAZE_TEST_ENV"), "SBXBENCH_FORGOTTEN"]))
+                more = dict(more, BLAZE_TEST_ENV=passed,
+                            SBXBENCH_FORGOTTEN=f"{os.getpid()}-{next(forgotten)}")
             start = time.perf_counter()
             _, said = await run(test, cwd=pkg, env=dict(env, **more))
             took = time.perf_counter() - start
