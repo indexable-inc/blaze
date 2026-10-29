@@ -5,7 +5,10 @@ usage: unittests.py [CONFIG]
 
 CONFIG is one JSON object, inline, in a file, or `-` for standard input, `{}` when left out:
 
-    {"cargo": false, "args": ["<test argument>", ...]}
+    {"cargo": false, "args": ["<test argument>", ...], "max_mb": 0}
+
+`max_mb`, when not 0, fails the run when the machine had more than that many megabytes of memory
+and swap in use at once while it ran (docs/memory-budget.md, the check in CI).
 
 Runs `blaze test --release --no-fail-fast` of CRATES (blaze tests blaze, AGENTS.md rule
 blaze-builds-blaze; `"cargo": true`: plain `cargo test`, on Windows, which has no release of
@@ -197,6 +200,8 @@ class Config:
     cargo: bool = False
     # Passed after the command's own arguments.
     args: list = dataclasses.field(default_factory=list)
+    # The most memory and swap the machine may have in use at once, in MB; 0 is no bound.
+    max_mb: int = 0
 
 
 def config(argv: list[str]) -> Config:
@@ -259,7 +264,10 @@ def main():
     if status and not any_failed:
         print(f"::error::{' '.join(command)} failed (exit status {status}) before any test failed: the build, most likely")
         sys.exit(1)
-    sys.exit(1 if new or fixed or gone else 0)
+    over = cfg.max_mb and watch.at_peak and watch.peak > cfg.max_mb
+    if over:
+        print(f"::error::the machine had {watch.peak} MB of memory and swap in use at once, over the {cfg.max_mb} MB bound (max_mb; docs/memory-budget.md)")
+    sys.exit(1 if new or fixed or gone or over else 0)
 
 
 if __name__ == "__main__":
