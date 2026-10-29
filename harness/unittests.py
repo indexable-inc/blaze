@@ -95,7 +95,7 @@ class Watch:
         self.began = time.monotonic()
         self.cpu, self.cpu_shown, self.idle_since, self.dumped = {}, {}, None, False
 
-    # A run whose processes use less than this share of one core for `STILL` seconds is stuck:
+    # A run whose blaze-engines use less than this share of one core for `STILL` seconds is stuck:
     # the threads of its blaze-engines are dumped and the run is stopped.
     IDLE, STILL = 0.05, 300
 
@@ -108,9 +108,15 @@ class Watch:
             return None
         return (cpu - last[1]) / (now - last[0])
 
+    def engines(self):
+        """The blaze-engines of the run that still run: the daemon and its workers, whose CPU says
+        whether a build moves (the client's ticker uses some however stuck the build is)."""
+        named = lambda pid: open(f"/proc/{pid}/comm").read().strip() if os.path.exists(f"/proc/{pid}/comm") else ""
+        return [pid for pid in list(self.sampler.most) if named(pid) == "blaze-engine"]
+
     def stuck(self, now):
-        """Whether the run's processes have been as good as idle for `STILL` seconds."""
-        shares = [self.busy(self.cpu, pid, now) for pid in list(self.sampler.most)]
+        """Whether the run's blaze-engines have been as good as idle for `STILL` seconds."""
+        shares = [self.busy(self.cpu, pid, now) for pid in self.engines()]
         shares = [it for it in shares if it is not None]
         if not shares or sum(shares) >= self.IDLE:
             self.idle_since = None
@@ -120,7 +126,7 @@ class Watch:
 
     def dump(self):
         """Every thread's stack of each blaze-engine of the run, by gdb."""
-        engines = [pid for pid in self.sampler.most if os.path.exists(f"/proc/{pid}/comm") and open(f"/proc/{pid}/comm").read().strip() == "blaze-engine"]
+        engines = self.engines()
         if not shutil.which("gdb"):
             print(f"::warning::the run is stuck (blaze-engine {engines}) and there is no gdb to say where", flush=True)
             return
