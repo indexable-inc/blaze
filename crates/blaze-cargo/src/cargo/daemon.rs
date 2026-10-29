@@ -1299,6 +1299,14 @@ pub fn serve() -> anyhow::Result<()> {
     let home = home()?;
     private_dir(&home).with_context(|| format!("the daemon's directory {}", home.display()))?;
     let memory_max = memory_max().map_err(anyhow::Error::msg)?;
+    let own = crate::memory::held_by(std::process::id()).unwrap_or(0);
+    match crate::memory::Budget::now(own).map_err(anyhow::Error::msg)? {
+        Some(budget) => eprintln!("memory budget: {budget}"),
+        None => eprintln!(
+            "memory budget: none ({}=off, or the system says nothing of memory)",
+            crate::memory::BUDGET
+        ),
+    }
     let spare_when = spares().map_err(anyhow::Error::msg)?;
     let socket = socket_in(&home);
     let served = match Served::bind(&socket) {

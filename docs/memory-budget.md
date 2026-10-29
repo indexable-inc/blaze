@@ -67,9 +67,10 @@ the process's groups; on macOS, `hw.memsize`. The budget is that, with two chang
   kernel and the page cache that the store's reads need.
 
 Swap is not budget: a build that needs swap to finish is a build that does not fit.
-`BLAZE_MEMORY_MAX` becomes this one budget, for everything blaze runs, not only the idle
-workers; `off` stays the way out, for a person who wants the old behavior and says so. The
-daemon says the budget and where it came from at start and in `blaze status`.
+`BLAZE_MEMORY_BUDGET` sets the limit (a size, or `off`, the way out for a person who says so),
+for everything blaze runs; `BLAZE_MEMORY_MAX`, the share the daemon's idle workers may keep, is
+then a share of the budget. The daemon says the budget and where it came from at start
+(`memory budget:` in its log, built) and in `blaze status` (to come).
 
 ### 2. Units, their peaks, and admission
 
