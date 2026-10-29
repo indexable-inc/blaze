@@ -141,8 +141,11 @@ of blaze is told where it is in `BLAZE_LIBRARY`, the first of:
 - `~/.blaze/library/<digest>/library`, which blaze makes once, beside the toolchain's
   download: copied from the checkout it was built in when that has the same library, else
   downloaded as the release's `library-<digest>.tar.xz` (6.0 MB, `harness/library.py
-  archive` writes it, the release workflow attaches it), or from where `BLAZE_LIBRARY_FROM`
-  names. Whichever way it came it is checked against the digest file by file. A checkout's own
+  archive` writes it, the release workflow attaches it). `BLAZE_LIBRARY_FROM` names another
+  place to get it from (an address or a directory with that archive, or a library to copy),
+  taken over the checkout too: `harness/libraryfetch.py` installs from an archive served
+  locally that way, so the release's download is tried before a tag ships. Whichever way it
+  came it is checked against the digest file by file. A checkout's own
   `library/` is never read in place: what the store keeps of a crate whose data names the
   checkout being built is that checkout's alone, and the standard library's is everyone's.
 

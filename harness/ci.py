@@ -105,6 +105,8 @@ HARNESSES = [
     ("core", ["staticcallbacks.py"], {}, on("linux", "macos"), None),
     ("core", ["latelisted.py"], {}, on("linux", "macos"), 1),
     ("core", ["rustsrc.py"], {}, EVERYWHERE, 1),
+    # The release's library archive, made and served here, installed from by digest.
+    ("core", ["libraryfetch.py"], {}, EVERYWHERE, 1),
     # Each scenario runs rustc and rustdoc no more often than norustc/baseline.json says.
     ("core", ["norustc.py"], {}, on("linux", "macos"), 2),
     # `blaze check`'s diagnostics, in each `--message-format`, against rustc's.
@@ -187,6 +189,8 @@ FAST = {
     "includes.py": (12, ()),
     "latelisted.py": (126, (X64,)),
     "rustsrc.py": (1, ()),
+    # Not measured yet: library.py's xz of library/ (79 MB) is most of it.
+    "libraryfetch.py": (90, (X64,)),
     "norustc.py": (253, (X64,)),
     "check_json.py": (38, (X64,)),
     "checktargets.py": (40, (X64,)),
