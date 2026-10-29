@@ -151,9 +151,9 @@ pub const fn fields(item: &const_ast::Item) -> String {
     let (name, count) = match item.as_struct() {
         Some(adt) => (
             adt.name(),
-            match adt.record_field_list() {
-                Some(list) => list.fields().count(),
-                None => 0,
+            match adt.field_list() {
+                Some(const_ast::FieldList::RecordFieldList(list)) => list.fields().count(),
+                _ => 0,
             },
         ),
         None => (None, 0),
