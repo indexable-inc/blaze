@@ -723,6 +723,7 @@ dependencies = [
  "blaze-build-script",
  "blaze-cache",
  "blaze-fmt",
+ "blaze-graph",
  "blaze-in-place",
  "blaze-lints",
  "blaze-live",
@@ -738,6 +739,7 @@ dependencies = [
  "blaze-ui",
  "blaze-units",
  "blaze-wasi",
+ "blaze-web",
  "cargo-platform",
  "cargo-util-schemas",
  "cargo_metadata",
@@ -1181,6 +1183,19 @@ dependencies = [
  "anyhow",
  "wasmtime",
  "wasmtime-wasi",
+]
+
+[[package]]
+name = "blaze-web"
+version = "0.0.0"
+dependencies = [
+ "base64",
+ "blaze-protocol",
+ "flate2",
+ "flecs-c",
+ "getrandom 0.3.4",
+ "rustc-hash 2.1.2",
+ "sha1 0.10.7",
 ]
 
 [[package]]
@@ -2094,6 +2109,13 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide 0.8.9",
+]
+
+[[package]]
+name = "flecs-c"
+version = "0.1.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

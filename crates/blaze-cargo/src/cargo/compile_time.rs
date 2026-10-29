@@ -20,11 +20,11 @@
 //! the result to cargo's.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     ffi::OsString,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::SystemTime,
 };
 
@@ -384,95 +384,92 @@ impl<'a> Driver<'a> {
         tasks
     }
 
-    /// Does every step, as many at once as there are workers, each once what it waits for is
-    /// done. The first failure fails the build once the steps under way end.
+    /// Does every step as a node of a build graph (docs/driver.md), as many at once as there
+    /// are workers, each once what it waits for is done, and says each node and its moves.
+    /// The first failure fails the build once the steps under way end.
     fn run(&self) -> anyhow::Result<()> {
+        use blaze_graph::{Config, Machine, NodeId, Pool, Spec, exec};
+        use blaze_protocol::events::NodeKind;
         let tasks = self.tasks();
         let index: FxHashMap<Task, usize> =
             tasks.iter().enumerate().map(|(at, (task, _))| (*task, at)).collect();
-        let mut waiting = vec![0usize; tasks.len()];
-        let mut then: Vec<Vec<usize>> = vec![Vec::new(); tasks.len()];
-        for (at, (_, waits)) in tasks.iter().enumerate() {
-            let waits: FxHashSet<usize> =
-                waits.iter().filter_map(|it| index.get(it).copied()).collect();
-            waiting[at] = waits.len();
-            for it in waits {
-                then[it].push(at);
-            }
-        }
-        struct State {
-            ready: VecDeque<usize>,
-            waiting: Vec<usize>,
-            busy: usize,
-            done: usize,
-            failed: Option<anyhow::Error>,
-        }
-        let ready = (0..tasks.len()).filter(|&it| waiting[it] == 0).collect();
-        let state = Mutex::new(State { ready, waiting, busy: 0, done: 0, failed: None });
-        let wake = Condvar::new();
+        let first = exec::ids(tasks.len());
+        let id = |at: usize| NodeId(first + at as u32);
+        let nodes = tasks
+            .iter()
+            .enumerate()
+            .map(|(at, (task, waits))| {
+                let mut deps: Vec<NodeId> =
+                    waits.iter().filter_map(|it| index.get(it)).map(|&it| id(it)).collect();
+                deps.sort();
+                deps.dedup();
+                let (unit, kind) = match *task {
+                    Task::Script(unit) => (unit, NodeKind::Script),
+                    Task::Run(unit) => (unit, NodeKind::ScriptRun),
+                    Task::Macro(unit) => (unit, NodeKind::Macro),
+                };
+                let name = self.package(unit).map_or_else(
+                    |_| self.unit(unit).pkg_id.clone(),
+                    |it| format!("{} v{}", it.name, it.version),
+                );
+                // One pool for compiles and runs alike: a run can be a C build that takes cores
+                // of its own, and together they are held to `workers` as before.
+                Spec { id: id(at), kind, name, deps, pool: Pool::Work, cost: 1 }
+            })
+            .collect();
         let workers =
             std::thread::available_parallelism().map_or(1, |it| it.get()).div_ceil(4).max(4);
+        let config = Config { io: 1, work: workers, keep_going: false };
+        let mut machine = Machine::new(config)?;
         let slots = workers.min(tasks.len().max(1));
         let counting = crate::events::Counting::new(
             blaze_protocol::events::Step::BuildScripts,
             tasks.len(),
             slots,
         );
-        let counting = &counting;
-        std::thread::scope(|scope| {
-            for slot in 0..slots {
-                let (state, wake, tasks, then) = (&state, &wake, &tasks, &then);
-                scope.spawn(move || {
-                    loop {
-                        let mut held = lock(&state);
-                        let at = loop {
-                            let over = held.failed.is_some() || held.done == tasks.len();
-                            if over || held.ready.is_empty() && held.busy == 0 {
-                                return;
-                            }
-                            if let Some(at) = held.ready.pop_front() {
-                                break at;
-                            }
-                            held =
-                                wake.wait(held).unwrap_or_else(std::sync::PoisonError::into_inner);
-                        };
-                        held.busy += 1;
-                        drop(held);
-                        counting.on(slot, || self.shown(tasks[at].0));
-                        let result = self.step(tasks[at].0);
-                        counting.done(slot);
-                        let mut held = lock(&state);
-                        held.busy -= 1;
-                        held.done += 1;
-                        match result {
-                            Ok(()) => {
-                                for &next in &then[at] {
-                                    held.waiting[next] -= 1;
-                                    if held.waiting[next] == 0 {
-                                        held.ready.push_back(next);
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                held.failed.get_or_insert(error);
-                            }
-                        }
-                        wake.notify_all();
-                    }
-                });
+        // The slot a step under way says what it works on in: at most `slots` are under way.
+        let free: Mutex<Vec<usize>> = Mutex::new((0..slots).rev().collect());
+        let failed: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+        let work = |node: NodeId| {
+            let at = (node.0 - first) as usize;
+            let slot = lock(&free).pop().unwrap_or_default();
+            counting.on(slot, || self.shown(tasks[at].0));
+            let result = self.step(tasks[at].0);
+            counting.done(slot);
+            lock(&free).push(slot);
+            match result {
+                Ok(()) => exec::Did::built(),
+                Err(error) => {
+                    let why = format!("{error:#}");
+                    lock(&failed).get_or_insert(error);
+                    exec::Did::failed(why)
+                }
             }
-        });
-        let state = state.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(error) = state.failed {
+        };
+        // A step that panicked failed with no error of its own: the machine has why.
+        let mut first_why = None;
+        let mut said = |record: &blaze_protocol::events::Record| {
+            if let blaze_protocol::events::Event::Moved {
+                state: blaze_protocol::events::NodeState::Failed { why },
+                ..
+            } = &record.event
+            {
+                first_why.get_or_insert_with(|| why.clone());
+            }
+            crate::events::say(record.event.clone());
+        };
+        let ok = exec::drive(&mut machine, nodes, &work, &mut said, None)?;
+        if let Some(error) = failed.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
             return Err(error);
         }
-        anyhow::ensure!(
-            state.done == tasks.len(),
-            "{} of the build's {} steps wait for one another",
-            tasks.len() - state.done,
-            tasks.len()
-        );
-        Ok(())
+        match (ok, first_why) {
+            (true, _) => Ok(()),
+            (false, why) => anyhow::bail!(
+                "a step of the build failed: {}",
+                why.as_deref().unwrap_or("it said no more")
+            ),
+        }
     }
 
     /// A step as the build's progress names it: `serde (build script)`.
