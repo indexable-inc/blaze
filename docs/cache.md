@@ -227,7 +227,14 @@ into one, without the packs the manifest no longer lists, so a project has a few
 root is signed and turned as the manifest is, and runs and shards are named by the hash of
 their bytes, so what the root names is checked as far down as it goes; a pack the index names
 is still checked to be in the manifest, and the key in the pack. The format is in
-`crates/blaze-store/src/remote_index.rs`. Nothing reads the index during a build yet.
+`crates/blaze-store/src/remote_index.rs`. A daemon with `BLAZE_REMOTE_LAZY` reads through it
+(below); what it fetches is decided in `crates/blaze-store/src/remote_tier.rs`.
+
+A lookup that needs a shard that is gone, or is not what its name says, fails rather than
+miss, and notes the shard in the store (`remote-index-broken/<project>`). The next push from
+that store reads each noted shard again, and takes out a run whose shard still cannot be used,
+indexing what it covered again; a push asks after no other shard, and a merge reads the
+shards of only the runs it merges.
 
 **Real AWS S3 has not been run.** Everything was measured against MinIO and SeaweedFS on
 the same machine over loopback. The client is the AWS SDK, so the code is the same, but
@@ -252,10 +259,27 @@ key and the manifest has changed, and pushes what it compiled after the first bu
 every five minutes, and once more when it is told to stop. No build waits for the network:
 the first build compiles from the start while the pull runs beside it, and once the pull is
 in, the store reads it and what the build asks for after that is found rather than compiled.
-With `BLAZE_REMOTE_LAZY`, the first key a build lacks of a pack starts fetching that pack,
-and the thread that asked waits for it a quarter of a second at most. Once a pack takes
-longer, no thread of the daemon waits on the remote again: what it lacks is compiled here
-while the packs come. Only `BLAZE_REMOTE_REQUIRED` has the first build wait for the pull,
+With `BLAZE_REMOTE_LAZY` the remote is a tier under the store instead, and nothing is
+pulled. The daemon reads the root of the project's key index, the runs it names and the
+manifest when it starts, and again when a build misses a key and the manifest has changed.
+A key a build lacks is looked up in the key's shard of each run, newest run first (shards
+are fetched once and kept in the store's directory, under `remote-index/<project>/`, as are runs);
+the pack a run names for it is fetched, checked and kept, and the key looked for in it,
+and in the next pack named if it is not there. A listed pack that no run covers is found
+by its key list, whether or not the store has the pack now. The thread that asked waits for
+all of it, however long it takes, and a key the build asks for while the remote is still
+being opened waits for that too. A key no listed pack holds is compiled. A lookup that fails
+reads the root and the manifest again once and tries again, as what it failed on may be what
+a collection took out after a merge. One that still cannot be answered (the remote cannot be
+reached or opened, an object is gone or does not hash to its name, a pack is larger than
+`BLAZE_CACHE_MAX`) fails the build, naming what failed, whatever `BLAZE_REMOTE_REQUIRED`
+says: what it would have fetched is not compiled in its place, nothing compiled while a
+build that saw the failure is under way is kept in the store, and a daemon answers each
+build that was under way when it happened with the error, not with cargo. The next build asks again; a daemon whose remote could not be opened when it
+started fails what its store lacks until it is started again.
+A read of the root and the manifest that fails once they were read leaves the look from
+before.
+Only `BLAZE_REMOTE_REQUIRED` has the first build wait for the pull,
 since its failure is then the build's. A connection that is not made within 2 seconds fails,
 as a network that is down does. A daemon killed with SIGKILL pushes nothing on its way out;
 the next push sends it.
@@ -265,7 +289,7 @@ the next push sends it.
 | `BLAZE_REMOTE` | the remote the daemon keeps its store in step with | not set |
 | `BLAZE_PROJECT` | which manifest | `default` |
 | `BLAZE_REMOTE_READONLY` | never write to the remote | off |
-| `BLAZE_REMOTE_LAZY` | fetch only the key lists, and a pack when a build first asks for a key in it | off |
+| `BLAZE_REMOTE_LAZY` | pull nothing: read through the key index, and fetch a pack when a build first asks for a key in it, waiting for it | off |
 | `BLAZE_REMOTE_PUSH_EVERY` | how often a running daemon pushes (`90s`, `5m`, `1h`), or `off` | `5m` |
 | `BLAZE_REMOTE_JOBS` | requests in flight at once | 8 |
 | `BLAZE_REMOTE_TIMEOUT` | seconds a request may go without an answer | 30 |
@@ -278,8 +302,8 @@ the next push sends it.
 reads it. `BLAZE_REMOTE=off` turns it off for one command.
 
 A remote that cannot be reached, answers 5xx after its retries, refuses the token (401, 403),
-or sends bytes that do not hash to their name does not stop a build: what it would have
-served is compiled, and every build's `Finished` line says so until an exchange with it
+or sends bytes that do not hash to their name does not stop a build, except a lookup with
+`BLAZE_REMOTE_LAZY` (above): what it would have served is compiled, and every build's `Finished` line says so until an exchange with it
 succeeds again, as in `[blaze, remote down: <remote>: <why>]`. With `BLAZE_REMOTE_REQUIRED=1`,
 which CI sets, each of those is an error that fails the command (`cache push`, `cache pull`,
 or the build), so a cache that stopped working is not a slowdown nobody sees.

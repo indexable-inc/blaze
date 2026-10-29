@@ -70,8 +70,8 @@ use hir_def::{
     expr_store::Body, item_scope::ItemScope,
 };
 use hir_ty_codegen::{
-    Backend, CodegenError, CodegenUnit, ContentId, ParallelWork, Rejections, Roots, SymbolResolver,
-    exported_static, exported_symbol, linked_symbol, tier as codegen_tier,
+    Backend, CodegenError, CodegenUnit, ContentId, ParallelWork, Rejections, Roots, STORE_FAILED,
+    SymbolResolver, exported_static, exported_symbol, linked_symbol, tier as codegen_tier,
 };
 use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
@@ -8922,6 +8922,10 @@ fn run_holding(
 
     // What other machines compiled is fetched beside the build, which never waits for it: the
     // store reads what arrived once it is in, and the build finds it from then on.
+    // A build's own failures to fetch are its own, and with BLAZE_REMOTE_LAZY what the store
+    // lacks waits for the remote to be opened rather than compile before it is.
+    let fetches = blaze_store::Build::begins();
+    remote::Shared::coming_from_env();
     let shared = std::thread::spawn(|| {
         let shared = remote::Shared::from_env()?;
         if let Some(shared) = &shared {
@@ -9030,7 +9034,11 @@ fn run_holding(
     if args.out.is_dir() {
         let texts = harnesses(&db, [&args], None);
         write_harnesses(&mut db, texts);
-        return build_batch(&db, args);
+        let built = build_batch(&db, args);
+        if let Some(why) = fetches.failure() {
+            anyhow::bail!("{STORE_FAILED}{why}");
+        }
+        return built;
     }
 
     pause_after_load();
@@ -9150,6 +9158,9 @@ fn run_holding(
         };
         let code = doctest::run_all(&mut db, &building, libraries, emits.triple());
         blaze_store::settled();
+        if let Some(why) = fetches.failure() {
+            anyhow::bail!("{STORE_FAILED}{why}");
+        }
         std::process::exit(code);
     }
     if let Some(stale) = stale_copies(&db, &table, &args) {
@@ -9405,6 +9416,15 @@ fn run_holding(
     if once && let Some(pulling) = pulling.take() {
         events::at(events::Step::Remote, None);
         shared = pulled(pulling)?;
+    }
+    // A key the remote could not bring fails the build that lacked it, whatever lacked it,
+    // and what the build made is not sent. A daemon whose first build failed so serves none.
+    if let Some(why) = fetches.failure() {
+        anyhow::bail!("{STORE_FAILED}{why}");
+    }
+    // The builds a daemon serves from here on are each one of their own.
+    if !once {
+        drop(fetches);
     }
     match (shared, pulling) {
         (Some(shared), _) if once => {
@@ -10520,10 +10540,11 @@ fn run_holding(
                     });
                 }
                 std::thread::spawn(move || {
+                    let fetches = blaze_store::Build::begins();
                     let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let answer =
                             program.sync(&db, &listed, &paths, &edit, wanted.as_ref(), link, defer);
-                        program.refused_in_codegen(answer)
+                        program.refused_in_codegen(answer, &fetches)
                     }));
                     done.store(true, Ordering::SeqCst);
                     // The write that interrupts waits for this.
@@ -10531,8 +10552,9 @@ fn run_holding(
                     let answer = match answer {
                         _ if INTERRUPTING.load(Ordering::SeqCst) => None,
                         Ok(answer) => Some(answer),
-                        Err(panic) => Some(Ok(program.panicked(&*panic))),
+                        Err(panic) => Some(Ok(program.panicked(&*panic, fetches.failure()))),
                     };
+                    drop(fetches);
                     end_link();
                     events::idle();
                     let _ = sender.send(Event::Built(at, program, answer));
@@ -10561,16 +10583,19 @@ fn run_holding(
                         let (db, listed, paths, edit) = (db.clone(), &*listed, &*paths, &edit);
                         let wanted = outputs.get(&at);
                         let build = scope.spawn(move || {
+                            let fetches = blaze_store::Build::begins();
                             let answer =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     let answer =
                                         program.sync(&db, listed, paths, edit, wanted, link, defer);
-                                    program.refused_in_codegen(answer)
+                                    program.refused_in_codegen(answer, &fetches)
                                 }));
                             end_link();
                             // Each build's steps are of its own thread ([`events::at`]).
                             events::idle();
-                            answer.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                            answer.unwrap_or_else(|panic| {
+                                Ok(program.panicked(&*panic, fetches.failure()))
+                            })
                         });
                         (at, build)
                     })
@@ -10581,7 +10606,7 @@ fn run_holding(
                 .into_iter()
                 .map(|(at, answer)| match answer {
                     Ok(answer) => (at, answer),
-                    Err(panic) => (at, Ok(programs[at].panicked(&*panic))),
+                    Err(panic) => (at, Ok(programs[at].panicked(&*panic, None))),
                 })
                 .collect();
             // An `env!` the builds were the first to see was told the place of the loaded
@@ -10856,35 +10881,54 @@ impl Program {
     /// Takes a build that panicked as the build's error, not the worker's: the clients are
     /// told why, the worker stays, and the next build is a whole one, since what the build
     /// left of the patch base and of the executable may be half written.
-    fn panicked(&mut self, panic: &(dyn std::any::Any + Send)) -> Result<String, Refused> {
+    /// A build that a fetch failed for (`fetch`) fails with that: cargo does not build it.
+    fn panicked(
+        &mut self,
+        panic: &(dyn std::any::Any + Send),
+        fetch: Option<String>,
+    ) -> Result<String, Refused> {
         self.known.start_again();
         self.unbuilt.stale = true;
         (self.wrote, self.whole) = (None, None);
         let why = format!("a build of {} panicked: {}", self.args.krate, panic_message(panic));
         eprintln!("{why}");
-        Err(Refused::Cargos(why))
+        match fetch {
+            Some(fetch) => {
+                let why = format!("{STORE_FAILED}{fetch}; {why}");
+                Err(Refused::Error(errors::Said::one(errors::of_none(&why))))
+            }
+            None => Err(Refused::Cargos(why)),
+        }
     }
 
     /// Takes a build that code generation refused (`CodegenError::Refused`: what it would
     /// link would not be the program the source says) as that build's refusal, not the
     /// worker's error, as [`Program::panicked`] does: the clients are told why and the worker
-    /// stays. Nothing else is built in its place.
+    /// stays. Nothing else is built in its place. A key the store's remote could not bring
+    /// while this build was under way (`fetches`) fails it: what was compiled in its place is
+    /// not given, and cargo does not build it either.
     fn refused_in_codegen(
         &mut self,
         answer: anyhow::Result<Result<String, Refused>>,
+        fetches: &blaze_store::Build,
     ) -> anyhow::Result<Result<String, Refused>> {
-        let why = match &answer {
-            Err(error) => match error.downcast_ref::<CodegenError>() {
+        let fetch = fetches.failure().map(|why| format!("{STORE_FAILED}{why}"));
+        let why = match (&answer, fetch) {
+            (_, Some(why)) => why,
+            (Err(error), None) => match error.downcast_ref::<CodegenError>() {
                 Some(CodegenError::Refused(why)) => why.clone(),
                 _ => return answer,
             },
-            Ok(_) => return answer,
+            (Ok(_), None) => return answer,
         };
         self.known.start_again();
         self.unbuilt.stale = true;
         (self.wrote, self.whole) = (None, None);
         eprintln!("refused: {why}");
-        Ok(Err(Refused::Cargos(why)))
+        match why.starts_with(STORE_FAILED) {
+            true => Ok(Err(Refused::Error(errors::Said::one(errors::of_none(&why))))),
+            false => Ok(Err(Refused::Cargos(why))),
+        }
     }
 
     /// Notes the crates rustc did not compile from the files this program is of, when it joins

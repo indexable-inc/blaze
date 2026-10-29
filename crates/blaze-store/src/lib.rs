@@ -47,7 +47,8 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard,
+        RwLockWriteGuard,
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime},
@@ -334,16 +335,157 @@ pub fn pack_keys(name: &str, bytes: &[u8]) -> Result<Vec<[u8; KEY]>, &'static st
     Ok(Pack::verify(name, bytes)?.entries.into_iter().map(|it| it.key).collect())
 }
 
-/// Asked for a key, as it is on disk, that no sealed pack of the store has: brings the pack
-/// that has it into the store's directory, if it knows of one, and says whether it did.
-pub type FetchMissing = Box<dyn Fn(&[u8; KEY]) -> bool + Send + Sync>;
+/// Asked for a key, as it is on disk, that no sealed pack of the store has, and the packs it
+/// brought for that key already that did not hold it: brings the next pack that may hold it
+/// into the store's directory and names it, or says `None` when no pack it knows of may.
+/// An error is that it could not tell or could not bring the pack, naming what failed: the
+/// build that asked fails ([`Build::failure`]), and nothing compiles the key in its place.
+pub type FetchMissing = Box<
+    dyn Fn(&[u8; KEY], &[remote_index::Hash]) -> Result<Option<remote_index::Hash>, String>
+        + Send
+        + Sync,
+>;
 
-static FETCH_MISSING: OnceLock<FetchMissing> = OnceLock::new();
+/// What the store asks for the keys it lacks, by name, in the order they were named: a
+/// build's remote and the remotes of the closures its build scripts run with.
+static FETCH_MISSING: Mutex<Vec<(String, Asker)>> = Mutex::new(Vec::new());
+static FETCH_NAMED: Condvar = Condvar::new();
 
-/// Has the store of this process ask `fetch` for the keys it lacks, from now on. A process
-/// has one store, and only the first call counts.
-pub fn fetch_missing_with(fetch: FetchMissing) {
-    _ = FETCH_MISSING.set(fetch);
+#[derive(Clone)]
+enum Asker {
+    /// It is being opened: a key the store lacks waits for it.
+    Coming,
+    Ready(Arc<FetchMissing>),
+    /// It could not be opened: a key the store lacks fails the build with this.
+    Never(String),
+}
+
+fn askers() -> MutexGuard<'static, Vec<(String, Asker)>> {
+    FETCH_MISSING.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn name_asker(name: &str, asker: Asker) {
+    let mut askers = askers();
+    match askers.iter_mut().find(|(it, _)| it == name) {
+        Some((_, was)) => *was = asker,
+        None => askers.push((name.to_owned(), asker)),
+    }
+    FETCH_NAMED.notify_all();
+}
+
+/// Has the store of this process ask `fetch` for the keys it lacks, from now on, as `name`:
+/// in place of what was named so before, after what other names were.
+pub fn fetch_missing_with(name: &str, fetch: FetchMissing) {
+    name_asker(name, Asker::Ready(Arc::new(fetch)));
+}
+
+/// What will ask for keys as `name` is being opened: a key the store lacks waits until it
+/// is, or until [`fetch_missing_never`] says it cannot be. The opening must end in one or
+/// the other.
+pub fn fetch_missing_coming(name: &str) {
+    name_asker(name, Asker::Coming);
+}
+
+/// What was to ask for keys as `name` cannot: a key the store lacks fails the build with
+/// `why` rather than compile what it would have brought.
+pub fn fetch_missing_never(name: &str, why: String) {
+    name_asker(name, Asker::Never(why));
+}
+
+/// What asked for keys as `name` asks no more.
+pub fn fetch_missing_forget(name: &str) {
+    askers().retain(|(it, _)| it != name);
+    FETCH_NAMED.notify_all();
+}
+
+/// What to ask for a key the store lacks, once none is being opened; or how one failed.
+fn ask_for_missing() -> Result<Vec<Arc<FetchMissing>>, String> {
+    let mut askers = askers();
+    while askers.iter().any(|(_, it)| matches!(it, Asker::Coming)) {
+        askers = FETCH_NAMED.wait(askers).unwrap_or_else(PoisonError::into_inner);
+    }
+    (askers.iter())
+        .map(|(name, it)| match it {
+            Asker::Ready(fetch) => Ok(fetch.clone()),
+            Asker::Never(why) => Err(format!("{name}: {why}")),
+            Asker::Coming => unreachable!("waited for"),
+        })
+        .collect()
+}
+
+/// How the last fetch of a key the store lacked failed, with its number, since no build was
+/// under way ([`Build`]): every build that was under way when one failed fails with it (one
+/// under way at the last failure was at every one after it began), and while one is here
+/// nothing compiled is added to the store, as it may be what the remote would have brought.
+static FAILURES: Mutex<Failures> = Mutex::new(Failures { next: 0, running: 0, last: None });
+
+struct Failures {
+    /// The number the next failure gets.
+    next: u64,
+    /// How many builds are under way.
+    running: usize,
+    last: Option<(u64, String)>,
+}
+
+fn failures() -> MutexGuard<'static, Failures> {
+    FAILURES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A build under way, for the fetches that fail while it is: see [`FAILURES`]. A process
+/// that builds several programs at once has one of each.
+pub struct Build {
+    /// The number of the first failure that is this build's.
+    from: u64,
+}
+
+impl Build {
+    /// A build starts: failures from before it are not its own.
+    pub fn begins() -> Build {
+        let mut failures = failures();
+        failures.running += 1;
+        Build { from: failures.next }
+    }
+
+    /// How a fetch failed while this build was under way, if one did: the build fails with
+    /// it, whatever asked for the key, as what was compiled in place of the key is not what
+    /// the remote holds.
+    pub fn failure(&self) -> Option<String> {
+        let failures = failures();
+        let mine = failures.last.as_ref().filter(|(at, _)| *at >= self.from);
+        mine.map(|(_, why)| why.clone())
+    }
+}
+
+impl Drop for Build {
+    /// The failures are forgotten once no build that they may be of is under way: each that
+    /// was has seen them, or ended without asking.
+    fn drop(&mut self) {
+        let mut failures = failures();
+        failures.running -= 1;
+        if failures.running == 0 {
+            failures.last = None;
+        }
+    }
+}
+
+/// How a fetch failed that a build under way may be failing with: what a part of a build
+/// that cannot tell which build it is of (a unit of code generation) refuses on.
+pub fn failure() -> Option<String> {
+    failures().last.as_ref().map(|(_, why)| why.clone())
+}
+
+fn failed() -> bool {
+    failures().last.is_some()
+}
+
+fn fail(why: String) {
+    let mut failures = failures();
+    if failures.last.as_ref().is_none_or(|(_, was)| *was != why) {
+        eprintln!("store: {why}");
+    }
+    let at = failures.next;
+    failures.next += 1;
+    failures.last = Some((at, why));
 }
 
 /// Seals what the store of this process has open, however little it is, so that it can be
@@ -1311,6 +1453,13 @@ pub fn write_file_whole(to: &Path, bytes: &[u8]) -> io::Result<()> {
     write_whole(to, &[bytes], false)
 }
 
+/// [`write_file_whole`] of a file in a store's directory that is for the user alone, as the
+/// directories above it that are missing are made: what a store keeps tells what was built.
+pub fn write_private_whole(to: &Path, bytes: &[u8]) -> io::Result<()> {
+    private::create_dir(to.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
+    write_whole(to, &[bytes], true)
+}
+
 pub struct Store {
     dir: StoreDir,
     identity: Identity,
@@ -1966,7 +2115,8 @@ impl Store {
 
     /// Where the value of a key as it is on disk is, in a pack whose bytes are what its name
     /// says. A key no sealed pack has is asked of whoever fetches packs for this process, and
-    /// looked for again in what arrived.
+    /// looked for again in each pack that arrives, until one holds it or none is left that
+    /// may: a pack the remote's index names may not hold the key ([`remote_tier`]).
     fn place(&self, key: &[u8; KEY]) -> Option<Place> {
         let known = || {
             let mut found = self.found(key);
@@ -1981,11 +2131,41 @@ impl Store {
         if let Some(place) = known() {
             return Some(place);
         }
-        if !FETCH_MISSING.get().is_some_and(|fetch| fetch(key)) {
-            return None;
+        let askers = match ask_for_missing() {
+            Ok(askers) => askers,
+            Err(why) => {
+                fail(why);
+                return None;
+            }
+        };
+        // Packs are named by their hashes, so what one brought is never another's to bring.
+        let mut tried = Vec::new();
+        for fetch in askers {
+            loop {
+                match fetch(key, &tried) {
+                    Ok(None) => break,
+                    Ok(Some(pack)) => {
+                        self.refresh();
+                        if let Some(place) = known() {
+                            return Some(place);
+                        }
+                        if tried.contains(&pack) || !self.holds_pack(&pack) {
+                            fail(format!(
+                                "{} was brought in for a key, and the store cannot read it",
+                                named(&pack)
+                            ));
+                            return None;
+                        }
+                        tried.push(pack);
+                    }
+                    Err(why) => {
+                        fail(why);
+                        return None;
+                    }
+                }
+            }
         }
-        self.refresh();
-        known()
+        None
     }
 
     /// Where the index of a sealed pack says the value of a key as it is on disk is, the pack
@@ -1995,6 +2175,15 @@ impl Store {
         (candidates.into_iter())
             .filter(|(pack, _)| !pack.changed.load(Ordering::Relaxed))
             .find_map(|(pack, entry)| pack.place(entry, key))
+    }
+
+    /// Whether the sealed pack `pack` (by its hash) is one this store has read and can read.
+    fn holds_pack(&self, pack: &[u8; 32]) -> bool {
+        let sealed = self.sealed();
+        let number = sealed.named.get(&named(pack));
+        number
+            .and_then(|it| sealed.packs.get(it))
+            .is_some_and(|it| !it.changed.load(Ordering::Relaxed))
     }
 
     /// As [`check_packs`], of the packs this store has read, several at a time.
@@ -2251,7 +2440,9 @@ impl Store {
     }
 
     fn insert_on_disk(&self, key: [u8; KEY], value: &[u8]) {
-        if self.found(&key).is_some() {
+        // What is compiled while a fetch has failed may be what the remote would have
+        // brought: kept, a later build would take it as if it had been fetched.
+        if failed() || self.found(&key).is_some() {
             return;
         }
         let Ok(len) = u32::try_from(value.len()) else { return };
@@ -2442,6 +2633,7 @@ mod acl;
 pub mod bench;
 
 pub mod remote_index;
+pub mod remote_tier;
 
 /// Keeping the store to the user it is of. On Unix that is the owner and the mode of the
 /// directory and of each file. On Windows it is the owner and the access control list,
