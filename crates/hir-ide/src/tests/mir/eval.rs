@@ -1108,6 +1108,35 @@ fn main() {
 }
 
 #[test]
+fn syscalls_of_aarch64() {
+    check_pass(
+        r#"
+//- minicore: option
+//- /main.rs cfg:target_arch=aarch64
+
+extern "C" {
+    pub unsafe extern "C" fn syscall(num: i64, ...) -> i64;
+}
+
+const SYS_getrandom: i64 = 278;
+
+fn should_not_reach() {
+    _ // FIXME: replace this function with panic when that works
+}
+
+fn main() {
+    let mut x: i32 = 0;
+    let r = syscall(SYS_getrandom, &mut x, 4usize, 0);
+    if r != 4 {
+        should_not_reach();
+    }
+}
+
+"#,
+    )
+}
+
+#[test]
 fn posix_getenv() {
     check_pass(
         r#"

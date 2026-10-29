@@ -378,6 +378,15 @@ impl<'db> Evaluator<'db> {
         }
     }
 
+    /// The number of `SYS_getrandom`: Linux numbers its syscalls per architecture.
+    fn sys_getrandom(&self) -> i64 {
+        let aarch64 = cfg::CfgAtom::KeyValue {
+            key: intern::Symbol::intern("target_arch"),
+            value: intern::Symbol::intern("aarch64"),
+        };
+        if self.crate_id.cfg_options(self.db).check_atom(&aarch64) { 278 } else { 318 }
+    }
+
     fn exec_syscall(
         &mut self,
         id: i64,
@@ -387,8 +396,7 @@ impl<'db> Evaluator<'db> {
         _span: MirSpan,
     ) -> Result<'db, ()> {
         match id {
-            318 => {
-                // SYS_getrandom
+            id if id == self.sys_getrandom() => {
                 let [buf, len, _flags] = args else {
                     return Err(MirEvalError::InternalError(
                         "SYS_getrandom args are not provided".into(),
