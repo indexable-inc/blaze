@@ -4365,7 +4365,7 @@ fn refused_const_eval(
                     .and_then(|(owner, span)| fncache::location(db, owner, span))
                     .map(|it| format!(", called at {it}"))
                     .unwrap_or_default();
-                return Some(CodegenError::Unsupported(format!(
+                return Some(CodegenError::Refused(format!(
                     "const eval of {what}: the body of `{name}`{at} is not lowered: {error:?}"
                 )));
             }
