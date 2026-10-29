@@ -84,14 +84,16 @@ class Watch:
 
     EVERY = 30
 
-    def __init__(self, pid, dirs):
+    def __init__(self, proc, dirs):
+        self.proc = proc
+        pid = proc.pid
         self.sampler = memory.Sampler(interval=1.0).add(pid)
         self.dirs, self.peak, self.at_peak, self._stop = dirs, 0, None, threading.Event()
         self.began = time.monotonic()
         self.cpu, self.cpu_shown, self.idle_since, self.dumped = {}, {}, None, False
 
-    # A run whose processes use less than this share of one core for `STILL` seconds is stuck,
-    # and the threads of its blaze-engines are dumped once.
+    # A run whose processes use less than this share of one core for `STILL` seconds is stuck:
+    # the threads of its blaze-engines are dumped and the run is stopped.
     IDLE, STILL = 0.05, 300
 
     @staticmethod
@@ -147,6 +149,8 @@ class Watch:
             if not self.dumped and self.stuck(time.monotonic()):
                 self.dumped = True
                 self.dump()
+                print(f"::error::the run used under {self.IDLE * 100:.0f}% of a core for {self.STILL // 60} min: stuck, stopped (the threads are above)", flush=True)
+                self.proc.kill()
 
     def __enter__(self):
         self.sampler.start()
@@ -164,7 +168,7 @@ def run(command, cwd, env, seen, failed, watch_dirs):
     whether any of its tests failed and its `Watch`."""
     print(" ".join(command), flush=True)
     proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
-    with Watch(proc.pid, watch_dirs) as watch:
+    with Watch(proc, watch_dirs) as watch:
         return *read(proc, seen, failed), watch
 
 
