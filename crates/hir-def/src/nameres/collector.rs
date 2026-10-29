@@ -2874,8 +2874,29 @@ impl ModCollector<'_, '_> {
                 // follows: syn 1's `#[macro_use] mod token` has `Token!` from
                 // `include!("await.rs")`, and its `mod op` names it with nothing imported.
                 let prelude = || {
+                    // A block's def map is collected after the def maps around it, so what the
+                    // name is there (the std prelude, or an item of the module holding the
+                    // block) it stays. clang-sys's `load_manually` has a `mod build` in its
+                    // body whose `include!`d `macro_rules!` its `mod dynamic` uses.
                     if def_map.block.is_some() {
-                        return None;
+                        let local_def_map = self
+                            .def_collector
+                            .crate_local_def_map
+                            .unwrap_or(&self.def_collector.local_def_map);
+                        return def_map
+                            .resolve_path_fp_with_macro(
+                                local_def_map,
+                                db,
+                                ResolveMode::Other,
+                                self.module_id,
+                                path,
+                                BuiltinShadowMode::Module,
+                                Some(MacroSubNs::Bang),
+                            )
+                            .resolved_def
+                            .take_macros()
+                            .filter(|&id| sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
+                            .map(|it| it.definition(db));
                     }
                     let (prelude, _) = def_map.prelude?;
                     if prelude.krate(db) == def_map.krate {

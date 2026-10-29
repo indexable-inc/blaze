@@ -951,11 +951,19 @@ const INSTALLED_LIBRARY: &str = "/lib/rustlib/src/rust/";
 /// and `thread::min_stack`'s `MIN` were not found, and a program that spawned a thread or made
 /// a `HashMap` was refused (#840).
 fn place_path(symbols: &dyn SymbolResolver, path: Option<String>) -> Option<String> {
-    Some(path_everywhere(path?, symbols.cargo_home().as_deref()))
+    let library = symbols.library_sources().map(|it| it.here);
+    Some(path_everywhere(path?, symbols.cargo_home().as_deref(), library.as_deref()))
 }
 
-/// [`place_path`] with cargo's directory on this machine at `cargo_home`.
-fn path_everywhere(path: String, cargo_home: Option<&str>) -> String {
+/// [`place_path`] with cargo's directory on this machine at `cargo_home`, and the standard
+/// library's `library/` at `library`: `/rustc/library/...` names a file of it wherever it is,
+/// in a toolchain or as blaze's own.
+fn path_everywhere(path: String, cargo_home: Option<&str>, library: Option<&str>) -> String {
+    if let Some(rest) = library.and_then(|it| path.strip_prefix(it))
+        && let Some(rest) = rest.strip_prefix(['/', '\\'])
+    {
+        return format!("/rustc/library/{}", rest.replace('\\', "/"));
+    }
     let slashed = path.replace('\\', "/");
     if let Some(at) = slashed.find(INSTALLED_LIBRARY) {
         return format!("/rustc/{}", &slashed[at + INSTALLED_LIBRARY.len()..]);
@@ -1018,17 +1026,25 @@ mod tests {
         let runner = format!("/Users/runner/.rustup/toolchains/nightly-aarch64-apple-darwin/{std}");
         let user = format!("/home/me/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/{std}");
         let windows = format!(r"C:\Users\me\.rustup\toolchains\nightly\{}", std.replace('/', r"\"));
-        let named = path_everywhere(runner, None);
+        let named = path_everywhere(runner, None, None);
         assert_eq!(named, "/rustc/library/std/src/thread/mod.rs");
-        assert_eq!(path_everywhere(user, Some("/home/me/.cargo")), named);
-        assert_eq!(path_everywhere(windows, None), named);
+        assert_eq!(path_everywhere(user, Some("/home/me/.cargo"), None), named);
+        assert_eq!(path_everywhere(windows, None, None), named);
+        // blaze's own library, from a checkout or downloaded, is named as a toolchain's is.
+        let own = "/home/me/.blaze/library/b8b8/library/std/src/thread/mod.rs";
+        let at = Some("/home/me/.blaze/library/b8b8/library");
+        assert_eq!(path_everywhere(own.to_owned(), None, at), named);
+        let checkout = "/src/blaze/library/std/src/thread/mod.rs";
+        assert_eq!(path_everywhere(checkout.to_owned(), None, Some("/src/blaze/library")), named);
+        let beside = "/src/blaze/library-x/src/lib.rs";
+        assert_eq!(path_everywhere(beside.to_owned(), None, Some("/src/blaze/library")), beside);
         let fetched = "/home/me/.cargo/registry/src/index.crates.io-1/x-1.0.0/src/lib.rs";
         assert_eq!(
-            path_everywhere(fetched.to_owned(), Some("/home/me/.cargo")),
+            path_everywhere(fetched.to_owned(), Some("/home/me/.cargo"), None),
             "/cargo/registry/src/index.crates.io-1/x-1.0.0/src/lib.rs"
         );
         assert_eq!(
-            path_everywhere("src/main.rs".to_owned(), Some("/home/me/.cargo")),
+            path_everywhere("src/main.rs".to_owned(), Some("/home/me/.cargo"), None),
             "src/main.rs"
         );
     }

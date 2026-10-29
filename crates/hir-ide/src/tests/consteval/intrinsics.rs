@@ -708,7 +708,6 @@ fn a_grown_block_keeps_its_bytes() {
 }
 
 #[test]
-#[ignore = "frames are not freed yet (FREES_FRAMES in mir/eval.rs)"]
 fn stack_frames_are_freed() {
     // 2 GiB of locals in all, of 1 MiB a call.
     check_number(
@@ -955,6 +954,22 @@ fn signed_integer_log_in_a_type_alias() {
         "#
         ),
         20,
+    );
+}
+
+#[test]
+fn inline_const_compared_by_reference() {
+    // `x <= const { .. }` borrows both sides for `PartialOrd::le`: the constant is the block's
+    // value, not a reference to a local of its own frame, which is gone once it returns.
+    check_number(
+        r#"
+        //- minicore: ord, copy
+        const fn small(x: u32) -> u32 {
+            if x <= const { 3u32 } { 1 } else { 2 }
+        }
+        const GOAL: u32 = small(5) * 10 + small(2);
+        "#,
+        21,
     );
 }
 
@@ -1304,6 +1319,48 @@ fn atomic() {
         };
         "#,
         660 + 1024,
+    );
+}
+
+#[test]
+fn atomic_with_const_generic_orderings() {
+    // The pinned nightly's spelling: the orderings are const generics, not name suffixes.
+    check_number(
+        r#"
+        //- minicore: copy
+        #[rustc_intrinsic]
+        pub fn atomic_load<T: Copy, const ORD: u8, const VOLATILE: bool>(src: *const T) -> T;
+        #[rustc_intrinsic]
+        pub fn atomic_store<T: Copy, const ORD: u8, const VOLATILE: bool>(dst: *mut T, val: T);
+        #[rustc_intrinsic]
+        pub fn atomic_xadd<T: Copy, U: Copy, const ORD: u8>(dst: *mut T, src: U) -> T;
+        #[rustc_intrinsic]
+        pub fn atomic_max<T: Copy, const ORD: u8>(dst: *mut T, src: T) -> T;
+        #[rustc_intrinsic]
+        pub fn atomic_min<T: Copy, const ORD: u8>(dst: *mut T, src: T) -> T;
+        #[rustc_intrinsic]
+        pub fn atomic_umin<T: Copy, const ORD: u8>(dst: *mut T, src: T) -> T;
+        #[rustc_intrinsic]
+        pub fn atomic_cxchg<T: Copy, const S: u8, const F: u8>(dst: *mut T, old: T, src: T) -> (T, bool);
+        #[rustc_intrinsic]
+        pub fn atomic_fence<const ORD: u8>();
+
+        const GOAL: i32 = {
+            let mut x = 5i32;
+            atomic_store::<i32, 4, false>(&mut x, 10);
+            atomic_xadd::<i32, i32, 4>(&mut x, 7);
+            atomic_fence::<4>();
+            let old = atomic_max::<i32, 4>(&mut x, -3);
+            let before = atomic_max::<i32, 4>(&mut x, 40);
+            let mut u = 7u32;
+            atomic_umin::<u32, 4>(&mut u, 3);
+            let mut n = -10i32;
+            atomic_min::<i32, 4>(&mut n, 5);
+            let (prev, ok) = atomic_cxchg::<i32, 4, 4>(&mut x, 40, 41);
+            atomic_load::<i32, 4, false>(&x) + old + before + u as i32 + n + prev + ok as i32
+        };
+        "#,
+        41 + 17 + 17 + 3 - 10 + 40 + 1,
     );
 }
 

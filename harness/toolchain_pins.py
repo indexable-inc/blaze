@@ -5,13 +5,16 @@ static.rust-lang.org. blaze refuses a download whose bytes hash to anything else
 has what that rustc says its version is and the commit it was built from, which blaze and the
 harnesses compare a rustc with; harness/toolchain (`nightly-YYYY-MM-DD`) is the one pin.
 
-    toolchain_pins.py            say whether pins.txt is what the manifest says
-    toolchain_pins.py --write    write pins.txt, after harness/toolchain moves
+    toolchain_pins.py '{}'                  say whether pins.txt is what the manifest says
+    toolchain_pins.py '{"write": true}'     write pins.txt, after harness/toolchain moves
+
+The JSON is inline, a file's path, or `-` for stdin.
 
 The manifest itself is checked against the `.sha256` the Rust project publishes beside it, and
 its own hash is pinned too, since blaze writes it into the toolchain as rustup does.
 """
-import hashlib, os, sys, tomllib, urllib.request
+import hashlib, json, os, sys, tomllib, urllib.request
+from dataclasses import dataclass, fields
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -24,11 +27,10 @@ DIST = "https://static.rust-lang.org/dist"
 # The hosts blaze has a build for, and Windows for `cargo install`.
 HOSTS = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
          "x86_64-pc-windows-msvc"]
-# rustup's `minimal` profile without rust-docs, the standard library of wasm32-wasip1, which
-# proc macros are built for (crates/blaze-cargo/src/cargo/own_macro.rs), and the standard library's
-# source. `None` is the host.
-COMPONENTS = [("rustc", None), ("cargo", None), ("rust-std", None), ("rust-std", "wasm32-wasip1"),
-              ("rust-src", "*")]
+# rustup's `minimal` profile without rust-docs, and the standard library of wasm32-wasip1, which
+# proc macros are built for (crates/blaze-cargo/src/cargo/own_macro.rs). `None` is the host. The
+# standard library's source is not downloaded: it is blaze's own library/ (docs/toolchain.md).
+COMPONENTS = [("rustc", None), ("cargo", None), ("rust-std", None), ("rust-std", "wasm32-wasip1")]
 
 
 def get(url):
@@ -55,7 +57,7 @@ def pins():
     commit = channel["pkg"]["rust"]["git_commit_hash"]
     lines = [
         f"# The Rust nightly blaze downloads as its own toolchain: written by",
-        f"# harness/toolchain_pins.py --write from {DIST}/{DATE}/channel-rust-{CHANNEL}.toml.",
+        f"# harness/toolchain_pins.py '{{\"write\": true}}' from {DIST}/{DATE}/channel-rust-{CHANNEL}.toml.",
         f"# release <toolchain> <date> <channel>; rustc <what `rustc -V` says after `rustc `>;",
         f"# commit <rust-lang/rust commit>; manifest <sha256> <bytes>; then per host",
         f"# <host> <package> <target> <sha256 of the .tar.xz> <bytes>.",
@@ -78,9 +80,36 @@ def pins():
     return "\n".join(lines) + "\n"
 
 
+@dataclass(frozen=True)
+class Pins:
+    write: bool = False
+
+
+def typed(text):
+    """[`Pins`] from the JSON `text` (inline, a path, or `-`); exits naming the field that is wrong."""
+    if text == "-":
+        text = sys.stdin.read()
+    elif text and not text.lstrip().startswith("{"):
+        text = open(text).read()
+    try:
+        value = json.loads(text or "{}")
+    except json.JSONDecodeError as e:
+        sys.exit(f"toolchain_pins.py: the input is not JSON: {e}")
+    if not isinstance(value, dict):
+        sys.exit("toolchain_pins.py: the input is a JSON object")
+    if unknown := sorted(set(value) - {f.name for f in fields(Pins)}):
+        sys.exit(f"toolchain_pins.py: no field {', '.join(unknown)} (fields: write)")
+    if not isinstance(value.get("write", False), bool):
+        sys.exit(f"toolchain_pins.py: field write is a bool, not {value['write']!r}")
+    return Pins(**value)
+
+
 def main():
+    if len(sys.argv) > 2:
+        sys.exit(f"usage: toolchain_pins.py '<json>'\n\n{__doc__}")
+    asked = typed(sys.argv[1] if len(sys.argv) == 2 else "")
     written = pins()
-    if "--write" in sys.argv:
+    if asked.write:
         with open(PINS, "w") as out:
             out.write(written)
         print(f"wrote {os.path.relpath(PINS, ROOT)} for Rust {RELEASE}")
@@ -88,7 +117,7 @@ def main():
     have = open(PINS).read() if os.path.exists(PINS) else ""
     if have != written:
         sys.exit(f"{os.path.relpath(PINS, ROOT)} is not what Rust {RELEASE}'s manifest says: "
-                 "toolchain_pins.py --write writes it")
+                 "toolchain_pins.py '{\"write\": true}' writes it")
     print(f"{os.path.relpath(PINS, ROOT)} is Rust {RELEASE}'s manifest")
 
 

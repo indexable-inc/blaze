@@ -14,7 +14,7 @@ A bump, in order (each step names itself when it fails, and stops there):
  1. picks the nightly: the given date, or the newest of the last two weeks whose manifest has
     rustc, cargo, rust-std, rust-src, llvm-tools, rustfmt, clippy, rust-analyzer and (but on
     Windows) rustc-codegen-cranelift-preview for every host blaze ships for;
- 2. writes harness/toolchain and runs toolchain_pins.py --write (pins.txt: the files' hashes,
+ 2. writes harness/toolchain and runs toolchain_pins.py '{"write": true}' (pins.txt: the files' hashes,
     the nightly's `rustc -V` and its rust-lang/rust commit);
  3. re-vendors from rust-lang/rust at the new commit: crates/rustc_abi/src is
     compiler/rustc_abi/src copied as it is, and vendor/proc-macro-srv is upstream's crates at
@@ -22,7 +22,7 @@ A bump, in order (each step names itself when it fails, and stops there):
     apply; a conflict stops the bump and names the files);
  4. merges the new nightly's standard library into library/ (`library.py merge`): upstream's
     changes since library/UPSTREAM's nightly, applied three-way, so blaze's own changes to it
-    (library/PATCHES.md) are kept; a conflict stops the bump and names the files. It runs when
+    are kept; a conflict stops the bump and names the files. It runs when
     the pin is already the nightly's too, so a bump branch made before library/ catches up;
  5. moves the pins written down elsewhere: the old toolchain name, rustc version line and
     commit in install.sh and vendor/proc-macro-srv (RUSTC_VERSION_STRING, the manifest's
@@ -337,7 +337,7 @@ async def bump(date):
         return
     print(f"moving {old[0]} ({old[1]}) to {name} ({channel['pkg']['rustc']['version']})")
     open(PIN, "w").write(name + "\n")
-    await run("pins", sys.executable, os.path.join(HERE, "toolchain_pins.py"), "--write", bound=900)
+    await run("pins", sys.executable, os.path.join(HERE, "toolchain_pins.py"), '{"write": true}', bound=900)
     new = pinned()
     await vendor(old[2], new[2])
     await library(date)
@@ -369,7 +369,7 @@ async def checks():
     await run("build", "cargo", "build", "-p", "blaze-engine", "--release", env=env, bound=3600)
     env.setdefault("BLAZE_BIN", os.path.join(ROOT, "target/release/blaze-engine"))
     harness = [
-        ["toolchain_pins.py"],
+        ["toolchain_pins.py", "{}"],
         ["answers.py"],
         ["macroserver.py"],
         ["difftest.py", "corpus", "--bin", "runner", "--crate", "cases", "--layouts"],

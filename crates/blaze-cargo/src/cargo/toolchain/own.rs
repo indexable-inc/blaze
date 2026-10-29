@@ -1,7 +1,7 @@
 //! blaze's own copy of the Rust release it builds with, for a machine with no rustup or whose
 //! rustup does not have that release (docs/self-contained.md, "blaze's own toolchain"). It is
-//! the release's `rustc`, `cargo`, `rust-std` and `rust-src` as the Rust project publishes them,
-//! each checked against the sha256 `pins.txt` has for it (`harness/toolchain_pins.py` writes
+//! the release's `rustc`, `cargo` and `rust-std` as the Rust project publishes them (the source
+//! of the standard library is blaze's own, `library.rs`), each checked against the sha256 `pins.txt` has for it (`harness/toolchain_pins.py` writes
 //! that from the release's manifest), and laid out in `~/.blaze/toolchains/<release>-<host>`
 //! as rustup lays out a toolchain, its records and channel manifest included, so that what
 //! reads a sysroot reads this one unchanged.
@@ -144,7 +144,7 @@ pub fn rustc_version() -> &'static str {
     PINS.lines()
         .find_map(|it| it.strip_prefix("rustc "))
         .map(str::trim)
-        .expect("pins.txt has the rustc line: harness/toolchain_pins.py --write")
+        .expect("pins.txt has the rustc line: harness/toolchain_pins.py '{\"write\": true}'")
 }
 
 /// The commit of rust-lang/rust the toolchain blaze builds with was built from: what a
@@ -153,7 +153,7 @@ pub fn commit() -> &'static str {
     PINS.lines()
         .find_map(|it| it.strip_prefix("commit "))
         .map(str::trim)
-        .expect("pins.txt has the commit line: harness/toolchain_pins.py --write")
+        .expect("pins.txt has the commit line: harness/toolchain_pins.py '{\"write\": true}'")
 }
 
 /// The host's tuple, as the Rust project names its builds.
@@ -184,7 +184,6 @@ fn whole(dir: &Path) -> bool {
         format!("bin/cargo{exe}"),
         format!("bin/rustc{exe}"),
         "lib/rustlib/multirust-channel-manifest.toml".to_owned(),
-        "lib/rustlib/src/rust/library".to_owned(),
     ];
     needed.iter().all(|it| dir.join(it).exists())
 }
@@ -215,7 +214,7 @@ fn fetch_from(
         format!(
             "blaze builds with Rust {0}, which it downloads once, and the download failed. \
              Running the command again tries again, going on from where a download stopped; on \
-             a machine with no network, `rustup toolchain install {0} --component rust-src` \
+             a machine with no network, `rustup toolchain install {0}` \
              gives blaze the same Rust.\n  {e}",
             release.version
         )
@@ -736,7 +735,7 @@ mod tests {
     #[test]
     fn pins_are_of_the_host_and_the_release_blaze_builds_with() {
         let ours = Release::read(PINS, "x86_64-unknown-linux-gnu").unwrap();
-        assert_eq!(ours.version, super::super::OURS.trim(), "harness/toolchain_pins.py --write");
+        assert_eq!(ours.version, super::super::OURS.trim(), "toolchain_pins.py '{{\"write\": true}}'");
         assert_eq!(ours.channel, "nightly");
         assert!(ours.rustc.contains("-nightly ("), "{}", ours.rustc);
         let names: Vec<_> = ours.components.iter().map(Component::name).collect();
@@ -747,15 +746,17 @@ mod tests {
                 "cargo-x86_64-unknown-linux-gnu",
                 "rust-std-x86_64-unknown-linux-gnu",
                 "rust-std-wasm32-wasip1",
-                "rust-src"
             ],
             "proc macros are built for wasm32-wasip1 (own_macro.rs), so its library is pinned"
         );
-        assert_eq!(ours.components[4].file(ours.channel), "rust-src-nightly.tar.xz");
+        assert!(
+            !names.iter().any(|it| it == "rust-src"),
+            "the standard library's source is blaze's library/, not the release's"
+        );
         assert!(Release::read(PINS, "riscv64gc-unknown-linux-gnu").is_none());
         for host in ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
         {
-            assert_eq!(Release::read(PINS, host).unwrap().components.len(), 5, "{host}");
+            assert_eq!(Release::read(PINS, host).unwrap().components.len(), 4, "{host}");
         }
     }
 
@@ -823,7 +824,6 @@ mod tests {
                 std::fs::create_dir_all(dir.join(path).parent().unwrap()).unwrap();
                 std::fs::write(dir.join(path), "").unwrap();
             }
-            std::fs::create_dir_all(dir.join("lib/rustlib/src/rust/library")).unwrap();
         };
         // The test release is channel 9.9.9 of 2000-01-01.
         whole("9.9.9-1999-12-31-test-host");
