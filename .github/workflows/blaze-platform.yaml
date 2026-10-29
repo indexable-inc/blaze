@@ -123,7 +123,7 @@ jobs:
       # compiled. Run out here, the step fails and main's push still runs.
       - if: env.BLAZE == 'true'
         timeout-minutes: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 335 || startsWith(inputs.os, 'macos') && 220 || 150 }}
-        run: $PYTHON harness/unittests.py --events json
+        run: $PYTHON harness/unittests.py
       - if: env.BLAZE != 'true'
         run: |
           $PYTHON harness/unittests.py '{"cargo": true}'
