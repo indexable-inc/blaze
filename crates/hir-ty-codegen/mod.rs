@@ -106,6 +106,7 @@ pub use backend::{Backend, builds_edits, links_own, sections_of_their_own};
 mod cached;
 mod debuginfo;
 pub use debuginfo::Sidecar;
+pub mod counted;
 mod f16_f128;
 pub mod flight;
 mod float_pair;
@@ -768,8 +769,18 @@ impl CodegenUnit {
         denied: &FxHashSet<FunctionId>,
         known: &mut Rejections,
     ) -> Result<CodegenUnit> {
-        let unit =
-            CodegenUnit::compile_or_hold(db, symbols, roots, denied, known, &|| false, false)?;
+        let counting = counted::Counting::start();
+        let counted = counting.counted();
+        let unit = CodegenUnit::compile_or_hold(
+            db,
+            symbols,
+            roots,
+            denied,
+            known,
+            &|| false,
+            false,
+            counted,
+        )?;
         Ok(unit.expect("a build that is never held makes a unit"))
     }
 
@@ -781,6 +792,10 @@ impl CodegenUnit {
     /// With `undoable`, a full build that replaces another keeps what it replaced until
     /// [`Rejections::keep_built`] or [`Rejections::undo_built`]: a build the daemon refuses
     /// once it is made is undone, and the next edit is a patch of the build before it.
+    ///
+    /// `counted` is what counts the compiles of this build, on this thread and the threads
+    /// that work for it ([`counted::Counting`]): the stats say it compiled what it counted, and
+    /// had the rest of its bodies from before.
     pub fn compile_or_hold(
         db: &dyn HirDatabase,
         symbols: &dyn SymbolResolver,
@@ -789,6 +804,7 @@ impl CodegenUnit {
         known: &mut Rejections,
         hold: &dyn Fn() -> bool,
         undoable: bool,
+        counted: &counted::Counted,
     ) -> Result<Option<CodegenUnit>> {
         backend::keep_frame_pointers(symbols.keeps_frame_pointers());
         let on_demand: FxHashSet<FunctionId> = roots.on_demand.iter().copied().collect();
@@ -852,7 +868,7 @@ impl CodegenUnit {
             };
             if let Some(patch) = patch {
                 backend::Tally::global().report();
-                let compiled_now = known.compiled_since_last_build();
+                let compiled_now = counted.compiled();
                 known.stats = BuildStats {
                     bodies: base.bodies,
                     reused: base.bodies.saturating_sub(compiled_now),
@@ -912,7 +928,6 @@ impl CodegenUnit {
             full,
             forgot_rustc: _,
             patching: _,
-            counted,
             stale: _,
             frozen,
             used_by_rustc: _,
@@ -1203,8 +1218,7 @@ impl CodegenUnit {
                         }
                     });
                 }
-                let total = COMPILED.load(std::sync::atomic::Ordering::Relaxed);
-                let compiled_now = total - std::mem::replace(counted, total);
+                let compiled_now = counted.compiled();
                 *stats = BuildStats {
                     bodies: cg.bodies,
                     reused: cg.bodies.saturating_sub(compiled_now),
@@ -1441,8 +1455,6 @@ pub struct Rejections {
     forgot_rustc: Option<&'static str>,
     frozen: patch::Frozen,
     stale: Vec<Stale>,
-    /// How many functions had been compiled when the last build finished.
-    counted: usize,
     pub stats: BuildStats,
     /// The functions at a level above 1, which a patch has at that level.
     pub tiers: tier::Tiers,
@@ -1463,9 +1475,9 @@ impl Rejections {
     /// Whether there was one to put back.
     pub fn undo_built(&mut self) -> bool {
         let Some(kept) = self.undo.take() else { return false };
-        let (counted, stats) = (self.counted, self.stats);
+        let stats = self.stats;
         *self = *kept;
-        (self.counted, self.stats) = (counted, stats);
+        self.stats = stats;
         true
     }
 
@@ -1482,17 +1494,6 @@ impl Rejections {
         for (instance, rejected) in &other.rejected {
             self.rejected.entry(instance.clone()).or_insert_with(|| rejected.clone());
         }
-    }
-
-    /// Leaves what was compiled since the last build out of the next one's count: it was
-    /// another build's, made before it.
-    pub fn not_counted(&mut self) {
-        self.compiled_since_last_build();
-    }
-
-    fn compiled_since_last_build(&mut self) -> usize {
-        let total = COMPILED.load(std::sync::atomic::Ordering::Relaxed);
-        total - std::mem::replace(&mut self.counted, total)
     }
 
     /// Looks at one part in `parts` of what the last full build compiled for what an edit
@@ -2597,9 +2598,6 @@ fn selected_target() -> Result<&'static Target> {
     Target::selected().map_err(CodegenError::Backend)
 }
 
-/// How many functions went through Cranelift since the process started.
-static COMPILED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// What tells compiled code from any other: equal for the same code however often an edit
 /// went away from it and came back, so that a patch holds what differs from its base alone.
 fn print_of(code: &impl std::hash::Hash) -> u128 {
@@ -2826,35 +2824,11 @@ fn rows_of(db: &dyn HirDatabase, compiled: &CompiledFunction) -> Vec<Row> {
     rows.collect()
 }
 
-/// How many functions and instances this process has compiled: salsa running the query, not
-/// handing back what it has. What a build says of itself as it goes reads it.
-static COMPILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// The functions of the source compiled since [`take_recompiled`], the first
 /// [`RECOMPILED_KEPT`] of them, and how many there were: what a build says it rebuilt.
 static RECOMPILED: std::sync::Mutex<(Vec<FunctionId>, usize)> =
     std::sync::Mutex::new((Vec::new(), 0));
 const RECOMPILED_KEPT: usize = 64;
-
-/// How many functions and instances this process has compiled.
-pub fn compiled_so_far() -> usize {
-    COMPILES.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// [`COMPILES`] by the crate each was compiled for: what the build's tree of crates says of
-/// each as it goes.
-static COMPILES_OF: LazyLock<std::sync::Mutex<FxHashMap<Crate, usize>>> =
-    LazyLock::new(Default::default);
-
-fn compiles_of(krate: Crate) {
-    *COMPILES_OF.lock().unwrap_or_else(|e| e.into_inner()).entry(krate).or_default() += 1;
-}
-
-/// How many functions and instances this process has compiled for each crate.
-pub fn compiled_by_crate() -> Vec<(Crate, usize)> {
-    let counts = COMPILES_OF.lock().unwrap_or_else(|e| e.into_inner());
-    counts.iter().map(|(&krate, &count)| (krate, count)).collect()
-}
 
 /// A function of the source a build compiled: its name, the crate it is of and the file it
 /// is written in.
@@ -2905,8 +2879,7 @@ fn in_source(db: &dyn HirDatabase, id: InFile<span::ErasedFileAstId>) -> bool {
 fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<CompiledFunction> {
     let _timer = watch::Timer::of(|| watch::Timed::Root(func));
     let _span = tracing::info_span!(target: "blaze", "compiled_root").entered();
-    COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    compiles_of(func.krate(db));
+    counted::compiles(func.krate(db));
     let _flight = flight::Flight::root(db, func);
     {
         let mut recompiled = RECOMPILED.lock().unwrap_or_else(|e| e.into_inner());
@@ -3109,8 +3082,7 @@ fn compiled_instance<'db>(
 ) -> Result<CompiledFunction> {
     let _timer = watch::Timer::of(|| watch::Timed::instance(&instance, &env));
     let _span = tracing::info_span!(target: "blaze", "compiled_instance").entered();
-    COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    compiles_of(env.krate);
+    counted::compiles(env.krate);
     let _flight = flight::Flight::instance(db, &instance, &env);
     tier::for_build(|| instance_code(db, instance, env, Detach::No)).map(Produced::code)
 }
@@ -4783,7 +4755,7 @@ fn compile_as<'db>(
     let (requests, layouts) = cg.finish();
     // What a build compiled, which a compile at a level above 1 is not part of.
     if !tier {
-        COMPILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        counted::compiled();
     }
     Ok(Produced::Code(CompiledFunction {
         requests,

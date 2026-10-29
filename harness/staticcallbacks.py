@@ -38,7 +38,9 @@ def values(value, tag):
 
 
 def main():
-    work = tempfile.mkdtemp(prefix="blaze-callbacks-")
+    # Not macOS's temporary directory (/var/folders/...): the daemon's socket under it passes
+    # the 104 bytes macOS has for one.
+    work = tempfile.mkdtemp(prefix="blaze-callbacks-", dir="/tmp" if sys.platform == "darwin" else None)
     ws = os.path.realpath(os.path.join(work, "ws"))
     for file, text in (("Cargo.toml", MANIFEST), ("src/main.rs", MAIN), ("values/Cargo.toml",
                        '[package]\nname = "values"\nversion = "0.1.0"\nedition = "2021"\n'),
