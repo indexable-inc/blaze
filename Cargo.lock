@@ -739,6 +739,7 @@ dependencies = [
  "blaze-ui",
  "blaze-units",
  "blaze-wasi",
+ "blaze-web",
  "cargo-platform",
  "cargo-util-schemas",
  "cargo_metadata",
@@ -988,6 +989,7 @@ dependencies = [
  "salsa",
  "sha2 0.10.9",
  "span",
+ "target-lexicon",
  "tt",
  "wasmtime",
 ]
@@ -1182,6 +1184,19 @@ dependencies = [
  "anyhow",
  "wasmtime",
  "wasmtime-wasi",
+]
+
+[[package]]
+name = "blaze-web"
+version = "0.0.0"
+dependencies = [
+ "base64",
+ "blaze-protocol",
+ "flate2",
+ "flecs-c",
+ "getrandom 0.3.4",
+ "rustc-hash 2.1.2",
+ "sha1 0.10.7",
 ]
 
 [[package]]
@@ -1431,6 +1446,13 @@ checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
 dependencies = [
  "lazy_static",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "const-ast"
+version = "0.0.0"
+dependencies = [
+ "syntax",
 ]
 
 [[package]]
@@ -2091,6 +2113,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "flecs-c"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2468,6 +2497,7 @@ name = "hir-ide"
 version = "0.0.0"
 dependencies = [
  "base-db",
+ "const-ast",
  "cov-mark",
  "either",
  "expect-test",

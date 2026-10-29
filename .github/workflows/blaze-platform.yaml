@@ -120,7 +120,8 @@ jobs:
         timeout-minutes: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 335 || startsWith(inputs.os, 'macos') && 220 || 150 }}
         run: $PYTHON harness/unittests.py
       - if: env.BLAZE != 'true'
-        run: $PYTHON harness/unittests.py --cargo
+        run: |
+          $PYTHON harness/unittests.py '{"cargo": true}'
       # What was compiled, and each test that passed, for the runs after this one; a run whose
       # tests failed pushes too, since what it compiled is no less right. The daemons end
       # first: a push sends sealed packs, and a daemon's last pack seals when it ends.

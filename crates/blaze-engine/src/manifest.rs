@@ -20,7 +20,10 @@
 //! has a manifest of writes its files; `check` builds in full anyway and fails the build when
 //! what it wrote is not the manifest's; `off` neither reads nor writes one.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use ide_db::{
     RootDatabase,
@@ -441,32 +444,62 @@ pub(crate) fn lookup(
     Ok(files)
 }
 
-/// Keeps what the build of `args` under `key` wrote, the files at `wrote`, as its manifest.
-pub(crate) fn keep(
+/// What the build of `args` under `key` wrote, the files at `wrote`, read to be kept as its
+/// manifest by [`Keeping::keep`].
+pub(crate) fn keeping(
     db: &RootDatabase,
     args: &Args,
     key: &Hash,
     wrote: &[PathBuf],
-) -> Result<usize, String> {
+) -> Result<Keeping, String> {
     let store = blaze_store::Store::global().ok_or("there is no store")?;
     let mut files = Vec::with_capacity(wrote.len());
-    let mut bytes_kept = 0;
     for path in wrote {
-        let reading = |e: std::io::Error| format!("reading {}: {e}", path.display());
-        let file = std::fs::File::open(path).map_err(reading)?;
-        // Mapped and not read: the files of a large program are hundreds of megabytes, which
-        // the store writes from here. SAFETY: the daemon is the one that had them written,
-        // and it does not start another build while this keeps them.
-        let bytes = unsafe { memmap2::Mmap::map(&file) }.map_err(reading)?;
-        let content: Hash = Sha256::digest(&bytes).into();
-        store.insert(&content_key(&content), &bytes);
-        bytes_kept += bytes.len();
-        files.push(Written { path: named(args, path), content });
+        // Read and not mapped: the next build may write the file again, in place, while
+        // this is kept.
+        let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+        files.push((named(args, path), bytes));
     }
-    let manifest = Manifest { reads: Reads::of(db), files };
-    store.insert(key, &manifest.encode());
-    store.flush();
-    Ok(bytes_kept)
+    Ok(Keeping { store, key: *key, reads: Reads::of(db), files })
+}
+
+/// A manifest and the files it names, to be added to the store.
+pub(crate) struct Keeping {
+    store: &'static blaze_store::Store,
+    key: Hash,
+    reads: Reads,
+    files: Vec<(String, Vec<u8>)>,
+}
+
+impl Keeping {
+    /// Keeps it beside what the build does next, as what codegen kept is: the next full
+    /// build and the end of the process wait for it. `then` is told how many bytes the
+    /// files were and how long keeping them took.
+    pub(crate) fn settle(self, then: impl FnOnce(usize, Duration) + Send + 'static) {
+        self.store.settle_with(move || {
+            let start = Instant::now();
+            let bytes = self.keep();
+            then(bytes, start.elapsed());
+        });
+    }
+
+    /// Adds the files and then the manifest that names them, and returns how many bytes
+    /// the files are.
+    fn keep(self) -> usize {
+        let Keeping { store, key, reads, files } = self;
+        let mut written = Vec::with_capacity(files.len());
+        let mut bytes_kept = 0;
+        for (path, bytes) in files {
+            let content: Hash = Sha256::digest(&bytes).into();
+            store.insert(&content_key(&content), &bytes);
+            bytes_kept += bytes.len();
+            written.push(Written { path, content });
+        }
+        let manifest = Manifest { reads, files: written };
+        store.insert(&key, &manifest.encode());
+        store.flush();
+        bytes_kept
+    }
 }
 
 /// For `BLAZE_MANIFEST=check`: whether the files the full build wrote at `wrote` are those

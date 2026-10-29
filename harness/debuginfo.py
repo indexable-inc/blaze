@@ -575,7 +575,7 @@ class Pdb:
         ours = set()
         self.procedures, self.lines, self.variables = [], [], 0
         for module in re.split(r"^\s*Mod (?=\d{4} \|)", symbols, flags=re.M)[1:]:
-            if "Ver = blaze " not in module:
+            if not re.search(r"Ver = blaze\b", module):
                 continue
             ours.add(module[:4])
             self.variables += len(re.findall(r"\| S_(?:LOCAL|REGREL32|BPREL32|REGISTER) ", module))
@@ -630,7 +630,7 @@ def verify(tally, what, binary):
         verdict = "INVALID" if not pdb.sound else "NOT ITS PDB" if not pdb.same else "sound" if pdb.modules else "NO UNIT"
         return tally.say(f"{what}: llvm-pdbutil reads the PDB", verdict, f"{pdb.modules} modules of blaze's")
     read = subprocess.run([DWARFDUMP, "--verify", binary], capture_output=True, text=True)
-    ours = sum(bool(re.search(r'DW_AT_producer\s+\("blaze ', unit)) for unit in units(binary))
+    ours = sum(bool(re.search(r'DW_AT_producer\s+\("blaze[ "]', unit)) for unit in units(binary))
     wrong = read.returncode != 0 or "No errors." not in read.stdout
     said = next((l for l in read.stdout.splitlines() if "error" in l.lower()), "")
     verdict = "INVALID" if wrong else "sound" if ours else "NO UNIT"
@@ -696,7 +696,7 @@ def own_ranges(binary):
     """Where the code of each function of blaze's is, as its units say."""
     ours = set()
     for unit in units(binary):
-        if re.search(r'DW_AT_producer\s+\("blaze ', unit):
+        if re.search(r'DW_AT_producer\s+\("blaze[ "]', unit):
             ours |= {(int(a, 16), int(b, 16)) for a, b in re.findall(r"\[0x([0-9a-f]+), 0x([0-9a-f]+)\)", unit)}
     return ours
 
@@ -1064,7 +1064,7 @@ def edited(tally, part):
         right = mine == theirs or (LLVM and mine == "<optimized out>")
         tally.say(f"{part}: the last binary: gdb prints an argument", "as cargo's" if right else "NOT AS CARGO'S", f"at = {mine}")
     if os.environ.get("CARGO_PROFILE_DEV_SPLIT_DEBUGINFO"):
-        kept = sum("DW_AT_GNU_dwo_name" in unit and bool(re.search(r'DW_AT_producer\s+\("blaze ', unit)) for unit in units(binary))
+        kept = sum("DW_AT_GNU_dwo_name" in unit and bool(re.search(r'DW_AT_producer\s+\("blaze[ "]', unit)) for unit in units(binary))
         tally.say(f"{part}: units of the last binary kept apart", "some" if kept else "NONE", str(kept))
     daemon.kill()
     if os.environ.get("BLAZE_SPLICE") != "0":
@@ -1389,7 +1389,7 @@ def settings(tally):
 
     def apart():
         """How many units of blaze's in the program have their entries in a file beside its object, which is there."""
-        named = re.findall(rf'DW_AT_producer\s+\("blaze .*?DW_AT_GNU_dwo_name\s+\("({re.escape(fx.objects[0])}[^"]*\.dwo)"\)', "".join(units(fx.binary)), re.S)
+        named = re.findall(rf'DW_AT_producer\s+\("blaze[ "].*?DW_AT_GNU_dwo_name\s+\("({re.escape(fx.objects[0])}[^"]*\.dwo)"\)', "".join(units(fx.binary)), re.S)
         return sum(os.path.exists(name) for name in named)
 
     linked = None

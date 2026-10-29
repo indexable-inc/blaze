@@ -1,0 +1,19 @@
+[package]
+name = "ce_inflate"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["const"]
+const = []
+
+[dependencies]
+miniz_oxide = "0.8"
+
+[build-dependencies]
+miniz_oxide = "0.8"
+
+[workspace]
+
+[workspace.metadata.blaze]
+const-eval = { steps = 100000000000 }

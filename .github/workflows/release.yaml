@@ -1,7 +1,8 @@
 name: release
 
 # A tag `v0.YYYYMMDD.N` (a dated version, .github/scripts/train_release.py) builds blaze for
-# Linux (x86_64, aarch64) and macOS (aarch64) and makes a GitHub release of that name: one tarball per target, a `.sha256` per tarball, SHA256SUMS, and the
+# Linux (x86_64, aarch64) and macOS (aarch64) and makes a GitHub release of that name: one tarball per target, a `.sha256` per tarball, SHA256SUMS,
+# the standard library's source `library-<digest>.tar.xz` (docs/toolchain.md), and the
 # notes (what CHANGELOG.md's [Unreleased] gained and what was merged since the release before). The release is a prerelease, the canary channel's,
 # until promote.yaml makes it stable (docs/release.md). Every tag (canary.yaml's, train_release.py's)
 # is on a commit of main as it is: no release commits a version to main, whose Cargo.toml stays
@@ -50,6 +51,15 @@ jobs:
         with:
           name: notes
           path: ${{ runner.temp }}/notes.md
+          if-no-files-found: error
+      # library/, which a blaze with no checkout of its commit downloads once and checks
+      # against its digest (crates/blaze-cargo/src/cargo/toolchain/library.rs).
+      - run: |
+          python3 -I harness/library.py archive "{\"out\": \"$RUNNER_TEMP/library\"}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: library
+          path: ${{ runner.temp }}/library/library-*.tar.xz
           if-no-files-found: error
 
   build:
@@ -187,7 +197,7 @@ jobs:
           EOF
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
             --title "blaze $GITHUB_REF_NAME" --notes-file out/notes.md \
-            out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS \
+            out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS out/library-*.tar.xz \
             out/manifests.* out/packs.* out/keys.*
       # A canary: the canary pointer names it (what a workspace pinned to canary reads), and
       # promote.yaml tests the archives just published and makes this same release stable when

@@ -99,6 +99,7 @@ pub fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
         Asked::Stop => stop()?,
         Asked::Why(args) => why::command(&args)?,
         Asked::Watch => watch()?,
+        Asked::Ui { open } => ui(open)?,
         Asked::Toolchain { path } => match toolchain::settle() {
             Ok(chosen) if path => {
                 println!("{}", chosen.dir().display());
@@ -143,6 +144,8 @@ usage: blaze <command> [cargo's flags]    (or blaze <command>)
   stop               ends the daemon; the next build starts one
   why [fn|crate]     what the last build compiled again and why
   watch              every build the daemon does, as it does it
+  ui                 the build page, down to every function: its address on 127.0.0.1, opened
+                     in the browser (`--no-open`: the address alone)
   toolchain          blaze's own toolchain, which it builds every project with, downloaded once
                      if it has none (`--path`: its directory)
   lock --fetches     records what build scripts download, by sha256, in Cargo.fetches.lock
@@ -470,6 +473,42 @@ fn watch() -> anyhow::Result<i32> {
         }
         _ => {
             eprintln!("error: {}", client::why_none());
+            Ok(FAILED)
+        }
+    }
+}
+
+/// `blaze ui`: the address of the build page (docs/web.md), which the daemon serves from the
+/// first time it is asked, and with `open` the page in the browser.
+fn ui(open: bool) -> anyhow::Result<i32> {
+    let url = match client::ask(Request::Ui, Start::IfMissing)? {
+        Some(Reply::Ui(Ok(url))) => url,
+        Some(Reply::Ui(Err(why))) => {
+            say::error(&why);
+            return Ok(FAILED);
+        }
+        Some(Reply::Restart { version }) => {
+            eprintln!("error: the daemon is another build of blaze, version {version}");
+            return Ok(FAILED);
+        }
+        _ => {
+            eprintln!("error: {}", client::why_none());
+            return Ok(FAILED);
+        }
+    };
+    println!("{url}");
+    if !open {
+        return Ok(0);
+    }
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    match std::process::Command::new(opener).arg(&url).status() {
+        Ok(status) if status.success() => Ok(0),
+        Ok(status) => {
+            eprintln!("error: `{opener}` of the page ended with {status}; open the address above");
+            Ok(FAILED)
+        }
+        Err(why) => {
+            eprintln!("error: `{opener}` of the page: {why}; open the address above");
             Ok(FAILED)
         }
     }

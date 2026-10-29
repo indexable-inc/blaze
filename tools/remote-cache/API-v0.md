@@ -12,10 +12,12 @@ puts objects at `<base>/<name>`.
 
 Allowed `<name>`s (anything else is the same 404 as an absent object):
 
-- `packs/<h>.pack`, `keys/<h>`, `units/<h>`: content-addressed, `<h>` = lowercase hex SHA-256 of the body.
+- `packs/<h>.pack`, `keys/<h>`, `index/<h>`, `units/<h>`: content-addressed, `<h>` = lowercase hex SHA-256 of the body.
+  `index/<h>` is a run or a shard of a project's key index (`crates/blaze-store/src/remote_index.rs`).
 - `packs/<h>.pack.zst`: `<h>` names the uncompressed pack; the body's own SHA-256 is sent as
   `x-blaze-sha256` on PUT, checked, stored, and returned on GET/HEAD as `x-blaze-sha256`.
-- `manifests/<project>`, `deps/<project>`: mutable lists (signed by the client, not by the Worker),
+- `manifests/<project>`, `deps/<project>`: mutable lists (a project's key index is the list
+  `manifests/<project>.index`) (signed by the client, not by the Worker),
   `<project>` matching `[A-Za-z0-9._-]{1,128}`.
 
 R2 key: `v3/<tenant id>/<name>` (tenant id opaque, from KV, never reused).

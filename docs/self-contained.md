@@ -61,8 +61,8 @@ it, and the step that ends the need for it ([no-rustc.md](no-rustc.md#the-plan))
 | `rust-lld` (`lib/rustlib/<host>/bin/gcc-ld`) | in `rustc` | blaze's own link on ELF targets (`link.rs`), as rustc links | blaze shipping its own lld, or the system linker |
 | `rust-analyzer-proc-macro-srv` (`libexec`) | in `rustc` | expanding proc macros with the libraries rustc built | J1 and J2 |
 | `rust-std-<host>` (the sysroot's rlibs) | 31.7 MB | linking what cargo and rustc built; `libstd`'s dynamic library for a proc macro's tests | F and G as the only build |
-| `rust-src` | 6.0 MB | the standard library's source, which blaze compiles (and which the shipped std unit is keyed by) | stays: it is source. Later shipped with blaze |
-| rustup | | finding the pinned nightly and its `rust-src` (`cargo/toolchain.rs`, #296), `multirust-channel-manifest.toml` for the release and commit (`answers/own.rs`, `lib.rs`) | blaze's own toolchain ([below](#blazes-own-toolchain-the-stopgap)) |
+| `rust-src` | 6.0 MB | not part of the toolchain since 2026-10-28: the standard library's source is blaze's `library/` ([toolchain.md](toolchain.md#the-standard-library-library)), kept in `~/.blaze/library/<digest>` and keyed by its digest. Unpatched it is `rust-src`'s bytes, downloaded beside the toolchain as that file; patched, the release's `library-<digest>.tar.xz` (6.0 MB) | gone from the toolchain (#402) |
+| rustup | | finding the pinned nightly (`cargo/toolchain.rs`, #296), `multirust-channel-manifest.toml` for the release (`answers/own.rs`) | blaze's own toolchain ([below](#blazes-own-toolchain-the-stopgap)) |
 
 On macOS the same pieces are 51.6, 8.9, 30.9 and 6.0 MB (97.4 MB); on Linux AArch64 118.2 MB.
 Unpacked they are 710 MB on Linux x86-64 and 548 MB on macOS.
@@ -74,13 +74,15 @@ Until K, J and M land, blaze still runs cargo and rustc for the first build and 
 macros. So that installing needs no rustup now, blaze keeps a toolchain of its own, private
 to it, that no project's pin or `PATH` changes:
 
-- **What:** the pinned nightly's `rustc`, `cargo`, `rust-std-<host>`, `rust-std-wasm32-wasip1` (the
-  WASI libc a proc macro's module is linked with, `own_macro.rs`) and `rust-src` components, as
-  the Rust project publishes them on static.rust-lang.org, unchanged. Not `rustfmt`, `clippy`,
+- **What:** the pinned nightly's `rustc`, `cargo`, `rust-std-<host>` and `rust-std-wasm32-wasip1`
+  (the WASI libc a proc macro's module is linked with, `own_macro.rs`) components, as the Rust
+  project publishes them on static.rust-lang.org, unchanged. Not `rust-src`: the standard
+  library's source is blaze's own (`library/`, `~/.blaze/library/<digest>`). Not `rustfmt`, `clippy`,
   `rust-docs` or `rust-analyzer`.
-- **Size:** 159.4 MB to download on Linux x86-64, 143.8 MB on Linux AArch64, 122.9 MB on
-  macOS, the same bytes rustup's `minimal` profile, `rust-src` and the `wasm32-wasip1` target
-  download today.
+- **Size:** 152.5 MB to download on Linux x86-64, 136.9 MB on Linux AArch64, 116.0 MB on
+  macOS (`pins.txt`), the same bytes rustup's `minimal` profile and the `wasm32-wasip1` target
+  download; 6.0 MB less than with `rust-src`, and blaze's library archive (6.0 MB) comes
+  beside it.
 - **Where:** `~/.blaze/toolchains/nightly-2026-10-25-<host>/` (`BLAZE_HOME` moves it), laid out as rustup
   lays out a toolchain, with its channel manifest, so that blaze's sysroot rules read it
   unchanged.
@@ -89,7 +91,7 @@ to it, that no project's pin or `PATH` changes:
   bytes differ is not used.
 - **When:** install.sh fetches it after installing blaze, and blaze fetches it itself on the
   first build that needs it and finds no other copy (a `cargo install` of blaze, a deleted
-  directory). A rustup that already has `nightly-2026-10-25` with `rust-src` is used as it is, rather than
+  directory). A rustup that already has `nightly-2026-10-25` is used as it is, rather than
   downloading the same bytes again.
 - **Who sees it:** nobody. cargo, rustc and the daemon blaze starts run from it (`CARGO`,
   `RUSTC`, `RUSTDOC` and `PATH` for the processes it starts); the user's own `cargo` and
@@ -98,8 +100,8 @@ to it, that no project's pin or `PATH` changes:
 Its removal, piece by piece, as the steps land: `cargo` when the resolver and fetcher below are
 the only source of a build's shape and K has no first cargo build; `rustc`, with `rust-lld`
 and the proc-macro server, when K, J and M are done and blaze links with a linker it ships or
-the system's; `rust-std` when G is the only build; `rust-src` becomes part of blaze's release,
-pruned to what the standard library's build reads. Each removal shrinks the download, and the
+the system's; `rust-std` when G is the only build. `rust-src` is gone already: the
+standard library's source is blaze's `library/`, part of blaze's release. Each removal shrinks the download, and the
 last leaves the 18 to 21 MB of blaze alone.
 
 ## Resolution and fetching
