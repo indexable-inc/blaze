@@ -7,11 +7,11 @@
  * - else `build` is not the one this tab last saw (the first frame after a load only notes it): only content changed,
  *   so client/nav.ts fetches the page in view again and swaps it in where it is (`blaze:refresh`).
  *
- * Either waits for a moment that loses the reader nothing: not while they type in a field with text in it, play the
- * narration, or drag; a hidden tab goes at once (unless it is playing). Until then a line in the feed
+ * Either waits for a moment that loses the reader nothing: not while they type in a field with text in it or drag;
+ * a hidden tab goes at once. Until then a line in the feed
  * (client/lib/feed.ts) says an update is ready, with a button to take it now. Just before, every script that owns state puts it in sessionStorage (`blaze:save`,
- * client/lib/page.ts): the page's scroll, the feed input's (client/lib/chat.ts `save`), comment drafts (client/comments.ts),
- * the narration's place (client/listen.ts). After the load each takes its part back once, and this clears the rest.
+ * client/lib/page.ts): the page's scroll, the feed input's (client/lib/chat.ts `save`), comment drafts (client/comments.ts).
+ * After the load each takes its part back once, and this clears the rest.
  *
  * After a reload whose assets still differ (a CDN behind), it doesn't reload again for LOOP_MS.
  */
@@ -105,7 +105,6 @@ function looping(assets: string): boolean {
 
 /** Whether going now would lose the reader something: a reload anything on the page, a refresh only the page's part. */
 function safe(kind: Want['kind']): boolean {
-	if (document.querySelector('.listen.playing')) return false;
 	if (document.hidden) return true;
 	if (dragging) return false;
 	const a = document.activeElement;

@@ -1,3 +1,7 @@
+---
+status: current
+summary: The harnesses that compare blaze with rustc, what each checks, and how CI runs them.
+---
 # The harnesses
 
 blaze is tested by comparison with rustc. Almost every script under `harness/` builds
@@ -376,14 +380,27 @@ change runs the two scripts alone. `.github/scripts/gate_changes.py` (the `chang
 those files, and why each: the crates (`crates/`, with their test data, the LLVM pin
 `crates/hir-ty-codegen/llvm.json` and the toolchain's `pins.txt`), the vendored crates
 (`vendor/`), `Cargo.toml`, `Cargo.lock`, `.cargo/`, `.rustfmt.toml` and `.clippy.toml`, the
-pinned nightly (`harness/toolchain`), `harness/unittests.py`, the flake (`flake.nix`,
-`flake.lock`), the release of blaze that builds blaze (`.github/blaze-version`, `install.sh`),
-`blaze.yaml`, `blaze-platform.yaml` and the actions they use (`toolchain`, `blaze`,
-`blaze-remote`, `rust-tests`); on a push to main, the smoke corpus too (`harness/smoke.py`,
+pinned nightly (`harness/toolchain`), `harness/unittests.py`, `.github/scripts/llvm.py`
+(which fetches the pinned LLVM), the release of blaze that builds blaze (`.github/blaze-version`,
+`install.sh`), `blaze.yaml`, `blaze-platform.yaml` and the actions they use (`toolchain`,
+`blaze`, `blaze-remote`, `rust-tests`); on a push to main, the smoke corpus too (`harness/smoke.py`,
 `harness/smoke/`), which the `warm` tier runs. It names what is code rather than what is not,
 so a new directory of documents, benches or harnesses runs no build; a list of files that
 cannot be had (a run by hand, a comparison of 300 files or more, GitHub refusing) counts as
 code. When the build or the unit tests start reading a new file, add it there.
+
+The build and the unit tests of the `gate` and `warm` tiers install no rustup and no Nix: a
+checkout, then `.github/actions/blaze`, which installs the release of blaze as a user does, with
+install.sh fetching its own Rust (the release's pinned `rustc`, `cargo`, `rust-std` and
+`rust-src`, into `~/.blaze/toolchains`,
+[self-contained.md](self-contained.md#blazes-own-toolchain-the-stopgap)), and for the build the
+pinned LLVM as a contributor outside Nix gets it
+([contributing.md](contributing.md#llvm-for---features-llvm)): `.github/scripts/llvm.py fetch`
+into `/usr/local/lib/blaze-llvm/<triple>`, checked against `crates/hir-ty-codegen/llvm.json`'s
+sha256, as `LLVM_SYS_231_PREFIX`. Neither is cached by CI. The C compiler, linker and libc are
+the runner's (gcc and glibc 2.39 on Ubuntu 24.04, Xcode's clang on macOS), so what the build and
+the tests link runs on the runner; the train's tiers still build with cargo in the flake's dev
+shell, against its glibc, and their harness jobs install Nix for that.
 
 A change reaches main through a **pull request** alone
 ([contributing.md](contributing.md#landing-a-change)), merged directly once `ci` passes on it;

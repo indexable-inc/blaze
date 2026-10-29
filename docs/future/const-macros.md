@@ -1,3 +1,8 @@
+---
+status: plan
+summary: Const macros: proc macros written inline as const fn, run by the const evaluator. Stage 0 is experimental.
+date: 2026-10-28
+---
 # Const macros: proc macros written inline as `const fn`
 
 Status: design. Stage 0 of the prototype ([below](#the-prototype-stage-0)) is on main behind

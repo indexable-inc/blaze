@@ -31,9 +31,6 @@ export type Discussion = {
 /** A page as the renderer lists it. */
 export type Page = { url: string; file: string; doc: string; discussable: boolean };
 
-/** One line of a page's spoken version (renderer core `spoken.rs`): what the voice says for one block. */
-export type SpokenLine = { id: string; block: string; text: string; authored: boolean };
-
 /** Each discussable doc: its title and the blocks comments may attach to, with their text. */
 export type Discussable = Record<string, { title: string; blocks: Record<string, string> }>;
 
@@ -114,13 +111,6 @@ export class Site {
 		return this.json('discussable');
 	}
 
-	/** The page's spoken lines, in order (the narration's text; audio/generate.py voices them). */
-	spoken(url: string): SpokenLine[] {
-		const status = call(this.a, [utf8.encode(url)], ([u]) => this.a.fn('spoken')(this.h, u.ptr, u.len));
-		if (status !== 0) throw new RenderError(`site_spoken ${url}: ${this.text()}`);
-		return JSON.parse(this.text()) as SpokenLine[];
-	}
-
 	/** The page at `url` with its comments, for `d`'s viewer: the whole HTML, or an exception. */
 	render(url: string, comments: CommentRow[], d: Discussion): string {
 		const discussion: Cbor = { viewer: d.viewer, sign_in: d.signIn, error: d.error ?? null };
@@ -135,8 +125,7 @@ export class Site {
 /** The input of site-snapshot.wasm: the scripts in run order, and what the build baked, by entity path. */
 export type SnapshotInput = {
 	scripts: { name: string; code: string }[];
-	/** `audio` goes on a page entity: its narration manifest's URL (the renderer then adds the player). */
-	bakes: Record<string, { highlighted?: string; baked?: string; audio?: string }>;
+	bakes: Record<string, { highlighted?: string; baked?: string }>;
 };
 
 /** Runs the content scripts in site-snapshot.wasm (a fresh instance: Flecs's world is freed with it). */

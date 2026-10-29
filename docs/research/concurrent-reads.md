@@ -1,3 +1,8 @@
+---
+status: record
+summary: The store's cache of unpacked blocks on a warm start, and ordered and hash maps for blaze's shared maps.
+date: 2026-10-24
+---
 # Concurrent reads: the store's block cache, ordered maps and hash maps
 
 2026-10-24. What the compiling threads share and read together: whether the store's cache of

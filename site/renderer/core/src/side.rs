@@ -7,6 +7,8 @@
 //! - a page's RFCs (`World::rfcs`, by number) are its row's kids, folded under a caret;
 //! - a page holding a `Course` (the home page) is followed by its lessons, numbered, each with a progress mark that
 //!   client/side.ts fills from the reader's progress;
+//! - a page holding an `UpdateLog` (What's new) carries the keys of the course's updates, and client/side.ts shows
+//!   how many are new since the reader's last visit and not yet studied;
 //! - a section with `FoldOnPhone` (Reference) starts folded in the phone drawer (client/keep.ts).
 //!
 //! Rows sort by `order` within their section, sections by theirs. Folding is `<details>`, so it works without JS;
@@ -30,6 +32,8 @@ pub struct Row {
     pub num: Option<String>,
     /// A lesson row: the lesson's name and its question ids, for its progress mark.
     pub lesson: Option<(String, String)>,
+    /// What's new's row: the keys of the course's updates, space separated, for its count of new ones.
+    pub updates: Option<String>,
     pub kids: Vec<Row>,
 }
 
@@ -104,6 +108,7 @@ pub fn build(world: &World, pages: &[Page]) -> Result<Vec<Group>, String> {
                 order: js::to_number(l.value("Link").and_then(|v| v.get("order"))),
                 num: None,
                 lesson: None,
+                updates: None,
                 kids: Vec::new(),
             });
         }
@@ -141,9 +146,26 @@ pub fn build(world: &World, pages: &[Page]) -> Result<Vec<Group>, String> {
                 order: 0.0,
                 num: Some(js::pad_zero(&field(re, "Number", "value"), 4)),
                 lesson: None,
+                updates: None,
                 kids: Vec::new(),
             });
         }
+        // What's new: the keys of every update on the course.
+        let updates = match world.tagged_in(p.node, "UpdateLog") {
+            Some(_) => {
+                let mut keys = Vec::new();
+                for q in pages {
+                    if let Some(c) = world.course_in(q.node) {
+                        let course = crate::course::build(world, &world.course_sources(c)?)?;
+                        keys.extend(
+                            course.nodes.iter().filter(|n| n.is_update()).map(|n| n.key.clone()),
+                        );
+                    }
+                }
+                Some(keys.join(" "))
+            }
+            None => None,
+        };
         let row = Row {
             label: js::string(nav_value.get("label")),
             href: p.url.clone(),
@@ -151,6 +173,7 @@ pub fn build(world: &World, pages: &[Page]) -> Result<Vec<Group>, String> {
             order: js::to_number(nav_value.get("order")),
             num: None,
             lesson: None,
+            updates,
             kids,
         };
         let (_, g) = groups
@@ -160,18 +183,21 @@ pub fn build(world: &World, pages: &[Page]) -> Result<Vec<Group>, String> {
         // The page holding the course path is followed by its lessons, numbered in course order.
         let mut lessons = Vec::new();
         if let Some(c) = world.course_in(p.node) {
-            for (i, l) in world.lessons(world.course_source(c)?).into_iter().enumerate() {
-                let le = world.get(l);
-                let lp = page_of(l)
+            let course = crate::course::build(world, &world.course_sources(c)?)?;
+            for l in course.lessons() {
+                let crate::course::Kind::Lesson(i) = l.kind else { continue };
+                let le = world.get(l.id);
+                let lp = page_of(l.id)
                     .ok_or_else(|| format!("{}: a Lesson that is not a page", le.path))?;
-                let (_, quizzes) = crate::render::lesson_parts(world, l);
+                let (_, quizzes) = crate::render::lesson_parts(world, l.id);
                 lessons.push(Row {
                     label: field(le, "Title", "text"),
                     href: lp.url.clone(),
                     icon: String::new(),
-                    order: row.order + (i + 1) as f64 / 1000.0,
-                    num: Some((i + 1).to_string()),
-                    lesson: Some((le.name.clone(), quizzes.join(" "))),
+                    order: row.order + i as f64 / 1000.0,
+                    num: Some(i.to_string()),
+                    lesson: Some((l.key.clone(), quizzes.join(" "))),
+                    updates: None,
                     kids: Vec::new(),
                 });
             }
@@ -258,6 +284,14 @@ fn row_html(row: &Row, page: &Page, served: &Served, depth: usize) -> String {
         ),
         None => (svg(&row.icon), String::new()),
     };
+    // What's new: how many updates are new to the reader (client/side.ts fills and shows it).
+    let (lesson, count) = match &row.updates {
+        Some(keys) => (
+            format!("{lesson} data-updates=\"{}\"", esc(keys)),
+            "<span class=\"count\" hidden></span>",
+        ),
+        None => (lesson, ""),
+    };
     let kids = if row.kids.is_empty() {
         String::new()
     } else {
@@ -269,7 +303,7 @@ fn row_html(row: &Row, page: &Page, served: &Served, depth: usize) -> String {
         )
     };
     format!(
-        "<div class=\"rowwrap{}\"><a class=\"row\" href=\"{}\" title=\"{}\"{}{}{lesson}>{lead}{num}<span class=\"label\">{}</span>{}</a>{kids}</div>",
+        "<div class=\"rowwrap{}\"><a class=\"row\" href=\"{}\" title=\"{}\"{}{}{lesson}>{lead}{num}<span class=\"label\">{}</span>{count}{}</a>{kids}</div>",
         if depth > 0 { " kid" } else { "" },
         esc(&served.href(&row.href)),
         esc(&row.label),
@@ -345,7 +379,21 @@ fn find<'g>(groups: &'g [Group], url: &str) -> Option<(&'g Group, &'g Row)> {
 
 /// Above the title: the section's icon and name, or for a page under another page (an RFC), a link to that page.
 pub fn crumb(groups: &[Group], page: &Page, served: &Served) -> String {
-    let Some((g, r)) = find(groups, &page.url) else { return String::new() };
+    let Some((g, r)) = find(groups, &page.url) else {
+        // A page under a page in the sidebar that does not list it (an update under What's new): a link to that one.
+        let Some((parent, _)) = page.url.rsplit_once('/').filter(|(p, _)| !p.is_empty()) else {
+            return String::new();
+        };
+        let Some((_, r)) = find(groups, parent).filter(|(_, r)| r.href == parent) else {
+            return String::new();
+        };
+        return format!(
+            "<p class=\"crumb\"><a href=\"{}\">{}<span>{}</span></a></p>",
+            esc(&served.href(&r.href)),
+            svg(&r.icon),
+            esc(&r.label)
+        );
+    };
     if r.href != page.url {
         return format!(
             "<p class=\"crumb\"><a href=\"{}\">{}<span>{}</span></a></p>",

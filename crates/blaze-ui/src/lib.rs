@@ -399,7 +399,7 @@ impl Build {
                 self.slowest.clone_from(functions);
                 Change::Nothing
             }
-            // The build page's (docs/web.md).
+            // The build page's (https://github.com/indexable-inc/blaze/pull/1341).
             Event::Functions { .. } => Change::Nothing,
         }
     }

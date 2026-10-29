@@ -1,3 +1,8 @@
+---
+status: record
+summary: Flat syntax trees for files nobody edits (#42): the design and its memory and time, measured.
+date: 2026-10-22
+---
 # Flat syntax trees for files nobody edits
 
 2026-10-22, for [#42](https://github.com/indexable-inc/blaze/issues/42) (Glancer item 4,

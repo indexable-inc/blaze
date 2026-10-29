@@ -151,8 +151,17 @@ struct Args {
     /// The program is a build script for wasm32-wasip1 whose commands run on the host: its
     /// standard library has blaze's `std::process` ([`run_tool_std`]).
     run_tool: bool,
-    /// Build the workspace's crates as `cargo test` does, with `cfg(test)`.
+    /// Load the workspace as `cargo test` builds it: with every crate of its build, each
+    /// library's and binary's unit tests a crate of their own with `cfg(test)`.
     cfg_test: bool,
+    /// The program is the unit tests of the target `krate` names, its crate with `cfg(test)`,
+    /// and not the target. Only of a `cfg_test` load, which has them.
+    unit_test: bool,
+    /// Where the build of the tests puts its programs and the directory it gives its
+    /// integration tests, which those are told as `CARGO_BIN_EXE_<name>` and
+    /// `CARGO_TARGET_TMPDIR`.
+    executables: Option<AbsPathBuf>,
+    scratch: Option<AbsPathBuf>,
     /// Run build scripts and build proc macros in a directory of blaze's own under the
     /// target directory, so that nothing here waits for a cargo that is building there.
     own_target: bool,
@@ -247,6 +256,8 @@ impl Args {
         let mut dep_info = None;
         let mut inputs = None;
         let mut cfg_test = false;
+        let mut unit_test = false;
+        let (mut executables, mut scratch) = (None, None);
         let mut dev_deps = false;
         let mut own_target = false;
         let mut scripts_from = None;
@@ -288,6 +299,13 @@ impl Args {
                 "--watch" => watch = true,
                 "--socket" => socket = Some(PathBuf::from(value()?)),
                 "--cfg-test" => cfg_test = true,
+                // A unit test is built of a load that has it.
+                "--unit-test" => {
+                    cfg_test = true;
+                    unit_test = true;
+                }
+                "--executables" => executables = Some(absolute(&arg, value()?)?),
+                "--scratch" => scratch = Some(absolute(&arg, value()?)?),
                 "--dev-deps" => dev_deps = true,
                 "--own-target" => own_target = true,
                 "--scripts-from" => scripts_from = Some(PathBuf::from(value()?)),
@@ -340,6 +358,9 @@ impl Args {
             library: false,
             run_tool,
             cfg_test,
+            unit_test,
+            executables,
+            scratch,
             own_target,
             scripts_from,
             selection: plan::Selection {
@@ -1457,19 +1478,24 @@ impl SymbolResolver for Resolver<'_> {
             return beside();
         }
         let next = std::sync::atomic::AtomicUsize::new(0);
+        // What the threads compile, the build that asked counts.
+        let counted = hir_ty_codegen::counted::now();
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 let (db, next, parts) = (self.db.clone(), &next, self.parts());
+                let counted = counted.clone();
                 scope.spawn(move || {
                     let resolver = parts.over(&db);
-                    hir::attach_db(&db, || {
-                        loop {
-                            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if at >= count {
-                                break;
+                    hir_ty_codegen::counted::within(counted, || {
+                        hir::attach_db(&db, || {
+                            loop {
+                                let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if at >= count {
+                                    break;
+                                }
+                                work(&db, &resolver, at);
                             }
-                            work(&db, &resolver, at);
-                        }
+                        })
                     })
                 });
             }
@@ -2505,14 +2531,21 @@ fn crates_called(db: &RootDatabase, krate: &str, args: &Args) -> Vec<Crate> {
         })
         .map(|it| it.krate)
         .collect();
-    // Built as `cargo test` builds them, a library and its unit tests are two crates of one
-    // root file, the tests alone with `cfg(test)`: the crate asked for first is the program's,
-    // and the others are what it links.
+    // Built as `cargo test` builds them, a library or a binary and its unit tests are two
+    // crates of one root file, the tests alone with `cfg(test)`: the crate asked for first is
+    // the program's, its unit tests when it is those, and the others are what it links. An
+    // integration test has `cfg(test)` and is no target's unit tests.
     if args.cfg_test {
-        let tests = |it: &Crate| it.cfg(db).check_atom(&cfg::CfgAtom::Flag(intern::sym::test));
-        let first = *krate == args.krate;
-        if found.iter().any(|it| tests(it) == first) {
-            found.retain(|it| tests(it) == first);
+        let unit_tests = |it: &Crate| {
+            let data = ide_db::base_db::Crate::from(*it).data(db);
+            matches!(data.target_kind, TargetKind::Lib { .. } | TargetKind::Bin)
+                && it.cfg(db).check_atom(&cfg::CfgAtom::Flag(intern::sym::test))
+        };
+        // Unit tests asked for are those or none, never the target in their place: a load
+        // that has one copy of a crate gives it to what links it.
+        let wanted = *krate == args.krate && args.unit_test;
+        if wanted || found.iter().any(|it| !unit_tests(it)) {
+            found.retain(|it| unit_tests(it) == wanted);
         }
     }
     found
@@ -2696,21 +2729,40 @@ impl Checkouts {
         })
     }
 
-    /// The directories of the member packages of the checkout at `at`, and whether each is
-    /// of a procedural macro.
-    fn packages(&self, at: usize) -> Vec<(PathBuf, bool)> {
+    /// The directories of the member packages of the checkout at `at`, whether each is of a
+    /// procedural macro, and whether it has an integration test or a benchmark told a place in
+    /// the checkout (`CARGO_BIN_EXE_<name>`, `CARGO_TARGET_TMPDIR`), which another checkout
+    /// tells its own.
+    fn packages(&self, at: usize) -> Vec<(PathBuf, bool, bool)> {
         let ProjectWorkspaceKind::Cargo { cargo, .. } = &self.loaded.workspaces()[at].kind else {
             return Vec::new();
         };
+        let told = self.tells_places(at);
         cargo
             .packages()
             .filter(|&it| cargo[it].is_member)
             .map(|it| {
                 let package = &cargo[it];
                 let dir = AsRef::<Path>::as_ref(package.manifest.parent()).to_owned();
-                (dir, package.targets.iter().any(|&it| cargo[it].kind.is_proc_macro()))
+                let kinds = || package.targets.iter().map(|&it| cargo[it].kind);
+                let tests = kinds().any(|it| matches!(it, TargetKind::Test | TargetKind::Bench));
+                (dir, kinds().any(|it| it.is_proc_macro()), told && tests)
             })
             .collect()
+    }
+
+    /// Whether the integration tests and benchmarks of the checkout at `at` are told places in
+    /// it (`CARGO_BIN_EXE_<name>`, `CARGO_TARGET_TMPDIR` in its target directory), which those
+    /// of another checkout are told in that one.
+    fn tells_places(&self, at: usize) -> bool {
+        let ProjectWorkspaceKind::Cargo { cargo, .. } = &self.loaded.workspaces()[at].kind else {
+            return false;
+        };
+        let root = &self.roots[at].1;
+        [cargo.executables(), cargo.scratch()]
+            .into_iter()
+            .flatten()
+            .any(|it| AsRef::<Path>::as_ref(it).starts_with(root))
     }
 
     /// The packages of the checkout at `over` whose files are not those of the loaded one at
@@ -2720,10 +2772,11 @@ impl Checkouts {
         let base = &self.roots[base].1;
         let nested: FxHashSet<&Path> = packages.iter().map(|it| &*it.0).collect();
         // A procedural macro is rustc's to build: one that is not the same is another build.
+        // A test told a place in its checkout is the other checkout's own.
         packages
             .iter()
-            .filter(|(dir, proc_macro)| {
-                !proc_macro && !package_alike(dir, base, over, &nested, &self.compared)
+            .filter(|(dir, proc_macro, told)| {
+                !proc_macro && (*told || !package_alike(dir, base, over, &nested, &self.compared))
             })
             .map(|it| &it.0)
             .filter_map(|dir| Some(dir.strip_prefix(base).ok()?.to_owned()))
@@ -2795,8 +2848,11 @@ impl Checkouts {
         if overlay == Overlay::Never {
             return None;
         }
-        // One that shares packages with another has those where the other is.
-        let whole = self.roots.iter().zip(&self.splits).filter(|it| it.1.is_none()).map(|it| it.0);
+        // One that shares packages with another has those where the other is. Not one whose
+        // tests are told places in it: read over another, they would be told the other's.
+        let whole = (0..self.roots.len())
+            .filter(|&at| self.splits[at].is_none() && !self.tells_places(at))
+            .map(|at| &self.roots[at]);
         whole.into_iter().find_map(|(loaded, base)| {
             let inside = loaded.strip_prefix(base).ok()?;
             let mut over = project.clone();
@@ -3067,6 +3123,12 @@ fn pause_after_load() {
         eprintln!("load: paused");
         std::thread::sleep(Duration::from_millis(pause));
     }
+}
+
+/// The absolute path `flag` names.
+fn absolute(flag: &str, path: String) -> anyhow::Result<AbsPathBuf> {
+    AbsPathBuf::try_from(path.as_str())
+        .map_err(|it| anyhow::anyhow!("{flag} names a directory by its absolute path, not `{it}`"))
 }
 
 /// The directory cargo put the executables of the build in: the profile's directory the
@@ -3770,7 +3832,7 @@ fn harness_main(db: &RootDatabase, functions: &[FunctionId]) -> Option<FunctionI
 /// Whether the program of `args` is one of tests, which starts in blaze's test harness where
 /// blaze writes one: a unit test, built with `cfg(test)`, or one the plan says is a test.
 fn of_tests(args: &Args) -> bool {
-    args.cfg_test || args.out.parent().is_some_and(|it| it.join(cargo::plan::TESTS).is_file())
+    args.unit_test || args.out.parent().is_some_and(|it| it.join(cargo::plan::TESTS).is_file())
 }
 
 /// Why the program of `args` is right only with blaze's test harness, when the plan says it
@@ -4819,6 +4881,9 @@ fn std_unit_at(
         exe: None,
         shared: false,
         library: true,
+        // The unit is the standard library's crates, never the program's unit tests: asked as
+        // those, `crates_called` keeps only crates with `cfg(test)`, which no crate of it has.
+        unit_test: false,
         debug,
         ..args.clone()
     };
@@ -5091,6 +5156,9 @@ fn build(
     hold: Option<&dyn Fn() -> bool>,
 ) -> anyhow::Result<Option<Build>> {
     let start = Instant::now();
+    // What this build compiles, here and on the threads that work for it: not what builds of
+    // other programs compile beside it.
+    let counting = hir_ty_codegen::counted::Counting::start();
     let contents = &content::Contents::default();
     let resolver = Resolver::of(db, table, args, contents, listed)?;
     let hir_db: &dyn HirDatabase = db;
@@ -5226,17 +5294,24 @@ fn build(
             .map(|part| {
                 let (db, known, local, next) = (db.clone(), &*known, &local, &next);
                 let parts = resolver.parts();
+                let counted = Some(counting.counted().clone());
                 scope.spawn(move || {
                     PROBING.set(true);
                     let resolver = parts.over(&db);
-                    hir::attach_db(&db, || {
-                        while let Some(&krate) =
-                            local.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-                        {
-                            hir_ty::method_resolution::TraitImpls::for_crate(&db, krate.into());
-                            hir_ty::method_resolution::InherentImpls::for_crate(&db, krate.into());
-                        }
-                        known.stale(&db, Some(&resolver), part, threads)
+                    // What an edit changed is compiled again to tell what changed.
+                    hir_ty_codegen::counted::within(counted, || {
+                        hir::attach_db(&db, || {
+                            while let Some(&krate) =
+                                local.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                            {
+                                hir_ty::method_resolution::TraitImpls::for_crate(&db, krate.into());
+                                hir_ty::method_resolution::InherentImpls::for_crate(
+                                    &db,
+                                    krate.into(),
+                                );
+                            }
+                            known.stale(&db, Some(&resolver), part, threads)
+                        })
                     })
                 })
             })
@@ -5250,7 +5325,10 @@ fn build(
     let undoable = hold.is_some();
     let hold = hold.unwrap_or(&|| false);
     let unit = hir::attach_db(db, || {
-        CodegenUnit::compile_or_hold(hir_db, &resolver, roots, &denied, known, hold, undoable)
+        let counted = counting.counted();
+        CodegenUnit::compile_or_hold(
+            hir_db, &resolver, roots, &denied, known, hold, undoable, counted,
+        )
     })
     .map_err(anyhow::Error::msg)?;
     let Some(mut unit) = unit else { return Ok(None) };
@@ -6699,6 +6777,9 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             library: args.library,
             run_tool: args.run_tool,
             cfg_test: args.cfg_test,
+            unit_test: args.unit_test,
+            executables: args.executables.clone(),
+            scratch: args.scratch.clone(),
             own_target: args.own_target,
             scripts_from: None,
             selection: args.selection.clone(),
@@ -6785,6 +6866,8 @@ struct Target {
     exe: Option<PathBuf>,
     /// `exe` is a shared library, a `cdylib` (#262).
     shared: bool,
+    /// It is the unit tests of the target `krate` names ([`Args::unit_test`]).
+    unit_test: bool,
     /// What its link takes that rustc compiled. Code rustc instantiated for one program is in
     /// that program's own objects, so another has to be told where its copies are. Empty for
     /// the files the daemon was started with.
@@ -6804,12 +6887,19 @@ impl Target {
             splice: args.splice.clone(),
             exe: args.exe.clone(),
             shared: args.shared,
+            unit_test: args.unit_test,
             symbol_files: args.symbol_files.clone(),
         }
     }
 
     fn is(&self, args: &Args) -> bool {
-        self.krate == args.krate && self.out == args.out
+        self.of_crate(args) && self.out == args.out
+    }
+
+    /// Whether `args` builds the crate this program does: a binary and its unit tests are two
+    /// programs of one root file.
+    fn of_crate(&self, args: &Args) -> bool {
+        self.krate == args.krate && self.unit_test == args.unit_test
     }
 
     /// The daemon's arguments, were it started for this program.
@@ -6824,8 +6914,15 @@ impl Target {
             splice,
             exe,
             shared,
+            unit_test,
             symbol_files,
         } = self;
+        // Only a load with `cfg(test)` has the crate of a target's unit tests.
+        anyhow::ensure!(
+            !unit_test || daemon.cfg_test,
+            "the unit tests of `{krate}` are asked of a worker that loaded the workspace \
+             without `cfg(test)`"
+        );
         let project = project.unwrap_or_else(|| daemon.project.clone());
         let Parts { root: checkout, base, members, debug, lints_capped, link_args } =
             checkouts.parts(&project)?;
@@ -6852,6 +6949,7 @@ impl Target {
             splice,
             exe,
             shared,
+            unit_test,
             symbol_files,
             ..daemon.clone()
         })
@@ -6862,7 +6960,12 @@ impl Target {
         let (mut krate, mut out, mut patch, mut link_cmd) = (None, None, None, None);
         let (mut project, mut splice, mut exe) = (None, None, None);
         let mut symbol_files = Vec::new();
+        let mut unit_test = false;
         while let Some(flag) = flags.next() {
+            if flag == "--unit-test" {
+                unit_test = true;
+                continue;
+            }
             let value = flags.next().with_context(|| format!("{flag} needs a value"))?;
             match flag.as_str() {
                 "--crate" => krate = Some(value),
@@ -6889,11 +6992,13 @@ impl Target {
                     splice,
                     exe,
                     shared: false,
+                    unit_test,
                     symbol_files,
                 }))
             }
             (None, None)
                 if patch.is_none()
+                    && !unit_test
                     && link_cmd.is_none()
                     && splice.is_none()
                     && exe.is_none()
@@ -6908,8 +7013,18 @@ impl Target {
 
     /// The fields after the request's name on its line, each after a tab. Empty is absent.
     fn parse(fields: &[&str]) -> Option<Target> {
-        let &[project, krate, out, patch, link_cmd, splice, exe, shared, ref symbol_files @ ..] =
-            fields
+        let &[
+            project,
+            krate,
+            out,
+            patch,
+            link_cmd,
+            splice,
+            exe,
+            shared,
+            unit_test,
+            ref symbol_files @ ..,
+        ] = fields
         else {
             return None;
         };
@@ -6925,6 +7040,7 @@ impl Target {
             splice: given(splice).map(PathBuf::from),
             exe: given(exe).map(PathBuf::from),
             shared: shared == "shared",
+            unit_test: unit_test == cargo::plan::UNIT_TEST,
             symbol_files: symbol_files.iter().map(PathBuf::from).collect(),
         })
     }
@@ -6947,7 +7063,7 @@ impl Target {
             None => self.krate.clone(),
         };
         let mut fields = format!(
-            "\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.project.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
             crates,
             self.out.display(),
@@ -6955,7 +7071,8 @@ impl Target {
             self.link_cmd.as_deref().unwrap_or_default(),
             self.splice.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
             self.exe.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
-            if self.shared { "shared" } else { "" }
+            if self.shared { "shared" } else { "" },
+            if self.unit_test { cargo::plan::UNIT_TEST } else { "" }
         );
         for file in &self.symbol_files {
             fields.push('\t');
@@ -8035,7 +8152,13 @@ fn cargo_config(args: &Args) -> CargoConfig {
         // workspace does.
         extra_args: selected(&args),
         only_manifest_package: true,
-        executables: executables_of(&args.symbol_files),
+        // A whole build of tests says where it puts its programs; one over rustc's, where
+        // cargo put them.
+        executables: match &args.executables {
+            Some(dir) => Some(dir.clone()),
+            None => executables_of(&args.symbol_files),
+        },
+        scratch: args.scratch.clone(),
         own_metadata: cargo::metadata::own(&args.selection),
         // The build scripts and proc macros of a load in blaze's own target directory are
         // built and run by blaze (`cargo/compile_time.rs`), not `cargo check
@@ -8939,10 +9062,11 @@ fn run_holding(
     let sysroot = checkouts.loaded.workspaces().first().and_then(|it| it.sysroot.root());
     let _ = SYSROOT.set(sysroot.map(|it| AsRef::<Path>::as_ref(it).to_owned()));
     let from_manifest;
+    // What the compile of the program counted, for what is said of it once it is built.
+    let mut counted = None;
     let cold = {
         if let Some(unit) = std_unit(&db, &table, &args, &listed)? {
             args.prebuilt = Some(unit);
-            known.not_counted();
         }
         if let Some((cmd, exe)) = own_link_line(&db, &args)? {
             (args.link_cmd, args.splice) = (Some(cmd), Some(exe));
@@ -8975,7 +9099,8 @@ fn run_holding(
             }
             None => {
                 fns::building();
-                let _compiling = events::compiling(&shown_crate(&db, &args));
+                let compiling = events::compiling(&shown_crate(&db, &args));
+                counted = compiling.counted();
                 let mut cold = build_unheld(&db, &table, &args, &mut known, &listed)?;
                 // An `include!` in a body is first seen when the body is compiled.
                 if WatchedFile::include_sources(&mut files, &mut tree, &mut db) != Loaded::Nothing {
@@ -9005,7 +9130,7 @@ fn run_holding(
             bail!("{why}");
         }
         if events::heard() {
-            events::built(&db, &shown_crate(&db, &args), &known.stats, None);
+            events::built(&db, &shown_crate(&db, &args), &known.stats, None, counted.as_deref());
             if !served {
                 events::cache(&known.stats);
             }
@@ -9542,7 +9667,7 @@ fn run_holding(
                         }
                         // The checkouts read as one share its programs.
                         (Some(target), Some(view)) if shared => programs.iter().position(|it| {
-                            it.args.krate == target.krate && it.args.checkout == view.base
+                            target.of_crate(&it.args) && it.args.checkout == view.base
                         }),
                         (Some(_), _) => None,
                         (None, _) => Some(0),
@@ -9674,9 +9799,6 @@ fn run_holding(
                                 program.unbuilt.stale = false;
                                 program.whole = built.whole.clone();
                             }
-                            // Its first build counts what it compiles, not what the
-                            // programs before it did.
-                            program.known.not_counted();
                             let first = program.args.symbol_files == programs[0].args.symbol_files;
                             program.distrust_rustc(&db, &files, first.then_some(&as_compiled));
                             clients.push((programs.len(), (request, asked, stream)));
@@ -10295,6 +10417,8 @@ fn run_holding(
                                     program.refused_in_codegen(answer)
                                 }));
                             end_link();
+                            // Each build's steps are of its own thread ([`events::at`]).
+                            events::idle();
                             answer.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
                         });
                         (at, build)
@@ -10791,7 +10915,8 @@ impl Program {
             && self.known.patches()
             && self.known.patching == other.known.patching
             && Arc::ptr_eq(&self.table, &other.table)
-            && (ours.cfg_test, &ours.selection) == (theirs.cfg_test, &theirs.selection)
+            && (ours.cfg_test, ours.unit_test, &ours.selection)
+                == (theirs.cfg_test, theirs.unit_test, &theirs.selection)
             && crates(ours).is_some_and(|it| Some(it) == crates(theirs))
     }
 
@@ -10957,6 +11082,7 @@ impl Program {
         eprint!("edit (apply {apply:.1?}): ");
         report(&warm);
         report_stats(&known.stats);
+        let counted = compiling.counted();
         drop(compiling);
         let edited_paths: FxHashMap<vfs::FileId, PathBuf> = edited
             .iter()
@@ -10965,7 +11091,7 @@ impl Program {
                 Some((*file, path.strip_prefix(&args.checkout).unwrap_or(path).to_owned()))
             })
             .collect();
-        events::built(db, &named, &known.stats, Some(&edited_paths));
+        events::built(db, &named, &known.stats, Some(&edited_paths), counted.as_deref());
         let reported = start.elapsed();
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
         let dated = start.elapsed();
@@ -11646,5 +11772,86 @@ mod user {
         assert!(held.is_poisoned());
         *lock(&held) += 1;
         assert_eq!(*lock(&held), 2);
+    }
+
+    /// A load of `cargo test`'s build has every crate of it, as one worker builds them all: a
+    /// binary and a library each without `cfg(test)` and as their unit tests, the unit tests
+    /// linking the library without, an example without `cfg(test)`, and only the integration
+    /// test told `CARGO_BIN_EXE_<name>` and `CARGO_TARGET_TMPDIR`.
+    #[cfg(unix)]
+    #[test]
+    fn a_load_of_the_tests_has_every_crate_cargo_test_builds() {
+        use project_model::{
+            CargoWorkspace, ManifestPath, ProjectWorkspace, ProjectWorkspaceKind, Sysroot,
+            WorkspaceBuildScripts,
+        };
+        project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
+        let json = include_str!("../../project-model/test_data/hello-world-metadata.json");
+        let meta: project_model::Metadata =
+            serde_json::from_str(&json.replace("$ROOT$", "/ROOT/")).unwrap();
+        let manifest = ManifestPath::try_from(AbsPathBuf::assert_utf8("/ROOT/".into())).unwrap();
+        let mut cargo = CargoWorkspace::new(meta, manifest, Default::default(), false);
+        cargo.set_executables(Some(AbsPathBuf::assert_utf8("/ROOT/target/debug".into())));
+        cargo.set_scratch(Some(AbsPathBuf::assert_utf8("/ROOT/target/tmp".into())));
+        let workspace = ProjectWorkspace {
+            kind: ProjectWorkspaceKind::Cargo {
+                cargo,
+                build_scripts: WorkspaceBuildScripts::default(),
+                rustc: Err(None),
+                error: None,
+            },
+            cfg_overrides: Default::default(),
+            sysroot: Sysroot::empty(),
+            rustc_cfg: Vec::new(),
+            toolchain: None,
+            target: Err("no target data".into()),
+            extra_includes: Vec::new(),
+            set_test: true,
+            const_eval: Default::default(),
+        };
+        let mut files = FxHashMap::default();
+        let (graph, _) = workspace.to_crate_graph(
+            &mut |path| {
+                let next = ide_db::FileId::from_raw(files.len() as u32 + 1);
+                Some(*files.entry(path.to_path_buf()).or_insert(next))
+            },
+            &Default::default(),
+        );
+        let test = cfg::CfgAtom::Flag(intern::sym::test);
+        let of = |name: &str, kind: TargetKind| -> Vec<_> {
+            graph
+                .iter()
+                .filter(|&it| graph[it].basic.target_kind == kind)
+                .filter(|&it| {
+                    let named = graph[it].extra.display_name.as_ref();
+                    named.is_some_and(|it| it.canonical_name().as_str() == name)
+                })
+                .collect()
+        };
+        let lib = TargetKind::Lib { is_proc_macro: false };
+        let tested = |it: ide_db::base_db::CrateBuilderId| graph[it].cfg_options.check_atom(&test);
+        let told = |it: ide_db::base_db::CrateBuilderId, var: &str| graph[it].env.get(var);
+        let libs = of("hello-world", lib);
+        let bins = of("hello-world", TargetKind::Bin);
+        let (examples, tests) = (of("an-example", TargetKind::Example), of("it", TargetKind::Test));
+        assert_eq!((libs.len(), bins.len(), examples.len(), tests.len()), (2, 2, 1, 1));
+        let library = *libs.iter().find(|&&it| !tested(it)).unwrap();
+        for unit in [&libs, &bins] {
+            assert_eq!(unit.iter().filter(|&&it| tested(it)).count(), 1, "{unit:?}");
+        }
+        for &bin in &bins {
+            let deps = &graph[bin].basic.dependencies;
+            assert!(deps.iter().any(|it| it.crate_id == library), "a binary links the library");
+        }
+        assert!(!tested(examples[0]) && tested(tests[0]));
+        assert_eq!(
+            told(tests[0], "CARGO_BIN_EXE_hello-world").as_deref(),
+            Some("/ROOT/target/debug/hello-world")
+        );
+        assert_eq!(told(tests[0], "CARGO_TARGET_TMPDIR").as_deref(), Some("/ROOT/target/tmp"));
+        for &it in libs.iter().chain(&bins).chain(&examples) {
+            assert_eq!(told(it, "CARGO_BIN_EXE_hello-world"), None);
+            assert_eq!(told(it, "CARGO_TARGET_TMPDIR"), None);
+        }
     }
 }

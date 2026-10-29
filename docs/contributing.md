@@ -1,3 +1,7 @@
+---
+status: current
+summary: How to build, test and change blaze: AI use, where new code goes, rules for code, working in parallel, landing.
+---
 # Contributing
 
 ## AI use
@@ -55,7 +59,7 @@ it was a module of `hir-ty`. The front end's crates depend on none of blaze's ma
 The front end's crates in `crates/` (`hir-ty`, `hir-def`, `hir-expand`, `syntax`, `parser`,
 `base-db`, `syntax-tree` and the rest) started as a fork of rust-analyzer (DioxusLabs' rustd branch
 merged with upstream master at `0b21bd6596`, with the MIR passes that make its MIR like rustc's
-on top: [mir-passes.md](mir-passes.md)); until 2026-10-28 they lived in `vendor/rust-analyzer`.
+on top: [mir-passes.md](mir-passes.md)); until 2026-10-28 they were a subtree under vendor/.
 They are no longer synced with upstream or with a fork repository, and keep rust-analyzer's crate
 names. Edit them, build and test from the root, and commit like any other file. A plain clone
 builds:
@@ -206,6 +210,18 @@ did about it in one line.
 When you report what you did, separate what you ran from what you inferred. The reports
 under `docs/reports/` do this and it is the reason they can be used.
 
+## Documents
+
+Every doc under `docs/` opens with front matter saying what it is (`tools/docs.py` has the
+fields): `current` (how blaze is now, kept true), `plan` (a design not fully built, dated),
+`record` (research, a report or a measurement, true on its date and never brought up to date) or
+`superseded` (with `superseded_by`, what replaced it). [docs/README.md](README.md) is the index,
+generated from it; superseded docs are left out. CI's `python3 tools/docs.py check` holds every
+doc's links, and a current doc's anchors, repository paths in backticks and `BLAZE_*` settings,
+against the tree, and every doc that code names. A change that makes a current doc
+untrue fixes it in the same change, or marks it superseded; `python3 tools/docs.py write`
+regenerates the index.
+
 ## Working in parallel
 
 Several lanes, people or agents, change blaze at once. A lane shares `git`'s metadata and
@@ -295,10 +311,15 @@ and pinned by its sha256 in `crates/hir-ty-codegen/llvm.json`. The flake's dev s
 
     nix develop -c cargo build -p blaze-engine --release --features llvm
 
-Outside the shell, fetch the same archive and point the build at it:
+Outside the shell, fetch the same archive and point the build at it, as CI's merge gate does
+(`.github/actions/blaze`). It goes below `/usr/local/lib`: llvm-sys's build script names the
+prefix's `lib` to the linker, and a build script in blaze's sandbox may name only a system
+directory of libraries (`crates/blaze-cargo/src/cargo/directives.rs`, `SYSTEM`), so `blaze
+build` refuses a prefix in your home directory.
 
-    python3 .github/scripts/llvm.py fetch --target <triple> --dir ~/.cache/blaze-llvm
-    LLVM_SYS_231_PREFIX=~/.cache/blaze-llvm cargo build -p blaze-engine --release --features llvm
+    sudo mkdir -p /usr/local/lib/blaze-llvm && sudo chown "$USER" /usr/local/lib/blaze-llvm
+    python3 .github/scripts/llvm.py fetch --target <triple> --dir /usr/local/lib/blaze-llvm/<triple>
+    LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/<triple> blaze build -p blaze-engine --release --features llvm
 
 `build.rs` checks the prefix's `blaze-llvm.json` against the pin and stops otherwise: neither
 Homebrew's LLVM nor a distribution's is a source. LLVM is linked in statically, and on Linux so
