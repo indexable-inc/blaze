@@ -34,7 +34,9 @@ Input, one JSON object:
             `commit` names what was built, for the report
   projects  names from PROJECTS below (uv, ruff, ty) and bench.py's PROJECTS
   work      a directory for the checkouts, homes and stores (emptied per project)
-  out       where the results go: raw/<project>.json, host.json, commands.txt, README.md
+  out       where the results go: raw/<project>.json, host.json, commands.txt, README.md, and
+            beside each project's JSON the output of each arm's first edit build and tests, with
+            our blaze's Chrome trace of that edit (`BLAZE_TRACE`, ui.perfetto.dev opens it)
   runs      timed builds per phase (default 5)
   tests     run each project's tests (default true)
   interleave  the arms take turns within each phase (default true); false measures each blaze
@@ -221,9 +223,9 @@ class Runner:
         self.prefix, self.env, self.loads = prefix, env, bool(prefix)
         self.side = Side(ws, env, arm.kind != "cargo")
 
-    def run(self, command, *args):
-        self.log.ran(self.arm.name, self.ws, self.side.env, self.side.argv(command, *args))
-        return self.side.cargo(command, *args)
+    def run(self, command, *args, env=None):
+        self.log.ran(self.arm.name, self.ws, dict(self.side.env, **(env or {})), self.side.argv(command, *args))
+        return self.side.cargo(command, *args, env=env)
 
     def stop(self):
         if self.prefix:
@@ -390,7 +392,8 @@ def measure(name, spec, arms, given, log):
                     continue
                 r = runners[arm.name]
                 bench.write_edit(r.ws, changes, False)
-                took, ran = r.run("build", *build)
+                trace = os.path.realpath(os.path.join(given.out, "raw", f"{name}-{arm.name}-{kind}.trace.json"))
+                took, ran = r.run("build", *build, env={"BLAZE_TRACE": trace} if round_ == 0 and r.prefix == "BLAZE_" else None)
                 if round_ == 0:
                     with open(os.path.join(given.out, "raw", f"{name}-{arm.name}-{kind}.txt"), "w") as f:
                         f.write(f"took {took:.3f}s, exit {ran.returncode}\n--- stdout\n{ran.stdout[-20000:]}\n--- stderr\n{ran.stderr[-40000:]}")

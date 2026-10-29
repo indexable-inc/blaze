@@ -5059,14 +5059,28 @@ pub fn lower_to_mir_with_store<'db>(
         return Err(MirLowerError::HasErrors);
     }
     let mut ctx = MirLowerCtx::new(db, owner, store, infer);
+    // An inline const's value is its block's: the adjustments recorded on the `const { .. }`
+    // expression (the autoref of `x <= const { .. }`) are the enclosing function's, which
+    // applies them to the constant.
+    let inline = matches!(owner, InferBodyId::AnonConstId(it) if it.is_inline_const(db));
     // 0 is return local
-    ctx.result.locals.alloc(Local { ty: ctx.expr_ty_after_adjustments(root_expr).store() });
+    let ty = if inline {
+        ctx.expr_ty_without_adjust(root_expr)
+    } else {
+        ctx.expr_ty_after_adjustments(root_expr)
+    };
+    ctx.result.locals.alloc(Local { ty: ty.store() });
     let expected_binding_owner =
         if matches!(owner, InferBodyId::DefWithBodyId(_)) { None } else { Some(root_expr) };
     let binding_picker = |b: BindingId| ctx.store.binding_owner(b) == expected_binding_owner;
     let current = ctx.lower_params_and_bindings(params, self_param, binding_picker)?;
     ctx.ends_temporaries.insert(root_expr);
-    if let Some(current) = ctx.lower_expr_to_place(root_expr, return_slot().into(), current)? {
+    let current = if inline {
+        ctx.lower_expr_to_place_without_adjust(root_expr, return_slot().into(), current)?
+    } else {
+        ctx.lower_expr_to_place(root_expr, return_slot().into(), current)?
+    };
+    if let Some(current) = current {
         let current = ctx.pop_drop_scope_assert_finished(current, root_expr.into())?;
         ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(root_expr).end());
     }

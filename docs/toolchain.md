@@ -33,14 +33,15 @@ the standard library is part of a compiler.
 - **Name:** `blaze-<date>` (`blaze-2026-10-27`), after the date of the Rust nightly it is built
   from (`harness/toolchain`, `nightly-2026-10-27`). `blaze toolchain` prints it and where it
   is; `blaze toolchain --path` prints the directory alone.
-- **Bytes:** the upstream nightly's `rustc`, `cargo`, `rust-std` (the host's, and `wasm32-wasip1`'s,
-  which proc macros are built for) and `rust-src`, unchanged, from
-  static.rust-lang.org, each checked against the sha256 compiled into blaze
+- **Bytes:** the upstream nightly's `rustc`, `cargo` and `rust-std` (the host's, and
+  `wasm32-wasip1`'s, which proc macros are built for), unchanged, from static.rust-lang.org, each checked against the sha256 compiled into blaze
   (`crates/blaze-cargo/src/cargo/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
   still says `1.101.0-nightly (16d1ffac1 2026-10-26)`.
 - **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>`, or rustup's `nightly-2026-10-27`
-  when rustup already has it with `rust-src` (the same bytes). The installer downloads it once;
+  when rustup already has it (the same bytes). The installer downloads it once;
   `blaze toolchain --path` prints its directory.
+- **The standard library's source** is not the toolchain's `rust-src`, which blaze neither
+  downloads nor reads: it is blaze's own `library/` ([below](#the-standard-library-library)).
 - **Who uses it:** cargo, rustc and the daemon that blaze starts (`CARGO`, `RUSTC`, `RUSTDOC`,
   `RUSTUP_TOOLCHAIN`, `PATH` for its own processes), whatever they were set to. The user's
   `cargo`, `rustc` and pins are untouched, and blaze reads none of them.
@@ -80,7 +81,7 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
    `blaze` on real projects.
 4. When the train finishes, `harness/stdcount.py` compiles the standard library with the bump's
    build and with `toolchain/base`'s (the same main commit, the old pin), each against its own
-   nightly's `rust-src`, and counts the functions each refuses. Against main's newest build
+   `library/`, and counts the functions each refuses. Against main's newest build
    instead, the first bump counted +1463 that were main's std fixes since the bump's commit. The verdict (`.github/scripts/toolchain_bump_ci.py verdict`):
    - **green**: no job or harness red that is green on `toolchain/base`'s train (waited for, or
      started if there is none; main's newest finished train only if it was cancelled), and no
@@ -123,8 +124,24 @@ byte, and the third-party crates of `library/Cargo.lock` (hashbrown, libc, compi
 deps, addr2line, gimli, object, ...) vendored in `library/vendor` with the
 `library/.cargo/config.toml` that reads them from there. They are vendored rather than fetched
 from crates.io so that a cold build needs no network beyond blaze's store, and so that their
-paths, which panics and `file!()` show, are the ones `rust-src` gives. Until blaze reads it
-from here (the next step of #402), it compiles the nightly's `rust-src`, whose files these are.
+paths, which panics and `file!()` show, are the ones `rust-src` gives: blaze names a file of
+it `/rustc/<commit>/library/...` as rustc does, wherever it is on disk.
+
+Where blaze reads it (`crates/blaze-cargo/src/cargo/toolchain/library.rs`): it is known by its
+digest, `library/DIGEST` (the sha256 of a line per file, `harness/library.py digest` writes
+it), which is compiled into blaze and is what the store keys the standard library by
+(`library=<digest>` in place of the nightly's commit and `rustc_driver` name). Every process
+of blaze is told where it is in `BLAZE_LIBRARY`, the first of:
+
+- `BLAZE_LIBRARY` itself, set by hand to try a changed library (its own `DIGEST` is used);
+- `share/blaze/library` above the program (the Nix package installs it there);
+- `~/.blaze/library/<digest>/library`, which blaze makes once, beside the toolchain's
+  download: copied from the checkout it was built in when that has the same library, else
+  downloaded as the release's `library-<digest>.tar.xz` (6.0 MB, `harness/library.py
+  archive` writes it, the release workflow attaches it), or from where `BLAZE_LIBRARY_FROM`
+  names. Whichever way it came it is checked against the digest file by file. A checkout's own
+  `library/` is never read in place: what the store keeps of a crate whose data names the
+  checkout being built is that checkout's alone, and the standard library's is everyone's.
 
 - `library/UPSTREAM` says which: the commit, the nightly and the sha256 of its `rust-src`,
   read from the nightly's channel manifest (`harness/library.py import` wrote it).
@@ -134,9 +151,12 @@ from here (the next step of #402), it compiles the nightly's `rust-src`, whose f
   changes from the old nightly to the new one are applied three-way, so blaze's own changes
   are kept. A conflict stops the bump, names the files and opens the bump's issue.
 
-To change the standard library, edit it under `library/` and commit. Nothing checks it against
-upstream file by file: the integration tests (smoke, the rustc comparison harnesses, real
-crates) are what hold blaze's behaviour to the nightly's.
+To change the standard library, edit it under `library/`, run
+`python3 harness/library.py digest '{}'` (the test `the_library_is_the_one_its_digest_says`
+fails on a stale `DIGEST`) and commit. The next build copies the changed library into
+`~/.blaze/library/<new digest>`, and the store keys what it compiles of it apart from the old.
+Nothing checks it against upstream file by file: the integration tests (smoke, the rustc
+comparison harnesses, real crates) are what hold blaze's behaviour to the nightly's.
 
 ## How far behind it gets, and how long a bump takes
 
@@ -183,12 +203,13 @@ blaze is moving off rustc ([no-rustc.md](no-rustc.md)); the rule is in [AGENTS.m
 blaze's nightly is the definition of the language and the standard library blaze matches while
 rustc is still in the tree: its layouts, ABI, `TypeId`s and answers are what blaze agrees with.
 It is not a rustc blaze maintains. As the no-rustc steps land its pieces go: cargo, then rustc
-with rust-lld and the proc-macro server, then `rust-std`; what is left is `rust-src`, shipped as
-part of blaze, and the toolchain is blaze alone.
+with rust-lld and the proc-macro server, then `rust-std`. The standard library's source is
+already blaze's (`library/`, downloaded with blaze's release rather than as the nightly's
+`rust-src`), so what is left then is blaze alone.
 
 - [#402](https://github.com/indexable-inc/blaze/issues/402): ship the standard library's
-  source (`rust-src` of the pinned nightly) with blaze's release, so blaze's toolchain needs no
-  upstream download once rustc is gone.
+  source with blaze's release, so blaze's toolchain needs no upstream download once rustc is
+  gone. Done: `library/`, the release's `library-<digest>.tar.xz`.
 - [#403](https://github.com/indexable-inc/blaze/issues/403): shrink the download as each
   no-rustc step removes a piece (`cargo`, `rustc`, `rust-std`), down to blaze alone.
 - [#404](https://github.com/indexable-inc/blaze/issues/404): the bump, every day

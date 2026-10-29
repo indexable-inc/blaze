@@ -985,6 +985,7 @@
      "salsa",
      "sha2 0.10.9",
      "span",
+     "target-lexicon",
      "tt",
      "wasmtime"
     ],
@@ -1431,6 +1432,13 @@
     "name": "colored",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "2.2.0"
+   },
+   {
+    "dependencies": [
+     "syntax"
+    ],
+    "name": "const-ast",
+    "version": "0.0.0"
    },
    {
     "checksum": "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8",
@@ -2465,6 +2473,7 @@
    {
     "dependencies": [
      "base-db",
+     "const-ast",
      "cov-mark",
      "either",
      "expect-test",
@@ -6762,6 +6771,10 @@
      "path": "crates/cfg",
      "version": "0.0.0"
     },
+    "const-ast": {
+     "path": "crates/const-ast",
+     "version": "0.0.0"
+    },
     "crossbeam-channel": "0.5.15",
     "dashmap": {
      "features": [
@@ -8816,6 +8829,23 @@
     "kind": "registry"
    },
    "version": "2.2.0"
+  },
+  "const-ast@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "Typed views over a flat syntax tree as const fns, for const macros (docs/future/const-macros.md).",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "const-ast",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/const-ast",
+    "kind": "path"
+   },
+   "version": "0.0.0"
   },
   "const-oid@0.10.2": {
    "authors": "RustCrypto Developers",
@@ -20937,6 +20967,10 @@
       {
        "name": "span",
        "unit": "span@0.0.0 lib span build"
+      },
+      {
+       "name": "target_lexicon",
+       "unit": "target-lexicon@0.13.5 lib target_lexicon build"
       },
       {
        "name": "tt",
@@ -42184,6 +42218,10 @@
        "unit": "span@0.0.0 lib span build"
       },
       {
+       "name": "target_lexicon",
+       "unit": "target-lexicon@0.13.5 lib target_lexicon build"
+      },
+      {
        "name": "tt",
        "unit": "tt@0.0.0 lib tt build"
       },
@@ -63300,6 +63338,10 @@
       {
        "name": "span",
        "unit": "span@0.0.0 lib span build"
+      },
+      {
+       "name": "target_lexicon",
+       "unit": "target-lexicon@0.13.5 lib target_lexicon build"
       },
       {
        "name": "tt",
@@ -84572,6 +84614,10 @@
       {
        "name": "span",
        "unit": "span@0.0.0 lib span build"
+      },
+      {
+       "name": "target_lexicon",
+       "unit": "target-lexicon@0.13.5 lib target_lexicon build"
       },
       {
        "name": "tt",

@@ -53,7 +53,10 @@ therefore found by any build of blaze from the same sources on any machine, for 
 toolchain: a CI runner that builds blaze for a commit that changes only the harnesses or
 the docs reuses the store of the commit before (`harness/storebuilds.py`). A blaze built
 outside this workspace (the published crate) keys by the bytes of its executable, as every
-build did before. Upgrading blaze makes the old
+build did before. `blaze-engine cache build` prints sixteen hex digits of the store's format
+and what the build was made from, and fails for a build keyed by its executable: two builds
+that print the same keep the same keys for a toolchain, whatever release each is, so CI names
+the remote's project by it rather than by the release (`.github/actions/blaze`). Upgrading blaze makes the old
 entries unreachable; they are removed over time as least recently used.
 
 A build script's run is kept under a key with the checkout and the target directory apart:
@@ -176,6 +179,7 @@ the least recently used; `blaze-engine cache gc --max 0` empties the store at on
 
 These act on the store `blaze status` names.
 
+    blaze-engine cache build                 what this build's keys are made with, but the toolchain
     blaze-engine cache stats                 format, packs, bytes, limit, oldest and newest use
     blaze-engine cache verify                read everything; exit 1 if a pack is not what was written
     blaze-engine cache gc [--max SIZE]       collect now, to BLAZE_CACHE_MAX or to SIZE
@@ -209,7 +213,21 @@ packs that project's builds were served from.
                                  uncompressed in the store, to be read in place)
     keys/<sha256>                the keys of one pack
     manifests/<project>          one line per pack
+    manifests/<project>.index    the project's key index: one line per run, signed as the manifest is
+    index/<sha256>               a run or a shard of the key index
     units/<sha256>, deps/<project>   cargo's builds of dependencies, see below
+
+The key index says which pack holds which key, so that a store lacking one key can fetch the
+pack that has it without reading the key list of every pack first (650 MB of them for the 830
+packs of blaze's own CI). Each push writes it after the manifest: the packs the manifest lists
+that no run of the index covers (those it sent, and those a blaze from before the index listed)
+go into a new run, whose entries are the first 6 bytes of each key, grouped by pack and cut by
+the keys' first bits into shards of at most about 256 KB. Runs of about one size are merged
+into one, without the packs the manifest no longer lists, so a project has a few runs. The
+root is signed and turned as the manifest is, and runs and shards are named by the hash of
+their bytes, so what the root names is checked as far down as it goes; a pack the index names
+is still checked to be in the manifest, and the key in the pack. The format is in
+`crates/blaze-store/src/remote_index.rs`. Nothing reads the index during a build yet.
 
 **Real AWS S3 has not been run.** Everything was measured against MinIO and SeaweedFS on
 the same machine over loopback. The client is the AWS SDK, so the code is the same, but
