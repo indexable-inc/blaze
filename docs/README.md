@@ -35,7 +35,7 @@ How blaze is now. Kept true: CI checks their links, paths and settings against t
 
 Designs not (fully) built, newest first.
 
-- [linker.md](linker.md) (2026-10-28): blaze's own linker: one patch engine with a lasting layout, writing to a running process or an executable, replacing cc, lld, ld64 and link.exe.
+- [patching.md](patching.md) (2026-10-28): blaze's patching: one engine with a lasting layout, writing to a running process or an executable, replacing cc, lld, ld64 and link.exe.
 - [future/const-macros.md](future/const-macros.md) (2026-10-28): Const macros: proc macros written inline as const fn, run by the const evaluator. Stage 0 is experimental.
 - [driver.md](driver.md) (2026-10-28): The build driver as a graph that does no IO: what is wrong with the serial driver and what replaces it.
 - [remote-cache.md](remote-cache.md) (2026-10-27): One shared remote cache for CI and everyone: the gateway, the CAS API, and the slices built and to come.

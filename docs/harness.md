@@ -25,6 +25,15 @@ depended on its library alone.
 
 `deriveerrors.py`: Unused invalid built-in derives fail check and build as Cargo's do; a valid edit and a daemon restart preserve the verdict (#751).
 
+`coldimage.py`: hello patched onto an empty ELF image by `blaze-engine patch-image`, against the
+same objects linked by lld ([patching.md](patching.md), stage 1), on x86-64 and AArch64 Linux.
+The two must run alike (standard output, standard error, exit status) and reach the same
+things: every relocation of every input section both images have reaches the same symbol and
+offset, import, or bytes; the bytes around the relocations are the same; and so are NEEDED, the
+versioned imports, PT_TLS, `.init_array` and `.fini_array` in order, the FDEs, the load-time
+relocations by what they reach, PT_INTERP, BIND_NOW and PIE. lld is the oracle in the harness
+only. Any flag of the link line it does not know the meaning of is an error.
+
 ## Running them
 
 You need Python 3, the pinned nightly (`harness/toolchain`) with `rust-src`, a C compiler
