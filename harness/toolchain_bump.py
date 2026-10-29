@@ -1,10 +1,12 @@
-#!/usr/bin/env python3
+# pyright: basic
 """toolchain_bump.py: move blaze to a newer Rust nightly. blaze supports one toolchain, the
 dated nightly in harness/toolchain; everything that mirrors that rustc moves with it.
 
-    toolchain_bump.py '{}'                     the newest nightly that has every component blaze needs
-    toolchain_bump.py '{"date": "2026-11-02"}'
-    toolchain_bump.py checks '{}'              after a bump, in an ix VM: build blaze and run the
+    uv run --frozen python harness/toolchain_bump.py '{}'
+                                              the newest nightly that has every component blaze needs
+    uv run --frozen python harness/toolchain_bump.py '{"date": "2026-11-02"}'
+    uv run --frozen python harness/toolchain_bump.py checks '{}'
+                                              after a bump, in an ix VM: build blaze and run the
                                                checks that prove blaze and the nightly agree
 
 The JSON is inline, a file's path, or `-` for stdin.
@@ -14,7 +16,7 @@ A bump, in order (each step names itself when it fails, and stops there):
  1. picks the nightly: the given date, or the newest of the last two weeks whose manifest has
     rustc, cargo, rust-std, rust-src, llvm-tools, rustfmt, clippy, rust-analyzer and (but on
     Windows) rustc-codegen-cranelift-preview for every host blaze ships for;
- 2. writes harness/toolchain and runs toolchain_pins.py --write (pins.txt: the files' hashes,
+ 2. writes harness/toolchain and runs toolchain_pins.py '{"write": true}' (pins.txt: the files' hashes,
     the nightly's `rustc -V` and its rust-lang/rust commit);
  3. re-vendors from rust-lang/rust at the new commit: crates/rustc_abi/src is
     compiler/rustc_abi/src copied as it is, and vendor/proc-macro-srv is upstream's crates at
@@ -22,7 +24,7 @@ A bump, in order (each step names itself when it fails, and stops there):
     apply; a conflict stops the bump and names the files);
  4. merges the new nightly's standard library into library/ (`library.py merge`): upstream's
     changes since library/UPSTREAM's nightly, applied three-way, so blaze's own changes to it
-    (library/PATCHES.md) are kept; a conflict stops the bump and names the files. It runs when
+    are kept; a conflict stops the bump and names the files. It runs when
     the pin is already the nightly's too, so a bump branch made before library/ catches up;
  5. moves the pins written down elsewhere: the old toolchain name, rustc version line and
     commit in install.sh and vendor/proc-macro-srv (RUSTC_VERSION_STRING, the manifest's
@@ -34,14 +36,26 @@ A bump, in order (each step names itself when it fails, and stops there):
 What it leaves to you, which it prints at the end: answers.py --write on each of x86-64 Linux,
 AArch64 Linux and arm64 macOS (the target specs depend on the host rustc was built for), the
 code that mirrors rustc by hand (the Rust ABI in the code generator, vtable.rs, type_id.rs,
-symbol names, new intrinsics and lang items: the checks find them), and `--checks`. The rustc
+symbol names, new intrinsics and lang items: the checks find them), and `checks '{}'`. The rustc
 and the daemon match by the whole `rustc -V` line, so a binary built before the bump refuses
 the new nightly until it is rebuilt. docs/contributing.md, "Moving to a newer nightly".
 """
-import asyncio, datetime, hashlib, json, os, re, shutil, sys, tempfile, tomllib, typing, urllib.request
-from dataclasses import dataclass, fields
+import asyncio
+import datetime
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+import tomllib
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
 
 import ci
+from typed_input import fail, parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -52,6 +66,8 @@ RUST = "https://github.com/rust-lang/rust"
 CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "blaze-bump")
 HOSTS = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
          "x86_64-pc-windows-msvc"]
+# rust-src is not blaze's (it compiles its own library/): the bump imports library/ from it
+# (library.py merge), and rustc's side of the harnesses names std's files where it installs.
 COMPONENTS = ["rustc", "cargo", "rust-std", "rust-src", "llvm-tools-preview", "rustfmt-preview",
               "clippy-preview", "rust-analyzer-preview", "rustc-codegen-cranelift-preview"]
 # Where the old pin is written down besides harness/toolchain and pins.txt.
@@ -141,17 +157,17 @@ async def pick(date):
     dates = [(today - datetime.timedelta(days=back)).isoformat() for back in range(14)]
     async with asyncio.TaskGroup() as group:
         tasks = {date: group.create_task(manifest(date)) for date in dates}
-    for date in dates:
-        channel = tasks[date].result()
+    for candidate in dates:
+        channel = tasks[candidate].result()
         if channel is not None and not missing(channel):
-            return date, channel
-        print(f"nightly-{date}: {'none published' if channel is None else 'lacks ' + ', '.join(missing(channel))}")
+            return candidate, channel
+        print(f"nightly-{candidate}: {'none published' if channel is None else 'lacks ' + ', '.join(missing(channel))}")
     raise Failed("pick: no nightly of the last two weeks has every component blaze needs")
 
 
 def pinned():
     """The pin as pins.txt has it: toolchain name, `rustc -V` after `rustc `, commit."""
-    lines = dict(line.split(" ", 1) for line in open(PINS).read().splitlines() if line and not line.startswith("#"))
+    lines = dict(line.split(" ", 1) for line in Path(PINS).read_text().splitlines() if line and not line.startswith("#"))
     return lines["release"].split()[0], lines["rustc"], lines["commit"]
 
 
@@ -199,10 +215,10 @@ def without_dev_dependencies(root):
         if os.path.basename(path) != "Cargo.toml":
             continue
         full = os.path.join(root, path)
-        text = open(full).read()
+        text = Path(full).read_text()
         kept = re.sub(r"(?ms)^\[dev-dependencies\]\n.*?(?=^\[|\Z)", "", text)
         if kept != text:
-            open(full, "w").write(kept)
+            Path(full).write_text(kept)
 
 
 def prune(new_root, base, ours):
@@ -273,7 +289,7 @@ async def vendor(old, new):
         if not patch.strip():
             return
         patch_file = os.path.join(work, "blaze.patch")
-        open(patch_file, "wb").write(patch)
+        await asyncio.to_thread(Path(patch_file).write_bytes, patch)
         # A three-way apply needs the old blobs in this repository, which upstream's are not:
         # apply with rejects, so what applies does and each hunk that does not is a .rej file.
         proc = await asyncio.create_subprocess_exec(
@@ -296,28 +312,28 @@ def move_mentions(old, new):
              (old_commit[:9], new_commit[:9])]
     for path in MENTIONS:
         full = os.path.join(ROOT, path)
-        text = open(full).read()
+        text = Path(full).read_text()
         moved = text
         for was, now in pairs:
             moved = moved.replace(was, now)
         if moved == text:
             print(f"note: {path} names none of the old pin ({old_name}, {old_commit[:9]})")
-        open(full, "w").write(moved)
+        Path(full).write_text(moved)
     blaze = lambda name: name.replace("nightly-", "blaze-", 1)
     for path in DOCS:
         full = os.path.join(ROOT, path)
-        text = open(full).read()
+        text = Path(full).read_text()
         moved = text
         for was, now in [(old_name, new_name), (blaze(old_name), blaze(new_name)), (old_rustc, new_rustc)]:
             moved = moved.replace(was, now)
-        open(full, "w").write(moved)
+        Path(full).write_text(moved)
     major_minor = ".".join(new_rustc.split(" ")[0].split(".")[:2])
     cargo = os.path.join(ROOT, "Cargo.toml")
-    text = open(cargo).read()
+    text = Path(cargo).read_text()
     moved, count = re.subn(r'(?m)^rust-version = "[^"]*"', f'rust-version = "{major_minor}"', text, count=1)
     if count != 1:
         raise Failed("mentions: Cargo.toml has no `rust-version = ...` line")
-    open(cargo, "w").write(moved)
+    Path(cargo).write_text(moved)
 
 
 async def library(date):
@@ -336,8 +352,8 @@ async def bump(date):
         await library(date)
         return
     print(f"moving {old[0]} ({old[1]}) to {name} ({channel['pkg']['rustc']['version']})")
-    open(PIN, "w").write(name + "\n")
-    await run("pins", sys.executable, os.path.join(HERE, "toolchain_pins.py"), "--write", bound=900)
+    await asyncio.to_thread(Path(PIN).write_text, name + "\n")
+    await run("pins", sys.executable, os.path.join(HERE, "toolchain_pins.py"), '{"write": true}', bound=900)
     new = pinned()
     await vendor(old[2], new[2])
     await library(date)
@@ -348,6 +364,8 @@ async def bump(date):
         else:
             print("note: nix is not on PATH: run `nix flake update rust-overlay` where it is")
         if shutil.which("rustup"):
+            # For rustc's side of the harnesses and an editor's rust-analyzer; blaze reads no
+            # rust-src.
             group.create_task(run("rustup", "rustup", "toolchain", "install", name, "--profile", "minimal",
                                   "-c", "rust-src", "-c", "llvm-tools", "-c", "rustfmt", "-c", "clippy",
                                   bound=1200))
@@ -356,7 +374,7 @@ blaze is pinned to {name} ({new[1]}). Left to do:
   - on x86-64 Linux, AArch64 Linux and arm64 macOS each: `python3 harness/answers.py --write`
     (with that host's release build of blaze), then commit crates/blaze-cargo/src/answers/rustc.json;
   - `cargo build -p blaze-engine --release` and fix what the new rustc_abi and std ask for;
-  - `python3 harness/toolchain_bump.py checks '{{}}'` in an ix VM, under Cranelift and under LLVM
+  - `uv run --frozen python harness/toolchain_bump.py checks '{{}}'` in an ix VM, under Cranelift and under LLVM
     (`nix develop -c ...` with BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast);
   - the full tier (uitest.py, libsuite.py, borrowck_ui.py) re-measured at the new commit;
   - `git diff --stat` and one commit for the bump (docs/contributing.md).""")
@@ -364,16 +382,17 @@ blaze is pinned to {name} ({new[1]}). Left to do:
 
 async def checks():
     """Builds blaze and runs what proves it agrees with the pinned nightly, in parallel."""
-    name = open(PIN).read().strip()
+    name = (await asyncio.to_thread(Path(PIN).read_text)).strip()
     env = dict(os.environ, RUSTUP_TOOLCHAIN=name)
     await run("build", "cargo", "build", "-p", "blaze-engine", "--release", env=env, bound=3600)
     env.setdefault("BLAZE_BIN", os.path.join(ROOT, "target/release/blaze-engine"))
     harness = [
-        ["toolchain_pins.py"],
+        ["toolchain_pins.py", "{}"],
         ["answers.py"],
         ["macroserver.py"],
         ["difftest.py", "corpus", "--bin", "runner", "--crate", "cases", "--layouts"],
-        *(["ci.py", part] for part in ci.fast_parts(env.get("BLAZE_BACKEND") or "cranelift")),
+        *(["ci.py", "run", json.dumps({"part": part})]
+          for part in ci.fast_parts(env.get("BLAZE_BACKEND") or "cranelift")),
     ]
     failed = []
 
@@ -404,43 +423,22 @@ class Checks:
     pass
 
 
-def typed(cls, text):
-    """`cls` from the JSON `text` (inline, a path, or `-`); exits naming the field that is wrong."""
-    if text == "-":
-        text = sys.stdin.read()
-    elif text and not text.lstrip().startswith("{"):
-        text = open(text).read()
-    try:
-        value = json.loads(text or "{}")
-    except json.JSONDecodeError as e:
-        sys.exit(f"toolchain_bump.py: the input is not JSON: {e}")
-    if not isinstance(value, dict):
-        sys.exit("toolchain_bump.py: the input is a JSON object")
-    known = {f.name for f in fields(cls)}
-    if unknown := sorted(set(value) - known):
-        sys.exit(f"toolchain_bump.py: no field {', '.join(unknown)} (fields: {', '.join(sorted(known)) or 'none'})")
-    hints = typing.get_type_hints(cls)
-    for name, given in value.items():
-        if not isinstance(given, hints[name]):
-            sys.exit(f"toolchain_bump.py: field {name} is a {hints[name].__name__}, not {given!r}")
-    if value.get("date") and not re.fullmatch(r"\d{4}-\d\d-\d\d", value["date"]):
-        sys.exit(f"toolchain_bump.py: field date is YYYY-MM-DD, not {value['date']!r}")
-    return cls(**value)
-
-
 def main():
     argv = sys.argv[1:]
     checking = bool(argv) and argv[0] == "checks"
     if checking:
         argv = argv[1:]
-    if len(argv) > 1:
-        sys.exit(f"usage: toolchain_bump.py [checks] '<json>'\n\n{__doc__}")
-    given = argv[0] if argv else ""
+    if len(argv) != 1:
+        fail("toolchain_bump.py", "usage: toolchain_bump.py [checks] JSON (see the top of the file)")
+    given = argv[0]
     if checking:
-        typed(Checks, given)
+        parse(Checks, given, "toolchain_bump.py")
         work = checks()
     else:
-        work = bump(typed(Bump, given).date)
+        options = parse(Bump, given, "toolchain_bump.py")
+        if options.date and not re.fullmatch(r"\d{4}-\d\d-\d\d", options.date):
+            fail("toolchain_bump.py", f"field date is YYYY-MM-DD, not {options.date!r}")
+        work = bump(options.date)
     try:
         asyncio.run(work)
     except Failed as error:

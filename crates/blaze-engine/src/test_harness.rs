@@ -24,6 +24,12 @@ fn written_at(text: &str) -> Option<usize> {
     [MARK, crate::macro_list::MARK].iter().filter_map(|it| text.find(it)).min()
 }
 
+/// The name of the module at the end of `text`, this one or a [`crate::macro_list`].
+pub(crate) fn appended(text: &str) -> Option<&'static str> {
+    let at = written_at(text)?;
+    Some(if text[at..].starts_with(MARK) { MODULE } else { crate::macro_list::MODULE })
+}
+
 /// The text of the root file without the module.
 pub(crate) fn without(text: &str) -> &str {
     written_at(text).map_or(text, |at| &text[..at])

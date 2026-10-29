@@ -153,10 +153,18 @@ PATH for an installed release).
 
 - **std** (no dependencies; the merge gate runs these on every pull request, under two minutes):
   `HashMap` insert and iterate, `thread::spawn` + `join`, `thread_local!`, `Mutex`/`OnceLock`/
-  atomic statics, `std::env` and `std::fs` basics.
+  atomic statics, `std::env` and `std::fs` basics, and `const_heap` (`Vec`, `String`, `Box` and
+  `BTreeMap` in constants).
 - **crates** (from crates.io, at the versions their Cargo.lock pins): tokio (multi-threaded
   runtime, a TCP echo on localhost), a serde_json round trip, proc-macro derives (thiserror,
-  clap's derive).
+  clap's derive), and three constants of real crates: SHA-256 of 1 MiB (`ce_sha256`, sha2), a
+  Cargo manifest parsed with basic-toml (`ce_toml`) and 4 MiB inflated with miniz_oxide
+  (`ce_inflate`).
+  `const_heap` and the three `ce_` cases call ordinary functions in a `const`, which the pinned
+  nightly refuses (E0015) and blaze does not yet (issue #1440). Each asserts that the constant
+  equals what the program computes at run time, and prints the values. `expected.txt` has the
+  same values computed independently (Python's `hashlib` and `tomllib`, and the same
+  arithmetic).
 - **projects** (real repositories at pinned commits): ripgrep, indexable-inc/anim, and blaze
   itself.
 - **apps** (large applications at pinned commits, with the system libraries each builds with

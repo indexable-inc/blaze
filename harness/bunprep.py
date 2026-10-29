@@ -103,7 +103,7 @@ def rust_env(env):
 def install_toolchain():
     rustup = shutil.which("rustup")
     if rustup and TOOLCHAIN not in subprocess.run([rustup, "toolchain", "list"], capture_output=True, text=True).stdout:
-        subprocess.run([rustup, "toolchain", "install", TOOLCHAIN, "--profile", "minimal", "-c", "rust-src"], check=True)
+        subprocess.run([rustup, "toolchain", "install", TOOLCHAIN, "--profile", "minimal"], check=True)
 
 
 def build_dir(tree):

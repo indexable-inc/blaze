@@ -655,7 +655,7 @@ machine; the band widens with the spread its own history shows.
 
 ## Run it yourself
 
-On any of the platforms with Nix (or with the pinned nightly of `harness/toolchain`, rust-src, the pinned LLVM 23 and Python 3 installed):
+On any of the platforms with Nix (or with the pinned nightly of `harness/toolchain`, the pinned LLVM 23 and Python 3 installed; ripgrep's run searches blaze's `library/`, not a rust-src):
 
 ```
 nix develop .#bench

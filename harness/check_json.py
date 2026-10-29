@@ -1,7 +1,12 @@
-#!/usr/bin/env python3
+# pyright: basic
 """check_json.py: `blaze check --message-format=...` against `cargo check` on the same errors.
 
-    check_json.py [CASE...] [--keep]
+    uv run --frozen python harness/check_json.py '{}'
+    uv run --frozen python harness/check_json.py '{"cases": ["two_codes"], "keep": true}'
+
+One JSON object, inline, a file's path, or `-` for stdin: `cases` selects case names (empty
+runs every case), `keep` keeps the scratch directory, and `blaze_bin` names blaze-engine
+(empty uses target/release/blaze-engine). Unknown fields and case names are refused.
 
 Each case below is a small package with errors the daemon reports. It is checked by plain
 cargo (rustc) and by `blaze check` (the daemon's checker, which runs no rustc), in a
@@ -22,16 +27,27 @@ What only rustc has is left out of the comparison and counted: a message worded 
 spans of an error) and `code.explanation`. A package without errors has to give
 `build-finished` with success true; rustc's `compiler-artifact` lines are not compared.
 
-BLAZE_BIN (default target/release/blaze-engine) is the blaze with `blaze` and `blaze-rustc`
+`blaze_bin` (default target/release/blaze-engine) is the blaze with `blaze` and `blaze-rustc`
 next to it. Exits 1 when anything compared differs.
 """
-import json, os, re, shutil, subprocess, sys, tempfile
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+from typed_input import fail, parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 EXE = ".exe" if os.name == "nt" else ""
-BLAZE = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/blaze-engine" + EXE)
-TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
+BLAZE = os.path.join(ROOT, "target/release/blaze-engine" + EXE)
+TOOLCHAIN = Path(HERE, "toolchain").read_text().strip()
 ALLOW = "#![allow(unused, dead_code)]\n"
 
 MANIFEST = """[package]
@@ -172,7 +188,7 @@ def make(work, name, files):
 def run(at, command, fmt, home):
     """stdout's JSON messages, stderr's lines and the status of `COMMAND check` (cargo's with none)."""
     args = [*(command or ["cargo"]), "check", f"--message-format={fmt}"]
-    done = subprocess.run(args, cwd=at, env=env(home), capture_output=True, text=True, timeout=600)
+    done = subprocess.run(args, cwd=at, env=env(home), capture_output=True, text=True, timeout=600, check=False)
     messages = [json.loads(line) for line in done.stdout.splitlines() if line.startswith("{")]
     return messages, done.stderr.splitlines(), done.returncode
 
@@ -254,6 +270,8 @@ def compare_json(tally, case, fmt, ours, theirs):
         if k[0] in PLACED_OTHERWISE:
             tally.placed_otherwise += 1
             continue
+        if ps is None or pr is None:
+            fail("check_json.py", f"{case} {fmt}: compiler error {k} has no span")
         tally.same(case, fmt, "rendered frame", frame(d["rendered"], ps), frame(e["rendered"], pr))
         for field in SPAN_FIELDS:
             tally.same(case, fmt, f"span {field}", ps[field], pr[field])
@@ -273,22 +291,20 @@ def compare_text(tally, case, fmt, ours, theirs):
     def placed(code, at):
         return at.rsplit(":", 2)[0] if code in PLACED_OTHERWISE else at
 
-    if fmt == "short":
-        def heads(lines):
+    def heads(lines):
+        if fmt == "short":
             found = (re.match(r"^(\S+:\d+:\d+): error(?:\[(E\d+)\])?: ", ANSI.sub("", l)) for l in lines)
             return sorted((m[2], placed(m[2], m[1])) for m in found if m)
-    else:
-        def heads(lines):
-            """Each error's code with the first `-->` after its header."""
-            out = []
-            for line in map(ANSI.sub, [""] * len(lines), lines):
-                head = re.match(r"^error(?:\[(E\d+)\])?: ", line)
-                arrow = re.match(r"^\s*--> (\S+)", line)
-                if head:
-                    out.append([head[1], None])
-                elif arrow and out and out[-1][1] is None:
-                    out[-1][1] = placed(out[-1][0], arrow[1])
-            return sorted(map(tuple, out), key=str)
+        # Each error's code with the first `-->` after its header.
+        out = []
+        for line in map(ANSI.sub, [""] * len(lines), lines):
+            head = re.match(r"^error(?:\[(E\d+)\])?: ", line)
+            arrow = re.match(r"^\s*--> (\S+)", line)
+            if head:
+                out.append([head[1], None])
+            elif arrow and out and out[-1][1] is None:
+                out[-1][1] = placed(out[-1][0], arrow[1])
+        return sorted(map(tuple, out), key=str)
     tally.same(case, fmt, "headers", heads(ours), heads(theirs))
 
     def tail(lines):
@@ -298,10 +314,29 @@ def compare_text(tally, case, fmt, ours, theirs):
     tally.same(case, fmt, "notes and could not compile", tail(ours), tail(theirs))
 
 
+Case = Literal[
+    "two_codes", "one_code_twice", "tab_and_wide_chars", "lib_module", "calls", "moved", "fine",
+    "dyn_associated_type_outlives", "nested_projection_outlives", "promoted_enum_array",
+    "unpromoted_enum_array", "static_supertrait_object",
+]
+
+
+@dataclass(frozen=True)
+class Input:
+    cases: tuple[Case, ...] = ()
+    keep: bool = False
+    blaze_bin: str = ""
+
+
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    keep = "--keep" in sys.argv
-    cases = {name: CASES[name] for name in (args or CASES)}
+    global BLAZE
+    match sys.argv[1:]:
+        case [text]:
+            options = parse(Input, text, "check_json.py")
+        case _:
+            fail("check_json.py", "usage: check_json.py JSON (see the top of the file)")
+    BLAZE = options.blaze_bin or BLAZE
+    cases = {name: CASES[name] for name in (options.cases or CASES)}
     # Under /tmp on macOS: the checkers' sockets are in BLAZE_HOME below, and under $TMPDIR
     # (/var/folders/...) their paths pass the 104 bytes macOS has for one.
     work = tempfile.mkdtemp(prefix="check-json-", dir="/tmp" if sys.platform == "darwin" else None)
@@ -324,8 +359,8 @@ def main():
                     compare_text(tally, name, fmt, our_err, their_err)
             print(f"{name}: done", flush=True)
     finally:
-        subprocess.run([BLAZE, "stop"], env=env(home), capture_output=True)
-        if not keep:
+        subprocess.run([BLAZE, "stop"], env=env(home), capture_output=True, check=False)
+        if not options.keep:
             shutil.rmtree(work, ignore_errors=True)
         else:
             print(f"kept {work}")
