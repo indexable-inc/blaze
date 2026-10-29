@@ -205,7 +205,7 @@ def collect2_of(said: str) -> list[str]:
 # --- ELF ----------------------------------------------------------------------------------
 
 SHT_SYMTAB, SHT_RELA, SHT_NOBITS, SHT_DYNSYM, SHT_REL = 2, 4, 8, 11, 9
-SHF_ALLOC = 2
+SHF_ALLOC, SHF_MERGE, SHF_STRINGS = 2, 0x10, 0x20
 PT_LOAD, PT_DYNAMIC, PT_INTERP, PT_TLS, PT_GNU_STACK, PT_GNU_RELRO = 1, 2, 3, 7, 0x6474E551, 0x6474E552
 STT_SECTION, STT_FILE, STT_TLS = 3, 4, 6
 
@@ -433,6 +433,11 @@ class Image:
         if depth > 1:
             return f"in {sec.name}"
         end = min(addr + size, sec.addr + sec.size)
+        if depth > 0:
+            # A pointee's length is not known here: up to its first NUL, past which a merged
+            # string's neighbours are each linker's own.
+            nul = self.read(addr, end - addr).find(b"\0")
+            end = end if nul < 0 else addr + nul + 1
         words = []
         for at in range(addr, end, 8):
             if at in self.dynrel:
@@ -597,10 +602,38 @@ def anchored(objects: list[Elf], images: list[Image]) -> tuple[list[tuple[Elf, l
     return out, left
 
 
+def what_of(obj: Elf, target: Sym | None, defined: dict[str, tuple[Elf, Sym]]) -> tuple[int, str | None]:
+    """How many bytes of a relocation's target tell it when the image has no symbol there, and
+    the name of its section when that is empty (so where it is is where its section went)."""
+    if target is not None and target.shndx == 0 and target.name in defined:
+        obj, target = defined[target.name]
+    if target is None or not 0 < target.shndx < len(obj.sections):
+        return 16, None
+    home = obj.sections[target.shndx]
+    if home.size == 0:
+        return 16, home.name
+    if home.flags & SHF_MERGE and not home.flags & SHF_STRINGS and home.entsize:
+        # A linker merges such a section by its entries.
+        return home.entsize, None
+    if target.type == STT_SECTION:
+        return 16, None
+    if target.size:
+        return target.size, None
+    if home.flags & SHF_STRINGS and target.value < home.size:
+        at = home.offset + target.value
+        return obj.data.index(b"\0", at) + 1 - at, None
+    return 16, None
+
+
 def compare_sections(objects: list[Elf], ours: Image, lld: Image) -> list[str]:
     """Every relocation of every anchored input section, in both images, and the bytes around."""
     diffs = []
     sections, left = anchored(objects, [ours, lld])
+    defined: dict[str, tuple[Elf, Sym]] = {}
+    for obj in objects:
+        for s in obj.symbols(SHT_SYMTAB):
+            if s.name and s.bind != 0 and 0 < s.shndx < 0xFF00:
+                defined.setdefault(s.name, (obj, s))
     rela = {id(obj): {rs.info: rs for rs in obj.sections if rs.type == SHT_RELA} for obj in objects}
     checked = 0
     for obj, syms, sec, anchor in sections:
@@ -620,9 +653,7 @@ def compare_sections(objects: list[Elf], ours: Image, lld: Image) -> list[str]:
             mask.update(masked(obj.machine, rel[0], rel[1]))
             target = syms[rel[2]] if rel[2] < len(syms) else None
             name = (target.name or f"section {obj.sections[target.shndx].name}") if target else "?"
-            size = target.size if target and target.type != STT_SECTION and target.size else 16
-            home = obj.sections[target.shndx] if target and 0 < target.shndx < len(obj.sections) else None
-            empty = home.name if home is not None and home.size == 0 else None
+            size, empty = what_of(obj, target, defined)
             got = [reached(img, base, rel, name, size, empty, pair) for img, base, pair in zip((ours, lld), bases, pairs)]
             checked += 1
             if got[0] != got[1]:
