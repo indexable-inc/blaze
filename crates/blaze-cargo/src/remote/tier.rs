@@ -119,7 +119,8 @@ impl Tiered {
             Ok(_) => _ = self.loads.fetch_add(1, Ordering::Relaxed),
             // A run the new look names and could not read fails the lookups that need it.
             Err(e) if was_ready => eprintln!(
-                "remote: the index of `{}` is looked up as it was read before: {e:#}",
+                "remote: the index of `{}` was read again; what of it could not be read fails \
+                 the lookups that need it: {e:#}",
                 self.project
             ),
             Err(e) => *held = State::Failed(format!("{e:#}")),

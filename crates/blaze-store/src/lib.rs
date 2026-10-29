@@ -339,7 +339,7 @@ pub fn pack_keys(name: &str, bytes: &[u8]) -> Result<Vec<[u8; KEY]>, &'static st
 /// brought for that key already that did not hold it: brings the next pack that may hold it
 /// into the store's directory and names it, or says `None` when no pack it knows of may.
 /// An error is that it could not tell or could not bring the pack, naming what failed: the
-/// build that asked fails ([`take_failure`]), and nothing compiles the key in its place.
+/// build that asked fails ([`Build::failure`]), and nothing compiles the key in its place.
 pub type FetchMissing = Box<
     dyn Fn(&[u8; KEY], &[remote_index::Hash]) -> Result<Option<remote_index::Hash>, String>
         + Send
@@ -413,39 +413,79 @@ fn ask_for_missing() -> Result<Vec<Arc<FetchMissing>>, String> {
         .collect()
 }
 
-/// How a fetch of a key the store lacked failed, if one did and no build has taken it: the
-/// build that takes it fails with it, whatever else asked for the key did. Until then no key
-/// is asked for again, rather than wait on a remote that failed key by key, and nothing
-/// compiled is added to the store.
-static FAILED: Mutex<Option<String>> = Mutex::new(None);
+/// How the last fetch of a key the store lacked failed, with its number, since no build was
+/// under way ([`Build`]): every build that was under way when one failed fails with it (one
+/// under way at the last failure was at every one after it began), and while one is here
+/// nothing compiled is added to the store, as it may be what the remote would have brought.
+static FAILURES: Mutex<Failures> = Mutex::new(Failures { next: 0, running: 0, last: None });
 
-/// A build starts: a failure of one before it is not its own.
-pub fn build_starts() {
-    if let Some(why) = take_failure() {
-        eprintln!("store: a failure of the build before is dropped: {why}");
+struct Failures {
+    /// The number the next failure gets.
+    next: u64,
+    /// How many builds are under way.
+    running: usize,
+    last: Option<(u64, String)>,
+}
+
+fn failures() -> MutexGuard<'static, Failures> {
+    FAILURES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A build under way, for the fetches that fail while it is: see [`FAILURES`]. A process
+/// that builds several programs at once has one of each.
+pub struct Build {
+    /// The number of the first failure that is this build's.
+    from: u64,
+}
+
+impl Build {
+    /// A build starts: failures from before it are not its own.
+    pub fn begins() -> Build {
+        let mut failures = failures();
+        failures.running += 1;
+        Build { from: failures.next }
+    }
+
+    /// How a fetch failed while this build was under way, if one did: the build fails with
+    /// it, whatever asked for the key, as what was compiled in place of the key is not what
+    /// the remote holds.
+    pub fn failure(&self) -> Option<String> {
+        let failures = failures();
+        let mine = failures.last.as_ref().filter(|(at, _)| *at >= self.from);
+        mine.map(|(_, why)| why.clone())
     }
 }
 
-/// How a fetch for this build failed, if one did, taken: the build that takes it fails.
-pub fn take_failure() -> Option<String> {
-    FAILED.lock().unwrap_or_else(PoisonError::into_inner).take()
+impl Drop for Build {
+    /// The failures are forgotten once no build that they may be of is under way: each that
+    /// was has seen them, or ended without asking.
+    fn drop(&mut self) {
+        let mut failures = failures();
+        failures.running -= 1;
+        if failures.running == 0 {
+            failures.last = None;
+        }
+    }
 }
 
-/// How a fetch for this build failed, if one did, left for the build's end to take.
+/// How a fetch failed that a build under way may be failing with: what a part of a build
+/// that cannot tell which build it is of (a unit of code generation) refuses on.
 pub fn failure() -> Option<String> {
-    FAILED.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    failures().last.as_ref().map(|(_, why)| why.clone())
 }
 
 fn failed() -> bool {
-    FAILED.lock().unwrap_or_else(PoisonError::into_inner).is_some()
+    failures().last.is_some()
 }
 
 fn fail(why: String) {
-    let mut failed = FAILED.lock().unwrap_or_else(PoisonError::into_inner);
-    if failed.is_none() {
+    let mut failures = failures();
+    if failures.last.as_ref().is_none_or(|(_, was)| *was != why) {
         eprintln!("store: {why}");
-        *failed = Some(why);
     }
+    let at = failures.next;
+    failures.next += 1;
+    failures.last = Some((at, why));
 }
 
 /// Seals what the store of this process has open, however little it is, so that it can be
@@ -2090,9 +2130,6 @@ impl Store {
         };
         if let Some(place) = known() {
             return Some(place);
-        }
-        if failed() {
-            return None;
         }
         let askers = match ask_for_missing() {
             Ok(askers) => askers,

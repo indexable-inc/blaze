@@ -273,9 +273,9 @@ reads the root and the manifest again once and tries again, as what it failed on
 a collection took out after a merge. One that still cannot be answered (the remote cannot be
 reached or opened, an object is gone or does not hash to its name, a pack is larger than
 `BLAZE_CACHE_MAX`) fails the build, naming what failed, whatever `BLAZE_REMOTE_REQUIRED`
-says: what it would have fetched is not compiled in its place, nothing the build compiles
-after the failure is kept in the store, and a daemon answers the build with the error, not
-with cargo. The next build asks again; a daemon whose remote could not be opened when it
+says: what it would have fetched is not compiled in its place, nothing compiled while a
+build that saw the failure is under way is kept in the store, and a daemon answers each
+build that was under way when it happened with the error, not with cargo. The next build asks again; a daemon whose remote could not be opened when it
 started fails what its store lacks until it is started again.
 A read of the root and the manifest that fails once they were read leaves the look from
 before.

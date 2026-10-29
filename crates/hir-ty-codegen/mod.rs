@@ -1097,13 +1097,13 @@ impl CodegenUnit {
                 }
             }
             cg.make_later();
-            if let Some(refused) = cg.refused.take() {
-                return Err(refused);
-            }
             // A key the store lacked and its remote could not be asked for, or could not
             // bring: what was compiled in its place is not this build's to give.
             if let Some(why) = store::failure() {
                 return Err(CodegenError::Refused(format!("{STORE_FAILED}{why}")));
+            }
+            if let Some(refused) = cg.refused.take() {
+                return Err(refused);
             }
             if cg.misfit {
                 // What was read of the entry that did not fit, and of those that call it.
