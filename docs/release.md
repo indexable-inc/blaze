@@ -165,8 +165,7 @@ PATH for an installed release).
   equals what the program computes at run time, and prints the values. `expected.txt` has the
   same values computed independently (Python's `hashlib` and `tomllib`, and the same
   arithmetic).
-- **projects** (real repositories at pinned commits): ripgrep, indexable-inc/anim, and blaze
-  itself.
+- **projects** (real repositories at pinned commits): ripgrep and blaze itself.
 - **apps** (large applications at pinned commits, with the system libraries each builds with
   in its entry): cargo 0.92.0 (which says `cargo 1.91.0`), zed v1.24.4 (a window it does not open: `--help`; its tests are
   those of the crates below gpui, since the whole suite with both builds is longer than a

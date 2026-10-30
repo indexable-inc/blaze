@@ -25,14 +25,6 @@
       ],
       "test": []
     },
-    "anim": {
-      "repo": "indexable-inc/anim",
-      "rev": "92c64f7276b3444a518904eaad2e107b36f77e08",
-      "private": true,
-      "apt": ["libasound2-dev", "pkg-config"],
-      "runs": [{ "args": ["--wav", "{work}/intro.wav"], "file": "{work}/intro.wav", "starts": "RIFF" }],
-      "test": []
-    },
     "blaze": {
       "repo": "indexable-inc/blaze",
       "rev": "{blaze}",
