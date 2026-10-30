@@ -684,3 +684,5 @@ impl DbPanicContext {
         CTX.with(|ctx| f(&mut ctx.borrow_mut()));
     }
 }
+
+// measurement only: a comment, to see what an edit of base-db recompiles
