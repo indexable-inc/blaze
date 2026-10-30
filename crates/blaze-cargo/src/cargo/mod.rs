@@ -28,6 +28,7 @@ pub mod package;
 pub mod plan;
 pub mod report;
 pub mod results;
+pub mod forked;
 pub mod run;
 pub mod sandboxed;
 pub mod say;

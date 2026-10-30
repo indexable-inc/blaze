@@ -2126,7 +2126,7 @@ fn sysroot_to_crate_graph(
     let scripted = build_script_cfgs(&rustc_cfg);
     let (public_deps, proc_macro) =
         sysroot_crates_to_crate_graph(crate_graph, sysroot, rustc_cfg, load, crate_ws_data);
-    // Nor are those of `compiler_builtins` and `libc`, whose cfgs are said here as theirs
+    // Nor are those of `compiler_builtins`, `libc` and `test`, whose cfgs are said here as theirs
     // would for the target.
     let crates: Vec<_> = crate_graph.iter().collect();
     for krate in crates {
@@ -2156,7 +2156,7 @@ fn sysroot_to_crate_graph(
     (public_deps, proc_macro)
 }
 
-/// The cfgs the build scripts of the standard library's `compiler_builtins` and `libc` set for
+/// The cfgs the build scripts of the standard library's `compiler_builtins`, `libc` and `test` set for
 /// the target of `rustc_cfg`, as their `build.rs` (and `libm/configure.rs`) compute them with
 /// nothing in the environment, for the library rustc ships: optimized, not on libc's CI.
 /// Targets no backend of blaze's has (32-bit ARM, Thumb) are left as on any other.
@@ -2212,7 +2212,9 @@ fn build_script_cfgs(rustc_cfg: &[CfgAtom]) -> Vec<(&'static str, Vec<CfgAtom>)>
         ("linux_time_bits64", musl32),
         ("musl_redir_time64", musl && matches!(arch, "arm" | "mips" | "powerpc" | "x86")),
     ]);
-    vec![("compiler_builtins", builtins), ("libc", libc)]
+    // libtest's sets it when `$RUSTC -vV` says nightly, as blaze's pinned toolchain always is.
+    let test = flags(&[("enable_unstable_features", true)]);
+    vec![("compiler_builtins", builtins), ("libc", libc), ("test", test)]
 }
 
 fn sysroot_crates_to_crate_graph(

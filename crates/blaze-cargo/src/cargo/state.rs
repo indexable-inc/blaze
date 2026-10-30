@@ -100,6 +100,10 @@ pub struct Program {
     /// program.
     #[serde(default)]
     pub default_run: bool,
+    /// Whether it is a program of tests that starts in blaze's harness, which runs each test
+    /// in a process of its own ([`super::forked`]): not one with `harness = false`.
+    #[serde(default)]
+    pub harness: bool,
 }
 
 impl Program {
@@ -115,6 +119,7 @@ impl Program {
         executable: PathBuf,
         asked_as: (usize, usize),
         env: Vec<(String, String)>,
+        harness: bool,
     ) -> Program {
         Program {
             name,
@@ -132,6 +137,7 @@ impl Program {
             inputs: Vec::new(),
             env,
             default_run: false,
+            harness,
         }
     }
 }

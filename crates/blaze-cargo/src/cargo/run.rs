@@ -12,7 +12,7 @@ use anyhow::Context as _;
 use super::{
     affected::{self, Pick},
     cli::Invocation,
-    experimental,
+    experimental, forked,
     report::{self, Report},
     results::Results,
     sandboxed, say,
@@ -165,7 +165,10 @@ pub fn started(command: &mut Command) -> std::io::Result<std::process::Child> {
 }
 
 /// Starts `command`, which runs `program` (itself, or in a sandbox), as [`started`] does.
-fn started_running(command: &mut Command, program: &Path) -> std::io::Result<std::process::Child> {
+pub(super) fn started_running(
+    command: &mut Command,
+    program: &Path,
+) -> std::io::Result<std::process::Child> {
     #[cfg(unix)]
     let _unwritten = crate::splice::unwritten(program);
     #[cfg(not(unix))]
@@ -197,6 +200,14 @@ pub fn tests(
             opt_outs.insert(&test.package_dir, sandboxed::of_tests(&test.package_dir)?);
         }
     }
+    let mut test_options: BTreeMap<&Path, forked::Options> = BTreeMap::new();
+    for test in &programs {
+        if !test_options.contains_key(test.package_dir.as_path()) {
+            test_options.insert(&test.package_dir, forked::options(&test.package_dir)?);
+        }
+    }
+    let one_process = forked::one_process()?;
+    let command_timeout = forked::command_timeout()?;
     let sandboxing = sandboxed::on();
     if sandboxing
         && opt_outs.values().any(sandboxed::OptOut::sandboxed)
@@ -221,6 +232,8 @@ pub fn tests(
     let run = affected::run_identity(asked);
     let mut scratch = sandboxed::Scratch::new();
     let no_test = BTreeSet::new();
+    let mut deferred: Vec<Deferred<'_>> = Vec::new();
+    let mut stopped = false;
     for test in programs {
         let opt_out = &opt_outs[test.package_dir.as_path()];
         let sandboxed_here = sandboxing && opt_out.sandboxed();
@@ -252,6 +265,17 @@ pub fn tests(
         };
         let sandbox = identity.as_deref().ok_or(why_outside.as_str());
         let outside = if sandboxed_here { &opt_out.tests } else { &no_test };
+        let options = &test_options[test.package_dir.as_path()];
+        let per_test = match per_test(asked, test, options, one_process) {
+            Ok(it) => it,
+            Err(why) => {
+                say::error(&why);
+                return Ok(FAILED);
+            }
+        };
+        // A test's pass in a process of its own is not one among others' threads: a global
+        // another test set can decide it.
+        let run = if per_test { format!("{run}+per-test") } else { run.clone() };
         let pick = affected::pick(asked, state, test, results.as_mut(), &run, sandbox, outside);
         let no_flaky = BTreeSet::new();
         if why_only {
@@ -291,7 +315,9 @@ pub fn tests(
                 picked = Some(names.as_slice());
             }
         }
-        say::status(asked.flags.quiet, "Running", &running);
+        if !per_test {
+            say::status(asked.flags.quiet, "Running", &running);
+        }
         let verbose = |word: &str, rest: &str| {
             if asked.flags.verbose {
                 say::status(asked.flags.quiet, word, rest);
@@ -318,6 +344,22 @@ pub fn tests(
         if sandboxing && opt_out.all {
             let why = format!("`tests = false` under `{}` in {manifest}", sandboxed::TABLE);
             verbose("Unsandboxed", &format!("every test of {}: {why}", test.package));
+        }
+        if per_test {
+            deferred.push(Deferred {
+                test,
+                picked: picked.map(|it| it.iter().cloned().collect()),
+                pick,
+                running,
+                shown,
+                sandboxed_here,
+                outside,
+                env,
+                reads,
+                opt_out,
+                timeout: command_timeout.or(options.timeout),
+            });
+            continue;
         }
         let parts = parts(asked, test, sandboxed_here, outside, picked, &bare, &running)?;
         let (mut ended_badly, mut failures, mut record, mut counts) =
@@ -367,61 +409,40 @@ pub fn tests(
                 }
             }
         }
-        let mut found_flaky = BTreeSet::new();
-        if let (Pick::Some { names, total, keys, cached, .. }, Some(results)) =
-            (&pick, results.as_mut())
-        {
-            let flaky = keys.settle(
-                results,
-                &affected::Ended {
-                    ran: names.as_deref(),
-                    total: *total,
-                    failed: ended_badly,
-                    failures: failures.as_deref(),
-                    counted: counts,
-                    record: record.as_deref(),
-                },
-            );
-            for name in &flaky {
-                say::warning(&format!(
-                    "{name} is flaky: it ended otherwise before with what it is a function of \
-                     the same, so it is never kept and runs every time"
-                ));
-            }
-            found_flaky.extend(flaky);
-            if affected::verifying() {
-                let failed: BTreeSet<&str> =
-                    failures.iter().flatten().map(String::as_str).collect();
-                for (name, from) in cached {
-                    match (ended_badly, failures.is_some(), failed.contains(name.as_str())) {
-                        (true, false, _) => tally.unverified += 1,
-                        (_, _, true) => tally.wrong.push(format!("{name} (passed in {from})")),
-                        _ => tally.verified += 1,
-                    }
-                }
-            }
-        }
-        if let Pick::Some { names, planned, flaky, .. } = &pick {
-            found_flaky.extend(flaky.iter().map(|(name, _)| name.clone()));
-            report.add(report::lines_of(
-                test,
-                planned,
-                &report_ended(
-                    false,
-                    names.as_deref(),
-                    ended_badly,
-                    failures.as_deref(),
-                    &found_flaky,
-                ),
-            ));
-        }
+        let ran = match &pick {
+            Pick::Some { names, .. } => names.as_deref(),
+            Pick::Asked => None,
+        };
+        let ended =
+            Settling { ran, failed: ended_badly, failures: failures.as_deref(), counted: counts };
+        settle(&pick, results.as_mut(), &mut tally, &mut report, test, &ended, record.as_deref());
         if ended_badly {
             failed.push(rerun_flags(test));
             if !asked.flags.no_fail_fast {
+                stopped = true;
                 break;
             }
         }
     }
+    #[cfg(unix)]
+    if !deferred.is_empty() && !stopped {
+        drop(held.take());
+        let mut each = Each {
+            asked,
+            state,
+            scratch: &mut scratch,
+            results: &mut results,
+            tally: &mut tally,
+            report: &mut report,
+            failed: &mut failed,
+        };
+        if let Err(why) = each_in_a_process(&deferred, &mut each) {
+            say::error(&format!("{why:#}"));
+            return Ok(FAILED);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (&deferred, stopped);
     if let Some(results) = &results {
         results.seal();
     }
@@ -446,6 +467,355 @@ pub fn tests(
             several.iter().for_each(|it| eprintln!("    `{it}`"));
             Ok(FAILED)
         }
+    }
+}
+
+/// A program of tests whose tests run each in a process of its own ([`forked`]), once the
+/// programs whose tests run as libtest's threads have run.
+struct Deferred<'a> {
+    test: &'a Program,
+    /// The tests [`affected`] picked, all of them when `None`.
+    picked: Option<BTreeSet<String>>,
+    pick: Pick,
+    running: String,
+    shown: String,
+    sandboxed_here: bool,
+    /// The tests its package takes out of the sandbox.
+    outside: &'a BTreeSet<String>,
+    /// The environment of its sandbox.
+    env: Option<Vec<(String, String)>>,
+    reads: bool,
+    opt_out: &'a sandboxed::OptOut,
+    timeout: Option<std::time::Duration>,
+}
+
+/// Whether the tests of `test` run each in a process of its own: unless the command
+/// (`BLAZE_TEST_PROCESSES=one`, `one`) or its package (`options`) has them run as libtest's
+/// threads, it has no harness of blaze's, or the command only lists them. Why not, as an
+/// error, where they can't: a platform with no fork server, or a harness flag it does not
+/// take.
+fn per_test(
+    asked: &Invocation,
+    test: &Program,
+    options: &forked::Options,
+    one: bool,
+) -> Result<bool, String> {
+    if one || options.threads || !test.harness {
+        return Ok(false);
+    }
+    let args: Vec<String> = asked.program_args().cloned().collect();
+    if args.iter().any(|it| it == "--list") {
+        return Ok(false);
+    }
+    let manifest = test.package_dir.join("Cargo.toml");
+    let ways = format!(
+        "`threads = true` under `{}` in {} runs the tests of `{}` as libtest's threads in one \
+         process, as `cargo test` does, and `{}=one` every test of the command",
+        forked::TABLE,
+        manifest.display(),
+        test.package,
+        forked::PROCESSES
+    );
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        return Err(format!(
+            "blaze runs each test in a process of its own, which it does on Linux and macOS and \
+             not yet on {}: {ways}",
+            std::env::consts::OS
+        ));
+    }
+    if let Some(flag) = forked::refused_flag(&args) {
+        return Err(format!(
+            "blaze runs each test in a process of its own, and its runner does not take the \
+             harness flag `{flag}` yet: {ways}"
+        ));
+    }
+    Ok(true)
+}
+
+/// What [`each_in_a_process`] adds to the command's run.
+#[cfg(unix)]
+struct Each<'a, 'b> {
+    asked: &'a Invocation,
+    state: &'a State,
+    scratch: &'b mut sandboxed::Scratch,
+    results: &'b mut Option<Results>,
+    tally: &'b mut Tally,
+    report: &'b mut Report,
+    failed: &'b mut Vec<String>,
+}
+
+/// The command that runs `test` outside a sandbox, as cargo runs it.
+fn bare_command(test: &Program, state: &State) -> Command {
+    let mut command = Command::new(&test.executable);
+    configured(&mut command, state);
+    command.envs(test.env.iter().cloned());
+    command.current_dir(&test.package_dir);
+    command
+}
+
+/// Starts the fork server of `test`, in a sandbox of `env` when `sandboxed` (which is added to
+/// `sandboxes`), with the harness flags `args`.
+#[cfg(unix)]
+fn server_of(
+    d: &Deferred<'_>,
+    sandboxed: bool,
+    args: &[String],
+    each: &mut Each<'_, '_>,
+    sandboxes: &mut Vec<sandboxed::Sandbox>,
+) -> anyhow::Result<forked::Server> {
+    let (test, state) = (d.test, each.state);
+    let mut made = None;
+    let scratch = &mut *each.scratch;
+    let server = forked::Server::start(
+        |fd| {
+            let mut command = match sandboxed {
+                true => {
+                    let mut env = d.env.clone().unwrap_or_default();
+                    env.push((forked::VAR.to_owned(), fd.to_string()));
+                    let sandbox = scratch.sandbox(state, test, env, d.reads)?;
+                    let mut command = sandbox.command(&test.executable)?;
+                    command.current_dir(&test.package_dir);
+                    made = Some(sandbox);
+                    command
+                }
+                false => {
+                    let mut command = bare_command(test, state);
+                    command.env(forked::VAR, fd.to_string());
+                    command
+                }
+            };
+            command.args(args);
+            Ok(command)
+        },
+        &test.executable,
+        state,
+    );
+    sandboxes.extend(made);
+    server
+}
+
+/// What of a deferred program is known once its servers listed its tests.
+#[cfg(unix)]
+struct Listing {
+    ignored: Vec<(String, String)>,
+    filtered: usize,
+    sandboxes: Vec<sandboxed::Sandbox>,
+}
+
+/// Runs the tests of `deferred`, each in a process of its own forked by its program's server,
+/// every program's at once on all the cores ([`forked::schedule`]), and says, keeps and
+/// reports each program's as its last test ends.
+#[cfg(unix)]
+fn each_in_a_process(deferred: &[Deferred<'_>], each: &mut Each<'_, '_>) -> anyhow::Result<()> {
+    let args: Vec<String> = each.asked.program_args().cloned().collect();
+    let shown = forked::Shown::of(&args, each.asked.flags.quiet);
+    let (mut servers, mut jobs, mut queue, mut listings) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (at, d) in deferred.iter().enumerate() {
+        let mut sandboxes = Vec::new();
+        let inside = server_of(d, d.sandboxed_here, &args, each, &mut sandboxes)?;
+        let mut listing = Listing {
+            ignored: Vec::new(),
+            filtered: inside.total.saturating_sub(inside.tests.len()),
+            sandboxes: Vec::new(),
+        };
+        let mut job = forked::Job::new(d.timeout);
+        let mut out_names = Vec::new();
+        for (index, it) in inside.tests.iter().enumerate() {
+            if d.picked.as_ref().is_some_and(|picked| !picked.contains(&it.name)) {
+                listing.filtered += 1;
+            } else if let Some(message) = &it.ignored {
+                listing.ignored.push((it.name.clone(), message.clone()));
+            } else if d.sandboxed_here && d.outside.contains(&it.name) {
+                out_names.push(it.name.clone());
+            } else {
+                queue.push(forked::Queued { job: at, server: servers.len(), index: index as u32 });
+                job.left += 1;
+            }
+        }
+        job.servers.push(servers.len());
+        servers.push(inside);
+        if !out_names.is_empty() {
+            let outside = server_of(d, false, &args, each, &mut sandboxes)?;
+            let by_name: BTreeMap<&str, usize> =
+                outside.tests.iter().enumerate().map(|(at, it)| (it.name.as_str(), at)).collect();
+            for name in &out_names {
+                if each.asked.flags.verbose {
+                    say::status(
+                        each.asked.flags.quiet,
+                        "Unsandboxed",
+                        &format!(
+                            "{name}: taken out of the sandbox in {}",
+                            d.opt_out.manifest.display()
+                        ),
+                    );
+                }
+                let Some(&index) = by_name.get(name.as_str()) else {
+                    anyhow::bail!(
+                        "{name} of {} is listed in its sandbox but not outside it, where {} \
+                         takes it to run",
+                        d.shown,
+                        d.opt_out.manifest.display()
+                    );
+                };
+                queue.push(forked::Queued { job: at, server: servers.len(), index: index as u32 });
+                job.left += 1;
+            }
+            job.servers.push(servers.len());
+            servers.push(outside);
+        }
+        listing.sandboxes = sandboxes;
+        jobs.push(job);
+        listings.push(listing);
+    }
+    let scratch = forked::scratch()?;
+    let quiet = each.asked.flags.quiet;
+    let result = forked::schedule(
+        servers,
+        jobs,
+        queue,
+        forked::jobs(&args),
+        each.asked.flags.no_fail_fast,
+        &scratch,
+        |at, job, outcome| {
+            // As cargo, which runs no executable after one fails, says nothing of it.
+            let forked::Outcome::Ran { well } = outcome else { return };
+            let (d, listing) = (&deferred[at], &listings[at]);
+            let mut failed_too = BTreeMap::new();
+            let (mut unknown, mut record) = (false, None);
+            for sandbox in &listing.sandboxes {
+                record = sandbox.record();
+                if let Some(lines) = &record {
+                    let denied = sandboxed::denied(lines, &d.shown, d.opt_out);
+                    unknown |= denied.unknown;
+                    for name in denied.tests {
+                        failed_too
+                            .insert(name, "the sandbox denied it what is said above".to_owned());
+                    }
+                }
+            }
+            let mut failures: BTreeSet<String> = job
+                .ran
+                .iter()
+                .filter(|it| !matches!(it.end, forked::End::Passed))
+                .map(|it| it.name.clone())
+                .collect();
+            failures.extend(failed_too.keys().cloned());
+            let failures: Vec<String> = failures.into_iter().collect();
+            if !well {
+                say::error(&format!("the fork server of {} did not end well", d.shown));
+            }
+            let ended_badly = !failures.is_empty() || !well || unknown;
+            let mut ran: Vec<String> = job.ran.iter().map(|it| it.name.clone()).collect();
+            ran.extend(listing.ignored.iter().map(|it| it.0.clone()));
+            ran.sort();
+            let text = forked::report(
+                &job.ran,
+                &listing.ignored,
+                listing.filtered,
+                &failed_too,
+                job.began.map_or(std::time::Duration::ZERO, |it| it.elapsed()),
+                &shown,
+            );
+            say::status(quiet, "Running", &d.running);
+            {
+                use std::io::Write as _;
+                let mut out = std::io::stdout().lock();
+                _ = out.write_all(text.as_bytes()).and_then(|()| out.flush());
+            }
+            let known = !unknown && (well || !failures.is_empty());
+            let ended = Settling {
+                ran: Some(&ran),
+                failed: ended_badly,
+                failures: known.then_some(failures.as_slice()),
+                counted: Some(ran.len()),
+            };
+            settle(
+                &d.pick,
+                each.results.as_mut(),
+                each.tally,
+                each.report,
+                d.test,
+                &ended,
+                record.as_deref(),
+            );
+            if ended_badly {
+                each.failed.push(rerun_flags(d.test));
+            }
+        },
+    );
+    _ = std::fs::remove_dir_all(&scratch);
+    result
+}
+
+/// How a program of tests' run ended, for [`settle`].
+struct Settling<'a> {
+    /// The tests it ran, all those picked when `None`.
+    ran: Option<&'a [String]>,
+    failed: bool,
+    failures: Option<&'a [String]>,
+    /// How many tests the run counted as passed, failed or ignored.
+    counted: Option<usize>,
+}
+
+/// Keeps in `results` the passes of the run of `test` that `ended` as `pick` picked its tests,
+/// says which were found flaky, counts what `verify` found in `tally`, and adds its tests'
+/// lines to `report`. `record` is what its sandbox recorded.
+fn settle(
+    pick: &Pick,
+    results: Option<&mut Results>,
+    tally: &mut Tally,
+    report: &mut Report,
+    test: &Program,
+    ended: &Settling<'_>,
+    record: Option<&[crate::sandbox::Line]>,
+) {
+    let (ended_badly, failures, counts) = (ended.failed, &ended.failures, ended.counted);
+    let mut found_flaky = BTreeSet::new();
+    if let (Pick::Some { names, total, keys, cached, .. }, Some(results)) = (pick, results) {
+        let flaky = keys.settle(
+            results,
+            &affected::Ended {
+                ran: ended.ran.or(names.as_deref()),
+                total: *total,
+                failed: ended_badly,
+                failures: *failures,
+                counted: counts,
+                record,
+            },
+        );
+        for name in &flaky {
+            say::warning(&format!(
+                "{name} is flaky: it ended otherwise before with what it is a function of \
+                 the same, so it is never kept and runs every time"
+            ));
+        }
+        found_flaky.extend(flaky);
+        if affected::verifying() {
+            let failed: BTreeSet<&str> =
+                failures.iter().copied().flatten().map(String::as_str).collect();
+            for (name, from) in cached {
+                match (ended_badly, failures.is_some(), failed.contains(name.as_str())) {
+                    (true, false, _) => tally.unverified += 1,
+                    (_, _, true) => tally.wrong.push(format!("{name} (passed in {from})")),
+                    _ => tally.verified += 1,
+                }
+            }
+        }
+    }
+    if let Pick::Some { names, planned, flaky, .. } = pick {
+        found_flaky.extend(flaky.iter().map(|(name, _)| name.clone()));
+        report.add(report::lines_of(
+            test,
+            planned,
+            &report_ended(
+                false,
+                ended.ran.or(names.as_deref()),
+                ended_badly,
+                *failures,
+                &found_flaky,
+            ),
+        ));
     }
 }
 

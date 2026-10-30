@@ -13,9 +13,11 @@ lowest and highest of the rounds:
 - a generated library, opted into sandboxed tests, with `--tests` unit tests, `--io` of which
   read a file of the package and write one in the package and one in `std::env::temp_dir()`, under `blaze test`
   once the daemon serves its build: with `BLAZE_SANDBOX=off`, in the sandbox under
-  `BLAZE_TESTS=all`, under `affected` with what passed forgotten before each run (so every
-  test runs and records what it reads), and as one process per test (`--exact name`, 16 at a
-  time), in a sandbox each and bare. The command's wall time is given whole and less that of
+  `BLAZE_TESTS=all`, under `verify`, which picks the tests as `affected` does and runs every
+  one, recording what it reads, and as one process per test (`--exact name`, 16 at a
+  time), in a sandbox each and bare. The first three run each test in a process forked from
+  the executable's fork server, blaze's default; the `one process` setups run them as
+  libtest's threads in one process (`BLAZE_TEST_PROCESSES=one`), as cargo does. The command's wall time is given whole and less that of
   `blaze test --no-run` (the build and the daemon's answer, which every setup has).
   It is `--lib`: the doc tests, which load the workspace whatever runs them, are not measured.
 
@@ -111,15 +113,6 @@ def library(root, tests, io):
     }}""")
     lines.append("}")
     open(os.path.join(root, "src", "lib.rs"), "w").write("\n".join(lines) + "\n")
-
-
-def forget_passed(root):
-    """Removes what `affected` keeps of the tests that passed, so that each runs again."""
-    for top in root:
-        for dirpath, _, names in os.walk(top):
-            for name in names:
-                if name in ("tests-passed", "tests-inputs"):
-                    os.remove(os.path.join(dirpath, name))
 
 
 def test_executable(pkg):
@@ -230,9 +223,7 @@ async def main():
                 argvs.append(argv)
             return await timed(argvs, parallel, cwd=pkg, env=env)
 
-        async def command(more, forget=False):
-            if forget:
-                forget_passed([pkg, home])
+        async def command(more):
             start = time.perf_counter()
             _, said = await run(test, cwd=pkg, env=dict(env, **more))
             took = time.perf_counter() - start
@@ -248,9 +239,14 @@ async def main():
 
         modes = {
             "build only (--no-run)": no_run,
-            "BLAZE_SANDBOX=off": lambda: command({"BLAZE_SANDBOX": "off"}),
+            "BLAZE_SANDBOX=off": lambda: command({"BLAZE_SANDBOX": "off", "BLAZE_TESTS": "all"}),
             "sandbox, all": lambda: command({"BLAZE_TESTS": "all"}),
-            "sandbox, affected, every test": lambda: command({"BLAZE_TESTS": "affected"}, forget=True),
+            "sandbox, verify": lambda: command({"BLAZE_TESTS": "verify"}),
+            "BLAZE_SANDBOX=off, one process": lambda: command(
+                {"BLAZE_SANDBOX": "off", "BLAZE_TESTS": "all", "BLAZE_TEST_PROCESSES": "one"}),
+            "sandbox, all, one process": lambda: command({"BLAZE_TESTS": "all", "BLAZE_TEST_PROCESSES": "one"}),
+            "sandbox, verify, one process": lambda: command(
+                {"BLAZE_TESTS": "verify", "BLAZE_TEST_PROCESSES": "one"}),
             f"a sandbox per test, {parallel} at a time": lambda: per_test(True),
             f"a process per test, bare, {parallel} at a time": lambda: per_test(False),
         }
@@ -262,7 +258,7 @@ async def main():
         table(times)
         base = statistics.median(times["build only (--no-run)"])
         print(f"\nless the build's median ({base:.3f} s): the tests' part")
-        for name in list(modes)[1:4]:
+        for name in list(modes)[1:7]:
             print(f"  {name}: {statistics.median(times[name]) - base:.3f}")
     finally:
         if os.path.isdir(pkg):
