@@ -463,15 +463,6 @@ pub fn answered(
     let args = args.iter().map(|it| it.to_str()).collect::<Option<Vec<_>>>()?;
     let toolchain = Toolchain::ours()?;
     let release = toolchain.release;
-    // Whether unstable features are allowed: always on a nightly (the toolchain blaze is
-    // pinned to), unless `RUSTC_BOOTSTRAP=-1` makes it act as a stable release; a list of
-    // crates is not answered.
-    let nightly = match var("RUSTC_BOOTSTRAP") {
-        None => release.version.contains("-nightly") || release.version.contains("-dev"),
-        Some(it) if it == "1" => true,
-        Some(it) if it == "-1" => false,
-        Some(_) => return None,
-    };
     if !args.is_empty()
         && args.iter().all(|it| matches!(*it, "-V" | "-v" | "-vV" | "--version" | "--verbose"))
     {
@@ -484,6 +475,21 @@ pub fn answered(
         return Some(Answer { stdout: text.into_bytes(), stderr: Vec::new() });
     }
     let given = Given::of(&args)?;
+    // Whether unstable features are allowed, as rustc's `UnstableFeatures::from_environment`
+    // decides: `RUSTC_BOOTSTRAP=1`, or a list that names the crate, allows them, `-1` makes it act as a stable release, and anything else leaves the
+    // release's own, which on a nightly (the toolchain blaze is pinned to) allows them.
+    let nightly = match var("RUSTC_BOOTSTRAP") {
+        Some(it) if it == "-1" => false,
+        Some(it)
+            if it == "1"
+                || given.crate_name.is_some_and(|name| {
+                    it.to_str().is_some_and(|list| list.split(',').any(|it| it == name))
+                }) =>
+        {
+            true
+        }
+        _ => release.version.contains("-nightly") || release.version.contains("-dev"),
+    };
     if given.prints.is_empty() || (given.from_stdin && !stdin.trim_ascii().is_empty()) {
         return None;
     }
@@ -751,6 +757,25 @@ mod tests {
         assert!(static_of("--crate-type bin"));
         assert!(!static_of("--crate-type bin --crate-type proc-macro"));
         assert!(static_of("--crate-type proc-macro -C target-feature=+crt-static"));
+    }
+
+    /// servo's `[env]` sets `RUSTC_BOOTSTRAP` to a list of its crates, which libc's build
+    /// script asks `rustc --version` under: rustc answers as it does without one.
+    #[test]
+    fn a_list_of_crates_in_rustc_bootstrap_is_answered() {
+        let with = |bootstrap: &'static str, args: &str| {
+            let args: Vec<OsString> = args.split_whitespace().map(OsString::from).collect();
+            let var = move |name: &str| (name == "RUSTC_BOOTSTRAP").then(|| bootstrap.into());
+            answered(&args, &[], &var).map(|it| it.stdout)
+        };
+        let cfg = "--target x86_64-unknown-linux-gnu --print cfg";
+        let plain = told(cfg).expect("an answer").stdout;
+        let list = "crown,script,mozjs";
+        assert_eq!(with(list, "--version"), told("--version").map(|it| it.stdout));
+        assert_eq!(with(list, cfg).as_ref(), Some(&plain));
+        assert_eq!(with(list, &format!("{cfg} --crate-name script")).as_ref(), Some(&plain));
+        assert_eq!(with("1", cfg).as_ref(), Some(&plain));
+        assert_ne!(with("-1", cfg).as_ref(), Some(&plain));
     }
 
     #[test]
