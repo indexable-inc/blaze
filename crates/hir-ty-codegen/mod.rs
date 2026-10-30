@@ -4320,7 +4320,9 @@ fn describe_scopes(
 /// The error the build stops with when the evaluation of `of`, or of a constant it reads, is
 /// refused, naming the constant: it ran past its budget (`const-eval` under
 /// `[workspace.metadata.blaze]`), with what it ran out of, where, and the setting that raises
-/// it; or its value points to memory allocated while evaluating it. `None` for any other error.
+/// it; or its value points to memory allocated while evaluating it; or it calls a function whose
+/// body blaze could not lower, which is named with where it was called. `None` for any other
+/// error.
 fn refused_const_eval(
     db: &dyn HirDatabase,
     of: GeneralConstId<'_>,
@@ -4338,9 +4340,14 @@ fn refused_const_eval(
     let mut what = name(of).unwrap_or_else(|| "a constant expression".to_owned());
     let ConstEvalError::MirEvalError(e) = e else { return None };
     let mut e: &MirEvalError<'_> = e;
+    // Where the innermost call was made, from the stack the evaluation unwound through.
+    let mut called = None;
     loop {
         match e {
-            MirEvalError::InFunction(inner, _) => e = &**inner,
+            MirEvalError::InFunction(inner, stack) => {
+                called = stack.first().map(|&(_, span, owner)| (owner, span)).or(called);
+                e = &**inner;
+            }
             MirEvalError::ConstEvalError(inner, error) => {
                 let ConstEvalError::MirEvalError(inner_error) = &**error else { return None };
                 what = format!("`{inner}`");
@@ -4358,6 +4365,17 @@ fn refused_const_eval(
             }
             MirEvalError::HeapInValue { .. } => {
                 return Some(CodegenError::Refused(format!("the value of {what}: {e:?}")));
+            }
+            MirEvalError::MirLowerError(func, error) => {
+                let name = hir_ty_mir::mir::type_name::rustc_function_name(db, *func, &[])
+                    .unwrap_or_else(|| FunctionSignature::of(db, *func).name.as_str().to_owned());
+                let at = called
+                    .and_then(|(owner, span)| fncache::location(db, owner, span))
+                    .map(|it| format!(", called at {it}"))
+                    .unwrap_or_default();
+                return Some(CodegenError::Refused(format!(
+                    "const eval of {what}: the body of `{name}`{at} is not lowered: {error:?}"
+                )));
             }
             _ => return None,
         }

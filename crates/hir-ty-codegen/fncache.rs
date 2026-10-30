@@ -37,7 +37,8 @@ use base_db::{Crate, LangCrateOrigin};
 use cranelift_codegen::ir::{InstBuilder, Value, types};
 use cranelift_module::ModuleRelocTarget;
 use hir_def::{
-    AdtId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId, VariantId,
+    AdtId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, HasModule, ItemContainerId, Lookup,
+    StaticId, VariantId,
     signatures::{
         FunctionSignature, StaticFlags, StaticSignature, StructSignature, TraitSignature,
     },
@@ -2063,7 +2064,15 @@ pub(super) fn location(
     owner: InferBodyId<'_>,
     span: MirSpan,
 ) -> Option<String> {
-    let InferBodyId::DefWithBodyId(owner) = owner else { return None };
+    let owner = match owner {
+        InferBodyId::DefWithBodyId(owner) => owner,
+        // An inline constant or an array length in a body is written in the store of that body,
+        // and its spans are places in it. One in a signature has no body to find them in.
+        InferBodyId::AnonConstId(id) => match id.loc(db).owner {
+            ExpressionStoreOwnerId::Body(owner) => owner,
+            _ => return None,
+        },
+    };
     let (file, line, column) = super::source_location(db, owner, span)?;
     let root = db.file_source_root(file).source_root_id(db);
     let root = db.source_root(root).source_root(db);
