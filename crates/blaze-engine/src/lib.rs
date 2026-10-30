@@ -9080,7 +9080,12 @@ fn run_holding(
             if let Some(told) = blaze_store::toolchain().filter(|it| *it != toolchain) {
                 eprintln!("store: of `{told}`, not of the toolchain loaded, `{toolchain}`");
             }
-            std::thread::spawn(blaze_store::check_packs);
+            // Every pack is the daemon's to check: a build of one build script or proc macro
+            // checks a pack the first time it finds a key in it, and would otherwise hash the
+            // whole store on every core beside each of the dozens a cold build starts at once.
+            if args.socket.is_some() || args.watch {
+                std::thread::spawn(blaze_store::check_packs);
+            }
         }
         None => eprintln!("store: the toolchain of the library cannot be told from another"),
     }
