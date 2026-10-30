@@ -192,8 +192,11 @@ test with libtest and exits. One scheduler runs the tests of every executable of
 at once, on as many cores as the machine has (`--test-threads` or `RUST_TEST_THREADS` say
 otherwise), and prints each executable's results as cargo does once its last test ends, with
 the output of each failing test (and of every test with `--nocapture` or `--show-output`)
-kept to itself. `--no-fail-fast` goes on after a failure; without it no test starts after the
-first failure, as with cargo. Under `BLAZE_TESTS=affected` each test's pass is kept as before.
+kept to itself. `--no-fail-fast` goes on after a failure. Without it, as with cargo, an
+executable none of whose tests had started when a test failed runs none and is not reported,
+and one that had started runs all of its tests, as libtest does. Each test leads a process
+group of its own, and blaze going away kills every test still running (on Linux the server
+going away does too). Under `BLAZE_TESTS=affected` each test's pass is kept as before.
 
 A package whose tests need to share one process (a global one test sets and another reads, a
 logger set up once, a test that counts the process's threads) runs them as libtest's threads in
@@ -207,7 +210,8 @@ timeout = 60        # seconds a test may take before it is killed and fails
 
 Any other key there is an error. `BLAZE_TEST_TIMEOUT=<seconds>` gives every test of the command
 a time limit, over the manifest's; there is none by default. A test past its limit is killed
-(`SIGKILL`) and fails as `TIMEOUT`, its output ending `blaze: it took more than its <n> s`.
+(`SIGKILL`, with every process of its group) and fails as `TIMEOUT`, its output ending
+`blaze: it took more than its <n> s`.
 
 What does not run this way is an error that says so and how to run the tests as threads, never
 a quiet switch to threads: a harness flag the fork server does not take yet (`--format json`,

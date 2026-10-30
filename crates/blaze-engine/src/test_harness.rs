@@ -318,12 +318,31 @@ const MARKED: &str = r#"
 /// says how each child ended. The server never starts a thread, so the fork is sound; one
 /// that has threads before it begins (a static constructor's) says so and runs nothing.
 ///
+/// Each child leads a process group of its own, which a kill takes whole, and on Linux dies
+/// with the server; blaze going away (its end of the socket closed with children left) kills
+/// them all.
+///
 /// What it is told, 12 bytes each: an operation (1 runs the test at an index of the list,
 /// with the output file's descriptor; 2 kills the child of an id), the id blaze gives the run,
 /// and the index. What it says, a line each: `t <name>` or `i <name>\t<message>` (ignored)
 /// for each test of the list, `e <tests>` at its end with how many the program has, `x <id>
 /// <wait status>` as each child ends, and `f <why>` when it can't go on.
 const SERVER: &str = r#"
+    #[cfg(not(unix))]
+    pub mod server {
+        use super::test;
+        extern crate std;
+
+        /// Elsewhere than Unix blaze runs no fork server (it refuses first); a program told
+        /// to be one says it can't.
+        pub fn serve(_: &[&test::TestDescAndFn]) -> self::std::option::Option<test::ExitCode> {
+            self::std::env::var_os("{VAR}")?;
+            self::std::eprintln!("blaze runs a process per test on Linux and macOS only");
+            self::std::option::Option::Some(test::ExitCode::from(101u8))
+        }
+    }
+
+    #[cfg(unix)]
     pub mod server {
         use super::test;
         // The crate's own `std`: a `no_std` crate's tests have none in the extern prelude.
@@ -393,6 +412,12 @@ const SERVER: &str = r#"
         #[cfg(not(target_os = "linux"))]
         const SIGCHLD: c_int = 20;
         const SIGKILL: c_int = 9;
+        #[cfg(target_os = "linux")]
+        const PR_SET_PDEATHSIG: c_int = 1;
+        #[cfg(target_os = "linux")]
+        const MSG_CTRUNC: c_int = 8;
+        #[cfg(not(target_os = "linux"))]
+        const MSG_CTRUNC: c_int = 0x20;
         const WNOHANG: c_int = 1;
         const POLLIN: i16 = 1;
         const F_SETFD: c_int = 2;
@@ -418,6 +443,9 @@ const SERVER: &str = r#"
             fn recvmsg(fd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
             fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
             fn signal(signal: c_int, handler: usize) -> usize;
+            fn setpgid(pid: c_int, group: c_int) -> c_int;
+            #[cfg(target_os = "linux")]
+            fn prctl(option: c_int, ...) -> c_int;
             #[cfg(target_os = "macos")]
             fn pthread_is_threaded_np() -> c_int;
         }
@@ -451,8 +479,17 @@ const SERVER: &str = r#"
             }
         }
 
+        /// The Linux targets whose signal numbers, flags and socket level are not those
+        /// above.
+        #[cfg(all(target_os = "linux", any(target_arch = "mips", target_arch = "mips64", target_arch = "mips32r6", target_arch = "mips64r6", target_arch = "sparc", target_arch = "sparc64")))]
+        fn threaded() -> self::std::option::Option<self::std::string::String> {
+            self::std::option::Option::Some(self::std::string::String::from(
+                "blaze's fork server does not run on MIPS or SPARC Linux, whose constants differ",
+            ))
+        }
+
         /// Why this process can't fork soundly: it has threads.
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(any(target_arch = "mips", target_arch = "mips64", target_arch = "mips32r6", target_arch = "mips64r6", target_arch = "sparc", target_arch = "sparc64"))))]
         fn threaded() -> self::std::option::Option<self::std::string::String> {
             match self::std::fs::read_dir("/proc/self/task") {
                 self::std::result::Result::Ok(it) => match it.count() {
@@ -484,8 +521,9 @@ const SERVER: &str = r#"
         }
 
         /// Reads what blaze sent into `pending`, and the descriptors it passed into `fds`:
-        /// false once blaze is gone.
-        fn receive(fd: c_int, pending: &mut self::std::vec::Vec<u8>, fds: &mut self::std::vec::Vec<c_int>) -> bool {
+        /// `Ok(false)` once blaze is gone, and an error when descriptors were lost, which
+        /// would give the tests after them each other's output files.
+        fn receive(fd: c_int, pending: &mut self::std::vec::Vec<u8>, fds: &mut self::std::vec::Vec<c_int>) -> self::std::result::Result<bool, &'static str> {
             let mut data = [0u8; 4096];
             let mut control = [0u64; 32];
             let mut iov = IoVec { base: data.as_mut_ptr() as *mut c_void, len: data.len() };
@@ -504,7 +542,10 @@ const SERVER: &str = r#"
                 break got;
             };
             if got <= 0 {
-                return false;
+                return self::std::result::Result::Ok(false);
+            }
+            if msg.flags & MSG_CTRUNC != 0 {
+                return self::std::result::Result::Err("descriptors blaze sent were cut off (MSG_CTRUNC)");
             }
             pending.extend_from_slice(&data[..got as usize]);
             let (header, align) = (self::std::mem::size_of::<CmsgHdr>(), self::std::mem::size_of::<Len>());
@@ -527,23 +568,30 @@ const SERVER: &str = r#"
                 }
                 at += aligned(len);
             }
-            true
+            self::std::result::Result::Ok(true)
         }
 
         /// The server, when blaze started this program as one: its code, or the code of
         /// the child that ran a test. `None` when it was not.
         pub fn serve(tests: &[&test::TestDescAndFn]) -> self::std::option::Option<test::ExitCode> {
-            let fd: c_int = self::std::env::var("{VAR}").ok()?.parse().ok()?;
-            // SAFETY: no thread has started (`threaded` says so before the first fork).
-            unsafe {
-                self::std::env::remove_var("{VAR}");
-                fcntl(fd, F_SETFD, FD_CLOEXEC);
-            }
             let failed = self::std::option::Option::Some(test::ExitCode::from(101u8));
+            let given = self::std::env::var_os("{VAR}")?;
+            let fd: c_int = match given.to_str().and_then(|it| it.parse().ok()) {
+                self::std::option::Option::Some(it) => it,
+                self::std::option::Option::None => {
+                    self::std::eprintln!("{VAR}={:?} names no descriptor", given);
+                    return failed;
+                }
+            };
             let one_line = |it: &str| it.replace('\n', " ");
             if let self::std::option::Option::Some(why) = threaded() {
                 say(fd, &self::std::format!("f {}\n", one_line(&why)));
                 return failed;
+            }
+            // SAFETY: no thread has started (`threaded` said so).
+            unsafe {
+                self::std::env::remove_var("{VAR}");
+                fcntl(fd, F_SETFD, FD_CLOEXEC);
             }
             let args: self::std::vec::Vec<self::std::string::String> = self::std::env::args().collect();
             let opts = match test::test::parse_opts(&args) {
@@ -625,28 +673,64 @@ const SERVER: &str = r#"
                 if polled[0].revents == 0 {
                     continue;
                 }
-                open = receive(fd, &mut pending, &mut fds);
+                open = match receive(fd, &mut pending, &mut fds) {
+                    self::std::result::Result::Ok(it) => it,
+                    self::std::result::Result::Err(why) => {
+                        say(fd, &self::std::format!("f {}\n", why));
+                        false
+                    }
+                };
+                if !open {
+                    // blaze closes its end only once no test of this program runs, so a
+                    // child left means blaze went away: its tests are not to outlive it.
+                    for it in &children {
+                        // SAFETY: children of this process not waited for, and their groups.
+                        unsafe {
+                            kill(-it.0, SIGKILL);
+                            kill(it.0, SIGKILL);
+                        }
+                    }
+                    continue;
+                }
                 while pending.len() >= 12 {
                     let word = |at: usize| u32::from_ne_bytes([pending[at], pending[at + 1], pending[at + 2], pending[at + 3]]);
                     let (op, id, index) = (word(0), word(4), word(8) as usize);
                     pending.drain(..12);
                     if op == 2 {
                         if let self::std::option::Option::Some(it) = children.iter().find(|it| it.1 == id) {
-                            // SAFETY: a child of this process that has not been waited for.
-                            unsafe { kill(it.0, SIGKILL) };
+                            // SAFETY: a child of this process that has not been waited for, and
+                            // the group it made, so what the test started goes too.
+                            unsafe {
+                                kill(-it.0, SIGKILL);
+                                kill(it.0, SIGKILL);
+                            }
                         }
                         continue;
                     }
-                    if op != 1 || fds.is_empty() || index >= listed.len() {
+                    if op != 1 {
+                        say(fd, &self::std::format!("f blaze asked for operation {}\n", op));
+                        return failed;
+                    }
+                    if fds.is_empty() {
+                        say(fd, "f a request to run a test came without its output file\n");
+                        return failed;
+                    }
+                    let out = fds.remove(0);
+                    if index >= listed.len() {
+                        // SAFETY: the descriptor blaze passed for this request.
+                        unsafe { close(out) };
                         say(fd, &self::std::format!("x {} -1\n", id));
                         continue;
                     }
-                    let out = fds.remove(0);
+                    let name = listed[index].desc.name.as_slice();
                     // SAFETY: this process has one thread.
                     let pid = unsafe { fork() };
                     if pid == 0 {
-                        // SAFETY: the child's own descriptors and signal disposition.
+                        // SAFETY: the child's own descriptors, signal disposition and group.
                         unsafe {
+                            setpgid(0, 0);
+                            #[cfg(target_os = "linux")]
+                            prctl(PR_SET_PDEATHSIG, SIGKILL);
                             signal(SIGCHLD, 0);
                             close(fd);
                             close(wake[0]);
@@ -658,9 +742,17 @@ const SERVER: &str = r#"
                             dup2(out, 2);
                             close(out);
                         }
+                        // The test alone, so libtest's filter can't miss it and pass with none run.
+                        let alone: [&test::TestDescAndFn; 1] = match tests.iter().find(|it| it.desc.name.as_slice() == name) {
+                            self::std::option::Option::Some(it) => [*it],
+                            self::std::option::Option::None => {
+                                self::std::eprintln!("blaze: the harness has no test {}", name);
+                                return failed;
+                            }
+                        };
                         let one: self::std::vec::Vec<self::std::string::String> = [
                             args.first().map_or("", |it| it.as_str()),
-                            listed[index].desc.name.as_slice(),
+                            name,
                             "--exact",
                             "--include-ignored",
                             "--test-threads=1",
@@ -674,7 +766,7 @@ const SERVER: &str = r#"
                         .iter()
                         .map(|it| self::std::string::String::from(*it))
                         .collect();
-                        return self::std::option::Option::Some(test::test_main(&one, tests));
+                        return self::std::option::Option::Some(test::test_main(&one, &alone));
                     }
                     // SAFETY: the child has its copy.
                     unsafe { close(out) };

@@ -619,8 +619,7 @@ fn each_in_a_process(deferred: &[Deferred<'_>], each: &mut Each<'_, '_>) -> anyh
             filtered: inside.total.saturating_sub(inside.tests.len()),
             sandboxes: Vec::new(),
         };
-        let mut job =
-            forked::Job { servers: Vec::new(), left: 0, timeout: d.timeout, ran: Vec::new() };
+        let mut job = forked::Job::new(d.timeout);
         let mut out_names = Vec::new();
         for (index, it) in inside.tests.iter().enumerate() {
             if d.picked.as_ref().is_some_and(|picked| !picked.contains(&it.name)) {
@@ -651,7 +650,14 @@ fn each_in_a_process(deferred: &[Deferred<'_>], each: &mut Each<'_, '_>) -> anyh
                         ),
                     );
                 }
-                let Some(&index) = by_name.get(name.as_str()) else { continue };
+                let Some(&index) = by_name.get(name.as_str()) else {
+                    anyhow::bail!(
+                        "{name} of {} is listed in its sandbox but not outside it, where {} \
+                         takes it to run",
+                        d.shown,
+                        d.opt_out.manifest.display()
+                    );
+                };
                 queue.push(forked::Queued { job: at, server: servers.len(), index: index as u32 });
                 job.left += 1;
             }
@@ -662,8 +668,7 @@ fn each_in_a_process(deferred: &[Deferred<'_>], each: &mut Each<'_, '_>) -> anyh
         jobs.push(job);
         listings.push(listing);
     }
-    let started = std::time::Instant::now();
-    let scratch = forked::scratch();
+    let scratch = forked::scratch()?;
     let quiet = each.asked.flags.quiet;
     let result = forked::schedule(
         servers,
@@ -672,7 +677,9 @@ fn each_in_a_process(deferred: &[Deferred<'_>], each: &mut Each<'_, '_>) -> anyh
         forked::jobs(&args),
         each.asked.flags.no_fail_fast,
         &scratch,
-        |at, job, well| {
+        |at, job, outcome| {
+            // As cargo, which runs no executable after one fails, says nothing of it.
+            let forked::Outcome::Ran { well } = outcome else { return };
             let (d, listing) = (&deferred[at], &listings[at]);
             let mut failed_too = BTreeMap::new();
             let (mut unknown, mut record) = (false, None);
@@ -707,7 +714,7 @@ fn each_in_a_process(deferred: &[Deferred<'_>], each: &mut Each<'_, '_>) -> anyh
                 &listing.ignored,
                 listing.filtered,
                 &failed_too,
-                started.elapsed(),
+                job.began.map_or(std::time::Duration::ZERO, |it| it.elapsed()),
                 &shown,
             );
             say::status(quiet, "Running", &d.running);

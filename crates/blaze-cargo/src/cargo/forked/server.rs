@@ -136,10 +136,20 @@ impl Server {
         }
     }
 
-    /// Tells the server no more tests come, and waits for it to end once those running have.
-    fn end(&mut self) -> std::io::Result<std::process::ExitStatus> {
+    /// Tells the server no more tests come; it ends once those running have.
+    fn close(&self) {
         _ = self.socket.shutdown(std::net::Shutdown::Write);
-        self.child.wait()
+    }
+}
+
+impl Drop for Server {
+    /// A server not waited for is killed: blaze stopping with an error leaves no tests running
+    /// (the server kills its children when its socket closes).
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            _ = self.child.kill();
+            _ = self.child.wait();
+        }
     }
 }
 
@@ -173,6 +183,22 @@ pub struct Job {
     pub left: usize,
     pub timeout: Option<Duration>,
     pub ran: Vec<Ran>,
+    /// When its first test started.
+    pub began: Option<Instant>,
+}
+
+impl Job {
+    pub fn new(timeout: Option<Duration>) -> Job {
+        Job { servers: Vec::new(), left: 0, timeout, ran: Vec::new(), began: None }
+    }
+}
+
+/// How a job's run came out, for `done`.
+pub enum Outcome {
+    /// Its tests ran, and its servers ended well or not.
+    Ran { well: bool },
+    /// None of its tests started: a test of another failed first, without `--no-fail-fast`.
+    NotRun,
 }
 
 /// What reaches the scheduler from the servers' readers.
@@ -188,18 +214,18 @@ const OUTPUT_KEPT: u64 = 4 << 20;
 /// killed for its time.
 struct Running {
     job: usize,
-    server: usize,
     name: String,
     output: File,
     started: Instant,
     killed: Option<Duration>,
 }
 
-/// Runs the tests of `queue`, `jobs` at once, on `servers`: in the order queued, and after a
-/// test fails no more are started unless `no_fail_fast`. As the last test of a job ends, its
-/// servers are told to end and are waited for, and `done` is given the job's index, what ran
-/// and whether its servers ended well; once every test that started has ended, so is every
-/// job that has not been. `scratch` is where the output files are made.
+/// Runs the tests of `queue`, `jobs` at once, on `servers`, in the order queued. After a test
+/// fails, unless `no_fail_fast`, a job none of whose tests has started starts none (as cargo
+/// runs no executable after a failing one), and those started run to their end (as libtest
+/// runs every test of one). As the last test of a job ends its servers are told to end, and
+/// once they have, `done` is given the job's index, what ran and how. `scratch` is where the
+/// output files are made.
 pub fn schedule(
     mut servers: Vec<Server>,
     mut jobs_of: Vec<Job>,
@@ -207,7 +233,7 @@ pub fn schedule(
     jobs: usize,
     no_fail_fast: bool,
     scratch: &Path,
-    mut done: impl FnMut(usize, Job, bool),
+    mut done: impl FnMut(usize, Job, Outcome),
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(scratch).with_context(|| format!("making {}", scratch.display()))?;
     let (tx, rx) = mpsc::channel();
@@ -243,35 +269,22 @@ pub fn schedule(
     let mut running: BTreeMap<(usize, u32), Running> = BTreeMap::new();
     let mut next_id: u32 = 0;
     let mut stopped = false;
+    let mut began: BTreeSet<usize> = BTreeSet::new();
     let mut gone: BTreeSet<usize> = BTreeSet::new();
+    // Jobs whose servers were told to end, until they have; then those done.
+    let mut closing: BTreeSet<usize> = BTreeSet::new();
     let mut ended: BTreeSet<usize> = BTreeSet::new();
     let jobs = jobs.max(1);
-    let finish_job = |job: usize,
-                      servers: &mut Vec<Server>,
-                      jobs_of: &mut Vec<Job>,
-                      ended: &mut BTreeSet<usize>,
-                      done: &mut dyn FnMut(usize, Job, bool)| {
-        if !ended.insert(job) {
-            return;
-        }
-        let mut well = true;
-        for &server in &jobs_of[job].servers {
-            well &= servers[server].end().is_ok_and(|it| it.success());
-        }
-        let taken = std::mem::replace(
-            &mut jobs_of[job],
-            Job { servers: Vec::new(), left: 0, timeout: None, ran: Vec::new() },
-        );
-        done(job, taken, well);
-    };
     for job in 0..jobs_of.len() {
         if jobs_of[job].left == 0 {
-            finish_job(job, &mut servers, &mut jobs_of, &mut ended, &mut done);
+            close(job, &jobs_of, &servers, &mut closing, &ended);
         }
     }
     loop {
-        while running.len() < jobs && !stopped {
+        while running.len() < jobs {
             let Some(next) = queue.pop_front() else { break };
+            began.insert(next.job);
+            jobs_of[next.job].began.get_or_insert_with(Instant::now);
             if gone.contains(&next.server) {
                 let name = servers[next.server].tests[next.index as usize].name.clone();
                 let ran = Ran {
@@ -281,9 +294,13 @@ pub fn schedule(
                     took: Duration::ZERO,
                 };
                 jobs_of[next.job].ran.push(ran);
+                if !no_fail_fast && !stopped {
+                    stopped = true;
+                    queue.retain(|it| began.contains(&it.job));
+                }
                 jobs_of[next.job].left -= 1;
                 if jobs_of[next.job].left == 0 {
-                    finish_job(next.job, &mut servers, &mut jobs_of, &mut ended, &mut done);
+                    close(next.job, &jobs_of, &servers, &mut closing, &ended);
                 }
                 continue;
             }
@@ -304,20 +321,27 @@ pub fn schedule(
                 .with_context(|| format!("asking a fork server to run {name}"))?;
             running.insert(
                 (next.server, id),
-                Running {
-                    job: next.job,
-                    server: next.server,
-                    name,
-                    output,
-                    started: Instant::now(),
-                    killed: None,
-                },
+                Running { job: next.job, name, output, started: Instant::now(), killed: None },
             );
         }
-        if running.is_empty() {
+        if running.is_empty() && queue.is_empty() {
+            // What is left are jobs a stop kept from starting: their servers end too.
+            for job in 0..jobs_of.len() {
+                close(job, &jobs_of, &servers, &mut closing, &ended);
+            }
+        }
+        finish(&mut servers, &mut jobs_of, &gone, &began, &mut closing, &mut ended, &mut done);
+        if running.is_empty() && queue.is_empty() && closing.is_empty() {
             break;
         }
         let now = Instant::now();
+        for (&(server, id), it) in running.iter_mut() {
+            let Some(limit) = jobs_of[it.job].timeout else { continue };
+            if it.killed.is_none() && now >= it.started + limit {
+                it.killed = Some(limit);
+                _ = servers[server].send(2, id, 0, None);
+            }
+        }
         let deadline = running
             .values()
             .filter(|it| it.killed.is_none())
@@ -325,24 +349,21 @@ pub fn schedule(
             .min();
         let event = match deadline {
             Some(at) => match rx.recv_timeout(at.saturating_duration_since(now)) {
-                Ok(event) => Some(event),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Ok(event) => event,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     anyhow::bail!("every fork server ended with tests running")
                 }
             },
-            None => Some(rx.recv().context("every fork server ended with tests running")?),
-        };
-        let Some(event) = event else {
-            let now = Instant::now();
-            for (&(server, id), it) in running.iter_mut() {
-                let Some(limit) = jobs_of[it.job].timeout else { continue };
-                if it.killed.is_none() && now >= it.started + limit {
-                    it.killed = Some(limit);
-                    _ = servers[server].send(2, id, 0, None);
+            None => match rx.recv() {
+                Ok(event) => event,
+                Err(_) if running.is_empty() => {
+                    // Every reader has said its server is gone, so those closing are.
+                    gone.extend(0..servers.len());
+                    continue;
                 }
-            }
-            continue;
+                Err(_) => anyhow::bail!("every fork server ended with tests running"),
+            },
         };
         let ended_now: Vec<(Running, Option<i32>)> = match event {
             Event::Ended { server, id, status } => {
@@ -364,27 +385,73 @@ pub fn schedule(
         for (it, status) in ended_now {
             let took = it.started.elapsed();
             let output = own_output(&read_output(&it.output));
+            // A test that ended as its kill was sent ends as it did, not as timed out.
+            let killed = status.is_none_or(|it| it & 0x7f == libc::SIGKILL);
             let end = match (it.killed, status) {
-                (Some(limit), _) => End::TimedOut(limit),
-                (None, None) => End::Failed(Some("its fork server ended".to_owned())),
-                (None, Some(status)) => ended_with(status),
+                (Some(limit), _) if killed => End::TimedOut(limit),
+                (_, None) => End::Failed(Some("its fork server ended".to_owned())),
+                (_, Some(status)) => ended_with(status),
             };
-            if !matches!(end, End::Passed) && !no_fail_fast {
+            if !matches!(end, End::Passed) && !no_fail_fast && !stopped {
                 stopped = true;
+                queue.retain(|it| began.contains(&it.job));
             }
-            let _ = it.server;
             let job = it.job;
             jobs_of[job].ran.push(Ran { name: it.name, end, output, took });
             jobs_of[job].left -= 1;
             if jobs_of[job].left == 0 {
-                finish_job(job, &mut servers, &mut jobs_of, &mut ended, &mut done);
+                close(job, &jobs_of, &servers, &mut closing, &ended);
             }
         }
     }
-    for job in 0..jobs_of.len() {
-        finish_job(job, &mut servers, &mut jobs_of, &mut ended, &mut done);
-    }
     Ok(())
+}
+
+/// Tells the servers of `job` that no more tests come, once.
+fn close(
+    job: usize,
+    jobs_of: &[Job],
+    servers: &[Server],
+    closing: &mut BTreeSet<usize>,
+    ended: &BTreeSet<usize>,
+) {
+    if !ended.contains(&job) && closing.insert(job) {
+        for &server in &jobs_of[job].servers {
+            servers[server].close();
+        }
+    }
+}
+
+/// Gives `done` each closing job whose servers are all gone, having waited for them (which
+/// then takes no time: waiting on a server still running would hold up every other job).
+fn finish(
+    servers: &mut [Server],
+    jobs_of: &mut [Job],
+    gone: &BTreeSet<usize>,
+    began: &BTreeSet<usize>,
+    closing: &mut BTreeSet<usize>,
+    ended: &mut BTreeSet<usize>,
+    done: &mut impl FnMut(usize, Job, Outcome),
+) {
+    let ready: Vec<usize> = closing
+        .iter()
+        .copied()
+        .filter(|job| jobs_of[*job].servers.iter().all(|it| gone.contains(it)))
+        .collect();
+    for job in ready {
+        closing.remove(&job);
+        ended.insert(job);
+        let mut well = true;
+        for &server in &jobs_of[job].servers {
+            well &= servers[server].child.wait().is_ok_and(|it| it.success());
+        }
+        let taken = std::mem::replace(&mut jobs_of[job], Job::new(None));
+        let outcome = match taken.left > 0 && !began.contains(&job) {
+            true => Outcome::NotRun,
+            false => Outcome::Ran { well },
+        };
+        done(job, taken, outcome);
+    }
 }
 
 /// What a test's process wrote, at most the last [`OUTPUT_KEPT`] bytes of it.
@@ -401,6 +468,10 @@ fn read_output(file: &File) -> Vec<u8> {
         }
     }
     out.truncate(at);
+    if start > 0 {
+        let cut = format!("blaze: the first {start} bytes of this test's output are not kept\n");
+        out.splice(0..0, cut.into_bytes());
+    }
     out
 }
 
@@ -626,9 +697,21 @@ fn without_colors(text: &str) -> String {
     out
 }
 
-/// Where a command keeps its tests' output files: removed as each is made, so nothing stays.
-pub fn scratch() -> PathBuf {
-    std::env::temp_dir().join(format!("blaze-test-output-{}", std::process::id()))
+/// Makes the directory a command keeps its tests' output files in (each removed as it is
+/// made, so nothing stays): new, and the user's alone, so no one else can have made it first
+/// or see into it.
+pub fn scratch() -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |it| it.subsec_nanos());
+    let dir =
+        std::env::temp_dir().join(format!("blaze-test-output-{}-{nanos:08x}", std::process::id()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .with_context(|| format!("making {} for the tests' output", dir.display()))?;
+    Ok(dir)
 }
 
 #[cfg(test)]
