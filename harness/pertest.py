@@ -113,7 +113,7 @@ mod tests {
 }
 """,
 }
-RESULT = re.compile(r"^test (\S+) \.\.\. (ok|FAILED|ignored|TIMEOUT)", re.M)
+RESULT = re.compile(r"^test (\S+) \.\.\. (ok|FAILED|ignored|TIMEOUT)", re.MULTILINE)
 EVERY = {
     "tests::adds": "ok", "tests::fails": "FAILED", "tests::panics": "ok",
     "tests::ignored": "ignored", "tests::aborts": "FAILED", "tests::sleeps": "ok",
@@ -133,7 +133,8 @@ def typed(text):
     if text == "-":
         text = sys.stdin.read()
     elif not text.lstrip().startswith("{"):
-        text = open(text).read()
+        with open(text) as file:
+            text = file.read()
     try:
         value = json.loads(text)
     except json.JSONDecodeError as e:
@@ -150,7 +151,7 @@ def typed(text):
 
 def run(ws, env, *args, **more):
     ran = subprocess.run(["blaze", "test", *args], cwd=ws, env=dict(env, **more),
-                         capture_output=True, text=True, timeout=TIMEOUT)
+                         capture_output=True, text=True, timeout=TIMEOUT, check=False)
     return ran.returncode, ran.stdout, ran.stderr
 
 
@@ -169,7 +170,8 @@ def main():
     ws, home = os.path.join(root, "ws"), tempfile.mkdtemp(prefix="bz-pt-", dir="/tmp")
     for path, text in FILES.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
-        open(os.path.join(ws, path), "w").write(text)
+        with open(os.path.join(ws, path), "w") as file:
+            file.write(text)
     env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home,
                RUST_BACKTRACE="0", BLAZE_CACHE=os.path.join(root, "store"), BLAZE_TESTS="all")
     for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS",
@@ -194,7 +196,7 @@ def main():
         elif "the output of a failing test" not in out:
             verdict = "THE FAILING TEST'S OUTPUT IS NOT PRINTED"
         elif re.search(r"^---- tests::fails stdout ----\n(?:(?!\n\n)[\s\S])*^(running|test result)",
-                       out, re.M):
+                       out, re.MULTILINE):
             verdict = "A TEST'S OUTPUT HOLDS ITS CHILD'S LIBTEST REPORT"
         step("every test, each in a process of its own", verdict, out + err)
 
@@ -228,7 +230,8 @@ def main():
             f"ENDED {code}, THE COUNTING TESTS {counted}"
         step("BLAZE_TEST_PROCESSES=one: libtest's threads", verdict, out + err)
     finally:
-        subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
+        subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=120,
+                       check=False)
     print(f"{sum(verdicts)} of {len(verdicts)} right; under {root}, the daemon's home {home}")
     if not all(verdicts):
         sys.exit(1)
