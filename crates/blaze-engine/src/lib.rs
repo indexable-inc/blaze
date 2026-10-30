@@ -1130,9 +1130,12 @@ impl Resolver<'_> {
     /// What stands for a crate of the checkout that rustc built nothing of, the same after
     /// every edit: its name and where in the checkout its source starts. One of the standard
     /// library, when the build has nothing of rustc's, by its name alone: a program has one
-    /// of each name, wherever its source is.
+    /// of each name, wherever its source is. One of a registry or of git by what it is built
+    /// with too ([`content::Contents::library`]): its source does not change, but its features,
+    /// cfgs and what its build script set and wrote do, and code of one is not the other's.
     fn own_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
-        let lang = krate.data(self.db).origin.is_lang();
+        let origin = &krate.data(self.db).origin;
+        let (lang, local) = (origin.is_lang(), origin.is_local());
         if lang && !self.table.is_empty() || self.rustc_crate_id(krate).is_some() {
             return None;
         }
@@ -1143,7 +1146,17 @@ impl Resolver<'_> {
         let root = self.crate_root(krate.into())?;
         let home = self.contents.cargo_home(self.db);
         let place = crate_place(&root, self.inside(&root), home.as_deref());
-        let named = format!("blaze crate {} {place}", name.crate_name());
+        if local {
+            return Some(short_hash(&format!("blaze crate {} {place}", name.crate_name())));
+        }
+        let built = self.contents.library(
+            self.db,
+            krate,
+            &root,
+            &|krate| Some((self.stable_crate_id(krate), self.crate_root(krate.into())?)),
+            &|krate| process_reads(self.db, krate),
+        );
+        let named = format!("blaze crate {} {place} {built}", name.crate_name());
         Some(short_hash(&named))
     }
 

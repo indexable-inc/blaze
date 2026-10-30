@@ -103,6 +103,49 @@ def tree(root):
     return found
 
 
+def system_mb():
+    """What the whole machine has and uses now, in megabytes: `total`, `used` (all but what
+    the kernel could hand out without swapping, `MemAvailable`), `swap_total` and `swap_used`.
+    None off Linux."""
+    try:
+        with open("/proc/meminfo") as f:
+            info = {line.split(":")[0]: int(line.split()[1]) for line in f if line.split()[1:]}
+    except (OSError, ValueError):
+        return None
+    mb = lambda kb: round(kb / 1024)
+    return dict(
+        total=mb(info["MemTotal"]), used=mb(info["MemTotal"] - info["MemAvailable"]),
+        swap_total=mb(info["SwapTotal"]), swap_used=mb(info["SwapTotal"] - info["SwapFree"]),
+    )
+
+
+def largest_processes(count):
+    """The `count` processes of the whole machine that hold the most, as (megabytes resident,
+    megabytes swapped out, pid, name), most first. Linux only: empty elsewhere."""
+    found = []
+    for pid in (int(p) for p in os.listdir("/proc") if p.isdigit()) if os.path.isdir("/proc") else ():
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                status = dict(line.rstrip("\n").split(":\t", 1) for line in f if ":\t" in line)
+        except OSError:
+            continue
+        kb = lambda field: int(status.get(field, "0 kB").split()[0])
+        if kb("VmRSS") or kb("VmSwap"):
+            found.append((round(kb("VmRSS") / 1024), round(kb("VmSwap") / 1024), pid, status.get("Name", "?").strip()))
+    return sorted(found, key=lambda it: it[0] + it[1], reverse=True)[:count]
+
+
+def cpu_seconds(pid):
+    """The CPU time `pid` has used, user and system, in seconds; None when it is gone or off
+    Linux."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+    except (OSError, IndexError):
+        return None
+    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+
+
 def resident_mb(roots):
     """What the trees of `roots` hold now, summed, in megabytes."""
     pids = {p for root in roots if root for p in tree(root)}
