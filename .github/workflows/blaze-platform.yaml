@@ -150,6 +150,9 @@ jobs:
       # A limit of its own, under the job's: a cold store's tests ran past the job's 90 minutes
       # on 2026-10-28, which cancelled the push after them, so no run after it found them
       # compiled. Run out here, the step fails and main's push still runs.
+      # unittests.py dumps the threads of a blaze that stops using the CPU (a stuck build).
+      - if: env.BLAZE == 'true' && runner.os == 'Linux'
+        run: sudo apt-get install -y -qq gdb > /dev/null
       - if: env.BLAZE == 'true'
         timeout-minutes: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 335 || startsWith(inputs.os, 'macos') && 220 || 150 }}
         run: |

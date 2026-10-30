@@ -2568,6 +2568,34 @@ fn deps_of(
     krate.transitive_deps(db).into_iter().collect()
 }
 
+/// Whether the program `args` builds is of one of `crates`: one of its crates is, or one it
+/// links. A proc macro is a library of the compiler's, not of the program, built to its
+/// module apart from this database, so neither it nor what it links is. A program whose
+/// crates are not found may be.
+fn program_reads_any(
+    db: &RootDatabase,
+    args: &Args,
+    crates: &FxHashSet<ide_db::base_db::Crate>,
+) -> bool {
+    let mut seen = FxHashSet::default();
+    let mut next = Vec::new();
+    for krate in args.crates() {
+        let Ok(found) = crates_named(db, krate, args) else { return true };
+        next.extend(found.into_iter().map(ide_db::base_db::Crate::from));
+    }
+    while let Some(krate) = next.pop() {
+        if !seen.insert(krate) {
+            continue;
+        }
+        if crates.contains(&krate) {
+            return true;
+        }
+        let linked = krate.data(db).dependencies.iter().map(|it| it.crate_id);
+        next.extend(linked.filter(|it| !it.data(db).target_kind.is_proc_macro()));
+    }
+    false
+}
+
 /// The crates called `krate` to build: the ones rustc built into this program, when it built
 /// any, which may be a crate of the checkout and a dependency of the same name both. Otherwise
 /// what `crates_named` finds.
@@ -6783,9 +6811,7 @@ impl WatchedFile {
         if as_rustc_read { Loaded::AsRustcRead } else { Loaded::New }
     }
 
-    /// Adds the files the last build included that are not watched yet. One is read again once
-    /// its timestamp is taken, so a write between the build's read and now is not lost: the
-    /// result is whether there was one.
+    /// Whether a build included a file that is not watched yet.
     fn unwatched(files: &[WatchedFile], db: &RootDatabase) -> bool {
         let watched: FxHashSet<&Path> = files.iter().map(|it| &*it.path).collect();
         db.included_files()
@@ -6794,30 +6820,32 @@ impl WatchedFile {
             .any(|it| !watched.contains(it) && !WatchedFile::immutable(it))
     }
 
-    fn watch_included(files: &mut Vec<WatchedFile>, db: &mut RootDatabase) -> bool {
+    /// Watches the files the last build included that are not watched yet, writing nothing to
+    /// the database, so the builds still under way go on. Each is compared with what the build
+    /// read after its timestamp is taken, so a write between the build's read and now is not
+    /// lost: one that differs is watched as changed ([`WatchedFile::mtime`] `None`), and the
+    /// scan for changed files reads it in once the builds are settled.
+    fn watch_included(files: &mut Vec<WatchedFile>, db: &RootDatabase) {
         let watched: FxHashSet<&Path> = files.iter().map(|it| &*it.path).collect();
         let new: Vec<AbsPathBuf> = db
             .included_files()
             .into_iter()
             .filter(|it| !watched.contains(AsRef::<Path>::as_ref(it)))
             .collect();
-        let mut changed = false;
         for path in new {
             if WatchedFile::immutable(path.as_ref()) {
                 continue;
             }
             // One that is not there is watched for when it is, as a new file is.
             let on_disk = db.on_disk(path.as_ref());
-            let mtime = std::fs::metadata(&on_disk).and_then(|it| it.modified());
+            let mtime = std::fs::metadata(&on_disk).and_then(|it| it.modified()).ok();
+            let mtime = mtime.filter(|_| db.included_is_read(&path));
             files.push(WatchedFile {
                 file: Watched::Included(path.clone()),
                 path: AsRef::<Path>::as_ref(&path).to_owned(),
-                mtime: mtime.ok(),
+                mtime,
             });
-            changed |= db.reload_included_file(&path);
         }
-        prepare_macro_sessions(db);
-        changed
     }
 }
 
@@ -7749,9 +7777,21 @@ impl Builds {
 
     /// Leaves no build under way, for the database to be written to: a write stops every
     /// thread that reads it. The builds that are kept are waited for, the others interrupted.
+    #[track_caller]
     fn settle(&mut self, db: &mut RootDatabase, programs: &mut [Program]) -> anyhow::Result<()> {
+        self.settle_waiting(db, programs, &FxHashSet::default())
+    }
+
+    /// [`Self::settle`], waiting for the builds of `waited` too, as for those that are kept.
+    #[track_caller]
+    fn settle_waiting(
+        &mut self,
+        db: &mut RootDatabase,
+        programs: &mut [Program],
+        waited: &FxHashSet<usize>,
+    ) -> anyhow::Result<()> {
         use ide_db::base_db::salsa::Database as _;
-        while self.running.values().any(|it| it.kept) {
+        while self.running.iter().any(|(at, it)| it.kept || waited.contains(at)) {
             let event = self.events.recv()?;
             self.take(event, programs)?;
         }
@@ -7761,6 +7801,7 @@ impl Builds {
             }
             let linking = lock(&LINKING);
             if *linking == 0 {
+                eprintln!("settle: interrupting from {}", std::panic::Location::caller());
                 INTERRUPTING.store(true, Ordering::SeqCst);
                 break;
             }
@@ -9639,21 +9680,41 @@ fn run_holding(
     // The programs whose tests blaze's harness lists, by their object.
     let mut harnessed: FxHashSet<PathBuf> = FxHashSet::default();
     loop {
-        if WatchedFile::unwatched(&files, &db) || tree.includes_more(&db) {
-            builds.settle(&mut db, &mut programs)?;
+        WatchedFile::watch_included(&mut files, &db);
+        // An `include!` in a body is first seen when the body is compiled. Only the crates
+        // that named the file, and what depends on them, compiled without it: the builds of
+        // the other programs go on to their end.
+        let including = tree.includes_more(&db).then(|| tree.including(&db));
+        if let Some(including) = &including {
+            let named: Vec<String> = (including.iter())
+                .map(|&it| {
+                    let name = it.extra_data(&db).display_name.as_ref();
+                    name.map_or_else(|| "?".to_owned(), ToString::to_string)
+                })
+                .collect();
+            eprintln!("included late, by {}", named.join(", "));
+            // With no crate noted as naming it, any may have.
+            let named: FxHashSet<ide_db::base_db::Crate> = including.iter().copied().collect();
+            let waited = (builds.running.keys().copied())
+                .filter(|&at| {
+                    !named.is_empty() && !program_reads_any(&db, &programs[at].args, &named)
+                })
+                .collect();
+            builds.settle_waiting(&mut db, &mut programs, &waited)?;
         }
-        let included = WatchedFile::watch_included(&mut files, &mut db);
+        let including = including.filter(|it| !it.is_empty());
         let loaded = WatchedFile::include_sources(&mut files, &mut tree, &mut db);
         match loaded {
-            _ if included => programs.iter_mut().for_each(|it| it.known.touch(&db, None)),
             Loaded::Nothing => {}
             // A build of the daemon's own compiled without them; what rustc linked is of them.
             Loaded::AsRustcRead => programs.iter_mut().for_each(|it| it.known.touch_own(&db)),
-            Loaded::New => programs.iter_mut().for_each(|it| it.known.touch(&db, None)),
+            Loaded::New => {
+                programs.iter_mut().for_each(|it| it.known.touch(&db, including.as_deref()))
+            }
         }
         // What they declare is in the crates now, and a listing from before has none of it.
         if loaded != Loaded::Nothing {
-            listed.touch(&db, None);
+            listed.touch(&db, including.as_deref());
         }
         // The program each client asks for.
         let mut clients: Vec<(usize, Asked)> = Vec::new();
