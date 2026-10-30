@@ -6770,9 +6770,7 @@ impl WatchedFile {
         if as_rustc_read { Loaded::AsRustcRead } else { Loaded::New }
     }
 
-    /// Adds the files the last build included that are not watched yet. One is read again once
-    /// its timestamp is taken, so a write between the build's read and now is not lost: the
-    /// result is whether there was one.
+    /// Whether a build included a file that is not watched yet.
     fn unwatched(files: &[WatchedFile], db: &RootDatabase) -> bool {
         let watched: FxHashSet<&Path> = files.iter().map(|it| &*it.path).collect();
         db.included_files()
@@ -6781,30 +6779,32 @@ impl WatchedFile {
             .any(|it| !watched.contains(it) && !WatchedFile::immutable(it))
     }
 
-    fn watch_included(files: &mut Vec<WatchedFile>, db: &mut RootDatabase) -> bool {
+    /// Watches the files the last build included that are not watched yet, writing nothing to
+    /// the database, so the builds still under way go on. Each is compared with what the build
+    /// read after its timestamp is taken, so a write between the build's read and now is not
+    /// lost: one that differs is watched as changed ([`WatchedFile::mtime`] `None`), and the
+    /// scan for changed files reads it in once the builds are settled.
+    fn watch_included(files: &mut Vec<WatchedFile>, db: &RootDatabase) {
         let watched: FxHashSet<&Path> = files.iter().map(|it| &*it.path).collect();
         let new: Vec<AbsPathBuf> = db
             .included_files()
             .into_iter()
             .filter(|it| !watched.contains(AsRef::<Path>::as_ref(it)))
             .collect();
-        let mut changed = false;
         for path in new {
             if WatchedFile::immutable(path.as_ref()) {
                 continue;
             }
             // One that is not there is watched for when it is, as a new file is.
             let on_disk = db.on_disk(path.as_ref());
-            let mtime = std::fs::metadata(&on_disk).and_then(|it| it.modified());
+            let mtime = std::fs::metadata(&on_disk).and_then(|it| it.modified()).ok();
+            let mtime = mtime.filter(|_| db.included_is_read(&path));
             files.push(WatchedFile {
                 file: Watched::Included(path.clone()),
                 path: AsRef::<Path>::as_ref(&path).to_owned(),
-                mtime: mtime.ok(),
+                mtime,
             });
-            changed |= db.reload_included_file(&path);
         }
-        prepare_macro_sessions(db);
-        changed
     }
 }
 
@@ -9626,13 +9626,12 @@ fn run_holding(
     // The programs whose tests blaze's harness lists, by their object.
     let mut harnessed: FxHashSet<PathBuf> = FxHashSet::default();
     loop {
-        if WatchedFile::unwatched(&files, &db) || tree.includes_more(&db) {
+        WatchedFile::watch_included(&mut files, &db);
+        if tree.includes_more(&db) {
             builds.settle(&mut db, &mut programs)?;
         }
-        let included = WatchedFile::watch_included(&mut files, &mut db);
         let loaded = WatchedFile::include_sources(&mut files, &mut tree, &mut db);
         match loaded {
-            _ if included => programs.iter_mut().for_each(|it| it.known.touch(&db, None)),
             Loaded::Nothing => {}
             // A build of the daemon's own compiled without them; what rustc linked is of them.
             Loaded::AsRustcRead => programs.iter_mut().for_each(|it| it.known.touch_own(&db)),
