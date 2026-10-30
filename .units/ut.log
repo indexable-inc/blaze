@@ -1,0 +1,1061 @@
+Current runner version: '2.338.0'
+##[group]Runner Image Provisioner
+Hosted Compute Agent
+Version: 20261021.618
+Commit: 21505ad2541d5be6135ed84fc33697146cf75b8e
+Build Date: 2026-10-21T00:45:21Z
+Worker ID: {a7b37fbd-06c3-4973-a8e5-809e4c182d8e}
+Region: eastus
+Cloud: Azure
+##[endgroup]
+##[group]Operating System
+Ubuntu
+24.04.5
+LTS
+##[endgroup]
+##[group]Runner Image
+Image: ubuntu-24.04
+Version: 20261025.353.1
+Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20261025.353/images/ubuntu/Ubuntu2404-Readme.md
+Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20261025.353
+##[endgroup]
+##[group]GITHUB_TOKEN Permissions
+Contents: read
+Metadata: read
+##[endgroup]
+Secret source: Actions
+Cache mode: write
+Prepare workflow directory
+Prepare all required actions
+Getting action download info
+Download action repository 'actions/checkout@v7' (SHA:3d3c42e5aac5ba805825da76410c181273ba90b1)
+Uses: indexable-inc/blaze/.github/workflows/blaze-platform.yaml@refs/pull/1363/merge (73a77c91084434ab39a3cce87b3dc7cf2df8e634)
+##[group] Inputs
+  platform: linux-x64
+  os: ubuntu-24.04
+  tier: gate
+  borrowck: true
+  pinned-ui: true
+  consteval: false
+  blaze-cli: false
+  projects: false
+  bench: false
+  bun-e2e: false
+  wasm32: false
+  smoke: true
+##[endgroup]
+Complete job name: linux x64 / tests
+##[group]Run actions/checkout@v7
+with:
+  repository: indexable-inc/blaze
+  token: ***
+  ssh-strict: true
+  ssh-user: git
+  persist-credentials: true
+  clean: true
+  sparse-checkout-cone-mode: true
+  fetch-depth: 1
+  fetch-tags: false
+  show-progress: true
+  lfs: false
+  submodules: false
+  set-safe-directory: true
+  allow-unsafe-pr-checkout: false
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  BLAZE_SANDBOX: 
+  PYTHON: python3
+  BLAZE: true
+  BLAZE_TESTS: affected
+##[endgroup]
+Syncing repository: indexable-inc/blaze
+##[group]Getting Git version info
+Working directory is '/home/runner/work/blaze/blaze'
+[command]/usr/bin/git version
+git version 2.56.0
+##[endgroup]
+Temporarily overriding HOME='/home/runner/work/_temp/2d00ead2-7a8e-49cf-a8a8-c793c007fb00' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/blaze/blaze
+Deleting the contents of '/home/runner/work/blaze/blaze'
+##[group]Determining repository object format
+##[endgroup]
+##[group]Initializing the repository
+[command]/usr/bin/git init /home/runner/work/blaze/blaze
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /home/runner/work/blaze/blaze/.git/
+[command]/usr/bin/git remote add origin https://github.com/indexable-inc/blaze
+##[endgroup]
+##[group]Disabling automatic garbage collection
+[command]/usr/bin/git config --local gc.auto 0
+##[endgroup]
+##[group]Setting up auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+[command]/usr/bin/git config --file /home/runner/work/_temp/git-credentials-1624f028-4a79-45a5-ad88-1e475035c2a5.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/blaze/blaze/.git.path /home/runner/work/_temp/git-credentials-1624f028-4a79-45a5-ad88-1e475035c2a5.config
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/blaze/blaze/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-1624f028-4a79-45a5-ad88-1e475035c2a5.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-1624f028-4a79-45a5-ad88-1e475035c2a5.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-1624f028-4a79-45a5-ad88-1e475035c2a5.config
+##[endgroup]
+##[group]Fetching the repository
+[command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +73a77c91084434ab39a3cce87b3dc7cf2df8e634:refs/remotes/pull/1363/merge
+From https://github.com/indexable-inc/blaze
+ * [new ref]         73a77c91084434ab39a3cce87b3dc7cf2df8e634 -> pull/1363/merge
+##[endgroup]
+##[group]Determining the checkout info
+##[endgroup]
+[command]/usr/bin/git sparse-checkout disable
+[command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+##[group]Checking out the ref
+[command]/usr/bin/git checkout --progress --force refs/remotes/pull/1363/merge
+Note: switching to 'refs/remotes/pull/1363/merge'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+HEAD is now at 73a77c9 Merge 2758f898c05b86e32f5466e50bf39aae13c13426 into a8f4cb9192799bf680ebe7294a86fe3e428ff850
+##[endgroup]
+[command]/usr/bin/git log -1 --format=%H
+73a77c91084434ab39a3cce87b3dc7cf2df8e634
+Prepare all required actions
+Getting action download info
+##[group]Run ./.github/actions/blaze
+with:
+  job: tests
+  llvm: false
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  BLAZE_SANDBOX: 
+  PYTHON: python3
+  BLAZE: true
+  BLAZE_TESTS: affected
+##[endgroup]
+##[start-action display=user namespaces;id=blaze.__run]
+##[group]Run if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+  sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+fi
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  BLAZE_SANDBOX: 
+  PYTHON: python3
+  BLAZE: true
+  BLAZE_TESTS: affected
+##[endgroup]
+kernel.apparmor_restrict_unprivileged_userns = 0
+##[end-action id=blaze.__run;outcome=success;conclusion=success;duration_ms=21]
+##[start-action display=blaze (the release .github/blaze-version names);id=blaze.install]
+##[group]Run # Without --no-toolchain: install.sh has blaze fetch its toolchain now (`blaze toolchain`),
+# Without --no-toolchain: install.sh has blaze fetch its toolchain now (`blaze toolchain`),
+# as a user's install does, rather than at the first build.
+sh install.sh --version "$(cat .github/blaze-version)" --verbose
+said=$(blaze-engine --version)
+version=$(echo "$said" | awk '$1 == "blaze" { print $2 }')
+[ -n "$version" ] || { echo "::error::blaze-engine --version said no version: $said"; exit 1; }
+echo "BLAZE_CACHE=$RUNNER_TEMP/blaze-store" >> "$GITHUB_ENV"
+# No limit on the store: its default, a tenth of the free disk (about 3 GB on a hosted
+# runner), left a third of main's packs unpulled ("318 left that do not fit under
+# BLAZE_CACHE_MAX"), so a warm run still rebuilt what they held. A runner's disk lives
+# for one job, so nothing needs collecting.
+echo "BLAZE_CACHE_MAX=off" >> "$GITHUB_ENV"
+echo "project=blaze-$RUNNER_OS-$RUNNER_ARCH-$JOB-$version" | tee -a "$GITHUB_OUTPUT"
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  BLAZE_SANDBOX: 
+  PYTHON: python3
+  BLAZE: true
+  BLAZE_TESTS: affected
+  JOB: tests
+##[endgroup]
+  release v0.20261028.9 of indexable-inc/blaze (stable)
+Installing blaze 0.20261028.9 for Linux on x86-64...
+  downloading blaze-v0.20261028.9-x86_64-unknown-linux-gnu.tar.gz
+  installing blaze
+  installing blaze-engine
+  installing blaze-proc-macro-srv
+  installing blaze-rustc
+Downloading Rust nightly-2026-10-27 for blaze (159 MB, once)...
+Downloaded Rust nightly-2026-10-27 for blaze in 4.9s.
+  blaze builds with blaze-2026-10-27, blaze's toolchain (Rust nightly-2026-10-27), at /home/runner/.blaze/toolchains/nightly-2026-10-27-x86_64-unknown-linux-gnu
+
+blaze 0.20261028.9 is installed.
+
+In a Rust project, run:
+
+    blaze run
+project=blaze-Linux-X64-tests-0.20261028.9
+##[end-action id=blaze.install;outcome=success;conclusion=success;duration_ms=7025]
+##[start-action display=LLVM (the pin);id=blaze.__run_2]
+##[end-action id=blaze.__run_2;outcome=skipped;conclusion=skipped;duration_ms=0]
+##[start-action display=swap;id=blaze.__run_3]
+##[group]Run # On the disk with the most room: /mnt on x86-64, the root on AArch64, which has no /mnt.
+# On the disk with the most room: /mnt on x86-64, the root on AArch64, which has no /mnt.
+disk=$(df --output=avail,target / /mnt 2>/dev/null | tail -n +2 | sort -n | tail -n 1 | awk '{ print $2 }')
+swap="${disk%/}/blaze.swap"
+sudo fallocate -l 20G "$swap"
+sudo chmod 600 "$swap"
+sudo mkswap "$swap" > /dev/null
+sudo swapon "$swap"
+free -g
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  BLAZE_SANDBOX: 
+  PYTHON: python3
+  BLAZE: true
+  BLAZE_TESTS: affected
+  BLAZE_CACHE: /home/runner/work/_temp/blaze-store
+  BLAZE_CACHE_MAX: off
+##[endgroup]
+               total        used        free      shared  buff/cache   available
+Mem:              15           1          11           0           2          13
+Swap:             22           0          22
+##[end-action id=blaze.__run_3;outcome=success;conclusion=success;duration_ms=127]
+##[start-action display=Run ./.github/actions/blaze-remote;id=blaze.__self]
+Prepare all required actions
+##[group]Run ./.github/actions/blaze-remote
+with:
+  mode: pull
+  project: blaze-Linux-X64-tests-0.20261028.9
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  BLAZE_SANDBOX: 
+  PYTHON: python3
+  BLAZE: true
+  BLAZE_TESTS: affected
+  BLAZE_CACHE: /home/runner/work/_temp/blaze-store
+  BLAZE_CACHE_MAX: off
+##[endgroup]
+##[start-action display=blaze remote pull;id=blaze.__self.__run]
+##[group]Run set -o pipefail
+set -o pipefail
+refuse() {
+  echo "::error::blaze remote $MODE: $1"
+  echo "### blaze remote $MODE: refused: $1" >> "$GITHUB_STEP_SUMMARY"
+  exit 1
+}
+[ -n "${BLAZE_CACHE:-}" ] || refuse "BLAZE_CACHE is not set: run .github/actions/blaze first"
+PROJECT=${PROJECT:-blaze-$RUNNER_OS-$RUNNER_ARCH}
+case "$MODE" in
+  pull)
+    export BLAZE_REMOTE_READONLY=1
+    ;;
+  push)
+    if [ "$GITHUB_REF" != refs/heads/main ]; then
+      refuse "push runs on main only, not $GITHUB_REF"
+    fi
+    if [ -z "$TOKEN" ] || [ -z "$SIGN_KEY" ]; then
+      refuse "push needs token and sign-key (the cache-writer environment)"
+    fi
+    export BLAZE_REMOTE_TOKEN="$TOKEN"
+    key="$RUNNER_TEMP/blaze-remote-sign.key"
+    (umask 077 && printf '%s\n' "$SIGN_KEY" > "$key")
+    trap 'rm -f "$key"' EXIT
+    export BLAZE_REMOTE_SIGN="$key"
+    ;;
+  *)
+    refuse "the mode is pull or push, not $MODE"
+    ;;
+esac
+log="$RUNNER_TEMP/blaze-remote-$MODE.log"
+start=$(date +%s.%N)
+# The exit status is said too: a blaze killed by a signal (137 for SIGKILL) says nothing.
+if blaze-engine cache "$MODE" "$REMOTE" "$PROJECT" 2>&1 | tee "$log"; then
+  status=ok
+else
+  status="failed (blaze-engine exit status ${PIPESTATUS[0]})"
+fi
+took=$(awk -v a="$start" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }')
+{
+  echo "### blaze remote $MODE: $status (${took} s)"
+  echo
+  echo '```'
+  tail -n 20 "$log"
+  echo '```'
+} >> "$GITHUB_STEP_SUMMARY"
+if [ "$status" != ok ]; then
+  echo "::error::blaze remote $MODE $status: see the job summary"
+  exit 1
+fi
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  BLAZE_SANDBOX: 
+  PYTHON: python3
+  BLAZE: true
+  BLAZE_TESTS: affected
+  BLAZE_CACHE: /home/runner/work/_temp/blaze-store
+  BLAZE_CACHE_MAX: off
+  REMOTE: blaze+https://blaze-gateway.indexable.workers.dev/t/blaze/v3
+  BLAZE_REMOTE_REQUIRED: 1
+  BLAZE_REMOTE_TRUST: 5a8e41ddc2c6e7c0f2de2e6aa4ed71b9e2b81115c3793a9f9b446d7bbfefbaf8
+  MODE: pull
+  PROJECT: blaze-Linux-X64-tests-0.20261028.9
+  TOKEN: 
+  SIGN_KEY: 
+##[endgroup]
+remote: 1116 requests (0 tried again, 1 transfers resumed), 5907756489 bytes received, 0 sent, 0 objects rejected
+pull: 934 objects, 5907756489 bytes, 87.57 s, 64.3 MiB/s
+933 packs of `blaze-Linux-X64-tests-0.20261028.9` fetched, 5907582748 bytes in 87.6s
+##[end-action id=blaze.__self.__run;outcome=success;conclusion=success;duration_ms=87603]
+##[end-action id=blaze.__self;outcome=success;conclusion=success;duration_ms=87617]
+##[group]Run $PYTHON harness/unittests.py
+$PYTHON harness/unittests.py
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  BLAZE_SANDBOX: 
+  PYTHON: python3
+  BLAZE: true
+  BLAZE_TESTS: affected
+  BLAZE_CACHE: /home/runner/work/_temp/blaze-store
+  BLAZE_CACHE_MAX: off
+##[endgroup]
+blaze test --release --no-fail-fast -phir-ty-codegen -pblaze-store -pblaze-registry -pblaze-resolve -pblaze-build-script -pblaze-manifest -pblaze-in-place -pblaze-splice -pblaze-cargo -pblaze-engine -phir-ty -phir-ty-mir -phir-ty-borrowck -phir-ty-wfcheck -phir-def -pparser -psyntax -phir-ide -pide-diagnostics -pproc-macro-api
+   Compiling blaze-build-script v0.0.0 (/home/runner/work/blaze/blaze/crates/blaze-build-script)
+   Compiling blaze-cargo v0.0.0 (/home/runner/work/blaze/blaze/crates/blaze-cargo)
+   Compiling blaze-engine v0.0.0 (/home/runner/work/blaze/blaze/crates/blaze-engine)
+   Compiling blaze-in-place v0.0.0 (/home/runner/work/blaze/blaze/crates/blaze-in-place)
+   Compiling blaze-manifest v0.0.0 (/home/runner/work/blaze/blaze/crates/blaze-manifest)
+   Compiling blaze-registry v0.0.0 (/home/runner/work/blaze/blaze/crates/blaze-registry)
+   Compiling blaze-resolve v0.0.0 (/home/runner/work/blaze/blaze/crates/blaze-resolve)
+   Compiling blaze-splice v0.0.0 (/home/runner/work/blaze/blaze/crates/blaze-splice)
+   Compiling blaze-store v0.0.0 (/home/runner/work/blaze/blaze/crates/blaze-store)
+   Compiling hir-def v0.0.0 (/home/runner/work/blaze/blaze/crates/hir-def)
+   Compiling hir-ide v0.0.0 (/home/runner/work/blaze/blaze/crates/hir-ide)
+   Compiling hir-ty v0.0.0 (/home/runner/work/blaze/blaze/crates/hir-ty)
+   Compiling hir-ty-borrowck v0.0.0 (/home/runner/work/blaze/blaze/crates/hir-ty-borrowck)
+   Compiling hir-ty-codegen v0.0.0 (/home/runner/work/blaze/blaze/crates/hir-ty-codegen)
+   Compiling hir-ty-mir v0.0.0 (/home/runner/work/blaze/blaze/crates/hir-ty-mir)
+   Compiling hir-ty-wfcheck v0.0.0 (/home/runner/work/blaze/blaze/crates/hir-ty-wfcheck)
+   Compiling ide-diagnostics v0.0.0 (/home/runner/work/blaze/blaze/crates/ide-diagnostics)
+   Compiling parser v0.0.0 (/home/runner/work/blaze/blaze/crates/parser)
+   Compiling proc-macro-api v0.0.0 (/home/runner/work/blaze/blaze/crates/proc-macro-api)
+   Compiling syntax v0.0.0 (/home/runner/work/blaze/blaze/crates/syntax)
+     Loading workspace
+      Loaded workspace in 1.78s
+   Compiling the standard library of build scripts
+   Compiling the standard library of build scripts (15.5s)
+   Compiling the standard library of build scripts (30.6s)
+   Compiling the standard library of build scripts (45.7s)
+    Compiled the standard library of build scripts in 1m00s
+    Building build scripts and proc macros
+    Building build scripts and proc macros: 6/139 steps (15.6s)
+    Building build scripts and proc macros: 12/139 steps (30.8s)
+    Building build scripts and proc macros: 17/139 steps (45.8s)
+    Building build scripts and proc macros: 24/139 steps (1m00s)
+    Building build scripts and proc macros: 32/139 steps (1m15s)
+    Building build scripts and proc macros: 42/139 steps (1m31s)
+    Building build scripts and proc macros: 63/139 steps (1m46s)
+    Building build scripts and proc macros: 103/139 steps (2m01s)
+    Building build scripts and proc macros: 103/139 steps (2m16s)
+    Building build scripts and proc macros: 106/139 steps (2m31s)
+    Building build scripts and proc macros: 108/139 steps (2m46s)
+    Building build scripts and proc macros: 112/139 steps (3m01s)
+    Building build scripts and proc macros: 116/139 steps (3m16s)
+    Building build scripts and proc macros: 118/139 steps (3m31s)
+    Building build scripts and proc macros: 123/139 steps (3m46s)
+    Building build scripts and proc macros: 128/139 steps (4m01s)
+    Building build scripts and proc macros: 128/139 steps (4m16s)
+    Building build scripts and proc macros: 128/139 steps (4m31s)
+    Building build scripts and proc macros: 128/139 steps (4m46s)
+    Building build scripts and proc macros: 134/139 steps (5m01s)
+    Building build scripts and proc macros: 135/139 steps (5m16s)
+    Building build scripts and proc macros: 135/139 steps (5m32s)
+       Built build scripts and proc macros in 5m45s
+     Loading workspace
+     Loading workspace (15.5s)
+     Loading workspace (30.6s)
+      Loaded workspace in 33.8s
+   Resolving names
+   Resolving names (15.6s)
+    Resolved names in 30.4s
+   Compiling config
+   Compiling blaze_manifest
+    Checking 24 files
+     Checked 24 files in 0.84s
+   Compiling metadata
+   Compiling blaze_manifest
+   Compiling profiles
+   Compiling blaze_manifest
+   Compiling cargo_features (0.12s)
+   Compiling cargo_features
+   Compiling blaze_manifest
+   Compiling std
+   Compiling config_get (0.11s)
+   Compiling config_get
+   Compiling blaze_manifest
+   Compiling config_typed
+   Compiling blaze_manifest
+   Compiling fixtures (0.11s)
+   Compiling fixtures
+   Compiling blaze_manifest
+   Compiling profiles (0.28s)
+   Compiling profiles
+   Compiling blaze_manifest
+   Compiling fetch
+   Compiling blaze_manifest
+   Compiling query
+   Compiling anyhow
+   Compiling std
+   Compiling toml
+   Compiling rustc_hash
+   Compiling semver
+   Compiling auth (0.18s)
+   Compiling auth
+   Compiling blaze_manifest
+     Linking auth
+      Linked auth in 0.93s
+   Compiling fetch
+   Compiling git (0.18s)
+   Compiling git
+   Compiling git_index (0.15s)
+   Compiling git_index
+   Compiling query (0.17s)
+   Compiling query
+     Linking query
+      Linked query in 0.68s
+   Compiling metadata_resolve
+   Compiling features (0.19s)
+   Compiling features
+     Linking features
+      Linked features in 2.29s
+   Compiling lockfile
+   Compiling metadata (0.24s)
+   Compiling metadata
+     Linking metadata
+      Linked metadata in 1.93s
+   Compiling resolver
+     Linking resolver
+      Linked resolver in 2.02s
+   Compiling workspace_resolve
+     Linking workspace_resolve
+      Linked workspace_resolve in 2.92s
+   Compiling trees
+     Rebuilt 2589 fns: main, run, from_process, root_manifest, new, new, workspace_warnings, warnings (uses what changed) and 2581 more; 12m47s
+        Took 12m47s: build scripts 5m45s (3.9/4 cores), std of build scripts 1m00s (3.7/4), codegen 52.0s (2.5/4)
+warning: 14.3s with no step named, after program
+             `blaze why` says more
+    Building build scripts and proc macros
+    Building build scripts and proc macros: 131/139 steps (15.7s)
+    Building build scripts and proc macros: 137/139 steps (30.7s)
+    Building build scripts and proc macros: 137/139 steps (45.8s)
+    Building build scripts and proc macros: 137/139 steps (1m01s)
+       Built build scripts and proc macros in 1m06s
+     Loading workspace
+     Loading workspace (15.6s)
+     Loading workspace (30.6s)
+      Loaded workspace in 39.6s
+   Resolving names
+    Resolved names in 1.35s
+   Compiling blaze_build_script
+   Compiling blaze_cargo
+   Compiling blaze_cargo (15.7s)
+   Compiling blaze_cargo (30.9s)
+   Compiling libc
+   Compiling std
+   Compiling blaze_cargo (1m01s)
+   Compiling blaze_cargo (1m17s)
+   Compiling blaze_cargo (1m32s)
+   Compiling blaze_cargo (1m47s)
+   Compiling blaze_cargo (2m02s)
+   Compiling blaze_cargo (2m17s)
+   Compiling blaze_cargo (2m32s)
+   Compiling blaze_cargo (2m47s)
+   Compiling blaze_cargo (3m02s)
+   Compiling blaze_cargo (3m17s)
+   Compiling blaze_cargo (3m32s)
+   Compiling blaze_cargo (3m47s)
+   Compiling blaze_cargo (4m03s)
+   Compiling blaze_cargo (4m18s)
+   Compiling blaze_cargo (4m33s)
+   Compiling blaze_cargo (4m48s)
+   Compiling blaze_cargo (5m03s)
+     Linking blaze_cargo
+     Linking blaze_cargo (15.6s)
+      Linked blaze_cargo in 23.3s
+   Compiling blaze_engine (0.30s)
+   Compiling blaze_engine
+   Compiling blaze_engine (15.5s)
+   Compiling blaze_engine (30.8s)
+   Compiling libc
+   Compiling std
+   Compiling blaze_engine (51.3s)
+   Compiling blaze_engine (1m06s)
+   Compiling blaze_engine (1m21s)
+     Linking blaze_engine
+     Linking blaze_engine (15.5s)
+     Linking blaze_engine (30.6s)
+     Linking blaze_engine (45.7s)
+     Linking blaze_engine (1m00s)
+     Linking blaze_engine (1m15s)
+     Linking blaze_engine (1m30s)
+     Linking blaze_engine (1m45s)
+     Linking blaze_engine (2m00s)
+     Linking blaze_engine (2m15s)
+     Linking blaze_engine (2m30s)
+      Linked blaze_engine in 2m34s
+   Compiling blaze (0.30s)
+   Compiling blaze
+   Compiling blaze (15.5s)
+     Linking blaze
+      Linked blaze in 2.83s
+   Compiling blaze_rustc
+   Compiling blaze_rustc (15.6s)
+     Linking blaze_rustc
+      Linked blaze_rustc in 2.54s
+   Compiling blaze_in_place
+   Compiling blaze_manifest
+   Compiling blaze_registry
+   Compiling blaze_resolve
+   Compiling blaze_splice
+   Compiling libc
+   Compiling std
+   Compiling blaze_store
+   Compiling libc
+   Compiling hir_def
+   Compiling hir_def (15.6s)
+   Compiling hir_def (30.6s)
+     Linking hir_def
+     Linking hir_def (15.5s)
+     Linking hir_def (30.6s)
+     Linking hir_def (45.6s)
+      Linked hir_def in 55.1s
+   Compiling hir_ide
+   Compiling libc
+   Compiling hir_ide (25.2s)
+   Compiling hir_ide (40.3s)
+   Compiling hir_ide (55.3s)
+   Compiling hir_ide (1m10s)
+   Compiling hir_ide (1m25s)
+     Linking hir_ide
+     Linking hir_ide (15.5s)
+     Linking hir_ide (30.6s)
+     Linking hir_ide (45.6s)
+     Linking hir_ide (1m00s)
+     Linking hir_ide (1m15s)
+     Linking hir_ide (1m30s)
+      Linked hir_ide in 1m38s
+   Compiling hir_ty
+   Compiling hir_ty (15.5s)
+   Compiling hir_ty (30.5s)
+     Linking hir_ty
+      Linked hir_ty in 0.71s
+   Compiling hir_ty_borrowck
+   Compiling std
+   Compiling hir_ty_borrowck (20.3s)
+   Compiling hir_ty_borrowck (35.5s)
+   Compiling hir_ty_borrowck (50.5s)
+     Linking hir_ty_borrowck
+      Linked hir_ty_borrowck in 1.30s
+   Compiling hir_ty_codegen
+   Compiling hir_ty_codegen (15.5s)
+   Compiling hir_ty_codegen (30.6s)
+   Compiling hir_ty_codegen (45.7s)
+   Compiling hir_ty_codegen (1m00s)
+   Compiling hir_ty_codegen (1m15s)
+   Compiling hir_ty_codegen (1m30s)
+   Compiling hir_ty_codegen (1m46s)
+   Compiling hir_ty_codegen (2m01s)
+   Compiling hir_ty_codegen (2m16s)
+   Compiling hir_ty_codegen (2m31s)
+   Compiling hir_ty_codegen (2m46s)
+   Compiling hir_ty_codegen (3m01s)
+   Compiling hir_ty_codegen (3m16s)
+   Compiling hir_ty_codegen (3m31s)
+   Compiling hir_ty_codegen (3m46s)
+   Compiling hir_ty_codegen (4m01s)
+   Compiling hir_ty_codegen (4m16s)
+   Compiling hir_ty_codegen (4m31s)
+   Compiling hir_ty_codegen (4m47s)
+   Compiling hir_ty_codegen (5m02s)
+   Compiling hir_ty_codegen (5m17s)
+   Compiling hir_ty_codegen (5m32s)
+   Compiling hir_ty_codegen (5m47s)
+   Compiling hir_ty_codegen (6m02s)
+   Compiling hir_ty_codegen (6m17s)
+   Compiling hir_ty_codegen (6m32s)
+   Compiling hir_ty_codegen (6m47s)
+   Compiling hir_ty_codegen (7m02s)
+   Compiling hir_ty_codegen (7m17s)
+   Compiling hir_ty_codegen (7m32s)
+   Compiling hir_ty_codegen (7m47s)
+   Compiling hir_ty_codegen (8m03s)
+   Compiling hir_ty_codegen (8m18s)
+   Compiling hir_ty_codegen (8m33s)
+   Compiling hir_ty_codegen (8m48s)
+   Compiling hir_ty_codegen (9m03s)
+   Compiling hir_ty_codegen (9m18s)
+   Compiling hir_ty_codegen (9m33s)
+   Compiling hir_ty_codegen (9m48s)
+   Compiling hir_ty_codegen (10m03s)
+   Compiling hir_ty_codegen (10m18s)
+   Compiling hir_ty_codegen (10m33s)
+   Compiling hir_ty_codegen (10m48s)
+   Compiling hir_ty_codegen (11m04s)
+   Compiling hir_ty_codegen (11m19s)
+   Compiling hir_ty_codegen (11m34s)
+   Compiling hir_ty_codegen (11m49s)
+   Compiling hir_ty_codegen (12m04s)
+   Compiling hir_ty_codegen (12m19s)
+   Compiling hir_ty_codegen (12m34s)
+   Compiling hir_ty_codegen (12m49s)
+   Compiling hir_ty_codegen (13m04s)
+   Compiling hir_ty_codegen (13m19s)
+   Compiling hir_ty_codegen (13m34s)
+   Compiling hir_ty_codegen (13m49s)
+   Compiling hir_ty_codegen (14m04s)
+   Compiling hir_ty_codegen (14m20s)
+   Compiling hir_ty_codegen (14m35s)
+   Compiling hir_ty_codegen (14m50s)
+   Compiling hir_ty_codegen (15m05s)
+   Compiling hir_ty_codegen (15m20s)
+   Compiling hir_ty_codegen (15m35s)
+   Compiling hir_ty_codegen (15m50s)
+   Compiling hir_ty_codegen (16m05s)
+   Compiling hir_ty_codegen (16m20s)
+   Compiling hir_ty_codegen (16m35s)
+   Compiling hir_ty_codegen (16m50s)
+   Compiling hir_ty_codegen (17m05s)
+   Compiling hir_ty_codegen (17m21s)
+   Compiling hir_ty_codegen (17m36s)
+   Compiling hir_ty_codegen (17m51s)
+   Compiling hir_ty_codegen (18m06s)
+   Compiling hir_ty_codegen (18m21s)
+   Compiling hir_ty_codegen (18m36s)
+   Compiling hir_ty_codegen (18m51s)
+   Compiling hir_ty_codegen (19m06s)
+   Compiling hir_ty_codegen (19m21s)
+   Compiling hir_ty_codegen (19m36s)
+   Compiling hir_ty_codegen (19m51s)
+   Compiling hir_ty_codegen (20m06s)
+   Compiling hir_ty_codegen (20m21s)
+   Compiling hir_ty_codegen (20m37s)
+   Compiling hir_ty_codegen (20m52s)
+   Compiling hir_ty_codegen (21m07s)
+   Compiling hir_ty_codegen (21m22s)
+   Compiling hir_ty_codegen (21m37s)
+   Compiling hir_ty_codegen (21m52s)
+   Compiling hir_ty_codegen (22m07s)
+   Compiling hir_ty_codegen (22m22s)
+   Compiling hir_ty_codegen (22m37s)
+   Compiling hir_ty_codegen (22m52s)
+   Compiling hir_ty_codegen (23m07s)
+   Compiling hir_ty_codegen (23m22s)
+   Compiling hir_ty_codegen (23m38s)
+   Compiling hir_ty_codegen (23m53s)
+   Compiling hir_ty_codegen (24m08s)
+   Compiling hir_ty_codegen (24m23s)
+   Compiling hir_ty_codegen (24m38s)
+   Compiling hir_ty_codegen (24m53s)
+   Compiling hir_ty_codegen (25m08s)
+   Compiling hir_ty_codegen (25m23s)
+   Compiling hir_ty_codegen (25m38s)
+   Compiling hir_ty_codegen (25m53s)
+   Compiling hir_ty_codegen (26m08s)
+   Compiling hir_ty_codegen (26m23s)
+   Compiling hir_ty_codegen (26m38s)
+   Compiling hir_ty_codegen (26m54s)
+   Compiling hir_ty_codegen (27m09s)
+   Compiling hir_ty_codegen (27m24s)
+   Compiling hir_ty_codegen (27m39s)
+   Compiling hir_ty_codegen (27m54s)
+   Compiling hir_ty_codegen (28m09s)
+   Compiling hir_ty_codegen (28m24s)
+   Compiling hir_ty_codegen (28m39s)
+   Compiling hir_ty_codegen (28m54s)
+   Compiling hir_ty_codegen (29m09s)
+   Compiling hir_ty_codegen (29m24s)
+   Compiling hir_ty_codegen (29m39s)
+   Compiling hir_ty_codegen (29m55s)
+   Compiling hir_ty_codegen (30m10s)
+   Compiling hir_ty_codegen (30m25s)
+   Compiling hir_ty_codegen (30m40s)
+   Compiling hir_ty_codegen (30m55s)
+   Compiling hir_ty_codegen (31m10s)
+   Compiling hir_ty_codegen (31m25s)
+   Compiling hir_ty_codegen (31m40s)
+   Compiling hir_ty_codegen (31m55s)
+   Compiling hir_ty_codegen (32m10s)
+   Compiling hir_ty_codegen (32m25s)
+   Compiling hir_ty_codegen (32m40s)
+   Compiling hir_ty_codegen (32m55s)
+   Compiling hir_ty_codegen (33m11s)
+   Compiling hir_ty_codegen (33m26s)
+   Compiling hir_ty_codegen (33m41s)
+   Compiling hir_ty_codegen (33m56s)
+   Compiling hir_ty_codegen (34m11s)
+   Compiling hir_ty_codegen (34m26s)
+   Compiling hir_ty_codegen (34m41s)
+   Compiling hir_ty_codegen (34m56s)
+   Compiling hir_ty_codegen (35m11s)
+   Compiling hir_ty_codegen (35m26s)
+   Compiling hir_ty_codegen (35m41s)
+   Compiling hir_ty_codegen (35m56s)
+   Compiling hir_ty_codegen (36m12s)
+   Compiling hir_ty_codegen (36m27s)
+   Compiling hir_ty_codegen (36m42s)
+   Compiling hir_ty_codegen (36m57s)
+   Compiling hir_ty_codegen (37m12s)
+   Compiling hir_ty_codegen (37m27s)
+   Compiling hir_ty_codegen (37m42s)
+   Compiling hir_ty_codegen (37m57s)
+   Compiling hir_ty_codegen (38m12s)
+   Compiling hir_ty_codegen (38m27s)
+   Compiling hir_ty_codegen (38m42s)
+   Compiling hir_ty_codegen (38m57s)
+   Compiling hir_ty_codegen (39m12s)
+   Compiling hir_ty_codegen (39m28s)
+   Compiling hir_ty_codegen (39m43s)
+   Compiling hir_ty_codegen (39m58s)
+   Compiling hir_ty_codegen (40m13s)
+   Compiling hir_ty_codegen (40m28s)
+   Compiling hir_ty_codegen (40m43s)
+   Compiling hir_ty_codegen (40m58s)
+   Compiling hir_ty_codegen (41m13s)
+   Compiling hir_ty_codegen (41m28s)
+   Compiling hir_ty_codegen (41m43s)
+   Compiling hir_ty_codegen (41m58s)
+   Compiling hir_ty_codegen (42m13s)
+   Compiling hir_ty_codegen (42m29s)
+   Compiling hir_ty_codegen (42m44s)
+   Compiling hir_ty_codegen (42m59s)
+   Compiling hir_ty_codegen (43m14s)
+   Compiling hir_ty_codegen (43m29s)
+   Compiling hir_ty_codegen (43m44s)
+   Compiling hir_ty_codegen (43m59s)
+   Compiling hir_ty_codegen (44m14s)
+   Compiling hir_ty_codegen (44m29s)
+   Compiling hir_ty_codegen (44m44s)
+   Compiling hir_ty_codegen (44m59s)
+   Compiling hir_ty_codegen (45m14s)
+   Compiling hir_ty_codegen (45m29s)
+   Compiling hir_ty_codegen (45m45s)
+   Compiling hir_ty_codegen (46m00s)
+   Compiling hir_ty_codegen (46m15s)
+   Compiling hir_ty_codegen (46m30s)
+   Compiling hir_ty_codegen (46m45s)
+   Compiling hir_ty_codegen (47m00s)
+   Compiling hir_ty_codegen (47m15s)
+   Compiling hir_ty_codegen (47m30s)
+   Compiling hir_ty_codegen (47m45s)
+   Compiling hir_ty_codegen (48m00s)
+   Compiling hir_ty_codegen (48m15s)
+   Compiling hir_ty_codegen (48m30s)
+   Compiling hir_ty_codegen (48m46s)
+   Compiling hir_ty_codegen (49m01s)
+   Compiling hir_ty_codegen (49m16s)
+   Compiling hir_ty_codegen (49m31s)
+   Compiling hir_ty_codegen (49m46s)
+   Compiling hir_ty_codegen (50m01s)
+   Compiling hir_ty_codegen (50m16s)
+   Compiling hir_ty_codegen (50m31s)
+   Compiling hir_ty_codegen (50m46s)
+   Compiling hir_ty_codegen (51m01s)
+   Compiling hir_ty_codegen (51m16s)
+   Compiling hir_ty_codegen (51m31s)
+   Compiling hir_ty_codegen (51m46s)
+   Compiling hir_ty_codegen (52m02s)
+   Compiling hir_ty_codegen (52m17s)
+   Compiling hir_ty_codegen (52m32s)
+   Compiling hir_ty_codegen (52m47s)
+   Compiling hir_ty_codegen (53m02s)
+   Compiling hir_ty_codegen (53m17s)
+   Compiling hir_ty_codegen (53m32s)
+   Compiling hir_ty_codegen (53m47s)
+   Compiling hir_ty_codegen (54m02s)
+   Compiling hir_ty_codegen (54m17s)
+   Compiling hir_ty_codegen (54m32s)
+   Compiling hir_ty_codegen (54m47s)
+   Compiling hir_ty_codegen (55m03s)
+   Compiling hir_ty_codegen (55m18s)
+   Compiling hir_ty_codegen (55m33s)
+   Compiling hir_ty_codegen (55m48s)
+   Compiling hir_ty_codegen (56m03s)
+   Compiling hir_ty_codegen (56m18s)
+   Compiling hir_ty_codegen (56m33s)
+   Compiling hir_ty_codegen (56m48s)
+   Compiling hir_ty_codegen (57m03s)
+   Compiling hir_ty_codegen (57m18s)
+   Compiling hir_ty_codegen (57m33s)
+   Compiling hir_ty_codegen (57m48s)
+   Compiling hir_ty_codegen (58m03s)
+   Compiling hir_ty_codegen (58m19s)
+   Compiling hir_ty_codegen (58m34s)
+   Compiling hir_ty_codegen (58m49s)
+   Compiling hir_ty_codegen (59m04s)
+   Compiling hir_ty_codegen (59m19s)
+   Compiling hir_ty_codegen (59m34s)
+   Compiling hir_ty_codegen (59m49s)
+   Compiling hir_ty_codegen (60m04s)
+   Compiling hir_ty_codegen (60m19s)
+   Compiling hir_ty_codegen (60m34s)
+   Compiling hir_ty_codegen (60m49s)
+   Compiling hir_ty_codegen (61m04s)
+   Compiling hir_ty_codegen (61m20s)
+   Compiling hir_ty_codegen (61m35s)
+   Compiling hir_ty_codegen (61m50s)
+   Compiling hir_ty_codegen (62m05s)
+   Compiling hir_ty_codegen (62m20s)
+   Compiling hir_ty_codegen (62m35s)
+   Compiling hir_ty_codegen (62m50s)
+   Compiling hir_ty_codegen (63m05s)
+   Compiling hir_ty_codegen (63m20s)
+   Compiling hir_ty_codegen (63m35s)
+   Compiling hir_ty_codegen (63m50s)
+   Compiling hir_ty_codegen (64m05s)
+   Compiling hir_ty_codegen (64m20s)
+   Compiling hir_ty_codegen (64m36s)
+   Compiling hir_ty_codegen (64m51s)
+   Compiling hir_ty_codegen (65m06s)
+   Compiling hir_ty_codegen (65m21s)
+   Compiling hir_ty_codegen (65m36s)
+   Compiling hir_ty_codegen (65m51s)
+   Compiling hir_ty_codegen (66m06s)
+   Compiling hir_ty_codegen (66m21s)
+   Compiling hir_ty_codegen (66m36s)
+   Compiling hir_ty_codegen (66m51s)
+   Compiling hir_ty_codegen (67m06s)
+   Compiling hir_ty_codegen (67m21s)
+   Compiling hir_ty_codegen (67m37s)
+   Compiling hir_ty_codegen (67m52s)
+   Compiling hir_ty_codegen (68m07s)
+   Compiling hir_ty_codegen (68m22s)
+   Compiling hir_ty_codegen (68m37s)
+   Compiling hir_ty_codegen (68m52s)
+   Compiling hir_ty_codegen (69m07s)
+   Compiling hir_ty_codegen (69m22s)
+   Compiling hir_ty_codegen (69m37s)
+   Compiling hir_ty_codegen (69m52s)
+   Compiling hir_ty_codegen (70m07s)
+   Compiling hir_ty_codegen (70m22s)
+   Compiling hir_ty_codegen (70m37s)
+   Compiling hir_ty_codegen (70m53s)
+   Compiling hir_ty_codegen (71m08s)
+   Compiling hir_ty_codegen (71m23s)
+   Compiling hir_ty_codegen (71m38s)
+   Compiling hir_ty_codegen (71m53s)
+   Compiling hir_ty_codegen (72m08s)
+   Compiling hir_ty_codegen (72m23s)
+   Compiling hir_ty_codegen (72m38s)
+   Compiling hir_ty_codegen (72m53s)
+   Compiling hir_ty_codegen (73m08s)
+   Compiling hir_ty_codegen (73m23s)
+   Compiling hir_ty_codegen (73m38s)
+   Compiling hir_ty_codegen (73m54s)
+   Compiling hir_ty_codegen (74m09s)
+   Compiling hir_ty_codegen (74m24s)
+   Compiling hir_ty_codegen (74m39s)
+   Compiling hir_ty_codegen (74m54s)
+   Compiling hir_ty_codegen (75m09s)
+   Compiling hir_ty_codegen (75m24s)
+   Compiling hir_ty_codegen (75m39s)
+   Compiling hir_ty_codegen (75m54s)
+   Compiling hir_ty_codegen (76m09s)
+   Compiling hir_ty_codegen (76m24s)
+   Compiling hir_ty_codegen (76m39s)
+   Compiling hir_ty_codegen (76m54s)
+   Compiling hir_ty_codegen (77m10s)
+   Compiling hir_ty_codegen (77m25s)
+   Compiling hir_ty_codegen (77m40s)
+   Compiling hir_ty_codegen (77m55s)
+   Compiling hir_ty_codegen (78m10s)
+   Compiling hir_ty_codegen (78m25s)
+   Compiling hir_ty_codegen (78m40s)
+   Compiling hir_ty_codegen (78m55s)
+   Compiling hir_ty_codegen (79m10s)
+   Compiling hir_ty_codegen (79m25s)
+   Compiling hir_ty_codegen (79m40s)
+   Compiling hir_ty_codegen (79m55s)
+   Compiling hir_ty_codegen (80m11s)
+   Compiling hir_ty_codegen (80m26s)
+   Compiling hir_ty_codegen (80m41s)
+   Compiling hir_ty_codegen (80m56s)
+   Compiling hir_ty_codegen (81m11s)
+   Compiling hir_ty_codegen (81m26s)
+   Compiling hir_ty_codegen (81m41s)
+   Compiling hir_ty_codegen (81m56s)
+   Compiling hir_ty_codegen (82m11s)
+   Compiling hir_ty_codegen (82m26s)
+   Compiling hir_ty_codegen (82m41s)
+   Compiling hir_ty_codegen (82m56s)
+   Compiling hir_ty_codegen (83m11s)
+   Compiling hir_ty_codegen (83m27s)
+   Compiling hir_ty_codegen (83m42s)
+   Compiling hir_ty_codegen (83m57s)
+   Compiling hir_ty_codegen (84m12s)
+   Compiling hir_ty_codegen (84m27s)
+   Compiling hir_ty_codegen (84m42s)
+   Compiling hir_ty_codegen (84m57s)
+   Compiling hir_ty_codegen (85m12s)
+   Compiling hir_ty_codegen (85m27s)
+   Compiling hir_ty_codegen (85m42s)
+   Compiling hir_ty_codegen (85m57s)
+   Compiling hir_ty_codegen (86m12s)
+   Compiling hir_ty_codegen (86m28s)
+   Compiling hir_ty_codegen (86m43s)
+   Compiling hir_ty_codegen (86m58s)
+   Compiling hir_ty_codegen (87m13s)
+   Compiling hir_ty_codegen (87m28s)
+   Compiling hir_ty_codegen (87m43s)
+   Compiling hir_ty_codegen (87m58s)
+   Compiling hir_ty_codegen (88m13s)
+   Compiling hir_ty_codegen (88m28s)
+   Compiling hir_ty_codegen (88m43s)
+   Compiling hir_ty_codegen (88m58s)
+   Compiling hir_ty_codegen (89m13s)
+   Compiling hir_ty_codegen (89m28s)
+   Compiling hir_ty_codegen (89m44s)
+   Compiling hir_ty_codegen (89m59s)
+   Compiling hir_ty_codegen (90m14s)
+   Compiling hir_ty_codegen (90m29s)
+   Compiling hir_ty_codegen (90m44s)
+   Compiling hir_ty_codegen (90m59s)
+   Compiling hir_ty_codegen (91m14s)
+   Compiling hir_ty_codegen (91m29s)
+   Compiling hir_ty_codegen (91m44s)
+   Compiling hir_ty_codegen (91m59s)
+   Compiling hir_ty_codegen (92m14s)
+   Compiling hir_ty_codegen (92m29s)
+   Compiling hir_ty_codegen (92m45s)
+   Compiling hir_ty_codegen (93m00s)
+   Compiling hir_ty_codegen (93m15s)
+   Compiling hir_ty_codegen (93m30s)
+   Compiling hir_ty_codegen (93m45s)
+   Compiling hir_ty_codegen (94m00s)
+   Compiling hir_ty_codegen (94m15s)
+   Compiling hir_ty_codegen (94m30s)
+   Compiling hir_ty_codegen (94m45s)
+   Compiling hir_ty_codegen (95m00s)
+   Compiling hir_ty_codegen (95m15s)
+   Compiling hir_ty_codegen (95m30s)
+   Compiling hir_ty_codegen (95m45s)
+   Compiling hir_ty_codegen (96m01s)
+   Compiling hir_ty_codegen (96m16s)
+   Compiling hir_ty_codegen (96m31s)
+   Compiling hir_ty_codegen (96m46s)
+   Compiling hir_ty_codegen (97m01s)
+   Compiling hir_ty_codegen (97m16s)
+   Compiling hir_ty_codegen (97m31s)
+   Compiling hir_ty_codegen (97m46s)
+   Compiling hir_ty_codegen (98m01s)
+   Compiling hir_ty_codegen (98m16s)
+   Compiling hir_ty_codegen (98m31s)
+   Compiling hir_ty_codegen (98m46s)
+   Compiling hir_ty_codegen (99m02s)
+   Compiling hir_ty_codegen (99m17s)
+   Compiling hir_ty_codegen (99m32s)
+   Compiling hir_ty_codegen (99m47s)
+   Compiling hir_ty_codegen (100m02s)
+   Compiling hir_ty_codegen (100m17s)
+   Compiling hir_ty_codegen (100m32s)
+   Compiling hir_ty_codegen (100m47s)
+   Compiling hir_ty_codegen (101m02s)
+   Compiling hir_ty_codegen (101m17s)
+   Compiling hir_ty_codegen (101m32s)
+   Compiling hir_ty_codegen (101m47s)
+   Compiling hir_ty_codegen (102m02s)
+   Compiling hir_ty_codegen (102m18s)
+   Compiling hir_ty_codegen (102m33s)
+   Compiling hir_ty_codegen (102m48s)
+   Compiling hir_ty_codegen (103m03s)
+   Compiling hir_ty_codegen (103m18s)
+   Compiling hir_ty_codegen (103m33s)
+   Compiling hir_ty_codegen (103m48s)
+   Compiling hir_ty_codegen (104m03s)
+   Compiling hir_ty_codegen (104m18s)
+   Compiling hir_ty_codegen (104m33s)
+   Compiling hir_ty_codegen (104m48s)
+   Compiling hir_ty_codegen (105m03s)
+   Compiling hir_ty_codegen (105m19s)
+   Compiling hir_ty_codegen (105m34s)
+##[error]The action 'Run $PYTHON harness/unittests.py' has timed out after 150 minutes.
+Post job cleanup.
+Post job cleanup.
+[command]/usr/bin/git version
+git version 2.56.0
+Temporarily overriding HOME='/home/runner/work/_temp/64ab6819-d25b-4f27-abf2-c558a624b6b5' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/blaze/blaze
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+includeif.gitdir:/home/runner/work/blaze/blaze/.git.path
+includeif.gitdir:/home/runner/work/blaze/blaze/.git/worktrees/*.path
+includeif.gitdir:/github/workspace/.git.path
+includeif.gitdir:/github/workspace/.git/worktrees/*.path
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/blaze/blaze/.git.path
+/home/runner/work/_temp/git-credentials-1624f028-4a79-45a5-ad88-1e475035c2a5.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/blaze/blaze/.git.path \/home\/runner\/work\/_temp\/git\-credentials\-1624f028\-4a79\-45a5\-ad88\-1e475035c2a5\.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/blaze/blaze/.git/worktrees/*.path
+/home/runner/work/_temp/git-credentials-1624f028-4a79-45a5-ad88-1e475035c2a5.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/blaze/blaze/.git/worktrees/*.path \/home\/runner\/work\/_temp\/git\-credentials\-1624f028\-4a79\-45a5\-ad88\-1e475035c2a5\.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+/github/runner_temp/git-credentials-1624f028-4a79-45a5-ad88-1e475035c2a5.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path \/github\/runner_temp\/git\-credentials\-1624f028\-4a79\-45a5\-ad88\-1e475035c2a5\.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+/github/runner_temp/git-credentials-1624f028-4a79-45a5-ad88-1e475035c2a5.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path \/github\/runner_temp\/git\-credentials\-1624f028\-4a79\-45a5\-ad88\-1e475035c2a5\.config
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Removing credentials config '/home/runner/work/_temp/git-credentials-1624f028-4a79-45a5-ad88-1e475035c2a5.config'
+Cleaning up orphan processes
+Terminate orphan process: pid (2227) (python3)
+Terminate orphan process: pid (2228) (blaze)
+Terminate orphan process: pid (2229) (blaze-engine)
+Terminate orphan process: pid (2264) (blaze-engine)
+Terminate orphan process: pid (30244) (blaze-engine)
