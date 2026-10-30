@@ -16,17 +16,13 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+use blaze_registry::http::HttpClient;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use http_body_util::Full;
 use hyper::{
     HeaderMap, Method, Request, StatusCode,
     body::{Bytes, Incoming},
     header,
-};
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::{
-    client::legacy::{Client, connect::HttpConnector},
-    rt::TokioExecutor,
 };
 use serde_derive::Deserialize;
 use url::Url;
@@ -54,7 +50,7 @@ const SLOWEST_UPLOAD: u64 = 64 << 10;
 const REASON_MAX: usize = 300;
 
 pub struct Gateway {
-    client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    client: HttpClient<Full<Bytes>>,
     spec: Spec,
     token: Option<String>,
     patience: Duration,
@@ -291,12 +287,7 @@ impl Gateway {
         traffic: Arc<Traffic>,
     ) -> anyhow::Result<Gateway> {
         let spec = Spec::parse(spec)?;
-        let roots = HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .context("the machine's certificates cannot be read")?;
-        let connector =
-            roots.https_or_http().enable_http1().wrap_connector(super::https::connector(patience));
-        let client = Client::builder(TokioExecutor::new()).build(connector);
+        let client = HttpClient::new(Some(super::https::CONNECT_WITHIN.min(patience)))?;
         Ok(Gateway { client, spec, token, patience, traffic })
     }
 

@@ -9,17 +9,14 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+use blaze_registry::http::HttpClient;
 use http_body_util::{BodyExt, Empty};
 use hyper::{
     Method, Request, StatusCode,
     body::{Bytes, Incoming},
     header,
 };
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::{
-    client::legacy::{Client, connect::HttpConnector},
-    rt::TokioExecutor,
-};
+use hyper_util::client::legacy::connect::HttpConnector;
 use url::Url;
 
 use super::transfer::{Object, Refused, TooLong, Traffic, Version};
@@ -41,7 +38,7 @@ pub fn connector(patience: Duration) -> HttpConnector {
 }
 
 pub struct Https {
-    client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
+    client: HttpClient<Empty<Bytes>>,
     /// With no `/` at its end.
     base: String,
     patience: Duration,
@@ -50,11 +47,7 @@ pub struct Https {
 
 impl Https {
     pub fn open(spec: &Url, patience: Duration, traffic: Arc<Traffic>) -> anyhow::Result<Https> {
-        let roots = HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .context("the machine's certificates cannot be read")?;
-        let connector = roots.https_or_http().enable_http1().wrap_connector(connector(patience));
-        let client = Client::builder(TokioExecutor::new()).build(connector);
+        let client = HttpClient::new(Some(CONNECT_WITHIN.min(patience)))?;
         let base = spec.as_str().trim_end_matches('/').to_owned();
         Ok(Https { client, base, patience, traffic })
     }
@@ -144,4 +137,69 @@ pub async fn next(body: &mut Incoming) -> anyhow::Result<Option<Vec<u8>>> {
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use hyper_util::client::proxy::matcher::Matcher;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn tunnels_through_http_connect_proxy_and_honors_no_proxy() {
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await.unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\ndirect").await.unwrap();
+        });
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let (mut stream, _) = proxy.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).await.unwrap();
+            let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+            assert!(head.starts_with(&format!("CONNECT {origin_addr} HTTP/1.1\r\n")));
+            assert!(head.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
+            stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
+
+            let n = stream.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            assert!(req.starts_with("GET /packs.abc.pack HTTP/1.1\r\n"));
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nproxied").await.unwrap();
+        });
+
+        let matcher = Matcher::builder()
+            .http(format!("http://user:pass@{proxy_addr}"))
+            .no("localhost")
+            .build();
+        let client = HttpClient::with_matcher(Some(CONNECT_WITHIN), matcher).unwrap();
+        let proxied = Https {
+            client: client.clone(),
+            base: format!("http://{origin_addr}"),
+            patience: Duration::from_secs(5),
+            traffic: Arc::new(Traffic::new(1)),
+        };
+        let (bytes, _) = proxied.read_small("packs/abc.pack", 64).await.unwrap().unwrap();
+        assert_eq!(bytes, b"proxied");
+        proxy_task.await.unwrap();
+
+        let bypassed = Https {
+            client,
+            base: format!("http://localhost:{}", origin_addr.port()),
+            patience: Duration::from_secs(5),
+            traffic: Arc::new(Traffic::new(1)),
+        };
+        let (bytes, _) = bypassed.read_small("packs/abc.pack", 64).await.unwrap().unwrap();
+        assert_eq!(bytes, b"direct");
+        origin_task.await.unwrap();
+    }
 }

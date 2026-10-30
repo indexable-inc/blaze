@@ -11,6 +11,7 @@ since the release before and the title of each change merged since.
 
 ### Added
 
+- HTTP(S) downloads (`blaze toolchain`, `blaze version-fetch`, registry index and `.crate` fetches, and the remote cache gateway) honor proxy environment variables (`CARGO_HTTP_PROXY`, `HTTPS_PROXY`/`https_proxy`, `HTTP_PROXY`/`http_proxy`, `ALL_PROXY`/`all_proxy`, `NO_PROXY`/`no_proxy`) over HTTP `CONNECT`, SOCKS5/5h and SOCKS4/4a (#1495).
 - promote.yaml: OpenAI's Codex CLI (rust-v0.165.0, its codex-rs workspace) in the gate to stable; smoke.py and bench.py take a project's `dir`, the workspace's place in its checkout.
 - `blaze build` writes a library's `staticlib` (dynamo's C API, #964): built as its `cdylib`
   would be, checked by linking that beside it, and archived with the standard library's object
