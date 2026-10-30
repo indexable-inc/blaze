@@ -200,6 +200,23 @@ impl Pushed {
     /// (in the order of their text) can call something by a name bound to another thing now: it
     /// names a method added or taken away, or a name bound differently in a crate's root, in
     /// one of `modules`, or in a module it names.
+    /// Which of [`Self::rebinds`]'s reasons holds of code first, for what the stats say.
+    fn rebinds_by(&self, modules: &[ModuleId], names: &[Symbol]) -> &'static str {
+        let named = |it: &Symbol| names.binary_search_by(|n| n.as_str().cmp(it.as_str())).is_ok();
+        let bounds = || names.iter().filter_map(|it| self.bound.get(it)).flatten();
+        if names.iter().any(|it| self.methods.contains(it)) {
+            "a method"
+        } else if bounds().any(|it| modules.contains(&it.module)) {
+            "its module"
+        } else if bounds().any(|it| it.name.as_ref().is_some_and(named)) {
+            "a module it names"
+        } else if bounds().any(|it| it.root) {
+            "a root"
+        } else {
+            "none"
+        }
+    }
+
     pub fn rebinds(&self, modules: &[ModuleId], names: &[Symbol]) -> bool {
         let named = |it: &Symbol| names.binary_search_by(|n| n.as_str().cmp(it.as_str())).is_ok();
         names.iter().any(|name| {
@@ -836,6 +853,22 @@ impl Index {
         again.sort_unstable_by_key(|it| format!("{it:?}"));
         again.dedup();
         let again_len = again.len();
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            let mut by: FxHashMap<&str, usize> = FxHashMap::default();
+            for it in again.iter().filter_map(|it| self.entries.get(it)) {
+                *by.entry(pushed.rebinds_by(&it.modules, &it.names)).or_default() += 1;
+            }
+            let mut names: FxHashMap<&str, usize> = FxHashMap::default();
+            for it in again.iter().filter_map(|it| self.entries.get(it)) {
+                for name in it.names.iter().filter(|it| pushed.bound.contains_key(*it)) {
+                    *names.entry(name.as_str()).or_default() += 1;
+                }
+            }
+            let mut names: Vec<_> = names.into_iter().collect();
+            names.sort_unstable_by_key(|it| std::cmp::Reverse(it.1));
+            names.truncate(12);
+            eprintln!("items-again: {by:?}; most named {names:?}");
+        }
         let again_entries = entries_of(db, fan, &again);
         self.parts.push(("again", start.elapsed()));
         for (id, entry) in again.into_iter().zip(again_entries) {
