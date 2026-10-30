@@ -1421,6 +1421,10 @@ fn library_in(dir: &Path) -> Vec<PathBuf> {
 }
 
 impl SymbolResolver for Resolver<'_> {
+    fn named_dependencies(&self, krate: ide_db::base_db::Crate) -> Vec<ide_db::base_db::Crate> {
+        self.listed.named(self.db, krate.into()).iter().map(|&it| it.into()).collect()
+    }
+
     fn in_parallel_beside(&self, count: usize, work: &ParallelWork<'_>, beside: &mut dyn FnMut()) {
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(count);
         // One alone is as soon done by whoever asks for what it computes.
@@ -3815,6 +3819,8 @@ struct Listed {
     built: std::sync::Mutex<FxHashSet<Crate>>,
     /// What [`Listed::in_files`] found written in a file, by its [`outline::skeleton`] then.
     files: std::sync::Mutex<FxHashMap<vfs::FileId, (u64, Vec<FunctionId>)>>,
+    /// What [`hir::named_dependencies`] found of each crate asked about.
+    named: std::sync::Mutex<FxHashMap<Crate, Arc<[Crate]>>>,
 }
 
 struct ListedCrate {
@@ -4238,34 +4244,40 @@ impl Listed {
             let functions = lock(&self.functions);
             crates.iter().copied().filter(|it| !functions.contains_key(it)).collect()
         };
-        if unlisted.len() < 2 {
-            for krate in unlisted {
-                self.of(db, krate);
-            }
-            return;
-        }
-        let crates = &unlisted[..];
-        let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|scope| {
-            let parts: Vec<_> = (0..threads.min(crates.len()))
-                .map(|_| {
-                    let (db, next) = (db.clone(), &next);
-                    scope.spawn(move || {
-                        hir::attach_db(&db, || {
-                            let at = || next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            while let Some(&krate) = crates.get(at()) {
-                                self.of(&db, krate);
-                            }
-                        })
-                    })
-                })
-                .collect();
-            // A query that is cancelled unwinds, and goes on unwinding here as what it is.
-            for part in parts {
-                part.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
-            }
+        on_every_core(db, &unlisted, |db, krate| {
+            self.of(db, krate);
         });
+    }
+
+    /// The dependencies `krate` names ([`hir::named_dependencies`]), found once.
+    fn named(&self, db: &RootDatabase, krate: Crate) -> Arc<[Crate]> {
+        if let Some(named) = lock(&self.named).get(&krate) {
+            return named.clone();
+        }
+        let named: Arc<[Crate]> = hir::named_dependencies(db, krate).into();
+        lock(&self.named).entry(krate).or_insert(named).clone()
+    }
+
+    /// The crates a program of `crates` links, themselves and all, as rustc loads them: what
+    /// their code names, and what that names in turn, but not through the standard library's
+    /// crates, which are built apart, nor through a proc macro, a library of the compiler's.
+    /// Read a level of the graph at a time, on every core.
+    fn program(&self, db: &RootDatabase, crates: &[Crate]) -> FxHashSet<Crate> {
+        let mut program: FxHashSet<Crate> = crates.iter().copied().collect();
+        let mut level: Vec<Crate> = crates.to_vec();
+        while !level.is_empty() {
+            on_every_core(db, &level, |db, krate| {
+                self.named(db, krate);
+            });
+            let named: Vec<Crate> =
+                level.iter().flat_map(|&it| self.named(db, it).to_vec()).collect();
+            let linked = |it: &Crate| {
+                let data = ide_db::base_db::Crate::from(*it).data(db);
+                !data.origin.is_lang() && !data.target_kind.is_proc_macro()
+            };
+            level = named.into_iter().filter(linked).filter(|&it| program.insert(it)).collect();
+        }
+        program
     }
 
     /// Notes that a build of `crates` began: the files they read are a program's before the
@@ -4279,6 +4291,7 @@ impl Listed {
         lock(&self.files).clear();
         let Some(crates) = crates else {
             lock(&self.functions).clear();
+            lock(&self.named).clear();
             return;
         };
         // Asked before the lock is taken: a query that is cancelled unwinds, and would poison it.
@@ -4286,11 +4299,43 @@ impl Listed {
             .iter()
             .flat_map(|krate| krate.transitive_rev_deps(db).into_iter().map(Crate::from))
             .collect();
-        let mut functions = lock(&self.functions);
+        let (mut functions, mut named) = (lock(&self.functions), lock(&self.named));
         for krate in seeing {
             functions.remove(&krate);
+            named.remove(&krate);
         }
     }
+}
+
+/// Runs `each` of `crates` on every core, a crate to a thread at a time.
+fn on_every_core(db: &RootDatabase, crates: &[Crate], each: impl Fn(&RootDatabase, Crate) + Sync) {
+    if crates.len() < 2 {
+        for &krate in crates {
+            each(db, krate);
+        }
+        return;
+    }
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let parts: Vec<_> = (0..threads.min(crates.len()))
+            .map(|_| {
+                let (db, next, each) = (db.clone(), &next, &each);
+                scope.spawn(move || {
+                    hir::attach_db(&db, || {
+                        let at = || next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        while let Some(&krate) = crates.get(at()) {
+                            each(&db, krate);
+                        }
+                    })
+                })
+            })
+            .collect();
+        // A query that is cancelled unwinds, and goes on unwinding here as what it is.
+        for part in parts {
+            part.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+        }
+    });
 }
 
 fn declared_in(db: &RootDatabase, krate: Crate) -> Declared {
@@ -4998,16 +5043,7 @@ fn link_executable(
             if data.target_kind.is_proc_macro() {
                 continue;
             }
-            crates.extend(
-                ide_db::base_db::Crate::from(krate)
-                    .transitive_deps(db)
-                    .into_iter()
-                    .filter(|it| {
-                        let data = it.data(db);
-                        !data.origin.is_lang() && !data.target_kind.is_proc_macro()
-                    })
-                    .map(Crate::from),
-            );
+            crates.extend(listed.program(db, &[krate]));
         }
         for krate in crates {
             let of = listed.of(db, krate);
@@ -5264,11 +5300,8 @@ fn build(
     if table.is_empty() {
         let asked: FxHashSet<Crate> = local.iter().copied().collect();
         let tested = tests_linked(db, &local, of_tests(args));
-        let own: FxHashSet<ide_db::base_db::Crate> = local
-            .iter()
-            .flat_map(|&it| ide_db::base_db::Crate::from(it).transitive_deps(db))
-            .filter(|it| !it.data(db).origin.is_lang())
-            .collect();
+        let own: FxHashSet<ide_db::base_db::Crate> =
+            listed.program(db, &local).into_iter().map(ide_db::base_db::Crate::from).collect();
         let macros = macros_linked(db, &local, &own);
         let linked: FxHashSet<Crate> = own
             .into_iter()
@@ -11768,6 +11801,58 @@ fn main() {}
             assert_eq!(crates_of(&within(&[example]), shared), [example]);
             assert_eq!(crates_of(&within(&[app]), shared), [app]);
             assert_eq!(crates_of(&within(&[example]), main), [app]);
+        });
+    }
+
+    /// A crate names the dependencies its paths look up in the extern prelude, at the level of
+    /// items, in bodies and in what macros expand to, and those it names with `extern crate`:
+    /// not one a false `#[cfg]` leaves out, a local of the same name, or one never written.
+    #[test]
+    fn a_crate_names_the_dependencies_rustc_loads_for_it() {
+        use test_fixture::WithFixture;
+        let (db, files) = RootDatabase::with_many_files(
+            r#"
+//- /main.rs crate:main deps:imported,called,externed,mac,expanded,tokens,cfgd,value,unused
+use imported::Item;
+extern crate externed;
+#[cfg(any())]
+use cfgd as _;
+mac::make!();
+macro_rules! local {
+    () => { tokens::T };
+}
+fn f() -> u32 {
+    let value = called::g();
+    value
+}
+//- /imported.rs crate:imported
+pub struct Item;
+//- /called.rs crate:called
+pub fn g() -> u32 { 0 }
+//- /externed.rs crate:externed
+//- /mac.rs crate:mac
+#[macro_export]
+macro_rules! make {
+    () => { pub use expanded::E; };
+}
+//- /expanded.rs crate:expanded
+pub struct E;
+//- /tokens.rs crate:tokens
+//- /cfgd.rs crate:cfgd
+//- /value.rs crate:value
+//- /unused.rs crate:unused
+"#,
+        );
+        let main = files[0].file_id(&db);
+        hir::attach_db(&db, || {
+            let sema = hir::Semantics::new(&db);
+            let krate = sema.file_to_module_def(main).unwrap().krate(&db);
+            let mut named: Vec<String> = hir::named_dependencies(&db, krate)
+                .into_iter()
+                .map(|it| it.display_name(&db).unwrap().to_string())
+                .collect();
+            named.sort();
+            assert_eq!(named, ["called", "expanded", "externed", "imported", "mac", "tokens"]);
         });
     }
 

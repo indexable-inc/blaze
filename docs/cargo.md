@@ -120,11 +120,15 @@ nothing for more than 1.5 s.
 ## What a build does
 
 blaze never runs rustc, and a build has one path ([no-rustc.md](no-rustc.md)). `build` and
-`run` build each program the build asks for whole: every crate it depends on is compiled by
-blaze over the shipped standard library and linked by blaze, and the executable is put where
+`run` build each program the build asks for whole: every crate it links is compiled by blaze
+over the shipped standard library and linked by blaze, and the executable is put where
 cargo puts it (`target/debug/<name>`, `target/release/<name>`, `examples/` for an example).
-No `cargo build` runs. A function the program can reach that blaze cannot compile fails the
-build, which says which and why; nothing is handed to cargo or rustc:
+No `cargo build` runs. The crates a program links are those rustc loads for it: the ones its
+code names (a path looked up in the extern prelude, or `extern crate`), and what those name in
+turn. A dependency the manifest lists but no code names is not linked, nor its constructors,
+`#[used]` statics or `#[global_allocator]`, as under rustc. A function the program can reach
+that blaze cannot compile fails the build, which says which and why; nothing is handed to cargo
+or rustc:
 
        Compiling kapp v0.3.1 (/src/k/app)
         Finished `dev` profile [blaze] target(s) in 18.40s

@@ -97,6 +97,8 @@ HARNESSES = [
     ("core", ["coldbuild.py", "statics"], {}, on("macos"), None),
     # std's own writable statics (`thread_local!`s, `MIN`), from a unit built on another machine (#840).
     ("core", ["stdstatics.py"], {}, on("linux", "macos"), 2),
+    # A dependency no code names is not linked, its constructors with it, as rustc does not load it.
+    ("core", ["unnamedcrates.py"], {}, on("linux", "macos"), None),
     ("core", ["splices.py"], {}, EVERYWHERE, 2),
     ("core", ["live_e2e.py"], {}, on("linux-x86_64"), 1),
     # A type added beside another, the code moved to it and the old one deleted, each a patch.
