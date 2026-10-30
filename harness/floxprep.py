@@ -16,9 +16,10 @@ comes from cache.nixos.org or cache.flox.dev. Not taken: crane's prebuilt depend
 cargo hooks, flox's own Rust toolchain (blaze builds with its own), and the `RUSTFLAGS` flox's
 x86-64 Linux build gives rustc's linker. It returns the checkout and that environment.
 
-The checkout is changed in one way: `factory-api-v1`'s build script writes its OpenAPI client
-into its own `src/client.rs`, which a sandboxed script may not, so the workspace's manifest
-takes it out of the sandbox as docs/cargo.md says a user does (`unsandboxed-build-scripts`).
+The checkout is changed in one way: the build scripts of `factory-api-v1` and `catalog-api-v1`
+write their OpenAPI clients into their own `src/client.rs`, which a sandboxed script may not, so
+the workspace's manifest takes them out of the sandbox as docs/cargo.md says a user does
+(`unsandboxed-build-scripts`).
 The flake is read at the checkout's commit, so that change is not part of what Nix evaluates.
 """
 import json, os, shlex, subprocess, sys
@@ -47,8 +48,8 @@ IGNORED = {"BASHOPTS", "HOME", "NIX_BUILD_TOP", "NIX_ENFORCE_PURITY", "NIX_LOG_F
            "SHELL", "SHELLOPTS", "SSL_CERT_FILE", "NIX_SSL_CERT_FILE", "TEMP", "TEMPDIR", "TERM", "TMP",
            "TMPDIR", "TZ", "UID"}
 
-# What the workspace's manifest is given: the script that writes into its own source.
-OUTSIDE = '\n[workspace.metadata.blaze.sandbox]\nunsandboxed-build-scripts = ["factory-api-v1"]\n'
+# What the workspace's manifest is given: the scripts that write into their own source.
+OUTSIDE = '\n[workspace.metadata.blaze.sandbox]\nunsandboxed-build-scripts = ["factory-api-v1", "catalog-api-v1"]\n'
 
 
 def prepare(checkout):
@@ -69,7 +70,10 @@ def prepare(checkout):
     manifest = os.path.join(checkout, "Cargo.toml")
     with open(manifest) as f:
         text = f.read()
-    if "[workspace.metadata.blaze.sandbox]" not in text:
+    if OUTSIDE not in text:
+        if "[workspace.metadata.blaze.sandbox]" in text:
+            raise SystemExit(f"floxprep: {manifest} has a [workspace.metadata.blaze.sandbox] that is not "
+                             f"floxprep's: clone it again")
         with open(manifest, "a") as f:
             f.write(OUTSIDE)
     return checkout, env

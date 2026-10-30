@@ -237,9 +237,11 @@ PROJECTS = {
         test=["-p", "util"],
     ),
     # A browser engine. SpiderMonkey comes as mozjs's prebuilt archive; `--version` is answered
-    # before anything opens a window.
+    # before anything opens a window. servoprep.py takes stylo's build script out of the
+    # sandbox: it writes into the target directory. Measured only when named.
     "servo": dict(
         repo="servo/servo", tag="v0.7.0", rev="aac43a3f31a259f04a574f5ec4e959c943ad7cc7",
+        prepare="servoprep",
         build=["-p", "servoshell", "--bin", "servoshell"], run=["--version"],
         edits=dict(
             body=body("ports/servoshell/main.rs", "fn main() {"),
