@@ -102,6 +102,14 @@ is `blaze build`. In a flake, take the package from the input:
 
 Nix compiles blaze from source; there is no binary cache yet.
 
+## With MacPorts
+
+```sh
+sudo port install blaze
+```
+
+This fetches the blaze source and compiles locally without having to configure anything else on Apple Silicon Macs.
+
 ## The old names
 
 blaze had another name and another command before 2026-10-28, and no longer answers to either:
