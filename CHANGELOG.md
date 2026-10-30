@@ -31,6 +31,7 @@ since the release before and the title of each change merged since.
 
 ### Fixed
 
+- A future polled again after it panicked panics with "`async fn` resumed after panicking", and one polled after it returned with "`async fn` resumed after completion", as rustc's do. ra-jit marked a future as panicked only where the call that unwound had something to clean up, so one that panicked with nothing in scope resumed at its last await, ran that code again and freed what it had freed already; one polled after it returned trapped.
 - The gate to stable builds bun, flox and servo as a user of blaze's sandbox would: bunprep.py names `BUN_CODEGEN_DIR` and `BUN_NATIVE_LINK_ARGS` in `build-script-env` (bun_core's and bun-exe's scripts saw them unset), floxprep.py takes `catalog-api-v1`'s script out of the sandbox beside `factory-api-v1`'s (it writes its OpenAPI client into `src/`), and the new servoprep.py takes stylo's out (it writes its documentation into the target directory). Canary v0.20261029.7's gate failed each of the three at these (#1549).
 - Windows: a `raw-dylib` named with `+verbatim` imports from the DLL as it is written, as rustc does: `ort-sys`'s `#[link(name = "SHELL32.DLL", kind = "raw-dylib", modifiers = "+verbatim")]` imported from `SHELL32.DLL.dll`, and its build script stopped with 0xc0000135 (DLL not found).
 

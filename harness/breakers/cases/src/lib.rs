@@ -23,6 +23,8 @@ cases![
     future_size,
     await_left_in_generic,
     future_states,
+    future_polled_after_panic,
+    future_polled_after_return,
     macro_item_location,
     clmul,
     crc_ternlog,

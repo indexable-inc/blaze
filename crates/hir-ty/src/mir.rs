@@ -1402,6 +1402,9 @@ pub struct CoroutineLocals {
     /// The `Poll` that `Return` and `Yield` hand to the caller of `poll`.
     pub poll: LocalId,
     pub context: LocalId,
+    /// rustc's span of the body: the `async` block, or the block an `async fn` or closure is
+    /// written with. A future polled after it ended panics there.
+    pub span: MirSpan,
 }
 
 /// A walk over every place a body mentions, as `walk_places` (each place can be changed) or

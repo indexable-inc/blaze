@@ -4910,6 +4910,7 @@ fn build<'db>(
         inner_pad: None,
         unwind_to: None,
         pads: Vec::new(),
+        poison: None,
         exception: None,
         argument_slots: Vec::new(),
         free_argument_slots: Vec::new(),
@@ -8087,6 +8088,9 @@ struct FunctionCx<'cx, 'db> {
     unwind_to: Option<BasicBlockId>,
     /// The landing pad of each cleanup block something unwinds to.
     pads: Vec<(BasicBlockId, ir::Block)>,
+    /// In an `async` body: the landing pad of what unwinds with nothing to clean up, which
+    /// marks the body as panicked.
+    poison: Option<ir::Block>,
     /// Where the exception is kept while the cleanup blocks run.
     exception: Option<ir::StackSlot>,
     /// The slots the arguments of the calls so far were copied to since the last were
@@ -10251,7 +10255,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         self.in_cleanup = false;
         self.unwind_to = None;
-        self.emit_pads();
+        self.emit_pads()?;
         Ok(())
     }
 
@@ -18116,7 +18120,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(())
     }
 
-    /// The block that cleans up after a call that unwinds, if there is anything to clean up.
+    /// The block a call unwinds to: the one that cleans up after it, or in an `async` body
+    /// with nothing to clean up the one that marks the body as panicked. None when unwinding
+    /// just goes on.
     fn landing_pad_for_call(&mut self) -> Option<ir::Block> {
         if self.in_cleanup || self.aborts {
             return None;
@@ -18124,7 +18130,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if self.inner_pad.is_some() {
             return self.inner_pad;
         }
-        let target = self.unwind_to?;
+        let Some(target) = self.unwind_to else {
+            // rustc's coroutine transform has every call that unwinds out of an `async` body
+            // unwind to a block that poisons it, so that polling it again panics.
+            self.suspended.as_ref()?;
+            return Some(*self.poison.get_or_insert_with(|| {
+                let pad = self.builder.create_block();
+                self.builder.append_block_param(pad, ptr());
+                self.builder.set_cold_block(pad);
+                pad
+            }));
+        };
         if let Some(&(_, pad)) = self.pads.iter().find(|(it, _)| *it == target) {
             return Some(pad);
         }
@@ -18188,7 +18204,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// Fills in the landing pads of a body in `MirPhase::Runtime`: each keeps the exception
     /// and goes on to its cleanup block, which ends in `UnwindResume`.
-    fn emit_pads(&mut self) {
+    fn emit_pads(&mut self) -> Result<()> {
         for (target, pad) in std::mem::take(&mut self.pads) {
             self.builder.switch_to_block(pad);
             let exception = self.builder.block_params(pad)[0];
@@ -18196,6 +18212,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.builder.ins().stack_store(ptr(), exception, slot, 0);
             self.builder.ins().jump(self.blocks[target], &[]);
         }
+        if let (Some(pad), Some(state)) = (self.poison.take(), &self.suspended) {
+            let (addr, ty) = (state.addr, state.ty);
+            self.builder.switch_to_block(pad);
+            let exception = self.builder.block_params(pad)[0];
+            self.store_state(addr, ty, PANICKED);
+            self.resume_unwinding(exception)?;
+        }
+        Ok(())
     }
 
     fn exception_slot(&mut self) -> ir::StackSlot {
@@ -18239,7 +18263,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         ty: Ty<'db>,
         layout: &Layout,
     ) -> Result<()> {
-        let Some(hir_ty_mir::mir::CoroutineLocals { context, .. }) = body.coroutine else {
+        let Some(hir_ty_mir::mir::CoroutineLocals { context, span, .. }) = body.coroutine else {
             unsupported!("async body without a context");
         };
         let context = self.builder.ins().load(ptr(), MEM, self.locals[context].addr, 0);
@@ -18259,9 +18283,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             switch.set_entry(SUSPENDED as u128 + index as u128, self.blocks[point.resume]);
         }
         switch.emit(&mut self.builder, at, finished);
-        // FIXME: rustc panics with "`async fn` resumed after completion".
         self.builder.switch_to_block(finished);
-        self.builder.ins().trap(TrapCode::user(3).expect("non-zero trap code"));
+        self.resumed_after_end(span, at)?;
 
         let (unresumed, done) = (self.builder.create_block(), self.builder.create_block());
         // Dropping is laid out behind the body, so that the code a function begins with is
@@ -18295,6 +18318,26 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.in_cleanup = false;
         self.builder.switch_to_block(done);
         self.return_()
+    }
+
+    /// Polling a future again after it returned or panicked panics at its body, as rustc's
+    /// coroutine transform has it. `state` is one of the two: the others resume the body.
+    fn resumed_after_end(&mut self, span: MirSpan, state: Value) -> Result<()> {
+        self.at(span);
+        let (returned, panicked) = (self.builder.create_block(), self.builder.create_block());
+        let ended = self.builder.ins().icmp_imm(IntCC::Equal, state, RETURNED);
+        self.builder.ins().brif(ended, returned, &[], panicked, &[]);
+        for (block, name) in [
+            (returned, "panic_const_async_fn_resumed"),
+            (panicked, "panic_const_async_fn_resumed_panic"),
+        ] {
+            self.builder.set_cold_block(block);
+            self.builder.switch_to_block(block);
+            let location = self.caller_location()?;
+            self.call_panic(&["panicking", "panic_const", name], &[location])?;
+            self.builder.ins().trap(TrapCode::user(1).expect("non-zero trap code"));
+        }
+        Ok(())
     }
 
     /// Where the body is written to end, which is where rustc has an `async` block dropped.
