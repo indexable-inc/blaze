@@ -100,7 +100,8 @@ fn escaping(func: &ir::Function) -> rustc_hash::FxHashSet<ir::StackSlot> {
             };
             if !followed {
                 escaping.extend(
-                    dfg.inst_values(inst).filter_map(|it| of.get(&dfg.resolve_aliases(it)).copied()),
+                    dfg.inst_values(inst)
+                        .filter_map(|it| of.get(&dfg.resolve_aliases(it)).copied()),
                 );
             }
         }
