@@ -2215,10 +2215,11 @@ fn exited(child: &mut Child) -> Option<String> {
 fn last_words(log: &Path) -> String {
     let log = std::fs::read_to_string(log).unwrap_or_default();
     let lines: Vec<&str> = log.lines().collect();
-    if let Some(at) = lines.iter().rposition(|it| it.contains(" panicked at ")) {
-        // `thread '…' panicked at <place>:`, and the message on the line after it.
-        let place = lines[at].split_once(" panicked at ").map_or(lines[at], |it| it.1);
-        let message = lines.get(at + 1).copied().unwrap_or_default();
+    if let Some(panic) = last_panic(&log) {
+        // `thread '…' panicked at <place>:`, and the message on the lines after it.
+        let (first, message) = panic.split_once('\n').unwrap_or((panic, ""));
+        let place = first.split_once(" panicked at ").map_or(first, |it| it.1);
+        let message = message.lines().map(str::trim).collect::<Vec<_>>().join("; ");
         return format!("panicked at {place} {message}");
     }
     match last_error(&log) {
@@ -2227,6 +2228,32 @@ fn last_words(log: &Path) -> String {
         }
         None => lines.last().copied().unwrap_or("no output").to_owned(),
     }
+}
+
+/// The last panic of a thread that `said`, a process's stderr, has: `thread '…' panicked at
+/// <place>:` and its message, up to a blank line or the note on backtraces. Not the panic
+/// `std::thread::scope` then raises, which says only that a thread panicked, unless it is the
+/// only one; the last, as one a compile caught was printed before it all the same.
+pub fn last_panic(said: &str) -> Option<&str> {
+    const SCOPE: &str = "a scoped thread panicked";
+    let panics = said.match_indices("thread '").filter_map(|(at, _)| {
+        let starts = at == 0 || said.as_bytes()[at - 1] == b'\n';
+        let rest = &said[at..];
+        (starts && rest.lines().next()?.contains("' panicked at ")).then_some(rest)
+    });
+    let panics = panics.map(|rest| {
+        let mut end = 0;
+        for (n, line) in rest.split_inclusive('\n').enumerate() {
+            let next = n > 0 && line.starts_with("thread '");
+            if next || line.trim().is_empty() || line.starts_with("note: ") {
+                break;
+            }
+            end += line.len();
+        }
+        rest[..end].trim_end()
+    });
+    let (own, scope): (Vec<_>, Vec<_>) = panics.partition(|it| !it.ends_with(SCOPE));
+    own.last().or(scope.last()).copied()
 }
 
 /// The last error a worker's log has, with what caused it, each cause on a line of its own:
@@ -2496,6 +2523,30 @@ mod tests {
             "two lines:\n  first\nwhy"
         );
         assert_eq!(last_error("nothing wrong\n"), None);
+    }
+
+    /// The gate's dynamo jobs said only the scope's panic or the note on backtraces, of a
+    /// build whose cause was the panic of a thread it had spawned.
+    #[test]
+    fn the_panic_said_is_the_threads_not_the_scopes() {
+        let said = "   Compiling pear_codegen\n\
+                    thread 'w1' panicked at crates/a.rs:1:2:\ncaught, compiled again\n\
+                    thread 'w2' panicked at crates/hir-ty-codegen/mod.rs:10:5:\n\
+                    no layout for `T`\nof `pear_codegen::parse`\n\
+                    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\
+                    thread 'main' panicked at crates/b.rs:3:4:\na scoped thread panicked\n";
+        assert_eq!(
+            last_panic(said).unwrap(),
+            "thread 'w2' panicked at crates/hir-ty-codegen/mod.rs:10:5:\n\
+             no layout for `T`\nof `pear_codegen::parse`"
+        );
+        let scope = "thread 'main' panicked at b.rs:3:4:\na scoped thread panicked\n\nnote: x\n";
+        assert_eq!(
+            last_panic(scope).unwrap(),
+            "thread 'main' panicked at b.rs:3:4:\na scoped thread panicked"
+        );
+        assert_eq!(last_panic("a thread 'x' panicked at y\n"), None);
+        assert_eq!(last_panic("Error: no `foo`\n"), None);
     }
 
     /// A build that waits for its workspace to load is answered with how the load ended, also
