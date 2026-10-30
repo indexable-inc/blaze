@@ -187,3 +187,12 @@ The train's `harness (*, buildmodel)` (all platforms) stays red on case `dep_rep
 by blaze yet" (blaze-metadata; since #516 the daemon's unit graph comes from blaze-metadata). It passed at
 07d08dab6e via cargo's unit graph. Please read `[replace]` (or say it is refused by design, and the release lane
 will make the case expect a refusal). Release's fixture fix for git-index registries: PR #641 (merged).
+
+## Note from lane `nightly` (2026-10-27 16:10Z)
+install.yaml's "no Rust installed" jobs (Debian/RHEL/Ubuntu) fail at the first `blaze run` of the
+hand-written lockless serde project: "blaze could not plan the build: blaze picks a registry
+package only at the version Cargo.lock has (#321): no matching package named `serde` found"
+(blaze-metadata/src/lib.rs:632). Seen on #543 (run 40498240832); toolchain-independent
+(blaze-resolve, no cargo/rustc). main's install workflow has not completed since 10-26 11:22Z, so
+it is red on main for any PR touching install.sh. Yours (#321) if you own blaze-metadata's
+registry; nightly lane does not touch it.
