@@ -2541,6 +2541,7 @@ mod tests {
             sources: Vec::new(),
             env: BTreeMap::new(),
             scripts: None,
+            profile: None,
         };
         let said = crate::errors::Said(Vec::new());
         for round in 0..200u32 {
