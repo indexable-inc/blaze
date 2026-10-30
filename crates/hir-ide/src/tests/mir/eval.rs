@@ -1079,30 +1079,78 @@ fn main() {
     );
 }
 
-#[test]
-fn syscalls() {
-    check_pass(
+fn getrandom_syscall(arch: &str, number: i64) -> String {
+    format!(
         r#"
 //- minicore: option
+//- /main.rs cfg:target_arch={arch}
 
+extern "C" {{
+    pub unsafe extern "C" fn syscall(num: i64, ...) -> i64;
+}}
+
+const SYS_getrandom: i64 = {number};
+
+fn should_not_reach() {{
+    _ // FIXME: replace this function with panic when that works
+}}
+
+fn main() {{
+    let mut x: i32 = 0;
+    let r = syscall(SYS_getrandom, &mut x, 4usize, 0);
+    if r != 4 {{
+        should_not_reach();
+    }}
+}}
+"#
+    )
+}
+
+#[test]
+fn syscalls() {
+    check_pass(&getrandom_syscall("x86_64", 318));
+    check_pass(&getrandom_syscall("aarch64", 278));
+}
+
+#[test]
+fn syscall_numbers_are_the_targets() {
+    check_error_with(&getrandom_syscall("aarch64", 318), |e| {
+        matches!(e, MirEvalError::NotSupported(s) if s.contains("syscall id 318"))
+    });
+    check_error_with(
+        r#"
+//- minicore: option
 extern "C" {
     pub unsafe extern "C" fn syscall(num: i64, ...) -> i64;
 }
+fn main() {
+    let mut x: i32 = 0;
+    syscall(318, &mut x, 4usize, 0);
+}
+"#,
+        |e| matches!(e, MirEvalError::InternalError(s) if s.contains("target_arch")),
+    );
+}
 
-const SYS_getrandom: i64 = 318;
+#[test]
+fn cc_random_generate_bytes() {
+    check_pass(
+        r#"
+//- minicore: option
+extern "C" {
+    fn CCRandomGenerateBytes(bytes: *mut u8, count: usize) -> i32;
+}
 
 fn should_not_reach() {
     _ // FIXME: replace this function with panic when that works
 }
 
 fn main() {
-    let mut x: i32 = 0;
-    let r = syscall(SYS_getrandom, &mut x, 4usize, 0);
-    if r != 4 {
+    let mut x = [0u8; 16];
+    if unsafe { CCRandomGenerateBytes(&mut x as *mut [u8; 16] as *mut u8, 16) } != 0 {
         should_not_reach();
     }
 }
-
 "#,
     )
 }
