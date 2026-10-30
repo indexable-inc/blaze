@@ -417,6 +417,14 @@ fn sections_written(data: &[u8]) -> Vec<bool> {
     written
 }
 
+/// The functions of ra-jit's a `#[global_allocator]` of the crate's is called through.
+const ALLOCATOR_FUNCTIONS: &[&str] = &[
+    "__ra_jit_global_alloc",
+    "__ra_jit_global_dealloc",
+    "__ra_jit_global_realloc",
+    "__ra_jit_global_alloc_zeroed",
+];
+
 /// As [`definitions`], for an object of ra-jit's. Of a program's whole, with a C `main` of
 /// ra-jit's, that `main` and the functions a stand-in's allocator calls stay as they are: the
 /// stand-ins rustc built have weak ones for cargo's link of them, and of two weak ones Apple's
@@ -431,7 +439,7 @@ pub(crate) fn ours(data: &mut [u8]) {
     weaken_but(data, |name| {
         let name = name.strip_prefix(b"_").unwrap_or(name);
         let stays = name == b"main"
-            || crate::stub::ALLOCATOR_FUNCTIONS.iter().any(|it| it.as_bytes() == name);
+            || ALLOCATOR_FUNCTIONS.iter().any(|it| it.as_bytes() == name);
         match () {
             _ if has_main && stays => Made::Kept,
             _ if of_rust(name) => Made::Private,

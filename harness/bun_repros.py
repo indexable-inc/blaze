@@ -51,25 +51,21 @@ CASES = {
         "expected": "compiled",
         "reasons": (),
     },
-    # Every crate ra-jit's, as in bun's whole-program link: no rustc copy defines the statics.
     "exported_statics": {
         "package": "runner",
         "crate": "runner,exported_statics",
-        "alone": True,
         "expected": "compiled",
         "reasons": (),
     },
     "same_name": {
         "package": "runner",
         "crate": "runner,same_name",
-        "alone": True,
         "expected": "compiled",
         "reasons": (),
     },
     "unreached_externs": {
         "package": "runner",
         "crate": "runner,unreached_externs",
-        "alone": True,
         "cargo_args": ["--release"],
         # Without difftest's `-C link-dead-code`, as runbench builds bun: rustc's link takes
         # out what nothing reaches, and so does the link of ra-jit's object.
@@ -175,9 +171,6 @@ def build_case(name, case, workspace, json_path):
     fx = Fixture(workspace, [case["crate"]], ["-p", case["package"], *case.get("cargo_args", ())])
     fx.rustc_build()
     expected = fx.behaviour(fx.reference)
-    if case.get("alone"):
-        fx.alone = True
-        fx.rustc_build()
     fx.ra_jit_build()
     actual = fx.behaviour(fx.binary)
     rows = rows_for(fx)

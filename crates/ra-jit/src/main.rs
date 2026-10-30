@@ -29,7 +29,6 @@ mod shipped;
 mod socket;
 mod splice;
 mod splicer;
-mod stub;
 mod symbols;
 mod test_harness;
 mod tier;
@@ -7282,12 +7281,10 @@ fn main() -> anyhow::Result<()> {
     }
     syntax::set_green_trees(std::env::var_os("RA_JIT_GREEN_TREES").is_some());
     project_model::answer_toolchain_questions_with(answers::ask);
-    let stands_in_for_rustc = std::env::var_os("RA_JIT_WRAPS_RUSTC").is_some();
     if let Some(replayed) = doctest::replay() {
         return replayed;
     }
     match std::env::args().nth(1).as_deref() {
-        _ if stands_in_for_rustc => {}
         None | Some("--help" | "-h" | "help") => {
             end_with_reader();
             println!("{HELP}");
@@ -7331,9 +7328,6 @@ fn main() -> anyhow::Result<()> {
     }
     if std::env::var_os(cargo::daemon::ENDS_WITH_INPUT).is_some() {
         std::thread::spawn(end_with_input);
-    }
-    if std::env::var_os("RA_JIT_WRAPS_RUSTC").is_some() {
-        return stub::command(std::env::args_os().skip(1));
     }
     if std::env::args().nth(1).as_deref() == Some("--check") {
         return check::serve(Args::parse(std::env::args().skip(2))?);

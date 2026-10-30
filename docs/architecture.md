@@ -370,11 +370,6 @@ there wanted (`headerpad_ahead`), so it is not linked twice.
 
 `RA_JIT_RUSTC_BASE=0` makes the first build the daemon's own, as before. `harness/rustcbase.py` checks every kind of edit against cargo.
 
-An alternative wrapper exists in `stub.rs` (`RA_JIT_WRAPS_RUSTC`), where rustc compiles only
-a stub for each workspace crate and all code is ra-jit's. It makes the first build faster,
-but a function ra-jit refuses then has no rustc copy to fall back on, so it is used by
-`harness/alone.py` and not by `cargo ra-jit`.
-
 ## Debug info
 
 `debuginfo.rs` writes DWARF 4 for ra-jit's functions: line tables, a subprogram entry per

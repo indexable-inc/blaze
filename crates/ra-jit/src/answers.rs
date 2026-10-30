@@ -122,7 +122,7 @@ pub(crate) fn is_question(args: &[OsString]) -> bool {
             "-" => from_stdin = true,
             _ if !flag.starts_with('-') => inputs += 1,
             _ if joined.is_none()
-                && (crate::stub::VALUED.contains(&flag) || ALSO_VALUED.contains(&flag)) =>
+                && (crate::cargo::wrapper::VALUED.contains(&flag) || ALSO_VALUED.contains(&flag)) =>
             {
                 words.next();
             }

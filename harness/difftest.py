@@ -73,17 +73,6 @@ def toolchain():
     return sysroot, host()
 
 
-def only_the_link_failed(stderr):
-    """Whether all that failed in a build with stand-ins is the link of the program. The
-    stand-ins have none of the workspace's code, so native code linked into the program that
-    calls a function of the workspace (C calling a `#[no_mangle]` function, as bun's does) finds
-    it nowhere; ra-jit's objects define it in the link that is run, and what is taken from
-    cargo's is the link line, which rustc prints first."""
-    errors = [line for line in stderr.splitlines() if line.startswith("error")]
-    return bool(errors) and errors[0].startswith("error: linking with ") and all(
-        line.startswith(("error: linking with ", "error: could not compile ")) for line in errors)
-
-
 def linker_line(output):
     """The line of `--print link-args`, as the arguments from the linker on: the C compiler
     where it drives the linker, and a linker of the `link.exe` kind (rustc's own `rust-lld`,
@@ -158,8 +147,6 @@ class Fixture:
             touch = next(t["src_path"] for p in meta["packages"] if p["name"] == target[1]
                          for t in p["targets"] if "bin" in t["kind"])
         self.touch = touch
-        # Whether rustc builds stand-ins for the workspace's crates, all of their code being ra-jit's.
-        self.alone = bool(os.environ.get("RA_JIT_ALONE"))
 
     def rustc_build(self):
         """Builds with cargo and captures the linker line so ra-jit objects can be spliced in."""
@@ -169,16 +156,12 @@ class Fixture:
         # path in its workspace, so programs of one name built at once in the caller's would
         # take each other's place (fuzz/edits.py's, all of them `fz`).
         env.pop("CARGO_TARGET_DIR", None)
-        if self.alone:
-            env.update(RUSTC_WORKSPACE_WRAPPER=RA_JIT, RA_JIT_WRAPS_RUSTC="1",
-                       CARGO_TARGET_DIR=os.path.join(self.ws, "target-alone"))
-            target = ["--target", TARGET or host()]
-        elif TARGET:
+        if TARGET:
             target = TARGET_ARGS
         out = subprocess.run(
             ["cargo", "rustc", *self.target_args, *target, "--", "--print", "link-args", "-C", "save-temps"],
             cwd=self.ws, capture_output=True, text=True, env=env)
-        if out.returncode != 0 and not (self.alone and only_the_link_failed(out.stderr)):
+        if out.returncode != 0:
             raise SystemExit(f"cargo failed:\n{out.stderr[-3000:]}")
         # rustc's object of the names the program keeps is how GNU ld, reading each archive once,
         # takes the panic runtime that comes before the standard library calling it.
@@ -216,12 +199,7 @@ class Fixture:
 
     def link(self, objects):
         args = list(self.link_args)
-        first = linkline.first_of_rustc(args)
-        if self.alone:
-            # Nothing of the workspace is rustc's for ra-jit's to be defined a second time.
-            args[first:first] = objects
-        else:
-            args = linkline.ahead(args, objects, RA_JIT)
+        args = linkline.ahead(args, objects, RA_JIT)
         self.binary = self.binary_path()
         args = linkline.with_output(args, self.binary)
         run = subprocess.run(args, capture_output=True, text=True)

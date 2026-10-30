@@ -50,9 +50,6 @@ EVERYWHERE = on()
 HARNESSES = [
     ("core", ["difftest.py", "corpus", "--bin", "runner", "--crate", "cases", "--layouts"], {}, EVERYWHERE, 2),
     ("core", ["programs.py"], {}, EVERYWHERE, 1),
-    # The daemon compiles every function of both programs, main too, and LLVM is optimizing: an
-    # edit of what both use has to reach each program, whatever its callers had built into them.
-    ("core", ["programs.py"], {"RA_JIT_ALONE": "1"}, on("linux", "macos", backend="llvm"), 1),
     ("core", ["breakers.py"], {}, EVERYWHERE, 1),
     ("core", ["unwinds.py"], {}, EVERYWHERE, 1),
     ("core", ["growth.py"], {}, on(backend="cranelift"), 1),
@@ -139,7 +136,6 @@ X64, MAC = "linux-x86_64", "macos"
 FAST = {
     "difftest.py corpus": (34, ()),
     "programs.py": (20, ()),
-    "RA_JIT_ALONE=1 programs.py": (20, (X64,)),
     "breakers.py": (211, ()),
     "unwinds.py": (11, ()),
     "growth.py": (31, (X64,)),

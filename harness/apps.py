@@ -11,9 +11,7 @@ has that module of the harness make what cargo needs before it (for bun, bunprep
 build of its C and C++, and the member rustc links). The stages:
 
 build     cargo builds the program for the link line; ra-jit compiles every crate linked into
-          it and links its objects ahead of rustc's. Then the same with ra-jit as cargo's
-          `RUSTC_WRAPPER`, where rustc builds only what runs during the build: that one is
-          timed from nothing and is the program the other stages use when it links.
+          it and links its objects ahead of rustc's: the program the other stages use.
 workload  each command line of `runs`, cargo's program against ra-jit's: status, stdout, stderr.
 perf      `bench` timed with cargo's debug and release programs and ra-jit's; sizes.
 tests     the test binaries of `tests`: those of a library are linked again with ra-jit's
@@ -106,10 +104,9 @@ def package_directory(ws, package):
 class App(Fixture):
     """A program and every crate linked into it."""
 
-    def __init__(self, ws, spec, alone):
+    def __init__(self, ws, spec):
         self.spec = spec
         super().__init__(ws, [], ["-p", spec["package"], *spec.get("cargo_args", [])])
-        self.alone = alone
         self.reports = {}
         self.scrubbed = spec.get("scrub", [])
         self.argv0 = spec.get("bin", spec["package"])
@@ -118,20 +115,10 @@ class App(Fixture):
         self.project = package_directory(ws, spec["package"])
 
     def rustc_build(self):
-        """Cargo's build, with ra-jit in rustc's place for every crate when the program is
-        ra-jit's alone: a dependency is not of the workspace to cargo. Without `lto`, which
-        links one object of what the stand-ins use in place of the libraries, the standard
-        library's among them, that ra-jit's object calls into."""
-        own = {"RUSTC_WRAPPER": RA_JIT, "CARGO_PROFILE_RELEASE_LTO": "off", "CARGO_PROFILE_DEV_LTO": "off"}
-        if self.alone:
-            os.environ.update(own)
-        try:
-            began = time.monotonic()
-            super().rustc_build()
-            self.cargo_secs = time.monotonic() - began
-        finally:
-            for var in own if self.alone else ():
-                os.environ.pop(var, None)
+        """Cargo's build, the reference ra-jit's objects are linked ahead of."""
+        began = time.monotonic()
+        super().rustc_build()
+        self.cargo_secs = time.monotonic() - began
         linked = {os.path.basename(r)[3:].rsplit("-", 1)[0] for r in self.rlibs
                   if r.endswith(".rlib") and "/rustlib/" not in r}
         program = os.path.basename(self.reference).rsplit("-", 1)[0].replace("-", "_")
@@ -200,10 +187,10 @@ def cause(reason):
     return re.sub(r"`[^`]*`", "`..`", last)[:120]
 
 
-def build(ws, spec, result, alone):
+def build(ws, spec, result):
     """One build of the program by ra-jit; returns the fixture, or None with the failure noted."""
-    key = "alone" if alone else "ahead"
-    fx = App(ws, spec, alone)
+    key = "ahead"
+    fx = App(ws, spec)
     try:
         fx.rustc_build()
         fx.ra_jit_build()
@@ -388,10 +375,8 @@ def main():
     result = {"app": a.name, "backend": backend, "rev": spec.get("rev")}
     debug, result["debug_cold_s"] = reference(ws, spec, "debug")
     setup(ws, spec)
-    ahead = build(ws, spec, result, alone=False)
-    alone = build(ws, spec, result, alone=True) if ahead else None
-    fx = alone or ahead
-    result["program"] = "alone" if alone else "ahead" if ahead else None
+    fx = build(ws, spec, result)
+    result["program"] = "ahead" if fx else None
     ok = fx is not None
     if fx and "workload" in stages:
         workload(fx, spec, debug, result)
