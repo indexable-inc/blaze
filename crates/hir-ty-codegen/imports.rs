@@ -22,7 +22,10 @@
 use std::{
     collections::VecDeque,
     hash::BuildHasher,
-    sync::{Arc, LazyLock, Mutex, OnceLock, atomic::Ordering},
+    sync::{
+        Arc, LazyLock, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use cranelift_codegen::ir;
@@ -72,6 +75,8 @@ pub(super) struct Export {
     /// Its instructions, as LLVM counts them.
     pub(super) size: usize,
     pub(super) hint: Hint,
+    /// Whether a compile imported it.
+    pub(super) imported: AtomicBool,
 }
 
 /// An export a compile imports, with what it refers to as the compile names it.
@@ -147,6 +152,9 @@ pub(super) fn chosen_for(
         }
         taken.insert(id);
         spent += export.size;
+        if !export.imported.swap(true, Ordering::Relaxed) {
+            Tally::global().exports_imported.fetch_add(1, Ordering::Relaxed);
+        }
         let (funcs, datas) = recorder.moved_requests(&export.requests);
         if depth + 1 < DEPTH {
             next.extend(funcs.iter().map(|it| (it.as_u32(), share * EVOLUTION, depth + 1)));
@@ -187,8 +195,10 @@ fn export(
         let start = stdx::time::Instant::now();
         let built = build(db, instance, env).map(Arc::new);
         let tally = Tally::global();
-        let bytes = built.as_ref().map_or(0, |it| it.bitcode.len());
-        tally.exports.add(start.elapsed(), bytes);
+        match &built {
+            Some(it) => tally.exports.add(start.elapsed(), it.bitcode.len()),
+            None => tally.exports_refused.add(start.elapsed(), 0),
+        }
         built
     })
     .clone()
@@ -283,6 +293,6 @@ fn build(
             return None;
         }
         let signature = ctx.func.signature.clone();
-        Some(Export { bitcode, requests, signature, size, hint })
+        Some(Export { bitcode, requests, signature, size, hint, imported: AtomicBool::new(false) })
     })
 }

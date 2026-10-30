@@ -222,7 +222,16 @@ fn compiled(
             &readonly,
             machine.get_target_data().get_pointer_byte_size(None) as usize,
         );
-        let debug = lower::Debug::of(&module)?;
+        let debug = if super::backend::marks_lines() { lower::Debug::of(&module)? } else { None };
+        let staged = optimization.stages().filter(|_| {
+            (alone.is_some() || std::env::var_os("RA_JIT_X_STAGED_UNITS").is_some())
+                && !imports.is_empty()
+                && std::env::var_os("RA_JIT_X_STAGED").is_some()
+        });
+        let linkage = match alone {
+            Some(_) => Linkage::AvailableExternally,
+            None => Linkage::LinkOnceODR,
+        };
         let (shown, failed) = tally.time(Phase::Lower, || {
             // What is wrong with the function of each member, which is then only declared.
             let mut failed: Vec<Option<Unhandled>> = defined.iter().map(|_| None).collect();
@@ -247,11 +256,9 @@ fn compiled(
                 }
             }
             // Before the functions' bodies: their calls of what is imported are of the bodies.
-            let linkage = match alone {
-                Some(_) => Linkage::AvailableExternally,
-                None => Linkage::LinkOnceODR,
-            };
-            link(context, &module, imports, linkage)?;
+            if staged.is_none() {
+                link(context, &module, imports, linkage)?;
+            }
             let names: Vec<String> = seen.iter().map(|it| shown_name(it.id.as_u32())).collect();
             let shown: Vec<Defined<'_>> = std::iter::zip(&seen, &names)
                 .map(|(it, name)| Defined {
@@ -312,7 +319,7 @@ fn compiled(
             if let Some(debug) = &debug {
                 debug.finish();
             }
-            if !imports.is_empty() || alone.is_none() {
+            if (!imports.is_empty() || alone.is_none()) && staged.is_none() {
                 agree_calls(context, &module)?;
             }
             if wrapped && let Some(Some(function)) = functions.first() {
@@ -330,7 +337,7 @@ fn compiled(
         tally
             .time(Phase::Verify, || module.verify())
             .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))?;
-        if let Some(pipeline) = optimization.pipeline() {
+        let passes = |pipeline: &str| {
             tally
                 .time(Phase::Optimize, || {
                     // rustc vectorizes straight-line code at `-O2` and `-O3`.
@@ -338,19 +345,65 @@ fn compiled(
                     options.set_loop_slp_vectorization(true);
                     module.run_passes(pipeline, machine, options)
                 })
+                .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))
+        };
+        if let Some((before, after)) = staged {
+            tally.time(Phase::Own, || passes(before))?;
+            tally.time(Phase::Lower, || {
+                link(context, &module, imports, linkage)?;
+                agree_calls(context, &module)
+            })?;
+            tally
+                .time(Phase::Verify, || module.verify())
                 .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))?;
-            if rebase::rebase(&module) {
-                tally
-                    .time(Phase::Optimize, || {
-                        module.run_passes(REBASED, machine, PassBuilderOptions::create())
-                    })
-                    .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))?;
+            let mut parts = after.split('|').peekable();
+            let mut first = true;
+            while let Some(part) = parts.next() {
+                if std::mem::take(&mut first) {
+                    tally.time(Phase::Light, || passes(part))?;
+                } else {
+                    passes(part)?;
+                }
+                if parts.peek().is_some() {
+                    told_constants(
+                        context,
+                        &module,
+                        &readonly,
+                        machine.get_target_data().get_pointer_byte_size(None) as usize,
+                    );
+                }
             }
+        }
+        if let Some(pipeline) = optimization.pipeline().filter(|_| staged.is_none()) {
+            passes(pipeline)?;
+        }
+        if optimization.pipeline().is_some() && rebase::rebase(&module) {
+            tally
+                .time(Phase::Optimize, || {
+                    module.run_passes(REBASED, machine, PassBuilderOptions::create())
+                })
+                .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))?;
         }
         // What a compile alone imports is only there to be built in: a body LLVM did not
         // build in is the callee's own code, called. The passes above drop them; a function
         // too large for them gets none. What a unit imports and still calls is kept.
         let mut kept = Vec::new();
+        for import in imports {
+            let name = Symbol::Func(import.id).to_string();
+            // SAFETY: a function is a value.
+            let called = module.get_function(&name).is_some_and(|it| unsafe {
+                !inkwell::llvm_sys::core::LLVMGetFirstUse(
+                    inkwell::values::AsValueRef::as_value_ref(&it),
+                )
+                .is_null()
+            });
+            if called {
+                tally.imports_called.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tally
+                    .imports_called_size
+                    .fetch_add(import.export.size, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         if !imports.is_empty() {
             let pass = if alone.is_some() { "elim-avail-extern" } else { "globaldce" };
             module
@@ -475,6 +528,14 @@ fn mark_hint<'ctx>(context: &'ctx Context, function: FunctionValue<'ctx>, hint: 
 /// pipeline, which leaves loops to be unrolled and vectorized where the body is built in,
 /// after the slots are taken apart as for a compile ([`Optimization::pipeline`]).
 fn exported(optimization: Optimization) -> &'static str {
+    match std::env::var("RA_JIT_X_EXPORT").as_deref() {
+        Ok("lite") => {
+            return "function(sroa,instsimplify,sroa,jump-threading,early-cse<memssa>,instcombine<no-verify-fixpoint>,simplifycfg),cgscc(function-attrs)";
+        }
+        Ok("o2") => return "function(sroa,instsimplify,sroa,jump-threading),thinlto-pre-link<O2>",
+        Ok("o1") => return "function(sroa,instsimplify,sroa,jump-threading),thinlto-pre-link<O1>",
+        _ => {}
+    }
     match optimization.passes {
         Passes::Aggressive => {
             "function(sroa,instsimplify,sroa,jump-threading),thinlto-pre-link<O3>"
@@ -515,7 +576,16 @@ pub(super) fn export(
             .run_passes(exported(optimization), machine, PassBuilderOptions::create())
             .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))?;
         let size = function.get_basic_blocks().into_iter().map(|it| it.get_instructions().count());
-        Ok((module.write_bitcode_to_memory().as_slice().to_vec(), size.sum()))
+        let bitcode = module.write_bitcode_to_memory().as_slice().to_vec();
+        if let Some(dir) = std::env::var_os("RA_JIT_X_DUMPEXPORT") {
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n % 500 == 0 {
+                let dir = std::path::Path::new(&dir);
+                _ = std::fs::write(dir.join(format!("{n}.bc")), &bitcode);
+            }
+        }
+        Ok((bitcode, size.sum()))
     })
 }
 
@@ -532,11 +602,23 @@ fn link<'ctx>(
     imports: &[Import],
     linkage: Linkage,
 ) -> Result<(), Unhandled> {
+    Tally::global().time(Phase::Link, || linked(context, module, imports, linkage))
+}
+
+fn linked<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    imports: &[Import],
+    linkage: Linkage,
+) -> Result<(), Unhandled> {
     let llvm = |e: inkwell::support::LLVMString| Unhandled::Llvm(e.to_string_lossy().into_owned());
     let mut modules = Vec::with_capacity(imports.len());
-    for import in imports {
-        modules.push(imported(context, module, import)?);
-    }
+    Tally::global().time(Phase::Parse, || {
+        for import in imports {
+            modules.push(imported(context, module, import)?);
+        }
+        Ok::<_, Unhandled>(())
+    })?;
     while modules.len() > 1 {
         let mut linked = Vec::with_capacity(modules.len().div_ceil(2));
         let mut pairs = modules.into_iter();
@@ -795,6 +877,13 @@ fn set_options(arch: Arch) {
         if arch == Arch::Aarch64 {
             arguments.push(c"-aarch64-enable-global-isel-at-O=-1".as_ptr());
         }
+        let extra: Vec<std::ffi::CString> = std::env::var("RA_JIT_X_LLVMARGS")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(|it| std::ffi::CString::new(it).unwrap())
+            .collect();
+        let extra = Box::leak(extra.into_boxed_slice());
+        arguments.extend(extra.iter().map(|it| it.as_ptr()));
         // SAFETY: the arguments are C strings that outlive the call, and LLVM is given
         // their number.
         unsafe {
@@ -842,6 +931,53 @@ impl Optimization {
     /// units go through ThinLTO within the crate: the one before linking, then the one at
     /// it, so every function is simplified twice. The second time a loop is small enough to
     /// unroll whole that the first left too big (nbody's loops over pairs of bodies).
+    fn stages(self) -> Option<(&'static str, &'static str)> {
+        match self.passes {
+            Passes::None | Passes::Less => None,
+            Passes::Default => Some((
+                "function(sroa,instsimplify,sroa,jump-threading),thinlto-pre-link<O2>",
+                "thinlto<O2>",
+            )),
+            Passes::Aggressive => {
+                const LIGHT: &str = "cgscc(inline,function(sroa,instsimplify,sroa,jump-threading,early-cse<memssa>))";
+                const CLEANUP: &str =
+                    "function(gvn,sccp,instcombine<no-verify-fixpoint>,simplifycfg)";
+                const OWN: &str = "function(sroa,instsimplify,sroa,jump-threading)";
+                let staged = std::env::var("RA_JIT_X_STAGED").unwrap_or_default();
+                let leak = |it: String| -> &'static str { Box::leak(it.into_boxed_str()) };
+                static STAGES: std::sync::OnceLock<(&'static str, &'static str)> =
+                    std::sync::OnceLock::new();
+                Some(*STAGES.get_or_init(|| match staged.as_str() {
+                    spec if spec.starts_with("spec:") => {
+                        let spec = spec["spec:".len()..]
+                            .replace("LIGHT", LIGHT)
+                            .replace("CLEANUP", CLEANUP)
+                            .replace("OWN", OWN);
+                        let (before, after) = spec.split_once(';').unwrap();
+                        (leak(before.to_owned()), leak(after.to_owned()))
+                    }
+                    "plain" => (
+                        leak(format!("{OWN},thinlto-pre-link<O3>")),
+                        leak(format!("thinlto<O3>,{CLEANUP}")),
+                    ),
+                    "lite" => (
+                        leak(format!("{OWN},thinlto-pre-link<O3>")),
+                        leak(format!("{LIGHT},elim-avail-extern|thinlto<O3>,{CLEANUP}")),
+                    ),
+                    "lite0a" => (OWN, "cgscc(inline),elim-avail-extern|thinlto<O3>,function(gvn,sccp,instcombine<no-verify-fixpoint>,simplifycfg)"),
+                    "lite0b" => (OWN, "cgscc(inline,function(sroa,instsimplify,sroa,early-cse<memssa>)),elim-avail-extern|thinlto<O3>,function(gvn,sccp,instcombine<no-verify-fixpoint>,simplifycfg)"),
+                    "lite0" => {
+                        (OWN, leak(format!("{LIGHT},elim-avail-extern|thinlto<O3>,{CLEANUP}")))
+                    }
+                    _ => (
+                        leak(format!("{OWN},thinlto-pre-link<O3>")),
+                        leak(format!("{LIGHT},thinlto<O3>,{CLEANUP}")),
+                    ),
+                }))
+            }
+        }
+    }
+
     fn pipeline(self) -> Option<&'static str> {
         match self.passes {
             Passes::None => None,
@@ -1014,11 +1150,12 @@ fn told_constants<'ctx>(
         if at < blob.bytes.len() {
             fields.push(i8.array_type((blob.bytes.len() - at) as u32).into());
         }
-        let global = module.add_global(
-            context.struct_type(&fields, true),
-            None,
-            &Symbol::Data(*index).to_string(),
-        );
+        let name = Symbol::Data(*index).to_string();
+        let ty = context.struct_type(&fields, true);
+        let global = match module.get_global(&name) {
+            Some(it) if it.get_value_type() == ty.as_any_type_enum() => it,
+            _ => module.add_global(ty, None, &name),
+        };
         global.set_linkage(Linkage::AvailableExternally);
         global.set_visibility(GlobalVisibility::Hidden);
         global.set_constant(true);
@@ -1195,6 +1332,7 @@ define void @"ra-jit.own"(ptr %to, i64 %from) {
             signature: ir::Signature::new(cranelift_codegen::isa::CallConv::SystemV),
             size: 3,
             hint: Hint::Inline,
+            imported: Default::default(),
         };
         Import { export: std::sync::Arc::new(export), id, funcs, datas: Vec::new() }
     }
@@ -1256,6 +1394,7 @@ define void @"ra-jit.own"(ptr %to, i64 %from) {
             signature: ir::Signature::new(cranelift_codegen::isa::CallConv::SystemV),
             size: 8,
             hint: Hint::Inline,
+            imported: Default::default(),
         };
         // The export's request 0 is itself; its own 1 is the compile's 7, its datum 0 the 3.
         let import = Import {
@@ -1450,6 +1589,7 @@ attributes #0 = { alwaysinline }
                 signature: sig.clone(),
                 size: 2,
                 hint: Hint::None,
+                imported: Default::default(),
             }),
             id: id.as_u32(),
             funcs: vec![id.as_u32()],

@@ -72,6 +72,26 @@ pub(super) fn frame_pointers() -> bool {
     FRAME_POINTERS.load(Ordering::Relaxed)
 }
 
+/// Whether the build under way tells a debugger where its code comes from: one answer for
+/// all the code a build writes, as the frame pointers are.
+static DESCRIBED: AtomicBool = AtomicBool::new(true);
+
+pub(super) fn describe(described: bool) {
+    DESCRIBED.store(described, Ordering::Relaxed);
+}
+
+/// Whether LLVM is to say what source each instruction is of. A build that describes nothing
+/// reads that only to describe it, and a whole program is not compiled again for a build that
+/// does: LLVM is told nothing of the source there, which took 4% off its time on helix
+/// (2026-10-24).
+pub(super) fn marks_lines() -> bool {
+    lines_marked(DESCRIBED.load(Ordering::Relaxed), whole_program())
+}
+
+fn lines_marked(described: bool, whole_program: bool) -> bool {
+    described || !whole_program
+}
+
 /// Says the build under way is of a whole program.
 pub(super) fn set_whole_program() {
     WHOLE_PROGRAM.store(true, Ordering::Relaxed);
@@ -339,6 +359,14 @@ pub(super) struct Tally {
     /// The exports built for compiles to import ([`super::imports`]), and how many bodies
     /// and instructions those imported.
     pub(super) exports: Produced,
+    /// The builds of exports that gave none: a body too large, or one LLVM has no lowering
+    /// for.
+    pub(super) exports_refused: Produced,
+    /// How many of the exports a compile imported.
+    pub(super) exports_imported: AtomicUsize,
+    /// The imports LLVM left a call of in some function, and their instructions.
+    pub(super) imports_called: AtomicUsize,
+    pub(super) imports_called_size: AtomicUsize,
     pub(super) imported: AtomicUsize,
     pub(super) imported_size: AtomicUsize,
 }
@@ -360,12 +388,30 @@ pub(super) enum Phase {
     Read,
     /// Building an export for compiles to import, all its steps.
     Export,
+    /// Of `Lower`: linking the imports in.
+    Link,
+    /// Of `Optimize`: the passes of the function before its imports are linked in.
+    Own,
+    /// Of `Optimize`: the first passes after the imports are linked in.
+    Light,
+    /// Of `Link`: reading the imports and naming what they refer to.
+    Parse,
 }
 
 impl Phase {
-    const COUNT: usize = 6;
-    const ALL: [Phase; Phase::COUNT] =
-        [Phase::Lower, Phase::Verify, Phase::Optimize, Phase::Emit, Phase::Read, Phase::Export];
+    const COUNT: usize = 10;
+    const ALL: [Phase; Phase::COUNT] = [
+        Phase::Lower,
+        Phase::Verify,
+        Phase::Optimize,
+        Phase::Emit,
+        Phase::Read,
+        Phase::Export,
+        Phase::Link,
+        Phase::Own,
+        Phase::Light,
+        Phase::Parse,
+    ];
 }
 
 /// The steps of compiling one function that are not the producer's.
@@ -526,9 +572,17 @@ impl Tally {
         if let Some(exports) = self.exports.take() {
             let imported = self.imported.swap(0, Ordering::Relaxed);
             let size = self.imported_size.swap(0, Ordering::Relaxed);
+            let used = self.exports_imported.swap(0, Ordering::Relaxed);
+            let called = self.imports_called.swap(0, Ordering::Relaxed);
+            let called_size = self.imports_called_size.swap(0, Ordering::Relaxed);
             eprintln!(
-                "backend: llvm built exports of {exports}; {imported} imported, {size} instructions"
+                "backend: llvm built exports of {exports}, {used} of them imported; {imported} \
+                 imported, {size} instructions, of which {called} ({called_size} instructions) \
+                 still called after the passes"
             );
+        }
+        if let Some(refused) = self.exports_refused.take() {
+            eprintln!("backend: llvm built no export of {refused}");
         }
         let (units, members) =
             (self.units.swap(0, Ordering::Relaxed), self.unit_members.swap(0, Ordering::Relaxed));
@@ -561,5 +615,19 @@ impl Tally {
 
     fn selected_llvm() -> bool {
         matches!(Backend::from_env(), Ok(Backend::Llvm(_)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lines_marked;
+
+    /// An edit is a patch of code compiled before, which may be of a build that describes.
+    #[test]
+    fn only_a_whole_program_that_describes_nothing_has_no_lines_marked() {
+        assert!(!lines_marked(false, true));
+        assert!(lines_marked(true, true));
+        assert!(lines_marked(false, false));
+        assert!(lines_marked(true, false));
     }
 }

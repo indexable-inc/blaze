@@ -650,6 +650,7 @@ impl CodegenUnit {
         undoable: bool,
     ) -> Result<Option<CodegenUnit>> {
         backend::keep_frame_pointers(symbols.keeps_frame_pointers());
+        backend::describe(symbols.debug_directory().is_some());
         let on_demand: FxHashSet<FunctionId> = roots.on_demand.iter().copied().collect();
         let all = || roots.entries.iter().chain(roots.on_demand).copied();
         // Code of the checkout comes from the store in the first build alone: what a patch is

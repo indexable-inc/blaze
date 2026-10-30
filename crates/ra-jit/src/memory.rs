@@ -201,4 +201,12 @@ mod tests {
             assert!(held.is_some_and(|it| it > 0) && machine.is_some_and(|it| it > held.unwrap()));
         }
     }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn c_allocates_from_jemalloc() {
+        // SAFETY: the name is a C string, and the symbol is only compared.
+        let malloc = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"malloc".as_ptr()) };
+        assert_eq!(malloc as usize, tikv_jemalloc_sys::malloc as usize);
+    }
 }

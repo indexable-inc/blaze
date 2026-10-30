@@ -96,7 +96,7 @@ ra-jit-live = { path = "../ra-jit-live" }
 libc.workspace = true
 tikv-jemallocator = "0.5.4"
 tikv-jemalloc-ctl = "0.5.4"
-tikv-jemalloc-sys = "0.5.4"
+tikv-jemalloc-sys = { version = "0.5.4", features = ["unprefixed_malloc_on_supported_platforms"] }
 
 [dev-dependencies]
 object = { version = "0.37", default-features = false, features = ["write", "elf"] }

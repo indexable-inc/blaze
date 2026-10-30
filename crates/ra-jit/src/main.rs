@@ -38,7 +38,9 @@ mod whole;
 
 /// The daemon holds millions of small allocations and frees a file's worth of them on each
 /// edit, which the system allocator is slow at. jemalloc gives the system back more of what
-/// a build freed than mimalloc does. It is not built for Windows.
+/// a build freed than mimalloc does. It is not built for Windows. On Linux it is C's `malloc`
+/// too, as rustc has it, so LLVM allocates from it: with glibc's, LLVM took 7% longer on a
+/// whole-program build of helix (2026-10-24).
 #[cfg(unix)]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
