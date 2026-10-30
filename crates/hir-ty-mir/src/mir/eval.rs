@@ -895,7 +895,7 @@ impl<'db> Evaluator<'db> {
             self.running = Some((my_stack_frame.callee, my_stack_frame.span));
             let e = (|| {
                 let locals = &mut my_stack_frame.locals;
-                let body = locals.body.clone();
+                let body = locals.body;
                 loop {
                     let current_block = &body.basic_blocks[current_block_idx];
                     if let Some(it) = self.steps_left.checked_sub(1) {
