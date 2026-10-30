@@ -71,10 +71,15 @@ runs:
       with:
         path: C:\llvm
         key: llvm-${{ hashFiles('crates/hir-ty-codegen/llvm.json') }}-x86_64-pc-windows-msvc
+    - if: runner.os == 'Windows' && inputs.llvm != 'none' && steps.llvm-windows.outputs.cache-hit != 'true'
+      uses: actions/setup-python@v7
+      with:
+        python-version: "3.13"
     - name: LLVM 23 (Windows)
       if: runner.os == 'Windows' && inputs.llvm != 'none' && steps.llvm-windows.outputs.cache-hit != 'true'
       shell: bash
-      run: python .github/scripts/llvm.py fetch --target x86_64-pc-windows-msvc --dir 'C:\llvm'
+      run: |
+        python .github/scripts/llvm.py '{"command": "fetch", "target": "x86_64-pc-windows-msvc", "dir": "C:\\llvm"}'
     - if: runner.os == 'Windows' && inputs.llvm != 'none'
       shell: bash
       run: |

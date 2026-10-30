@@ -44,7 +44,12 @@ jobs:
       - run: python -m pip install ninja==1.13.0
       - if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
-      - run: python .github/scripts/llvm.py build --target ${{ matrix.target }} --work "${{ runner.temp }}/llvm" --out "${{ runner.temp }}/out"
+      - shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        # JSON, which escapes the backslashes of a Windows runner's temporary directory.
+        run: |
+          python .github/scripts/llvm.py "$(jq -nc --arg target "$TARGET" --arg work "$RUNNER_TEMP/llvm" --arg out "$RUNNER_TEMP/out" '{command: "build", target: $target, work: $work, out: $out}')"
       - uses: actions/upload-artifact@v7
         with:
           name: llvm-${{ matrix.target }}
@@ -86,6 +91,6 @@ jobs:
           done
       - name: Pins
         run: |
-          python3 .github/scripts/llvm.py pin "$RUNNER_TEMP"/llvm/*
+          python3 .github/scripts/llvm.py "$(jq -nc --arg root "$RUNNER_TEMP/llvm" '{command: "pin", root: $root}')"
           { echo '`crates/hir-ty-codegen/llvm.json` for these builds:'; echo '```json'; cat crates/hir-ty-codegen/llvm.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           cat crates/hir-ty-codegen/llvm.json
