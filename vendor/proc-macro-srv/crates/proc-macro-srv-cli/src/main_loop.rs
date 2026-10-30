@@ -358,7 +358,9 @@ impl proc_macro_srv::ProcMacroClientInterface for ProcMacroClientHandle<'_> {
         first: proc_macro_srv::span::Span,
         second: proc_macro_srv::span::Span,
     ) -> Option<proc_macro_srv::span::Span> {
-        assert_eq!(first.anchor.file_id, second.anchor.file_id);
+        if first.anchor.file_id != second.anchor.file_id {
+            return None;
+        }
         let response = self.roundtrip(bidirectional::SubRequest::SpanJoin {
             file_id: first.anchor.file_id.as_u32(),
             ast_id_first: first.anchor.ast_id.into_raw(),
@@ -620,4 +622,45 @@ fn run_old(
 fn send_response(stdout: &mut dyn Write, resp: bidirectional::Response) -> io::Result<()> {
     let resp = bidirectional::BidirectionalMessage::Response(resp);
     resp.write(stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proc_macro_srv::ProcMacroClientInterface;
+    use proc_macro_srv::span::{
+        Edition, EditionedFileId, ErasedFileAstId, FileId, Span, SpanAnchor, SyntaxContext,
+        TextRange,
+    };
+
+    #[test]
+    fn span_join_different_files_returns_none() {
+        let mut stdin = std::io::empty();
+        let mut stdout = Vec::new();
+        let mut buf = Vec::new();
+        let mut handle = ProcMacroClientHandle {
+            stdin: &mut stdin,
+            stdout: &mut stdout,
+            buf: &mut buf,
+        };
+
+        let span1 = Span {
+            range: TextRange::default(),
+            anchor: SpanAnchor {
+                file_id: EditionedFileId::new(FileId::from_raw(1313), Edition::Edition2024),
+                ast_id: ErasedFileAstId::from_raw(0),
+            },
+            ctx: unsafe { SyntaxContext::from_u32(0) },
+        };
+        let span2 = Span {
+            range: TextRange::default(),
+            anchor: SpanAnchor {
+                file_id: EditionedFileId::new(FileId::from_raw(62), Edition::Edition2021),
+                ast_id: ErasedFileAstId::from_raw(0),
+            },
+            ctx: unsafe { SyntaxContext::from_u32(0) },
+        };
+
+        assert_eq!(handle.span_join(span1, span2), None);
+    }
 }

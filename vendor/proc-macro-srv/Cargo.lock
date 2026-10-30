@@ -825,6 +825,7 @@ dependencies = [
  "stdx",
  "tracing",
  "triomphe",
+ "unicode-ident",
 ]
 
 [[package]]
