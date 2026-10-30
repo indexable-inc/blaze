@@ -30,9 +30,14 @@ import dataclasses, json, os, re, shutil, signal, subprocess, sys, threading, ti
 import memory
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CRATES = ["parser", "syntax", "hir-def", "blaze-store"]
+CRATES = [
+    "hir-ty-codegen", "blaze-store", "blaze-registry", "blaze-resolve", "blaze-build-script", "blaze-manifest", "blaze-in-place", "blaze-splice", "blaze-cargo", "blaze-engine",
+    "hir-ty", "hir-ty-mir", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "const-ast", "hir-ide", "ide-diagnostics",
+]
+CRATES += ["proc-macro-api"]
+PROBED = ["parser", "syntax", "hir-def", "blaze-store"]
 # What the build job ships blaze with: LLVM as a second code producer.
-FEATURES = []
+FEATURES = ["blaze-engine/llvm"]
 
 # crate::test, as libtest names it under the crate's test binary.
 OPEN = {
@@ -309,7 +314,9 @@ def main():
     plain, args = cfg.cargo, cfg.args
     if cfg.build and plain:
         sys.exit("unittests.py: `build` is blaze's build, not cargo's")
-    packages = [f"-p{c}" for c in CRATES]
+    packages = [f"-p{c}" for c in (CRATES if cfg.build else PROBED)]
+    global FEATURES
+    FEATURES = FEATURES if cfg.build else []
     if plain:
         command = ["cargo", "test", "--release", "--no-fail-fast", *packages, *args]
     else:
