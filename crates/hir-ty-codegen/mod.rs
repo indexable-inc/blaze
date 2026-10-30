@@ -366,6 +366,15 @@ enum PassMode {
         size: u32,
         padded: bool,
     },
+    /// A `Pair` with a 128-bit integer half that finds one integer register left by the
+    /// System V x86-64 convention: that half is passed as `OnStack` passes sixteen bytes,
+    /// `Some(padded)`, and the other as a value (see `wide_ints_on_stack`).
+    SpilledPair {
+        a: AbiScalar,
+        b: AbiScalar,
+        offset: Size,
+        spilled: [Option<bool>; 2],
+    },
 }
 
 impl PassMode {
@@ -379,6 +388,43 @@ impl PassMode {
 struct FnAbi {
     ret: PassMode,
     args: Vec<PassMode>,
+}
+
+/// The first 128-bit integer parameter that finds one integer register left by the System V
+/// x86-64 convention, and how many bytes of the stack the parameters before it take, as
+/// Cranelift places them. Cranelift and LLVM both put such an integer on the stack, but
+/// LLVM gives the register that is left to the next integer parameter and Cranelift gives
+/// it to nobody, so the two place the parameters after it differently.
+pub(crate) fn lone_register_i128(params: &[AbiParam]) -> Option<(usize, u32)> {
+    const INTS: usize = 6;
+    const FLOATS: usize = 8;
+    let (mut ints, mut floats, mut stack) = (0, 0, 0u32);
+    for (at, param) in params.iter().enumerate() {
+        let ty = param.value_type;
+        if let ArgumentPurpose::StructArgument(size) = param.purpose {
+            stack += size;
+        } else if ty == types::I128 {
+            if ints == INTS - 1 {
+                return Some((at, stack));
+            }
+            if ints > INTS - 2 {
+                stack = stack.next_multiple_of(16) + 16;
+            }
+            ints += 2;
+        } else if ty.is_float() || ty.is_vector() {
+            if floats < FLOATS {
+                floats += 1;
+            } else {
+                let size = ty.bytes().max(8);
+                stack = stack.next_multiple_of(size) + size;
+            }
+        } else if ints < INTS {
+            ints += 1;
+        } else {
+            stack += 8;
+        }
+    }
+    None
 }
 
 /// How AAPCS64 sorts a value, before the registers that are left decide where it goes.
@@ -5957,7 +6003,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 .into_iter()
                 .map(|ty| self.pass_mode(&*self.layout(ty)?, false))
                 .collect::<Result<_>>()?;
-            return Ok(FnAbi { ret, args });
+            let mut abi = FnAbi { ret, args };
+            self.wide_ints_on_stack(&mut abi)?;
+            return Ok(abi);
         }
         if self.cg.target.call_conv == isa::CallConv::WindowsFastcall {
             if matches!(abi, ExternAbi::SysV64 { .. }) {
@@ -5976,12 +6024,64 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let arch = self.cg.target.arch;
         match (abi, arch) {
             (ExternAbi::C { .. } | ExternAbi::System { .. }, Arch::X86_64)
-            | (ExternAbi::SysV64 { .. }, Arch::X86_64) => self.sysv_x86_64_abi(ret, args),
+            | (ExternAbi::SysV64 { .. }, Arch::X86_64) => {
+                let mut abi = self.sysv_x86_64_abi(ret, args)?;
+                self.wide_ints_on_stack(&mut abi)?;
+                Ok(abi)
+            }
             (ExternAbi::C { .. } | ExternAbi::System { .. }, Arch::Aarch64) => {
                 self.aapcs64_abi(ret, args)
             }
             _ => unsupported!("calling convention {abi:?}"),
         }
+    }
+
+    /// Passes a 128-bit integer that finds one integer register left as memory on the stack.
+    ///
+    /// By the System V x86-64 convention such an integer goes on the stack, and LLVM (so
+    /// rustc) gives the register that is left to the next integer argument, where Cranelift
+    /// gives it to nobody. As memory on the stack the integer takes no register in either,
+    /// so Cranelift places every argument where rustc does, and where LLVM does.
+    fn wide_ints_on_stack(&self, abi: &mut FnAbi) -> Result<()> {
+        let target = &self.cg.target;
+        if target.arch != Arch::X86_64 || target.call_conv != isa::CallConv::SystemV {
+            return Ok(());
+        }
+        while let Some((at, stack)) =
+            lone_register_i128(&self.signature(&abi.args, abi.ret).params)
+        {
+            // The argument the parameter is of, and which of the argument's parameters it is.
+            let mut first = usize::from(matches!(abi.ret, PassMode::Indirect));
+            let arg = abi
+                .args
+                .iter()
+                .position(|&mode| {
+                    let mut these = Vec::new();
+                    self.push_abi_params(mode, &mut these);
+                    if first + these.len() > at {
+                        return true;
+                    }
+                    first += these.len();
+                    false
+                })
+                .expect("every parameter comes from an argument");
+            let padded = stack % 16 != 0;
+            abi.args[arg] = match abi.args[arg] {
+                PassMode::Direct(_) => PassMode::OnStack { size: 16, padded },
+                PassMode::Pair(a, b, offset) => {
+                    let mut spilled = [None; 2];
+                    spilled[usize::from(at > first)] = Some(padded);
+                    PassMode::SpilledPair { a, b, offset, spilled }
+                }
+                // Both halves are 128-bit integers, and the second finds the register the
+                // first left.
+                PassMode::SpilledPair { a, b, offset, spilled: [half @ Some(_), None] } => {
+                    PassMode::SpilledPair { a, b, offset, spilled: [half, Some(padded)] }
+                }
+                mode => unreachable!("a 128-bit integer passed as {mode:?}"),
+            };
+        }
+        Ok(())
     }
 
     /// The C convention of the System V x86-64 psABI, as rustc's `callconv/x86_64.rs` has it.
@@ -6017,6 +6117,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 PassMode::Cast(ty) => self.count_regs(&[ty]),
                 PassMode::CastPair(a, b) => self.count_regs(&[a, b]),
                 PassMode::Uniform { .. } => unreachable!("x86-64 has no uniform aggregate"),
+                PassMode::SpilledPair { .. } => unreachable!("only the stack spills a pair"),
             };
             let aggregate = matches!(mode, PassMode::Cast(_) | PassMode::CastPair(..));
             let in_registers = match (int_regs.checked_sub(ints), sse_regs.checked_sub(sses)) {
@@ -6445,6 +6546,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn push_abi_params(&self, mode: PassMode, params: &mut Vec<AbiParam>) {
+        let copied = |size| AbiParam::special(ptr(), ArgumentPurpose::StructArgument(size));
         match mode {
             PassMode::Ignore => (),
             PassMode::Direct(s) => params.push(s.param()),
@@ -6457,9 +6559,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             PassMode::Indirect => params.push(AbiParam::new(ptr())),
             PassMode::OnStack { size, padded } => {
-                let copied = |size| AbiParam::special(ptr(), ArgumentPurpose::StructArgument(size));
                 params.extend(padded.then(|| copied(8)));
                 params.push(copied(size));
+            }
+            PassMode::SpilledPair { a, b, spilled, .. } => {
+                for (half, spilled) in [a, b].into_iter().zip(spilled) {
+                    match spilled {
+                        None => params.push(half.param()),
+                        Some(padded) => {
+                            params.extend(padded.then(|| copied(8)));
+                            params.push(copied(16));
+                        }
+                    }
+                }
             }
         }
     }
@@ -6541,6 +6653,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
                 values.push(addr);
             }
+            PassMode::SpilledPair { a, b, offset, spilled } => {
+                for (half, at, spilled) in [(a, 0, spilled[0]), (b, offset.bytes(), spilled[1])] {
+                    match spilled {
+                        None => values.push(self.builder.ins().load(half.ty, MEM, addr, at as i32)),
+                        Some(padded) => {
+                            if padded {
+                                values.push(self.scratch());
+                            }
+                            values.push(self.builder.ins().iadd_imm(addr, at as i64));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -6584,6 +6709,21 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let part = self.builder.ins().iadd_imm(addr, (index * step) as i64);
                     let left = layout.size - Size::from_bytes(index * step);
                     self.store_cast(value, part, left.min(Size::from_bytes(step)));
+                }
+            }
+            PassMode::SpilledPair { a, b, offset, spilled } => {
+                for (half, at, spilled) in [(a, 0, spilled[0]), (b, offset.bytes(), spilled[1])] {
+                    let value = match spilled {
+                        None => next(),
+                        Some(padded) => {
+                            if padded {
+                                next();
+                            }
+                            let copy = next();
+                            self.builder.ins().load(half.ty, MEM, copy, 0)
+                        }
+                    };
+                    self.builder.ins().store(MEM, value, addr, at as i32);
                 }
             }
         }
@@ -10424,6 +10564,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let count = match mode {
             PassMode::Ignore => 0,
             PassMode::Pair(..) => 2,
+            PassMode::SpilledPair { spilled, .. } => {
+                spilled.iter().map(|it| it.map_or(1, |padded| 1 + usize::from(padded))).sum()
+            }
             _ => 1,
         };
         let mut sig = sig.clone();

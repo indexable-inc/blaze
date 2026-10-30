@@ -392,6 +392,17 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
 
     /// A parameter that stands for memory is a pointer to LLVM; the rest are what they are.
     fn function_type(context: &'ctx Context, sig: &Signature) -> Lowered<FunctionType<'ctx>> {
+        // LLVM would give the register such an integer leaves to the next parameter, which
+        // Cranelift, building the other side of the call, does not. The Rust and C ABIs
+        // pass it in memory instead; what is left is a signature with a parameter put in
+        // front of them, as a vtable's receiver.
+        if sig.call_conv == CallConv::SystemV
+            && crate::mir::codegen::Target::current().arch
+                == crate::mir::codegen::target::Arch::X86_64
+            && crate::mir::codegen::lone_register_i128(&sig.params).is_some()
+        {
+            return Err(Unhandled::Shape("a 128-bit integer that finds one register left"));
+        }
         let pointer = context.ptr_type(AddressSpace::default());
         let mut params: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::with_capacity(sig.params.len());
         for param in &sig.params {
