@@ -204,7 +204,16 @@ export class MainView {
     const all = levels.flatMap((l) => l.nodes);
     if (all.length === 0) return;
     const fitMs = follow ? 700 * this.slow : 0;
-    if (follow) this.graph.fitViewByPointIndices(all, fitMs, 0.35, false);
+    if (follow) {
+      // With what it calls and what calls it in view, so the spread is seen where it sits.
+      const m = this.model;
+      const around = new Set(all);
+      for (const i of all) {
+        for (const e of m.out[i]) around.add(m.edges[2 * e + 1]);
+        for (const e of m.inn[i]) around.add(m.edges[2 * e]);
+      }
+      this.graph.fitViewByPointIndices(Array.from(around), fitMs, 0.1, false);
+    }
     levels.forEach((level, d) => {
       this.spreadTimers.push(setTimeout(() => {
         for (const i of level.nodes) this.outlined.add(i);

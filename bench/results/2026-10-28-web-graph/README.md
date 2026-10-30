@@ -183,4 +183,14 @@ The page's own screenshots, on the 80k fixture with its edit records, are in `sc
 - `edit-settled.png`: after the spread.
 - `phases.png`, `crates.png`, `crates-open.png` (the anim crate opened), `search.png`.
 
+## 8. Screenshots of anim
+
+The page served by `blaze ui` while blaze builds anim (69 crates, 79,696 functions, 149,538 calls), in `screens/anim/`. They're 1024x640 in headless Chromium on the lane's x86_64 VM, taken by `live.py`. The page was open before the cold build started and stayed open through two edits of `anim::main`:
+
+- `cold.png`: the cold build finished (218 s), every function lit in its crate's colour.
+- `edit.png`: the second edit's build finished. What it didn't compile is dim. The camera is on the 60 functions the edit reached (at the bottom left) and on what they call, with the calls between them lit.
+- `edit-tab.png`: the Edit tab after the same build. It lists `anim::main` in `src/main.rs`, the one function compiled again in an edited file.
+
+The daemon's RSS after the cold build and both edits was 121 MB in this run, and 167 MB in the run before it. Each REST query of the world (`Crate,(Calls,*)`, `Module`, `Function`) took 1 to 1.5 ms.
+
 `check.py` (`vm-check.sh`) loads the page against hostile input and a live websocket, and checks that each one gives the right error panel or works.
