@@ -64,6 +64,87 @@ pub(crate) fn executable(
     took
 }
 
+/// Writes the archive of a `staticlib` at `archive`: the members of `objects` (an archive's
+/// each), then those of each static library the crates `program` links ask for, but one
+/// that says `-bundle`, as rustc bundles them, looked for where a link of them looks. What
+/// they link shared (`dylib`, a framework) is the user's link's to name. Its index is of the
+/// target's format, as rustc's is (`archive_format`). How long it took.
+pub(crate) fn archive(
+    db: &RootDatabase,
+    program: &[Crate],
+    objects: &[&Path],
+    archive: &Path,
+) -> anyhow::Result<Duration> {
+    let start = Instant::now();
+    let Some(&first) = program.first() else { bail!("nothing to archive") };
+    let target = Target { shared: true, ..Target::of(db, first.into()) };
+    let native = native(db, program, &target);
+    let dirs: Vec<PathBuf> = native
+        .search
+        .iter()
+        .filter_map(|it| it.strip_prefix("-L").or_else(|| it.strip_prefix("/LIBPATH:")))
+        .map(PathBuf::from)
+        .collect();
+    let mut files: Vec<PathBuf> = objects.iter().map(|it| it.to_path_buf()).collect();
+    for lib in native.libs.iter().filter(|it| it.kind == NativeLibKind::Static && it.bundle) {
+        let name = lib.name.as_str();
+        let file = match (lib.verbatim, target.windows) {
+            (true, _) => name.to_owned(),
+            (false, true) => format!("{name}.lib"),
+            (false, false) => format!("lib{name}.a"),
+        };
+        let Some(found) = dirs.iter().map(|it| it.join(&file)).find(|it| it.is_file()) else {
+            bail!(
+                "the static library `{name}` the staticlib bundles, `{file}`, is in none of \
+                 the directories its link is told to look in: {dirs:?}"
+            );
+        };
+        files.push(found);
+    }
+    let read: Vec<(PathBuf, Vec<u8>)> = files
+        .into_iter()
+        .map(|it| std::fs::read(&it).map(|bytes| (it.clone(), bytes)))
+        .collect::<Result<_, _>>()
+        .context("reading what the staticlib archives")?;
+    let mut members = Vec::new();
+    for (path, bytes) in &read {
+        if !split::is_archive(bytes) {
+            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            members.push((name, &bytes[..]));
+            continue;
+        }
+        let parsed = object::read::archive::ArchiveFile::parse(&bytes[..])
+            .with_context(|| format!("reading the archive {}", path.display()))?;
+        for member in parsed.members() {
+            let member = member.with_context(|| format!("reading {}", path.display()))?;
+            let name = String::from_utf8_lossy(member.name()).into_owned();
+            let data = member.data(&bytes[..]).with_context(|| format!("reading {name}"))?;
+            members.push((name, data));
+        }
+    }
+    let members: Vec<ar_archive_writer::NewArchiveMember<'_>> = members
+        .into_iter()
+        .map(|(name, bytes)| {
+            ar_archive_writer::NewArchiveMember::new(
+                bytes,
+                &ar_archive_writer::DEFAULT_OBJECT_READER,
+                name,
+            )
+        })
+        .collect();
+    let kind = match (target.apple, target.windows) {
+        (true, _) => ar_archive_writer::ArchiveKind::Darwin,
+        (_, true) => ar_archive_writer::ArchiveKind::Coff,
+        _ => ar_archive_writer::ArchiveKind::Gnu,
+    };
+    let mut out = std::io::Cursor::new(Vec::new());
+    ar_archive_writer::write_archive_to_stream(&mut out, &members, kind, false, None)
+        .with_context(|| format!("writing the archive {}", archive.display()))?;
+    blaze_cargo::replace(archive, &out.into_inner())
+        .with_context(|| format!("writing {}", archive.display()))?;
+    Ok(start.elapsed())
+}
+
 /// The command that links `objects` into the executable `exe` as [`executable`] does, for a
 /// shell: the daemon's line, which its edits are spliced after.
 pub(crate) fn command(
@@ -252,7 +333,7 @@ impl Line {
         let missing: Vec<_> = self
             .raw_dylibs
             .iter()
-            .filter(|(dll, _)| !system.iter().any(|dir| dir.join(format!("{dll}.lib")).is_file()))
+            .filter(|(dll, _)| !system.iter().any(|dir| dir.join(import_library(dll)).is_file()))
             .collect();
         if missing.is_empty() {
             return Ok(None);
@@ -266,22 +347,22 @@ impl Line {
             let mut names = names.clone();
             names.sort();
             names.dedup();
-            let mut def = format!("LIBRARY {dll}.dll\nEXPORTS\n");
+            let mut def = format!("LIBRARY {dll}\nEXPORTS\n");
             for (name, data) in &names {
                 def.push_str(&format!("  {name}{}\n", if *data { " DATA" } else { "" }));
             }
-            let file = dir.join(format!("{dll}.def"));
+            let file = dir.join(format!("{}.def", dll_stem(dll)));
             std::fs::write(&file, def).with_context(|| format!("writing {}", file.display()))?;
             let ran = Command::new(&tool)
                 .arg("/NOLOGO")
                 .arg(format!("/DEF:{}", file.display()))
-                .arg(format!("/OUT:{}", dir.join(format!("{dll}.lib")).display()))
+                .arg(format!("/OUT:{}", dir.join(import_library(dll)).display()))
                 .arg("/MACHINE:X64")
                 .output()
                 .with_context(|| format!("running {}", tool.display()))?;
             if !ran.status.success() {
                 bail!(
-                    "the import library of {dll}.dll failed: {}",
+                    "the import library of {dll} failed: {}",
                     String::from_utf8_lossy(&ran.stdout)
                 );
             }
@@ -553,14 +634,38 @@ fn raw_dylibs(db: &RootDatabase, krate: base_db::Crate) -> Vec<(String, Vec<(Str
                     _ => {}
                 }
             }
-            let stem = lib.name.as_str().strip_suffix(".dll").unwrap_or(lib.name.as_str());
-            match found.iter_mut().find(|(dll, _)| dll == stem) {
+            let file = raw_dylib_file(lib);
+            // Windows names files whatever their case: `KERNEL32.DLL` is `kernel32.dll`.
+            match found.iter_mut().find(|(dll, _)| dll.eq_ignore_ascii_case(&file)) {
                 Some((_, known)) => known.extend(names),
-                None => found.push((stem.to_owned(), names)),
+                None => found.push((file, names)),
             }
         }
     }
     found
+}
+
+/// The DLL a `raw-dylib` imports from, as rustc names it: a `+verbatim` name as it is written
+/// (`windows-link`'s `api-ms-win-core-synch-l1-2-0.dll`, `ort-sys`'s `SHELL32.DLL`), any other
+/// with `.dll` added.
+fn raw_dylib_file(lib: &NativeLib) -> String {
+    let name = lib.name.as_str();
+    if lib.verbatim { name.to_owned() } else { format!("{name}.dll") }
+}
+
+/// `dll` without its `.dll`: `SHELL32.DLL` is `SHELL32`. Any other suffix stays, since `+verbatim`
+/// may name `plugin.debug` and `plugin.release` as two DLLs, and each needs an import library of
+/// its own.
+fn dll_stem(dll: &str) -> &str {
+    match dll.len().checked_sub(".dll".len()).and_then(|at| dll.split_at_checked(at)) {
+        Some((stem, ext)) if ext.eq_ignore_ascii_case(".dll") => stem,
+        _ => dll,
+    }
+}
+
+/// The import library of `dll`, the system's or the one made of the names imported.
+fn import_library(dll: &str) -> String {
+    format!("{}.lib", dll_stem(dll))
 }
 
 /// What the build script of `krate`'s package printed for the link, as cargo passes it to
@@ -625,11 +730,14 @@ fn lib_of(spec: &str) -> Option<NativeLib> {
     };
     let name = name.split_once(':').map_or(name, |(_, renamed)| renamed);
     let on = |modifier: &str| modifiers.split(',').any(|it| it.strip_prefix('+') == Some(modifier));
+    let off =
+        |modifier: &str| modifiers.split(',').any(|it| it.strip_prefix('-') == Some(modifier));
     (!name.is_empty()).then(|| NativeLib {
         name: intern::Symbol::intern(name),
         kind,
         verbatim: on("verbatim"),
         whole_archive: on("whole-archive"),
+        bundle: !off("bundle"),
     })
 }
 
@@ -766,11 +874,9 @@ impl Target {
             };
         }
         if self.windows {
-            // A `raw-dylib` is linked by the import library made of it, whatever it is named:
-            // `windows-link` names the DLLs of the API sets with `+verbatim` and the extension.
-            let stem = name.strip_suffix(".dll").unwrap_or(name);
+            // A `raw-dylib` is linked by the import library made of it, whatever it is named.
             let file = match (lib.kind, lib.verbatim) {
-                (NativeLibKind::RawDylib, _) => format!("{stem}.lib"),
+                (NativeLibKind::RawDylib, _) => import_library(&raw_dylib_file(lib)),
                 (_, true) => name.to_owned(),
                 _ => format!("{name}.lib"),
             };
@@ -912,18 +1018,26 @@ mod tests {
             apple: false,
             wasm: false,
             windows: true,
-            raw_dylibs: vec![(
-                "api-ms-win-core-test-l1-1-0".to_owned(),
-                vec![("Function".to_owned(), false), ("Data".to_owned(), true)],
-            )],
+            raw_dylibs: vec![
+                (
+                    "api-ms-win-core-test-l1-1-0.dll".to_owned(),
+                    vec![("Function".to_owned(), false), ("Data".to_owned(), true)],
+                ),
+                // `ort-sys`'s `#[link(name = "SHELL32.DLL", kind = "raw-dylib", modifiers =
+                // "+verbatim")]`: the DLL is the name as written, not `SHELL32.DLL.dll`.
+                ("BLAZETEST.DLL".to_owned(), vec![("Upper".to_owned(), false)]),
+            ],
         };
         let exe = dir.join("program.exe");
         let made = line.import_libraries(&[], &exe).unwrap().unwrap();
         let lib = made.join("api-ms-win-core-test-l1-1-0.lib");
         assert!(lib.is_file());
         let def = std::fs::read_to_string(made.join("api-ms-win-core-test-l1-1-0.def")).unwrap();
-        assert!(def.contains("LIBRARY api-ms-win-core-test-l1-1-0.dll"));
+        assert!(def.contains("LIBRARY api-ms-win-core-test-l1-1-0.dll\n"));
         assert!(def.contains("  Function\n") && def.contains("  Data DATA\n"));
+        assert!(made.join("BLAZETEST.lib").is_file());
+        let def = std::fs::read_to_string(made.join("BLAZETEST.def")).unwrap();
+        assert!(def.contains("LIBRARY BLAZETEST.DLL\n"), "{def}");
         // One the system's directories have is not made again.
         assert!(line.import_libraries(&[made], &exe).unwrap().is_none());
         std::fs::remove_dir_all(&dir).unwrap();
@@ -936,8 +1050,34 @@ mod tests {
             kind: NativeLibKind::RawDylib,
             verbatim: true,
             whole_archive: false,
+            bundle: true,
         };
         assert_eq!(windows_target().lib(&dll), ["api-ms-win-core-test-l1-1-0.lib"]);
+        let upper = NativeLib { name: intern::Symbol::intern("SHELL32.DLL"), ..dll.clone() };
+        assert_eq!(windows_target().lib(&upper), ["SHELL32.lib"]);
+        let plain = NativeLib { name: intern::Symbol::intern("ole32"), verbatim: false, ..dll };
+        assert_eq!(windows_target().lib(&plain), ["ole32.lib"]);
+    }
+
+    /// A `raw-dylib`'s DLL is named as rustc names it: `+verbatim` as written, any other with
+    /// `.dll` added.
+    #[test]
+    fn a_raw_dylib_imports_from_the_dll_rustc_names() {
+        let lib = |name, verbatim| NativeLib {
+            name: intern::Symbol::intern(name),
+            kind: NativeLibKind::RawDylib,
+            verbatim,
+            whole_archive: false,
+        };
+        assert_eq!(raw_dylib_file(&lib("SHELL32.DLL", true)), "SHELL32.DLL");
+        assert_eq!(raw_dylib_file(&lib("kernel32.dll", true)), "kernel32.dll");
+        assert_eq!(raw_dylib_file(&lib("ole32", false)), "ole32.dll");
+        assert_eq!(raw_dylib_file(&lib("foo.bar", false)), "foo.bar.dll");
+        assert_eq!(import_library("SHELL32.DLL"), "SHELL32.lib");
+        assert_eq!(import_library("foo.bar.dll"), "foo.bar.lib");
+        // A `+verbatim` suffix other than `.dll` is part of the name, so two DLLs do not share one.
+        assert_eq!(import_library("plugin.debug"), "plugin.debug.lib");
+        assert_eq!(import_library("plugin.release"), "plugin.release.lib");
     }
 
     #[test]
@@ -963,6 +1103,11 @@ mod tests {
             Some(("libz.so.1".to_owned(), NativeLibKind::Dylib, true, false))
         );
         assert_eq!(lib("bogus=x"), None);
+        // A `staticlib` bundles a static library unless it says `-bundle`, as rustc's does.
+        let bundled = |spec| lib_of(spec).map(|it| it.bundle);
+        assert_eq!(bundled("static=z"), Some(true));
+        assert_eq!(bundled("static:+bundle=z"), Some(true));
+        assert_eq!(bundled("static:+whole-archive,-bundle=z"), Some(false));
         let linux = Target {
             apple: false,
             wasm: false,

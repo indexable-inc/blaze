@@ -658,6 +658,9 @@ pub struct NativeLib {
     pub verbatim: bool,
     /// `+whole-archive`: every object of a static library is linked, reached or not.
     pub whole_archive: bool,
+    /// Not `-bundle`: a static library's objects go into the archive of a `staticlib` that
+    /// links it, as rustc's default is.
+    pub bundle: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -678,6 +681,7 @@ fn parse_link_tt(tt: &ast::TokenTree) -> Option<(NativeLib, Option<CfgExpr>)> {
         kind: NativeLibKind::Unspecified,
         verbatim: false,
         whole_archive: false,
+        bundle: true,
     };
     let mut cfg = None;
     let mut named = false;
@@ -720,6 +724,7 @@ fn parse_link_tt(tt: &ast::TokenTree) -> Option<(NativeLib, Option<CfgExpr>)> {
                             match name {
                                 "verbatim" => lib.verbatim = on == "+",
                                 "whole-archive" => lib.whole_archive = on == "+",
+                                "bundle" => lib.bundle = on == "+",
                                 _ => (),
                             }
                         }

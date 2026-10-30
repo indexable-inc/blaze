@@ -126,6 +126,7 @@ pub fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
             0
         }
     };
+    crate::trace::finish();
     std::process::exit(code)
 }
 
@@ -411,11 +412,12 @@ pub fn built(checkout: &Checkout) -> Result<Vec<Result<(), String>>, NotBuilt> {
 /// reads where cargo set none, but those that say what blaze prints of the build: one that
 /// changed would be an edit of every `env!`.
 fn asking(checkout: &Checkout) -> Checkout {
-    let printing = |name: &str| matches!(name, "BLAZE_STATS" | "BLAZE_TRACE" | "BLAZE_TRACE_CONST");
+    let printing =
+        |name: &str| matches!(name, "BLAZE_STATS" | crate::trace::VAR | crate::trace::CONST_VAR);
     let mut env: BTreeMap<String, String> =
         std::env::vars().filter(|(name, _)| !printing(name)).collect();
     env.extend(checkout.env.clone());
-    Checkout { env, ..checkout.clone() }
+    Checkout { env, profile: crate::trace::dir(), ..checkout.clone() }
 }
 
 /// What the store of compiled code holds and may hold, and where it is.

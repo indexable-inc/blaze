@@ -454,6 +454,30 @@ fn is_plain_cfg(cfg: &str) -> bool {
     plain_name && !builtin && plain_value
 }
 
+/// Whether rustc allows unstable features with `RUSTC_BOOTSTRAP` at `bootstrap`, for the crate
+/// `--crate-name` names, on a release whose channel allows them or not: rustc's
+/// `UnstableFeatures::from_environment`. `1`, or a list of crates that has this one, allows
+/// them; `-1` does not; another value, or one that is not text, leaves the channel's default.
+/// `None` for compiletest's `-allow-unstable-compiler-flags=`, which allows only the `-Z`
+/// flags it names.
+fn unstable_allowed(
+    bootstrap: Option<OsString>,
+    crate_name: Option<&str>,
+    channel_nightly: bool,
+) -> Option<bool> {
+    let Some(bootstrap) = bootstrap.and_then(|it| it.into_string().ok()) else {
+        return Some(channel_nightly);
+    };
+    let listed = |name: &str| bootstrap.split(',').any(|it| it == name);
+    Some(match bootstrap.as_str() {
+        it if it.starts_with("-allow-unstable-compiler-flags=") => return None,
+        "1" => true,
+        _ if crate_name.is_some_and(listed) => true,
+        "-1" => false,
+        _ => channel_nightly,
+    })
+}
+
 /// What rustc prints, answering.
 #[derive(Debug, PartialEq)]
 pub struct Answer {
@@ -486,15 +510,6 @@ pub fn answered(
     let args = args.iter().map(|it| it.to_str()).collect::<Option<Vec<_>>>()?;
     let toolchain = Toolchain::ours()?;
     let release = toolchain.release;
-    // Whether unstable features are allowed: always on a nightly (the toolchain blaze is
-    // pinned to), unless `RUSTC_BOOTSTRAP=-1` makes it act as a stable release; a list of
-    // crates is not answered.
-    let nightly = match var("RUSTC_BOOTSTRAP") {
-        None => release.version.contains("-nightly") || release.version.contains("-dev"),
-        Some(it) if it == "1" => true,
-        Some(it) if it == "-1" => false,
-        Some(_) => return None,
-    };
     if !args.is_empty()
         && args.iter().all(|it| matches!(*it, "-V" | "-v" | "-vV" | "--version" | "--verbose"))
     {
@@ -507,6 +522,8 @@ pub fn answered(
         return Some(Answer { stdout: text.into_bytes(), stderr: Vec::new() });
     }
     let given = Given::of(&args)?;
+    let channel_nightly = release.version.contains("-nightly") || release.version.contains("-dev");
+    let nightly = unstable_allowed(var("RUSTC_BOOTSTRAP"), given.crate_name, channel_nightly)?;
     if given.prints.is_empty() || (given.from_stdin && !stdin.trim_ascii().is_empty()) {
         return None;
     }
@@ -797,6 +814,39 @@ mod tests {
         assert!(String::from_utf8(wasm).unwrap().contains("\"arch\": \"wasm32\""));
         let apple = spec("aarch64-apple-darwin", true).expect("an Apple spec under SDKROOT");
         assert_eq!(Some(apple), spec("aarch64-apple-darwin", false));
+    }
+
+    /// servo's `[env]` has `RUSTC_BOOTSTRAP` a list of its crates, which every build script
+    /// that asks `rustc --version` (libc's, rustversion's) is run with.
+    #[test]
+    fn a_list_of_crates_bootstrapped_is_rustcs() {
+        let told = |args: &str, bootstrap: &str| {
+            let args: Vec<OsString> = args.split_whitespace().map(OsString::from).collect();
+            answered(&args, &[], &|name| (name == "RUSTC_BOOTSTRAP").then(|| bootstrap.into()))
+        };
+        let servo = "crown,script,mozjs_sys";
+        for args in ["--version", "-vV"] {
+            assert!(told(args, servo).is_some(), "{args}");
+            assert_eq!(told(args, servo), told(args, "1"), "{args}");
+        }
+        let cfg = |name: &str, bootstrap: &str| {
+            let asked = format!("--crate-name {name} --print cfg -C debug-assertions=on");
+            let said = told(&asked, bootstrap).expect("--print cfg");
+            String::from_utf8(said.stdout).unwrap()
+        };
+        assert_eq!(cfg("script", servo), cfg("script", "1"));
+        assert_eq!(cfg("libc", servo), cfg("libc", "1"));
+        assert_eq!(cfg("libc", "1,"), cfg("libc", "1"));
+        assert!(cfg("libc", "-1").len() < cfg("libc", "1").len());
+        assert_eq!(cfg("script", "-1,script"), cfg("script", "1"));
+        let compiletest = told("--print cfg", "-allow-unstable-compiler-flags=threads");
+        assert!(compiletest.is_none());
+
+        assert_eq!(unstable_allowed(Some("script".into()), Some("script"), false), Some(true));
+        assert_eq!(unstable_allowed(Some("script".into()), Some("libc"), false), Some(false));
+        assert_eq!(unstable_allowed(Some("script".into()), None, true), Some(true));
+        assert_eq!(unstable_allowed(Some("-1".into()), Some("-1"), true), Some(true));
+        assert_eq!(unstable_allowed(None, None, false), Some(false));
     }
 
     #[test]

@@ -1,0 +1,140 @@
+== 0.20261028.9, cold (empty store)
+blaze 0.20261028.9 (399ab12)
+1 old-cold rc=0 wall_ms=63327
+          Loaded workspace in 8.35s
+        Resolved names in 1.72s
+        Compiled 51609 fns in 94 crates, 0 kept; 1m00s
+            Took 1m00s: build scripts 28.8s (3.7/4 cores), codegen 13.6s (3.4/4), workspace 8.76s (2.0/4)
+           Cache cold: the store is empty
+        Finished `dev` profile [blaze] target(s) in 63.32s
+  old-cold pid=2645 rss_mb=56 hwm_mb=61 /home/runner/.cargo/bin/blaze-engine daemon 
+  old-cold pid=2649 rss_mb=4518 hwm_mb=5637 /home/runner/.cargo/bin/blaze-engine /home/runner/work/_temp
+2 old-cold-noop rc=0 wall_ms=125
+        Finished `dev` profile [blaze] target(s) in 0.11s
+3 old-cold-edit1 rc=0 wall_ms=1234
+         Rebuilt 1 fn: main (src/main.rs edited); 1.08s
+            Took 1.08s: codegen anim 0.25s
+        Finished `dev` profile [blaze] target(s) in 1.22s
+  old-cold-edit1 pid=2645 rss_mb=53 hwm_mb=61 /home/runner/.cargo/bin/blaze-engine daemon 
+  old-cold-edit1 pid=2649 rss_mb=3678 hwm_mb=5637 /home/runner/.cargo/bin/blaze-engine /home/runner/work/_temp
+4 old-cold-edit2 rc=0 wall_ms=1003
+         Rebuilt 1 fn: main (src/main.rs edited); 0.87s
+        Finished `dev` profile [blaze] target(s) in 0.99s
+== 0.20261028.10 over 0.20261028.9's store: cold after upgrade
+blaze 0.20261028.10 (c9d702d)
+5 upgrade rc=0 wall_ms=32755
+          Loaded workspace in 6.01s
+        Resolved names in 1.82s
+        Compiled 51609 fns in 94 crates, 0 kept; 32.0s
+            Took 32.0s: codegen 15.1s (3.2/4 cores), workspace 6.25s (1.1/4), build scripts 5.02s (3.1/4)
+           Cache cold: cache keys changed since blaze blaze 0.20261028.9 (399ab12)
+        Finished `dev` profile [blaze] target(s) in 32.75s
+  upgrade pid=7199 rss_mb=55 hwm_mb=62 /home/runner/.cargo/bin/blaze-engine daemon 
+  upgrade pid=7203 rss_mb=4492 hwm_mb=5529 /home/runner/.cargo/bin/blaze-engine /home/runner/work/_temp
+6 upgrade-noop rc=0 wall_ms=9
+        Finished `dev` profile [blaze] target(s) in 0.00s
+7 upgrade-edit1 rc=0 wall_ms=398
+         Rebuilt 1 fn: main (src/main.rs edited); 0.25s
+        Finished `dev` profile [blaze] target(s) in 0.38s
+  upgrade-edit1 pid=7199 rss_mb=54 hwm_mb=62 /home/runner/.cargo/bin/blaze-engine daemon 
+  upgrade-edit1 pid=7203 rss_mb=3658 hwm_mb=5529 /home/runner/.cargo/bin/blaze-engine /home/runner/work/_temp
+8 upgrade-edit2 rc=0 wall_ms=180
+         Rebuilt 1 fn: main (src/main.rs edited); 0.04s
+        Finished `dev` profile [blaze] target(s) in 0.17s
+== 0.20261028.10, fresh daemon, warm store (1)
+9 warm1 rc=0 wall_ms=20441
+          Loaded workspace in 5.62s
+        Resolved names in 0.71s
+            Took 19.7s: codegen 10.5s (1.9/4 cores), workspace 5.89s (1.2/4), link anim 1.86s (0.5/4)
+        Finished `dev` profile [blaze] target(s) in 20.43s
+  warm1 pid=8965 rss_mb=69 hwm_mb=75 /home/runner/.cargo/bin/blaze-engine daemon 
+  warm1 pid=8969 rss_mb=2323 hwm_mb=4163 /home/runner/.cargo/bin/blaze-engine /home/runner/work/_temp
+10 warm1-noop rc=0 wall_ms=11
+        Finished `dev` profile [blaze] target(s) in 0.00s
+11 warm1-edit1 rc=0 wall_ms=538
+         Rebuilt 1 fn: main (src/main.rs edited); 0.40s
+        Finished `dev` profile [blaze] target(s) in 0.52s
+  warm1-edit1 pid=8965 rss_mb=57 hwm_mb=75 /home/runner/.cargo/bin/blaze-engine daemon 
+  warm1-edit1 pid=8969 rss_mb=2082 hwm_mb=4163 /home/runner/.cargo/bin/blaze-engine /home/runner/work/_temp
+12 warm1-edit2 rc=0 wall_ms=193
+         Rebuilt 1 fn: main (src/main.rs edited); 0.05s
+        Finished `dev` profile [blaze] target(s) in 0.18s
+== 0.20261028.10, fresh daemon, warm store (2)
+13 warm2 rc=0 wall_ms=20858
+          Loaded workspace in 5.60s
+        Resolved names in 0.78s
+            Took 20.1s: codegen 11.2s (1.8/4 cores), workspace 5.86s (1.2/4), link anim 1.55s (0.6/4)
+        Finished `dev` profile [blaze] target(s) in 20.85s
+  warm2 pid=10619 rss_mb=59 hwm_mb=67 /home/runner/.cargo/bin/blaze-engine daemon 
+  warm2 pid=10623 rss_mb=2328 hwm_mb=4245 /home/runner/.cargo/bin/blaze-engine /home/runner/work/_temp
+14 warm2-noop rc=0 wall_ms=11
+        Finished `dev` profile [blaze] target(s) in 0.00s
+15 warm2-edit1 rc=0 wall_ms=565
+         Rebuilt 1 fn: main (src/main.rs edited); 0.42s
+        Finished `dev` profile [blaze] target(s) in 0.55s
+  warm2-edit1 pid=10619 rss_mb=54 hwm_mb=67 /home/runner/.cargo/bin/blaze-engine daemon 
+  warm2-edit1 pid=10623 rss_mb=2039 hwm_mb=4245 /home/runner/.cargo/bin/blaze-engine /home/runner/work/_temp
+16 warm2-edit2 rc=0 wall_ms=187
+         Rebuilt 1 fn: main (src/main.rs edited); 0.05s
+        Finished `dev` profile [blaze] target(s) in 0.17s
+== 0.20261028.10, cold (empty store)
+17 cold rc=0 wall_ms=33519
+          Loaded workspace in 6.16s
+        Resolved names in 1.77s
+        Compiled 51609 fns in 94 crates, 0 kept; 32.7s
+            Took 32.7s: codegen 15.1s (3.2/4 cores), workspace 6.40s (1.0/4), build scripts 4.98s (3.7/4)
+           Cache cold: the store is empty
+        Finished `dev` profile [blaze] target(s) in 33.51s
+  cold pid=12276 rss_mb=58 hwm_mb=62 /home/runner/.cargo/bin/blaze-engine daemon 
+  cold pid=12280 rss_mb=4436 hwm_mb=5510 /home/runner/.cargo/bin/blaze-engine /home/runner/work/_temp
+18 cold-noop rc=0 wall_ms=131
+        Finished `dev` profile [blaze] target(s) in 0.12s
+19 cold-edit1 rc=0 wall_ms=1242
+         Rebuilt 1 fn: main (src/main.rs edited); 1.09s
+            Took 1.09s: codegen anim 0.24s
+        Finished `dev` profile [blaze] target(s) in 1.23s
+  cold-edit1 pid=12276 rss_mb=55 hwm_mb=62 /home/runner/.cargo/bin/blaze-engine daemon 
+  cold-edit1 pid=12280 rss_mb=3661 hwm_mb=5510 /home/runner/.cargo/bin/blaze-engine /home/runner/work/_temp
+20 cold-edit2 rc=0 wall_ms=1008
+         Rebuilt 1 fn: main (src/main.rs edited); 0.88s
+        Finished `dev` profile [blaze] target(s) in 1.00s
+== 0.20261028.10, fresh daemon, warm store, BLAZE_MEMORY
+21 warm-memory rc=0 wall_ms=22172
+          Loaded workspace in 5.95s
+        Resolved names in 0.93s
+            Took 21.6s: codegen 10.2s (1.7/4 cores), workspace 6.19s (1.1/4), build scripts 1.84s (3.0/4)
+        Finished `dev` profile [blaze] target(s) in 22.16s
+  warm-memory pid=13939 rss_mb=62 hwm_mb=77 /home/runner/.cargo/bin/blaze-engine daemon 
+  warm-memory pid=13943 rss_mb=2374 hwm_mb=4198 /home/runner/.cargo/bin/blaze-engine /home/runner/work/_temp
+22 warm-memory-noop rc=0 wall_ms=10
+        Finished `dev` profile [blaze] target(s) in 0.00s
+23 warm-memory-edit1 rc=0 wall_ms=503
+         Rebuilt 1 fn: main (src/main.rs edited); 0.37s
+        Finished `dev` profile [blaze] target(s) in 0.49s
+  warm-memory-edit1 pid=13939 rss_mb=55 hwm_mb=77 /home/runner/.cargo/bin/blaze-engine daemon 
+  warm-memory-edit1 pid=13943 rss_mb=2140 hwm_mb=4198 /home/runner/.cargo/bin/blaze-engine /home/runner/work/_temp
+24 warm-memory-edit2 rc=0 wall_ms=173
+         Rebuilt 1 fn: main (src/main.rs edited); 0.04s
+        Finished `dev` profile [blaze] target(s) in 0.16s
+== 0.20261028.10, cold, BLAZE_MEMORY
+25 cold-memory rc=0 wall_ms=34529
+          Loaded workspace in 5.88s
+        Resolved names in 1.68s
+        Compiled 51609 fns in 94 crates, 0 kept; 33.7s
+            Took 33.7s: codegen 15.3s (3.2/4 cores), workspace 6.13s (1.0/4), build scripts 5.08s (3.6/4)
+           Cache cold: the store is empty
+        Finished `dev` profile [blaze] target(s) in 34.52s
+  cold-memory pid=15803 rss_mb=56 hwm_mb=61 /home/runner/.cargo/bin/blaze-engine daemon 
+  cold-memory pid=15807 rss_mb=4425 hwm_mb=5531 /home/runner/.cargo/bin/blaze-engine /home/runner/work/_temp
+26 cold-memory-noop rc=0 wall_ms=127
+        Finished `dev` profile [blaze] target(s) in 0.12s
+27 cold-memory-edit1 rc=0 wall_ms=1239
+         Rebuilt 1 fn: main (src/main.rs edited); 1.09s
+            Took 1.09s: codegen anim 0.25s
+        Finished `dev` profile [blaze] target(s) in 1.23s
+  cold-memory-edit1 pid=15803 rss_mb=55 hwm_mb=61 /home/runner/.cargo/bin/blaze-engine daemon 
+  cold-memory-edit1 pid=15807 rss_mb=3742 hwm_mb=5531 /home/runner/.cargo/bin/blaze-engine /home/runner/work/_temp
+28 cold-memory-edit2 rc=0 wall_ms=1013
+         Rebuilt 1 fn: main (src/main.rs edited); 0.88s
+        Finished `dev` profile [blaze] target(s) in 1.00s
+DONE

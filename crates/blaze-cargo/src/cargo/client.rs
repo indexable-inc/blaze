@@ -286,6 +286,9 @@ fn started(home: &Path, spares: bool) -> anyhow::Result<UnixStream> {
     let log = private_file(OpenOptions::new().create(true).append(true), &home.join("daemon.log"))?;
     let mut daemon = Command::new(std::env::current_exe()?);
     daemon.arg("daemon");
+    // Each build the client asks to profile says so itself (`Checkout::profile`): the
+    // daemon outlives this one.
+    daemon.env_remove(crate::trace::VAR);
     if !spares && std::env::var_os(SPARE).is_none() {
         daemon.env(SPARE, "0");
     }

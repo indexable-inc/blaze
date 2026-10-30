@@ -6,9 +6,9 @@ name: promote
 # itself. Against the archives the release published, installed with install.sh --version as a
 # user installs them, on macOS (Apple silicon) and Linux (x86-64, ARM64): install checks, the
 # whole smoke corpus (harness/smoke.py), and the train (train.yaml, every tier) on the tag. Each
-# application of the corpus's `apps` group (cargo, zed, servo, bun, dynamo, fff, fframes, flox) has
-# two jobs of its own per platform: `works` (dev and release builds run, its tests pass under
-# `blaze test`) and `speed`
+# application of the corpus's `apps` group (cargo, zed, servo, bun, dynamo, fff, fframes, flox,
+# codex) has two jobs of its own per platform: `works` (dev and release builds run, its tests
+# pass under `blaze test`) and `speed`
 # (bench.py: cold, no-op, every edit and the tests faster than cargo on the same runner, nothing
 # otherwise than cargo's, and nothing more than 25% worse than the stable release's numbers, an
 # asset of it). All green: the same release is marked stable and Latest, with a line in its notes
@@ -135,9 +135,12 @@ jobs:
           if [ "${#packages[@]}" -gt 0 ]; then sudo apt-get update -qq && sudo apt-get install -y -qq "${packages[@]}"; fi
       - name: smoke corpus
         env:
-          # anim is private: read with the bot's token.
-          GH_TOKEN: ${{ secrets.BLAZE_BOT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.BLAZE_BOT_TOKEN }}
         run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::the smoke corpus reads GitHub with the secret BLAZE_BOT_TOKEN, which this run does not have"
+            exit 1
+          fi
           export PATH="$CARGO_HOME/bin:$PATH"
           python3 -I harness/smoke.py "{\"blaze_rev\": \"${{ needs.release.outputs.sha }}\", \"work\": \"$RUNNER_TEMP/smoke\", \"results\": \"$RUNNER_TEMP/${{ matrix.os }}.json\"}"
       - if: always()
@@ -207,9 +210,13 @@ jobs:
             nix develop .#bench-bun --command true
             echo "SHELL_OF_APP=nix develop .#bench-bun --command" >> "$GITHUB_ENV"
           fi
-          # bench.py's cargo builds dynamo with its pin (rust-toolchain.toml), as its users do.
-          if [ "$APP" = dynamo ] && [ "$CHECK" = speed ]; then
-            rustup toolchain install 1.96.1 --profile minimal
+          # bench.py's cargo builds dynamo and codex with their pins (rust-toolchain.toml), as
+          # their users do.
+          if [ "$CHECK" = speed ]; then
+            case "$APP" in
+              dynamo) rustup toolchain install 1.96.1 --profile minimal ;;
+              codex) rustup toolchain install 1.99.1 --profile minimal ;;
+            esac
           fi
       - name: ${{ matrix.app }} works
         if: matrix.check == 'works'
@@ -299,11 +306,17 @@ jobs:
               [ -n "$id" ] && break
             done
             [ -n "$id" ] || { echo "::error::the train dispatched on $TAG did not start"; exit 1; }
+            echo "TRAIN_STARTED=$id" >> "$GITHUB_ENV"
           fi
           echo "train: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$id" | tee -a "$GITHUB_STEP_SUMMARY"
           gh run watch "$id" -R "$GITHUB_REPOSITORY" --interval 120 --exit-status > /dev/null
           [ "$(gh run view "$id" -R "$GITHUB_REPOSITORY" --json headBranch -q .headBranch)" = "$TAG" ] ||
             { echo "::error::run $id is not a train on $TAG"; exit 1; }
+      # A train this promote started serves only it: once the promote is cancelled, nothing
+      # reads the train's result, and it would hold the runners and the train group for hours.
+      - name: cancel the train this promote started
+        if: cancelled() && env.TRAIN_STARTED != ''
+        run: gh run cancel "$TRAIN_STARTED" -R "$GITHUB_REPOSITORY"
 
   verdict:
     name: promote or file
