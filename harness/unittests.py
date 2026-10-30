@@ -30,11 +30,7 @@ import dataclasses, json, os, re, shutil, signal, subprocess, sys, threading, ti
 import memory
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CRATES = [
-    "hir-ty-codegen", "blaze-store", "blaze-registry", "blaze-resolve", "blaze-build-script", "blaze-manifest", "blaze-in-place", "blaze-splice", "blaze-cargo", "blaze-engine",
-    "hir-ty", "hir-ty-mir", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "const-ast", "hir-ide", "ide-diagnostics",
-]
-CRATES += ["proc-macro-api"]
+CRATES = ["parser", "syntax", "hir-def", "blaze-store"]
 # What the build job ships blaze with: LLVM as a second code producer.
 FEATURES = ["blaze-engine/llvm"]
 

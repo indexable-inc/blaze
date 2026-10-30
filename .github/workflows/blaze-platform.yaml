@@ -155,8 +155,16 @@ jobs:
         run: sudo apt-get install -y -qq gdb > /dev/null
       - if: env.BLAZE == 'true'
         timeout-minutes: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 335 || startsWith(inputs.os, 'macos') && 220 || 150 }}
+        env:
+          BLAZE_MEMORY: ${{ runner.temp }}/blaze-memory
         run: |
+          mkdir -p "$BLAZE_MEMORY"
           $PYTHON harness/unittests.py '{"args": ["--events", "json"]}'
+      - if: always() && env.BLAZE == 'true' && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: blaze-memory-${{ inputs.os }}
+          path: ${{ runner.temp }}/blaze-memory
       - if: env.BLAZE != 'true'
         run: |
           $PYTHON harness/unittests.py '{"cargo": true}'
