@@ -9,22 +9,29 @@ it links runs for wasm32-wasip1, as cargo runs it for a library built for that t
 (compile_time.rs).
 
 The macro here hashes its input with a C function of `csum`, whose build script compiles it
-with the compiler of `TARGET` (`CC_<target>`, `CC` or `cc`, as cc-rs looks) and archives it
-(`AR_<target>`, `AR` or `ar`). The program prints the hash; blaze's has to print cargo's, with
-the macro expanded natively and as WebAssembly. wasm32-wasip1's compiler is clang and its
-archiver llvm-ar, as cc-rs takes them for a wasm target.
+with the compiler and flags of `TARGET` (`CC_<target>`, `CFLAGS_<target>`, else `CC` or `cc`, as
+cc-rs looks) and archives it (`AR_<target>`, `AR` or `ar`). The C includes libc's headers, as
+zstd's does. The program prints the hash; blaze's has to print cargo's, with the macro expanded
+natively and as WebAssembly. The harness gives no C toolchain for wasm32-wasip1: blaze's own
+(wasi-sdk, docs/c-toolchain.md) compiles it, where the runner's clang found glibc's
+`/usr/include` on Linux and has no wasm32 backend on macOS (promote run 40968467065).
 """
 import os, shutil, subprocess, tempfile
 
 from blaze_cli import base_env
 from checktargets import write
 
-C = r'''unsigned int csum(const unsigned char *bytes, __SIZE_TYPE__ len) {
-    unsigned int hash = 2166136261u;
-    for (__SIZE_TYPE__ i = 0; i < len; i++) {
+C = r'''#include <limits.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+uint32_t csum(const unsigned char *bytes, size_t len) {
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < len && i < (size_t)INT_MAX; i++) {
         hash = (hash ^ bytes[i]) * 16777619u;
     }
-    return hash;
+    return hash + (uint32_t)strlen("");
 }
 '''
 
@@ -33,6 +40,12 @@ BUILD = r'''use std::{env, path::PathBuf, process::Command};
 fn tool(kind: &str, plain: &str) -> String {
     let target = env::var("TARGET").unwrap().replace('-', "_");
     env::var(format!("{kind}_{target}")).or_else(|_| env::var(kind)).unwrap_or(plain.into())
+}
+
+fn flags() -> Vec<String> {
+    let target = env::var("TARGET").unwrap().replace('-', "_");
+    let flags = env::var(format!("CFLAGS_{target}")).or_else(|_| env::var("CFLAGS"));
+    flags.unwrap_or_default().split_whitespace().map(str::to_owned).collect()
 }
 
 fn main() {
@@ -44,6 +57,7 @@ fn main() {
         true => cc.arg(format!("--target={target}")),
         false => cc.arg("-fPIC"),
     };
+    cc.args(flags());
     let compiled = cc.args(["-O2", "-c", "csum.c", "-o"]).arg(&object).status().unwrap();
     assert!(compiled.success(), "compiling csum.c");
     let archive = out.join("libcsum.a");
@@ -79,21 +93,7 @@ MAIN = r'''fn main() {
 '''
 
 
-def wasm_tools():
-    """clang and llvm-ar, which cc-rs takes for a wasm target: an error naming what is missing."""
-    clang = shutil.which("clang")
-    assert clang, "wasmcmacro.py needs clang, the C compiler of wasm32-wasip1"
-    targets = subprocess.run([clang, "--print-targets"], capture_output=True, text=True).stdout
-    assert "wasm32" in targets, f"{clang} has no wasm32 backend:\n{targets}"
-    ar = subprocess.run([clang, "-print-prog-name=llvm-ar"], capture_output=True, text=True)
-    ar = ar.stdout.strip()
-    ar = ar if os.path.isabs(ar) else shutil.which(ar or "llvm-ar")
-    assert ar and os.path.exists(ar), f"no llvm-ar beside {clang}, the archiver of wasm32-wasip1"
-    return clang, ar
-
-
 def main():
-    clang, ar = wasm_tools()
     work = tempfile.mkdtemp(prefix="wasm-c-macro-", dir="/tmp" if os.name != "nt" else None)
     print(f"work: {work}", flush=True)
     at = os.path.join(work, "workspace")
@@ -120,8 +120,10 @@ def main():
         for mode in ("0", "1"):
             base = base_env(os.path.join(work, "home-" + mode))
             base["BLAZE_PROC_MACRO_WASM"] = mode
-            base["CC_wasm32_wasip1"] = clang
-            base["AR_wasm32_wasip1"] = ar
+            for name in ("CC", "AR", "CFLAGS"):
+                for target in ("wasm32_wasip1", "wasm32-wasip1"):
+                    base.pop(f"{name}_{target}", None)
+            base.pop("WASI_SYSROOT", None)
             expected = run(["cargo", "run", "-q"])
             ours = run(["blaze", "run", "-q"])
             assert ours == expected, f"wasm={mode}: {ours!r} != {expected!r}"

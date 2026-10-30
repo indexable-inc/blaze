@@ -72,7 +72,9 @@ What it does not cover:
   hands something to rustc or cargo.
 - The platform's linker and C toolchain: `cc`, `ld`, `lld`, `link.exe`, and the C or C++ a
   build script compiles with the `cc` crate. They are not rustc. blaze runs the linker with a
-  line it works out itself, not with rustc's.
+  line it works out itself, not with rustc's. The C toolchain is becoming blaze's own, pinned
+  as its Rust is ([c-toolchain.md](c-toolchain.md)): the C of build scripts for the wasm32 WASI
+  targets is compiled with it already, and the machine's still compiles the C of the others.
 - blaze's own executable, which is built with cargo and the pinned nightly's rustc. Building
   blaze with blaze is a later goal, not part of this rule.
 - The standard library's source. It is source, and stays an input: blaze's own `library/`
@@ -553,7 +555,8 @@ build of blaze with LLVM (CI's) assembles every block with LLVM's MC assembler i
 whatever the backend; before, only the LLVM backend did. A build without LLVM, which the release
 is, has the platform's C compiler assemble the block, clang for any target or `cc` for the
 host's own, with the text as rustc hands it to its assembler (Intel syntax on x86-64). That is a
-process, but not rustc, and the C toolchain is outside the rule. `BLAZE_ASSEMBLER=cc` picks the
+process, but not rustc, and the C toolchain is outside the rule (until that compiler is blaze's
+pinned clang, [c-toolchain.md](c-toolchain.md#the-compiler)). `BLAZE_ASSEMBLER=cc` picks the
 C compiler in a build with LLVM, and asmedits.py also runs with it in the fast tier.
 
 The rustc that assembled where there was neither LLVM nor a C compiler is gone (the `no-rustc-hl`

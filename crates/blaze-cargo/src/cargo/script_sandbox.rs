@@ -235,6 +235,10 @@ pub fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
     let package = script.package();
     let mut env = with_own_rustc(script.env, script.scratch)?;
     env.retain(|it| it.0 != ROOT);
+    // The C toolchain is blaze's for the targets it pins one for, inside the sandbox or not.
+    let own_c = super::toolchain::c::for_script(script.env)?;
+    let own_c_env = own_c.as_ref().map_or(&[][..], |it| &it.env[..]);
+    env.extend(own_c_env.iter().cloned());
     if !on_in(script.env) {
         return Ok(Plan::Outside(format!("{}=off", crate::sandbox::VAR), env));
     }
@@ -284,6 +288,7 @@ pub fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
     // (one below `/tmp`): the blaze a script runs as its `rustc` reads the standard library's
     // frozen maps from it, and without them makes them again, seconds a probe.
     readable.extend(super::daemon::store().filter(|it| it.is_dir() && emptied(it)));
+    readable.extend(own_c.as_ref().map(|it| it.dir.clone()).filter(|it| emptied(it)));
     // The programs cargo names, and the directories of `PATH`, where a sandbox has empty
     // directories: `RUSTC` is blaze's own, which may be built below `/dev/shm`.
     let var = |name: &str| env.iter().find(|it| it.0 == name).map(|it| it.1.as_str());
@@ -315,6 +320,16 @@ pub fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
             Some(manifest) => hermetic::system_deps(manifest)?,
             None => Default::default(),
         };
+        if own_c.is_some() {
+            anyhow::bail!(
+                "the build script of `{package}` is for {}, whose C blaze compiles with wasi-sdk, \
+                 and a run in its closure alone ({}=on) has none of the C++ runtime its clang \
+                 loads (docs/c-toolchain.md): run it without {1}, or with `{}=given`",
+                script.var("TARGET").unwrap_or("?"),
+                hermetic::VAR,
+                super::toolchain::c::VAR,
+            );
+        }
         let version = script.var("CARGO_PKG_VERSION").unwrap_or("0.0.0");
         let closure = hermetic::closure_for(package, version, &overrides)?;
         let mut also = also;
@@ -407,7 +422,7 @@ pub fn given(name: &str) -> bool {
         "CXXSTDLIB",
         "LC_",
     ];
-    const NAMES: [&str; 29] = [
+    const NAMES: [&str; 30] = [
         "OUT_DIR",
         "TARGET",
         "HOST",
@@ -437,6 +452,7 @@ pub fn given(name: &str) -> bool {
         "LIBRARY_PATH",
         "COMPILER_PATH",
         "GCC_EXEC_PREFIX",
+        "WASI_SYSROOT",
     ];
     const TOOLS: [&str; 25] = [
         "CC",

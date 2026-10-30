@@ -10,6 +10,7 @@
 //! blaze's own copy (`own.rs`), downloaded the first time neither is there. The source of the
 //! standard library is not the release's: it is blaze's own `library/` ([`library`]).
 
+pub mod c;
 pub mod library;
 pub mod own;
 

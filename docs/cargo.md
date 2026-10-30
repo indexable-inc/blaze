@@ -386,6 +386,24 @@ too: clang's module cache, `xcrun`'s and the Metal compiler's live there, are fo
 `confstr` and not by a variable a private one could be named in, and check what they cache.
 Cargo's own rules for running a script again are unchanged.
 
+The C a script compiles for a `wasm32-wasip*` target (`wasm32-wasip1`, its `-threads`,
+`wasm32-wasip2`, `wasm32-wasip3`), the wasm32-wasip1 build of a proc macro's dependencies
+included, is compiled with blaze's own C toolchain, not the machine's
+([c-toolchain.md](c-toolchain.md)): wasi-sdk at the release the pinned nightly builds its
+wasi-libc with, pinned by sha256 in `crates/blaze-cargo/src/cargo/toolchain/c_pins.txt` and
+downloaded once into `~/.blaze/c` (`BLAZE_C_DIST` names a mirror or a directory with the file).
+Such a run, sandboxed or not, is given the target's own variables, `CC_<target>`,
+`CXX_<target>`, `AR_<target>`, `RANLIB_<target>`, `CFLAGS_<target>` and `CXXFLAGS_<target>`
+(`--sysroot` of its wasi sysroot), and `WASI_SYSROOT`, which cc-rs and cmake read before
+`TARGET_CC` and `CC`, so the host's compiler and flags still compile for the host. One of them
+already set by the environment stops the build naming it; `BLAZE_C_TOOLCHAIN=given` leaves the
+C toolchain to the environment, as cargo does. A failed download stops the build: the machine's
+compiler is not used instead. On Linux wasi-sdk's clang loads the machine's `libstdc++.so.6`,
+`libgcc_s.so.1` and `libtinfo.so.6` (NixOS has none of them), and a clang that does not start
+stops the build naming them; a run of `BLAZE_SCRIPT_VIEW=on` for such a target stops too. Every
+other target's C is still compiled with what the
+environment gives, until its step of [c-toolchain.md](c-toolchain.md#steps) lands.
+
 A script that fails having been refused a write or a connection says so under its output:
 
     note: the build script of `sys-crate` failed in the sandbox, which refused it writing `/home/me/ws/sys-crate/src/bindings.rs` (the machine is read-only in a sandbox); if it needs that, run it outside: `unsandboxed-build-scripts = ["sys-crate"]` under `[workspace.metadata.blaze.sandbox]` in /home/me/ws/Cargo.toml (or `build-script = false` under `[package.metadata.blaze.sandbox]` in its own manifest, for a package of the workspace), or `BLAZE_SANDBOX=off` for every build script and test of the command
@@ -649,9 +667,10 @@ In blaze's own target directory, the build script of each library a module links
 for the module, as cargo runs it for a library built for `wasm32-wasip1`: `TARGET` and the
 `CARGO_CFG_*` are that target's, with an `OUT_DIR` of its own (`wasm32-wasip1/out` beside the
 host's), and the `DEP_*` of the other scripts' runs for it. What it compiles of C is then
-WebAssembly, as the module's link needs: zstd-sys compiles zstd with clang for it (a C
-compiler with a `wasm32` backend, and llvm-ar, as cc-rs takes them; `CC_wasm32_wasip1` and
-`AR_wasm32_wasip1` name others). The script of a crate that links `proc_macro` (a proc
+WebAssembly, as the module's link needs: zstd-sys compiles zstd for it with blaze's own
+wasi-sdk, its clang, llvm-ar and wasi sysroot
+([above](#build-scripts-and-proc-macros-run-in-a-sandbox), [c-toolchain.md](c-toolchain.md)),
+whatever C compiler the machine has. The script of a crate that links `proc_macro` (a proc
 macro, proc-macro2), which is not told it is on WASI, runs as for the host, as for rustc's
 build of a proc macro. What the load reads of a package stays the run for the host.
 `harness/wasmcmacro.py` holds a macro that calls such C to cargo's expansion.

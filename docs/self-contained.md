@@ -19,7 +19,9 @@ resolves the project exactly as cargo does. The issue is
 
 What a machine still needs is what any native build needs: a C compiler and linker (`cc` on
 Linux, the Xcode command line tools on macOS), which build scripts and the link use. They are
-outside the rule of [no-rustc.md](no-rustc.md#what-counts-as-running-rustc).
+outside the rule of [no-rustc.md](no-rustc.md#what-counts-as-running-rustc), and are becoming
+blaze's own, pinned ([c-toolchain.md](c-toolchain.md)); the C of build scripts for the wasm32
+WASI targets needs nothing of the machine already.
 
 ## Which Rust a project gets
 

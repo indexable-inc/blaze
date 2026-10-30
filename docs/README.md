@@ -35,6 +35,7 @@ How blaze is now. Kept true: CI checks their links, paths and settings against t
 
 Designs not (fully) built, newest first.
 
+- [c-toolchain.md](c-toolchain.md) (2026-10-30): blaze's own pinned C toolchain and sysroots for the C and C++ that build scripts compile, never the machine's; wasm32 first, then Linux, macOS and Windows.
 - [unit-keys.md](unit-keys.md) (2026-10-29): The store is never wholly cold: each record keyed by what its value depends on, so a new pin or a sandbox change reuses what it did not change.
 - [memory-budget.md](memory-budget.md) (2026-10-29): Memory as a scheduled budget: blaze reads the machine's real limit, admits work by its measured peak, sheds caches under pressure and stops with an error naming what cannot fit, never swapping a machine to death.
 - [linker.md](linker.md) (2026-10-28): blaze's own linker: one patch engine with a lasting layout, writing to a running process or an executable, replacing cc, lld, ld64 and link.exe.

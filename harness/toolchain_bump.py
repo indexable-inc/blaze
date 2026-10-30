@@ -17,7 +17,8 @@ A bump, in order (each step names itself when it fails, and stops there):
     rustc, cargo, rust-std, rust-src, llvm-tools, rustfmt, clippy, rust-analyzer and (but on
     Windows) rustc-codegen-cranelift-preview for every host blaze ships for;
  2. writes harness/toolchain and runs toolchain_pins.py '{"write": true}' (pins.txt: the files' hashes,
-    the nightly's `rustc -V` and its rust-lang/rust commit);
+    the nightly's `rustc -V` and its rust-lang/rust commit) and c_toolchain_pins.py '{"write": true}'
+    (c_pins.txt: the wasi-sdk that commit builds its wasm32 libc with, docs/c-toolchain.md);
  3. re-vendors from rust-lang/rust at the new commit: crates/rustc_abi/src is
     compiler/rustc_abi/src copied as it is, and vendor/proc-macro-srv is upstream's crates at
     the new commit with blaze's changes to them at the old commit carried over (a three-way
@@ -354,6 +355,7 @@ async def bump(date):
     print(f"moving {old[0]} ({old[1]}) to {name} ({channel['pkg']['rustc']['version']})")
     await asyncio.to_thread(Path(PIN).write_text, name + "\n")
     await run("pins", sys.executable, os.path.join(HERE, "toolchain_pins.py"), '{"write": true}', bound=900)
+    await run("c pins", sys.executable, os.path.join(HERE, "c_toolchain_pins.py"), '{"write": true}', bound=300)
     new = pinned()
     await vendor(old[2], new[2])
     await library(date)
@@ -388,6 +390,7 @@ async def checks():
     env.setdefault("BLAZE_BIN", os.path.join(ROOT, "target/release/blaze-engine"))
     harness = [
         ["toolchain_pins.py", "{}"],
+        ["c_toolchain_pins.py", "{}"],
         ["answers.py"],
         ["macroserver.py"],
         ["difftest.py", "corpus", "--bin", "runner", "--crate", "cases", "--layouts"],
