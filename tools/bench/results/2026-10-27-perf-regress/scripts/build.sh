@@ -11,7 +11,7 @@ cd $wt && git checkout -q --force --detach "$rev" && git clean -qfdx -e target
 export CARGO_TARGET_DIR=/root/perf/target CARGO_INCREMENTAL=0
 start=$(date +%s)
 nix develop --command cargo build -j 16 -p blaze-engine --release --features llvm --locked
-nix develop --command bash -c 'export CARGO=$(command -v cargo); python3 .github/scripts/build_release.py --server-beside $CARGO_TARGET_DIR/release/blaze-engine' || { echo "no server at $rev"; mkdir -p "$out"; touch "$out/no-server"; }
+nix develop --command bash -c 'export CARGO=$(command -v cargo); python3 .github/scripts/build_release.py "{\"server_beside\": \"$CARGO_TARGET_DIR/release/blaze-engine\"}"' || { echo "no server at $rev"; mkdir -p "$out"; touch "$out/no-server"; }
 mkdir -p "$out"
 for b in blaze-engine blaze blaze-rustc blaze-proc-macro-srv; do
   [ -f $CARGO_TARGET_DIR/release/$b ] && cp $CARGO_TARGET_DIR/release/$b "$out/"
