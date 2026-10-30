@@ -373,11 +373,14 @@ pub fn layout_of_ty_query(
                     trait_env.clone(),
                 )
             }
-            .map_err(|_| LayoutError::Unknown)?;
+            .map_err(|e| {
+                eprintln!("D1DEBUG coroutine {id:?} mir error: {e:?}");
+                LayoutError::Unknown
+            })?;
             let held = body.locals_held_across_yields();
             let upvars = rustc_type_ir::inherent::Ty::tuple_fields(args.tupled_upvars_ty())
                 .iter()
-                .map(|ty| db.layout_of_ty(ty.store(), trait_env.clone()))
+                .map(|ty| db.layout_of_ty(ty.store(), trait_env.clone()).inspect_err(|e| eprintln!("D1DEBUG coroutine {id:?} upvar {ty:?}: {e:?}")))
                 .collect::<Result<Vec<_>, _>>()?;
             // Each local is a `MaybeUninit` of its type, as rustc has it: nothing of it is a
             // niche.
@@ -385,7 +388,7 @@ pub fn layout_of_ty_query(
                 .locals
                 .iter()
                 .map(|&local| {
-                    let of = db.layout_of_ty(body.locals[local].ty.clone(), trait_env.clone())?;
+                    let of = db.layout_of_ty(body.locals[local].ty.clone(), trait_env.clone()).inspect_err(|e| eprintln!("D1DEBUG coroutine {id:?} local {:?} layout: {e:?}", body.locals[local].ty.as_ref()))?;
                     let mut layout = LayoutData::unit(dl, true);
                     layout.size = of.size;
                     layout.align = of.align;

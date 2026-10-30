@@ -72,6 +72,9 @@ impl<'db> InferenceContext<'db> {
             *entry = self.resolve_vars_if_possible(*entry);
         }
         debug!(?opaque_types);
+        if std::env::var_os("D1DEBUG").is_some() {
+            eprintln!("D1DEBUG opaque uses {:?} owner {:?}", opaque_types, self.owner);
+        }
 
         let interner = self.interner();
         let TypingMode::Analysis { defining_opaque_types_and_generators } =
@@ -111,9 +114,16 @@ impl<'db> InferenceContext<'db> {
                     let expected = EarlyBinder::bind(ty.ty)
                         .instantiate(interner, opaque_type_key.args)
                         .skip_norm_wip();
-                    _ = self.demand_eqtype_fixme_no_diag(expected, hidden_type.ty);
+                    let r = self.demand_eqtype_fixme_no_diag(expected, hidden_type.ty);
+                    if std::env::var_os("D1DEBUG").is_some() {
+                        let after = self.resolve_vars_if_possible(hidden_type.ty);
+                        eprintln!("D1DEBUG eq {expected:?} with {:?}: {r:?} -> {after:?}", hidden_type.ty);
+                    }
                 }
 
+                if std::env::var_os("D1DEBUG").is_some() {
+                    eprintln!("D1DEBUG defining {def_id:?} = {:?}", ty.ty);
+                }
                 self.result.type_of_opaque.insert(def_id, ty.ty.store());
 
                 continue;

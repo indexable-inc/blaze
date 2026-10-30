@@ -263,6 +263,13 @@ fn infer_finalize<'db>(mut ctx: InferenceContext<'db>) -> InferenceResult<'db> {
 
     ctx.handle_opaque_type_uses();
 
+    // Applying the defining use to the other uses of an opaque only equates their hidden types;
+    // what was waiting on those types (a coercion of a recursive call's future into
+    // `Box::pin`'s parameter, say) still has to be selected, or writeback would leave its
+    // variables unresolved. rustc selects here too, at the start of
+    // `drain_stalled_coroutine_obligations`.
+    ctx.table.select_obligations_where_possible();
+
     ctx.merge_anon_consts();
 
     ctx.resolve_all()

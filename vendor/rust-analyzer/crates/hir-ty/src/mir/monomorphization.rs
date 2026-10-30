@@ -193,8 +193,10 @@ impl<'db> Filler<'db> {
 
     fn fill_ty(&mut self, t: &mut StoredTy) -> Result<(), MirLowerError<'db>> {
         // Can't deep normalized as that'll try to normalize consts and fail.
+        let before = format!("{:?}", t.as_ref());
         *t = t.as_ref().try_fold_with(self)?.store();
         if references_non_lt_error(&t.as_ref()) {
+            eprintln!("D1DEBUG fill_ty before {before}");
             Err(MirLowerError::NotSupported(format!(
                 "monomorphization resulted in errors: {:?}",
                 t.as_ref()
