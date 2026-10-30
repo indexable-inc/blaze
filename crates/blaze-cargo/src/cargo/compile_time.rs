@@ -82,7 +82,11 @@ pub fn build(
     let mut driver =
         Driver::new(cargo, &graph, &toolchain, host, &own, manifest, selection, config)?;
     driver.native = native;
-    let ran = driver.run()?;
+    let home = super::daemon::home()?;
+    let held = super::builders::hold(&home, &own.join("builders")).map_err(anyhow::Error::msg)?;
+    let ran = driver.run();
+    drop(held);
+    let ran = ran?;
     Ok(driver.outputs(&ran))
 }
 

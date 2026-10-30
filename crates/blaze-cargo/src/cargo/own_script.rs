@@ -436,6 +436,9 @@ fn built(
     let inputs = dir.join("blaze-inputs");
     if made.wasm {
         super::own_macro::wasm_target(sysroot)?;
+    } else if super::builders::held() {
+        // The builder's first build makes the standard library once, for all the others.
+        fetched();
     } else if let Some(store) = super::daemon::store() {
         standard_library_once(sysroot, &store, &dir.join("standard-library"))?;
     }
@@ -593,43 +596,56 @@ fn build(
     std::fs::create_dir_all(dir).map_err(|it| it.to_string())?;
     let project = dir.join("rust-project.json");
     std::fs::write(&project, described).map_err(|it| it.to_string())?;
-    let mut blaze = Command::new(std::env::current_exe().map_err(|it| it.to_string())?);
-    blaze.arg(&project).args(["--crate", made.name]).arg("--out").arg(dir.join("built.o"));
-    blaze.arg("--exe").arg(&made.exe).arg("--dep-info").arg(&made.dep_info);
-    if let Some(inputs) = inputs {
-        blaze.arg("--inputs").arg(inputs);
+    let mut crates = vec![made.name];
+    if made.proc_macro || proc_macro {
+        crates.push("proc_macro");
     }
-    if made.proc_macro {
-        blaze.args(["--crate", "proc_macro", "--shared"]);
-    } else if proc_macro {
-        blaze.args(["--crate", "proc_macro"]);
-    }
-    if made.wasi {
-        blaze.args(["--target", crate::RUN_TOOL_TARGET, "--run-tool"]);
-    } else if made.wasm {
-        blaze.args(["--target", super::own_macro::WASM_TARGET]);
-    }
+    let kind = match () {
+        _ if made.wasi => vec!["--target", crate::RUN_TOOL_TARGET, "--run-tool"],
+        _ if made.wasm => vec!["--target", super::own_macro::WASM_TARGET],
+        _ => Vec::new(),
+    };
     // What cargo set for the script's rustc is not the build's: the build blaze runs is its
     // own, which asks cargo nothing through a wrapper and is no doctest.
-    for (name, _) in std::env::vars_os() {
-        let text = name.to_string_lossy();
-        let cargos = text.starts_with("CARGO_") && text != "CARGO_HOME";
-        if cargos || text.starts_with("RUSTC_") || text.starts_with("BLAZE_") || text == "CARGO" {
-            blaze.env_remove(&name);
-        }
-    }
+    let mut env: BTreeMap<String, String> = std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(name, _)| {
+            let cargos = name.starts_with("CARGO_") && name != "CARGO_HOME";
+            !(cargos || name.starts_with("RUSTC_") || name.starts_with("BLAZE_") || name == "CARGO")
+        })
+        .collect();
     for kept in ["BLAZE_HOME", "BLAZE_BACKEND", "BLAZE_STD_FROM", super::own_macro::SERVER] {
-        if let Some(value) = std::env::var_os(kept) {
-            blaze.env(kept, value);
+        if let Ok(value) = std::env::var(kept) {
+            env.insert(kept.to_owned(), value);
         }
     }
     if let Some(store) = store {
-        blaze.env("BLAZE_CACHE", store);
+        let store = store.to_str().ok_or("the store's directory is not named in text")?;
+        env.insert("BLAZE_CACHE".to_owned(), store.to_owned());
     }
     // No release ships the standard library for wasm32-wasip1, nor with blaze's `std::process`.
     if !shipped || made.wasi || made.wasm {
-        blaze.env("BLAZE_STD_FROM", "off");
+        env.insert("BLAZE_STD_FROM".to_owned(), "off".to_owned());
     }
+    let out = dir.join("built.o");
+    let asked = super::builders::Asked {
+        project: &project,
+        crates,
+        out: &out,
+        exe: &made.exe,
+        dep_info: &made.dep_info,
+        inputs,
+        shared: made.proc_macro,
+        kind,
+        env,
+    };
+    if let Some(built) = super::builders::build(&asked) {
+        let said = built.as_ref().unwrap_or_else(|why| why);
+        std::fs::write(dir.join("blaze.log"), said).map_err(|it| it.to_string())?;
+        return built;
+    }
+    let mut blaze = Command::new(std::env::current_exe().map_err(|it| it.to_string())?);
+    blaze.args(asked.flags()).env_clear().envs(&asked.env);
     blaze.current_dir(dir).stdin(Stdio::null()).stdout(Stdio::null());
     let built = blaze.output().map_err(|it| format!("blaze did not run: {it}"))?;
     let said = String::from_utf8_lossy(&built.stderr).into_owned();
