@@ -217,7 +217,12 @@ Each lands as its own pull request with its tests.
 
 1. **wasm32**, what breaks the gate: wasi-sdk 34.0 pinned for the four hosts blaze ships,
    fetched once, given to every build script of a `wasm32-wasi*` target, the opt-out and the
-   error above; then zed's gate run.
+   error above; then zed's gate run. Built (`crates/blaze-cargo/src/cargo/toolchain/c.rs`);
+   checked on 2026-10-30 in an ix VM (NixOS, arm64, no clang installed, the C++ runtime given
+   through nix-ld): `harness/wasmcmacro.py`, whose C includes `limits.h`, `stdint.h` and
+   `string.h`, prints cargo's output with the macro expanded as WebAssembly, and the three
+   errors (no C++ runtime, `CC_wasm32_wasip1` set, `BLAZE_C_TOOLCHAIN=given` with no wasm
+   compiler) say what they should. zed in the gate is still to confirm.
 2. **wasm32 freestanding**: `wasm32-unknown-unknown` and `wasm32v1-none` with the same clang and
    no sysroot.
 3. **blaze's clang**: `llvm.py` builds clang and lld with the WebAssembly target, a tools archive
