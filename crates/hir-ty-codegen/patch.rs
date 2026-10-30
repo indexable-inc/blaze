@@ -1230,7 +1230,7 @@ impl FromStore {
             return from;
         };
         let owned = &cg.own_statics.crates;
-        from.ids = super::linked_crates(db, owned.iter().copied())
+        from.ids = super::linked_crates(db, cg.symbols, owned.iter().copied())
             .into_iter()
             .filter(|krate| owned.contains(krate) || krate.data(db).origin.is_local())
             .filter_map(|krate| Some((krate, cg.names.content_id(krate)?)))

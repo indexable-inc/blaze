@@ -386,26 +386,47 @@ impl<'db> Evaluator<'db> {
         _locals: &Locals<'db>,
         _span: MirSpan,
     ) -> Result<'db, ()> {
-        match id {
-            318 => {
-                // SYS_getrandom
-                let [buf, len, _flags] = args else {
-                    return Err(MirEvalError::InternalError(
-                        "SYS_getrandom args are not provided".into(),
-                    ));
-                };
-                let addr = Address::from_bytes(buf.get(self)?)?;
-                let size = from_bytes!(usize, len.get(self)?);
-                for i in 0..size {
-                    let rand_byte = self.random_state.rand_u64() as u8;
-                    self.write_memory(addr.offset(i), &[rand_byte])?;
-                }
-                destination.write_from_interval(self, len.interval)
-            }
-            _ => {
-                not_supported!("Unknown syscall id {id:?}")
-            }
+        if id == self.sys_getrandom()? {
+            let [buf, len, _flags] = args else {
+                return Err(MirEvalError::InternalError(
+                    "SYS_getrandom args are not provided".into(),
+                ));
+            };
+            let addr = Address::from_bytes(buf.get(self)?)?;
+            let size = from_bytes!(usize, len.get(self)?);
+            self.fill_random(addr, size)?;
+            return destination.write_from_interval(self, len.interval);
         }
+        not_supported!("Unknown syscall id {id:?}")
+    }
+
+    /// The number of `getrandom` in the Linux system call table of the crate's `target_arch`
+    /// (the kernel's `unistd.h`): the generic table's, but on the architectures with a table
+    /// of their own.
+    fn sys_getrandom(&self) -> Result<'db, i64> {
+        let cfg = self.crate_id.cfg_options(self.db);
+        let Some(arch) = cfg.get_cfg_values("target_arch").next() else {
+            return Err(MirEvalError::InternalError(
+                "a system call in a crate with no `target_arch`".into(),
+            ));
+        };
+        Ok(match arch.as_str() {
+            // x32, x86-64 with 32-bit pointers, sets `__X32_SYSCALL_BIT` in every number.
+            "x86_64" if self.ptr_size() == 4 => 0x4000_0000 + 318,
+            "x86_64" => 318,
+            "x86" => 355,
+            "arm" => 384,
+            "aarch64" | "riscv64" | "riscv32" | "loongarch64" => 278,
+            other => not_supported!("the number of the system call `getrandom` on {other}"),
+        })
+    }
+
+    fn fill_random(&mut self, addr: Address, size: usize) -> Result<'db, ()> {
+        for i in 0..size {
+            let rand_byte = self.random_state.rand_u64() as u8;
+            self.write_memory(addr.offset(i), &[rand_byte])?;
+        }
+        Ok(())
     }
 
     fn exec_extern_c(
@@ -515,6 +536,19 @@ impl<'db> Evaluator<'db> {
                 // return 0 as success
                 destination.write_from_bytes(self, &0u64.to_le_bytes()[0..destination.size])?;
                 Ok(())
+            }
+            "CCRandomGenerateBytes" => {
+                // Apple's CommonCrypto: `CCRNGStatus CCRandomGenerateBytes(void *, size_t)`,
+                // `kCCSuccess` (0) when it filled the buffer.
+                let [buf, len] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "CCRandomGenerateBytes args are not provided".into(),
+                    ));
+                };
+                let addr = Address::from_bytes(buf.get(self)?)?;
+                let size = from_bytes!(usize, len.get(self)?);
+                self.fill_random(addr, size)?;
+                destination.write_from_bytes(self, &0i32.to_le_bytes()[0..destination.size])
             }
             "syscall" => {
                 let Some((id, rest)) = args.split_first() else {

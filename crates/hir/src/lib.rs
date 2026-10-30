@@ -25,6 +25,7 @@ extern crate rustc_type_ir;
 mod attrs;
 mod from_id;
 mod has_source;
+mod named;
 mod semantics;
 mod source_analyzer;
 
@@ -150,6 +151,7 @@ pub use crate::{
     attrs::{AttrsWithOwner, HasAttrs, resolve_doc_path_on},
     diagnostics::*,
     has_source::HasSource,
+    named::named_dependencies,
     semantics::{
         LintAttr, PathResolution, PathResolutionPerNs, Semantics, SemanticsImpl, SemanticsScope,
         TypeInfo, VisibleTraits,

@@ -39,7 +39,7 @@ impl Mixed {
         symbols: &dyn SymbolResolver,
         built: &FxHashSet<Crate>,
     ) -> Option<Mixed> {
-        let program = super::linked_crates(db, built.iter().copied());
+        let program = super::linked_crates(db, symbols, built.iter().copied());
         let crates: Vec<(Crate, bool)> = program
             .iter()
             .filter_map(|&krate| Some((krate, crate_checks_overflow(db, krate)?)))

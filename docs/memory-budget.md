@@ -182,7 +182,9 @@ section 6, never killed by the kernel and never into swap.
 2. The limit (section 1): one budget, `memory.high`, what others hold, said at start (#1516).
 3. The cause of 2026-10-29 under a first bound: the bootstrap with #1482 (#1538), and the
    programs a worker builds side by side admitted by the budget
-   (`crates/blaze-engine/src/admit.rs`): a program not yet measured in the worker runs alone,
+   (`crates/blaze-engine/src/admit.rs`; #1539 added it without calling it, the worker calls it
+   since the pull request after, which names each program by the object its client asked
+   for): a program not yet measured in the worker runs alone,
    and its peak, the most more than at its start the worker held while it ran (read every
    100 ms), is its prediction afterwards. Measured in the worker's memory only, not yet in the
    store, so a new worker runs each program alone once.

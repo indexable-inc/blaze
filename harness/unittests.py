@@ -102,6 +102,59 @@ class Watch:
         self.dirs, self.peak, self.at_peak, self._stop = dirs, 0, None, threading.Event()
         self.began = time.monotonic()
         self.cpu, self.cpu_shown, self.idle_since, self.dumped = {}, {}, None, False
+        self.read_to, self.tailed = {}, False
+
+    # Swap in use, in MB, past which the end of each blaze log is said once: what the daemon and
+    # its workers were doing when the machine ran out of memory.
+    SWAPPING = 2048
+
+    def tails(self, count=80):
+        home = self.blaze_home()
+        for at, _, files in os.walk(home):
+            for name in files:
+                if name not in ("log", "daemon.log"):
+                    continue
+                log = os.path.join(at, name)
+                try:
+                    with open(log, "rb") as f:
+                        lines = f.read().decode(errors="replace").splitlines()[-count:]
+                except OSError:
+                    continue
+                print(f"::group::the end of {os.path.relpath(log, home)}, the machine swapping", flush=True)
+                print("\n".join(lines), flush=True)
+                print("::endgroup::", flush=True)
+
+    # Lines of the daemon's and its workers' logs that are said in the run's: they are files the
+    # CI log does not have, and a runner that is lost takes them with it.
+    SAID = re.compile(r"memory|over budget|not compiling the program")
+
+    @staticmethod
+    def blaze_home():
+        """Where the daemon keeps its log and its workers', as `daemon::home` says."""
+        if os.environ.get("BLAZE_HOME"):
+            return os.environ["BLAZE_HOME"]
+        if os.environ.get("XDG_RUNTIME_DIR"):
+            return os.path.join(os.environ["XDG_RUNTIME_DIR"], "blaze")
+        return os.path.expanduser("~/.cache/blaze")
+
+    def logged(self):
+        """The lines of the blaze logs, new since the last call, that `SAID` matches."""
+        home = self.blaze_home()
+        logs = [os.path.join(home, "daemon.log")]
+        for at, _, files in os.walk(home):
+            logs += [os.path.join(at, it) for it in files if it == "log"]
+        said = []
+        for log in logs:
+            try:
+                with open(log, "rb") as f:
+                    f.seek(self.read_to.get(log, 0))
+                    text = f.read()
+                    self.read_to[log] = f.tell()
+            except OSError:
+                continue
+            name = os.path.relpath(log, home)
+            said += [f"{name}: {line}" for line in text.decode(errors="replace").splitlines() if self.SAID.search(line)]
+        return said
 
     # A run whose blaze-engines use less than this share of one core for `STILL` seconds is stuck:
     # the threads of its blaze-engines are dumped and the run is stopped.
@@ -163,6 +216,12 @@ class Watch:
     def _loop(self):
         while not self._stop.wait(self.EVERY):
             print(self.line(), flush=True)
+            for line in self.logged():
+                print(f"blaze log: {line}", flush=True)
+            machine = memory.system_mb()
+            if not self.tailed and machine and machine["swap_used"] > self.SWAPPING:
+                self.tailed = True
+                self.tails()
             if not self.dumped and self.stuck(time.monotonic()):
                 self.dumped = True
                 self.dump()

@@ -635,13 +635,28 @@ fn build(
     let said = String::from_utf8_lossy(&built.stderr).into_owned();
     std::fs::write(dir.join("blaze.log"), &said).map_err(|it| it.to_string())?;
     if !built.status.success() {
-        // The error, of as many lines as it has, or else the last line.
-        let error = said.rfind("\nError: ").map(|at| said[at + 1..].trim_end());
-        let last = said.lines().rev().find(|it| !it.trim().is_empty()).unwrap_or("");
-        let last = error.unwrap_or(last);
-        return Err(format!("blaze did not build it ({}): {last}", built.status));
+        let log = dir.join("blaze.log");
+        return Err(format!(
+            "blaze did not build it ({}): {} (all it said is in {})",
+            built.status,
+            failure(&said),
+            log.display()
+        ));
     }
     Ok(said)
+}
+
+/// Why a build of blaze that failed with `said` on its stderr failed: the panic of a thread
+/// ([`super::daemon::last_panic`]), which the note on backtraces after it would hide as the
+/// last line, else the error, of as many lines as it has, else the last line.
+fn failure(said: &str) -> &str {
+    if let Some(panic) = super::daemon::last_panic(said) {
+        return panic;
+    }
+    if let Some(at) = said.rfind("\nError: ") {
+        return said[at + 1..].trim_end();
+    }
+    said.lines().rev().find(|it| !it.trim().is_empty()).unwrap_or("")
 }
 
 /// How many fetches of the standard library a release ships are under way in this process
@@ -829,6 +844,19 @@ fn described(krate: &Described, member: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gate's dynamo jobs said the note on backtraces, the last line, of a build that
+    /// panicked.
+    #[test]
+    fn a_failed_build_says_its_panic_else_its_error_else_its_last_line() {
+        let said = "thread 'w' panicked at a.rs:1:2:\nno layout\n\
+                    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n";
+        assert_eq!(failure(said), "thread 'w' panicked at a.rs:1:2:\nno layout");
+        let error = "   Compiling x\nError: no `foo`\n  in bar\n";
+        assert_eq!(failure(error), "Error: no `foo`\n  in bar");
+        assert_eq!(failure("one\ntwo\n\n"), "two");
+        assert_eq!(failure(""), "");
+    }
 
     #[test]
     fn generated_compile_time_inputs_are_keyed_by_names_and_contents() {

@@ -314,6 +314,9 @@ pub enum RustcStaticCopy {
 
 pub trait SymbolResolver {
     fn function(&self, func: FunctionId) -> Option<String>;
+    /// The dependencies of `krate` its code names, as rustc loads them: those a program of it
+    /// links. Every one, for a crate of the standard library.
+    fn named_dependencies(&self, krate: Crate) -> Vec<Crate>;
     fn static_(&self, id: StaticId) -> Option<String>;
     /// What rustc's copy under `symbol`, which [`Self::static_`] named, is to ours, when
     /// that is not simply the whole static.
@@ -1339,7 +1342,7 @@ impl OwnStatics {
         // With on-demand roots the build is of a program whose `main` is in `crates`, and only
         // what that depends on is linked. Without, anything may be linked on top.
         let program: FxHashSet<Crate> = if is_program {
-            linked_crates(db, crates.iter().copied())
+            linked_crates(db, symbols, crates.iter().copied())
         } else {
             base_db::all_crates(db).iter().copied().collect()
         };
@@ -3051,18 +3054,20 @@ fn root_code(db: &dyn HirDatabase, func: FunctionId, tier: bool) -> Result<Produ
     })
 }
 
-/// The crates of a program of `crates`: what they depend on, but not through a proc macro,
-/// which is a library of the compiler's.
+/// The crates of a program of `crates`: what they name ([`SymbolResolver::named_dependencies`]),
+/// and what that names in turn, but not through a proc macro, which is a library of the
+/// compiler's.
 fn linked_crates(
     db: &dyn HirDatabase,
+    symbols: &dyn SymbolResolver,
     crates: impl IntoIterator<Item = Crate>,
 ) -> FxHashSet<Crate> {
     let mut linked = FxHashSet::default();
     let mut stack: Vec<Crate> = crates.into_iter().collect();
     while let Some(krate) = stack.pop() {
         if linked.insert(krate) {
-            let deps = krate.data(db).dependencies.iter().map(|it| it.crate_id);
-            stack.extend(deps.filter(|it| !it.data(db).target_kind.is_proc_macro()));
+            let deps = symbols.named_dependencies(krate);
+            stack.extend(deps.into_iter().filter(|it| !it.data(db).target_kind.is_proc_macro()));
         }
     }
     linked
@@ -5744,7 +5749,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let Some(boxed) = DbInterner::new_with(db, krate).lang_items().OwnedBox else {
             return Ok(());
         };
-        let program = linked_crates(db, self.own_statics.crates.iter().copied());
+        let program = linked_crates(db, self.symbols, self.own_statics.crates.iter().copied());
         if !program.contains(&boxed.krate(db)) {
             return Ok(());
         }

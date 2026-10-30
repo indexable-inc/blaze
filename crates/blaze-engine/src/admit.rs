@@ -66,6 +66,14 @@ pub(crate) fn admit(db: &RootDatabase, program: &Path) -> anyhow::Result<Grant> 
         let measured = ledger.peaks.get(program).copied();
         let bytes = measured.map_or(u64::MAX, |it| it.saturating_add(it / 4));
         if fits(ledger.running, held, ledger.granted, bytes, budget.as_ref().map(|it| it.bytes)) {
+            if ledger.running > 0 {
+                eprintln!(
+                    "memory: building {} beside {} others, {} MB more predicted",
+                    program.display(),
+                    ledger.running,
+                    bytes >> 20
+                );
+            }
             let alone = (ledger.running == 0).then(|| {
                 ledger.peak = held;
                 (held, ledger.begun + 1)
@@ -116,6 +124,11 @@ impl Drop for Grant {
             && ledger.begun == begun
         {
             let peak = ledger.peak.max(held).saturating_sub(start);
+            eprintln!(
+                "memory: {} built alone, holding {} MB more at most",
+                self.program.display(),
+                peak >> 20
+            );
             ledger.peaks.insert(std::mem::take(&mut self.program), peak);
         }
         FREED.notify_all();
