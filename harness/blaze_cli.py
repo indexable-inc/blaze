@@ -446,6 +446,28 @@ def linked_for_loads(ws):
     return linked
 
 
+def store_use(text):
+    """What the builds a worker logged in `text` took from the store and what they made
+    again: functions compiled and reused, entries found and not, build-script and proc-macro
+    steps kept, and whether a build manifest was used and why not."""
+    total = lambda pattern: sum(int(n) for n in re.findall(pattern, text, re.M))
+    return dict(functions_compiled=total(r"^stats: (\d+) of \d+ functions compiled"),
+                functions_reused=total(r"^stats: \d+ of \d+ functions compiled, (\d+) reused"),
+                entries_found=total(r"^entries: (\d+) found"),
+                entries_missed=total(r'^not found: .*?\("no entry", (\d+)\)'),
+                steps_kept=total(r"^compile-time steps: (\d+) of \d+ kept"),
+                steps=total(r"^compile-time steps: \d+ of (\d+) kept"),
+                manifest_used=len(re.findall(r"^manifest: \d+ files of the program from the store", text, re.M)),
+                manifest_missed=re.findall(r"^manifest: none used, (.*?) \(", text, re.M))
+
+
+def worker_logs(home):
+    """What every worker of the daemon of `home` logged."""
+    workers = os.path.join(home, "workers")
+    logs = [os.path.join(workers, it, "log") for it in sorted(os.listdir(workers))] if os.path.isdir(workers) else []
+    return "".join(open(log, errors="replace").read() for log in logs if os.path.exists(log))
+
+
 def wait_warm(side, root):
     """Waits until the daemon has every build of `root` loaded or has given up on one. The
     result is the seconds it took and how each ended."""

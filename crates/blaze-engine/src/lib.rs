@@ -190,6 +190,9 @@ struct Args {
     /// The root of the workspace `project` is in. Another checkout has crates of the same
     /// names, and the ones to build are the ones below this.
     checkout: PathBuf,
+    /// The workspace that a build of a description (a build script's or proc macro's) names
+    /// its files from in place of `checkout`, as cargo has rustc name a member's.
+    names_from: Option<PathBuf>,
     /// The loaded checkout that `checkout` reads the packages from that are the same in both.
     base: Option<PathBuf>,
     /// The crates of `checkout`. One that is the same in another checkout is of both.
@@ -275,6 +278,7 @@ impl Args {
         let mut asked_in = None;
         let mut also = Vec::new();
         let mut target = None;
+        let mut names_from = None;
         while let Some(arg) = args.next() {
             let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
             match arg.as_str() {
@@ -330,6 +334,7 @@ impl Args {
                 "--profile" => profile = Some(value()?),
                 "--config" => config.push(value()?),
                 "--asked-in" => asked_in = Some(PathBuf::from(value()?)),
+                "--names-from" => names_from = Some(PathBuf::from(value()?)),
                 _ if project.is_none() => project = Some(PathBuf::from(arg)),
                 _ => bail!("unexpected argument {arg}"),
             }
@@ -391,6 +396,7 @@ impl Args {
             lints_capped: false,
             link_args: Vec::new(),
             checkout: PathBuf::new(),
+            names_from,
             base: None,
             members: Arc::default(),
         })
@@ -820,7 +826,8 @@ impl<'a> Resolver<'a> {
             .as_deref()
             .filter(|_| table.is_empty() && args.patch.is_some())
             .and_then(splice::kept_names);
-        let (root, base) = (args.checkout.clone(), args.base.clone());
+        let root = args.names_from.clone().unwrap_or_else(|| args.checkout.clone());
+        let base = args.base.clone();
         let debug = args.debug;
         let apart = (debug.kept != plan::Kept::Linked).then(|| args.out.clone());
         let named = (root.clone(), base.clone());
@@ -1151,6 +1158,7 @@ impl Resolver<'_> {
         }
         let built = self.contents.library(
             self.db,
+            (&self.root, self.base.as_deref()),
             krate,
             &root,
             &|krate| Some((self.stable_crate_id(krate), self.crate_root(krate.into())?)),
@@ -1610,6 +1618,7 @@ impl SymbolResolver for Resolver<'_> {
             let root = self.crate_root(krate.into())?;
             return Some(self.contents.library(
                 self.db,
+                places,
                 krate,
                 &root,
                 &|krate| Some((self.stable_crate_id(krate), self.crate_root(krate.into())?)),
@@ -6905,6 +6914,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             lints_capped: args.lints_capped,
             link_args: args.link_args.clone(),
             checkout: args.checkout.clone(),
+            names_from: args.names_from.clone(),
             base: args.base.clone(),
             members: args.members.clone(),
         };

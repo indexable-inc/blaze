@@ -10,7 +10,8 @@
 //! - the directory [`VAR`] names, for a process started by blaze, which says where it found
 //!   it, or a person trying a changed library (its own `DIGEST` is then the one used);
 //! - `share/blaze/library/` in a directory above the program (Nix's `$out`);
-//! - blaze's own copy, `~/.blaze/library/<digest>/library`, which [`fetch`] makes once from
+//! - blaze's own copy, `library/<digest>/library` beside the store (`~/.cache/blaze/store`,
+//!   [`super::own::shared`]) so that every home's programs name it alike, which [`fetch`] makes once from
 //!   the checkout this blaze was built in while it has the same library, else downloaded as
 //!   the release's `library-<digest>.tar.xz`. It is checked file by file against the digest
 //!   whichever way it came.
@@ -159,10 +160,10 @@ fn candidates() -> Vec<PathBuf> {
     dirs
 }
 
-/// blaze's own copy of the library: `~/.blaze/library/<digest>/library`, in a directory of
-/// its own, so that every file under the one it is in is the library's.
+/// blaze's own copy of the library: `library/<digest>/library` in [`super::own::shared`], in a
+/// directory of its own, so that every file under the one it is in is the library's.
 fn own() -> Option<PathBuf> {
-    Some(super::own::home()?.join("library").join(digest()).join("library"))
+    Some(super::own::shared()?.join("library").join(digest()).join("library"))
 }
 
 /// The library of the checkout this blaze was built in.
@@ -174,7 +175,7 @@ fn short() -> &'static str {
     &digest()[..digest().len().min(12)]
 }
 
-/// [`found`], else blaze's own copy, made in `~/.blaze/library` once: from where [`FROM_VAR`]
+/// [`found`], else blaze's own copy, made in [`own`] once: from where [`FROM_VAR`]
 /// names, else copied from the checkout this blaze was built in while it has the same library,
 /// else downloaded from the release this blaze is (the tag of its version, `v0.YYYYMMDD.N`).
 /// `Err` says what failed and what to do.
@@ -183,8 +184,8 @@ pub fn fetch() -> Result<Library, String> {
         return Ok(found.clone());
     }
     let dir = own().ok_or_else(|| {
-        "blaze keeps its standard library in .blaze in your home directory, and there is no \
-         home directory: `BLAZE_HOME` names where to keep it"
+        "blaze keeps its standard library beside its store, and there is none and no home \
+         directory: `BLAZE_CACHE` or `BLAZE_HOME` names where to keep it"
             .to_owned()
     })?;
     let given = std::env::var(FROM_VAR).ok().filter(|it| !it.is_empty());

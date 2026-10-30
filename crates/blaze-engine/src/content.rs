@@ -164,18 +164,7 @@ impl Contents {
         }
         // Sorted by its `Debug`. Where the crate is stands for itself: code that has the place
         // in it is not kept, see [`Contents::names_place`].
-        let mut env = format!("{env:?}");
-        // The longer path first: the others are often what it starts with.
-        let mut places = vec![(manifest.as_str(), "$PACKAGE")];
-        places.extend(out.as_deref().map(|out| (out, "$OUT")));
-        let (checkout, base) =
-            (checkouts.0.to_string_lossy(), checkouts.1.map(Path::to_string_lossy));
-        places.push((&*checkout, "$CHECKOUT"));
-        places.extend(base.as_deref().map(|base| (base, "$CHECKOUT")));
-        places.sort_unstable_by_key(|(path, _)| std::cmp::Reverse(path.len()));
-        for (path, stands_for) in places {
-            env = env.replace(path, stands_for);
-        }
+        let env = placed(format!("{env:?}"), Some(&manifest), out.as_deref(), checkouts);
         if let Some(out) = out.clone() {
             self.places.lock().unwrap_or_else(|e| e.into_inner()).insert(out);
         }
@@ -228,12 +217,13 @@ impl Contents {
     pub(crate) fn library(
         &self,
         db: &RootDatabase,
+        checkouts: (&Path, Option<&Path>),
         krate: Crate,
         root: &Path,
         known: &dyn Fn(Crate) -> Option<(Option<u64>, std::path::PathBuf)>,
         process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
     ) -> ContentId {
-        let hash = || self.hash_library(db, krate, root, known, process_reads);
+        let hash = || self.hash_library(db, checkouts, krate, root, known, process_reads);
         if let Some(id) = *self.of(krate).get_or_init(|| Some(hash())) {
             return id;
         }
@@ -247,6 +237,7 @@ impl Contents {
     fn hash_library(
         &self,
         db: &RootDatabase,
+        checkouts: (&Path, Option<&Path>),
         krate: Crate,
         root: &Path,
         known: &dyn Fn(Crate) -> Option<(Option<u64>, std::path::PathBuf)>,
@@ -257,7 +248,7 @@ impl Contents {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"blaze library 5");
+        field(b"blaze library 6");
         field(Self::version(db, krate).as_bytes());
         // Where cargo fetched it to is under another directory on another machine.
         let root = root.to_string_lossy();
@@ -275,17 +266,12 @@ impl Contents {
         cfgs.sort_unstable();
         field(cfgs.join("\n").as_bytes());
         // What its build script set and wrote, with the places as the checkout's hash has them:
-        // code that has a place in it is not kept, see [`Contents::names_place`].
+        // code that has a place in it is not kept, see [`Contents::names_place`]. The checkout
+        // is among them: cargo's `[env]` gives every crate of the build, a registry's too, what
+        // it sets, and a `relative` entry names where the checkout is.
         let env = krate.env(db);
         let (package, out) = (env.get("CARGO_MANIFEST_DIR"), env.get("OUT_DIR"));
-        let mut vars = format!("{env:?}");
-        let mut places: Vec<(&str, &str)> = Vec::new();
-        places.extend(package.as_deref().map(|package| (package, "$PACKAGE")));
-        places.extend(out.as_deref().map(|out| (out, "$OUT")));
-        places.sort_unstable_by_key(|(path, _)| std::cmp::Reverse(path.len()));
-        for (path, stands_for) in places {
-            vars = vars.replace(path, stands_for);
-        }
+        let vars = placed(format!("{env:?}"), package.as_deref(), out.as_deref(), checkouts);
         field(vars.as_bytes());
         if let Some(out) = out {
             for (path, hash) in written_to(db, krate, &out) {
@@ -301,7 +287,9 @@ impl Contents {
             let on = dependency.crate_id;
             field(dependency.name.as_str().as_bytes());
             match known(on) {
-                Some((None, root)) => field(&self.library(db, on, &root, known, process_reads).0),
+                Some((None, root)) => {
+                    field(&self.library(db, checkouts, on, &root, known, process_reads).0)
+                }
                 Some((id, _)) => field(&Self::outside(db, on, id)),
                 None => field(&Self::outside(db, on, None)),
             }
@@ -331,6 +319,33 @@ impl Contents {
         let name = extra.display_name.as_ref().map(|it| it.to_string());
         format!("{name:?} {:?}", extra.version)
     }
+}
+
+/// `text` with where the crate's package is, where its build script wrote and where the
+/// checkout is (and the base it was copied from) written as what stands for each, so that a
+/// crate hashes the same wherever these are.
+fn placed(
+    mut text: String,
+    package: Option<&str>,
+    out: Option<&str>,
+    checkouts: (&Path, Option<&Path>),
+) -> String {
+    // A build of no checkout (the standard library's alone) is at the root, which is no place.
+    fn checkout(it: &Path) -> Option<std::borrow::Cow<'_, str>> {
+        it.parent().map(|_| it.to_string_lossy())
+    }
+    let (checkout, base) = (checkout(checkouts.0), checkouts.1.and_then(checkout));
+    let mut places: Vec<(&str, &str)> = Vec::new();
+    places.extend(package.map(|package| (package, "$PACKAGE")));
+    places.extend(out.map(|out| (out, "$OUT")));
+    places.extend(checkout.as_deref().map(|checkout| (checkout, "$CHECKOUT")));
+    places.extend(base.as_deref().map(|base| (base, "$CHECKOUT")));
+    // The longer path first: the others are often what it starts with.
+    places.sort_unstable_by_key(|(path, _)| std::cmp::Reverse(path.len()));
+    for (path, stands_for) in places.into_iter().filter(|(path, _)| !path.is_empty()) {
+        text = text.replace(path, stands_for);
+    }
+    text
 }
 
 /// What a build script wrote to `out` that the source root of `krate` holds: the path of each
@@ -416,5 +431,27 @@ mod tests {
         let nested = format!("{registry}/dep-0.1.0/registry/src/inner/lib.rs");
         assert_eq!(home(&nested), Some("/home/one/.cargo"));
         assert_eq!(home("/home/one/checkout/src/lib.rs"), None);
+    }
+
+    #[test]
+    fn a_crate_is_hashed_the_same_in_every_checkout() {
+        // cargo's `[env]` with `relative = true` gives every crate, a registry's too, the
+        // checkout's place, as cargo's own `.cargo/config.toml` does.
+        let env = |checkout: &str| {
+            format!(
+                "{{\"CARGO_MANIFEST_DIR\": \"/home/one/.cargo/registry/src/i/dep-0.1.0\", \
+                 \"CARGO_RUSTC_CURRENT_DIR\": \"{checkout}\", \"OUT_DIR\": \"{checkout}/target/out\"}}"
+            )
+        };
+        let hashed = |checkout: &str, base: Option<&str>| {
+            let out = format!("{checkout}/target/out");
+            let package = Some("/home/one/.cargo/registry/src/i/dep-0.1.0");
+            placed(env(checkout), package, Some(&out), (Path::new(checkout), base.map(Path::new)))
+        };
+        assert_eq!(hashed("/a/ws", None), hashed("/elsewhere/b/checkout", None));
+        assert_eq!(hashed("/a/ws", None), hashed("/a/copy", Some("/a/ws")));
+        assert!(!hashed("/a/ws", None).contains("/a/ws"));
+        // A build of no checkout is at the root, whose `/` is in every path.
+        assert_eq!(placed("/x/y".to_owned(), None, None, (Path::new("/"), None)), "/x/y");
     }
 }

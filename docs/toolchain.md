@@ -37,7 +37,8 @@ the standard library is part of a compiler.
   `wasm32-wasip1`'s, which proc macros are built for), unchanged, from static.rust-lang.org, each checked against the sha256 compiled into blaze
   (`crates/blaze-cargo/src/cargo/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
   still says `1.101.0-nightly (16d1ffac1 2026-10-26)`.
-- **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>`, or rustup's `nightly-2026-10-27`
+- **Where:** `toolchains/nightly-2026-10-27-<host>` beside the store (`~/.cache/blaze/store`,
+  `BLAZE_CACHE`; with `BLAZE_CACHE=off` in `~/.blaze`), or rustup's `nightly-2026-10-27`
   when rustup already has it (the same bytes). The installer downloads it once;
   `blaze toolchain --path` prints its directory.
 - **The standard library's source** is not the toolchain's `rust-src`, which blaze neither
@@ -142,8 +143,7 @@ of blaze is told where it is in `BLAZE_LIBRARY`, the first of:
 
 - `BLAZE_LIBRARY` itself, set by hand to try a changed library (its own `DIGEST` is used);
 - `share/blaze/library` above the program (the Nix package installs it there);
-- `~/.blaze/library/<digest>/library`, which blaze makes once, beside the toolchain's
-  download: copied from the checkout it was built in when that has the same library, else
+- `library/<digest>/library` beside the store, as the toolchain is, which blaze makes once: copied from the checkout it was built in when that has the same library, else
   downloaded as the release's `library-<digest>.tar.xz` (6.0 MB, `harness/library.py
   archive` writes it, the release workflow attaches it). `BLAZE_LIBRARY_FROM` names another
   place to get it from (an address or a directory with that archive, or a library to copy),
@@ -171,7 +171,7 @@ of blaze is told where it is in `BLAZE_LIBRARY`, the first of:
 To change the standard library, edit it under `library/`, run
 `python3 harness/library.py digest '{}'` (the test `the_library_is_the_one_its_digest_says`
 fails on a stale `DIGEST`) and commit. The next build copies the changed library into
-`~/.blaze/library/<new digest>`, and the store keys what it compiles of it apart from the old.
+`library/<new digest>` beside the store, and the store keys what it compiles of it apart from the old.
 Nothing checks it against upstream file by file: the integration tests (smoke, the rustc
 comparison harnesses, real crates) are what hold blaze's behaviour to the nightly's.
 

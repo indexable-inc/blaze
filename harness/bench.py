@@ -61,7 +61,7 @@ The blaze of a backend is `BLAZE_BIN` (cranelift) or `BLAZE_LLVM_BIN` (llvm).
 import csv, glob, importlib, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
 
 import blaze_cli, memory, packs
-from blaze_cli import HERE, ROOT, TOOLCHAIN, Side, difference, fetch, how_built, program_output, test_results, timed, wait_warm
+from blaze_cli import HERE, ROOT, TOOLCHAIN, Side, difference, fetch, how_built, program_output, store_use, test_results, timed, wait_warm
 
 LET = "\n    let _bench_edit = 1u32;"
 
@@ -638,6 +638,7 @@ def compiled(text):
     return sum(int(n) for n in re.findall(r"^stats: (\d+) of \d+ functions compiled", text, re.M))
 
 
+
 class Setup:
     """Another way to build with cargo (`SETUPS`), measured beside plain cargo on the same
     source after every step, into a target directory of its own. Once a build of it fails it
@@ -926,19 +927,23 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         shutil.copytree(top, other_top, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref", "target-*"))
         other_ws = os.path.join(other_top, os.path.relpath(ws, top))
         second = Side(other_ws, dict(ours.env, BLAZE_HOME=home(f"{turn}b")), True)
-        took_b, warm_b, _, used_b = cold_blaze(second, "store filled by another checkout", Daemon(second))
+        second_daemon = Daemon(second)
+        took_b, warm_b, _, used_b = cold_blaze(second, "store filled by another checkout", second_daemon)
+        use_b = store_use(second_daemon.said())
         second.cargo("stop")
         shutil.rmtree(other_top, ignore_errors=True)
         shutil.rmtree(home(f"{turn}b"), ignore_errors=True)
-        warm_store.append((took_b, warm_b, used_b))
+        warm_store.append((took_b, warm_b, used_b, use_b))
         print(f"  warm store {turn + 1}/{cold_runs}  blaze {took_b:.2f}s + ready {warm_b:.2f}s  peak {used_b['peak_mb']} MB  "
-              f"daemon {used_b['resident_mb']} MB", flush=True)
+              f"daemon {used_b['resident_mb']} MB  functions {use_b['functions_compiled']} compiled {use_b['functions_reused']} reused  "
+              f"steps {use_b['steps_kept']} of {use_b['steps']} kept  manifest {'used' if use_b['manifest_used'] else 'missed'}", flush=True)
     if warm_store:
-        phases["cold"].update(warm_store_build_s=round(statistics.median(b for b, _, _ in warm_store), 3),
-                              warm_store_s=round(statistics.median(b + w for b, w, _ in warm_store), 3),
-                              warm_store_samples_s=[round(b + w, 3) for b, w, _ in warm_store],
-                              warm_store_memory=dict(peak_mb=round(statistics.median(u["peak_mb"] for _, _, u in warm_store)),
-                                                     resident_mb=round(statistics.median(u["resident_mb"] for _, _, u in warm_store))))
+        phases["cold"].update(warm_store_build_s=round(statistics.median(b for b, _, _, _ in warm_store), 3),
+                              warm_store_s=round(statistics.median(b + w for b, w, _, _ in warm_store), 3),
+                              warm_store_samples_s=[round(b + w, 3) for b, w, _, _ in warm_store],
+                              warm_store_memory=dict(peak_mb=round(statistics.median(u["peak_mb"] for _, _, u, _ in warm_store)),
+                                                     resident_mb=round(statistics.median(u["resident_mb"] for _, _, u, _ in warm_store))),
+                              warm_store_use=[s for _, _, _, s in warm_store])
     entries = store_entries(ours.env["BLAZE_CACHE"])
     added = sum(size for key, size in entries.items() if key not in STORED)
     STORED.update(entries)

@@ -415,7 +415,7 @@ code. When the build or the unit tests start reading a new file, add it there.
 The build and the unit tests of the `gate` and `warm` tiers install no rustup and no Nix: a
 checkout, then `.github/actions/blaze`, which installs the release of blaze as a user does, with
 install.sh fetching its own Rust (the release's pinned `rustc`, `cargo`, `rust-std` and
-`rust-src`, into `~/.blaze/toolchains`,
+`rust-src`, into `toolchains/` beside the store,
 [self-contained.md](self-contained.md#blazes-own-toolchain-the-stopgap)), and for the build the
 pinned LLVM as a contributor outside Nix gets it
 ([contributing.md](contributing.md#llvm-for---features-llvm)): `.github/scripts/llvm.py fetch`

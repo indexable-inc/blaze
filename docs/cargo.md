@@ -55,7 +55,8 @@ what it builds by the rustc, so neither rebuilds the other's.
 Where the nightly's files come from, found with nothing run: rustup's `nightly-2026-10-27`,
 when rustup has it (only as a copy of the same files; what rustup would pick
 is not asked); else blaze's own copy in
-`~/.blaze/toolchains/nightly-2026-10-27-<host>` (`BLAZE_HOME` moves `~/.blaze`), laid out as rustup lays
+`toolchains/nightly-2026-10-27-<host>` beside the store (`~/.cache/blaze/store`; `BLAZE_CACHE` moves it, and with
+`BLAZE_CACHE=off` it is in `~/.blaze`, which `BLAZE_HOME` moves), laid out as rustup lays
 out a toolchain. blaze downloads its copy the first time it needs it, once, with a line on
 stderr while it does: rustc, cargo and the built standard library from the Rust project's
 own servers (the standard library's source is blaze's own `library/`, a 6.0 MB archive from
@@ -1093,8 +1094,8 @@ starts its own.
 
 ### Files
 
-The daemon's directory is `$BLAZE_HOME` if set (which moves blaze's toolchains there too,
-[Install](#install)), else `$XDG_RUNTIME_DIR/blaze`, else `~/.cache/blaze`. It holds
+The daemon's directory is `$BLAZE_HOME` if set (blaze's toolchain and standard library are
+beside the store, so every home that shares the store shares them, [Install](#install)), else `$XDG_RUNTIME_DIR/blaze`, else `~/.cache/blaze`. It holds
 `daemon.sock`, `daemon.sock.lock`, `daemon.log`, `workers/<id>/` with each worker's socket and log, and `states/`. The directory must belong
 to you and be closed to group and others (mode 0700); otherwise the client and the daemon
 refuse to use it. The socket is 0600, and a connection from another user is refused before

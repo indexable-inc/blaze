@@ -450,6 +450,8 @@ fn module_of(sysroot: &Path, library: &Path, described: &Path) -> Result<PathBuf
         wasm: true,
         exe: dir.join(format!("{stem}.wasm")),
         dep_info: dir.join(format!("{stem}.d")),
+        target: None,
+        checkout: None,
     };
     own_script::compile_described(sysroot, &description, &made, dir)?;
     // Here, as soon as it is built and beside the other modules' builds, rather than in the
@@ -477,6 +479,8 @@ fn library_of(sysroot: &Path, library: &Path) -> Result<Option<PathBuf>, String>
         wasm: false,
         exe: dir.join(file),
         dep_info: dir.join(format!("{}{extra}.d", record.crate_name)),
+        target: None,
+        checkout: None,
     };
     std::fs::create_dir_all(&dir).map_err(|it| it.to_string())?;
     own_script::compile_record(sysroot, &record, &made, &dir)?;
@@ -498,6 +502,8 @@ pub fn made(record: &Record, wasm: bool) -> Option<Made<'_>> {
         wasm,
         exe: out_dir.join(format!("{prefix}{name}{extra}{suffix}")),
         dep_info: out_dir.join(format!("{name}{extra}.d")),
+        target: None,
+        checkout: None,
     })
 }
 

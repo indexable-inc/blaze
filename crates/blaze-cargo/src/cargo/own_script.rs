@@ -106,6 +106,11 @@ pub struct Made<'a> {
     pub wasm: bool,
     pub exe: PathBuf,
     pub dep_info: PathBuf,
+    /// The target directory it is made in, which the `OUT_DIR`s it reads are below too, and
+    /// the checkout's root. The store keeps the build by what stands for them, so that another
+    /// checkout or target directory finds it, unless what it made names one of them.
+    pub target: Option<&'a Path>,
+    pub checkout: Option<&'a Path>,
 }
 
 /// The arguments of one run of rustc, as cargo gave them for a crate.
@@ -187,6 +192,8 @@ pub fn compile(
         wasm: false,
         exe: exe.to_owned(),
         dep_info: exe.with_extension("d"),
+        target: None,
+        checkout: None,
     };
     compile_as(args, cwd, source, &made, dir)
 }
@@ -208,6 +215,8 @@ pub fn compile_wasi(
         wasm: false,
         exe: module.to_owned(),
         dep_info: module.with_extension("wasm.d"),
+        target: None,
+        checkout: None,
     };
     compile_as(args, cwd, source, &made, dir)
 }
@@ -249,7 +258,7 @@ pub fn compile_described(
     made: &Made<'_>,
     dir: &Path,
 ) -> Result<(), String> {
-    built(sysroot, described, &[], made, dir)
+    built(sysroot, described, &[], made, dir).map(drop)
 }
 
 /// [`compile_as`] of the crate rustc was `asked` for, the variables its source reads by `env!`
@@ -287,23 +296,24 @@ fn compile_in(
     let deps =
         deps.iter().map(|(name, path)| Ok((name.clone(), add(&mut crates, &mut linked, path)?)));
     crates[0].deps = deps.collect::<Result<_, String>>()?;
-    build_described(sysroot, &crates, made, dir, rustc_had)
+    build_described(sysroot, &crates, made, dir, rustc_had).map(drop)
 }
 
 /// Builds the first of `crates`, over the standard library of `sysroot`, as `made` says,
-/// describing them in `dir` ([`built`]). `Err` is why it was not built, or a variable its source
-/// read that `rustc_had` says otherwise.
+/// describing them in `dir` ([`built`]): whether what was written is the store's. `Err` is why
+/// it was not built, or a variable its source read that `rustc_had` says otherwise.
 pub fn build_described(
     sysroot: &Path,
     crates: &[Described],
     made: &Made<'_>,
     dir: &Path,
     rustc_had: &dyn Fn(&str) -> Option<String>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let described = description(sysroot, crates);
-    built(sysroot, &described, crates, made, dir)?;
+    let kept = built(sysroot, &described, crates, made, dir)?;
     let read = std::fs::read_to_string(&made.dep_info).map_err(|it| it.to_string())?;
-    read_otherwise(&crate::dep_info::DepInfo::parse(&read), rustc_had)
+    read_otherwise(&crate::dep_info::DepInfo::parse(&read), rustc_had)?;
+    Ok(kept)
 }
 
 /// What the store keeps blaze's builds of build scripts and proc macros under in place of a
@@ -315,6 +325,15 @@ const BUILDS: &str = "build script and proc macro builds 1";
 /// described crate's OUT_DIR. In particular, rebuilding a proc macro must not retrieve the
 /// old module from the store after its generated constant changed.
 pub fn generated_fingerprint(described: &str) -> Result<[u8; 32], String> {
+    generated_fingerprint_with(described, &|it| it.to_vec())
+}
+
+/// [`generated_fingerprint`] with each `OUT_DIR` named as `unplace` writes it; what is in the
+/// files is as it is.
+fn generated_fingerprint_with(
+    described: &str,
+    unplace: &dyn Fn(&[u8]) -> Vec<u8>,
+) -> Result<[u8; 32], String> {
     fn walk(
         dir: &Path,
         files: &mut Vec<PathBuf>,
@@ -357,7 +376,7 @@ pub fn generated_fingerprint(described: &str) -> Result<[u8; 32], String> {
         walk(out, &mut files, &mut std::collections::BTreeSet::new())
             .map_err(|why| format!("reading build-script output {}: {why}", out.display()))?;
         files.sort();
-        key.field(out.as_os_str().as_encoded_bytes());
+        key.field(&unplace(out.as_os_str().as_encoded_bytes()));
         for file in files {
             let bytes = std::fs::read(&file)
                 .map_err(|why| format!("reading generated input {}: {why}", file.display()))?;
@@ -401,37 +420,84 @@ pub fn store() -> Option<&'static blaze_store::Store> {
 /// modules and what they include (`--inputs`), the libraries of the proc macros it expands
 /// with, and the files of the dep-info each crate names. With [`keyed::CHECK`] the build runs
 /// whatever the store has, and one that made something else than the store's is an error.
+/// Whether what was written is the store's.
 fn built(
     sysroot: &Path,
     described: &str,
     crates: &[Described],
     made: &Made<'_>,
     dir: &Path,
-) -> Result<(), String> {
-    let mut first = keyed::Key::new(BUILDS);
-    first.field(described.as_bytes()).field(keyed::toolchain(sysroot).as_bytes());
-    first.field(&[u8::from(made.proc_macro) | u8::from(made.wasm) << 1]);
-    if made.wasi {
-        first.field(crate::RUN_TOOL_TARGET.as_bytes());
-    }
-    if made.wasm {
-        first.field(super::own_macro::MODULE_CFG.as_bytes());
-    }
-    first.field(&generated_fingerprint(described)?);
-    let first = first.done();
+) -> Result<bool, String> {
+    let library = super::toolchain::library::found().ok();
+    // The library is no place: what is built names its files where they are, which is one
+    // directory for every home that shares the store (`toolchain::own::shared`).
+    let places = super::script::Places::of_build(made.target, made.checkout);
+    let first_of = |described: &[u8], generated: &[u8; 32], apart: bool| {
+        let mut first = keyed::Key::new(BUILDS);
+        if apart {
+            first.field(b"places apart");
+            let dir = library.map(|it| it.dir.as_os_str().as_encoded_bytes());
+            first.field(dir.unwrap_or_default());
+            first.field(library.map(|it| it.digest.as_str()).unwrap_or_default().as_bytes());
+        }
+        first.field(described).field(keyed::toolchain(sysroot).as_bytes());
+        // What the files are named from (`--names-from`), as the description names it.
+        let checkout = made.checkout.map(|it| it.as_os_str().as_encoded_bytes());
+        let checkout = checkout.map(|it| if apart { places.unplace(it) } else { it.to_vec() });
+        first.field(&checkout.unwrap_or_default());
+        first.field(&[u8::from(made.proc_macro) | u8::from(made.wasm) << 1]);
+        if made.wasi {
+            first.field(crate::RUN_TOOL_TARGET.as_bytes());
+        }
+        if made.wasm {
+            first.field(super::own_macro::MODULE_CFG.as_bytes());
+        }
+        first.field(generated);
+        first.done()
+    };
+    // Kept by what stands for the places, for another checkout or target directory to find,
+    // or, when the description holds what stands for one already, by the places themselves.
+    let here = first_of(described.as_bytes(), &generated_fingerprint(described)?, false);
+    let unplace = |bytes: &[u8]| places.unplace(bytes);
+    let apart = match places.marked(described.as_bytes()) {
+        true => None,
+        false => Some(first_of(
+            &places.unplace(described.as_bytes()),
+            &generated_fingerprint_with(described, &unplace)?,
+            true,
+        )),
+    };
+    let placed = |read: &str| String::from_utf8_lossy(&places.place(read.as_bytes())).into_owned();
+    let placed_now = |read: &str| keyed::digest(&placed(read));
     let store = store();
-    let found = store.and_then(|it| keyed::find(it, &first, &keyed::digest));
+    // What was found, the reads it was kept with as this build names them, and what the
+    // script was made of.
+    let mut found: Option<(Built, Vec<String>, String)> = None;
+    if let Some(store) = store {
+        if let Some(first) = &apart
+            && let Some((bytes, reads)) = keyed::find(store, first, &placed_now)
+        {
+            let kept = Built::read(&bytes).ok_or("the store's build of it is not one")?;
+            let of = second_with(first, &reads, &placed_now);
+            let mut reads: Vec<String> = reads.iter().map(|it| placed(it)).collect();
+            reads.sort();
+            found = Some((kept.placed(&places), reads, of));
+        } else if let Some((bytes, reads)) = keyed::find(store, &here, &keyed::digest) {
+            let kept = Built::read(&bytes).ok_or("the store's build of it is not one")?;
+            let of = second_with(&here, &reads, &keyed::digest);
+            found = Some((kept, reads, of));
+        }
+    }
     let checking = keyed::check();
-    if let Some((bytes, reads)) = &found
+    if let Some((kept, _, of)) = &found
         && !checking
     {
-        let kept = Built::read(bytes).ok_or("the store's build of it is not one")?;
         kept.write(made).map_err(|it| format!("writing what the store kept of it: {it}"))?;
-        write_made_of(made, &second_of(&first, reads))?;
+        write_made_of(made, of)?;
         if std::env::var_os("BLAZE_STATS").is_some() {
             eprintln!("blaze: a build the store kept: {}", made.exe.display());
         }
-        return Ok(());
+        return Ok(true);
     }
     let inputs = dir.join("blaze-inputs");
     if made.wasm {
@@ -461,7 +527,7 @@ fn built(
     // Two builds of the same inputs by blaze are not the same bytes (the order of functions
     // in the executable is not), so what a check compares is what the build read: a build
     // the store kept under fewer inputs than it reads would be found after another changed.
-    if let Some((_, kept_reads)) = &found
+    if let Some((_, kept_reads, _)) = &found
         && *kept_reads != reads
     {
         let only = |these: &[String], those: &[String]| {
@@ -479,21 +545,33 @@ fn built(
     if found.is_some() && std::env::var_os("BLAZE_STATS").is_some() {
         eprintln!("blaze: a build the store kept read what this one did: {}", made.exe.display());
     }
+    // A build that names a place in what it made is of that place alone.
+    let unplaced = apart.zip(kept.unplaced(&places)).zip(places.unplaced_reads(&reads));
+    let (first, mut reads, now, value): (_, _, &dyn Fn(&str) -> String, _) = match unplaced {
+        Some(((first, unplaced), unplaced_reads)) => {
+            (first, unplaced_reads, &placed_now, unplaced.bytes())
+        }
+        None => (here, reads, &keyed::digest, kept.bytes()),
+    };
+    // As the store keeps them, so that what is found is told by the same reads.
+    reads.sort();
+    reads.dedup();
     if let Some(store) = store {
         store.settled();
-        keyed::keep(store, &first, &reads, &keyed::digest, &kept.bytes());
+        keyed::keep(store, &first, &reads, now, &value);
         store.flush();
     }
-    write_made_of(made, &second_of(&first, &reads))
+    write_made_of(made, &second_with(&first, &reads, now))?;
+    Ok(false)
 }
 
 /// What a build of key `first` that read `reads` is told by, for [`MADE_OF`]: the reads' paths
-/// and what each has now.
-fn second_of(first: &[u8; 32], reads: &[String]) -> String {
+/// and what each has now, as `now` says.
+fn second_with(first: &[u8; 32], reads: &[String], now: &dyn Fn(&str) -> String) -> String {
     let mut key = keyed::Key::new("built of");
     key.field(first);
     for read in reads {
-        key.field(read.as_bytes()).field(keyed::digest(read).as_bytes());
+        key.field(read.as_bytes()).field(now(read).as_bytes());
     }
     key.done().iter().map(|it| format!("{it:02x}")).collect()
 }
@@ -537,6 +615,23 @@ impl Built {
             return None;
         }
         Some(Built { exe: take()?.to_vec(), dep_info: take()?.to_vec() })
+    }
+
+    /// It with what stands for each place in its dep-info, for a build in another checkout or
+    /// target directory to write. `None` when its executable names a place (its debug
+    /// information, an `env!("OUT_DIR")`): another place would be other bytes, of another
+    /// length. Also `None` when it holds what stands for a place already.
+    fn unplaced(&self, places: &super::script::Places) -> Option<Built> {
+        let named = places.named_in(&self.exe) || places.marked(&self.exe);
+        if named || places.marked(&self.dep_info) {
+            return None;
+        }
+        Some(Built { exe: self.exe.clone(), dep_info: places.unplace(&self.dep_info) })
+    }
+
+    /// What [`Built::unplaced`] made of a build, with the places of this one.
+    fn placed(self, places: &super::script::Places) -> Built {
+        Built { exe: self.exe, dep_info: places.place(&self.dep_info) }
     }
 
     /// Writes it where `made` says, each file whole or not at all.
@@ -596,6 +691,9 @@ fn build(
     let mut blaze = Command::new(std::env::current_exe().map_err(|it| it.to_string())?);
     blaze.arg(&project).args(["--crate", made.name]).arg("--out").arg(dir.join("built.o"));
     blaze.arg("--exe").arg(&made.exe).arg("--dep-info").arg(&made.dep_info);
+    if let Some(checkout) = made.checkout {
+        blaze.arg("--names-from").arg(checkout);
+    }
     if let Some(inputs) = inputs {
         blaze.arg("--inputs").arg(inputs);
     }
@@ -754,6 +852,8 @@ pub fn build_nothing(
         wasm: false,
         dep_info: exe.with_extension("d"),
         exe,
+        target: None,
+        checkout: None,
     };
     let described = description(sysroot, &[script]);
     build(&described, dir, &made, Some(store.to_owned()), shipped, None, false)

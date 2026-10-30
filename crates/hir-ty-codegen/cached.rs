@@ -461,6 +461,18 @@ impl Entry {
             field(b"lines alone");
         }
         field(name.as_bytes());
+        {
+            static NAMES: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+            let file = NAMES.get_or_init(|| {
+                let dir = std::env::var_os("BLAZE_DEBUG_NAMES")?;
+                let path = std::path::Path::new(&dir).join(std::process::id().to_string());
+                std::fs::File::options().append(true).create(true).open(path).ok().map(Mutex::new)
+            });
+            if let Some(file) = file {
+                use std::io::Write;
+                _ = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{name}");
+            }
+        }
         Some(hasher.finalize().into())
     }
 

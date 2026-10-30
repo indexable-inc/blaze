@@ -71,7 +71,7 @@ impl Sysroot {
     }
 
     /// Returns the sysroot "source" directory, where stdlib sources are located: blaze's
-    /// `library/`, like `$HOME/.blaze/library/<digest>/library` ([`BLAZE_LIBRARY`])
+    /// `library/`, like `~/.cache/blaze/store/library/<digest>/library` ([`BLAZE_LIBRARY`])
     pub fn rust_lib_src_root(&self) -> Option<&AbsPath> {
         self.rust_lib_src_root.as_deref()
     }

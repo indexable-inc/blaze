@@ -32,6 +32,9 @@ pub const REAL: &str = "BLAZE_BUILD_SCRIPT";
 /// The file next to a script's `OUT_DIR` that says how cargo ran it.
 const RAN: &str = "blaze-ran.json";
 
+/// The file next to a script's `OUT_DIR` there while what is in it is a run the store kept.
+const KEPT: &str = "blaze-kept";
+
 /// The file next to a script's `OUT_DIR` whose time is when [`rerun_is_same`] last found it
 /// the same.
 const CHECKED: &str = "blaze-checked";
@@ -135,6 +138,7 @@ pub fn run_as_cargo_does(
     let ran = Ran { real: real.clone(), cwd: cwd.clone(), env };
     // Without it the script is not run again by the daemon, and cargo builds.
     let _ = std::fs::write(run_dir.join(RAN), serde_json::to_vec(&ran)?);
+    say_kept(&out_dir, false)?;
     let package = ran.env.iter().find(|it| it.0 == "CARGO_PKG_NAME").map_or("?", |it| &it.1);
     blaze_store::compiles_against(RUNS);
     let store = blaze_store::Store::global_or(super::daemon::store().as_deref());
@@ -201,6 +205,7 @@ pub fn run_as_cargo_does(
                     continue;
                 }
                 kept.restore(&out_dir)?;
+                say_kept(&out_dir, true)?;
                 script_sandbox::keep_reads(&out_dir, None);
                 if std::env::var_os("BLAZE_STATS").is_some() {
                     eprintln!("blaze: a run the store kept, of its closure");
@@ -270,6 +275,7 @@ pub fn run_as_cargo_does(
                 continue;
             }
             kept.restore(&out_dir)?;
+            say_kept(&out_dir, true)?;
             let reads: Vec<String> = reads.iter().map(|it| keyed::path_of(it).to_owned()).collect();
             let reads = (!script_sandbox::says_what_it_reads(&kept.stdout)).then_some(&reads[..]);
             script_sandbox::keep_reads(&out_dir, reads);
@@ -547,6 +553,22 @@ pub struct Places(Vec<(Vec<u8>, &'static [u8])>);
 impl Places {
     const TARGET: &[u8] = b"\0TARGET\0";
     const PACKAGE: &[u8] = b"\0PACKAGE\0";
+    const CHECKOUT: &[u8] = b"\0CHECKOUT\0";
+
+    /// The places of a build blaze makes of a build script or a proc macro: the target
+    /// directory it is made in and the `OUT_DIR`s it reads are below, and the checkout's root.
+    pub fn of_build(target: Option<&Path>, checkout: Option<&Path>) -> Places {
+        let mut places = Vec::new();
+        for (place, mark) in [(target, Self::TARGET), (checkout, Self::CHECKOUT)] {
+            let Some(place) = place.and_then(Path::to_str) else { continue };
+            let place = place.trim_end_matches(['/', '\\']);
+            if !place.is_empty() {
+                places.push((place.as_bytes().to_vec(), mark));
+            }
+        }
+        places.sort_by_key(|it| std::cmp::Reverse(it.0.len()));
+        Places(places)
+    }
 
     pub fn of(env: &[(String, String)]) -> Places {
         let var = |name: &str| {
@@ -578,7 +600,7 @@ impl Places {
     }
 
     /// `bytes` with each place where [`Places::unplace`] put what stands for it.
-    fn place(&self, bytes: &[u8]) -> Vec<u8> {
+    pub fn place(&self, bytes: &[u8]) -> Vec<u8> {
         let mut bytes = bytes.to_vec();
         for (place, mark) in &self.0 {
             bytes = replaced(&bytes, mark, place);
@@ -589,7 +611,7 @@ impl Places {
     /// `reads`, a run's read set, with what stands for each place in place of it, for a run in
     /// any checkout or target directory to be found by. `None` when a path holds what stands
     /// for a place already, and so could not be told from one in the place.
-    fn unplaced_reads(&self, reads: &[String]) -> Option<Vec<String>> {
+    pub fn unplaced_reads(&self, reads: &[String]) -> Option<Vec<String>> {
         reads
             .iter()
             .map(|it| match self.marked(it.as_bytes()) {
@@ -600,13 +622,13 @@ impl Places {
     }
 
     /// Whether `bytes` name a place.
-    fn named_in(&self, bytes: &[u8]) -> bool {
+    pub fn named_in(&self, bytes: &[u8]) -> bool {
         self.0.iter().any(|(place, _)| holds(bytes, place))
     }
 
     /// Whether `bytes` hold what stands for a place, and so could not be told from bytes that
     /// named it.
-    fn marked(&self, bytes: &[u8]) -> bool {
+    pub fn marked(&self, bytes: &[u8]) -> bool {
         self.0.iter().any(|(_, mark)| holds(bytes, mark))
     }
 }
@@ -814,6 +836,24 @@ pub fn in_out_dir(path: &Path) -> bool {
     let names: Vec<&str> = path.components().filter_map(|c| c.as_os_str().to_str()).collect();
     names.windows(3).any(|it| it[0] == "build" && it[2] == "out")
         || names.windows(4).any(|it| it[0] == "build" && it[3] == "out")
+}
+
+/// Whether the last run into `out_dir` was one the store kept, not a run of the script.
+pub fn was_kept(out_dir: &Path) -> bool {
+    out_dir.parent().is_some_and(|it| it.join(KEPT).exists())
+}
+
+/// Says beside `out_dir` whether its run is one the store kept ([`was_kept`]).
+fn say_kept(out_dir: &Path, kept: bool) -> anyhow::Result<()> {
+    let file = out_dir.parent().context("an OUT_DIR at the root")?.join(KEPT);
+    match kept {
+        true => std::fs::write(&file, b"")?,
+        false => match std::fs::remove_file(&file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e)?,
+            _ => {}
+        },
+    }
+    Ok(())
 }
 
 /// Whether a script can be run again as cargo ran it into `out_dir`.
@@ -1258,6 +1298,29 @@ mod tests {
         binary.files[1].2 = [&[0xff][..], out.to_str().unwrap().as_bytes()].concat();
         assert_eq!(binary.unplaced(&places), None, "a file that is no text naming the place");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_build_in_another_checkout_and_target_is_described_the_same() {
+        let library = "/home/one/.cache/blaze/store/library/0123/library";
+        let places = |at: &str| {
+            let (target, checkout) = (format!("{at}/ws/target/compile-time"), format!("{at}/ws"));
+            let built = Places::of_build(Some(Path::new(&target)), Some(Path::new(&checkout)));
+            let described = format!(
+                "{{\"sysroot_src\": \"{library}\", \"root\": \"{checkout}/build.rs\", \
+                 \"OUT_DIR\": \"{target}/build/dep-0123/out\"}}"
+            );
+            (built, described)
+        };
+        let (one, described) = places("/a");
+        let (other, other_described) = places("/elsewhere/b");
+        let unplaced = one.unplace(described.as_bytes());
+        assert_eq!(unplaced, other.unplace(other_described.as_bytes()));
+        assert_eq!(other.place(&unplaced), other_described.as_bytes());
+        assert!(!one.named_in(&unplaced) && one.marked(&unplaced));
+        assert!(one.named_in(described.as_bytes()) && !one.marked(described.as_bytes()));
+        // The library is where it is for each.
+        assert!(String::from_utf8(unplaced).unwrap().contains(library));
     }
 
     /// Has the script of `out_dir` be one rustc compiled from `sources`, as `.d` says.

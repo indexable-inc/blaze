@@ -519,6 +519,7 @@ impl<'a> Driver<'a> {
         // The slot a step under way says what it works on in: at most `slots` are under way.
         let free: Mutex<Vec<usize>> = Mutex::new((0..slots).rev().collect());
         let failed: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+        let kept = std::sync::atomic::AtomicUsize::new(0);
         let work = |node: NodeId| {
             let at = (node.0 - first) as usize;
             let slot = lock(&free).pop().unwrap_or_default();
@@ -527,7 +528,14 @@ impl<'a> Driver<'a> {
             counting.done(slot);
             lock(&free).push(slot);
             match result {
-                Ok(()) => exec::Did::built(),
+                Ok(false) => exec::Did::built(),
+                Ok(true) => {
+                    kept.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    exec::Did {
+                        outcome: blaze_graph::Outcome::Cached { remote: false },
+                        added: Vec::new(),
+                    }
+                }
                 Err(error) => {
                     let why = format!("{error:#}");
                     lock(&failed).get_or_insert(error);
@@ -548,6 +556,8 @@ impl<'a> Driver<'a> {
             crate::events::say(record.event.clone());
         };
         let ok = exec::drive(&mut machine, nodes, &work, &mut said, None)?;
+        let kept = kept.into_inner();
+        eprintln!("compile-time steps: {} of {} kept", kept, tasks.len());
         if let Some(error) = failed.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)
         {
             return Err(error);
@@ -575,7 +585,9 @@ impl<'a> Driver<'a> {
         format!("{name}, {what}")
     }
 
-    fn step(&self, task: Task) -> anyhow::Result<()> {
+    /// Does `task`: whether what it made was kept, fresh from before or the store's, rather
+    /// than made again.
+    fn step(&self, task: Task) -> anyhow::Result<bool> {
         let (at, what) = match task {
             Task::Script(at) => (at, "compile the build script"),
             Task::Run(at) => (at, "run the build script"),
@@ -583,18 +595,24 @@ impl<'a> Driver<'a> {
             Task::Macro(at) => (at, "link the proc macro"),
         };
         let done = match task {
-            Task::Script(at) => {
-                self.script(at).map(|exe| _ = lock(&self.made).scripts.insert(at, exe))
-            }
-            Task::Run(at) => self
-                .run_script(at, false)
-                .map(|ran| _ = lock(&self.made).runs.insert(at, Arc::new(ran))),
-            Task::WasmRun(at) => self
-                .run_script(at, true)
-                .map(|ran| _ = lock(&self.made).wasm_runs.insert(at, Arc::new(ran))),
-            Task::Macro(at) => {
-                self.proc_macro(at).map(|lib| _ = lock(&self.made).macros.insert(at, lib))
-            }
+            Task::Script(at) => self.script(at).map(|(exe, kept)| {
+                lock(&self.made).scripts.insert(at, exe);
+                kept
+            }),
+            Task::Run(at) => self.run_script(at, false).map(|ran| {
+                let kept = super::script::was_kept(&ran.out_dir);
+                lock(&self.made).runs.insert(at, Arc::new(ran));
+                kept
+            }),
+            Task::WasmRun(at) => self.run_script(at, true).map(|ran| {
+                let kept = super::script::was_kept(&ran.out_dir);
+                lock(&self.made).wasm_runs.insert(at, Arc::new(ran));
+                kept
+            }),
+            Task::Macro(at) => self.proc_macro(at).map(|(lib, kept)| {
+                lock(&self.made).macros.insert(at, lib);
+                kept
+            }),
         };
         let unit = self.unit(at);
         done.with_context(|| {
@@ -1008,8 +1026,9 @@ impl<'a> Driver<'a> {
         Ok(info)
     }
 
-    /// Compiles the build script of unit `at`: where its executable is.
-    fn script(&self, at: usize) -> anyhow::Result<PathBuf> {
+    /// Compiles the build script of unit `at`: where its executable is, and whether it was
+    /// kept ([`Driver::compile`]).
+    fn script(&self, at: usize) -> anyhow::Result<(PathBuf, bool)> {
         let unit = self.unit(at);
         let dir = self.unit_dir(at);
         let exe = dir.join(format!("build-script-build{}", std::env::consts::EXE_SUFFIX));
@@ -1033,14 +1052,17 @@ impl<'a> Driver<'a> {
             wasm: false,
             dep_info: exe.with_extension("d"),
             exe: exe.clone(),
+            target: Some(self.own),
+            checkout: Some(self.cargo.workspace_root().as_ref()),
         };
-        self.compile(&crates, &made, &dir.join("blaze"))?;
-        Ok(exe)
+        let kept = self.compile(&crates, &made, &dir.join("blaze"))?;
+        Ok((exe, kept))
     }
 
     /// Builds the proc macro of unit `at` as a WebAssembly module, or links it for blaze's
-    /// server when the workspace expands it natively: where the module or library is.
-    fn proc_macro(&self, at: usize) -> anyhow::Result<PathBuf> {
+    /// server when the workspace expands it natively: where the module or library is, and
+    /// whether it was kept ([`Driver::compile`]).
+    fn proc_macro(&self, at: usize) -> anyhow::Result<(PathBuf, bool)> {
         let unit = self.unit(at);
         let name = unit.crate_name();
         let wasm = self.as_wasm(at);
@@ -1080,25 +1102,29 @@ impl<'a> Driver<'a> {
                 false => deps.join(format!("{prefix}{stem}{suffix}")),
             },
             dep_info: deps.join(format!("{stem}.d")),
+            target: Some(self.own),
+            checkout: Some(self.cargo.workspace_root().as_ref()),
         };
         let mut compiled = self.compile(&crates, &made, &deps.join(&stem));
         // Compiled for this host from here, beside the other units, rather than in the load,
         // which loads one module after another.
-        if wasm && compiled.is_ok() {
+        if wasm && let Ok(kept) = compiled {
             compiled = blaze_macro_wasm::prepare_soon(&made.exe, own_script::store())
+                .map(|()| kept)
                 .map_err(anyhow::Error::msg);
         }
         if let (true, Err(why)) = (wasm, &compiled) {
             let root: &Path = self.cargo.workspace_root().as_ref();
             anyhow::bail!(super::own_macro::refusal(&name, &format!("{why:#}"), root));
         }
-        compiled?;
-        Ok(made.exe)
+        let kept = compiled?;
+        Ok((made.exe, kept))
     }
 
     /// Builds the first of `crates` as `made` says, describing them in `dir`, unless what it
     /// made last is of the same description and no file it was made from changed since.
-    fn compile(&self, crates: &[Described], made: &Made<'_>, dir: &Path) -> anyhow::Result<()> {
+    /// Whether it was kept: made before, or the store's.
+    fn compile(&self, crates: &[Described], made: &Made<'_>, dir: &Path) -> anyhow::Result<bool> {
         let described = own_script::description(self.toolchain, crates);
         let stamp = made.exe.with_extension("described");
         let mut digest = Sha256::new();
@@ -1111,13 +1137,14 @@ impl<'a> Driver<'a> {
         let inputs =
             crates.iter().filter_map(|it| it.inputs.as_ref().map(|(info, _)| info.as_path()));
         if fresh(&stamp, &digest, std::iter::once(made.dep_info.as_path()).chain(inputs)) {
-            return Ok(());
+            return Ok(true);
         }
         let env = &crates[0].env;
         let rustc_had = |name: &str| env.get(name).cloned().or_else(|| std::env::var(name).ok());
-        own_script::build_described(self.toolchain, crates, made, dir, &rustc_had)
+        let kept = own_script::build_described(self.toolchain, crates, made, dir, &rustc_had)
             .map_err(|why| anyhow::anyhow!(why))?;
-        write(&stamp, digest.as_bytes())
+        write(&stamp, digest.as_bytes())?;
+        Ok(kept)
     }
 
     /// Runs the build script of unit `at`, a `run-custom-build`, as cargo runs it: for the

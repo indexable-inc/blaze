@@ -2,7 +2,7 @@
 //! rustup does not have that release (docs/self-contained.md, "blaze's own toolchain"). It is
 //! the release's `rustc`, `cargo` and `rust-std` as the Rust project publishes them (the source
 //! of the standard library is blaze's own, `library.rs`), each checked against the sha256 `pins.txt` has for it (`harness/toolchain_pins.py` writes
-//! that from the release's manifest), and laid out in `~/.blaze/toolchains/<release>-<host>`
+//! that from the release's manifest), and laid out in `toolchains/<release>-<host>` beside the store ([`shared`])
 //! as rustup lays out a toolchain, its records and channel manifest included, so that what
 //! reads a sysroot reads this one unchanged.
 //!
@@ -127,9 +127,9 @@ impl Release {
         (bytes + self.manifest.bytes + 500_000) / 1_000_000
     }
 
-    /// Where blaze keeps this release.
+    /// Where blaze keeps this release: in [`shared`], for every home that shares a store.
     pub fn dir(&self) -> Option<PathBuf> {
-        Some(home()?.join("toolchains").join(format!("{}-{}", self.version, self.host)))
+        Some(shared()?.join("toolchains").join(format!("{}-{}", self.version, self.host)))
     }
 }
 
@@ -170,6 +170,15 @@ pub fn home() -> Option<PathBuf> {
     }
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
     Some(PathBuf::from(home).join(".blaze"))
+}
+
+/// Where blaze keeps what is the same in every home: the toolchain and the standard library's
+/// source, each by its version or digest and checked against it. A program names the files of
+/// the library where they are, so two homes make the same programs, and can use each other's
+/// builds, only when theirs is one directory: the store's, which they share, or with no store
+/// the [`home`]'s.
+pub fn shared() -> Option<PathBuf> {
+    crate::cargo::daemon::store().or_else(home)
 }
 
 /// Whether `dir` has a whole toolchain: what is moved into place is whole, so this tells one
