@@ -57,7 +57,21 @@ impl<'db> MirLowerCtx<'_, 'db> {
         Ok(Some((place, current)))
     }
 
+    /// A place expression inside another goes as deep as the source does: the stack grows
+    /// for it as for `lower_expr_to_place_without_adjust`.
     pub(super) fn lower_expr_as_place_with_adjust(
+        &mut self,
+        current: BasicBlockId,
+        expr_id: ExprId,
+        upgrade_rvalue: bool,
+        adjustments: &[Adjustment],
+    ) -> Result<'db, Option<(Place<'db>, BasicBlockId)>> {
+        stdx::ensure_sufficient_stack(|| {
+            self.lower_expr_as_place_with_adjust_here(current, expr_id, upgrade_rvalue, adjustments)
+        })
+    }
+
+    fn lower_expr_as_place_with_adjust_here(
         &mut self,
         current: BasicBlockId,
         expr_id: ExprId,
