@@ -3,15 +3,17 @@
 //!
 //! Follows clippy's `clippy_lints/src/needless_borrows_for_generic_args.rs` at rust-lang/rust
 //! 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0 (MIT or Apache-2.0). Where clippy asks MIR whether
-//! a `&mut` referent is used once, this does not lint; bounds on other parameters and on
-//! projections, which clippy instantiates with the referent's type too, are not checked, nor
-//! are bounds whose arguments are the callee's parameters.
+//! a `&mut` referent is used once, this does not lint; bounds on other parameters, which
+//! clippy instantiates with the referent's type too, are not checked, nor are bounds whose
+//! arguments are the callee's parameters. A projection the signature binds or bounds
+//! (`I: IntoIterator<Item = &'a T>`) is held to be the borrow's, where clippy checks the bound
+//! on what the referent's projection is.
 
-use hir::{GenericParam, PathResolution};
+use hir::{GenericParam, HasSource as _, PathResolution};
 use ide_db::famous_defs::FamousDefs;
 use syntax::{
     AstNode, SyntaxNode,
-    ast::{self, HasGenericArgs as _},
+    ast::{self, HasGenericArgs as _, HasGenericParams as _, HasName as _, HasTypeBounds as _},
 };
 
 use crate::{check::Cx, diag::Applicability, msrvs};
@@ -59,6 +61,11 @@ fn callee(cx: &Cx<'_, '_, '_>, node: &SyntaxNode) -> Option<(hir::Function, usiz
     let list = ast::ArgList::cast(arg.parent()?)?;
     let index = list.args().position(|it| *it.syntax() == arg)?;
     let call = list.syntax().parent()?;
+    // clippy's `same_ctxt`: in a macro's expansion, the call is one of what it was handed, not
+    // one the macro makes of it (`insta::with_settings!({ snapshot_path => &dir }, ..)`).
+    if !cx.in_file() && !cx.is_written(&call) {
+        return None;
+    }
     if let Some(call) = ast::MethodCallExpr::cast(call.clone()) {
         if call.generic_arg_list().is_some() {
             return None;
@@ -113,7 +120,8 @@ fn needless_borrow_count(
     }
     let into_iter = FamousDefs(cx.sema(), krate).core_iter_IntoIterator();
     let drop = lang(hir::LangItem::Drop);
-    let holds = |referent: &ast::Expr| -> bool {
+    let projected = bound_assoc_types(db, function, type_param);
+    let holds = |borrowed: &ast::Expr, referent: &ast::Expr| -> bool {
         let inner = peel_parens(referent);
         if let ast::Expr::FieldExpr(field) = &inner
             && let Some(base) = field.expr().and_then(|it| cx.ty(&it))
@@ -142,14 +150,56 @@ fn needless_borrow_count(
                 let Some(arg) = arg.without_params(db) else { return false };
                 args.push(arg);
             }
-            ty.impls_trait(db, trait_, &args)
+            if !ty.impls_trait(db, trait_, &args) {
+                return false;
+            }
+            // A bound through a projection holds for the referent where the projection is the
+            // one the borrow has: `extend(&set)` takes `&T`s, `extend(set)` would take `T`s.
+            // Bound to a parameter of the callee, the projection is that parameter's, which
+            // holds where its bounds do: `args(&["a"])` and `args(["a"])` both give `AsRef<OsStr>`s.
+            let mut projections = Vec::new();
+            for item in trait_.items(db) {
+                let hir::AssocItem::TypeAlias(alias) = item else { continue };
+                let alias_name = alias.name(db);
+                for it in projected.iter().filter(|it| it.name == alias_name.as_str()) {
+                    projections.push((alias, it.to));
+                }
+            }
+            if projections.is_empty() {
+                return true;
+            }
+            let Some(borrowed) = cx.ty(borrowed) else { return false };
+            projections.into_iter().all(|(alias, to)| {
+                let Some(now) = ty.normalize_trait_assoc_type(db, &args, alias) else {
+                    return false;
+                };
+                if let Some(to) = to {
+                    let generic = GenericParam::TypeParam(to);
+                    let elsewhere =
+                        params.iter().any(|it| it.ty().generic_params(db).contains(&generic))
+                            || function.ret_type(db).generic_params(db).contains(&generic);
+                    return !elsewhere
+                        && to.trait_refs(db).iter().all(|bound| {
+                            let mut args = Vec::new();
+                            for at in 1.. {
+                                let Some(arg) = bound.get_type_argument(at) else { break };
+                                let Some(arg) = arg.without_params(db) else { return false };
+                                args.push(arg);
+                            }
+                            now.impls_trait(db, bound.trait_(), &args)
+                        });
+                }
+                borrowed
+                    .normalize_trait_assoc_type(db, &args, alias)
+                    .is_some_and(|was| was.could_unify_with_deeply(db, &now))
+            })
         })
     };
     let mut count = 0;
     let mut at = expr.clone();
     while let ast::Expr::RefExpr(reference) = &at {
         let Some(referent) = reference.expr() else { break };
-        if !holds(&referent) {
+        if !holds(&at, &referent) {
             break;
         }
         at = referent;
@@ -165,6 +215,86 @@ fn has_ref_mut_self_method(db: &dyn hir::db::HirDatabase, trait_: hir::Trait) ->
         }
         _ => false,
     })
+}
+
+/// An associated type `function`'s signature binds or bounds for a type parameter, and the
+/// callee's type parameter it is bound to, when it is one: `Item` and `S` of
+/// `I: IntoIterator<Item = S>`.
+struct Projected {
+    name: String,
+    to: Option<hir::TypeParam>,
+}
+
+/// The associated types `function`'s signature binds or bounds for `type_param`: `Item` of
+/// `I: IntoIterator<Item = &'a T>` or of `where I::Item: Debug`, `Output` of `F: Fn() -> R`.
+fn bound_assoc_types(
+    db: &dyn hir::db::HirDatabase,
+    function: hir::Function,
+    type_param: hir::TypeParam,
+) -> Vec<Projected> {
+    let params: Vec<_> = hir::GenericDef::from(function)
+        .type_or_const_params(db)
+        .into_iter()
+        .filter_map(|it| it.as_type_param(db))
+        .collect();
+    let param_named = |ty: Option<ast::Type>| {
+        let ast::Type::PathType(ty) = ty? else { return None };
+        let path = ty.path()?;
+        if path.qualifier().is_some() || path.segment()?.generic_arg_list().is_some() {
+            return None;
+        }
+        let name = path.segment()?.name_ref()?;
+        params.iter().copied().find(|it| it.name(db).as_str() == name.text())
+    };
+    let Some(source) = function.source(db) else { return Vec::new() };
+    let function = source.value;
+    let name = type_param.name(db);
+    let name = name.as_str();
+    let mut found = Vec::new();
+    let bindings = |bounds: Option<ast::TypeBoundList>, found: &mut Vec<Projected>| {
+        let Some(bounds) = bounds else { return };
+        for node in bounds.syntax().descendants() {
+            if let Some(arg) = ast::AssocTypeArg::cast(node.clone()) {
+                let Some(name) = arg.name_ref() else { continue };
+                let to = param_named(arg.ty());
+                found.push(Projected { name: name.text().to_string(), to });
+            } else if let Some(segment) = ast::PathSegment::cast(node)
+                && segment.parenthesized_arg_list().is_some()
+            {
+                found.push(Projected { name: "Output".to_owned(), to: None });
+            }
+        }
+    };
+    for param in function.generic_param_list().iter().flat_map(|it| it.generic_params()) {
+        if let ast::GenericParam::TypeParam(param) = param
+            && param.name().is_some_and(|it| it.text() == name)
+        {
+            bindings(param.type_bound_list(), &mut found);
+        }
+    }
+    for predicate in function.where_clause().iter().flat_map(|it| it.predicates()) {
+        let Some(ast::Type::PathType(ty)) = predicate.ty() else { continue };
+        let Some(path) = ty.path() else { continue };
+        let Some(last) = path.segment().and_then(|it| it.name_ref()) else { continue };
+        match path.qualifier() {
+            None if last.text() == name => bindings(predicate.type_bound_list(), &mut found),
+            Some(qualifier) => {
+                let first = qualifier.first_segment();
+                let named = first.as_ref().is_some_and(|it| {
+                    it.name_ref().is_some_and(|it| it.text() == name)
+                        || it.type_anchor().and_then(|it| it.ty()).is_some_and(|it| {
+                            it.syntax().text() == name
+                                || it.syntax().to_string().starts_with(&format!("{name} "))
+                        })
+                });
+                if named {
+                    found.push(Projected { name: last.text().to_string(), to: None });
+                }
+            }
+            None => {}
+        }
+    }
+    found
 }
 
 fn peel_parens(expr: &ast::Expr) -> ast::Expr {

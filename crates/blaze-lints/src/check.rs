@@ -256,10 +256,17 @@ impl<'a, 'db> Cx<'_, 'a, 'db> {
 
     /// The span rustc gives an item: from after its attributes and doc comments.
     pub(crate) fn item_span(&self, node: &SyntaxNode) -> Option<Span> {
-        let range = self.range(node)?;
-        if self.expansion.is_some() {
+        if let Some(expansion) = &self.expansion {
+            // An item made of the macro's own tokens and of the input's maps to no one range of
+            // the file; rustc has it where the macro was called, as `Span::call_site()` is
+            // (serde's `enum __Field {}` for a struct with no fields).
+            let call_site = &expansion.call_site;
+            let range = self
+                .range(node)
+                .unwrap_or_else(|| TextRange::new(call_site.lo.into(), call_site.hi.into()));
             return Some(self.span(range));
         }
+        self.range(node)?;
         Some(self.span(item_range(node)))
     }
 
@@ -593,8 +600,10 @@ impl<'a, 'db> Cx<'_, 'a, 'db> {
                 (MacroKind::Bang, name, node.value.text_range())
             }
             MacroCallKind::Derive { derive_index, .. } => {
-                let attr = ast::Attr::cast(node.value.clone())?;
-                let path = derive_paths(&attr).into_iter().nth(*derive_index as usize)?;
+                // The `derive(..)` itself, which in `#[cfg_attr(.., derive(..))]` is not the
+                // attribute's own meta.
+                let meta = node.value.ancestors().find_map(ast::Meta::cast)?;
+                let path = derive_paths(&meta).into_iter().nth(*derive_index as usize)?;
                 let name = path.1.rsplit("::").next()?.to_owned();
                 (MacroKind::Derive, name, path.0)
             }
@@ -885,13 +894,9 @@ fn lint_list(tt: &ast::TokenTree) -> (Vec<(String, TextRange)>, Option<String>) 
 }
 
 /// The paths of a `#[derive(...)]`, in order, with where each is.
-fn derive_paths(attr: &ast::Attr) -> Vec<(TextRange, String)> {
-    let Some(tt) = attr.meta().and_then(|it| match it {
-        ast::Meta::TokenTreeMeta(it) => it.token_tree(),
-        _ => None,
-    }) else {
-        return Vec::new();
-    };
+fn derive_paths(meta: &ast::Meta) -> Vec<(TextRange, String)> {
+    let ast::Meta::TokenTreeMeta(meta) = meta else { return Vec::new() };
+    let Some(tt) = meta.token_tree() else { return Vec::new() };
     lint_list(&tt).0.into_iter().map(|(name, range)| (range, name)).collect()
 }
 

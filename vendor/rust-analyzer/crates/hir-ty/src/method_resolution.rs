@@ -12,13 +12,13 @@ mod probe;
 
 use crate::next_solver::StoredGenericArgs;
 use either::Either;
-use hir_expand::name::Name;
+use hir_expand::{MacroDefKind, name::Name};
 use intern::Symbol;
 use salsa::SalsaValue;
 use span::Edition;
 use tracing::{debug, instrument};
 
-use base_db::Crate;
+use base_db::{BuiltDependency, Crate};
 use hir_def::{
     AssocItemId, BlockIdLt, BuiltinDeriveImplId, ConstId, DefWithBodyId, FunctionId,
     GenericParamId, HasModule, ImplId, ItemContainerId, ModuleDefId, ModuleId, TraitId,
@@ -41,7 +41,7 @@ use rustc_type_ir::{
     try_visit,
 };
 use stdx::impl_from;
-use syntax::{SyntaxKind, T, TextSize};
+use syntax::{SyntaxKind, SyntaxNode, T, TextSize};
 use triomphe::Arc;
 
 use crate::{
@@ -579,8 +579,9 @@ pub(crate) fn find_matching_impl<'db>(
 /// .unwrap())` parses an `f64` until serde_json's `impl PartialEq<Value> for f64` is seen, and
 /// a test of a crate whose benches use criterion depends on serde_json.
 ///
-/// Named is by the identifiers of `krate`'s files, which is more than rustc resolves (a local
-/// of the same name does) and less where a macro of another crate alone names the dependency.
+/// Named is by the identifiers of `krate`'s files and of what macros write among its items,
+/// which is more than rustc resolves (a local of the same name does) and less where a macro
+/// called in a body alone names the dependency.
 #[salsa::tracked(returns(deref))]
 pub fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
     let _p = tracing::info_span!("loaded_crates").entered();
@@ -608,13 +609,27 @@ pub fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
         if !unnamed.iter().any(|dep| text.contains(dep.name.symbol().as_str())) {
             continue;
         }
-        let root = file.parse(db).syntax_node().to_flat();
-        let (tree, at) = root.flat().expect("a flat tree");
-        let identifiers: FxHashSet<&str> = (at..tree.end(at))
-            .filter(|&it| tree.is_token(it) && tree.kind(it).0 == SyntaxKind::IDENT as u16)
-            .map(|it| tree.token_text(it))
-            .collect();
-        unnamed.retain(|dep| !identifiers.contains(dep.name.symbol().as_str()));
+        forget_named(&file.parse(db).syntax_node(), &mut unnamed);
+    }
+    // What a macro of another crate or a proc macro writes names crates as well:
+    // `#[derive(Deserializable)]` writes `biome_deserialize::Text::deserialize(..)` in a crate
+    // that names `biome_deserialize` nowhere else. The macros of the crate's own are among its
+    // files, and a macro called in a body is not looked into.
+    let mut calls = crate_def_map(db, krate)
+        .modules(db)
+        .flat_map(|(_, module)| module.scope(db).all_macro_calls());
+    while !unnamed.is_empty()
+        && let Some(call) = calls.next()
+    {
+        let def = call.loc(db).def;
+        let written_elsewhere = match def.kind {
+            MacroDefKind::ProcMacro(..) => true,
+            MacroDefKind::Declarative(..) => def.krate != krate,
+            _ => false,
+        };
+        if written_elsewhere {
+            forget_named(&call.parse_macro_expansion(db).value.0.syntax_node(), &mut unnamed);
+        }
     }
     let mut loaded = FxHashSet::default();
     let mut ordered = vec![krate];
@@ -631,6 +646,17 @@ pub fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
         }
     }
     ordered.into()
+}
+
+/// Drops from `unnamed` the dependencies an identifier in `node` names.
+fn forget_named(node: &SyntaxNode, unnamed: &mut Vec<&BuiltDependency>) {
+    let root = node.to_flat();
+    let (tree, at) = root.flat().expect("a flat tree");
+    let identifiers: FxHashSet<&str> = (at..tree.end(at))
+        .filter(|&it| tree.is_token(it) && tree.kind(it).0 == SyntaxKind::IDENT as u16)
+        .map(|it| tree.token_text(it))
+        .collect();
+    unnamed.retain(|dep| !identifiers.contains(dep.name.symbol().as_str()));
 }
 
 /// The items of `scope` whose bodies may hold impls: an impl is one of its crate wherever it
