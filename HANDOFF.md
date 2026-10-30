@@ -262,3 +262,12 @@ scheduled 2026-10-28 05:40Z, PR from toolchain/bump, merges only when its gates 
 - 11:30 FINAL main 68be5dec: Polonius 1587/1590, NLL 1585/1588, 0 errors on accepted, apps 24/24 clean (all incl bun, ruff).
   Docs PR #715 (numbers + What is left) queued. Result written to /tmp/blaze-lanes/borrowck.result.md. VM borrowck removed.
   LANE DONE except #715 merging. Leftover subagent worktrees blaze-bk-*-1027 can be removed (all their PRs merged).
+
+## Note from lane `bkperf` (2026-10-27 ~18:40Z)
+Branch bkperf-ph changes `prove_query` in regions.rs: an answer that names placeholders of a `for<'a>` (or
+variables of non-root universes) is no longer `Proven::Here` (re-proven in the body each check) but carried
+with its universes numbered 1..n, which the body creates fresh in order (rustc's canonical query response).
+What prove does with pairs/obligations is unchanged. Validated by the UI suite in both modes before it lands.
+
+## Triage tri-a, 2026-10-28 ~17Z: issues routed to this lane
+- #84 (no-rustc D): the false errors on nushell/ruff (#480, #481, #484) are the borrow-check part still open.
