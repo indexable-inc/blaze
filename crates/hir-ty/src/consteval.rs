@@ -419,14 +419,19 @@ pub(crate) fn const_eval_discriminant_variant<'db>(
     let body = Body::of(db, def);
     let loc = variant_id.lookup(db);
     if matches!(body[body.root_expr()], Expr::Missing) {
-        let prev_idx = loc.index(db).checked_sub(1);
-        let value = match prev_idx {
-            Some(prev_idx) => {
-                1 + db.const_eval_discriminant(loc.parent.enum_variants(db).variants[prev_idx].0)?
+        // One more than the previous variant's: found by walking back to the nearest explicit
+        // discriminant here, as rustc does, since asking the query for the previous variant
+        // takes a stack frame per variant and overflows on enums of thousands.
+        let variants = &loc.parent.enum_variants(db).variants;
+        let index = loc.index(db);
+        for prev_idx in (0..index).rev() {
+            let prev = variants[prev_idx].0;
+            let prev_body = Body::of(db, prev.into());
+            if !matches!(prev_body[prev_body.root_expr()], Expr::Missing) {
+                return Ok((index - prev_idx) as i128 + db.const_eval_discriminant(prev)?);
             }
-            _ => 0,
-        };
-        return Ok(value);
+        }
+        return Ok(index as i128);
     }
 
     let repr = AttrFlags::repr(db, loc.parent.into());

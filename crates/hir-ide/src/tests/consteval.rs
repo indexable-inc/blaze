@@ -2663,6 +2663,26 @@ fn enums() {
 }
 
 #[test]
+fn enum_of_many_implicit_discriminants() {
+    let variants: String = (1..20_000).map(|i| format!("V{i}, ")).collect();
+    check_number(
+        &format!("enum E {{ V0 = 7, {variants} }}\nconst GOAL: i32 = E::V19999 as i32;"),
+        7 + 19_999,
+    );
+    check_number(
+        &format!("enum E {{ {variants} }}\nconst GOAL: i32 = E::V19999 as i32;"),
+        19_998,
+    );
+    check_number(
+        r#"
+    enum E { A, B, C = 10, D, E, F = -3, G }
+    const GOAL: i32 = E::B as i32 * 1000 + E::E as i32 * 10 + E::G as i32;
+    "#,
+        1000 + 12 * 10 - 2,
+    );
+}
+
+#[test]
 fn unsupported_str_binary_op_in_eval_rvalue() {
     check_fail(
         r#"
