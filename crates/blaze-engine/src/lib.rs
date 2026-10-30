@@ -11,6 +11,7 @@ use blaze_cargo::{
     version, weaken,
 };
 
+mod admit;
 mod as_rustc;
 mod borrowck;
 mod check;
@@ -10676,8 +10677,10 @@ fn run_holding(
                 }
                 std::thread::spawn(move || {
                     let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let answer =
-                            program.sync(&db, &listed, &paths, &edit, wanted.as_ref(), link, defer);
+                        let out = wanted.as_ref().map_or(&program.args.out, |it| &it.out).clone();
+                        let answer = admit::admit(&db, &out).and_then(|_admitted| {
+                            program.sync(&db, &listed, &paths, &edit, wanted.as_ref(), link, defer)
+                        });
                         program.refused_in_codegen(answer)
                     }));
                     done.store(true, Ordering::SeqCst);
@@ -10718,8 +10721,11 @@ fn run_holding(
                         let build = scope.spawn(move || {
                             let answer =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    let answer =
-                                        program.sync(&db, listed, paths, edit, wanted, link, defer);
+                                    let out =
+                                        wanted.map_or(&program.args.out, |it| &it.out).clone();
+                                    let answer = admit::admit(&db, &out).and_then(|_admitted| {
+                                        program.sync(&db, listed, paths, edit, wanted, link, defer)
+                                    });
                                     program.refused_in_codegen(answer)
                                 }));
                             end_link();
