@@ -135,9 +135,12 @@ jobs:
           if [ "${#packages[@]}" -gt 0 ]; then sudo apt-get update -qq && sudo apt-get install -y -qq "${packages[@]}"; fi
       - name: smoke corpus
         env:
-          # anim is private: read with the bot's token.
-          GH_TOKEN: ${{ secrets.BLAZE_BOT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.BLAZE_BOT_TOKEN }}
         run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::the smoke corpus reads GitHub with the secret BLAZE_BOT_TOKEN, which this run does not have"
+            exit 1
+          fi
           export PATH="$CARGO_HOME/bin:$PATH"
           python3 -I harness/smoke.py "{\"blaze_rev\": \"${{ needs.release.outputs.sha }}\", \"work\": \"$RUNNER_TEMP/smoke\", \"results\": \"$RUNNER_TEMP/${{ matrix.os }}.json\"}"
       - if: always()

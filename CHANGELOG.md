@@ -32,6 +32,7 @@ since the release before and the title of each change merged since.
 ### Fixed
 
 - Const eval: `getrandom` (a `HashMap`'s seed) works on Linux AArch64 and macOS. The system call's number is the crate's `target_arch`'s (278 on AArch64, not x86-64's 318) and `CCRandomGenerateBytes` is shimmed, so the smoke case `ce_toml` no longer stops with "Unknown syscall id 278" or "unknown external function CCRandomGenerateBytes" in the gate to stable (#1549).
+- The gate to stable builds bun, flox and servo as a user of blaze's sandbox would: bunprep.py names `BUN_CODEGEN_DIR` and `BUN_NATIVE_LINK_ARGS` in `build-script-env` (bun_core's and bun-exe's scripts saw them unset), floxprep.py takes `catalog-api-v1`'s script out of the sandbox beside `factory-api-v1`'s (it writes its OpenAPI client into `src/`), and the new servoprep.py takes stylo's out (it writes its documentation into the target directory). Canary v0.20261029.7's gate failed each of the three at these (#1549).
 - Windows: a `raw-dylib` named with `+verbatim` imports from the DLL as it is written, as rustc does: `ort-sys`'s `#[link(name = "SHELL32.DLL", kind = "raw-dylib", modifiers = "+verbatim")]` imported from `SHELL32.DLL.dll`, and its build script stopped with 0xc0000135 (DLL not found).
 
 ## [0.20261028.9] - 2026-10-28
