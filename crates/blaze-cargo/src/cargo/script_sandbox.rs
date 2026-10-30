@@ -235,6 +235,10 @@ pub fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
     let package = script.package();
     let mut env = with_own_rustc(script.env, script.scratch)?;
     env.retain(|it| it.0 != ROOT);
+    // The C toolchain is blaze's for the targets it pins one for, inside the sandbox or not.
+    let own_c = super::toolchain::c::for_script(script.env)?;
+    let own_c_env = own_c.as_ref().map_or(&[][..], |it| &it.env[..]);
+    env.extend(own_c_env.iter().cloned());
     if !on_in(script.env) {
         return Ok(Plan::Outside(format!("{}=off", crate::sandbox::VAR), env));
     }
@@ -284,6 +288,7 @@ pub fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
     // (one below `/tmp`): the blaze a script runs as its `rustc` reads the standard library's
     // frozen maps from it, and without them makes them again, seconds a probe.
     readable.extend(super::daemon::store().filter(|it| it.is_dir() && emptied(it)));
+    readable.extend(own_c.as_ref().map(|it| it.dir.clone()).filter(|it| emptied(it)));
     // The programs cargo names, and the directories of `PATH`, where a sandbox has empty
     // directories: `RUSTC` is blaze's own, which may be built below `/dev/shm`.
     let var = |name: &str| env.iter().find(|it| it.0 == name).map(|it| it.1.as_str());
@@ -319,6 +324,7 @@ pub fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
         let closure = hermetic::closure_for(package, version, &overrides)?;
         let mut also = also;
         also.extend(script.declared.iter().cloned());
+        also.extend(own_c_env.iter().map(|it| it.0.clone()));
         let mut env = hermetic::env_in(&env, &also, &closure);
         env.extend(handed.env);
         let deps = hermetic::dep_out_dirs(&env);
@@ -326,6 +332,7 @@ pub fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
         read.extend(handed.readable);
         read.extend(script.real.parent().map(Path::to_owned));
         read.push(script.scratch.join(OWN_RUSTC));
+        read.extend(own_c.as_ref().map(|it| it.dir.clone()));
         read.extend(std::fs::canonicalize(&exe).ok().and_then(|it| Some(it.parent()?.to_owned())));
         let toolchain = env.iter().find(|it| it.0 == crate::as_rustc::TOOLCHAIN);
         let toolchain =
@@ -407,7 +414,7 @@ pub fn given(name: &str) -> bool {
         "CXXSTDLIB",
         "LC_",
     ];
-    const NAMES: [&str; 29] = [
+    const NAMES: [&str; 30] = [
         "OUT_DIR",
         "TARGET",
         "HOST",
@@ -437,6 +444,7 @@ pub fn given(name: &str) -> bool {
         "LIBRARY_PATH",
         "COMPILER_PATH",
         "GCC_EXEC_PREFIX",
+        "WASI_SYSROOT",
     ];
     const TOOLS: [&str; 25] = [
         "CC",

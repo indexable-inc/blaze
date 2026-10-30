@@ -1,0 +1,10 @@
+# The C toolchain blaze compiles build scripts' C for wasm32 with (docs/c-toolchain.md):
+# written by harness/c_toolchain_pins.py '{"write": true}' from the wasi-sdk release
+# rust-lang/rust 16d1ffac17ad's src/ci/docker/host-x86_64/dist-various-2/Dockerfile builds wasi-libc with, and GitHub's
+# digests of its assets. wasi-sdk <version> <release address>; then per host
+# <host> wasi-sdk <file> <sha256> <bytes>.
+wasi-sdk 34.0 https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34
+aarch64-apple-darwin wasi-sdk wasi-sdk-34.0-arm64-macos.tar.gz 9c59398106b417f8f14913380fdf0097a8cc0ff4af9eb3ce0065a859e88d49e9 180322002
+x86_64-unknown-linux-gnu wasi-sdk wasi-sdk-34.0-x86_64-linux.tar.gz b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4 192383077
+aarch64-unknown-linux-gnu wasi-sdk wasi-sdk-34.0-arm64-linux.tar.gz f7e243dff54d60bcc576e94d6166b69f410f2500ae4a9ceef34315be10e77971 192255247
+x86_64-pc-windows-msvc wasi-sdk wasi-sdk-34.0-x86_64-windows.tar.gz cccb5c323a9b34f0349a9b09e8804a0a7632c68c3310f4b5f437ed57d7e71d8f 619003408

@@ -58,6 +58,12 @@ the standard library is part of a compiler.
   rustc stand-in, which also checks the probes build scripts compile (`autocfg`, `rustversion`,
   `version_check`, `anyhow`'s and `thiserror`'s). No rustc is run to find any of it
   ([no-rustc.md](no-rustc.md), step B).
+- **The C toolchain** of build scripts for the wasm32 WASI targets is blaze's too
+  ([c-toolchain.md](c-toolchain.md)): wasi-sdk at the release the nightly builds its wasm32
+  wasi-libc with, checked against the sha256 in
+  `crates/blaze-cargo/src/cargo/toolchain/c_pins.txt` (`harness/c_toolchain_pins.py`, which
+  reads the release from the nightly's commit), in `~/.blaze/c`, downloaded the first time a
+  build script for such a target runs.
 - **Bumps:** every day, to the newest nightly, by a workflow, with the merge gate and the
   release train as the gate ([The daily bump](#the-daily-bump)).
 
@@ -69,7 +75,7 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
 
 1. On the branch `toolchain/bump` (the open bump's with main merged in, or a new one from main),
    `harness/toolchain_bump.py` pins the newest nightly whose manifest has every component blaze
-   needs on every host it ships for. It writes `harness/toolchain` and `pins.txt`, re-vendors
+   needs on every host it ships for. It writes `harness/toolchain`, `pins.txt` and `c_pins.txt`, re-vendors
    `crates/rustc_abi` and the proc-macro server from rust-lang/rust at the new commit, merges
    the new nightly's standard library into `library/` ([The standard
    library](#the-standard-library-library)), and moves the pin in `install.sh`, the server's

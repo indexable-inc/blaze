@@ -177,7 +177,9 @@ An input the engine can't handle stops the build with an error naming it:
 
     blaze: libfoo.a(bar.o): relocation R_X86_64_GOTPC32_TLSDESC at .text+0x1c4 is not supported by blaze's linker (docs/linker.md)
 
-The C toolchain stays a source of files, not a linker. Its start files, `libgcc_s`/`libgcc.a`,
+The C toolchain stays a source of files, not a linker; which C toolchain is
+[c-toolchain.md](c-toolchain.md)'s: blaze's own pinned sysroot of the target where blaze pins one,
+so the files below come from it and not from the machine. Its start files, `libgcc_s`/`libgcc.a`,
 and libc and its linker scripts (`libc.so` on glibc is a text `GROUP(...)` script) are found
 from its search directories, once per target, and kept with the target's settings. The engine
 parses GNU linker scripts of the kind system libraries ship: `GROUP`, `AS_NEEDED`, `INPUT`. A

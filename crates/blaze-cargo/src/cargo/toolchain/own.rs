@@ -56,9 +56,9 @@ pub struct Release {
 }
 
 #[derive(Clone, Copy)]
-struct Pin {
-    sha256: &'static str,
-    bytes: u64,
+pub(super) struct Pin {
+    pub(super) sha256: &'static str,
+    pub(super) bytes: u64,
 }
 
 struct Component {
@@ -293,7 +293,7 @@ fn superseded(release: &Release, parent: &Path) -> Vec<(PathBuf, String)> {
     old
 }
 
-fn remove_dir(dir: &Path) -> io::Result<()> {
+pub(super) fn remove_dir(dir: &Path) -> io::Result<()> {
     match std::fs::remove_dir_all(dir) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
@@ -302,7 +302,7 @@ fn remove_dir(dir: &Path) -> io::Result<()> {
 
 /// A file whose bytes are not the ones the Rust project published.
 #[derive(Debug)]
-struct NotPublished {
+pub(super) struct NotPublished {
     file: String,
     version: &'static str,
 }
@@ -323,19 +323,23 @@ impl std::error::Error for NotPublished {}
 
 /// Where the release's files come from: the Rust project's site, or what `BLAZE_RUST_DIST`
 /// names, an address or a directory with the files in it (a mirror, a machine with no network).
-enum Source {
+pub(super) enum Source {
     Web(Https),
     Dir(PathBuf),
 }
 
 impl Source {
     fn named(date: &str) -> anyhow::Result<Source> {
-        let given = std::env::var("BLAZE_RUST_DIST").ok().filter(|it| !it.is_empty());
+        Source::at("BLAZE_RUST_DIST", &format!("{DIST}/{date}"))
+    }
+
+    /// What the variable `var` names, an address or a directory, else `address`.
+    pub(super) fn at(var: &str, address: &str) -> anyhow::Result<Source> {
+        let given = std::env::var(var).ok().filter(|it| !it.is_empty());
         if let Some(dir) = given.as_ref().filter(|it| !it.contains("://")) {
             return Ok(Source::Dir(PathBuf::from(dir)));
         }
-        let address = given.unwrap_or_else(|| format!("{DIST}/{date}"));
-        let address = url::Url::parse(&address)?;
+        let address = url::Url::parse(&given.unwrap_or_else(|| address.to_owned()))?;
         Ok(Source::Web(Https::open(&address, PATIENCE, Arc::new(Traffic::new(8)))?))
     }
 
@@ -451,7 +455,7 @@ impl IntoPublished for anyhow::Error {
 /// Downloads `file` into `part`, going on from what an earlier download left there, and sends
 /// each piece on to `to`, what was there first included. Its sha256 is checked once it is
 /// whole: a file that is not the one published is removed, and is [`NotPublished`].
-async fn download(
+pub(super) async fn download(
     source: &Source,
     file: &str,
     part: &Path,
