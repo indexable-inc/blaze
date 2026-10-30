@@ -211,5 +211,6 @@ cases![
     projected_self_variant,
     enum_drop_across_await,
     assert_spacing,
+    promoted_record_spread,
     vtable_by_value_track_caller,
 ];

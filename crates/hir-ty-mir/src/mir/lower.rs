@@ -2831,7 +2831,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             )
         };
         match &self.store[expr] {
-            Expr::Literal(_) => true,
+            // A `const { .. }` block is a constant operand in rustc's MIR, as a constant item is
+            // (sqlx's `Cow::Borrowed(const { &[..] })`).
+            Expr::Literal(_) | Expr::Const(_) => true,
             Expr::Path(path) => {
                 // `Type::CONST` is resolved by inference, not by name.
                 if let Some((CandidateId::ConstId(_), _)) =
@@ -2862,8 +2864,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             }
             // The length is a constant already.
             &Expr::Array(Array::Repeat { initializer, .. }) => self.is_promotable(initializer),
-            Expr::RecordLit { fields, spread: RecordSpread::None, .. } => {
-                fields.clone().iter().all(|it| self.is_promotable(it.expr))
+            // `&M { a: 1, ..BASE }` copies the rest of its fields out of the base, which rustc
+            // promotes when the base is a constant (sqlx's `#[sqlx::test]` passes
+            // `&Migrator { .., ..Migrator::DEFAULT }` where `&'static` is wanted).
+            Expr::RecordLit { fields, spread, .. } => {
+                let base = match *spread {
+                    RecordSpread::None => true,
+                    RecordSpread::Expr(base) => self.is_promotable(base),
+                    RecordSpread::FieldDefaults => false,
+                };
+                base && fields.clone().iter().all(|it| self.is_promotable(it.expr))
             }
             &Expr::Field { expr, .. } => self.is_promotable(expr),
             Expr::Call { callee, args } => {
