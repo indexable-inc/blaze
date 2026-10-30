@@ -104,7 +104,34 @@ pub fn for_script(env: &[(String, String)]) -> anyhow::Result<Option<Given>> {
         )
     })?;
     let dir = fetch(&sdk)?;
+    runs(&dir)?;
     Ok(Some(given(target, &dir)))
+}
+
+/// Whether the clang at `dir` starts, once a process. wasi-sdk's on Linux loads the machine's
+/// C++ runtime (`libstdc++.so.6`, `libgcc_s.so.1`) and `libtinfo.so.6`, which every glibc
+/// distribution blaze is built for has and NixOS has not, until blaze's own clang
+/// (docs/c-toolchain.md, step 3): one that does not start is an error naming that.
+fn runs(dir: &Path) -> anyhow::Result<()> {
+    static RAN: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    let clang = dir.join("bin").join(format!("clang{}", std::env::consts::EXE_SUFFIX));
+    let ran = RAN.get_or_init(|| {
+        let said = std::process::Command::new(&clang).arg("--version").output();
+        match said {
+            Ok(it) if it.status.success() => Ok(()),
+            Ok(it) => Err(String::from_utf8_lossy(&it.stderr).trim().to_owned()),
+            Err(e) => Err(e.to_string()),
+        }
+    });
+    ran.clone().map_err(|why| {
+        anyhow::anyhow!(
+            "blaze compiles the C of build scripts for wasm32 with wasi-sdk's clang, and {} does \
+             not start: {why}. On Linux it needs the machine's libstdc++.so.6, libgcc_s.so.1 \
+             and libtinfo.so.6 (docs/c-toolchain.md); `{VAR}=given` compiles with the \
+             environment's C toolchain instead",
+            clang.display()
+        )
+    })
 }
 
 /// The target of a run with `env` that blaze gives its C toolchain to, after the checks of
@@ -180,7 +207,8 @@ pub fn fetch(sdk: &Sdk) -> anyhow::Result<PathBuf> {
     };
     let name = name.to_string_lossy().into_owned();
     std::fs::create_dir_all(parent).map_err(|e| failed(&e))?;
-    let lock = std::fs::File::create(parent.join(format!(".{name}.lock"))).map_err(|e| failed(&e))?;
+    let lock =
+        std::fs::File::create(parent.join(format!(".{name}.lock"))).map_err(|e| failed(&e))?;
     lock.lock().map_err(|e| failed(&e))?;
     if whole(&dir) {
         return Ok(dir);
@@ -224,7 +252,10 @@ pub fn fetch(sdk: &Sdk) -> anyhow::Result<PathBuf> {
     eprintln!("Downloaded wasi-sdk {} in {:.1?}.", sdk.version, start.elapsed());
     for old in superseded(sdk, parent, &name) {
         if let Err(e) = own::remove_dir(&old) {
-            eprintln!("blaze could not remove {}, which it no longer builds with: {e}", old.display());
+            eprintln!(
+                "blaze could not remove {}, which it no longer builds with: {e}",
+                old.display()
+            );
         }
     }
     Ok(dir)
@@ -238,7 +269,10 @@ fn superseded(sdk: &Sdk, parent: &Path, ours: &str) -> Vec<PathBuf> {
         .flatten()
         .filter(|it| {
             let name = it.file_name().to_string_lossy().into_owned();
-            name != ours && name.starts_with("wasi-sdk-") && name.contains(&host) && whole(&it.path())
+            name != ours
+                && name.starts_with("wasi-sdk-")
+                && name.contains(&host)
+                && whole(&it.path())
         })
         .map(|it| it.path())
         .collect()
@@ -279,7 +313,8 @@ mod tests {
         for target in ["wasm32-wasip1", "wasm32-wasip1-threads", "wasm32-wasip2", "wasm32-wasip3"] {
             assert_eq!(wanted(&env(&[("TARGET", target)])).unwrap(), Some(target));
         }
-        for target in ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "wasm32-unknown-unknown"] {
+        for target in ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "wasm32-unknown-unknown"]
+        {
             assert_eq!(wanted(&env(&[("TARGET", target)])).unwrap(), None);
         }
         assert_eq!(wanted(&env(&[])).unwrap(), None);
@@ -287,7 +322,8 @@ mod tests {
 
     #[test]
     fn given_leaves_the_c_toolchain_to_the_environment() {
-        let given = env(&[("TARGET", "wasm32-wasip1"), (VAR, "given"), ("CC_wasm32_wasip1", "gcc")]);
+        let given =
+            env(&[("TARGET", "wasm32-wasip1"), (VAR, "given"), ("CC_wasm32_wasip1", "gcc")]);
         assert_eq!(wanted(&given).unwrap(), None);
         let own = env(&[("TARGET", "wasm32-wasip1"), (VAR, "own")]);
         assert_eq!(wanted(&own).unwrap(), Some("wasm32-wasip1"));
@@ -297,19 +333,26 @@ mod tests {
 
     #[test]
     fn a_variable_of_the_target_the_environment_sets_stops_the_build_naming_it() {
-        for set in ["CC_wasm32_wasip1", "CC_wasm32-wasip1", "CFLAGS_wasm32_wasip1", "WASI_SYSROOT"] {
+        for set in ["CC_wasm32_wasip1", "CC_wasm32-wasip1", "CFLAGS_wasm32_wasip1", "WASI_SYSROOT"]
+        {
             let why = wanted(&env(&[("TARGET", "wasm32-wasip1"), (set, "x")])).unwrap_err();
             let why = why.to_string();
             assert!(why.contains(&format!("`{set}` is set")) && why.contains(VAR), "{why}");
         }
         // The host's compiler and flags are not the target's, and stay as they are.
-        let host = env(&[("TARGET", "wasm32-wasip1"), ("CC", "gcc"), ("CFLAGS", "-O2"), ("TARGET_CC", "cc")]);
+        let host = env(&[
+            ("TARGET", "wasm32-wasip1"),
+            ("CC", "gcc"),
+            ("CFLAGS", "-O2"),
+            ("TARGET_CC", "cc"),
+        ]);
         assert_eq!(wanted(&host).unwrap(), Some("wasm32-wasip1"));
     }
 
     #[test]
     fn the_target_s_variables_name_the_sdk_s_compiler_and_sysroot() {
-        let dir = Path::new("/home/u/.blaze/c/wasi-sdk-34.0-x86_64-unknown-linux-gnu-b761e3a0721dbae9");
+        let dir =
+            Path::new("/home/u/.blaze/c/wasi-sdk-34.0-x86_64-unknown-linux-gnu-b761e3a0721dbae9");
         let got = given("wasm32-wasip1-threads", dir);
         let exe = std::env::consts::EXE_SUFFIX;
         let sysroot = dir.join("share").join("wasi-sysroot").display().to_string();

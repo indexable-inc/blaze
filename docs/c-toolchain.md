@@ -95,6 +95,17 @@ Its version is the one the pinned nightly builds `rust-std`'s wasi-libc with, so
 file is compiled against are the headers of the `libc.a` the module links. The daily bump checks
 that and moves it with the nightly.
 
+What wasi-sdk 34.0 is, as checked on 2026-10-30 (arm64 Linux): clang 23.1.0 with only the
+WebAssembly targets (`wasm32`, `wasm64`), so it can compile for no host; `clang.cfg` defaults
+`--sysroot` to its own `share/wasi-sysroot`, which has headers and libraries for `wasm32-wasip1`,
+`-wasip1-threads`, `-wasip2` and `-wasip3`. Its Linux programs need glibc 2.17 or newer and load
+the machine's `libstdc++.so.6`, `libgcc_s.so.1` and (through its `libLLVM.so`) `libtinfo.so.6`.
+Every glibc distribution's base install has them (Ubuntu's runners do); NixOS has not, nor does a
+run of `BLAZE_SCRIPT_VIEW=on`, which sees only its closure. That is the one thing of the machine
+step 1 still uses: blaze checks once a process that the clang starts and stops naming the three
+libraries when it does not, and a run in its closure alone stops for a `wasm32-wasip*` target.
+blaze's own clang (step 3), linked statically as its LLVM is, removes it.
+
 `wasm32-unknown-unknown` and `wasm32v1-none` have no libc. They get the same clang with no
 sysroot, so a C file sees clang's freestanding headers (`stdint.h`, `stddef.h`, `stdarg.h`) and
 nothing of the host. A crate that needs more ships it itself, as `zstd-sys`'s `wasm-shim` does.
@@ -174,9 +185,9 @@ target-specific variables cc-rs, `cmake` and their kin read first:
 
 cc-rs takes `CC_<target>` before `TARGET_CC` and `CC`, so the host's `CC` and `CFLAGS` still
 compile for the host and none of them reaches the wasm32 compile. The pinned directory is made
-readable in the sandbox when it would be empty there (`BLAZE_HOME` below `/tmp`, as in the gate),
-and is seen in a run of `BLAZE_SCRIPT_VIEW=on`. The variables name the pinned directory, whose
-name has the download's sha256, so the run's key in the store has the toolchain in it.
+readable in the sandbox when it would be empty there (`BLAZE_HOME` below `/tmp`, as in the gate).
+The variables name the pinned directory, whose name has the download's sha256, so the run's key
+in the store has the toolchain in it.
 
 ## What a user may set
 

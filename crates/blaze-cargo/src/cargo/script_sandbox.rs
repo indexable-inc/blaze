@@ -320,11 +320,20 @@ pub fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
             Some(manifest) => hermetic::system_deps(manifest)?,
             None => Default::default(),
         };
+        if own_c.is_some() {
+            anyhow::bail!(
+                "the build script of `{package}` is for {}, whose C blaze compiles with wasi-sdk, \
+                 and a run in its closure alone ({}=on) has none of the C++ runtime its clang \
+                 loads (docs/c-toolchain.md): run it without {1}, or with `{}=given`",
+                script.var("TARGET").unwrap_or("?"),
+                hermetic::VAR,
+                super::toolchain::c::VAR,
+            );
+        }
         let version = script.var("CARGO_PKG_VERSION").unwrap_or("0.0.0");
         let closure = hermetic::closure_for(package, version, &overrides)?;
         let mut also = also;
         also.extend(script.declared.iter().cloned());
-        also.extend(own_c_env.iter().map(|it| it.0.clone()));
         let mut env = hermetic::env_in(&env, &also, &closure);
         env.extend(handed.env);
         let deps = hermetic::dep_out_dirs(&env);
@@ -332,7 +341,6 @@ pub fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
         read.extend(handed.readable);
         read.extend(script.real.parent().map(Path::to_owned));
         read.push(script.scratch.join(OWN_RUSTC));
-        read.extend(own_c.as_ref().map(|it| it.dir.clone()));
         read.extend(std::fs::canonicalize(&exe).ok().and_then(|it| Some(it.parent()?.to_owned())));
         let toolchain = env.iter().find(|it| it.0 == crate::as_rustc::TOOLCHAIN);
         let toolchain =

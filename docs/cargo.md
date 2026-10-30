@@ -398,7 +398,10 @@ Such a run, sandboxed or not, is given the target's own variables, `CC_<target>`
 `TARGET_CC` and `CC`, so the host's compiler and flags still compile for the host. One of them
 already set by the environment stops the build naming it; `BLAZE_C_TOOLCHAIN=given` leaves the
 C toolchain to the environment, as cargo does. A failed download stops the build: the machine's
-compiler is not used instead. Every other target's C is still compiled with what the
+compiler is not used instead. On Linux wasi-sdk's clang loads the machine's `libstdc++.so.6`,
+`libgcc_s.so.1` and `libtinfo.so.6` (NixOS has none of them), and a clang that does not start
+stops the build naming them; a run of `BLAZE_SCRIPT_VIEW=on` for such a target stops too. Every
+other target's C is still compiled with what the
 environment gives, until its step of [c-toolchain.md](c-toolchain.md#steps) lands.
 
 A script that fails having been refused a write or a connection says so under its output:
