@@ -32,7 +32,7 @@ import memory
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CRATES = ["parser", "syntax", "hir-def", "blaze-store"]
 # What the build job ships blaze with: LLVM as a second code producer.
-FEATURES = ["blaze-engine/llvm"]
+FEATURES = []
 
 # crate::test, as libtest names it under the crate's test binary.
 OPEN = {
@@ -314,7 +314,7 @@ def main():
         command = ["cargo", "test", "--release", "--no-fail-fast", *packages, *args]
     else:
         verb = ["build"] if cfg.build else ["test", "--no-fail-fast"]
-        command = ["blaze", *verb, "--release", "--locked", "--features", ",".join(FEATURES), *packages, *args]
+        command = ["blaze", *verb, "--release", "--locked", *(["--features", ",".join(FEATURES)] if FEATURES else []), *packages, *args]
     open_ = OPEN if plain else OPEN | OPEN_BLAZE
     # Under CI rust-analyzer's slow tests run, and mark that they did in the target directory.
     env = {"CARGO_TARGET_DIR": os.path.join(ROOT, "target"), **os.environ}
