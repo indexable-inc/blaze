@@ -115,55 +115,66 @@ of an edit one after another: settle, read, apply, roots, check, reach, resolve,
 object, write, link, and what is left between them), `phases:`, `backend:` (the producer's
 time summed over threads; LLVM's split into lower, verify, optimize, emit, read), `store:`,
 `link:` (spliced or not and why) and `edit-to-binary:`; and for the first build `load
-workspace:`, `resolve:` and `cold:`. Two things could not be told from those and were added,
-on the same switch and as lines of the same kind:
+workspace:`, `resolve:` and `cold:`. Two things could not be told from those and were added:
 
-- `steps: infer …, mir …, monomorphize …, translate …, describe …, store read …, store write …`:
-  what the compiling threads spent, summed over the threads, on the types of a body, its MIR,
-  putting an instance's types into a generic body, turning MIR into the producer's IR, debug
-  info (lines and variables of each function, and writing the sections), and reading and
-  writing entries of the store. `infer` is only what had not been asked for before codegen got
-  to it; after an edit the types are computed in the `check` step of the timeline, so `infer`
-  is then near zero.
+- The time the compiling threads spent on the types of a body (`infer`), its MIR (`mir`),
+  putting an instance's types into a generic body (`monomorphize`), turning MIR into the
+  producer's IR (`translate`), debug info (`describe`), and reading and writing entries of the
+  store (`store read`, `store write`). These are spans of the profile now (below), rows of its
+  `phases.tsv`. `infer` is only what had not been asked for before codegen got to it; after an
+  edit the types are computed in the `check` step of the timeline, so `infer` is then near
+  zero.
 - `round N: TIME, started over: WHY` for every pass over the program whose object was thrown
   away, and `discarded=` in `timeline-us` for their sum. `phases:` only ever described the last
   round, so a build of four rounds showed three quarters of its time as "compile-rest".
 
-The client, the daemon and the worker also record spans of every build on one clock, always
-(`crates/blaze-cargo/src/trace.rs`): the worker sends its own with its answer, the daemon adds its
-own, and the client puts them together. With them:
+The client, the daemon and the worker also note the steps of every build on one clock, always
+(`crates/blaze-profile`): the worker sends its own with its answer, the daemon adds its own,
+and the client puts them together. With them:
 
 - `BLAZE_STATS=1` makes `blaze build` print `blaze time: 402.1 ms: check 285.5 (71%),
   …` and a table of where the client's wall time went, step by step (client, daemon, worker),
   with `unaccounted` for moments no step had: the rows add up to the total.
-- `BLAZE_TRACE=<path>` writes the spans as a Chrome trace (ui.perfetto.dev and
-  chrome://tracing open it): to `path` if it ends in `.json`, else to a new file in the
-  directory `path` for every build. Besides the steps it has a span for each rust-analyzer
-  query the worker ran (infer, MIR, impls) and each step of code generation (translate,
-  cranelift) of 0.2 ms or longer. The worker's
-  reach, resolve, define, object, statics, setup and compile-rest are sums over threads laid
-  end to end, so read them as one stretch.
+- `BLAZE_PROFILE=<dir>` profiles the whole build, in every process of it (the client, the
+  worker, build scripts, proc macros), on every thread. At the end of the build the client
+  writes to `dir`:
+  - `trace.json`, a Chrome trace (ui.perfetto.dev and chrome://tracing open it): a track per
+    thread of each process with the target `blaze` spans (load, cargo metadata, build scripts,
+    resolve names, check, the steps of compiling each function, store, splice) and every
+    rust-analyzer query of 50 µs or longer, a track of the build steps each process said it
+    was at, and the client's, daemon's and worker's steps above. A span of one function or
+    crate is shown under its name. Key `blaze` has the client's wall time and the breakdown
+    of the table above.
+  - `phases.tsv`: each span's count, wall time and own CPU time (without the `blaze` spans
+    under it, from the thread's CPU clock), the most CPU first.
+  - `functions.tsv`: the same for each function compiled (`compile root`, `compile
+    instance`), each crate resolved, each build script run and each proc macro made.
+  - `passes.tsv`: the time of each Cranelift pass (and LLVM phase), less the passes under it.
+
+  Off, nothing is recorded: the subscriber tells every callsite it is never wanted, so a span
+  costs the check of a cached flag, and Cranelift's passes are not timed at all (they were,
+  always, before). A daemon started by a profiled build profiles its worker's load; one
+  already running starts profiling at the request, so what a worker started before then
+  (spare workers, build scripts it ran already) is not in the profile.
 - A worker started directly (`blaze <crates> --watch`, or one build without it) with
-  `BLAZE_TRACE=<path>` writes its first build as a trace of its own: the steps and queries
-  from its start until it says `watching N files`, or until that one build ends.
-  `blaze.startup.outcome` says which (`watch ready`, `complete` or `failed`), and
-  `blaze.startup.dropped` counts the spans that did not fit. Each parallel dispatch has a
-  `parallel N worker` span per thread, `parallel N caller` for the caller's own share and
-  `parallel N join` for its wait on the last thread, and each linker run a `link` span,
-  failed ones saying how they ended. A worker the daemon starts writes none.
-- `BLAZE_TRACE_CONST=crate::module::NAME` with it follows one module-level constant: a
+  `BLAZE_PROFILE=<dir>` puts its first build's profile together itself, as a client does:
+  from its start until it says `watching N files`, or until that one build ends. Each
+  parallel dispatch has a `parallel` span per thread (`worker`), one for the caller's own
+  share (`caller`) and one for its wait on the last thread (`join`), and each linker run a
+  `link` span.
+- `BLAZE_PROFILE_CONST=crate::module::NAME` with it follows one module-level constant: a
   `const request` span is a wait for its value, and a `const eval` inside it is a run of its
-  query, however short; a request with none found it already computed. Compare them with the
-  threads of the same parallel dispatch, its join and the link. An associated constant or
-  one in a block has no such path and is not followed.
-- `harness/realbench.py` runs every warm build with `BLAZE_TRACE` and keeps the breakdown of
+  query, both on the timeline however short; a request with none found it already computed.
+  Compare them with the threads of the same parallel dispatch, its join and the link. An
+  associated constant or one in a block has no such path and is not followed.
+- `harness/realbench.py` runs every warm build with `BLAZE_PROFILE` and keeps the breakdown of
   each row's median run; `realbench.py --table FILE` prints it under the results.
 
-The old `BLAZE_TRACE` switch, which printed the rust-analyzer queries an edit ran, is now
-`BLAZE_QUERIES`.
+The old `BLAZE_TRACE` switches (the queries an edit ran, now `BLAZE_QUERIES`; then a Chrome
+trace of the steps, now `BLAZE_PROFILE`) are gone: setting it stops blaze with a note.
 
-`bench.py` puts these in the JSON as `steps_ms` (the timeline), `threads_s` (the `steps:` and
-`backend:` lines) and `started_over` (the reasons).
+`bench.py` puts these in the JSON as `steps_ms` (the timeline), `threads_s` (the `backend:`
+lines, and with a profile its compile steps) and `started_over` (the reasons).
 
 On ripgrep's cold build under Cranelift (7.1 s of compiling on 8 threads, 23,387 functions)
 the threads spent: MIR 2.9 s, translation 3.8 s, Cranelift 6.2 s, store writes 2.1 s, debug

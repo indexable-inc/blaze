@@ -1,0 +1,27 @@
+[package]
+name = "blaze-profile"
+description = "Where the time of a blaze build goes: the steps of a build, and with BLAZE_PROFILE every process's per-thread timeline, the CPU time of each function compiled and of each pass"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+rustc-hash.workspace = true
+serde.workspace = true
+serde_derive.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

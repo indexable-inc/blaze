@@ -115,7 +115,7 @@ def main():
 
     def step(label, side):
         pulled = cache(side, "pull") if label != "seed" else None
-        side.env["BLAZE_TRACE"] = os.path.join(work, f"trace-{label}.json")
+        side.env["BLAZE_PROFILE"] = os.path.join(work, f"profile-{label}")
         daemon = bench.Daemon(side)
         with memory.Sampler() as sampler:
             took, ran, used = bench.metered(side, build, sampler=sampler)
@@ -129,7 +129,7 @@ def main():
         row = dict(step=label, build_s=round(took, 3), ready_s=round(ready, 3), states=states,
                    built=bench.how_built(ran.stderr), peak_mb=max(sampler.peak_mb, used["largest_mb"]),
                    resident_mb=daemon.resident_mb(), compiled=bench.compiled(said),
-                   steps_s=bench.cold_steps(said), threads_s=bench.thread_steps(said),
+                   steps_s=bench.cold_steps(said), threads_s=bench.thread_steps(said, side.env["BLAZE_PROFILE"]),
                    phases=re.findall(r"^phases: (.*)$", said, re.M), store=from_store(said),
                    manifest=re.findall(r"^manifest: (.*)$", said, re.M), pull=pulled)
         row["output"] = output(side)

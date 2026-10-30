@@ -57,8 +57,8 @@ pub(crate) fn mode() -> Option<Mode> {
 fn configures(name: &str) -> bool {
     const NOT_OF_THE_CODE: &[&str] = &[
         "BLAZE_STATS",
-        "BLAZE_TRACE",
-        "BLAZE_TRACE_CONST",
+        "BLAZE_PROFILE",
+        "BLAZE_PROFILE_CONST",
         "BLAZE_MEMORY",
         "BLAZE_MANIFEST",
         "BLAZE_HOME",

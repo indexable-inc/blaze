@@ -343,6 +343,8 @@ mod tests {
                       cargo:rustc-link-arg=-Wl,-rpath,/nix/store/abc-libva/lib\n\
                       cargo:rustc-cdylib-link-arg=-Wl,-soname,libx.so.1\n\
                       cargo:rustc-link-arg=-lstdc++\n\
+                      cargo:rustc-link-arg=-ObjC\n\
+                      cargo:rustc-link-arg-bins=-Wl,-ObjC\n\
                       cargo:rustc-link-arg=-fuse-ld=/tmp/evil\n\
                       cargo:rustc-link-arg=-Wl,-rpath,/home/u/lib\n\
                       cargo:rustc-link-arg=-Wl,--version-script=../../etc/x\n\

@@ -179,6 +179,8 @@ HARNESSES = [
     ("store", ["storefull.py"], {}, on("linux", "windows"), 2),
     ("store", ["storeshared.py"], {}, EVERYWHERE, None),
     ("store", ["storeguards.py"], {}, on("linux"), None),
+    # A dependency's features and what its build script set and wrote, in the keys of its code.
+    ("store", ["depkeys.py", arg({})], {}, on("linux"), None),
     ("store", ["storetracked.py"], {}, on("linux", "macos"), 2),
     ("store", ["storebuilds.py"], {}, on("linux", "macos"), 2),
     # Typed JSON from the Python workspace: the harness job has to run ci.py under `uv run --frozen`.

@@ -257,19 +257,45 @@ impl Contents {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(b"blaze library 4");
+        field(b"blaze library 5");
         field(Self::version(db, krate).as_bytes());
         // Where cargo fetched it to is under another directory on another machine.
         let root = root.to_string_lossy();
         let home = self.cargo_home(db);
         let there = home.and_then(|home| moved(&root, &home, CARGO_HOME));
         field(there.as_deref().unwrap_or(&root).as_bytes());
+        let data = krate.data(db);
+        field(format!("{:?} {}", data.edition, data.target_kind.is_proc_macro()).as_bytes());
+        for attr in &data.crate_attrs {
+            field(attr.as_bytes());
+        }
+        // Its features are among its cfgs, and so is what its build script set.
         let mut cfgs: Vec<String> =
             krate.cfg_options(db).into_iter().map(|it| it.to_string()).collect();
         cfgs.sort_unstable();
         field(cfgs.join("\n").as_bytes());
+        // What its build script set and wrote, with the places as the checkout's hash has them:
+        // code that has a place in it is not kept, see [`Contents::names_place`].
+        let env = krate.env(db);
+        let (package, out) = (env.get("CARGO_MANIFEST_DIR"), env.get("OUT_DIR"));
+        let mut vars = format!("{env:?}");
+        let mut places: Vec<(&str, &str)> = Vec::new();
+        places.extend(package.as_deref().map(|package| (package, "$PACKAGE")));
+        places.extend(out.as_deref().map(|out| (out, "$OUT")));
+        places.sort_unstable_by_key(|(path, _)| std::cmp::Reverse(path.len()));
+        for (path, stands_for) in places {
+            vars = vars.replace(path, stands_for);
+        }
+        field(vars.as_bytes());
+        if let Some(out) = out {
+            for (path, hash) in written_to(db, krate, &out) {
+                field(path.as_bytes());
+                field(&hash);
+            }
+            self.places.lock().unwrap_or_else(|e| e.into_inner()).insert(out);
+        }
         field(format!("{:?}", process_reads(krate)).as_bytes());
-        let mut dependencies: Vec<_> = krate.data(db).dependencies.iter().collect();
+        let mut dependencies: Vec<_> = data.dependencies.iter().collect();
         dependencies.sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
         for dependency in dependencies {
             let on = dependency.crate_id;

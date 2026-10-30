@@ -489,12 +489,13 @@ impl SymbolTable {
             SymbolTable { read: Some(SystemTime::now()), generation, ..SymbolTable::default() };
         let mut symbols = Vec::new();
         let mut owners = Vec::new();
-        let start = std::time::Instant::now();
+        let span = tracing::info_span!(target: "blaze", "read symbols").entered();
         READ_BEFORE.store(0, std::sync::atomic::Ordering::Relaxed);
         let read = names_of(files);
         // What was read ahead of files that are not of the link is not asked for again.
         lock(&READ_AHEAD).clear();
-        let read_in = start.elapsed();
+        drop(span);
+        let span = tracing::info_span!(target: "blaze", "add symbols").entered();
         for (file, names) in files.iter().zip(read) {
             let first = symbols.len();
             for name in names? {
@@ -523,17 +524,14 @@ impl SymbolTable {
                 }
             }
         }
-        let added_in = start.elapsed() - read_in;
-        table.place(unplaced);
-        table.index(symbols);
+        drop(span);
+        tracing::info_span!(target: "blaze", "index symbols").in_scope(|| {
+            table.place(unplaced);
+            table.index(symbols);
+        });
         if std::env::var_os("BLAZE_STATS").is_some() {
-            let indexed_in = start.elapsed() - read_in - added_in;
             let ahead = READ_BEFORE.load(std::sync::atomic::Ordering::Relaxed);
-            eprintln!(
-                "symbols: read {read_in:.1?} ({ahead} of {} files ahead), added {added_in:.1?}, \
-                 indexed {indexed_in:.1?}",
-                files.len()
-            );
+            eprintln!("symbols: {ahead} of {} files read ahead", files.len());
             let unshared = table.static_copies.values();
             let unshared = unshared.filter(|it| matches!(it, StaticCopy::Unshared(_))).count();
             eprintln!(

@@ -593,6 +593,7 @@ fn checkout(
         // What `env!` reads that cargo sets is each crate's own, in the load.
         env: BTreeMap::new(),
         scripts: None,
+        profile: None,
     }
 }
 

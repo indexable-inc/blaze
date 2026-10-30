@@ -178,6 +178,17 @@
       "excluded": {
         "flox-rust-sdk, flox-manifest and flox's own tests": "they run Nix, reach FloxHub or the catalog, or read what `just build` made; flox's CI runs them in its Nix shell with its services"
       }
+    },
+    "codex": {
+      "group": "apps",
+      "repo": "openai/codex",
+      "rev": "360319d8dee62d87e2d59fc0c21805d79519cfed",
+      "dir": "codex-rs",
+      "note": "OpenAI's Codex CLI, rust-v0.165.0: its Rust workspace is codex-rs, pinned to Rust 1.99.1 (rust-toolchain.toml), which bench.py's cargo builds with. System libraries from its rust-ci-full.yml (libcap for the Linux sandbox, ALSA for voice) and OpenSSL, which hosted runners have. Only the codex binary is built: v8, which codex-code-mode-runtime builds against V8 archives of codex's own (#1369), is not below it. `--version` needs no API key or network. Its tests are the unit and integration tests of crates that need neither a model, a network nor credentials.",
+      "apt": ["build-essential", "libasound2-dev", "libcap-dev", "libssl-dev", "pkg-config"],
+      "seconds": 18000,
+      "runs": [{ "select": ["-p", "codex-cli", "--bin", "codex"], "args": ["--version"], "stdout": "codex-cli 0.165.0\n" }],
+      "test": ["-p", "codex-apply-patch", "-p", "codex-protocol", "-p", "codex-execpolicy", "-p", "codex-features"]
     }
   }
 }

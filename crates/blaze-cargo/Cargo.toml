@@ -59,6 +59,7 @@ blaze-lints.workspace = true
 blaze-manifest.workspace = true
 blaze-metadata.workspace = true
 blaze-new.workspace = true
+blaze-profile.workspace = true
 blaze-graph.workspace = true
 blaze-protocol.workspace = true
 blaze-tree.workspace = true

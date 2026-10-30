@@ -247,7 +247,7 @@ impl<'db> Keeper<'_, 'db> {
         declared: Option<(String, u32, u32)>,
     ) -> Option<FunctionDebug> {
         let rows = rows?;
-        let start = stdx::time::Instant::now();
+        let _span = tracing::info_span!(target: "blaze", "describe").entered();
         if let Some((file, line, column)) = declared {
             debug.declared = Some(debug.place(file, line, column));
         }
@@ -290,7 +290,6 @@ impl<'db> Keeper<'_, 'db> {
                 &mut debug,
             );
         }
-        backend::Tally::global().add(Step::Describe, start.elapsed());
         Some(debug)
     }
 
