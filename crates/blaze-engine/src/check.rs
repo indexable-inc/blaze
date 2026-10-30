@@ -357,7 +357,7 @@ impl Checker {
             targets,
             loaded,
             manifests,
-            sources: Sources { paths },
+            sources: Sources { paths, on_disk: FxHashMap::default() },
             root,
             lints_capped,
             located,

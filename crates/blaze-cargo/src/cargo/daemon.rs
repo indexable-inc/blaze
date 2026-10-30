@@ -465,8 +465,9 @@ impl Checkout {
             (false, _) => ("", plan.patch.display().to_string()),
         };
         let unit_test = if plan.unit_test { super::plan::UNIT_TEST } else { "" };
+        // No dep-info and no inputs: cargo writes those of the programs it builds.
         let mut line = format!(
-            "sync\t{}\t{}\t{}\t{patch}\t{}\t{splice}\t{exe}\t{shared}\t{unit_test}",
+            "sync\t{}\t{}\t{}\t{patch}\t{}\t{splice}\t{exe}\t{shared}\t{unit_test}\t\t",
             self.project().display(),
             crates,
             plan.object.display(),

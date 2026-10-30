@@ -7,6 +7,7 @@ pub mod load_wrapper;
 
 pub mod affected;
 pub mod backend;
+pub mod builders;
 pub mod cli;
 pub mod client;
 #[cfg(unix)]

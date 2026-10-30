@@ -114,6 +114,10 @@ struct Args {
     watch: bool,
     /// A Unix socket to take build requests on, instead of building when a file changes.
     socket: Option<PathBuf>,
+    /// The requests on `socket` are each for a program to build once, in a database the
+    /// programs share, and none for an edit of one: the build scripts and proc macros of a
+    /// load (`cargo/compile_time.rs`). Its code is built as a build of no daemon's is.
+    builds_only: bool,
     link_cmd: Option<String>,
     /// Where to write the object that amends `out` after an edit, for the link to take ahead of
     /// `out`. Without it every edit writes `out` again.
@@ -259,6 +263,7 @@ impl Args {
         let mut run_tool = false;
         let mut dep_info = None;
         let mut inputs = None;
+        let mut builds_only = false;
         let mut cfg_test = false;
         let mut unit_test = false;
         let (mut executables, mut scratch) = (None, None);
@@ -303,6 +308,7 @@ impl Args {
                 "--inputs" => inputs = Some(PathBuf::from(value()?)),
                 "--watch" => watch = true,
                 "--socket" => socket = Some(PathBuf::from(value()?)),
+                "--builds-only" => builds_only = true,
                 "--cfg-test" => cfg_test = true,
                 // A unit test is built of a load that has it.
                 "--unit-test" => {
@@ -343,6 +349,9 @@ impl Args {
         if run_tool && target.as_deref() != Some(RUN_TOOL_TARGET) {
             bail!("--run-tool is for build scripts compiled for --target {RUN_TOOL_TARGET}");
         }
+        if builds_only && (socket.is_none() || watch) {
+            bail!("--builds-only says what the requests on --socket are, and there is no --socket");
+        }
         Ok(Args {
             project: project.context("missing project path")?,
             krate: krate.context("missing --crate")?,
@@ -352,6 +361,7 @@ impl Args {
             symbol_files,
             watch,
             socket,
+            builds_only,
             link_cmd,
             patch,
             splice,
@@ -5091,12 +5101,43 @@ fn own_link_line(db: &RootDatabase, args: &Args) -> anyhow::Result<Option<(Strin
     Ok(Some((cmd, exe.clone())))
 }
 
+/// Where the files of the database are on disk, for what a build writes of the files it read.
+#[derive(Clone, Copy)]
+enum FilePaths<'a> {
+    /// A file of the VFS that has no path is on no disk, and is named by nothing written.
+    Vfs(&'a vfs::Vfs),
+    /// What a build on a worker's threads has in place of the VFS ([`Sources::on_disk`]),
+    /// which has every file the database had when the build started.
+    Listed(&'a Sources),
+}
+
+impl FilePaths<'_> {
+    fn of(self, id: vfs::FileId) -> anyhow::Result<Option<String>> {
+        match self {
+            FilePaths::Vfs(vfs) => Ok(vfs.file_path(id).as_path().map(ToString::to_string)),
+            FilePaths::Listed(sources) => match sources.on_disk.get(&id) {
+                Some(path) => Ok(path.clone()),
+                None => bail!("the file {id:?} the build read was not in the VFS when it started"),
+            },
+        }
+    }
+
+    /// The paths of `files` that are on disk, in their order.
+    fn all(self, files: &[vfs::FileId]) -> anyhow::Result<Vec<String>> {
+        let mut paths = Vec::new();
+        for &file in files {
+            paths.extend(self.of(file)?);
+        }
+        Ok(paths)
+    }
+}
+
 /// Writes to `path` the dep-info rustc writes of the crate `args` asks for, linked as `exe`:
 /// one rule naming the files of its modules, the root first, and a rule of no files for each.
 fn write_dep_info(
     db: &RootDatabase,
     args: &Args,
-    vfs: &vfs::Vfs,
+    files_at: FilePaths<'_>,
     exe: &Path,
     path: &Path,
 ) -> anyhow::Result<()> {
@@ -5108,12 +5149,11 @@ fn write_dep_info(
         let included = hir_def::include_macro_invoc(db, krate.into()).iter();
         files.extend(included.map(|(_, file)| file.file_id(db)));
     }
-    let named = |id: &vfs::FileId| Some(vfs.file_path(*id).as_path()?.to_string());
     let mut paths: Vec<String> = Vec::new();
     // What `include_str!` and `include_bytes!` read from outside the VFS, as rustc names it.
     let read = krates.iter().flat_map(|it| db.included_by((*it).into()));
     let read: Vec<String> = read.map(|(path, _)| path.to_string()).collect();
-    for path in files.iter().filter_map(named).chain(read) {
+    for path in files_at.all(&files)?.into_iter().chain(read) {
         if !paths.contains(&path) {
             paths.push(path);
         }
@@ -5154,12 +5194,30 @@ fn write_dep_info(
     std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
 }
 
-/// Writes to `path` what [`Args::inputs`] says: the files of the modules of every crate that
-/// is not the toolchain's, what `include!` and its kin read for them, and the variables of
-/// this process `env!` and `option_env!` read where the crate's description had none.
-fn write_inputs(db: &RootDatabase, vfs: &vfs::Vfs, path: &Path) -> anyhow::Result<()> {
-    let krates: Vec<Crate> =
-        Crate::all(db).into_iter().filter(|it| !it.origin(db).is_lang()).collect();
+/// Writes to `path` what [`Args::inputs`] says: the files of the modules of every crate of the
+/// program `args` asks for that is not the toolchain's, what `include!` and its kin read for
+/// them, and the variables of this process `env!` and `option_env!` read where the crate's
+/// description had none. A worker's database has the crates of the other programs too.
+fn write_inputs(
+    db: &RootDatabase,
+    args: &Args,
+    files_at: FilePaths<'_>,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let mut krates = crates_named(db, &args.krate, args)?;
+    for name in &args.batch {
+        krates.extend(crates_named(db, name, args)?);
+    }
+    let mut reached = 0;
+    while let Some(&krate) = krates.get(reached) {
+        reached += 1;
+        for dep in krate.dependencies(db) {
+            if !krates.contains(&dep.krate) {
+                krates.push(dep.krate);
+            }
+        }
+    }
+    krates.retain(|it| !it.origin(db).is_lang());
     let mut files = Vec::new();
     for &krate in &krates {
         let modules = krate.modules(db).into_iter().map(|it| it.definition_source_file_id(db));
@@ -5167,8 +5225,7 @@ fn write_inputs(db: &RootDatabase, vfs: &vfs::Vfs, path: &Path) -> anyhow::Resul
         let included = hir_def::include_macro_invoc(db, krate.into()).iter();
         files.extend(included.map(|(_, file)| file.file_id(db)));
     }
-    let mut lines: Vec<String> =
-        files.iter().filter_map(|id| Some(vfs.file_path(*id).as_path()?.to_string())).collect();
+    let mut lines: Vec<String> = files_at.all(&files)?;
     lines.extend(
         krates.iter().flat_map(|it| db.included_by((*it).into())).map(|it| it.0.to_string()),
     );
@@ -6244,9 +6301,19 @@ impl CratesAsLoaded {
     }
 }
 
+/// The stack of a thread a worker builds a program on. A build of no daemon's runs on the main
+/// thread, with the 8 MiB its platform gives it, and the type inference and MIR building of
+/// deeply nested code (a build script that calls the `cc` crate) recurse deeper than the
+/// 2 MiB another thread gets by default. Only what is used of it is ever memory.
+const BUILD_STACK: usize = 64 << 20;
+
 /// The source files the daemon watches.
 struct Sources {
     paths: FxHashMap<vfs::FileId, PathBuf>,
+    /// Where each file of the VFS is, `None` for one on no disk, when a program of the build
+    /// writes what it read ([`Args::dep_info`], [`Args::inputs`]): what it read of the
+    /// toolchain and the registry is not watched. Empty when none does.
+    on_disk: FxHashMap<vfs::FileId, Option<String>>,
 }
 
 /// Why the daemon did not build a program.
@@ -6390,7 +6457,7 @@ fn unparsed(
     watched: &Sources,
     root: &Path,
 ) -> Option<errors::Diagnostic> {
-    let Sources { paths } = watched;
+    let Sources { paths, .. } = watched;
     for &file in sources {
         let path = paths.get(&file);
         // A manifest is cargo's to read: the checkout is loaded again when one changes.
@@ -6879,6 +6946,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             symbol_files: Vec::new(),
             watch: false,
             socket: None,
+            builds_only: false,
             link_cmd: None,
             patch: None,
             splice: None,
@@ -6987,6 +7055,9 @@ struct Target {
     staticlib: bool,
     /// It is the unit tests of the target `krate` names ([`Args::unit_test`]).
     unit_test: bool,
+    /// [`Args::dep_info`] and [`Args::inputs`] of the program, written once `exe` is linked.
+    dep_info: Option<PathBuf>,
+    inputs: Option<PathBuf>,
     /// What its link takes that rustc compiled. Code rustc instantiated for one program is in
     /// that program's own objects, so another has to be told where its copies are. Empty for
     /// the files the daemon was started with.
@@ -7008,6 +7079,8 @@ impl Target {
             shared: args.shared,
             staticlib: args.staticlib,
             unit_test: args.unit_test,
+            dep_info: args.dep_info.clone(),
+            inputs: args.inputs.clone(),
             symbol_files: args.symbol_files.clone(),
         }
     }
@@ -7036,6 +7109,8 @@ impl Target {
             shared,
             staticlib,
             unit_test,
+            dep_info,
+            inputs,
             symbol_files,
         } = self;
         // Only a load with `cfg(test)` has the crate of a target's unit tests.
@@ -7072,6 +7147,8 @@ impl Target {
             shared,
             staticlib,
             unit_test,
+            dep_info,
+            inputs,
             symbol_files,
             ..daemon.clone()
         })
@@ -7081,25 +7158,33 @@ impl Target {
     fn from_flags(mut flags: impl Iterator<Item = String>) -> anyhow::Result<Option<Target>> {
         let (mut krate, mut out, mut patch, mut link_cmd) = (None, None, None, None);
         let (mut project, mut splice, mut exe) = (None, None, None);
+        let (mut dep_info, mut inputs) = (None, None);
         let mut symbol_files = Vec::new();
-        let mut unit_test = false;
+        let (mut unit_test, mut shared) = (false, false);
         while let Some(flag) = flags.next() {
-            if flag == "--unit-test" {
-                unit_test = true;
-                continue;
-            }
-            let value = flags.next().with_context(|| format!("{flag} needs a value"))?;
             match flag.as_str() {
-                "--crate" => krate = Some(value),
-                "--project" => project = Some(PathBuf::from(value)),
-                "--out" => out = Some(PathBuf::from(value)),
-                "--patch" => patch = Some(PathBuf::from(value)),
-                "--link-cmd" => link_cmd = Some(value),
-                "--binary" | "--splice" => splice = Some(PathBuf::from(value)),
-                "--exe" => exe = Some(PathBuf::from(value)),
-                "--symbols" => symbol_files.push(PathBuf::from(value)),
-                _ => bail!("unexpected argument {flag}"),
+                "--unit-test" => unit_test = true,
+                "--shared" => shared = true,
+                _ => {
+                    let value = flags.next().with_context(|| format!("{flag} needs a value"))?;
+                    match flag.as_str() {
+                        "--crate" => krate = Some(value),
+                        "--project" => project = Some(PathBuf::from(value)),
+                        "--out" => out = Some(PathBuf::from(value)),
+                        "--patch" => patch = Some(PathBuf::from(value)),
+                        "--link-cmd" => link_cmd = Some(value),
+                        "--binary" | "--splice" => splice = Some(PathBuf::from(value)),
+                        "--exe" => exe = Some(PathBuf::from(value)),
+                        "--dep-info" => dep_info = Some(PathBuf::from(value)),
+                        "--inputs" => inputs = Some(PathBuf::from(value)),
+                        "--symbols" => symbol_files.push(PathBuf::from(value)),
+                        _ => bail!("unexpected argument {flag}"),
+                    }
+                }
             }
+        }
+        if (shared || dep_info.is_some() || inputs.is_some()) && exe.is_none() {
+            bail!("--shared, --dep-info and --inputs say what --exe links, and there is no --exe");
         }
         match (krate, out) {
             (Some(krate), Some(out)) => {
@@ -7113,9 +7198,11 @@ impl Target {
                     link_cmd,
                     splice,
                     exe,
-                    shared: false,
+                    shared,
                     staticlib: false,
                     unit_test,
+                    dep_info,
+                    inputs,
                     symbol_files,
                 }))
             }
@@ -7146,6 +7233,8 @@ impl Target {
             exe,
             shared,
             unit_test,
+            dep_info,
+            inputs,
             ref symbol_files @ ..,
         ] = fields
         else {
@@ -7165,6 +7254,8 @@ impl Target {
             shared: shared == "shared" || shared == "staticlib",
             staticlib: shared == "staticlib",
             unit_test: unit_test == cargo::plan::UNIT_TEST,
+            dep_info: given(dep_info).map(PathBuf::from),
+            inputs: given(inputs).map(PathBuf::from),
             symbol_files: symbol_files.iter().map(PathBuf::from).collect(),
         })
     }
@@ -7187,7 +7278,7 @@ impl Target {
             None => self.krate.clone(),
         };
         let mut fields = format!(
-            "\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.project.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
             crates,
             self.out.display(),
@@ -7200,7 +7291,9 @@ impl Target {
                 (true, false) => "shared",
                 (false, _) => "",
             },
-            if self.unit_test { cargo::plan::UNIT_TEST } else { "" }
+            if self.unit_test { cargo::plan::UNIT_TEST } else { "" },
+            self.dep_info.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
+            self.inputs.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
         );
         for file in &self.symbol_files {
             fields.push('\t');
@@ -8960,7 +9053,7 @@ fn run_holding(
         eprintln!("backend: {backend}");
     }
     process_wide();
-    if args.socket.is_some() || args.watch {
+    if (args.socket.is_some() || args.watch) && !args.builds_only {
         hir_ty_codegen::builds_edits();
     }
     if args.exe.is_some() {
@@ -9080,10 +9173,10 @@ fn run_holding(
             if let Some(told) = blaze_store::toolchain().filter(|it| *it != toolchain) {
                 eprintln!("store: of `{told}`, not of the toolchain loaded, `{toolchain}`");
             }
-            // Every pack is the daemon's to check: a build of one build script or proc macro
+            // Every pack is the daemon's to check: a build of build scripts and proc macros
             // checks a pack the first time it finds a key in it, and would otherwise hash the
-            // whole store on every core beside each of the dozens a cold build starts at once.
-            if args.socket.is_some() || args.watch {
+            // whole store on every core beside the build of the workspace they are of.
+            if (args.socket.is_some() || args.watch) && !args.builds_only {
                 std::thread::spawn(blaze_store::check_packs);
             }
         }
@@ -9252,7 +9345,7 @@ fn run_holding(
         let paths = written_sources(&files, written.iter().copied());
         let mut edited: Vec<_> = paths.keys().copied().collect();
         edited.sort_unstable();
-        let sources = Sources { paths };
+        let sources = Sources { paths, on_disk: FxHashMap::default() };
         let what = match edited.len() {
             1 => "the edited file".to_owned(),
             files => format!("{files} edited files"),
@@ -9413,7 +9506,7 @@ fn run_holding(
             let mut all: Vec<_> = paths.keys().copied().collect();
             all.sort_unstable();
             events::at(events::Step::Check, Some(&format!("{} files", all.len())));
-            let sources = Sources { paths };
+            let sources = Sources { paths, on_disk: FxHashMap::default() };
             let lints = !args.lints_capped;
             let within = Some(within);
             let broken = broken_in(&db, &all, &sources, &args.checkout, within, lints);
@@ -9451,11 +9544,12 @@ fn run_holding(
                 link_executable(&db, &table, &listed, &args, sysroot, exe)
                     .inspect_err(|_| _ = std::fs::remove_file(exe))?;
             }
+            let files_at = FilePaths::Vfs(tree.vfs());
             if let Some(path) = &args.dep_info {
-                write_dep_info(&db, &args, tree.vfs(), exe, path)?;
+                write_dep_info(&db, &args, files_at, exe, path)?;
             }
             if let Some(path) = &args.inputs {
-                write_inputs(&db, tree.vfs(), path)?;
+                write_inputs(&db, &args, files_at, path)?;
             }
         }
         if let (Some(key), false) = (&manifest_key, served) {
@@ -9600,10 +9694,12 @@ fn run_holding(
             }
         });
     }
-    if serving && tier::enabled() {
+    // A program built once is never tiered up.
+    let tiers = serving && !args.builds_only;
+    if tiers && tier::enabled() {
         let sender = sender.clone();
         tier::watch(move |ask| _ = sender.send(Event::Tier(ask)));
-    } else if serving {
+    } else if tiers {
         eprintln!(
             "tier: off (BLAZE_TIER=off, blaze built without `--features llvm`, or not macOS \
              on AArch64)"
@@ -10512,7 +10608,12 @@ fn run_holding(
                 Watched::Included(_) => None,
             })
             .collect();
-        let paths = Arc::new(Sources { paths });
+        let writes_reads = programs.iter().any(|it| it.args.dep_info.is_some() || it.args.inputs.is_some());
+        let on_disk = match writes_reads {
+            true => tree.vfs().iter().map(|(id, path)| (id, path.as_path().map(ToString::to_string))).collect(),
+            false => FxHashMap::default(),
+        };
+        let paths = Arc::new(Sources { paths, on_disk });
         let before_outlines = start.elapsed();
         let sources = outlines.after_edit(&db, &listed, sources);
         let outlined = start.elapsed();
@@ -10603,7 +10704,10 @@ fn run_holding(
                 let defer = clients.iter().all(|it| it.0 == Request::Edit);
                 let patches = program.known.patches() && !program.moved;
                 let own_base = program.known.builds_base();
-                let kept = !own_base && (patches || program.interrupted >= INTERRUPTIONS);
+                // A program built once is no edit's to give way to: the next request waits for
+                // it, where an interrupted one would build again from the start.
+                let kept = !own_base
+                    && (patches || program.interrupted >= INTERRUPTIONS || program.args.builds_only);
                 // What stands in for the program while it is built says what program it is.
                 let away = Program {
                     args: program.args.clone(),
@@ -10646,7 +10750,8 @@ fn run_holding(
                         }
                     });
                 }
-                std::thread::spawn(move || {
+                let thread = std::thread::Builder::new().stack_size(BUILD_STACK);
+                let spawned = thread.spawn(move || {
                     let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let answer =
                             program.sync(&db, &listed, &paths, &edit, wanted.as_ref(), link, defer);
@@ -10664,6 +10769,7 @@ fn run_holding(
                     events::idle();
                     let _ = sender.send(Event::Built(at, program, answer));
                 });
+                spawned.context("starting the thread of a build")?;
             }
             continue;
         }
@@ -10687,7 +10793,8 @@ fn run_holding(
                             theirs.peek().is_some() && theirs.all(|it| it.1.0 == Request::Edit);
                         let (db, listed, paths, edit) = (db.clone(), &*listed, &*paths, &edit);
                         let wanted = outputs.get(&at);
-                        let build = scope.spawn(move || {
+                        let thread = std::thread::Builder::new().stack_size(BUILD_STACK);
+                        let build = thread.spawn_scoped(scope, move || {
                             let answer =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     let answer =
@@ -10699,7 +10806,8 @@ fn run_holding(
                             events::idle();
                             answer.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
                         });
-                        (at, build)
+                        // As `scope.spawn` does, which takes no stack size.
+                        (at, build.expect("failed to spawn thread"))
                     })
                     .collect();
                 builds.into_iter().map(|(at, build)| (at, build.join())).collect::<Vec<_>>()
@@ -11460,7 +11568,24 @@ impl Program {
             let unspliced = || failed.is_none() && link_it && full && args.splice.is_none();
             if let Some(exe) = args.exe.as_deref().filter(|_| unspliced()) {
                 let sysroot = SYSROOT.get().and_then(Option::as_deref);
-                let linked = link_executable(db, table, listed, args, sysroot, exe);
+                let files_at = FilePaths::Listed(paths);
+                let linked = link_executable(db, table, listed, args, sysroot, exe)
+                    .and_then(|()| {
+                        if let Some(path) = &args.dep_info {
+                            write_dep_info(db, args, files_at, exe, path)?;
+                        }
+                        match &args.inputs {
+                            Some(path) => write_inputs(db, args, files_at, path),
+                            None => Ok(()),
+                        }
+                    })
+                    // A daemon's executable may be running, and stays as it was; one built
+                    // once is not there unless it is the program, as a build of no daemon's.
+                    .inspect_err(|_| {
+                        if args.builds_only {
+                            _ = std::fs::remove_file(exe);
+                        }
+                    });
                 failed = linked.err().map(|it| Refused::Cargos(format!("{it:#}")));
             }
         }
