@@ -194,7 +194,24 @@ jobs:
       # C runtime, and names libraries of the SDK that the linker is not otherwise shown.
       - name: blaze build -p blaze-engine --release --features llvm
         if: env.BLAZE == 'true'
-        run: blaze build -p blaze-engine --release --features llvm --locked
+        env:
+          BLAZE_STATS: "1"
+        run: |
+          blaze stop || true
+          blaze build -p blaze-engine --release --features llvm --locked
+          blaze stop || true
+      - name: reuse stats (measurement branch)
+        if: always() && env.BLAZE == 'true'
+        run: |
+          dir="${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/blaze}"; dir="${dir:-$HOME/.cache/blaze}"
+          ls -la "$dir" || true
+          mkdir -p "$RUNNER_TEMP/daemon-log" && cp "$dir"/*.log "$RUNNER_TEMP/daemon-log/" || true
+          grep -E "entries:|backend:|from the store|kept|reused|frozen|manifest" "$dir/daemon.log" | cut -c1-400 | tail -300 || true
+      - if: always() && env.BLAZE == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: daemon-log-${{ inputs.platform }}
+          path: ${{ runner.temp }}/daemon-log
       - name: cargo build -p blaze-engine --release --features llvm
         if: env.BLAZE != 'true'
         run: |
