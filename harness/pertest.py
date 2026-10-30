@@ -120,6 +120,7 @@ EVERY = {
     "tests::counts_a": "ok", "tests::counts_b": "ok", "tests::doubles": "ok",
     "tests::formats": "ok",
 }
+BARE = {"tests::doubles", "tests::formats"}
 
 
 @dataclass(frozen=True)
@@ -196,6 +197,20 @@ def main():
                        out, re.M):
             verdict = "A TEST'S OUTPUT HOLDS ITS CHILD'S LIBTEST REPORT"
         step("every test, each in a process of its own", verdict, out + err)
+
+        # One test at a time, so which executable runs first is the only freedom: whichever
+        # it is, each reported runs every test, and `t`, which fails, is reported.
+        code, out, err = run(ws, env, "--", "--test-threads=1")
+        got = results(out)
+        of_t = {it: v for it, v in EVERY.items() if it not in BARE}
+        of_bare = {it: v for it, v in EVERY.items() if it in BARE}
+        verdict = "ok"
+        if code != 101:
+            verdict = f"ENDED {code}, NOT 101"
+        elif got not in (of_t, EVERY):
+            verdict = f"WITHOUT --no-fail-fast RAN {sorted(got.items())}, NOT {sorted(of_t.items())} " \
+                f"WITH OR WITHOUT {sorted(of_bare.items())}"
+        step("a failure stops what had not started, as cargo", verdict, out + err)
 
         code, out, err = run(ws, env, "-p", "t", "sleeps", BLAZE_TEST_TIMEOUT="2",
                              PERTEST_SLEEP="1")
