@@ -136,6 +136,10 @@ since the release before and the title of each change merged since.
   scripts runs again for `wasm32-wasip1`, so zstd-sys compiles zstd for it, and zed's
   `include_flate_codegen` no longer links the host's `libzstd.a` (docs/cargo.md, "Proc macros
   run as WebAssembly").
+- A proc macro built as WebAssembly that reaches a static in `.init_array` (`ctor` 0.8, so
+  `tauri-macros` through `tauri-utils`) is expanded instead of refused with `static f in custom
+  section .init_array holds an address`: the static becomes an init function of the module, as
+  LLVM writes it, and `__wasm_call_ctors` runs it (#1501).
 - Build scripts run on a stock Ubuntu 23.10 or later, where AppArmor keeps a user from making a
   user namespace: every crate with a build script failed with `the sandbox could not be made:
   /proc/self/setgroups: Permission denied`. Where no user namespace can be made, the sandbox is

@@ -33,7 +33,18 @@ const LINKING_VERSION: u32 = 2;
 #[repr(u8)]
 enum Subsection {
     SegmentInfo = 5,
+    InitFuncs = 6,
     SymbolTable = 8,
+}
+
+/// The priority of the init functions whose pointers are in the section `name`, as LLVM's
+/// wasm object writer reads it: `.init_array` is the default 65535, `.init_array.N` is N.
+/// `None` for any other section.
+pub(super) fn init_priority(name: &str) -> Option<u32> {
+    match name.strip_prefix(".init_array")? {
+        "" => Some(65535),
+        rest => rest.strip_prefix('.')?.parse().ok(),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -105,6 +116,9 @@ struct Writer {
     data_relocs: Vec<Reloc>,
     segments: Vec<u8>,
     segment_count: u32,
+    /// The `WASM_INIT_FUNCS` entries: a priority and a function symbol each.
+    init_funcs: Vec<u8>,
+    init_count: u32,
 }
 
 const IMPORT: &str = "blaze.import.";
@@ -281,6 +295,17 @@ pub(super) fn from_elf(
         writer.code_relocs.push(fixup);
     }
 
+    // A pointer in `.init_array` is an init function too, which the linker calls from
+    // `__wasm_call_ctors` (listed below, once every function has its symbol). The static stays
+    // data as well, as rustc's object has it, since code may take its address or read it.
+    let inits: Vec<_> = datas
+        .iter()
+        .filter_map(|symbol| {
+            let section = symbol.section_index().and_then(|it| file.section_by_index(it).ok());
+            Some((symbol.index(), init_priority(section?.name().ok()?)?))
+        })
+        .collect();
+
     // Each piece of data is a segment of its own, at an address of its own, so that the
     // linker drops the ones nothing refers to.
     (datas.len() as u32).encode(&mut writer.data);
@@ -417,6 +442,40 @@ pub(super) fn from_elf(
         }
     }
 
+    // Each pointer of `.init_array` is one init function, of its section's priority: a static
+    // holds any number of them, as `[extern "C" fn(); 2]` two, or none, as a null one.
+    for (index, priority) in inits {
+        let symbol = file.symbol_by_index(index).map_err(|e| format!("wasm object: {e}"))?;
+        let name = symbol.name().map_err(|e| format!("wasm object: {e}"))?;
+        let section_index = symbol.section_index().expect("a defined symbol");
+        let (section, _) = section_data(section_index)?;
+        let range = symbol.address()..symbol.address() + symbol.size();
+        for (_, reloc) in section.relocations().filter(|(offset, _)| range.contains(offset)) {
+            let RelocationTarget::Symbol(target) = reloc.target() else {
+                return Err("wasm object: relocation against no symbol".to_owned());
+            };
+            let target_symbol =
+                file.symbol_by_index(target).map_err(|e| format!("wasm object: {e}"))?;
+            let function = if target_symbol.kind() == SymbolKind::Section {
+                target_symbol
+                    .section_index()
+                    .and_then(|section| containing(section, reloc.addend() as u64))
+                    .filter(|it| it.is_function && it.address == reloc.addend() as u64)
+                    .map(|it| it.symbol)
+            } else {
+                symbol_of.get(&target).filter(|(_, is_function)| *is_function).map(|&(it, _)| it)
+            };
+            let Some(function) = function else {
+                return Err(format!(
+                    "wasm object: `{name}` in `.init_array` points to no function"
+                ));
+            };
+            priority.encode(&mut writer.init_funcs);
+            function.encode(&mut writer.init_funcs);
+            writer.init_count += 1;
+        }
+    }
+
     let mut sections: Vec<(&str, Vec<u8>)> = Vec::new();
     for (name, bytes) in custom {
         if matches!(name.as_str(), "linking" | "name") || name.starts_with("reloc.") {
@@ -521,6 +580,9 @@ impl Writer {
         };
         subsection(Subsection::SymbolTable, self.symbol_count, &self.symbols);
         subsection(Subsection::SegmentInfo, self.segment_count, &self.segments);
+        if self.init_count > 0 {
+            subsection(Subsection::InitFuncs, self.init_count, &self.init_funcs);
+        }
 
         // The reloc sections name the section they are for by its place in the module.
         const CODE_SECTION: u32 = 3;
@@ -593,5 +655,21 @@ fn write_padded(place: &mut [u8], mut value: u32) {
     for (at, byte) in place.iter_mut().enumerate() {
         *byte = (value & 0x7f) as u8 | if at == last { 0 } else { 0x80 };
         value >>= 7;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::init_priority;
+
+    /// `.init_array` and `.init_array.N` are init functions, as LLVM reads them; anything else
+    /// that starts so is a custom section like any other.
+    #[test]
+    fn the_init_array_names_its_priority() {
+        assert_eq!(init_priority(".init_array"), Some(65535));
+        assert_eq!(init_priority(".init_array.101"), Some(101));
+        assert_eq!(init_priority(".init_arrays"), None);
+        assert_eq!(init_priority(".init_array.x"), None);
+        assert_eq!(init_priority("blaze_joined"), None);
     }
 }

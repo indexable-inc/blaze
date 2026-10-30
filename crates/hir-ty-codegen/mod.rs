@@ -7170,8 +7170,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let named = (again.is_some() || self.patching) && !thread_local;
         let asked = AttrFlags::link_section(db, id.into());
         // On wasm the section a static asks for is a custom section of the module, which
-        // holds a copy of its bytes; the static itself stays in memory like any other.
-        let custom = asked.as_ref().filter(|_| Target::current().writes_wasm_objects());
+        // holds a copy of its bytes; the static itself stays in memory like any other. But
+        // `.init_array`, as LLVM has it: its function pointers are the module's init
+        // functions (`ctor`'s), which the object writer lists (`wasm_object::init_priority`).
+        let custom = asked.as_ref().filter(|it| {
+            Target::current().writes_wasm_objects()
+                && wasm_object::init_priority(it.as_str()).is_none()
+        });
         let section =
             asked.as_ref().filter(|_| custom.is_none()).map(|it| it.as_str()).or_else(|| {
                 named.then(|| Target::current().section_of_static(compiled.writable)).flatten()
