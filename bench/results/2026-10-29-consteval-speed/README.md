@@ -18,7 +18,10 @@ Times are seconds for one whole `blaze run --release`, build plus run. Each run 
 |---|---|---|---|
 | ce_sha256 | 360, 363 | 71, 71 | about 27 |
 | ce_toml | 133, 134 | 60, 61 | about 37 |
-| ce_inflate | 611 | 119 | about 23 |
+| ce_inflate | 611 | 119, 121 | about 23 |
+| const_heap | 26, 27 | 15, 15 | |
+
+A's second inflate run is left out. Its 4493 s is past the script's 2400 s timeout, so the VM was frozen during that run (ix's data plane was down at the time); the C run right after it took 121 s.
 
 Take away the roughly 20 s that a build costs without the constant. Const evaluation itself drops from about 335 s to 45 s for sha256, from 590 s to 95 s for inflate, and from 95 s to 23 s for toml. It is still a few times slower than compiling the same code and running it.
 

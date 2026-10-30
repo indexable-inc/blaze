@@ -8,3 +8,10 @@ AC ce_toml A 134 s exit 0 correct
 AC ce_toml C 61 s exit 0 correct
 AC ce_inflate A 611 s exit 0 correct
 AC ce_inflate C 119 s exit 0 correct
+AC ce_inflate A 4493 s exit 124 WRONG
+AC ce_inflate C 121 s exit 0 correct
+AC const_heap A 26 s exit 0 correct
+AC const_heap C 15 s exit 0 correct
+AC const_heap A 27 s exit 0 correct
+AC const_heap C 15 s exit 0 correct
+ACDONE
