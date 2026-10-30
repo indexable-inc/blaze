@@ -446,6 +446,46 @@ fn g() {
         );
     }
 
+    #[test]
+    fn const_call_arguments_promote_associated_constants() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, copy, unsize, coerce_unsized
+struct Item(u8);
+const fn item(value: u8) -> Item { Item(value) }
+trait HasItem {
+    const ITEM: Item;
+    const ITEMS: &'static [Item] = &[Self::ITEM, item(2)];
+}
+struct A;
+impl HasItem for A { const ITEM: Item = item(1); }
+impl A { const INHERENT: Item = item(3); }
+const QUALIFIED: &[Item] = &[<A as HasItem>::ITEM, item(2)];
+const TRAIT: &[Item] = &[A::ITEM, item(2)];
+const INHERENT: &[Item] = &[A::INHERENT, item(2)];
+static STATIC: &[Item] = &[A::ITEM, item(2)];
+"#,
+        );
+    }
+
+    #[test]
+    fn associated_constants_do_not_promote_runtime_const_calls() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, copy, unsize, coerce_unsized
+struct Item(u8);
+const fn item(value: u8) -> Item { Item(value) }
+trait HasItem { const ITEM: Item; }
+struct A;
+impl HasItem for A { const ITEM: Item = item(1); }
+fn runtime() -> &'static [Item] {
+    &[A::ITEM, item(2)]
+  //^^^^^^^^^^^^^^^^^^^ error: returns a value referencing data owned by the current function
+}
+"#,
+        );
+    }
+
     // biome's organize_imports: `use<>` on an `impl Trait` inside the return type.
     #[test]
     fn use_bound_of_a_nested_impl_trait_captures_nothing() {
