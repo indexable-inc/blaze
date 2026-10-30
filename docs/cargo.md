@@ -636,6 +636,12 @@ is: `affected` runs the tests an edit reached
 `RA_JIT_SANDBOX=off` runs every test outside the sandbox
 ([above](#every-test-runs-in-a-sandbox)), and `RA_JIT_TEST_ENV` names more variables a test
 is given under `affected`, by commas; both are read the same way.
+`RA_JIT_SCRIPT_BUILDS` is how many of ra-jit's builds of build scripts and proc macros run at
+once on the machine, a number above 0; each is a process of its own with the standard
+library's maps loaded, using every core, and cargo starts one per job. The default is one per
+2 GiB of the machine's memory (on Linux, or of what its control group allows), at most one per
+core. A build waits for a free one of the files in `script-builds/` of the daemon's directory,
+locked while it runs ([#203](https://github.com/indexable-inc/blaze/issues/203)).
 
 These are read by the daemon when it starts, from the environment of whichever command
 started it. To change one, run `cargo ra-jit stop` first.
