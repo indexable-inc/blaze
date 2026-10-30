@@ -314,6 +314,9 @@ enum Reg {
     Gpr(usize),
     /// `xmm`, `ymm` and `zmm` of one number are one register.
     Vector(usize),
+    /// AVX-512's mask registers `k1` to `k7`: `k0` cannot mask, and `asm!` takes it only as
+    /// one a block overwrites.
+    Mask(usize),
     /// One a call does not keep and that holds no value here: nothing to do.
     Scratch,
 }
@@ -380,6 +383,9 @@ fn named(name: &str) -> Result<Reg, String> {
             return Ok(Reg::Vector(number));
         }
     }
+    if let Some(Ok(number @ 1..=7)) = name.strip_prefix('k').map(str::parse::<usize>) {
+        return Ok(Reg::Mask(number));
+    }
     let scratch = ["k", "mm", "st", "tmm"].iter().any(|prefix| {
         name.strip_prefix(prefix)
             .is_some_and(|rest| rest.trim_matches(['(', ')']).chars().all(|it| it.is_ascii_digit()))
@@ -427,6 +433,36 @@ fn transfer(reg: Reg, size: u32, offset: u32) -> Result<(&'static str, String, S
     }
 }
 
+/// The instructions that move `size` bytes between mask register `k{number}` and the slot,
+/// into the register when `load`. A value of 32 or 64 bits needs AVX512BW, as rustc's `kreg`
+/// takes one only with it, and one of 16 bits AVX512F. A byte goes through `eax`, kept on
+/// the stack meanwhile: `kmovb` would need AVX512DQ, which rustc's `kreg` does not ask for
+/// a byte, and LLVM's `kmovw` from a register zero-extended to it fills the mask as this
+/// does.
+fn mask_transfer(number: usize, size: u32, offset: u32, load: bool) -> Result<String, String> {
+    let memory = |width: &str| format!("{width} ptr [rbx + {offset}]");
+    Ok(match (size, load) {
+        (1, true) => {
+            format!("push rax\nmovzx eax, {}\nkmovw k{number}, eax\npop rax", memory("byte"))
+        }
+        (1, false) => {
+            format!("push rax\nkmovw eax, k{number}\nmov {}, al\npop rax", memory("byte"))
+        }
+        (2 | 4 | 8, _) => {
+            let (instruction, width) = match size {
+                2 => ("kmovw", "word"),
+                4 => ("kmovd", "dword"),
+                _ => ("kmovq", "qword"),
+            };
+            match load {
+                true => format!("{instruction} k{number}, {}", memory(width)),
+                false => format!("{instruction} {}, k{number}", memory(width)),
+            }
+        }
+        _ => return Err(format!("an inline assembly operand of {size} bytes in a mask register")),
+    })
+}
+
 /// The function for a block, in the assembly of the architecture.
 pub(super) fn wrapper(
     target: &Target,
@@ -471,6 +507,7 @@ fn wrapper_x86_64(
             "reg" | "reg_byte" => (0..OPERANDS).map(Reg::Gpr).find(|&it| free(it)),
             "reg_abcd" => (0..3).map(Reg::Gpr).find(|&it| free(it)),
             "xmm_reg" | "ymm_reg" | "zmm_reg" => (0..16).map(Reg::Vector).find(|&it| free(it)),
+            "kreg" => (1..8).map(Reg::Mask).find(|&it| free(it)),
             _ => return Err(format!("the register class `{class}`")),
         };
         let Some(found) = found else {
@@ -518,7 +555,9 @@ fn wrapper_x86_64(
         _ = writeln!(text, "movups xmmword ptr [rbx + {}], xmm{number}", at * 16);
     }
     for (reg, size, offset, input, _) in values() {
-        if input {
+        if let (true, Reg::Mask(number)) = (input, reg) {
+            _ = writeln!(text, "{}", mask_transfer(number, size, offset, true)?);
+        } else if input {
             let (instruction, reg, memory) = transfer(reg, size, offset)?;
             _ = writeln!(text, "{instruction} {reg}, {memory}");
         }
@@ -565,6 +604,10 @@ fn wrapper_x86_64(
                 };
                 vector_name(number, size)
             }
+            (_, Some(Reg::Mask(number))) => match modifier {
+                None => format!("k{number}"),
+                Some(other) => return Err(format!("the operand modifier `{other}`")),
+            },
             _ => return Err("an inline assembly template that names no operand".to_owned()),
         };
         if att {
@@ -579,7 +622,9 @@ fn wrapper_x86_64(
     let returns = !options.contains(AsmOptions::NORETURN);
     if returns {
         for (reg, size, offset, _, output) in values() {
-            if output {
+            if let (true, Reg::Mask(number)) = (output, reg) {
+                _ = writeln!(text, "{}", mask_transfer(number, size, offset, false)?);
+            } else if output {
                 let (instruction, reg, memory) = transfer(reg, size, offset)?;
                 _ = writeln!(text, "{instruction} {memory}, {reg}");
             }

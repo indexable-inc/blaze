@@ -4879,6 +4879,27 @@ pub mod simd_x86 {
         for (i, index) in indices.iter_mut().enumerate() { *index = (i as u8).wrapping_mul(37).wrapping_add(11); }
         core::mem::transmute(_mm512_permutex2var_epi8(a, core::mem::transmute(indices), b))
     } }
+    /// `asm!` with AVX-512 mask registers (`kreg`): a mask that goes in, one that comes out,
+    /// a byte's mask read back whole (the bits above the byte are clear), and one that does
+    /// both.
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn masks(a: __m512i, b: __m512i, k: u16, byte: u8) -> ([i32; 16], u16, u32, u8) { unsafe {
+        let mut sum = a;
+        core::arch::asm!("vpaddd {s}{{{k}}}, {s}, {b}", s = inout(zmm_reg) sum, b = in(zmm_reg) b, k = in(kreg) k, options(pure, nomem, nostack));
+        let equal: u16;
+        core::arch::asm!("vpcmpeqd {k}, {a}, {b}", k = out(kreg) equal, a = in(zmm_reg) a, b = in(zmm_reg) sum, options(pure, nomem, nostack));
+        let whole: u32;
+        core::arch::asm!("kmovw {r:e}, {k}", k = in(kreg) byte, r = out(reg) whole, options(pure, nomem, nostack));
+        let mut flipped = byte;
+        core::arch::asm!("knotw {k}, {k}", k = inout(kreg) flipped, options(pure, nomem, nostack));
+        (core::mem::transmute(sum), equal, whole, flipped)
+    } }
+    #[target_feature(enable = "avx512bw")]
+    pub unsafe fn wide_masks(d: u32, q: u64) -> (u32, u64) { unsafe {
+        let (mut d, mut q) = (d, q);
+        core::arch::asm!("kshiftld {d}, {d}, 3", "kshiftrq {q}, {q}, 5", d = inout(kreg) d, q = inout(kreg) q, options(pure, nomem, nostack));
+        (d, q)
+    } }
     pub fn run() -> String {
         let mut out = String::new();
         let v = unsafe { _mm_set_epi8(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16) };
@@ -4898,6 +4919,8 @@ pub mod simd_x86 {
         let b: __m512i = unsafe { core::mem::transmute(bytes) };
         if is_x86_feature_detected!("avx512f") { out += &format!(" {:?}", unsafe { blend(a, b) }); }
         if is_x86_feature_detected!("avx512bw") { out += &format!(" {:?}", unsafe { permute16(a, b) }); }
+        if is_x86_feature_detected!("avx512f") { out += &format!(" {:?}", unsafe { masks(a, b, 0b0110_1001_1100_0011, 0x5a) }); }
+        if is_x86_feature_detected!("avx512bw") { out += &format!(" {:?}", unsafe { wide_masks(0x8000_00f1, 0xf000_0000_0000_0fe1) }); }
         if is_x86_feature_detected!("avx512vbmi") { out += &format!(" {:?}", unsafe { permute8(a, b) }); }
         out
     }
