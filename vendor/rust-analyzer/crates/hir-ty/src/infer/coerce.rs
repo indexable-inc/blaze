@@ -667,6 +667,7 @@ where
         // for the former and let type inference do the rest.
         let coerce_target = self.infcx().next_ty_var(self.cause.span());
 
+        if std::env::var("D3DBG").is_ok() { eprintln!("D3 unsize {source:?} -> {target:?}"); }
         let mut coercion = self.unify_and(
             coerce_target,
             target,
@@ -917,7 +918,9 @@ impl<'db> InferenceContext<'db> {
             coerce_never,
             use_lub: false,
         };
-        let ok = coerce.commit_if_ok(|coerce| coerce.coerce(source, target))?;
+        let ok = coerce.commit_if_ok(|coerce| coerce.coerce(source, target));
+        if std::env::var("D3DBG").is_ok() { eprintln!("D3 coerce {source:?} -> {target:?} = {:?}", ok.as_ref().map(|it| &it.value)); }
+        let ok = ok?;
 
         let (adjustments, _) = self.table.register_infer_ok(ok);
         self.write_expr_adj(expr, adjustments.into_boxed_slice());
@@ -1662,6 +1665,7 @@ impl<'a, 'db, D: CoerceDelegate<'db>> ProofTreeVisitor<'db> for CoerceVisitor<'a
             return ControlFlow::Continue(());
         }
 
+        if std::env::var("D3DBG").is_ok() { eprintln!("D3 visit {:?} = {:?} cands {}", goal.goal().predicate, goal.result(), goal.candidates().len()); }
         match goal.result() {
             // If we prove the `Unsize` or `CoerceUnsized` goal, continue recursing.
             Ok(Certainty::Yes) => ControlFlow::Continue(()),

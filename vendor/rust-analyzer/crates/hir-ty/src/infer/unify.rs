@@ -199,6 +199,12 @@ impl<'db> InferenceTable<'db> {
         // NB: `T: Sized` implies that all subtypes and all supertypes of `T` are also sized,
         // so it's valid to use subtyping here. (subtyping has to preserve layout and
         // `T <: U => &T <: &U`, so subtyping can't change sizedness)
+        if std::env::var("D3DBG").is_ok() {
+            eprintln!("D3 sized? {self_ty:?} root {:?}", self.infer_ctxt.sub_unification_table_root_var(self_ty));
+            for o in self.fulfillment_cx.pending_obligations() { eprintln!("D3   pending {:?}", o.predicate); }
+            eprintln!("D3   opaques {:?}", self.infer_ctxt.clone_opaque_types());
+            eprintln!("D3   found {:?}", self.obligations_for_self_ty(self_ty, UseSubtyping::Yes).iter().map(|o| o.predicate).collect::<Vec<_>>());
+        }
         self.obligations_for_self_ty(self_ty, UseSubtyping::Yes).into_iter().any(|obligation| {
             match obligation.predicate.kind().skip_binder() {
                 PredicateKind::Clause(ClauseKind::Trait(data)) => data.def_id().0 == sized_did,
