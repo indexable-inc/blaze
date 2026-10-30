@@ -8911,3 +8911,41 @@ pub mod async_fn_item_of_trait {
         (loaded(Doubled(n)), loaded(Ready(n)), served(&Doubled(n)), routed(n))
     }
 }
+
+/// A function returning `impl Iterator` that calls itself in its own body and calls a trait
+/// method on the result, as wesl's scopes do. Inside the body the recursive call's type is the
+/// opaque's hidden type, not yet known, and method lookup has to take it as the opaque.
+pub mod recursive_opaque {
+    trait Boxed: Iterator {
+        fn boxed<'a>(self) -> Box<dyn Iterator<Item = Self::Item> + 'a>
+        where
+            Self: Sized + 'a;
+    }
+
+    impl<T: Iterator> Boxed for T {
+        fn boxed<'a>(self) -> Box<dyn Iterator<Item = Self::Item> + 'a>
+        where
+            Self: Sized + 'a,
+        {
+            Box::new(self)
+        }
+    }
+
+    struct Scope {
+        local: Vec<u32>,
+        parent: Option<std::rc::Rc<Scope>>,
+    }
+
+    impl Scope {
+        fn iter(&self) -> impl Iterator<Item = &u32> {
+            self.local.iter().chain(self.parent.iter().flat_map(|parent| parent.iter().boxed()))
+        }
+    }
+
+    pub fn run() -> Vec<u32> {
+        let root = std::rc::Rc::new(Scope { local: vec![1, 2], parent: None });
+        let inner = std::rc::Rc::new(Scope { local: vec![3], parent: Some(root) });
+        let scope = Scope { local: vec![4, 5], parent: Some(inner) };
+        scope.iter().copied().collect()
+    }
+}

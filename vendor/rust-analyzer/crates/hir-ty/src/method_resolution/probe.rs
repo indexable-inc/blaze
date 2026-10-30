@@ -35,10 +35,11 @@ use crate::{
     },
     next_solver::{
         Binder, Canonical, ClauseKind, DbInterner, FnSig, GenericArg, GenericArgs, Goal, ParamEnv,
-        PolyTraitRef, Predicate, Region, SimplifiedType, TraitRef, Ty, TyKind, Unnormalized,
+        PolyTraitRef, Predicate, PredefinedOpaques, Region, SimplifiedType, TraitRef, Ty, TyKind, Unnormalized,
         infer::{
             BoundRegionConversionTime, InferCtxt, InferOk,
             canonical::{QueryResponse, canonicalizer::OriginalQueryValues},
+            opaque_types::OpaqueHiddenType,
             select::{ImplSource, Selection, SelectionResult},
             traits::{Obligation, ObligationCause, PredicateObligation},
         },
@@ -308,7 +309,23 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
         choice: Choice,
     ) -> Choice::FinalChoice {
         let mut orig_values = OriginalQueryValues::default();
-        let query_input = self.infcx.canonicalize_query(self_ty, &mut orig_values);
+        // As rustc's `probe_op`, the opaque types defined so far go into the query with the self
+        // type, so that the inference variables standing for their hidden types are canonicalized
+        // together with the self type. Instantiating the query then gives fresh variables, and
+        // `method_autoderef_steps` registers the opaques again over them: without that, a
+        // receiver whose type is a not-yet-defined opaque (a recursive call of a function
+        // returning `impl Trait`) is a plain inference variable there, and the probe gives up on
+        // it instead of taking it as an opaque.
+        let predefined_opaques_in_body = PredefinedOpaques::new_from_iter(
+            self.infcx
+                .inner
+                .borrow_mut()
+                .opaque_types()
+                .iter_opaque_types()
+                .map(|(key, hidden)| (key, hidden.ty)),
+        );
+        let query_input =
+            self.infcx.canonicalize_query((predefined_opaques_in_body, self_ty), &mut orig_values);
         let steps = match mode {
             Mode::MethodCall => self.method_autoderef_steps(&query_input),
             Mode::Path => self.infcx.probe(|_| {
@@ -318,7 +335,7 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
                 // special handling for this "trivial case" is a good idea.
 
                 let infcx = self.infcx;
-                let (self_ty, var_values) =
+                let ((_, self_ty), var_values) =
                     infcx.instantiate_canonical(self.call_span, &query_input);
                 debug!(?self_ty, ?query_input, "probe_op: Mode::Path");
                 let prev_opaque_entries =
@@ -406,17 +423,24 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
 
     fn method_autoderef_steps(
         &self,
-        self_ty: &Canonical<'db, Ty<'db>>,
+        goal: &Canonical<'db, (PredefinedOpaques<'db>, Ty<'db>)>,
     ) -> MethodAutoderefStepsResult<'db> {
         self.infcx.probe(|_| {
-            debug!("method_autoderef_steps({:?})", self_ty);
+            debug!("method_autoderef_steps({:?})", goal);
 
             // We accept not-yet-defined opaque types in the autoderef
             // chain to support recursive calls. We do error if the final
             // infer var is not an opaque.
             let infcx = self.infcx;
-            let (self_ty, inference_vars) =
-                infcx.instantiate_canonical(self.receiver_span, self_ty);
+            let ((predefined_opaques_in_body, self_ty), inference_vars) =
+                infcx.instantiate_canonical(self.receiver_span, goal);
+            // rustc builds a fresh inference context here and registers the caller's opaques in
+            // it. This runs in the caller's own context (in a probe, undone afterwards), so the
+            // keys are there already, over the caller's variables: registering them again points
+            // them at the instantiated variables, which is what `self_ty_is_opaque` looks for.
+            for (key, ty) in predefined_opaques_in_body.iter() {
+                infcx.register_hidden_type_in_storage(key, OpaqueHiddenType { ty });
+            }
             let prev_opaque_entries = infcx.inner.borrow_mut().opaque_types().num_entries();
 
             let self_ty_is_opaque = |ty: Ty<'_>| {

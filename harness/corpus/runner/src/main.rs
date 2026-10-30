@@ -758,6 +758,7 @@ fn main() {
     case!(cases::elided_captures::run());
     case!(cases::destructuring_assignment::run());
     case!(cases::higher_ranked::run());
+    case!(cases::recursive_opaque::run());
 }
 
 fn nest<T>(depth: u8, value: T) -> Option<Option<T>> {

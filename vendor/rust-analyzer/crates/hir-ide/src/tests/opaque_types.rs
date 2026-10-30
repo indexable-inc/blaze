@@ -212,3 +212,21 @@ impl Miku {
         "#]],
     );
 }
+
+#[test]
+fn recursive_call_in_closure() {
+    check_infer(
+        r#"
+//- minicore: fn, sized
+trait Wrap { fn wrap(self) -> W<Self> where Self: Sized { loop {} } }
+impl<T> Wrap for T {}
+struct W<T>(T);
+fn foo(n: u32) -> impl Sized {
+    let f = |m: u32| { let _w = foo(m).wrap(); 0u8 };
+    if n == 0 { let _v = foo(1).wrap(); }
+    f
+}
+    "#,
+        expect![[r#""#]],
+    );
+}
