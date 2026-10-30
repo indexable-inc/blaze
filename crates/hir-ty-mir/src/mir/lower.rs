@@ -553,7 +553,21 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         })
     }
 
+    /// What every expression's lowering comes through, once for each level the expression is
+    /// deep: the stack grows for one as deep as rustc builds (`ensure_sufficient_stack` in
+    /// `rustc_mir_build`), on whatever thread lowers it.
     fn lower_expr_to_place_without_adjust(
+        &mut self,
+        expr_id: ExprId,
+        place: Place<'db>,
+        current: BasicBlockId,
+    ) -> Result<'db, Option<BasicBlockId>> {
+        stdx::ensure_sufficient_stack(|| {
+            self.lower_expr_to_place_without_adjust_here(expr_id, place, current)
+        })
+    }
+
+    fn lower_expr_to_place_without_adjust_here(
         &mut self,
         expr_id: ExprId,
         place: Place<'db>,

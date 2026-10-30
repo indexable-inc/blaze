@@ -102,6 +102,22 @@ fn f<T: Tr>(x: T::A) {
 }
 
 #[test]
+fn a_chain_of_calls_a_thousand_deep_lowers_on_a_small_stack() {
+    // Each receiver is a place inside the next (`&mut *b.f()`), as in the builder chains of
+    // build scripts, and a codegen thread has the default stack of 2 MiB.
+    let chain = ".f()".repeat(1_000);
+    let fixture = format!(
+        "struct B;\nimpl B {{ fn f(&mut self) -> &mut B {{ self }} }}\nfn g(b: &mut B) {{ b{chain}; }}\n"
+    );
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || lower_mir_all(&fixture))
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn nested_closure_moves_local_of_enclosing_closure() {
     let (db, file_id) = TestDB::with_single_file(
         r#"
