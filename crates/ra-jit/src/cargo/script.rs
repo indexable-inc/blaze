@@ -466,8 +466,8 @@ fn replaced(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
 /// What a run of a build script printed and left in its `OUT_DIR`.
 #[derive(Debug, PartialEq)]
 pub(crate) struct Kept {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    pub(super) stdout: Vec<u8>,
+    pub(super) stderr: Vec<u8>,
     /// Each file below `OUT_DIR`, by its path there, whether it is executable, and its bytes.
     files: Vec<(String, bool, Vec<u8>)>,
 }

@@ -457,6 +457,46 @@ sees the directories of the libraries of the loads before it started, so a works
 `/tmp` loaded later by the same daemon is not seen by it on Linux; doctests and the
 `blaze-build-script` crate's own runner (`harness/scripts.py` only) are not sandboxed.
 
+### Build scripts under WASI (an experiment, off by default)
+
+A build script can instead be compiled for `wasm32-wasip1` and run under Wasmtime. Nothing
+of the host is reachable but what is handed to it, and the module is not built for the host
+it runs on. It is off unless asked for, and asking needs a ra-jit built with the feature `wasi`
+(`cargo build --release -p ra-jit --features wasi`), which adds Wasmtime to it:
+
+- `RA_JIT_BUILD_SCRIPTS=wasi` runs every build script so, or
+- in the workspace's root manifest, `wasi-build-scripts = ["pkg", ...]` (`["*"]` for all)
+  under `[workspace.metadata.blaze.sandbox]` runs those packages' scripts so.
+
+When the wrapper is asked for a build script it also builds it for `wasm32-wasip1`, from the
+same description, beside where rustc links it (`build_script_build.wasm`). The standard
+library of that build is the toolchain's with one file of blaze's in place of
+`std/src/sys/process/unsupported.rs` (`crates/blaze-wasi/std/process.rs`, `ra-jit
+--run-tool`), so `std::process::Command` works. A command runs on the host when its output
+is first needed: `wait`, `output`, a read of its stdout. ra-jit refuses that std when the
+toolchain's file is not the one it was written against. Without `--run-tool` a wasip1 build
+keeps rustc's behaviour: `Command` is unsupported.
+
+When cargo runs the script, the module runs in its place:
+
+| | under WASI |
+|---|---|
+| files | the package's directory, read-only, at its path and at `.`; `OUT_DIR`, writable, at its path; nothing else |
+| environment | the variables cargo documents for build scripts (`CARGO_*` of the package, features and cfgs, `OUT_DIR`, `TARGET`, `HOST`, `DEP_*`, `RUSTC`, ...) and no other |
+| commands | the toolchain's `rustc` (the `RUSTC` it is given, which is ra-jit's: [above](#build-scripts-and-proc-macros-run-in-a-sandbox)), C and C++ compilers (`cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, `cpp`, with a target's prefix or a version), their archivers (`ar`, `ranlib`, `llvm-ar`, `llvm-ranlib`) and `pkg-config`: each runs in the sandbox the script would have run in, with the environment the script gave it over the sandbox's for C toolchains (`PATH`, `CC`, Nix's wrappers). Anything else is refused, naming the program: the script sees `PermissionDenied` |
+| record | every command, with the program that ran, its arguments, how it ended or why it was refused, in `ra-jit-wasi-tools.jsonl` beside `OUT_DIR` |
+
+What it printed is checked as a native run's is. A run is kept in the store under the Nix
+model's key: the module's bytes, the package's files, the environment and arguments with
+the checkout's and target directory's places unplaced, the toolchain, and each command it
+may run as `PATH` finds it. There are no read sets. A module ra-jit can't build, or a run
+that fails, is an error: the native script does not run instead.
+
+`RA_JIT_BUILD_SCRIPTS=wasi-compare` is for measuring it. The module runs first and what it
+printed and wrote is set aside in `ra-jit-wasi/` beside `OUT_DIR`, then the native script
+runs for cargo. `harness/bswasi.py` compares the two over the bench corpus;
+[the report](reports/BSWASI.md) has which scripts run unchanged and why the others don't.
+
 ### Running only the tests an edit reached
 
 With `RA_JIT_TESTS=affected`, `cargo ra-jit test` runs, of each test executable the daemon
@@ -694,6 +734,9 @@ build a command line is, so changing one starts from a cargo build again.
 | `RA_JIT_INLINE` | With LLVM at level 2 or 3, a program built whole (`runbench.py`'s builds) has the functions it calls in any crate built into it or shown to LLVM, as a release build does; the standard library's only when they are generic or `#[inline]`, as rustc does across crates. `crate` keeps that to the function's own crate, `0` builds nothing in, `all` does it in other builds with LLVM at level 2 or 3 too (never the daemon's, whose store keeps each function by its own code alone) | across crates in a whole program, the function's own crate otherwise |
 | `RA_JIT_SPLICE` | `0` links in full after every edit instead of splicing | splice |
 | `RA_JIT_OTHER_TOOLCHAIN` | `1` builds with the project's toolchain when it is not the pinned nightly, rather than with the pinned nightly, for a project pinned to a nightly near it; nothing checks that it agrees ([support.md](support.md#toolchain)) | not set |
+
+`RA_JIT_BUILD_SCRIPTS` (`wasi`, `wasi-compare`, `native`) is read by the wrapper and by each
+run of a build script ([above](#build-scripts-under-wasi-an-experiment-off-by-default)).
 
 `RA_JIT_TESTS` is read by each `cargo ra-jit test` alone and is not part of which build it
 is: `affected` runs the tests an edit reached

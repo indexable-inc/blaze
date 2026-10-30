@@ -3897,6 +3897,7 @@ fn run_tool_std(db: &mut RootDatabase) -> anyhow::Result<()> {
         .context("--run-tool: std's root has no directory")?;
     let file = source_root
         .file_for_path(&at)
+        .copied()
         .with_context(|| format!("--run-tool: the standard library has no {at}"))?;
     let digest = Sha256::digest(db.file_text(file).text(db).as_bytes());
     let digest: String = digest.iter().map(|it| format!("{it:02x}")).collect();

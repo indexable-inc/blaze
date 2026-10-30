@@ -55,7 +55,7 @@ fn engine() -> &'static Engine {
 
 /// Compiles the module at `path` for this host.
 pub fn compile(path: &Path) -> anyhow::Result<Module> {
-    Module::from_file(engine(), path).with_context(|| format!("compiling {}", path.display()))
+    Module::from_file(engine(), path).map_err(anyhow::Error::from).with_context(|| format!("compiling {}", path.display()))
 }
 
 /// Runs `guest`, `module` being its module compiled ([`compile`]), with each `blaze.run_tool`
@@ -74,6 +74,7 @@ pub fn run(
     for preopen in guest.preopens {
         let perms = if preopen.writable { FsPerms::ReadWrite } else { FsPerms::ReadOnly };
         wasi.preopened_dir(&preopen.host, &preopen.guest, perms)
+            .map_err(anyhow::Error::from)
             .with_context(|| format!("opening {} for the script", preopen.host.display()))?;
     }
     let state = State { wasi: wasi.build_p1(), tool: Box::new(tool), response: Vec::new() };
@@ -83,7 +84,7 @@ pub fn run(
     linker.func_wrap(
         IMPORT_MODULE,
         "run_tool",
-        |mut caller: Caller<'_, State>, at: u32, len: u32| -> anyhow::Result<i64> {
+        |mut caller: Caller<'_, State>, at: u32, len: u32| -> wasmtime::Result<i64> {
             let memory = memory(&mut caller)?;
             let mut bytes = vec![0; len as usize];
             if memory.read(&caller, at as usize, &mut bytes).is_err() {
@@ -99,10 +100,12 @@ pub fn run(
     linker.func_wrap(
         IMPORT_MODULE,
         "run_tool_response",
-        |mut caller: Caller<'_, State>, at: u32, len: u32| -> anyhow::Result<()> {
+        |mut caller: Caller<'_, State>, at: u32, len: u32| -> wasmtime::Result<()> {
             let memory = memory(&mut caller)?;
             let response = std::mem::take(&mut caller.data_mut().response);
-            anyhow::ensure!(response.len() == len as usize, "run_tool_response: a wrong length");
+            if response.len() != len as usize {
+                return Err(wasmtime::Error::msg("run_tool_response: a wrong length"));
+            }
             memory.write(&mut caller, at as usize, &response)?;
             Ok(())
         },
@@ -125,9 +128,9 @@ pub fn run(
     })
 }
 
-fn memory(caller: &mut Caller<'_, State>) -> anyhow::Result<wasmtime::Memory> {
+fn memory(caller: &mut Caller<'_, State>) -> wasmtime::Result<wasmtime::Memory> {
     caller
         .get_export("memory")
         .and_then(|it| it.into_memory())
-        .context("the script exports no memory")
+        .ok_or_else(|| wasmtime::Error::msg("the script exports no memory"))
 }

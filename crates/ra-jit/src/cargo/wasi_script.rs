@@ -302,11 +302,15 @@ mod running {
         }
         ra_jit_store::compiles_against(script::RUNS);
         let store = ra_jit_store::Store::global_or(crate::cargo::daemon::store().as_deref());
-        let key = store.zip(run_key(&module, script, plan, places));
+        let keys = store
+            .zip(run_key(&module, script, plan, Some(places)))
+            .zip(run_key(&module, script, plan, None));
         let checking = keyed::check();
-        let found = key.as_ref().and_then(|(store, key)| {
-            let (bytes, _) = keyed::find(store, key, &keyed::digest)?;
-            Some(Kept::read(&bytes)?.placed(places))
+        // A run kept with its places unplaced, from any checkout or target directory, or else
+        // one of this place, when what it left names it in a file that is no text.
+        let found = keys.as_ref().and_then(|((store, shared), here)| {
+            let read = |key| Kept::read(&keyed::find(store, key, &keyed::digest)?.0);
+            read(shared).map(|it| it.placed(places)).or_else(|| read(here))
         });
         if let Some(kept) = &found
             && !checking
@@ -356,9 +360,12 @@ mod running {
             );
             std::process::exit(1);
         }
-        if let (Some((store, key)), Some(made)) = (key, made.and_then(|it| it.unplaced(places))) {
+        if let (Some(((store, shared), here)), Some(made)) = (keys, made) {
             store.settled();
-            keyed::keep(store, &key, &[], &keyed::digest, &made.bytes());
+            match made.unplaced(places) {
+                Some(unplaced) => keyed::keep(store, &shared, &[], &keyed::digest, &unplaced.bytes()),
+                None => keyed::keep(store, &here, &[], &keyed::digest, &made.bytes()),
+            }
             store.flush();
         }
         std::process::exit(0)
@@ -577,23 +584,35 @@ mod running {
     /// The key of a run of `script`'s `module`, the Nix model's: what the run is given, before
     /// it runs. The module, by its bytes, which are the same on every host; the package's
     /// files; the environment the run and its commands are given, with what names the checkout
-    /// and the target directory unplaced ([`Places`]); its arguments; and the programs it may
-    /// run, each found as it would be: the toolchain's identity for `rustc`, and for the
-    /// others the file `PATH` finds, by its Nix store path or its bytes. `None` when one of
-    /// them can't be read.
-    fn run_key(module: &Path, script: &Script<'_>, plan: &Plan, places: &Places) -> Option<[u8; 32]> {
+    /// and the target directory unplaced ([`Places`]) when `places` are given; its arguments;
+    /// and the programs it may run, each found as it would be: the toolchain's identity for
+    /// `rustc`, and for the others the file `PATH` finds, by its Nix store path or its bytes.
+    /// `None` when one of them can't be read.
+    fn run_key(
+        module: &Path,
+        script: &Script<'_>,
+        plan: &Plan,
+        places: Option<&Places>,
+    ) -> Option<[u8; 32]> {
+        let text = |bytes: &[u8]| match places {
+            Some(places) => places.unplace(bytes),
+            None => bytes.to_vec(),
+        };
         let mut key = keyed::Key::new(WASI_RUNS);
+        if places.is_some() {
+            key.field(b"places apart");
+        }
         key.field(&Sha256::digest(std::fs::read(module).ok()?));
         key.field(&tree_of(script.cwd)?);
-        key.field(&places.unplace(script.cwd.as_os_str().as_encoded_bytes()));
+        key.field(&text(script.cwd.as_os_str().as_encoded_bytes()));
         for arg in script.args {
-            key.field(&places.unplace(arg.as_encoded_bytes()));
+            key.field(&text(arg.as_encoded_bytes()));
         }
         let mut env: Vec<&(String, String)> =
             plan.env().iter().filter(|it| !script::UNREAD.contains(&it.0.as_str())).collect();
         env.sort();
         for (name, value) in &env {
-            key.field(name.as_bytes()).field(&places.unplace(value.as_bytes()));
+            key.field(name.as_bytes()).field(&text(value.as_bytes()));
         }
         let sysroot = script::sysroot_of(plan.env());
         key.field(sysroot.as_deref().map(keyed::toolchain).unwrap_or_default().as_bytes());
