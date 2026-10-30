@@ -5,7 +5,9 @@
 //!
 //! The standard library is loaded once; each file then takes the place of the one before as
 //! the root of a library crate of the given edition, so what is checked again is only what
-//! the file changes. `harness/borrowck_ui.py` scores rustc's own `tests/ui` with it.
+//! the file changes. `harness/borrowck_ui.py` scores rustc's own `tests/ui` with it, and
+//! `harness/verdict_ui.py` the check verdict: each diagnostic says whether it is in that
+//! verdict (`"verdict"`, from [`crate::in_verdict`], with lints not capped).
 //!
 //! `ra-jit borrowck --project DIR` checks a cargo workspace instead: the errors the borrow
 //! checker finds in its crates, which for code rustc accepts must be none.
@@ -275,6 +277,13 @@ fn diagnostics(
                 let line = before.matches('\n').count() + 1;
                 let col = before.rsplit('\n').next().map_or(0, |it| it.chars().count()) + 1;
                 let expanded = it.main_node.is_some_and(|it| it.file_id.is_macro());
+                let verdict = crate::in_verdict(
+                    it.code.as_str(),
+                    it.severity,
+                    expanded,
+                    true,
+                    crate::borrowck_refuses(),
+                );
                 serde_json::json!({
                     "code": it.code.as_str(),
                     "severity": format!("{:?}", it.severity),
@@ -282,6 +291,7 @@ fn diagnostics(
                     "col": col,
                     "message": it.message,
                     "expanded": expanded,
+                    "verdict": verdict,
                 })
             })
             .collect()

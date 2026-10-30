@@ -5894,6 +5894,31 @@ const DENIED: &[&str] = &[
 /// The lints of [`DENIED`]'s kind that the borrow checker gives, off with its errors.
 const DENIED_BORROWCK: &[&str] = &["unused_mut"];
 
+/// Whether a diagnostic of rust-analyzer's fails the build: an error whose code is in
+/// [`SURE`] or [`BORROWCK`], or in [`DENIED`] or [`DENIED_BORROWCK`] where `lints` are not
+/// capped and it is not in what a macro expanded to (`expanded`), of which rustc says nothing
+/// for most lints. The borrow checker's count only when `refuse_borrowck`. `ra-jit borrowck`
+/// marks each diagnostic with it, so `harness/verdict_ui.py` scores the verdict itself.
+pub(crate) fn in_verdict(
+    code: &str,
+    severity: ide_db::Severity,
+    expanded: bool,
+    lints: bool,
+    refuse_borrowck: bool,
+) -> bool {
+    severity == ide_db::Severity::Error
+        && (SURE.contains(&code)
+            || refuse_borrowck && BORROWCK.contains(&code)
+            || lints
+                && !expanded
+                && (DENIED.contains(&code) || refuse_borrowck && DENIED_BORROWCK.contains(&code)))
+}
+
+/// Whether the borrow checker's errors fail a build: unless `RA_JIT_BORROWCK_REFUSE=0`.
+pub(crate) fn borrowck_refuses() -> bool {
+    std::env::var_os("RA_JIT_BORROWCK_REFUSE").is_none_or(|it| it != "0")
+}
+
 /// The errors written in the edited files, as rust-analyzer finds them, with paths from
 /// `root` as rustc's are. Nothing may reach them, so the build never looks at them.
 fn broken_in(
@@ -5906,7 +5931,7 @@ fn broken_in(
 ) -> Option<errors::Said> {
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     let config = ide_diagnostics::DiagnosticsConfig::test_sample();
-    let refuse_borrowck = std::env::var_os("RA_JIT_BORROWCK_REFUSE").is_none_or(|it| it != "0");
+    let refuse_borrowck = borrowck_refuses();
     let mut found: Vec<_> = std::thread::scope(|scope| {
         let checks: Vec<_> = (0..threads.min(edited.len()))
             .map(|part| {
@@ -5944,18 +5969,14 @@ fn broken_in(
                                 each.collect::<Vec<_>>()
                             })
                             .filter(|it| {
-                                let code = it.code.as_str();
-                                // rustc says nothing of most lints in what another crate's
-                                // macro expands to.
                                 let expanded = it.main_node.is_some_and(|it| it.file_id.is_macro());
-                                it.severity == ide_db::Severity::Error
-                                    && (SURE.contains(&code)
-                                        || refuse_borrowck && BORROWCK.contains(&code)
-                                        || lints
-                                            && !expanded
-                                            && (DENIED.contains(&code)
-                                                || refuse_borrowck
-                                                    && DENIED_BORROWCK.contains(&code)))
+                                in_verdict(
+                                    it.code.as_str(),
+                                    it.severity,
+                                    expanded,
+                                    lints,
+                                    refuse_borrowck,
+                                )
                             })
                             .map(|it| (it.range, it.code.as_str(), it.message))
                             .collect::<Vec<_>>()
