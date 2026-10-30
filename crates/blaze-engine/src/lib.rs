@@ -1130,9 +1130,12 @@ impl Resolver<'_> {
     /// What stands for a crate of the checkout that rustc built nothing of, the same after
     /// every edit: its name and where in the checkout its source starts. One of the standard
     /// library, when the build has nothing of rustc's, by its name alone: a program has one
-    /// of each name, wherever its source is.
+    /// of each name, wherever its source is. One of a registry or of git by what it is built
+    /// with too ([`content::Contents::library`]): its source does not change, but its features,
+    /// cfgs and what its build script set and wrote do, and code of one is not the other's.
     fn own_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
-        let lang = krate.data(self.db).origin.is_lang();
+        let origin = &krate.data(self.db).origin;
+        let (lang, local) = (origin.is_lang(), origin.is_local());
         if lang && !self.table.is_empty() || self.rustc_crate_id(krate).is_some() {
             return None;
         }
@@ -1143,7 +1146,17 @@ impl Resolver<'_> {
         let root = self.crate_root(krate.into())?;
         let home = self.contents.cargo_home(self.db);
         let place = crate_place(&root, self.inside(&root), home.as_deref());
-        let named = format!("blaze crate {} {place}", name.crate_name());
+        if local {
+            return Some(short_hash(&format!("blaze crate {} {place}", name.crate_name())));
+        }
+        let built = self.contents.library(
+            self.db,
+            krate,
+            &root,
+            &|krate| Some((self.stable_crate_id(krate), self.crate_root(krate.into())?)),
+            &|krate| process_reads(self.db, krate),
+        );
+        let named = format!("blaze crate {} {place} {built}", name.crate_name());
         Some(short_hash(&named))
     }
 
@@ -1414,7 +1427,9 @@ impl SymbolResolver for Resolver<'_> {
         if threads < 2 {
             return beside();
         }
-        let batch = trace::cold_batch(count);
+        let parallel = |name: &'static str| {
+            tracing::info_span!(target: "blaze", "parallel", subject = name).entered()
+        };
         let mut join = None;
         let next = std::sync::atomic::AtomicUsize::new(0);
         // What the threads compile, the build that asked counts.
@@ -1427,7 +1442,7 @@ impl SymbolResolver for Resolver<'_> {
                     let (db, next, parts) = (self.db.clone(), &next, self.parts());
                     let counted = counted.clone();
                     scope.spawn(move || {
-                        let _worker = trace::cold_span("worker", batch);
+                        let _worker = parallel("worker");
                         let resolver = parts.over(&db);
                         hir_ty_codegen::counted::within(counted, || {
                             hir::attach_db(&db, || {
@@ -1445,11 +1460,11 @@ impl SymbolResolver for Resolver<'_> {
                 })
                 .collect();
             {
-                let _caller = trace::cold_span("caller", batch);
+                let _caller = parallel("caller");
                 beside();
             }
             // From when the caller is done to when the last thread is.
-            join = trace::cold_span("join", batch);
+            join = Some(parallel("join"));
             let mut stopped: Option<Box<dyn std::any::Any + Send>> = None;
             for worker in workers {
                 let Err(panic) = worker.join() else { continue };
@@ -2553,6 +2568,34 @@ fn deps_of(
     krate.transitive_deps(db).into_iter().collect()
 }
 
+/// Whether the program `args` builds is of one of `crates`: one of its crates is, or one it
+/// links. A proc macro is a library of the compiler's, not of the program, built to its
+/// module apart from this database, so neither it nor what it links is. A program whose
+/// crates are not found may be.
+fn program_reads_any(
+    db: &RootDatabase,
+    args: &Args,
+    crates: &FxHashSet<ide_db::base_db::Crate>,
+) -> bool {
+    let mut seen = FxHashSet::default();
+    let mut next = Vec::new();
+    for krate in args.crates() {
+        let Ok(found) = crates_named(db, krate, args) else { return true };
+        next.extend(found.into_iter().map(ide_db::base_db::Crate::from));
+    }
+    while let Some(krate) = next.pop() {
+        if !seen.insert(krate) {
+            continue;
+        }
+        if crates.contains(&krate) {
+            return true;
+        }
+        let linked = krate.data(db).dependencies.iter().map(|it| it.crate_id);
+        next.extend(linked.filter(|it| !it.data(db).target_kind.is_proc_macro()));
+    }
+    false
+}
+
 /// The crates called `krate` to build: the ones rustc built into this program, when it built
 /// any, which may be a crate of the checkout and a dependency of the same name both. Otherwise
 /// what `crates_named` finds.
@@ -2887,10 +2930,10 @@ impl Checkouts {
         db: &mut RootDatabase,
         vfs: &mut vfs::Vfs,
     ) -> anyhow::Result<()> {
-        let start = Instant::now();
         let mut workspaces = Vec::new();
         let mut roots = Vec::new();
         let (mut splits, mut debug) = (Vec::new(), Vec::new());
+        let span = tracing::info_span!(target: "blaze", "load workspaces").entered();
         // A checkout like a loaded one shares the packages they have alike, unless told not to.
         let share = std::env::var_os("BLAZE_SPLIT").is_none_or(|it| it != "0");
         for project in projects {
@@ -2941,19 +2984,13 @@ impl Checkouts {
             roots.push((dunce::canonicalize(project)?, root));
             workspaces.push(workspace);
         }
-        let workspaces_at = start.elapsed();
+        drop(span);
+        let span = tracing::info_span!(target: "blaze", "load files").entered();
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
-        let added_at = start.elapsed();
+        drop(span);
         *lock(&UNEDITED) = Unedited::of(self.loaded.workspaces());
-        prepare_macro_sessions(db);
-        if std::env::var_os("BLAZE_STATS").is_some() {
-            eprintln!(
-                "load-us: workspaces={} files={} sessions={}",
-                workspaces_at.as_micros(),
-                (added_at - workspaces_at).as_micros(),
-                (start.elapsed() - added_at).as_micros()
-            );
-        }
+        tracing::info_span!(target: "blaze", "macro sessions")
+            .in_scope(|| prepare_macro_sessions(db));
         self.roots.extend(roots);
         self.splits.extend(splits);
         self.debug.extend(debug);
@@ -3254,7 +3291,7 @@ fn workspace_at(
     said: Option<Vec<String>>,
 ) -> anyhow::Result<(ProjectWorkspace, plan::Whole)> {
     let _load = plan::Load::start();
-    let start = Instant::now();
+    let span = tracing::info_span!(target: "blaze", "cargo metadata").entered();
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
     let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
@@ -3266,7 +3303,8 @@ fn workspace_at(
     {
         workspace.cfg_overrides = overrides;
     }
-    let metadata_at = start.elapsed();
+    drop(span);
+    let span = tracing::info_span!(target: "blaze", "plan").entered();
     // Without the standard library's source every call into it is unresolved, and each
     // function making one would be refused for a reason that says nothing of the toolchain.
     if workspace.sysroot.is_rust_lib_src_empty() {
@@ -3342,7 +3380,8 @@ fn workspace_at(
             cargo.set_primary(package, built.primary);
         }
     }
-    let planned_at = start.elapsed();
+    drop(span);
+    let _span = tracing::info_span!(target: "blaze", "build scripts").entered();
     if let Some(scripts) = scripts {
         workspace.set_build_scripts(scripts);
     } else if load_config.load_out_dirs_from_check {
@@ -3384,14 +3423,6 @@ fn workspace_at(
             anyhow::bail!("a build script failed: {}", error.trim().replace('\n', " "));
         }
         workspace.set_build_scripts(build_scripts);
-    }
-    if std::env::var_os("BLAZE_STATS").is_some() {
-        let us = |it: Duration| it.as_micros();
-        let (metadata, plan) = (us(metadata_at), us(planned_at - metadata_at));
-        eprintln!(
-            "load-us: metadata={metadata} plan={plan} scripts={}",
-            us(start.elapsed() - planned_at)
-        );
     }
     Ok((workspace, debug))
 }
@@ -3630,10 +3661,13 @@ fn resolve_one(
     busy: &std::sync::atomic::AtomicUsize,
     threads: usize,
 ) {
-    let start = Instant::now();
     let before = memory::live();
-    _ = hir::crate_def_map(db, krate);
-    let names = start.elapsed();
+    let subject = || crate_shown(db, krate);
+    tracing::info_span!(target: "blaze", "resolve names", subject = %subject()).in_scope(|| {
+        _ = hir::crate_def_map(db, krate);
+    });
+    let _span =
+        tracing::info_span!(target: "blaze", "resolve impls", subject = %subject()).entered();
     let frozen = hir_ty::method_resolution::frozen::served(db, krate);
     if !frozen {
         warm_impls(db, krate, busy, threads);
@@ -3650,19 +3684,11 @@ fn resolve_one(
         // for the crates that come next.
         _ = declared_in(db, krate.into());
     }
-    if std::env::var_os("BLAZE_STATS").is_some() {
-        let name = krate.extra_data(db).display_name.as_ref();
-        let name = name.map(|it| it.to_string()).unwrap_or_default();
-        // What the heap grew by is this crate's when one thread resolves.
-        let grew = memory::live().zip(before).map(|(now, before)| {
-            let origin = &krate.data(db).origin;
-            format!(", {:+} bytes {origin:?}", now as i64 - before as i64)
-        });
-        eprintln!(
-            "resolved {name}: names {names:.1?}, impls {:.1?}{}",
-            start.elapsed() - names,
-            grew.unwrap_or_default()
-        );
+    // What the heap grew by is this crate's when one thread resolves.
+    let grew = memory::live().zip(before).map(|(now, before)| now as i64 - before as i64);
+    if let Some(grew) = grew.filter(|_| std::env::var_os("BLAZE_STATS").is_some()) {
+        let origin = &krate.data(db).origin;
+        eprintln!("resolved {}: {grew:+} bytes {origin:?}", subject());
     }
 }
 
@@ -3869,7 +3895,7 @@ fn write_reach(db: &RootDatabase, table: &SymbolTable, listed: &Listed, args: &A
         _ = std::fs::remove_file(&file);
         return;
     }
-    let start = Instant::now();
+    let _span = tracing::info_span!(target: "blaze", "write tests reach").entered();
     let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match of_tests(args) {
         true => hir::attach_db(db, || {
             let contents = content::Contents::default();
@@ -3895,9 +3921,6 @@ fn write_reach(db: &RootDatabase, table: &SymbolTable, listed: &Listed, args: &A
         .and_then(|()| std::fs::rename(&writing, &file));
     if written.is_err() {
         _ = std::fs::remove_file(&file);
-    }
-    if std::env::var_os("BLAZE_STATS").is_some() {
-        eprintln!("tests-reach-us: {}", start.elapsed().as_micros());
     }
 }
 
@@ -3941,9 +3964,8 @@ fn reach_of_tests(
         let Some(name) = test_harness::name(db, krate, bench) else { continue };
         text.push_str(&format!("-\t{name}\tit is a benchmark\n"));
     }
-    let started = Instant::now();
-    let reaches = hir_ty_codegen::tests_reach(db, resolver, &tests);
-    let walked = started.elapsed();
+    let reaches = tracing::info_span!(target: "blaze", "tests reach")
+        .in_scope(|| hir_ty_codegen::tests_reach(db, resolver, &tests));
     for (&id, reach) in tests.iter().zip(reaches) {
         let function = hir::Function::from(id);
         let Some(name) = test_harness::name(db, krate, function) else { continue };
@@ -3981,13 +4003,6 @@ fn reach_of_tests(
             serde_json::to_string(it).unwrap_or_else(|_| "[]".to_owned())
         };
         text.push_str(&format!("{mark}{hex}\t{name}\t{}\t{}\n", json(&blocking), json(&others)));
-    }
-    if std::env::var_os("BLAZE_STATS").is_some() {
-        eprintln!(
-            "tests-reach-text-us: walk={} all={}",
-            walked.as_micros(),
-            started.elapsed().as_micros()
-        );
     }
     text
 }
@@ -4279,14 +4294,11 @@ impl Listed {
 }
 
 fn declared_in(db: &RootDatabase, krate: Crate) -> Declared {
-    let start = Instant::now();
+    let _span = tracing::info_span!(target: "blaze", "list functions").entered();
     // The first thing asked of a crate after an edit: name resolution is redone here.
     hir_def::nameres::crate_def_map(db, krate.into());
-    let resolved = start.elapsed();
     let mut declared = Declared::default();
     declared.in_modules(db, krate);
-    let scopes = start.elapsed();
-    let count = declared.bodies.len();
     // A body's blocks include those of the blocks in it, but not those of the items in them.
     while !declared.bodies.is_empty() || !declared.provided.is_empty() {
         for under_provided in [false, true] {
@@ -4303,13 +4315,6 @@ fn declared_in(db: &RootDatabase, krate: Crate) -> Declared {
                 }
             }
         }
-    }
-    if std::env::var_os("BLAZE_STATS").is_some() {
-        eprintln!(
-            "listing: name resolution {resolved:.1?}, scopes {:.1?}, {count} bodies {:.1?}",
-            scopes - resolved,
-            start.elapsed() - scopes
-        );
     }
     declared
 }
@@ -5764,9 +5769,7 @@ fn link(
             live::publish(baseline, patch);
         }
         let superseded = old.filter(|_| !rewritten).and_then(Baseline::uuid);
-        if std::env::var_os("BLAZE_STATS").is_some() {
-            eprintln!("link-us: read={}", start.elapsed().as_micros());
-        }
+        let span = tracing::info_span!(target: "blaze", "splice").entered();
         let spliced = match known {
             _ if rewritten => Err(anyhow::anyhow!("the whole object was written again")),
             Some(Ok(mut baseline)) if baseline.is_of(binary) => match std::fs::read(patch) {
@@ -5790,9 +5793,7 @@ fn link(
             Some(Err(why)) => Err(why),
             None => Err(anyhow::anyhow!("no executable to add to")),
         };
-        if std::env::var_os("BLAZE_STATS").is_some() {
-            eprintln!("link-us: spliced={}", start.elapsed().as_micros());
-        }
+        drop(span);
         match spliced {
             Ok((baseline, Spliced { redirected, appended, copied })) => {
                 if redirected != 0 && baseline.leaves_debug_info() {
@@ -6810,9 +6811,7 @@ impl WatchedFile {
         if as_rustc_read { Loaded::AsRustcRead } else { Loaded::New }
     }
 
-    /// Adds the files the last build included that are not watched yet. One is read again once
-    /// its timestamp is taken, so a write between the build's read and now is not lost: the
-    /// result is whether there was one.
+    /// Whether a build included a file that is not watched yet.
     fn unwatched(files: &[WatchedFile], db: &RootDatabase) -> bool {
         let watched: FxHashSet<&Path> = files.iter().map(|it| &*it.path).collect();
         db.included_files()
@@ -6821,30 +6820,32 @@ impl WatchedFile {
             .any(|it| !watched.contains(it) && !WatchedFile::immutable(it))
     }
 
-    fn watch_included(files: &mut Vec<WatchedFile>, db: &mut RootDatabase) -> bool {
+    /// Watches the files the last build included that are not watched yet, writing nothing to
+    /// the database, so the builds still under way go on. Each is compared with what the build
+    /// read after its timestamp is taken, so a write between the build's read and now is not
+    /// lost: one that differs is watched as changed ([`WatchedFile::mtime`] `None`), and the
+    /// scan for changed files reads it in once the builds are settled.
+    fn watch_included(files: &mut Vec<WatchedFile>, db: &RootDatabase) {
         let watched: FxHashSet<&Path> = files.iter().map(|it| &*it.path).collect();
         let new: Vec<AbsPathBuf> = db
             .included_files()
             .into_iter()
             .filter(|it| !watched.contains(AsRef::<Path>::as_ref(it)))
             .collect();
-        let mut changed = false;
         for path in new {
             if WatchedFile::immutable(path.as_ref()) {
                 continue;
             }
             // One that is not there is watched for when it is, as a new file is.
             let on_disk = db.on_disk(path.as_ref());
-            let mtime = std::fs::metadata(&on_disk).and_then(|it| it.modified());
+            let mtime = std::fs::metadata(&on_disk).and_then(|it| it.modified()).ok();
+            let mtime = mtime.filter(|_| db.included_is_read(&path));
             files.push(WatchedFile {
                 file: Watched::Included(path.clone()),
                 path: AsRef::<Path>::as_ref(&path).to_owned(),
-                mtime: mtime.ok(),
+                mtime,
             });
-            changed |= db.reload_included_file(&path);
         }
-        prepare_macro_sessions(db);
-        changed
     }
 }
 
@@ -7762,6 +7763,8 @@ impl Builds {
         if answer.is_ok() && program.dehydrate() && !self.unasked.contains(&at) {
             self.unasked.push(at);
         }
+        // Before the answer: the client puts the parts of the profile together once it has it.
+        trace::write_part();
         for (_, _, client) in clients {
             // A client that hangs up before the answer is not the daemon's problem.
             let _ = match &answer {
@@ -7774,9 +7777,21 @@ impl Builds {
 
     /// Leaves no build under way, for the database to be written to: a write stops every
     /// thread that reads it. The builds that are kept are waited for, the others interrupted.
+    #[track_caller]
     fn settle(&mut self, db: &mut RootDatabase, programs: &mut [Program]) -> anyhow::Result<()> {
+        self.settle_waiting(db, programs, &FxHashSet::default())
+    }
+
+    /// [`Self::settle`], waiting for the builds of `waited` too, as for those that are kept.
+    #[track_caller]
+    fn settle_waiting(
+        &mut self,
+        db: &mut RootDatabase,
+        programs: &mut [Program],
+        waited: &FxHashSet<usize>,
+    ) -> anyhow::Result<()> {
         use ide_db::base_db::salsa::Database as _;
-        while self.running.values().any(|it| it.kept) {
+        while self.running.iter().any(|(at, it)| it.kept || waited.contains(at)) {
             let event = self.events.recv()?;
             self.take(event, programs)?;
         }
@@ -7786,6 +7801,7 @@ impl Builds {
             }
             let linking = lock(&LINKING);
             if *linking == 0 {
+                eprintln!("settle: interrupting from {}", std::panic::Location::caller());
                 INTERRUPTING.store(true, Ordering::SeqCst);
                 break;
             }
@@ -7923,7 +7939,7 @@ fn requested(stream: UnixStream) -> Option<Event> {
     {
         let path = PathBuf::from(blaze_live::format::unescape(path));
         let text = blaze_live::format::unescape(text);
-        let client = Client { stream, env: process::decode(&env) };
+        let client = Client { stream, env: clients_env(&env) };
         return Some(Event::Edited(Edited { path, text, client, at: Instant::now() }));
     }
     let fields: Vec<&str> = request.split('\t').collect();
@@ -7931,11 +7947,22 @@ fn requested(stream: UnixStream) -> Option<Event> {
     if let Some(request) = Request::parse(fields[0])
         && (fields.len() == 1 || target.is_some())
     {
-        let client = Client { stream, env: process::decode(&env) };
+        let client = Client { stream, env: clients_env(&env) };
         return Some(Event::Asked((request, target, client)));
     }
     let _ = writeln!(&stream, "failed: unknown request {request:?}");
     None
+}
+
+/// The variables of the process a request is for, from their line: [`trace::VAR`] among them
+/// is not one of them, but has this worker record a profile from now on.
+fn clients_env(line: &str) -> ide_db::base_db::Env {
+    let (profile, env): (Vec<_>, Vec<_>) =
+        Vec::from(process::decode(line)).into_iter().partition(|(name, _)| name == trace::VAR);
+    if let Some((_, dir)) = profile.first() {
+        trace::start(Path::new(dir));
+    }
+    env.into_iter().collect()
 }
 
 /// Ends the process when its standard input ends: the daemon that started this worker holds
@@ -8026,6 +8053,7 @@ pub fn main() -> anyhow::Result<()> {
     cargo::toolchain::library::publish();
     trace::began();
     renamed::refuse_old_settings();
+    trace::install();
     if let Some(sources) = option_env!("BLAZE_SOURCES") {
         blaze_store::built_from(sources);
     }
@@ -8113,7 +8141,6 @@ pub fn main() -> anyhow::Result<()> {
     }
     if std::env::args().nth(1).as_deref() == Some("--spare") {
         let dir = std::env::args().nth(2).context("--spare needs a directory")?;
-        trace::install();
         return spare(Path::new(&dir));
     }
     if std::env::var_os(cargo::daemon::ENDS_WITH_INPUT).is_some() {
@@ -8148,22 +8175,24 @@ pub fn main() -> anyhow::Result<()> {
     {
         return ask(request, Path::new(&socket), Target::from_flags(std::env::args().skip(3))?);
     }
-    trace::install();
     let args = Args::parse(std::env::args().skip(1))?;
-    // A worker the daemon started answers its builds' traces; one started directly has
-    // only its own to write its first build to.
+    // A worker the daemon started answers its builds' profiles for the client to put
+    // together; one started directly puts its first build's together itself.
     if args.socket.is_none()
         && std::env::var_os(cargo::daemon::ENDS_WITH_INPUT).is_none()
-        && trace::start_cold().is_some()
+        && trace::on()
     {
-        hir_ty::consteval::trace_consts_with(followed_const);
+        FIRST_BUILD_PROFILED.store(true, std::sync::atomic::Ordering::Relaxed);
+        if trace::followed_const().is_some() {
+            hir_ty::consteval::trace_consts_with(followed_const);
+        }
     }
     let result = run(args, None);
-    trace::finish_cold(if result.is_ok() { "complete" } else { "failed" });
+    first_build_profiled();
     result
 }
 
-/// Whether `def` is the constant `BLAZE_TRACE_CONST` names, `crate::module::NAME`: its
+/// Whether `def` is the constant [`trace::CONST_VAR`] names, `crate::module::NAME`: its
 /// crate, every module and its name, so one of the same name elsewhere, in an impl or in a
 /// block is not. What to note for it, a request or a run of its query.
 fn followed_const(
@@ -8172,7 +8201,7 @@ fn followed_const(
     executing: bool,
 ) -> Option<fn(Instant)> {
     use hir_def::{HasModule as _, Lookup as _, signatures::ConstSignature};
-    let mut path = trace::cold_const()?.rsplit("::");
+    let mut path = trace::followed_const()?.rsplit("::");
     if ConstSignature::of(db, def).name.as_ref()?.as_str() != path.next()? {
         return None;
     }
@@ -8189,6 +8218,19 @@ fn followed_const(
         return None;
     }
     Some(if executing { trace::const_execution } else { trace::const_request })
+}
+
+/// Whether this is a worker started directly with a profile whose first build is not yet
+/// put together: no client does it for it.
+static FIRST_BUILD_PROFILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Puts the profile of a directly started worker's first build together, once: when it
+/// starts watching or its one build ends.
+fn first_build_profiled() {
+    if FIRST_BUILD_PROFILED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        trace::finish();
+    }
 }
 
 /// Compiles the crates `args` names on `threads` threads until `done`, giving up on what is
@@ -8829,6 +8871,7 @@ fn spare(dir: &Path) -> anyhow::Result<()> {
         // SAFETY: as above.
         unsafe { std::env::remove_var(name) };
     }
+    trace::from_env();
     std::env::set_current_dir(&told.cwd)?;
     if !told.ahead {
         std::thread::spawn(end_with_input);
@@ -8986,6 +9029,7 @@ fn run_holding(
     events::cache_ahead();
     events::flights();
     let start = Instant::now();
+    let span = tracing::info_span!(target: "blaze", "load").entered();
     let selection = args.selection.clone();
     blaze_store::identify_ahead();
     let projects: Vec<&Path> =
@@ -9022,7 +9066,8 @@ fn run_holding(
             load(&projects, &cargo_config, load_config(), selection, beside, scripts_said)?
         }
     };
-    let loaded_at = start.elapsed();
+    drop(span);
+    let span = tracing::info_span!(target: "blaze", "toolchain").entered();
     let listed = Arc::new(Listed::default());
     ide_db::base_db::set_process_env(&mut db, process::own());
     // What is compiled ahead is stored too, so the store is told the toolchain first. A build
@@ -9039,13 +9084,9 @@ fn run_holding(
         }
         None => eprintln!("store: the toolchain of the library cannot be told from another"),
     }
-    let following_at = start.elapsed();
-    let built = follow_cargo(&mut db, &mut vfs, &mut checkouts, &args, &listed)?;
-    if std::env::var_os("BLAZE_STATS").is_some() {
-        let (loaded, toolchain) = (loaded_at.as_micros(), (following_at - loaded_at).as_micros());
-        let cargo = (start.elapsed() - following_at).as_micros();
-        eprintln!("load-us: loaded={loaded} toolchain={toolchain} cargo={cargo}");
-    }
+    drop(span);
+    let built = tracing::info_span!(target: "blaze", "follow cargo")
+        .in_scope(|| follow_cargo(&mut db, &mut vfs, &mut checkouts, &args, &listed))?;
     let beside = built.is_some();
     let Parts { root, base, members, debug, lints_capped, link_args } =
         checkouts.parts(&args.project)?;
@@ -9530,7 +9571,7 @@ fn run_holding(
         memo_capacities(&mut db)?;
     }
     memory::report(&mut db, "warm-up")?;
-    trace::finish_cold("watch ready");
+    first_build_profiled();
     eprintln!("watching {} files", files.len());
     ide_db::executions::take(&db);
     // Requests wait here while a build is under way, and those that have come by the time it
@@ -9639,21 +9680,41 @@ fn run_holding(
     // The programs whose tests blaze's harness lists, by their object.
     let mut harnessed: FxHashSet<PathBuf> = FxHashSet::default();
     loop {
-        if WatchedFile::unwatched(&files, &db) || tree.includes_more(&db) {
-            builds.settle(&mut db, &mut programs)?;
+        WatchedFile::watch_included(&mut files, &db);
+        // An `include!` in a body is first seen when the body is compiled. Only the crates
+        // that named the file, and what depends on them, compiled without it: the builds of
+        // the other programs go on to their end.
+        let including = tree.includes_more(&db).then(|| tree.including(&db));
+        if let Some(including) = &including {
+            let named: Vec<String> = (including.iter())
+                .map(|&it| {
+                    let name = it.extra_data(&db).display_name.as_ref();
+                    name.map_or_else(|| "?".to_owned(), ToString::to_string)
+                })
+                .collect();
+            eprintln!("included late, by {}", named.join(", "));
+            // With no crate noted as naming it, any may have.
+            let named: FxHashSet<ide_db::base_db::Crate> = including.iter().copied().collect();
+            let waited = (builds.running.keys().copied())
+                .filter(|&at| {
+                    !named.is_empty() && !program_reads_any(&db, &programs[at].args, &named)
+                })
+                .collect();
+            builds.settle_waiting(&mut db, &mut programs, &waited)?;
         }
-        let included = WatchedFile::watch_included(&mut files, &mut db);
+        let including = including.filter(|it| !it.is_empty());
         let loaded = WatchedFile::include_sources(&mut files, &mut tree, &mut db);
         match loaded {
-            _ if included => programs.iter_mut().for_each(|it| it.known.touch(&db, None)),
             Loaded::Nothing => {}
             // A build of the daemon's own compiled without them; what rustc linked is of them.
             Loaded::AsRustcRead => programs.iter_mut().for_each(|it| it.known.touch_own(&db)),
-            Loaded::New => programs.iter_mut().for_each(|it| it.known.touch(&db, None)),
+            Loaded::New => {
+                programs.iter_mut().for_each(|it| it.known.touch(&db, including.as_deref()))
+            }
         }
         // What they declare is in the crates now, and a listing from before has none of it.
         if loaded != Loaded::Nothing {
-            listed.touch(&db, None);
+            listed.touch(&db, including.as_deref());
         }
         // The program each client asks for.
         let mut clients: Vec<(usize, Asked)> = Vec::new();
@@ -10697,6 +10758,7 @@ fn run_holding(
             replies.insert(at, answer?);
         }
         let mut linking: FxHashMap<usize, Vec<Asked>> = FxHashMap::default();
+        trace::write_part();
         for (at, asked) in clients {
             let mut client = &asked.2;
             let _ = match replies.get(&at) {
@@ -10752,6 +10814,7 @@ fn run_holding(
                 if failed.is_none() {
                     lock(&as_built).insert(object, from);
                 }
+                trace::write_part();
                 for (_, _, client) in clients {
                     let _ = match &failed {
                         None => writeln!(&client, "ok {built}"),
@@ -11231,12 +11294,8 @@ impl Program {
                 let (db, edited, root) = (db.clone(), &edited, &args.checkout);
                 let lints = !args.lints_capped;
                 scope.spawn(move || {
-                    let start = Instant::now();
-                    let broken = broken_in(&db, edited, paths, root, within, lints);
-                    if std::env::var_os("BLAZE_STATS").is_some() {
-                        eprintln!("check-us: {}", start.elapsed().as_micros());
-                    }
-                    broken
+                    tracing::info_span!(target: "blaze", "check edited")
+                        .in_scope(|| broken_in(&db, edited, paths, root, within, lints))
                 })
             };
             let (check, checked) = (std::sync::Mutex::new(Some(check)), std::sync::OnceLock::new());
@@ -11308,8 +11367,10 @@ impl Program {
             .collect();
         events::built(db, &named, &known.stats, Some(&edited_paths), counted.as_deref());
         let reported = start.elapsed();
+        let span = tracing::info_span!(target: "blaze", "out of date").entered();
         let out_of_date = hir::attach_db(db, || known.out_of_date(db));
-        let dated = start.elapsed();
+        drop(span);
+        let span = tracing::info_span!(target: "blaze", "refusal").entered();
         let mut failed = unnamed
             .map(Refused::Cargos)
             .or_else(|| refusal(db, &edited, paths, &args.checkout, broken, out_of_date))
@@ -11318,20 +11379,12 @@ impl Program {
                 Some(Refused::Error(errors::Said::one(errors::of_none(unset))))
             })
             .or_else(|| warm.refused_reached(args).map(Refused::Cargos));
-        let refused = start.elapsed();
+        drop(span);
+        let span = tracing::info_span!(target: "blaze", "stale copies").entered();
         failed = failed.or_else(|| stale_copies(db, table, args).map(Refused::Cargos));
-        let copies = start.elapsed();
-        let now = hir::attach_db(db, || Tests::of(db, listed, args, tests_now));
-        if std::env::var_os("BLAZE_STATS").is_some() {
-            let us = |it: Duration| it.as_micros();
-            eprintln!(
-                "refuse-us: out_of_date={} refusal={} copies={} tests={}",
-                us(dated - reported),
-                us(refused - dated),
-                us(copies - refused),
-                us(start.elapsed() - copies)
-            );
-        }
+        drop(span);
+        let now = tracing::info_span!(target: "blaze", "tests now")
+            .in_scope(|| hir::attach_db(db, || Tests::of(db, listed, args, tests_now)));
         // blaze's harness lists the tests as they are now, and rustc's as they were.
         let harnessed = of_tests(args)
             && crates_named(db, &args.krate, args)
@@ -11496,9 +11549,8 @@ impl Program {
     }
 }
 
-/// The spans of a build for the client's trace: the worker's wait from the request to the
-/// look at the files, then the steps of the timeline one after another from `start`, and
-/// the queries and code generation under them.
+/// The steps of a build for the client: the worker's wait from the request to the look at
+/// the files, then the steps of the timeline one after another from `start`.
 fn worker_spans(
     start: Instant,
     settled: Duration,
@@ -11519,7 +11571,6 @@ fn worker_spans(
         spans.push(trace::span(format!("worker {name}"), level, at, at + took));
         at += took;
     }
-    spans.extend(trace::take_detail(noticed));
     spans
 }
 

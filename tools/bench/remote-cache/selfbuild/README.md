@@ -15,7 +15,7 @@ runs) of the merge gate:
 | `fill` | `blaze` on a store kept across runs: a run the machine runs out of memory for keeps the packs it sealed, so repeating it ends with main's store (then pushed, as cold `a 1` is) |
 
 Each blaze run is a fresh CI job: a fresh copy of the tree at `/root/rb/b`, an empty target
-directory, a new `BLAZE_HOME`, `BLAZE_STATS=1` and a trace. Results are rows of
+directory, a new `BLAZE_HOME`, `BLAZE_STATS=1` and a profile (`BLAZE_PROFILE`). Results are rows of
 `/root/rb/results.tsv`; the measured ones are in `../selfbuild.tsv`.
 
 ## Running it

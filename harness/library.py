@@ -10,15 +10,24 @@
         to start over; the daily bump merges instead. An empty date is harness/toolchain's.
     library.py merge '{"date": "2026-11-02"}'
         library/ moves to that nightly's standard library as a merge: upstream's changes from
-        UPSTREAM's nightly to the new one are applied three-way to library/, so blaze's own
-        changes are kept. A conflict stops with the files, which have conflict markers then,
-        and nothing else changed is undone. An empty date is harness/toolchain's.
+        UPSTREAM's snapshot to the new nightly's are applied three-way to library/, so blaze's
+        own changes are kept. A conflict stops with the files, which have conflict markers then,
+        and nothing else changed is undone. An empty date is harness/toolchain's. The new
+        snapshot is the branch upstream/library then, which the bump pushes.
+    library.py snapshot '{}'
+        prints the snapshot of UPSTREAM's nightly and makes the branch upstream/library hold
+        it, so `git diff upstream/library -- library/` is blaze's changes to the standard library.
     library.py digest '{}'
         writes library/DIGEST, the digest blaze knows the library by (the store's key of the
         standard library; `toolchain/library.rs` computes the same): after any change to library/.
     library.py archive '{"out": "<dir>"}'
         writes <dir>/library-<digest>.tar.xz, the asset of a release a blaze without a checkout
         downloads the library from once, checking its files against the digest.
+
+A snapshot is a commit of nothing but library/ as a nightly's rust-src has it (none of blaze's
+own files), made the same way from the same rust-src and parent wherever it is made. Each one's
+parent is the snapshot before it: the branch upstream/library on origin is upstream's standard
+library, one commit a nightly, and the base of every merge.
 
 The JSON is inline, a file's path, or `-` for stdin. Downloads are kept in ~/.cache/blaze-library.
 Python 3.11+, stdlib and git.
@@ -228,12 +237,83 @@ def do_import(args):
     print(f"library/ is the standard library of {upstream.nightly} (rust-lang/rust {upstream.commit[:9]}), digest {digest[:12]}")
 
 
-def git(*argv, check=True, input=None):
-    env = {k: v for k, v in os.environ.items() if k != "GIT_EXTERNAL_DIFF"}
+def git(*argv, check=True, input=None, env=None):
+    env = {k: v for k, v in os.environ.items() if k != "GIT_EXTERNAL_DIFF"} | (env or {})
     done = subprocess.run(["git", *argv], cwd=ROOT, capture_output=True, input=input, env=env)
     if check and done.returncode != 0:
         sys.exit(f"library.py: `git {' '.join(argv)}` exited {done.returncode}: {done.stderr.decode()[-3000:]}")
     return done
+
+
+SNAPSHOTS = "refs/heads/upstream/library"
+ORIGIN_SNAPSHOTS = "refs/remotes/origin/upstream/library"
+
+
+def out(*argv, **kw):
+    return git(*argv, **kw).stdout.decode().strip()
+
+
+def ref(name):
+    return git("rev-parse", "-q", "--verify", f"{name}^{{commit}}", check=False).stdout.decode().strip() or None
+
+
+def ahead_of(ours, theirs):
+    return git("merge-base", "--is-ancestor", ours, theirs, check=False).returncode != 0
+
+
+def snapshots_tip():
+    """The newest snapshot: origin's upstream/library, or the local branch when it is ahead of it."""
+    git("fetch", "-q", "origin", f"+{SNAPSHOTS}:{ORIGIN_SNAPSHOTS}", check=False)
+    theirs, ours = ref(ORIGIN_SNAPSHOTS), ref(SNAPSHOTS)
+    if theirs and ours and ahead_of(ours, theirs):
+        return ours
+    return theirs or ours
+
+
+def snapshot(upstream):
+    """The snapshot of `upstream`, made on the newest one when there is none yet; the local branch
+    upstream/library holds the newest then."""
+    tip = snapshots_tip()
+    if tip:
+        found = out("log", tip, "--format=%H", "-1", "--fixed-strings",
+                    f"--grep=rust-src {upstream.url} {upstream.sha256}")
+        if found:
+            if not ref(SNAPSHOTS) or not ahead_of(ref(SNAPSHOTS), tip):
+                git("update-ref", SNAPSHOTS, tip)
+            return found
+    with tempfile.TemporaryDirectory(prefix="blaze-library-") as work:
+        root = os.path.join(work, "library")
+        unpack(upstream, root)
+        found = files(root)
+        paths = sorted(found)
+        plain = [p for p in paths if found[p][0] != "link"]
+        sha = dict(zip(plain, out("hash-object", "-w", "--no-filters", "--stdin-paths",
+                                  input="".join(os.path.join(root, p) + "\n" for p in plain).encode()).split()))
+        for p in paths:
+            if found[p][0] == "link":
+                sha[p] = out("hash-object", "-w", "--no-filters", "--stdin", input=found[p][1])
+        modes = {"file": "100644", "exe": "100755", "link": "120000"}
+        index = {"GIT_INDEX_FILE": os.path.join(work, "index")}
+        git("update-index", "--add", "--index-info", env=index,
+            input="".join(f"{modes[found[p][0]]} {sha[p]}\tlibrary/{p}\n" for p in paths).encode())
+        tree = out("write-tree", env=index)
+    date = upstream.nightly.removeprefix("nightly-")
+    who = {f"GIT_{role}_{what}": value for role in ("AUTHOR", "COMMITTER")
+           for what, value in (("NAME", "harness/library.py"), ("EMAIL", "library@blaze.invalid"),
+                               ("DATE", f"{date}T00:00:00Z"))}
+    message = (f"library: {upstream.nightly}, rust-lang/rust {upstream.commit[:12]}\n\n"
+               "The standard library as the nightly's rust-src has it, made by `harness/library.py`.\n\n"
+               f"repo https://github.com/rust-lang/rust\ncommit {upstream.commit}\nnightly {upstream.nightly}\n"
+               f"rustc {upstream.rustc}\nrust-src {upstream.url} {upstream.sha256}\n")
+    made = out("commit-tree", tree, *(["-p", tip] if tip else []), "-m", message, env=who)
+    git("update-ref", SNAPSHOTS, made)
+    return made
+
+
+def do_snapshot(args):
+    upstream = Upstream.read()
+    print(f"{snapshot(upstream)} upstream/library: {upstream.nightly}'s standard library "
+          f"(rust-lang/rust {upstream.commit[:9]})")
 
 
 def do_merge(args):
@@ -242,37 +322,28 @@ def do_merge(args):
     if new.commit == old.commit:
         print(f"library/ is already {new.nightly}'s ({new.commit[:9]})")
         open(UPSTREAM, "w").write(new.text())
+        snapshot(new)
         write_digest()
         return
-    with tempfile.TemporaryDirectory(prefix="blaze-library-") as work:
-        unpack(old, os.path.join(work, "a"))
-        unpack(new, os.path.join(work, "b"))
-        diff = subprocess.run(
-            ["git", "diff", "--no-ext-diff", "--no-index", "--binary", "--no-color", "--no-renames", "--full-index", "a", "b"],
-            cwd=work, capture_output=True, env={k: v for k, v in os.environ.items() if k != "GIT_EXTERNAL_DIFF"})
-        if diff.returncode not in (0, 1):
-            sys.exit(f"library.py: diffing {old.nightly}'s library with {new.nightly}'s exited {diff.returncode}: {diff.stderr.decode()[-2000:]}")
-        patch = diff.stdout
-        if patch.strip():
-            # The old side's blobs are in this repository (library/ was upstream's at old.commit
-            # but for blaze's own changes, whose upstream blobs its history has), so git merges
-            # each file three-way and leaves conflict markers where both sides changed a line.
-            # Its paths are a/a/<path> and b/b/<path>: -p2 leaves <path>.
-            applied = git("apply", "--3way", "--whitespace=nowarn", "-p2", "--directory=library", "-",
-                          check=False, input=patch)
-            if applied.returncode != 0:
-                conflicted = git("diff", "--name-only", "--diff-filter=U", check=False).stdout.decode().split()
-                kept = os.path.join(CACHE, f"library-{old.commit[:9]}-{new.commit[:9]}.patch")
-                os.makedirs(CACHE, exist_ok=True)
-                open(kept, "wb").write(patch)
-                sys.exit(
-                    f"library.py: upstream's changes from {old.nightly} to {new.nightly} conflict with blaze's "
-                    f"changes to the standard library in: {', '.join(conflicted) or '(see below)'}. "
-                    f"Resolve the conflict markers there, `git add` them and finish the bump; upstream's whole "
-                    f"change is {kept}. git apply said:\n{applied.stderr.decode()[-3000:]}")
+    base = snapshot(old)
+    theirs = snapshot(new)
+    patch = git("diff", "--no-ext-diff", "--binary", "--no-color", "--no-renames", "--full-index",
+                base, theirs, "--", "library").stdout
+    if patch.strip():
+        # Both sides' blobs are in this repository (the snapshots), so git merges each file
+        # three-way and leaves conflict markers where blaze and upstream changed the same lines.
+        applied = git("apply", "--3way", "--whitespace=nowarn", "-", check=False, input=patch)
+        if applied.returncode != 0:
+            conflicted = git("diff", "--name-only", "--diff-filter=U", check=False).stdout.decode().split()
+            sys.exit(
+                f"library.py: upstream's changes from {old.nightly} to {new.nightly} conflict with blaze's "
+                f"changes to the standard library in: {', '.join(conflicted) or '(see below)'}. "
+                f"Resolve the conflict markers there, `git add` them and finish the bump; upstream's whole "
+                f"change is `git diff {base[:12]} {theirs[:12]}`. git apply said:\n{applied.stderr.decode()[-3000:]}")
     open(UPSTREAM, "w").write(new.text())
     write_digest()
-    print(f"library/ merged {old.nightly} ({old.commit[:9]}) -> {new.nightly} ({new.commit[:9]})")
+    print(f"library/ merged {old.nightly} ({old.commit[:9]}) -> {new.nightly} ({new.commit[:9]}); "
+          f"upstream/library is {theirs[:12]}: `git push origin upstream/library`")
 
 
 def do_digest(args):
@@ -308,7 +379,8 @@ def do_archive(args):
 
 
 def main():
-    commands = {"import": (Nightly, do_import), "merge": (Nightly, do_merge), "digest": (Empty, do_digest),
+    commands = {"import": (Nightly, do_import), "merge": (Nightly, do_merge), "snapshot": (Empty, do_snapshot),
+                "digest": (Empty, do_digest),
                 "archive": (Archive, do_archive)}
     if len(sys.argv) not in (2, 3) or sys.argv[1] not in commands:
         sys.exit(f"usage: library.py {{{'|'.join(commands)}}} '<json>'\n\n{__doc__}")

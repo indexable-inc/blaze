@@ -5,18 +5,29 @@ usage: unittests.py [CONFIG]
 
 CONFIG is one JSON object, inline, in a file, or `-` for standard input, `{}` when left out:
 
-    {"cargo": false, "args": ["<test argument>", ...]}
+    {"cargo": false, "build": false, "args": ["<test argument>", ...], "max_mb": 0}
 
-Runs `blaze test --release --no-fail-fast` of CRATES (blaze tests blaze, AGENTS.md rule
-blaze-builds-blaze; `"cargo": true`: plain `cargo test`, on Windows, which has no release of
-blaze to test with yet), one run in the root workspace, with `args` after its own. Each line of
+`max_mb`, when not 0, fails the run when the machine had more than that many megabytes of memory
+and swap in use at once while it ran (docs/memory-budget.md, the check in CI).
+
+Runs `blaze test --release --no-fail-fast` of CRATES with FEATURES (blaze tests blaze, AGENTS.md
+rule blaze-builds-blaze; `"cargo": true`: plain `cargo test` without them, on Windows, which has
+no release of blaze to test with yet), one run in the root workspace, with `args` after its own.
+`"build": true` is CI's build job: `blaze build` of the same packages with the same profile and
+features, so that each library it compiles has the key the test build asks for (a crate of the
+workspace is keyed by its features, by whether it is of a package named, `CARGO_PRIMARY_PACKAGE`,
+and by the keys of the crates it is built on), and the tests job takes those from the store the build job hands it
+(.github/workflows/blaze-platform.yaml). Only the crates built with `cfg(test)` are then compiled
+again. Each line of
 the run is passed on as it comes, so a CI log shows a slow build while it is slow. A failing test that is not in OPEN fails the run, and so does a test in
 OPEN that passes or no longer exists: take it out; so does the cargo run failing before any of
 its tests failed. `ide-diagnostics` is the daemon's errors (its diagnostics are the verdict).
 `hir-ide` is rust-analyzer's type inference with its own tests; the ones in OPEN are what the
 fork does differently from upstream that its expectations have not caught up with.
 """
-import dataclasses, json, os, re, subprocess, sys, typing
+import dataclasses, json, os, re, shutil, signal, subprocess, sys, threading, time, typing
+
+import memory
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CRATES = [
@@ -24,6 +35,8 @@ CRATES = [
     "hir-ty", "hir-ty-mir", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "const-ast", "hir-ide", "ide-diagnostics",
 ]
 CRATES += ["proc-macro-api"]
+# What the build job ships blaze with: LLVM as a second code producer.
+FEATURES = ["blaze-engine/llvm"]
 
 # crate::test, as libtest names it under the crate's test binary.
 OPEN = {
@@ -74,11 +87,114 @@ DOCTESTS = re.compile(r"^\s+Doc-tests (\w+)")
 RESULT = re.compile(r"^test (\S+)(?: - .*)? \.\.\. (ok|FAILED|ignored)")
 
 
-def run(command, cwd, env, seen, failed):
-    """Runs one `cargo test`, adding its tests to seen and failed; returns its exit status and
-    whether any of its tests failed."""
+class Watch:
+    """What the machine and the run's processes hold, said every `EVERY` seconds while the run
+    runs, and the most of it: a hosted runner that runs out of memory and swap is shut down
+    with nothing in the log ("The runner has received a shutdown signal"), and these lines
+    are the last it has."""
+
+    EVERY = 30
+
+    def __init__(self, proc, dirs):
+        self.proc = proc
+        pid = proc.pid
+        self.sampler = memory.Sampler(interval=1.0).add(pid)
+        self.dirs, self.peak, self.at_peak, self._stop = dirs, 0, None, threading.Event()
+        self.began = time.monotonic()
+        self.cpu, self.cpu_shown, self.idle_since, self.dumped = {}, {}, None, False
+
+    # A run whose blaze-engines use less than this share of one core for `STILL` seconds is stuck:
+    # the threads of its blaze-engines are dumped and the run is stopped.
+    IDLE, STILL = 0.05, 300
+
+    @staticmethod
+    def busy(table, pid, now):
+        """The share of one core `pid` used since `table` last had it, or None the first time."""
+        cpu = memory.cpu_seconds(pid)
+        last, table[pid] = table.get(pid), (now, cpu)
+        if cpu is None or last is None or last[1] is None or now <= last[0]:
+            return None
+        return (cpu - last[1]) / (now - last[0])
+
+    def engines(self):
+        """The blaze-engines of the run that still run: the daemon and its workers, whose CPU says
+        whether a build moves (the client's ticker uses some however stuck the build is)."""
+        named = lambda pid: open(f"/proc/{pid}/comm").read().strip() if os.path.exists(f"/proc/{pid}/comm") else ""
+        return [pid for pid in list(self.sampler.most) if named(pid) == "blaze-engine"]
+
+    def stuck(self, now):
+        """Whether the run's blaze-engines have been as good as idle for `STILL` seconds."""
+        shares = [self.busy(self.cpu, pid, now) for pid in self.engines()]
+        shares = [it for it in shares if it is not None]
+        if not shares or sum(shares) >= self.IDLE:
+            self.idle_since = None
+            return False
+        self.idle_since = self.idle_since or now
+        return now - self.idle_since >= self.STILL
+
+    def dump(self):
+        """Every thread's stack of each blaze-engine of the run, by gdb."""
+        engines = self.engines()
+        if not shutil.which("gdb"):
+            print(f"::warning::the run is stuck (blaze-engine {engines}) and there is no gdb to say where", flush=True)
+            return
+        for pid in engines:
+            print(f"::group::the threads of blaze-engine[{pid}], stuck {self.STILL // 60} min", flush=True)
+            subprocess.run(["sudo", "-n", "gdb", "-p", str(pid), "-batch", "-ex", "thread apply all bt 40"], stdin=subprocess.DEVNULL, timeout=600)
+            print("::endgroup::", flush=True)
+
+    def line(self):
+        machine = memory.system_mb()
+        if machine:
+            held = machine["used"] + machine["swap_used"]
+            if held > self.peak:
+                self.peak, self.at_peak = held, machine
+        gb = lambda mb: f"{mb / 1024:.1f}"
+        said = [f"memory at {(time.monotonic() - self.began) / 60:.0f} min:"]
+        if machine:
+            said.append(f"machine {gb(machine['used'])}/{gb(machine['total'])} GB, swap {gb(machine['swap_used'])}/{gb(machine['swap_total'])} GB;")
+        said.append(f"the run's processes {gb(self.sampler.peak_mb)} GB at most;")
+        said.append("disk free " + ", ".join(f"{d} {shutil.disk_usage(d).free / 2**30:.0f} GB" for d in self.dirs if os.path.isdir(d)) + ";")
+        now = time.monotonic()
+        cpu = lambda pid: "" if (share := self.busy(self.cpu_shown, pid, now)) is None else f" {share * 100:.0f}% cpu"
+        said.append("largest " + ", ".join(f"{name}[{pid}] {gb(rss)}+{gb(swap)} GB{cpu(pid)}" for rss, swap, pid, name in memory.largest_processes(4)))
+        return " ".join(said)
+
+    def _loop(self):
+        while not self._stop.wait(self.EVERY):
+            print(self.line(), flush=True)
+            if not self.dumped and self.stuck(time.monotonic()):
+                self.dumped = True
+                self.dump()
+                print(f"::error::the run used under {self.IDLE * 100:.0f}% of a core for {self.STILL // 60} min: stuck, stopped (the threads are above)", flush=True)
+                # The daemon keeps the output open, which the run's end waits for.
+                for pid in [self.proc.pid, *self.engines()]:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+
+    def __enter__(self):
+        self.sampler.start()
+        threading.Thread(target=self._loop, daemon=True).start()
+        return self
+
+    def __exit__(self, *_):
+        self._stop.set()
+        self.sampler.stop()
+        print(self.line(), flush=True)
+
+
+def run(command, cwd, env, seen, failed, watch_dirs):
+    """Runs one `cargo test`, adding its tests to seen and failed; returns its exit status,
+    whether any of its tests failed and its `Watch`."""
     print(" ".join(command), flush=True)
     proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+    with Watch(proc, watch_dirs) as watch:
+        return *read(proc, seen, failed), watch
+
+
+def read(proc, seen, failed):
     binary, any_failed = "?", False
     for line in proc.stdout:
         # Flushed: a pipe's buffer (128 KiB from Python 3.14) held a whole build's lines until
@@ -101,8 +217,12 @@ def run(command, cwd, env, seen, failed):
 class Config:
     # Plain `cargo test`, where there is no release of blaze to test with (Windows).
     cargo: bool = False
+    # `blaze build` of what the tests are built on, and no tests: CI's build job.
+    build: bool = False
     # Passed after the command's own arguments.
     args: list = dataclasses.field(default_factory=list)
+    # The most memory and swap the machine may have in use at once, in MB; 0 is no bound.
+    max_mb: int = 0
 
 
 def config(argv: list[str]) -> Config:
@@ -132,7 +252,14 @@ def config(argv: list[str]) -> Config:
 def main():
     cfg = config(sys.argv[1:])
     plain, args = cfg.cargo, cfg.args
-    command = [*(["cargo"] if plain else ["blaze"]), "test", "--release", "--no-fail-fast", *(f"-p{c}" for c in CRATES), *args]
+    if cfg.build and plain:
+        sys.exit("unittests.py: `build` is blaze's build, not cargo's")
+    packages = [f"-p{c}" for c in CRATES]
+    if plain:
+        command = ["cargo", "test", "--release", "--no-fail-fast", *packages, *args]
+    else:
+        verb = ["build"] if cfg.build else ["test", "--no-fail-fast"]
+        command = ["blaze", *verb, "--release", "--locked", "--features", ",".join(FEATURES), *packages, *args]
     open_ = OPEN if plain else OPEN | OPEN_BLAZE
     # Under CI rust-analyzer's slow tests run, and mark that they did in the target directory.
     env = {"CARGO_TARGET_DIR": os.path.join(ROOT, "target"), **os.environ}
@@ -143,8 +270,21 @@ def main():
     if not plain:
         env.setdefault("RUST_MIN_STACK", str(16 << 20))
     seen, failed = set(), set()
-    status, any_failed = run(command, ROOT, env, seen, failed)
+    watch_dirs = [ROOT, *(d for d in [os.environ.get("BLAZE_CACHE"), "/mnt"] if d)]
+    status, any_failed, watch = run(command, ROOT, env, seen, failed, watch_dirs)
     sys.stdout.flush()
+    took = (time.monotonic() - watch.began) / 60
+    peak = f"{watch.peak / 1024:.1f} GB of memory and swap in use on the machine at most" if watch.at_peak else "no memory reading on this platform"
+    said = f"`{' '.join(command[:2])}`: {took:.0f} min, {peak}, {watch.sampler.peak_mb / 1024:.1f} GB resident in the run's processes at most"
+    print(said, flush=True)
+    if os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+            f.write(f"### Unit tests\n\n{said}\n\n")
+    over = cfg.max_mb and watch.at_peak and watch.peak > cfg.max_mb
+    if over:
+        print(f"::error::the machine had {watch.peak} MB of memory and swap in use at once, over the {cfg.max_mb} MB bound (max_mb; docs/memory-budget.md)")
+    if cfg.build:
+        sys.exit(status or (1 if over else 0))
     unsure = set() if plain else UNSURE_BLAZE
     new, fixed, gone = sorted(failed - open_ - unsure), sorted(open_ & seen - failed), sorted(open_ - seen)
     print(f"\n{len(seen)} tests, {len(failed)} failed, {len(open_ & failed)} of them known (OPEN in harness/unittests.py)")
@@ -157,7 +297,7 @@ def main():
     if status and not any_failed:
         print(f"::error::{' '.join(command)} failed (exit status {status}) before any test failed: the build, most likely")
         sys.exit(1)
-    sys.exit(1 if new or fixed or gone else 0)
+    sys.exit(1 if new or fixed or gone or over else 0)
 
 
 if __name__ == "__main__":

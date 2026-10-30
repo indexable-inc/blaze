@@ -21,7 +21,8 @@ whose `blaze test` passes `tests` tests. A project is a repository at a pinned c
 and whose `blaze test` (with the arguments of `test`) passes. A private repository is fetched with GH_TOKEN. A project may have
 `env` for its builds, `seconds` for each command (default 3600), and `prepare`, a module of the
 harness whose `prepare(checkout)` gives the tree to build and the environment its builds need
-(bun: bunprep.py, its own build of its C and C++; flox: floxprep.py, its Nix build's), and
+(bun: bunprep.py, its own build of its C and C++; flox: floxprep.py, its Nix build's; servo:
+servoprep.py, the sandbox opt-out its manifest needs), and
 `fetches`, the selections (`-p`s, `--tests`) `blaze lock --fetches` records its build scripts'
 downloads for first, one per feature set they pick it by (fframes'). A project's `dir` is where
 in the checkout its workspace is (codex: `codex-rs`): its runs, tests and builds start there.

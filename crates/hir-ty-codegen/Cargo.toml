@@ -16,6 +16,7 @@ path = "mod.rs"
 doctest = false
 
 [dependencies]
+blaze-profile.workspace = true
 either.workspace = true
 indexmap.workspace = true
 la-arena.workspace = true

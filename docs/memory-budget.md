@@ -42,10 +42,30 @@ past `BLAZE_MEMORY_MAX` (half the machine), and the own base that nobody waits f
 
 ## The cause
 
-To be filled in from the bisect probes (bootstrap 0.20261029.0, which has #1428 and not #1459,
-and 0.20261028.14, which has neither) and the stacks `harness/unittests.py` dumps by gdb once
-the run stops using the CPU. The first fix is whichever of the two it is, made right rather than
-reverted: the programs of a checkout still build side by side, under the budget below.
+Two, one hiding the other.
+
+**A deadlock in 0.20261029.1.** gdb's stacks of the stuck runs (#1503, job 123773519177): the
+worker's main thread waits in `Builds::settle` for salsa's `cancel_others`, that is for every
+other handle on the database to be dropped, while four program builds sit in
+`ObjectCodegen::compile_ahead`'s thread scope (`in_parallel_beside`) with sixteen threads parked
+on its condition variable, each holding a handle and none looking at the cancellation.
+[#1482](https://github.com/indexable-inc/blaze/pull/1482) ("compiling ahead ends when the build
+is cancelled") fixed this on main, in 0.20261029.3 and later; the bootstrap moves to
+0.20261029.7 in [#1538](https://github.com/indexable-inc/blaze/pull/1538).
+
+**Programs built side by side without a bound.** With the deadlock out of the way the bisect
+probes measure what is left:
+
+| bootstrap | has | the worker at most | the run |
+| --- | --- | --- | --- |
+| 0.20261028.14 ([#1512](https://github.com/indexable-inc/blaze/pull/1512)) | neither | about 14 GB resident and 5 GB swapped | still linking test programs at 55 min |
+| 0.20261029.0 ([#1511](https://github.com/indexable-inc/blaze/pull/1511)) | #1428 | 14.6 GB resident and 21.8 GB swapped | swap full at 28 min, runner lost (exit 143) |
+
+#1428 asks a cold worker for all of the checkout's programs at once, and the worker builds each
+on a thread of its own: twenty-one programs' codegen at once, about 36 GB on a 15.6 GB machine.
+Even one at a time the worker reaches about 19 GB, because every program's memos stay in the
+database for the next ([section 3](#3-caches-with-a-bound)): admission alone brings the tests
+job back to where it was on 2026-10-28, and only shedding caches brings it under the machine.
 
 ## The design
 
@@ -159,10 +179,13 @@ section 6, never killed by the kernel and never into swap.
 ## The order it lands in
 
 1. The watch and the bound in CI (#1503).
-2. The cause of 2026-10-29, fixed under a first bound: the programs a worker builds side by side
-   and their links are admitted by a count from the budget and the measured size of a program
-   build.
-3. The limit (section 1): one budget, `memory.high`, what others hold, said at start.
+2. The limit (section 1): one budget, `memory.high`, what others hold, said at start (#1516).
+3. The cause of 2026-10-29 under a first bound: the bootstrap with #1482 (#1538), and the
+   programs a worker builds side by side admitted by the budget
+   (`crates/blaze-engine/src/admit.rs`): a program not yet measured in the worker runs alone,
+   and its peak, the most more than at its start the worker held while it ran (read every
+   100 ms), is its prediction afterwards. Measured in the worker's memory only, not yet in the
+   store, so a new worker runs each program alone once.
 4. Measuring units and recording their peaks in the store (section 2's table).
 5. The ledger and grants in the daemon, for program builds, links, test programs, build scripts.
 6. The live watch, and the error of section 6.

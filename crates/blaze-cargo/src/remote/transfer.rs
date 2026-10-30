@@ -31,7 +31,7 @@ const FIRST_WAIT: Duration = Duration::from_millis(250);
 const CHUNK: usize = 1 << 16;
 
 /// The SHA-256 of an object, which is its name on the remote.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Digest([u8; 32]);
 
 impl Digest {

@@ -157,9 +157,16 @@ of blaze is told where it is in `BLAZE_LIBRARY`, the first of:
   read from the nightly's channel manifest (`harness/library.py import` wrote it).
 - It is not a member of blaze's workspace: no fmt, clippy or test of blaze's reads it, and
   `.gitattributes` keeps upstream's bytes.
-- The daily bump moves it with the pin as a merge (`harness/library.py merge`): upstream's
-  changes from the old nightly to the new one are applied three-way, so blaze's own changes
-  are kept. A conflict stops the bump, names the files and opens the bump's issue.
+- The branch `upstream/library` is upstream's standard library alone: one commit (a
+  snapshot) a nightly, each the child of the one before, holding nothing but `library/` as the
+  nightly's `rust-src` has it. `harness/library.py` makes a snapshot the same way wherever it
+  runs (same bytes, parent, author and date: the same commit). `git diff upstream/library --
+  library/` is blaze's changes (`python3 harness/library.py snapshot '{}'` points the local
+  branch at `UPSTREAM`'s snapshot first).
+- The daily bump moves it with the pin as a merge (`harness/library.py merge`): it makes the
+  new nightly's snapshot on `upstream/library` and applies upstream's changes from the old
+  snapshot to the new one three-way, so blaze's own changes are kept, then pushes the snapshot
+  with its branch. A conflict stops the bump, names the files and opens the bump's issue.
 
 To change the standard library, edit it under `library/`, run
 `python3 harness/library.py digest '{}'` (the test `the_library_is_the_one_its_digest_says`

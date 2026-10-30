@@ -5,7 +5,11 @@ date: 2026-10-29
 ---
 # The store is never wholly cold
 
-2026-10-29. Status: plan; nothing below is built yet but the project name (step 1).
+2026-10-29. Status: step 1 is built
+([#1481](https://github.com/indexable-inc/blaze/pull/1481)); step 2 is
+[#1519](https://github.com/indexable-inc/blaze/pull/1519), whose `harness/depkeys.py` showed main's
+blaze serving a dependency's stale code after its build script set another variable or wrote
+another file; the rest is not built.
 
 ## Why
 
@@ -85,7 +89,10 @@ source and checksum of each crate from crates.io. `Cargo.lock` lists the depende
 target and feature, so a closure can only be larger than what is linked, never smaller. The store
 takes one identity per stage (`Store::insert` and `Store::get` name the stage) in place of one per
 process. To begin with every stage's root is `blaze-engine`, which is today's identity less the
-crates nothing links (benches, the site, the fuzzer), so no key misses more than now.
+crates it does not depend on, so no key misses more than now. That alone buys little: of the 74
+crates of the workspace and `vendor/` on 2026-10-29, 4 are outside `blaze-engine`'s closure
+(`blaze-bench`, `blaze-fuzz`, `proc-macro-srv` and its test crate). It is the mechanism steps 4 to
+6 need, and lands with step 4, whose stage is the first with a closure of its own.
 
 Test: a unit test of the closure over a small lock file, and one that a change to a crate outside a
 stage's closure leaves its identity alone and one inside moves it.

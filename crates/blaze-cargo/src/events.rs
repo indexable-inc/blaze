@@ -67,6 +67,12 @@ fn current() -> Option<(Step, Option<String>)> {
 /// Says this thread of the process is at `step`, of `of` when it is of one crate or program,
 /// and done with the one it was at before.
 pub fn at(step: Step, of: Option<&str>) {
+    if crate::trace::on() {
+        crate::trace::step(Some(match of {
+            Some(of) => format!("{step:?} {of}"),
+            None => format!("{step:?}"),
+        }));
+    }
     let of = of.map(str::to_owned);
     let waited = crate::lock(&AT).is_empty();
     match replace(Some((step, of.clone()))) {
@@ -93,6 +99,7 @@ pub fn within<T>(step: Step, of: Option<&str>, work: impl FnOnce() -> T) -> T {
 /// Says this thread of the process is done with its step: once every thread is, the process
 /// waits to be asked.
 pub fn idle() {
+    crate::trace::step(None);
     if let Some((step, of)) = replace(None) {
         say(Event::Ended { step, of });
     }

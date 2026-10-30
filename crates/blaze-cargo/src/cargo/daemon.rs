@@ -429,6 +429,10 @@ pub struct Checkout {
     /// built, which a worker loads the checkout with.
     #[serde(default)]
     pub scripts: Option<PathBuf>,
+    /// Where the client asked the profile of the build to go ([`crate::trace::VAR`]): the
+    /// worker records one from then on, and one it starts records its load too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<PathBuf>,
 }
 
 impl Checkout {
@@ -617,6 +621,9 @@ impl Worker {
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
         started.extend(config.builds_env());
+        if let Some(profile) = checkout.profile.as_ref().and_then(|it| it.to_str()) {
+            started.insert(crate::trace::VAR.to_owned(), profile.to_owned());
+        }
         let told = spare.and_then(|it| it.told(&args, &started, &checkout.root));
         let child = match told {
             Some(spare) => {
@@ -830,6 +837,9 @@ impl Worker {
         let mut env = requests_env(&checkout.config);
         for (name, value) in &checkout.env {
             env.set(name, value);
+        }
+        if let Some(profile) = checkout.profile.as_ref().and_then(|it| it.to_str()) {
+            env.set(crate::trace::VAR, profile);
         }
         stream.write_all(checkout.sync_line(plan).as_bytes()).with_context(failed)?;
         stream
@@ -1783,53 +1793,38 @@ impl Daemon {
         Ok(ui.insert(served.url).clone())
     }
 
-    fn sync(&self, checkout: &Checkout) -> Reply {
-        let worker = lock(&self.workers).get(&checkout.config.id()).cloned();
-        let Some(worker) = worker else {
-            return Reply::Cold { reason: "the daemon has not loaded this workspace".to_owned() };
-        };
-        *lock(&worker.asked) = Instant::now();
-        // Counted before it is seen to be ready: [`Self::settle`] takes a worker that is
-        // answering nothing out of use.
-        let _answering = Answering::new(&worker.answering);
-        let warmth = match lock(&worker.checkouts).get(&checkout.key) {
-            Some(loaded) if loaded.generation == checkout.generation => loaded.warmth.clone(),
-            _ => Warmth::Failed("the daemon has not loaded this build of the workspace".to_owned()),
-        };
-        match warmth {
-            Warmth::Ready => worker.sync(checkout),
-            Warmth::Loading(since) => Reply::Cold {
-                reason: format!(
-                    "the daemon is still loading the workspace ({:.0?} so far)",
-                    since.elapsed()
-                ),
-            },
-            Warmth::Failed(reason) => Reply::Cold { reason },
-            Warmth::Broken(said, _) => {
-                let programs = checkout.programs.iter().map(|_| Err(NotBuilt::Error(said.clone())));
-                Reply::Synced { programs: programs.collect(), spans: Vec::new() }
-            }
-        }
-    }
-
-    /// What the worker that loads `checkout` has to say of its programs once it has.
+    /// What the worker that loads `checkout` has to say of its programs once it has. How far
+    /// the worker is is read once a round: a load that ends between two reads of it is
+    /// answered as it ended, never as still loading.
     fn built(&self, checkout: &Checkout) -> Reply {
         loop {
-            match self.sync(checkout) {
-                Reply::Cold { .. } if self.loads(checkout) => std::thread::sleep(POLL),
-                reply => return reply,
+            let worker = lock(&self.workers).get(&checkout.config.id()).cloned();
+            let Some(worker) = worker else {
+                return Reply::Cold {
+                    reason: "the daemon has not loaded this workspace".to_owned(),
+                };
+            };
+            *lock(&worker.asked) = Instant::now();
+            // Counted before it is seen to be ready: [`Self::settle`] takes a worker that is
+            // answering nothing out of use.
+            let _answering = Answering::new(&worker.answering);
+            let warmth = match lock(&worker.checkouts).get(&checkout.key) {
+                Some(loaded) if loaded.generation == checkout.generation => loaded.warmth.clone(),
+                _ => Warmth::Failed(
+                    "the daemon has not loaded this build of the workspace".to_owned(),
+                ),
+            };
+            match warmth {
+                Warmth::Ready => return worker.sync(checkout),
+                Warmth::Loading(_) => std::thread::sleep(POLL),
+                Warmth::Failed(reason) => return Reply::Cold { reason },
+                Warmth::Broken(said, _) => {
+                    let programs =
+                        checkout.programs.iter().map(|_| Err(NotBuilt::Error(said.clone())));
+                    return Reply::Synced { programs: programs.collect(), spans: Vec::new() };
+                }
             }
         }
-    }
-
-    /// Whether a worker is loading this build of `checkout`.
-    fn loads(&self, checkout: &Checkout) -> bool {
-        let worker = lock(&self.workers).get(&checkout.config.id()).cloned();
-        worker.is_some_and(|worker| {
-            lock(&worker.checkouts).get(&checkout.key).is_some_and(|it| {
-                it.generation == checkout.generation && matches!(it.warmth, Warmth::Loading(_))
-            })
-        })
     }
 
     /// Has a worker load `checkout`: the one of its configuration when that has not loaded
@@ -2365,6 +2360,7 @@ mod tests {
                 env: BTreeMap::new(),
                 command_env: BTreeMap::new(),
                 whole: false,
+                tests_told: None,
             },
             root: dir.clone(),
             crates: Vec::new(),
@@ -2500,5 +2496,97 @@ mod tests {
             "two lines:\n  first\nwhy"
         );
         assert_eq!(last_error("nothing wrong\n"), None);
+    }
+
+    /// A build that waits for its workspace to load is answered with how the load ended, also
+    /// when it ends between two looks at it: never with "still loading" (smoke (std) on main,
+    /// 2026-10-29, after 22 s and after 238 s of loading).
+    #[cfg(unix)]
+    #[test]
+    fn a_build_waiting_for_a_load_is_answered_with_how_it_ended() {
+        let dir = std::env::temp_dir().join(format!("blaze-loading-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = WorkerConfig {
+            repository: dir.clone(),
+            project: "p".into(),
+            cfg_test: false,
+            selection: crate::plan::Selection {
+                profile: "dev".to_owned(),
+                features: Vec::new(),
+                no_default_features: false,
+                all_features: false,
+                packages: Vec::new(),
+                workspace: false,
+                excludes: Vec::new(),
+                unstable: Vec::new(),
+                target: None,
+                dev_deps: false,
+                config: Vec::new(),
+                asked_in: None,
+            },
+            env: BTreeMap::new(),
+            command_env: BTreeMap::new(),
+            whole: true,
+            tests_told: None,
+        };
+        let checkout = Checkout {
+            key: "k".to_owned(),
+            generation: 1,
+            kept: false,
+            built_at: 0,
+            config: config.clone(),
+            root: dir.clone(),
+            programs: Vec::new(),
+            sources: Vec::new(),
+            env: BTreeMap::new(),
+            scripts: None,
+        };
+        let said = crate::errors::Said(Vec::new());
+        for round in 0..200u32 {
+            let loading = Loaded {
+                generation: 1,
+                root: dir.clone(),
+                warmth: Warmth::Loading(Instant::now()),
+                checkout: checkout.clone(),
+            };
+            let worker = Arc::new(Worker {
+                project: dir.clone(),
+                socket: dir.join("sock"),
+                log: dir.join("log"),
+                child: Mutex::new(Command::new("true").spawn().unwrap()),
+                checkouts: Mutex::new(FxHashMap::from_iter([("k".to_owned(), loading)])),
+                asked: Mutex::new(Instant::now()),
+                answering: AtomicUsize::new(0),
+                noted: AtomicBool::new(true),
+                settled: true,
+            });
+            let daemon = Daemon {
+                version: String::new(),
+                home: dir.clone(),
+                idle: None,
+                memory_max: None,
+                workers: Mutex::new(FxHashMap::from_iter([(config.id(), worker.clone())])),
+                spare: Mutex::default(),
+                spare_when: Spares::Never,
+                spares: AtomicUsize::new(0),
+                checkers: Mutex::default(),
+                asked: Arc::new(Mutex::new(Instant::now())),
+                watched: Arc::default(),
+                relays: Arc::default(),
+                ui: Mutex::default(),
+            };
+            let reply = std::thread::scope(|scope| {
+                let waiting = scope.spawn(|| daemon.built(&checkout));
+                // Ends the load at a different moment of the build's polling each round.
+                let micros = u64::from(round * 97 % 20_000);
+                std::thread::sleep(POLL * (round % 3) + Duration::from_micros(micros));
+                worker.set(&checkout, Warmth::Broken(said.clone(), SystemTime::now()));
+                waiting.join().unwrap()
+            });
+            assert!(matches!(reply, Reply::Synced { .. }), "round {round}: {reply:?}");
+            _ = lock(&worker.child).wait();
+        }
+        _ = std::fs::remove_dir_all(&dir);
     }
 }
