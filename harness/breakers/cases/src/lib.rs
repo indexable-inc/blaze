@@ -212,4 +212,5 @@ cases![
     enum_drop_across_await,
     assert_spacing,
     vtable_by_value_track_caller,
+    by_value_reference_receiver,
 ];

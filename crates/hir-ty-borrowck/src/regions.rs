@@ -1237,10 +1237,11 @@ impl<'db> Builder<'_, '_, 'db> {
                 {
                     body.param_locals.first().and_then(|&it| {
                         let ty = local_tys[it.into_raw().into_u32() as usize]?;
-                        self.self_reference(function, ty).or(match ty.kind() {
-                            TyKind::Ref(region, ..) => Some(region),
-                            _ => None,
-                        })
+                        self.self_reference(
+                            function,
+                            ty,
+                            GenericArgs::identity_for_item(self.interner(), function.into()),
+                        )
                     })
                 }
                 _ => None,
@@ -2744,21 +2745,27 @@ impl<'db> Builder<'_, '_, 'db> {
         self.regions.known = known;
     }
 
-    /// The self type of the impl `function` is in with its anonymous lifetimes universal
-    /// regions, when it has any.
-    /// The region of the one `&Self` in the type of a method's `self` (`self: Box<&Self>`,
-    /// `Pin<&mut Self>`), which rustc's lifetime elision gives the elided lifetimes of the
-    /// return type.
-    fn self_reference(&self, function: hir_def::FunctionId, ty: Ty<'db>) -> Option<Region<'db>> {
-        let ItemContainerId::ImplId(impl_) = function.lookup(self.ctx.db).container else {
-            return None;
-        };
+    /// The region of the one `&Self` in a method's receiver (`self: Box<&Self>`,
+    /// `Pin<&mut Self>`), which lifetime elision gives to the return type. A by-value
+    /// `Self` that is itself a reference does not supply a receiver lifetime.
+    fn self_reference(
+        &self,
+        function: hir_def::FunctionId,
+        ty: Ty<'db>,
+        args: GenericArgs<'db>,
+    ) -> Option<Region<'db>> {
         let interner = self.interner();
         let erase = |ty: Ty<'db>| {
             let ty = rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner));
             super::liveness::normalize_erased(self.ctx, ty).unwrap_or(ty)
         };
-        let self_ty = erase(self.ctx.db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip());
+        let self_ty = match function.lookup(self.ctx.db).container {
+            ItemContainerId::ImplId(impl_) => {
+                erase(self.ctx.db.impl_self_ty(impl_).instantiate(interner, args).skip_norm_wip())
+            }
+            ItemContainerId::TraitId(_) => erase(args.types().next()?),
+            _ => return None,
+        };
         let mut found = Vec::new();
         let mut stack = vec![ty];
         while let Some(ty) = stack.pop() {
@@ -5464,7 +5471,7 @@ impl<'db> Builder<'_, '_, 'db> {
                             _ => (false, true, false, false),
                         };
                         let function = match def {
-                            CallableDefId::FunctionId(it) => Some(it),
+                            CallableDefId::FunctionId(it) => Some((it, fn_args)),
                             _ => None,
                         };
                         let (inputs, output) = self.elide(
@@ -5621,7 +5628,7 @@ impl<'db> Builder<'_, '_, 'db> {
 
     /// A callee's signature with the lifetimes it elides, which RA leaves as errors, made
     /// region variables by the elision rules: each elided input lifetime its own, an elided
-    /// output lifetime that of `self` when `self` is a reference, else that of the only
+    /// output lifetime that of the receiver's reference to `Self`, else that of the only
     /// lifetime of the inputs. The default lifetime of a trait object is not one of them.
     /// `static_self`: `self` is of an impl for `dyn Trait`, whose lifetime the impl's header
     /// defaults to `'static` (`impl dyn Trait { fn f(&self) }`), not the reference's.
@@ -5634,7 +5641,7 @@ impl<'db> Builder<'_, '_, 'db> {
     #[allow(clippy::too_many_arguments)]
     fn elide(
         &self,
-        function: Option<hir_def::FunctionId>,
+        function: Option<(hir_def::FunctionId, GenericArgs<'db>)>,
         inputs: Vec<Ty<'db>>,
         output: Ty<'db>,
         self_param: bool,
@@ -5690,8 +5697,10 @@ impl<'db> Builder<'_, '_, 'db> {
                 rustc_type_ir::TypeFoldable::fold_with(ty, &mut defaults)
             })
             .collect();
-        let self_region = match inputs.first().map(|it| it.kind()) {
-            Some(TyKind::Ref(region, ..)) if self_param => Some(region),
+        let self_region = match (self_param, function, inputs.first()) {
+            (true, Some((function, args)), Some(&receiver)) => {
+                self.self_reference(function, receiver, args)
+            }
             _ => None,
         };
         let elided = self_region.or_else(|| {
@@ -5726,7 +5735,7 @@ impl<'db> Builder<'_, '_, 'db> {
             }
         });
         let output = match function {
-            Some(function) => {
+            Some((function, _)) => {
                 let regions = hir_ty::elided_lifetimes(self.ctx.db, function).regions(&errors);
                 hir_ty::with_elided_regions(self.ctx.db, output, function, &regions)
             }

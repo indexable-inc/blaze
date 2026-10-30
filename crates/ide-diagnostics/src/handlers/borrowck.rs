@@ -503,6 +503,77 @@ fn caller_err(id: Id<'static>) -> &'static u32 {
         );
     }
 
+    #[test]
+    fn by_value_reference_self_does_not_choose_the_output_lifetime() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, copy
+trait Pick {
+    fn pick(self, input: &u8) -> &u8;
+}
+impl Pick for &u8 {
+    fn pick(self, input: &u8) -> &u8 { input }
+}
+fn caller(input: &u8) -> &u8 {
+    let receiver = 9;
+    Pick::pick(&receiver, input)
+}
+trait DefaultPick: Sized {
+    fn pick(self, input: &u8) -> &u8 { input }
+}
+impl DefaultPick for &u16 {}
+fn default_caller(input: &u8) -> &u8 {
+    let receiver = 9;
+    DefaultPick::pick(&receiver, input)
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn by_value_reference_self_cannot_escape_as_the_input_lifetime() {
+        check_diagnostics(
+            r#"
+//- minicore: sized
+trait Pick {
+    fn pick(self, input: &u8) -> &u8;
+}
+impl Pick for &u8 {
+    fn pick(self, _input: &u8) -> &u8 {
+        self
+      //^^^^ error: lifetime may not live long enough
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn borrowed_reference_self_still_chooses_the_output_lifetime() {
+        check_diagnostics(
+            r#"
+//- minicore: sized
+trait Pick {
+    fn pick(&self, input: &u8) -> &u8;
+}
+impl Pick for &u8 {
+    fn pick(&self, input: &u8) -> &u8 {
+        input
+      //^^^^^ error: lifetime may not live long enough
+    }
+}
+trait Keep {
+    fn keep(&self, _input: &u8) -> &Self { self }
+}
+impl Keep for &u8 {}
+fn caller<'a>(receiver: &'a &'a u8) -> &'a &'a u8 {
+    let input = 9;
+    Keep::keep(receiver, &input)
+}
+"#,
+        );
+    }
+
     // hir-ty's `path_to_const`: what the types in a trait object's arguments imply holds,
     // `'db: 'a` of `&dyn Fn() -> &'a G<'db>`.
     #[test]
