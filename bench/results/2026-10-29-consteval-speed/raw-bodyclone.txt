@@ -1,0 +1,10 @@
+AC ce_sha256 A 360 s exit 0 correct
+AC ce_sha256 C 71 s exit 0 correct
+AC ce_sha256 A 363 s exit 0 correct
+AC ce_sha256 C 71 s exit 0 correct
+AC ce_toml A 133 s exit 0 correct
+AC ce_toml C 60 s exit 0 correct
+AC ce_toml A 134 s exit 0 correct
+AC ce_toml C 61 s exit 0 correct
+AC ce_inflate A 611 s exit 0 correct
+AC ce_inflate C 119 s exit 0 correct

@@ -1,0 +1,10 @@
+{
+  "machine": "ix VM (cheap-bench5 for raw-main-vs-1473.jsonl, cheap-test for raw-bodyclone.txt; same shape)",
+  "arch": "aarch64",
+  "cpu": "Neoverse-V3",
+  "nproc": 32,
+  "mem_total_gib": 41,
+  "kernel": "7.2.11",
+  "exclusive": false,
+  "note": "ix refused pinned cpus (--cpu) and --memory-commit, so cores are shared; arms alternate (ABAB) to spread the noise evenly"
+}
