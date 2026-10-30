@@ -5,14 +5,20 @@ usage: unittests.py [CONFIG]
 
 CONFIG is one JSON object, inline, in a file, or `-` for standard input, `{}` when left out:
 
-    {"cargo": false, "args": ["<test argument>", ...], "max_mb": 0}
+    {"cargo": false, "build": false, "args": ["<test argument>", ...], "max_mb": 0}
 
 `max_mb`, when not 0, fails the run when the machine had more than that many megabytes of memory
 and swap in use at once while it ran (docs/memory-budget.md, the check in CI).
 
-Runs `blaze test --release --no-fail-fast` of CRATES (blaze tests blaze, AGENTS.md rule
-blaze-builds-blaze; `"cargo": true`: plain `cargo test`, on Windows, which has no release of
-blaze to test with yet), one run in the root workspace, with `args` after its own. Each line of
+Runs `blaze test --release --no-fail-fast` of CRATES with FEATURES (blaze tests blaze, AGENTS.md
+rule blaze-builds-blaze; `"cargo": true`: plain `cargo test` without them, on Windows, which has
+no release of blaze to test with yet), one run in the root workspace, with `args` after its own.
+`"build": true` is CI's build job: `blaze build` of the same packages with the same profile and
+features, so that each library it compiles has the key the test build asks for (a crate of the
+workspace is keyed by its features, by whether it is of a package named, `CARGO_PRIMARY_PACKAGE`,
+and by the keys of the crates it is built on), and the tests job takes those from the store the build job hands it
+(.github/workflows/blaze-platform.yaml). Only the crates built with `cfg(test)` are then compiled
+again. Each line of
 the run is passed on as it comes, so a CI log shows a slow build while it is slow. A failing test that is not in OPEN fails the run, and so does a test in
 OPEN that passes or no longer exists: take it out; so does the cargo run failing before any of
 its tests failed. `ide-diagnostics` is the daemon's errors (its diagnostics are the verdict).
@@ -29,6 +35,8 @@ CRATES = [
     "hir-ty", "hir-ty-mir", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "const-ast", "hir-ide", "ide-diagnostics",
 ]
 CRATES += ["proc-macro-api"]
+# What the build job ships blaze with: LLVM as a second code producer.
+FEATURES = ["blaze-engine/llvm"]
 
 # crate::test, as libtest names it under the crate's test binary.
 OPEN = {
@@ -209,6 +217,8 @@ def read(proc, seen, failed):
 class Config:
     # Plain `cargo test`, where there is no release of blaze to test with (Windows).
     cargo: bool = False
+    # `blaze build` of what the tests are built on, and no tests: CI's build job.
+    build: bool = False
     # Passed after the command's own arguments.
     args: list = dataclasses.field(default_factory=list)
     # The most memory and swap the machine may have in use at once, in MB; 0 is no bound.
@@ -242,7 +252,14 @@ def config(argv: list[str]) -> Config:
 def main():
     cfg = config(sys.argv[1:])
     plain, args = cfg.cargo, cfg.args
-    command = [*(["cargo"] if plain else ["blaze"]), "test", "--release", "--no-fail-fast", *(f"-p{c}" for c in CRATES), *args]
+    if cfg.build and plain:
+        sys.exit("unittests.py: `build` is blaze's build, not cargo's")
+    packages = [f"-p{c}" for c in CRATES]
+    if plain:
+        command = ["cargo", "test", "--release", "--no-fail-fast", *packages, *args]
+    else:
+        verb = ["build"] if cfg.build else ["test", "--no-fail-fast"]
+        command = ["blaze", *verb, "--release", "--locked", "--features", ",".join(FEATURES), *packages, *args]
     open_ = OPEN if plain else OPEN | OPEN_BLAZE
     # Under CI rust-analyzer's slow tests run, and mark that they did in the target directory.
     env = {"CARGO_TARGET_DIR": os.path.join(ROOT, "target"), **os.environ}
@@ -263,6 +280,11 @@ def main():
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
             f.write(f"### Unit tests\n\n{said}\n\n")
+    over = cfg.max_mb and watch.at_peak and watch.peak > cfg.max_mb
+    if over:
+        print(f"::error::the machine had {watch.peak} MB of memory and swap in use at once, over the {cfg.max_mb} MB bound (max_mb; docs/memory-budget.md)")
+    if cfg.build:
+        sys.exit(status or (1 if over else 0))
     unsure = set() if plain else UNSURE_BLAZE
     new, fixed, gone = sorted(failed - open_ - unsure), sorted(open_ & seen - failed), sorted(open_ - seen)
     print(f"\n{len(seen)} tests, {len(failed)} failed, {len(open_ & failed)} of them known (OPEN in harness/unittests.py)")
@@ -275,9 +297,6 @@ def main():
     if status and not any_failed:
         print(f"::error::{' '.join(command)} failed (exit status {status}) before any test failed: the build, most likely")
         sys.exit(1)
-    over = cfg.max_mb and watch.at_peak and watch.peak > cfg.max_mb
-    if over:
-        print(f"::error::the machine had {watch.peak} MB of memory and swap in use at once, over the {cfg.max_mb} MB bound (max_mb; docs/memory-budget.md)")
     sys.exit(1 if new or fixed or gone or over else 0)
 
 

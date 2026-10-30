@@ -145,6 +145,8 @@ HARNESSES = [
      on("linux", "macos", backend="cranelift"), None),
     ("core", ["checktargets.py"], {}, on("linux", "macos", backend="cranelift"), 2),
     ("core", ["nativespans.py"], {}, on("linux", "macos"), 2),
+    # A proc macro calls C its library's build script compiled, for wasm32 by Ubuntu's clang.
+    ("core", ["wasmcmacro.py"], {}, on("linux"), 2),
     ("core", ["gitindex.py"], {}, on("linux", "macos", backend="cranelift"), 2),
     ("core", ["deriveerrors.py"], {}, on("linux", "macos"), 2),
     # blaze answers what is asked of rustc as rustc answers it, on every target it knows.
@@ -177,6 +179,8 @@ HARNESSES = [
     ("store", ["storefull.py"], {}, on("linux", "windows"), 2),
     ("store", ["storeshared.py"], {}, EVERYWHERE, None),
     ("store", ["storeguards.py"], {}, on("linux"), None),
+    # A dependency's features and what its build script set and wrote, in the keys of its code.
+    ("store", ["depkeys.py", arg({})], {}, on("linux"), None),
     ("store", ["storetracked.py"], {}, on("linux", "macos"), 2),
     ("store", ["storebuilds.py"], {}, on("linux", "macos"), 2),
     # Typed JSON from the Python workspace: the harness job has to run ci.py under `uv run --frozen`.
@@ -230,6 +234,8 @@ FAST = {
     "check_json.py": (38, (X64,)),
     "checktargets.py": (40, (X64,)),
     "nativespans.py": (90, (X64,)),
+    # Not measured yet: two cargo and two blaze builds of three small crates, as nativespans.py.
+    "wasmcmacro.py": (60, (X64,)),
     "gitindex.py": (3, (X64,)),
     "deriveerrors.py": (65, (X64,)),
     "answers.py": (17, (X64,)),

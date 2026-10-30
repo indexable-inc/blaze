@@ -2878,7 +2878,12 @@ fn in_source(db: &dyn HirDatabase, id: InFile<span::ErasedFileAstId>) -> bool {
 #[salsa::tracked(returns(ref))]
 fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<CompiledFunction> {
     let _timer = watch::Timer::of(|| watch::Timed::Root(func));
-    let _span = tracing::info_span!(target: "blaze", "compiled_root").entered();
+    // Its name reads what its symbol does, which the compile reads anyway.
+    let name = || {
+        hir_ty_mir::mir::type_name::rustc_function_name(db, func, &[])
+            .unwrap_or_else(|| FunctionSignature::of(db, func).name.as_str().to_owned())
+    };
+    let _span = tracing::info_span!(target: "blaze", "compiled_root", subject = %name()).entered();
     counted::compiles(func.krate(db));
     let _flight = flight::Flight::root(db, func);
     {
@@ -3082,7 +3087,10 @@ fn compiled_instance<'db>(
     env: StoredParamEnvAndCrate,
 ) -> Result<CompiledFunction> {
     let _timer = watch::Timer::of(|| watch::Timed::instance(&instance, &env));
-    let _span = tracing::info_span!(target: "blaze", "compiled_instance").entered();
+    // Its name reads what its symbol does, which the compile reads anyway.
+    let _span = tracing::info_span!(target: "blaze", "compiled_instance",
+        subject = %backtrace_name(db, &instance))
+    .entered();
     counted::compiles(env.krate);
     let _flight = flight::Flight::instance(db, &instance, &env);
     tier::for_build(|| instance_code(db, instance, env, Detach::No)).map(Produced::code)
@@ -3699,6 +3707,14 @@ fn implemented_fn_method(
     let method = trait_ref.skip_binder().def_id.0.trait_items(db).method_by_name(name)?;
     let [fn_methods, _] = fn_trait_methods(lang_items);
     fn_methods.contains(&Some(method)).then_some(method)
+}
+
+/// The trait's declaration of `func`, a method of a trait impl; `func` itself otherwise.
+fn declared_method(db: &dyn HirDatabase, func: FunctionId) -> FunctionId {
+    let ItemContainerId::ImplId(impl_) = func.lookup(db).container else { return func };
+    let Some(trait_ref) = db.impl_trait(impl_) else { return func };
+    let name = &FunctionSignature::of(db, func).name;
+    trait_ref.skip_binder().def_id.0.trait_items(db).method_by_name(name).unwrap_or(func)
 }
 
 /// The instance that is the `poll` of the future `ty`, when that is one of an `async` block.
@@ -5123,6 +5139,7 @@ fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
     {
         isa = &**target_with_frame_pointer()?;
     }
+    backend::time_passes();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         match store::Store::global() {
             Some(store) => ctx
@@ -5131,7 +5148,6 @@ fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
             None => ctx.compile(isa, &mut Default::default()).map(drop),
         }
         .map_err(|e| format!("{:?}", e.inner))?;
-        backend::Tally::global().passes();
         let Some(compiled) = ctx.compiled_code() else {
             return Err("no compiled code".to_owned());
         };
@@ -5236,7 +5252,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         base: Option<&'a patch::Base>,
         hydrate: bool,
     ) -> Result<Self> {
-        let start = stdx::time::Instant::now();
+        let span = tracing::info_span!(target: "blaze", "setup module").entered();
         let isa = target()?.clone();
         // A program's own link takes out what nothing reaches section by section, as of
         // rustc's objects, and what only that refers to need be defined nowhere: bun's calls of
@@ -5251,7 +5267,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         builder.per_function_section(sections).per_data_object_section(data_sections);
         let mut module = ObjectModule::new(builder);
         let unwind = UnwindContext::new(&mut module).map_err(CodegenError::Backend)?;
-        let built = start.elapsed();
+        drop(span);
+        let span = tracing::info_span!(target: "blaze", "setup debug").entered();
         // A patch is added to a program that is linked already, and is read with it.
         let apart = symbols.debug_apart().filter(|_| base.is_none());
         let elf = module.isa().triple().binary_format == target_lexicon::BinaryFormat::Elf;
@@ -5266,9 +5283,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             .map(|context| debuginfo::Describer::new(context, elf))
         });
         let debugged = cached::Told::of(debug.is_some(), symbols.describes_variables());
-        let described = start.elapsed();
-        let mixed = settled::Mixed::of(db, symbols, &own_statics.crates);
-        let mixed_at = start.elapsed();
+        drop(span);
+        let mixed = tracing::info_span!(target: "blaze", "setup mixed")
+            .in_scope(|| settled::Mixed::of(db, symbols, &own_statics.crates));
+        let span = tracing::info_span!(target: "blaze", "setup settled").entered();
         // Without an identity for such a program, nothing of it is kept or found.
         let program = mixed.as_ref().map(|it| it.key);
         let store = store::Store::global().filter(|_| program != Some(None));
@@ -5278,24 +5296,14 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if let Some(store) = store.filter(|_| base.is_none()) {
             store.settled();
         }
-        let settled_at = start.elapsed();
+        drop(span);
+        let _span = tracing::info_span!(target: "blaze", "setup names").entered();
         // A patch names what its base has from the store as the base did, to call it there.
         let names = match base.and_then(|it| it.frozen_ids()) {
             Some(ids) => stable::StableNames::new(db, symbols, own_statics.crates.clone(), true)
                 .frozen(ids.clone()),
             None => stable::StableNames::new(db, symbols, own_statics.crates.clone(), hydrate),
         };
-        if std::env::var_os("BLAZE_STATS").is_some() {
-            let us = |it: std::time::Duration| it.as_micros();
-            eprintln!(
-                "setup-us: module={} debug={} mixed={} settled={} names={}",
-                us(built),
-                us(described - built),
-                us(mixed_at - described),
-                us(settled_at - mixed_at),
-                us(start.elapsed() - settled_at),
-            );
-        }
         Ok(ObjectCodegen {
             db,
             symbols,
@@ -5665,7 +5673,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return;
         }
         let roots = &roots[..];
-        let start = stdx::time::Instant::now();
+        let _span = tracing::info_span!(target: "blaze", "find stored roots").entered();
         let owned = &self.own_statics.crates;
         let next = std::sync::atomic::AtomicUsize::new(0);
         let named = std::sync::Mutex::new(Vec::new());
@@ -5710,7 +5718,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             self.stored_roots.insert(func, whole.then_some(name));
         }
         if std::env::var_os("BLAZE_STATS").is_some() {
-            eprintln!("stored roots: {stored} of {} in {:.1?}", roots.len(), start.elapsed());
+            eprintln!("stored roots: {stored} of {}", roots.len());
         }
     }
 
@@ -13963,15 +13971,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             unsupported!("vtable method without a receiver");
         };
         // A by-value `self` reaches the method through a pointer and needs a shim, unless the
-        // method takes it through a pointer too.
+        // method takes it through a pointer too. rustc's shim (`ShimKind::VTable`) is of the
+        // trait's method, so one that tracks its caller only in the impl is given the place of
+        // the trait's declaration by the shim however `self` is passed.
         if receiver.as_ref() == self_ty {
             let layout = self.layout(self_ty)?;
             let mode = self.pass_mode(&layout, false)?;
-            if !matches!(mode, PassMode::Indirect) {
-                if track_caller(db, callee) {
-                    unsupported!("vtable method taking `self` by value that tracks its caller");
+            if !matches!(mode, PassMode::Indirect) || track_caller(db, callee) {
+                let mut sig = self.body_signature(body)?;
+                if track_caller(db, func) {
+                    sig.params.push(AbiParam::new(ptr()));
                 }
-                let sig = Self::by_pointer(&self.body_signature(body)?, mode);
+                let sig = Self::by_pointer(&sig, mode);
                 return self.cg.callee(
                     InstanceDef::VtableShim(callee),
                     callee_args,
@@ -14312,13 +14323,22 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return self.spread_shim(func, args, method);
         }
         let body = self.body_types(InstanceDef::Fn(func), args)?;
-        let sig = self.body_signature(body)?;
+        let mut sig = self.body_signature(body)?;
         let Some(receiver) = body.params.first() else {
             unsupported!("vtable method without a receiver");
         };
         let layout = self.layout(receiver.as_ref())?;
         let mode = self.pass_mode(&layout, false)?;
-        self.call_by_pointer(func, args, &sig, mode, &layout)
+        // The shim is handed the caller's place when the trait's declaration tracks it, and
+        // passes it on; otherwise a method that tracks it is given the declaration's place, the
+        // span of rustc's shim.
+        let declared = declared_method(self.cg.db, func);
+        let handed = track_caller(self.cg.db, declared);
+        if handed {
+            sig.params.push(AbiParam::new(ptr()));
+        }
+        let placed = (!handed && track_caller(self.cg.db, func)).then_some(declared);
+        self.call_by_pointer(func, args, &sig, mode, &layout, placed)
     }
 
     /// What the vtable slot for an `Fn`-trait method written for a type, whose body is
@@ -14408,7 +14428,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// The body of a shim that is handed a pointer to the receiver of `callee`, which takes
-    /// it by value as `mode` says.
+    /// it by value as `mode` says, and, with `placed`, the place that function is declared
+    /// as its caller's.
     fn call_by_pointer(
         &mut self,
         callee: FunctionId,
@@ -14416,6 +14437,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         sig: &Signature,
         mode: PassMode,
         layout: &Layout,
+        placed: Option<FunctionId>,
     ) -> Result<()> {
         self.builder.func.signature = Self::by_pointer(sig, mode);
         let entry = self.builder.create_block();
@@ -14426,11 +14448,20 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let Some(&receiver) = params.get(sret as usize) else {
             unsupported!("shim for a receiver that is not passed");
         };
-        let callee = self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, sig)?;
+        let mut callee_sig = sig.clone();
+        if placed.is_some() {
+            callee_sig.params.push(AbiParam::new(ptr()));
+        }
+        let callee = self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &callee_sig)?;
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
         let mut values = Vec::new();
         self.pass(mode, receiver, layout, &mut values);
         params.splice(sret as usize..sret as usize + 1, values);
+        if let Some(declared) = placed {
+            let location = self.cg.declaration(declared);
+            let location = self.cg.declare_data_in_func(location, self.builder.func);
+            params.push(self.builder.ins().symbol_value(ptr(), location));
+        }
         let results = self.invoke(callee, &params);
         self.builder.ins().return_(&results);
         Ok(())

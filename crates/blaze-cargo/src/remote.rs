@@ -999,6 +999,9 @@ pub fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let Some(verb) = args.next() else { bail!(USAGE) };
     // What this build's keys are made with apart from the toolchain: CI's project name.
     if verb == "build" {
+        if args.next().is_some() {
+            bail!(USAGE);
+        }
         let name = blaze_store::sources_name().context(
             "this blaze was built outside blaze's workspace: its store keys by the bytes of its \
              executable, which no other build of blaze shares",

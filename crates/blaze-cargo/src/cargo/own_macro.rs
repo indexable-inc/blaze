@@ -72,14 +72,24 @@ pub fn host_side_cfg(project: &Path) -> Result<Option<project_model::CfgOverride
     let mut overrides = project_model::CfgOverrides::default();
     for krate in crates {
         let Some(name) = krate["display_name"].as_str() else { continue };
-        let root = krate["root_module"].as_str().and_then(|it| std::fs::read_to_string(it).ok());
-        let links = krate["is_proc_macro"] == true
-            || root.is_some_and(|text| text.contains("extern crate proc_macro"));
-        if links {
+        let root = krate["root_module"].as_str().map(Path::new);
+        if links_proc_macro(krate["is_proc_macro"] == true, root) {
             overrides.selective.insert(name.to_owned(), diff.clone());
         }
     }
     Ok(Some(overrides))
+}
+
+/// Whether a crate of a proc macro's module links `proc_macro`: a proc macro, or a crate whose
+/// root, at `root`, says `extern crate proc_macro`. It is told of the host's side
+/// ([`host_side_cfg`]), and the build script of its package runs for the module as for the
+/// host (`compile_time.rs`), the platform the script of a crate rustc builds for a proc macro
+/// is told of and probes for (proc-macro2's).
+pub fn links_proc_macro(is_proc_macro: bool, root: Option<&Path>) -> bool {
+    is_proc_macro
+        || root
+            .and_then(|it| std::fs::read_to_string(it).ok())
+            .is_some_and(|text| text.contains("extern crate proc_macro"))
 }
 
 /// Has the toolchain at `sysroot` the WASI libc a module is linked with (`link.rs`), which
@@ -318,11 +328,12 @@ pub fn libraries_of(
                         }
                     }
                     command.arg(sysroot).arg(library);
-                    let start = std::time::Instant::now();
-                    let ran = command.stdin(std::process::Stdio::null()).output();
-                    if std::env::var_os("BLAZE_STATS").is_some() {
-                        eprintln!("blaze: the proc macro {name} made in {:.1?}", start.elapsed());
+                    if let Some((var, dir)) = crate::trace::child_env() {
+                        command.env(var, dir);
                     }
+                    let ran =
+                        tracing::info_span!(target: "blaze", "make proc macro", subject = %name)
+                            .in_scope(|| command.stdin(std::process::Stdio::null()).output());
                     let found = match ran {
                         Ok(ran) if ran.status.success() => {
                             let said = String::from_utf8_lossy(&ran.stdout).trim_end().to_owned();

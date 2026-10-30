@@ -272,13 +272,14 @@
         devShells.scripts = pkgs.mkShell scripts;
         # What harness/bench.py and runbench.py measure bun in (bunprep.py, docs/research/bun.md):
         # bun's own pinned nightly in place of blaze's, for the cargo side (blaze ignores the pin
-        # and compiles its own library/), and
+        # and compiles its own library/), with rust-src, which bun's own build of its Rust
+        # (`-Zbuild-std`, run by bunprep.py's plan step) reads std from, and
         # what bun's own build of its C and C++ needs, as its flake.nix has it: LLVM 23 as the
         # C and C++ compiler, cmake, ninja, nasm (x86), go, a bun to run its build scripts, and on Linux lld.
         # blaze itself is built in the bench shell.
         devShells.bench-bun = (pkgs.mkShell.override { stdenv = pkgs.llvmPackages_23.stdenv; }) {
           packages = [
-            pkgs.rust-bin.nightly."2026-09-15".default
+            (pkgs.rust-bin.nightly."2026-09-15".default.override { extensions = [ "rust-src" ]; })
             pkgs.python313
             pkgs.uv
             pkgs.nodejs

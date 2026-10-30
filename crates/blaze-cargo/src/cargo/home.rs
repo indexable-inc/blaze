@@ -21,6 +21,18 @@ pub fn cargo_home() -> Option<PathBuf> {
     set.or_else(|| Some(Path::new(&home()?).join(".cargo")))
 }
 
+/// Where cargo keeps the package in `dir` when it is a registry's or a git dependency's: the
+/// cargo home above its `registry/src` or `git/checkouts`.
+pub fn cargo_home_of(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors().find_map(|it| {
+        let parent = it.parent()?;
+        let name = it.file_name()?;
+        let below = (name == "src" && parent.file_name()? == "registry")
+            || (name == "checkouts" && parent.file_name()? == "git");
+        below.then(|| parent.parent().map(Path::to_owned)).flatten()
+    })
+}
+
 /// What `enable` recorded of what it changed.
 #[derive(Deserialize)]
 struct Enabled {

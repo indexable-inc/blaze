@@ -163,11 +163,8 @@ impl Outlines {
         files: Vec<FileId>,
     ) -> Vec<Changed> {
         let off = std::env::var_os("BLAZE_NO_BODIES").is_some();
-        let start = std::time::Instant::now();
-        let changed = self.types_changed(db, &files);
-        if std::env::var_os("BLAZE_STATS").is_some() {
-            eprintln!("types-us: {}", start.elapsed().as_micros());
-        }
+        let changed = tracing::info_span!(target: "blaze", "types changed")
+            .in_scope(|| self.types_changed(db, &files));
         if !changed.is_empty() {
             crate::live::types_changed(&changed);
         }
@@ -348,13 +345,10 @@ fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<
         crates.dedup();
         crate::resolve_names(db, &crates);
     }
-    let start = std::time::Instant::now();
-    let functions = listed.in_files(db, files);
-    let found = start.elapsed();
+    let functions = tracing::info_span!(target: "blaze", "outline list")
+        .in_scope(|| listed.in_files(db, files));
     let bodies: Vec<_> = functions.iter().flatten().flatten().map(|&it| it.into()).collect();
-    let count = bodies.len();
-    crate::lower(db, bodies);
-    let lowered = start.elapsed();
+    tracing::info_span!(target: "blaze", "outline lower").in_scope(|| crate::lower(db, bodies));
     let one = |file: FileId, functions: &Option<Vec<FunctionId>>| {
         let Some(functions) = functions else {
             if stats {
@@ -366,16 +360,8 @@ fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<
     };
     if let ([file], [functions]) = (files, &functions[..]) {
         // One file, the usual edit: hashed here rather than on a thread of its own.
-        let outline = hir::attach_db(db, || one(*file, functions));
-        if stats {
-            let us = |it: std::time::Duration| it.as_micros();
-            eprintln!(
-                "outlines-us: list={} lower={} bodies={count} hash={}",
-                us(found),
-                us(lowered - found),
-                us(start.elapsed() - lowered)
-            );
-        }
+        let outline = tracing::info_span!(target: "blaze", "outline hash")
+            .in_scope(|| hir::attach_db(db, || one(*file, functions)));
         return vec![outline];
     }
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());

@@ -25,8 +25,15 @@ stable name holds the function's path, its generic arguments spelled out, and it
 type whose spelling would be longer than 1 KB is written as the SHA-256 of that spelling
 instead: a closure that wraps closures holds each of their types twice, so written out in
 full its name doubles with each level (helix's parser combinators made one of 665 MB). A
-dependency is named by rustc's stable crate id (name, version, and the metadata cargo
-passes). A crate of your checkout is named by a hash of its source, so two checkouts with
+dependency rustc built something of is named by rustc's stable crate id (name, version, and
+the metadata cargo passes). One rustc built nothing of, from a registry or git, is named by
+its name, where its source is under cargo's home, and what it is built with: its edition, its
+cfgs (its features among them), its environment and the files its build script wrote, with
+its package's and the script's directories written as `$PACKAGE` and `$OUT`, the variables
+of the process it read, and the same of each crate it depends on. Two checkouts that share a
+store and build one version of a dependency with other features, or whose build scripts set or
+wrote something else, keep two copies of its code (`harness/depkeys.py`). A crate of your
+checkout is named by a hash of its source, so two checkouts with
 the same source share entries wherever they are on disk. An edit gives new names to
 everything in the edited crate and in the crates of the checkout that depend on it, so
 what the store serves across edits is the code of crates the edit does not reach:
@@ -56,8 +63,9 @@ outside this workspace (the published crate) keys by the bytes of its executable
 build did before. `blaze-engine cache build` prints sixteen hex digits of the store's format
 and what the build was made from, and fails for a build keyed by its executable: two builds
 that print the same keep the same keys for a toolchain, whatever release each is, so CI names
-the remote's project by it rather than by the release (`.github/actions/blaze`). Upgrading blaze makes the old
-entries unreachable; they are removed over time as least recently used.
+the remote's project by it rather than by the release (`.github/actions/blaze`). Upgrading to a
+blaze built from other sources makes the old entries unreachable; they are removed over time as
+least recently used. A release built from the same sources finds them all.
 
 A build script's run is kept under a key with the checkout and the target directory apart:
 its package's directory and the target directory its `OUT_DIR` is in are named by what stands
@@ -172,7 +180,8 @@ Eviction is by pack, not by record. One recently used record keeps its whole pac
 holds up to 64M of values (some 13M on disk), so a limit smaller than a few packs evicts
 nearly everything. The limit counts bytes on disk, compressed.
 
-Upgrading blaze leaves the old build's entries in the store, unreachable, until they are
+Upgrading to a blaze built from other sources leaves the old build's entries in the store,
+unreachable, until they are
 the least recently used; `blaze-engine cache gc --max 0` empties the store at once.
 
 ### Commands

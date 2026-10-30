@@ -10,7 +10,7 @@ Branch `fn-incremental`, from main at 46aff2550e, 2026-10-20. Measured on a load
 time the daemon spends on an edit is the steadier measure of work.
 
 `harness/fnincr.py` starts the daemon in watch mode with salsa's execution counts on
-(`RUSTD_TRACE`, `BLAZE_TRACE`), edits, and prints how often each query ran for the edit. Its
+(`RUSTD_TRACE`), edits, and prints how often each query ran for the edit. Its
 file is `harness/genbig.py`'s: 500 functions of 27 lines (a loop, a match, a closure, a
 `panic!`) in one 13,500-line file, and the same functions in 50 files of 10 as the control.
 `--workspace` takes a real file; here ripgrep 15.1.0's `crates/core/flags/defs.rs` (7,775 lines,

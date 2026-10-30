@@ -13,7 +13,9 @@ result with the machine, the commit and the date, for benchreport.py's runtime t
 Each project is one pinned checkout (cloned into `BLAZE_PROJECTS` as blaze_cli.py does, and
 copied; the clone is never written to). A project with `prepare` (bun) is copied from the tree
 that module's `prepare` makes beside the clone, and is measured only when named, as is one with
-`named` (dynamo, whose build needs protoc and libclang). Under each
+`named` (dynamo, whose build needs protoc and libclang; codex, which needs libcap). A project
+with `dir` is built in that directory of its checkout (codex: codex-rs), and its edits are
+paths in it. Under each
 backend, with a store, a daemon and a home of its own, and plain cargo building the same source
 into a target directory of its own outside the checkout (under `--reference`, which lets the two be on different disks, or `WORK/reference`):
   cold       `blaze build` from nothing, then the wait until the daemon has the
@@ -56,7 +58,7 @@ was linked again where it was added, or is missing. Differences under 50 ms are 
 
 The blaze of a backend is `BLAZE_BIN` (cranelift) or `BLAZE_LLVM_BIN` (llvm).
 """
-import glob, importlib, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
+import csv, glob, importlib, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
 
 import blaze_cli, memory, packs
 from blaze_cli import HERE, ROOT, TOOLCHAIN, Side, difference, fetch, how_built, program_output, test_results, timed, wait_warm
@@ -330,11 +332,14 @@ PROJECTS = {
         ),
         test=["-p", "fff-query-parser", "-p", "fff-grep", "-p", "fff-search"],
     ),
-    # A video rendering framework: its hello-world example's renderer, over FFmpeg (a prebuilt
-    # static one ffmpeg-sys-fframes downloads) and Skia. The run is one frame by the CPU
-    # backend. Its build scripts need nasm and libclang: measured only when named.
+    # A video rendering framework: its hello-world example's renderer, over FFmpeg and Skia,
+    # which its build scripts download (a prebuilt Skia; FFmpeg's source for the example's
+    # codecs, a prebuilt FFmpeg for the tests'): `fetches` locks them for both. The run is one
+    # frame by the CPU backend. Its build scripts need nasm and libclang: measured only when named.
     "fframes": dict(
         repo="dmtrKovalenko/fframes", tag="v1.3.0", rev="69174f0187b5d8e92329246898f70250b59f08f2", named=True,
+        fetches=[["-p", "hello-world-example"],
+                 ["--tests", "-p", "fframes", "-p", "fframes-media", "-p", "webvtt-parser", "-p", "fframes-media-dir-macro"]],
         build=["-p", "hello-world-example", "--bin", "hello_world_example_bin"],
         run=["--renderer", "cpu", "svg", "1s"],
         edits=dict(
@@ -362,6 +367,22 @@ PROJECTS = {
                       "    let _bench_edit = 1u32;\n    let mut serialized = serde_json::to_string_pretty(value)?;")],
         ),
         test=["-p", "flox-core", "-p", "flox-config", "--features", "flox-core/tests"],
+    ),
+    # OpenAI's Codex CLI: its Rust workspace is codex-rs (`dir`), 162 members; the `codex`
+    # binary is over 151 of its 167 local packages and about 1,200 packages in all. cargo builds with its pin (rust-toolchain.toml, 1.99.1), as its users do.
+    # Needs libcap (its Linux sandbox) and ALSA; measured only when named.
+    "codex": dict(
+        repo="openai/codex", tag="rust-v0.165.0", rev="360319d8dee62d87e2d59fc0c21805d79519cfed",
+        dir="codex-rs", env=dict(RUSTUP_TOOLCHAIN="1.99.1"), named=True,
+        build=["-p", "codex-cli", "--bin", "codex"], run=["--version"],
+        edits=dict(
+            body=body("cli/src/main.rs", "fn main() -> anyhow::Result<()> {"),
+            # codex-protocol, which most crates of the workspace depend on.
+            leaf=body("protocol/src/protocol.rs", "pub fn strip_user_message_prefix(text: &str) -> &str {"),
+            # AbsolutePathBuf::join, which the workspace calls at many types of path.
+            generic=body("utils/absolute-path/src/lib.rs", "    pub fn join<P: AsRef<Path>>(&self, path: P) -> Self {"),
+        ),
+        test=["-p", "codex-apply-patch", "-p", "codex-protocol", "-p", "codex-execpolicy", "-p", "codex-features"],
     ),
     # A game: built, not run (it opens a window). Its own code is small; the engine is ~400 crates.
     "bevy": dict(
@@ -586,13 +607,20 @@ def cold_steps(text):
     return steps
 
 
-def thread_steps(text):
-    """What the daemon's threads spent on each step of compiling a function and on each of
-    the producer's, in seconds summed over the threads and the builds in `text`."""
+# The steps of compiling one function, as the profile's spans name them.
+COMPILE_STEPS = ("infer", "mir", "monomorphize", "translate", "describe", "store read", "store write")
+
+
+def thread_steps(text, profile=None):
+    """What the daemon's threads spent on each producer in `text`, and with the directory of a
+    build's profile (BLAZE_PROFILE) on each step of compiling a function: seconds summed
+    over the threads."""
     steps = {}
-    for line in re.findall(r"^steps: (.*)$", text, re.M):
-        for name, took in re.findall(r"([a-z ]+) ([0-9.]+(?:ns|µs|ms|s))(?:,|$)", line):
-            steps[name.strip()] = round(steps.get(name.strip(), 0) + seconds(took), 3)
+    phases = os.path.join(profile, "phases.tsv") if profile else None
+    if phases and os.path.exists(phases):
+        for row in csv.DictReader(open(phases), delimiter="\t"):
+            if row["phase"] in COMPILE_STEPS:
+                steps[row["phase"]] = round(float(row["wall_ms"]) / 1000, 3)
     for producer, took in re.findall(r"^backend: (\w+) compiled \d+ functions, \d+ bytes, (\S+) ", text, re.M):
         steps[producer] = round(steps.get(producer, 0) + seconds(took), 3)
     return steps
@@ -724,6 +752,8 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
     left_out = lambda at, names: [n for n in names if n in ("target", "target-ref", ".git")
                                   or ("prepare" in spec and n == "build" and os.path.samefile(at, source))]
     shutil.copytree(source, ws, symlinks=True, ignore=left_out)
+    # The checkout is copied whole; the workspace is its `dir` (codex's is codex-rs).
+    top, ws = ws, os.path.join(ws, spec["dir"]) if "dir" in spec else ws
     home = lambda label: os.path.join(work, f"home-{name}-{backend}-{label}")
     env = dict(blaze_cli.base_env(home(0)), **spec.get("env", {}), **prepared)
     env["PATH"] = os.path.dirname(blaze) + os.pathsep + env["PATH"]
@@ -738,6 +768,12 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
     SO_FAR[name, backend] = (phases, wrong, ours)
     build, run = spec.get("build", []), spec.get("run")
     subprocess.run(["cargo", "fetch"], cwd=ws, env=env, capture_output=True)
+    # What its build scripts download, for each feature set a build of it picks it by.
+    for selection in spec.get("fetches", []):
+        _, locked = ours.cargo("lock", "--fetches", *selection)
+        if locked.returncode != 0:
+            raise Failed(f"{name} {backend}: `blaze lock --fetches {' '.join(selection)}` failed:\n"
+                         f"{locked.stderr[-3000:]}")
 
     def others():
         """Every setup builds what plain cargo just built: its seconds by name."""
@@ -884,12 +920,13 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
     # directory but the store the measured one filled: a second checkout, or a teammate's store.
     warm_store = []
     for turn in range(cold_runs):
-        other_ws = ws + "-b"
-        shutil.copytree(ws, other_ws, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref", "target-*"))
+        other_top = top + "-b"
+        shutil.copytree(top, other_top, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref", "target-*"))
+        other_ws = os.path.join(other_top, os.path.relpath(ws, top))
         second = Side(other_ws, dict(ours.env, BLAZE_HOME=home(f"{turn}b")), True)
         took_b, warm_b, _, used_b = cold_blaze(second, "store filled by another checkout", Daemon(second))
         second.cargo("stop")
-        shutil.rmtree(other_ws, ignore_errors=True)
+        shutil.rmtree(other_top, ignore_errors=True)
         shutil.rmtree(home(f"{turn}b"), ignore_errors=True)
         warm_store.append((took_b, warm_b, used_b))
         print(f"  warm store {turn + 1}/{cold_runs}  blaze {took_b:.2f}s + ready {warm_b:.2f}s  peak {used_b['peak_mb']} MB  "
