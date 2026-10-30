@@ -897,8 +897,34 @@ Where J stands (2026-10-24):
   function-like macros equal (on dev-aws-11: the server linked in 10.6 s, each library in
   11-14 s). A proc-macro crate has no entry point: rust-analyzer took tokio's
   `#[proc_macro_attribute] pub fn main` for one.
-- Next: ra-jit's server and libraries where every crate that expands with them is ra-jit's,
-  in place of a rustc build of the macro crates.
+- ra-jit's own target directory (`--own-target`, and the daemon's workers) builds its proc
+  macros with ra-jit when `RA_JIT_PROC_MACRO_SERVER` names ra-jit's server. Its load's `cargo
+  check --compile-time-deps` runs rustc through ra-jit's wrapper, which links a proc-macro
+  crate where rustc would compile it, `--shared` from the unit's record, into the file cargo
+  expects (`crates/ra-jit/src/cargo/own_macro.rs`). load-cargo loads a library with ra-jit's
+  list through ra-jit's server and the others through the toolchain's
+  (`load-cargo/src/listed.rs`). A crate rustc compiles in the same pass that links one of
+  ra-jit's libraries has rustc compile that macro first, into the same file, as rustc reads
+  only its own metadata, and says so; a macro ra-jit cannot link is rustc's, and says why.
+  `macroserver.py` builds a package whole with its four macro crates rustc's and then
+  ra-jit's: 6.9 s against 16.3 s on dev-aws-11, and both print what cargo's build does.
+- Cargo's own builds never read that directory: the cold build `norustc.py` counts and
+  `cargo ra-jit`'s base have rustc compile the crates that expand macros until K, and those
+  need rustc's library. So its counts do not change.
+- A proc macro's library links libc. The link left out what a proc macro links, the
+  program's own crate included, so a library linked no native library at all, and glibc
+  bound each libc symbol of it to the oldest version: a `realpath` that fails with `EINVAL`
+  when given no buffer, which rust-embed's derive called in nushell.
+- On dev-aws-11, over a store, `ra-jit --own-target` builds nushell in 60.9-63.3 s with
+  rustc's macros (the load 6.4 s) and NUSHELL with ra-jit's (the load NUSHELL_LOAD): 24 of
+  its 30 macro crates are linked by ra-jit, five of them also compiled by rustc for a crate
+  rustc compiles, and pest_consume_macros is rustc's (a `drop_in_place` ra-jit cannot
+  compile). helix takes 63.2-79.9 s and 80.8-83.5 s (the load 5.6 s and 14.0-16.5 s), 7 of
+  its 9 macro crates ra-jit's. The compile varies by 15 s between runs of the same build;
+  the load is 8-11 s longer with ra-jit's macros, a ra-jit process linking each.
+- Next: syn, quote and proc-macro2 are still compiled by rustc for macros only ra-jit links,
+  and a macro is linked by ra-jit and then compiled by rustc when a crate rustc compiles
+  needs it.
 
 **K. The cold build is ra-jit's.** ([#91](https://github.com/indexable-inc/ra-jit/issues/91)) `cargo ra-jit build` with nothing built plans the units
 (plan.rs), and the daemon compiles them all, taking what the store and the remote have, links

@@ -8,6 +8,12 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Added
 
+- `RA_JIT_PROC_MACRO_SERVER` names ra-jit's proc-macro server, and ra-jit's own target
+  directory (`--own-target`, the daemon's workers) then links its proc macros with ra-jit
+  where rustc compiled them, loaded through that server; a macro a crate rustc compiles
+  needs, or one ra-jit cannot link, stays rustc's and says why
+  ([no-rustc.md](docs/no-rustc.md), step J1). A proc macro's library ra-jit links names libc;
+  without it glibc bound the library's libc calls to their oldest versions.
 - `vendor/proc-macro-srv`, the 1.99.0 release's proc-macro server with a loader that reads
   the list of macros ra-jit writes into a proc-macro library, built by ra-jit with nothing of
   rustc's. `RA_JIT_PROC_MACRO_COMPARE` and `RA_JIT_PROC_MACRO_LIBS` expand each call again
