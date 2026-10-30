@@ -369,10 +369,6 @@ pub(super) struct Tally {
     pub(super) large: AtomicUsize,
     /// Where LLVM's time went.
     pub(super) phases: [AtomicU64; Phase::COUNT],
-    /// Where the time around the producer went.
-    steps: [AtomicU64; Step::COUNT],
-    /// Where Cranelift's time went, summed over the threads, with `BLAZE_STATS`.
-    passes: Mutex<Option<cranelift_codegen::timing::PassTimes>>,
     /// The exports built for compiles to import ([`super::imports`]), and how many bodies
     /// and instructions those imported.
     pub(super) exports: Produced,
@@ -405,6 +401,28 @@ impl Phase {
         [Phase::Lower, Phase::Verify, Phase::Optimize, Phase::Emit, Phase::Read, Phase::Export];
 }
 
+/// Has Cranelift time its passes on this thread into the profile ([`blaze_profile::pass`])
+/// from now on, in place of its own timer, which would time them whether asked or not.
+pub(super) fn time_passes() {
+    thread_local! {
+        static SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if !SET.replace(true) {
+        cranelift_codegen::timing::set_thread_profiler(Box::new(PassTimer));
+    }
+}
+
+struct PassTimer;
+
+impl cranelift_codegen::timing::Profiler for PassTimer {
+    fn start_pass(&self, pass: cranelift_codegen::timing::Pass) -> Box<dyn std::any::Any> {
+        match blaze_profile::pass(pass.description()) {
+            Some(timed) => Box::new(timed) as Box<dyn std::any::Any>,
+            None => Box::new(()),
+        }
+    }
+}
+
 /// The steps of compiling one function that are not the producer's.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Step {
@@ -422,19 +440,6 @@ pub(super) enum Step {
     StoreRead,
     /// Encoding an entry and adding it to the store.
     StoreWrite,
-}
-
-impl Step {
-    const COUNT: usize = 7;
-    const ALL: [(Step, &str); Step::COUNT] = [
-        (Step::Infer, "infer"),
-        (Step::Mir, "mir"),
-        (Step::Monomorphize, "monomorphize"),
-        (Step::Translate, "translate"),
-        (Step::Describe, "describe"),
-        (Step::StoreRead, "store read"),
-        (Step::StoreWrite, "store write"),
-    ];
 }
 
 impl Produced {
@@ -482,27 +487,22 @@ impl Tally {
 
     #[cfg(feature = "llvm")]
     pub(super) fn time<T>(&self, phase: Phase, work: impl FnOnce() -> T) -> T {
+        let _pass = blaze_profile::pass(match phase {
+            Phase::Lower => "LLVM lower",
+            Phase::Verify => "LLVM verify",
+            Phase::Optimize => "LLVM optimize",
+            Phase::Emit => "LLVM emit",
+            Phase::Read => "LLVM read",
+            Phase::Export => "LLVM export",
+        });
         let start = Instant::now();
         let out = work();
         self.phases[phase as usize].fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         out
     }
 
-    /// Adds the times of Cranelift's passes on this thread since it was last asked, with
-    /// `BLAZE_STATS`.
-    pub(super) fn passes(&self) {
-        static STATS: OnceLock<bool> = OnceLock::new();
-        if !*STATS.get_or_init(|| std::env::var_os("BLAZE_STATS").is_some()) {
-            return;
-        }
-        let times = cranelift_codegen::timing::take_current();
-        let mut passes = self.passes.lock().unwrap_or_else(|e| e.into_inner());
-        passes.get_or_insert_with(Default::default).add(&times);
-    }
-
-    /// Runs `work` as part of `step`.
+    /// Runs `work` as part of `step`, a span of the profile.
     pub(super) fn step<T>(&self, step: Step, work: impl FnOnce() -> T) -> T {
-        // For blaze's trace: target `blaze` spans of 200 µs and longer.
         let _span = match step {
             Step::Infer => tracing::info_span!(target: "blaze", "infer"),
             Step::Mir => tracing::info_span!(target: "blaze", "mir"),
@@ -513,14 +513,7 @@ impl Tally {
             Step::StoreWrite => tracing::info_span!(target: "blaze", "store write"),
         }
         .entered();
-        let start = Instant::now();
-        let out = work();
-        self.add(step, start.elapsed());
-        out
-    }
-
-    pub(super) fn add(&self, step: Step, took: Duration) {
-        self.steps[step as usize].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+        work()
     }
 
     /// Says what was compiled by which producer since the last call, on stderr. Times are
@@ -534,21 +527,8 @@ impl Tally {
         });
         let (llvm, cranelift) = (self.llvm.take(), self.cranelift.take());
         let large = self.large.swap(0, Ordering::Relaxed);
-        let steps = Step::ALL.map(|(step, name)| {
-            let took = Duration::from_nanos(self.steps[step as usize].swap(0, Ordering::Relaxed));
-            format!("{name} {took:.1?}")
-        });
-        let selected = Self::selected_llvm();
-        let stats = std::env::var_os("BLAZE_STATS").is_some();
-        if !selected && !stats {
+        if !Self::selected_llvm() && std::env::var_os("BLAZE_STATS").is_none() {
             return;
-        }
-        if stats {
-            eprintln!("steps: {}", steps.join(", "));
-            let passes = self.passes.lock().unwrap_or_else(|e| e.into_inner()).take();
-            if let Some(passes) = passes {
-                eprint!("cranelift passes:\n{passes}");
-            }
         }
         if let Some(llvm) = llvm {
             let phases = std::iter::zip(Phase::ALL, phases)

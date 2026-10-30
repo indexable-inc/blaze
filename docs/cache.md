@@ -25,8 +25,15 @@ stable name holds the function's path, its generic arguments spelled out, and it
 type whose spelling would be longer than 1 KB is written as the SHA-256 of that spelling
 instead: a closure that wraps closures holds each of their types twice, so written out in
 full its name doubles with each level (helix's parser combinators made one of 665 MB). A
-dependency is named by rustc's stable crate id (name, version, and the metadata cargo
-passes). A crate of your checkout is named by a hash of its source, so two checkouts with
+dependency rustc built something of is named by rustc's stable crate id (name, version, and
+the metadata cargo passes). One rustc built nothing of, from a registry or git, is named by
+its name, where its source is under cargo's home, and what it is built with: its edition, its
+cfgs (its features among them), its environment and the files its build script wrote, with
+its package's and the script's directories written as `$PACKAGE` and `$OUT`, the variables
+of the process it read, and the same of each crate it depends on. Two checkouts that share a
+store and build one version of a dependency with other features, or whose build scripts set or
+wrote something else, keep two copies of its code (`harness/depkeys.py`). A crate of your
+checkout is named by a hash of its source, so two checkouts with
 the same source share entries wherever they are on disk. An edit gives new names to
 everything in the edited crate and in the crates of the checkout that depend on it, so
 what the store serves across edits is the code of crates the edit does not reach:

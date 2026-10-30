@@ -544,6 +544,9 @@ fn user_cache() -> Option<PathBuf> {
 /// has a note after what it printed to stderr, naming the package, what the sandbox refused
 /// it and how to take it out; a sandbox that could not be made, why and how to fix it.
 pub fn run(script: &Script<'_>, plan: &Plan, stdin: Stdio) -> anyhow::Result<Ran> {
+    let _span =
+        tracing::info_span!(target: "blaze", "run build script", subject = %script.package())
+            .entered();
     let (spec, root_manifest, in_view) = match plan {
         Plan::Outside(why, env) => {
             if std::env::var_os("BLAZE_STATS").is_some() {

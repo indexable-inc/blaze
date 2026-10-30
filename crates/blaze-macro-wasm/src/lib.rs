@@ -1046,7 +1046,9 @@ fn write_whole(path: &Path, bytes: &[u8]) {
 /// beside it and in `store`, and writes the list of its macros beside it, so that a load
 /// compiles nothing and reads the list without running it.
 pub fn prepare(path: &Path, store: Option<&blaze_store::Store>) -> Result<(), String> {
-    let start = Instant::now();
+    let _span =
+        tracing::info_span!(target: "blaze", "prepare proc macro", subject = %path.display())
+            .entered();
     if let Some((known, _)) = listing(path)
         && code_file(path, &code_key(&known.digest)).is_file()
     {
@@ -1056,13 +1058,6 @@ pub fn prepare(path: &Path, store: Option<&blaze_store::Store>) -> Result<(), St
     let known = Known { digest: keyed::sha256(&bytes), identity: None };
     let wasm = Wasm::known(path, known, Some(&bytes), store)?;
     list(path, &wasm, &wasm.list()?);
-    if std::env::var_os("BLAZE_STATS").is_some() {
-        eprintln!(
-            "blaze: the proc-macro module {} ready in {:.1?}",
-            path.display(),
-            start.elapsed()
-        );
-    }
     Ok(())
 }
 
@@ -1083,15 +1078,13 @@ pub fn prepare_soon(path: &Path, store: Option<&'static blaze_store::Store>) -> 
     let path = path.to_owned();
     let known = Known { digest, identity: Some(identity) };
     std::thread::spawn(move || {
-        let start = Instant::now();
-        let done = Wasm::known(&path, known, Some(&bytes), store);
-        if std::env::var_os("BLAZE_STATS").is_some() {
-            let how = done.map_or_else(|e| format!("failed: {e}"), |_| "ready".to_owned());
-            eprintln!(
-                "blaze: the proc-macro module {} {how} in {:.1?}",
-                path.display(),
-                start.elapsed()
-            );
+        let span =
+            tracing::info_span!(target: "blaze", "prepare proc macro", subject = %path.display());
+        let done = span.in_scope(|| Wasm::known(&path, known, Some(&bytes), store));
+        if let Err(why) = &done
+            && std::env::var_os("BLAZE_STATS").is_some()
+        {
+            eprintln!("blaze: the proc-macro module {} failed: {why}", path.display());
         }
     });
     Ok(())

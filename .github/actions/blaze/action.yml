@@ -12,8 +12,8 @@
 # those, so the name only picks which packs are worth pulling, never what a key finds: two
 # releases built from the same crates, as most of the release train's are, share their store, and
 # a release whose sources changed starts a project of its own, as its keys would miss every older
-# pack anyway and a project's manifest only grows. A project with no manifest yet pulls nothing;
-# no run reads another project's.
+# pack anyway and a project's manifest only grows. A project with no manifest yet pulls nothing.
+# A job reads no other job's project but the one `also` names.
 name: blaze
 description: the release of blaze .github/blaze-version names, its toolchain, and the store main's runs pushed
 inputs:
@@ -23,6 +23,9 @@ inputs:
   llvm:
     description: also the pinned LLVM, as LLVM_SYS_231_PREFIX (true or false)
     default: "false"
+  also:
+    description: another job whose store is pulled too (the tests job takes the build job's), or empty
+    default: ""
 outputs:
   project:
     description: the remote's project of this job's store, for the push after it
@@ -49,6 +52,7 @@ runs:
       shell: bash
       env:
         JOB: ${{ inputs.job }}
+        ALSO: ${{ inputs.also }}
       run: |
         # Without --no-toolchain: install.sh has blaze fetch its toolchain now (`blaze toolchain`),
         # as a user's install does, rather than at the first build.
@@ -65,6 +69,9 @@ runs:
         build=$(blaze-engine cache build) || { echo "::error::blaze-engine cache build failed: blaze $version cannot say what its store keys are made with"; exit 1; }
         [[ "$build" =~ ^[0-9a-f]{16}$ ]] || { echo "::error::blaze-engine cache build said '$build', not sixteen hex digits"; exit 1; }
         echo "project=blaze-$RUNNER_OS-$RUNNER_ARCH-$JOB-$build" | tee -a "$GITHUB_OUTPUT"
+        if [ -n "$ALSO" ]; then
+          echo "also=blaze-$RUNNER_OS-$RUNNER_ARCH-$ALSO-$build" | tee -a "$GITHUB_OUTPUT"
+        fi
     # The pinned LLVM, as a contributor outside Nix gets it (docs/contributing.md, "LLVM for
     # `--features llvm`"): llvm.py fetches the archive llvm.json names for this host, checks its
     # sha256 and unpacks it; crates/hir-ty-codegen/build.rs refuses any other prefix. Below
@@ -105,3 +112,10 @@ runs:
       with:
         mode: pull
         project: ${{ steps.install.outputs.project }}
+    # What the other job compiled that this one asks for by the same keys, such as the
+    # libraries the build job compiled for the tests job's programs (harness/unittests.py).
+    - if: inputs.also != ''
+      uses: ./.github/actions/blaze-remote
+      with:
+        mode: pull
+        project: ${{ steps.install.outputs.also }}

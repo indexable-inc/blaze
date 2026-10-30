@@ -328,11 +328,12 @@ pub fn libraries_of(
                         }
                     }
                     command.arg(sysroot).arg(library);
-                    let start = std::time::Instant::now();
-                    let ran = command.stdin(std::process::Stdio::null()).output();
-                    if std::env::var_os("BLAZE_STATS").is_some() {
-                        eprintln!("blaze: the proc macro {name} made in {:.1?}", start.elapsed());
+                    if let Some((var, dir)) = crate::trace::child_env() {
+                        command.env(var, dir);
                     }
+                    let ran =
+                        tracing::info_span!(target: "blaze", "make proc macro", subject = %name)
+                            .in_scope(|| command.stdin(std::process::Stdio::null()).output());
                     let found = match ran {
                         Ok(ran) if ran.status.success() => {
                             let said = String::from_utf8_lossy(&ran.stdout).trim_end().to_owned();

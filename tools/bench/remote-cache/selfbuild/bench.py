@@ -118,7 +118,7 @@ def main():
         home = run / "home"
         home.mkdir(mode=0o700)
         env.update(PATH=f"{BIN}:{env['PATH']}", BLAZE_HOME=str(home), BLAZE_CACHE=str(store),
-                   BLAZE_CACHE_MAX="off", BLAZE_STATS="1", BLAZE_TRACE=str(run / "trace"),
+                   BLAZE_CACHE_MAX="off", BLAZE_STATS="1", BLAZE_PROFILE=str(run / "profile"),
                    CARGO_TARGET_DIR=str(tree / "target"))
         knobs = RB / "bench.env"
         if knobs.exists():

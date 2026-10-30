@@ -30,7 +30,7 @@ pub mod sandbox;
 pub mod socket;
 pub mod stub;
 pub mod symbols;
-pub mod trace;
+pub use blaze_profile as trace;
 pub mod tree;
 pub mod unstable;
 pub mod weaken;

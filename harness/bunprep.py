@@ -64,8 +64,8 @@ MAIN = """#![no_main]
 extern crate bun_runtime;
 """
 BUILD_RS = """fn main() {
-    let args = std::env::var("BUN_NATIVE_LINK_ARGS").expect("BUN_NATIVE_LINK_ARGS names the file of native link arguments");
     println!("cargo:rerun-if-env-changed=BUN_NATIVE_LINK_ARGS");
+    let args = std::env::var("BUN_NATIVE_LINK_ARGS").expect("BUN_NATIVE_LINK_ARGS names the file of native link arguments");
     println!("cargo:rerun-if-changed={args}");
     for line in std::fs::read_to_string(&args).unwrap().lines() {
         if !line.is_empty() {
@@ -74,6 +74,7 @@ BUILD_RS = """fn main() {
     }
 }
 """
+SANDBOX_ENV = '\n[workspace.metadata.blaze.sandbox]\nbuild-script-env = ["BUN_CODEGEN_DIR", "BUN_NATIVE_LINK_ARGS"]\n'
 MANIFEST = """[package]
 name = "bun-exe"
 version = "0.0.0"
@@ -217,6 +218,12 @@ def overlay(tree):
     for name, text in (("Cargo.toml", MANIFEST), ("main.rs", MAIN), ("build.rs", BUILD_RS)):
         open(os.path.join(tree, "bun-exe", name), "w").write(text)
     edit(os.path.join(tree, "Cargo.toml"), '  "src/bunfig",\n', '  "src/bunfig",\n  "bun-exe",\n')
+    # A sandboxed build script is given only what cargo documents, what it says it reads and
+    # what the root manifest names (docs/cargo.md): bun_core's reads BUN_CODEGEN_DIR without
+    # saying so, and bun-exe's needs BUN_NATIVE_LINK_ARGS on its first run.
+    manifest = os.path.join(tree, "Cargo.toml")
+    if SANDBOX_ENV not in open(manifest).read():
+        open(manifest, "a").write(SANDBOX_ENV)
     # Bun's C and C++ are its release build, without ASSERT_ENABLED; with debug assertions the
     # Rust calls the functions that only a build with them has.
     edit(os.path.join(tree, "Cargo.toml"), '[profile.dev]\npanic = "abort"\n',

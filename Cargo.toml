@@ -97,6 +97,7 @@ blaze-units = { path = "crates/blaze-units" }
 blaze-new = { path = "crates/blaze-new" }
 blaze-tree = { path = "crates/blaze-tree" }
 blaze-fuzz = { path = "crates/blaze-fuzz" }
+blaze-profile = { path = "crates/blaze-profile" }
 blaze-graph = { path = "crates/blaze-graph" }
 blaze-protocol = { path = "crates/blaze-protocol" }
 blaze-ui = { path = "crates/blaze-ui" }

@@ -27,7 +27,7 @@ report gives the median, min and max.
 `--pause S` waits S seconds once the daemon is ready, before the no-op and the edits, as a
 person would before the first edit: what the daemon does by itself once ready is then over.
 
-Every warm `blaze build` (no-op and edits) runs with BLAZE_TRACE, and the row keeps
+Every warm `blaze build` (no-op and edits) runs with BLAZE_PROFILE, and the row keeps
 where the time of its median run went: the client's breakdown of its wall time into steps of
 the client, the daemon and the worker, plus the time outside the client (cargo, process
 start). `--table FILE` prints the results table and that breakdown table.
@@ -163,13 +163,14 @@ async def wait_ready(ws, env, began, step):
 
 
 async def traced(argv, cwd, env, step, trace):
-    """Runs a `blaze build` with BLAZE_TRACE at `trace`; the result is run()'s and
-    where its time went, from the trace: the client's breakdown (ms, adding up to its wall
-    time) and the time outside the client (cargo before and after it, process start)."""
-    took, rc, out, err = await run(argv, cwd, dict(env, BLAZE_TRACE=trace), step)
+    """Runs a `blaze build` with BLAZE_PROFILE in the directory `trace`; the result is
+    run()'s and where its time went, from the profile's trace: the client's breakdown (ms,
+    adding up to its wall time) and the time outside the client (cargo before and after it,
+    process start)."""
+    took, rc, out, err = await run(argv, cwd, dict(env, BLAZE_PROFILE=trace), step)
     try:
-        ours = json.load(open(trace))["blaze"]
-        os.remove(trace)
+        ours = json.load(open(os.path.join(trace, "trace.json")))["blaze"]
+        shutil.rmtree(trace)
     except (OSError, ValueError, KeyError):
         return took, rc, out, err, None
     rows = [[name, round(us / 1000, 1)] for name, us in ours["breakdown"]]
@@ -278,7 +279,7 @@ async def project(name, spec, work, runs, parts, pause=0.0):
     row["linker"] = {side: subprocess.run(["readelf", "-p", ".comment", os.path.join(t, "debug", spec["bin"])], capture_output=True, text=True).stdout
                      for side, t in (("cargo", tc), ("blaze", tr))}
 
-    trace = os.path.join(top, "trace.json")
+    trace = os.path.join(top, "profile")
     if "noop" in parts:
         c, r, built, spent = [], [], [], []
         for i in range(1, runs + 1):

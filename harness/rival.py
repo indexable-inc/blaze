@@ -36,7 +36,7 @@ Input, one JSON object:
   work      a directory for the checkouts, homes and stores (emptied per project)
   out       where the results go: raw/<project>.json, host.json, commands.txt, README.md, and
             beside each project's JSON the output of each arm's first edit build and tests, with
-            our blaze's Chrome trace of that edit (`BLAZE_TRACE`, ui.perfetto.dev opens it)
+            our blaze's profile of that edit (`BLAZE_PROFILE`; ui.perfetto.dev opens its trace.json)
   runs      timed builds per phase (default 5)
   tests     run each project's tests (default true)
   interleave  the arms take turns within each phase (default true); false measures each blaze
@@ -392,8 +392,8 @@ def measure(name, spec, arms, given, log):
                     continue
                 r = runners[arm.name]
                 bench.write_edit(r.ws, changes, False)
-                trace = os.path.realpath(os.path.join(given.out, "raw", f"{name}-{arm.name}-{kind}.trace.json"))
-                took, ran = r.run("build", *build, env={"BLAZE_TRACE": trace} if round_ == 0 and r.prefix == "BLAZE_" else None)
+                trace = os.path.realpath(os.path.join(given.out, "raw", f"{name}-{arm.name}-{kind}.profile"))
+                took, ran = r.run("build", *build, env={"BLAZE_PROFILE": trace} if round_ == 0 and r.prefix == "BLAZE_" else None)
                 if round_ == 0:
                     with open(os.path.join(given.out, "raw", f"{name}-{arm.name}-{kind}.txt"), "w") as f:
                         f.write(f"took {took:.3f}s, exit {ran.returncode}\n--- stdout\n{ran.stdout[-20000:]}\n--- stderr\n{ran.stderr[-40000:]}")
