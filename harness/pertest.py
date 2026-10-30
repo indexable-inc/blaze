@@ -192,6 +192,9 @@ def main():
             verdict = f"RESULTS {sorted(set(got.items()) ^ set(EVERY.items()))} ARE NOT LIBTEST'S"
         elif "the output of a failing test" not in out:
             verdict = "THE FAILING TEST'S OUTPUT IS NOT PRINTED"
+        elif re.search(r"^---- tests::fails stdout ----\n(?:(?!\n\n)[\s\S])*^(running|test result)",
+                       out, re.M):
+            verdict = "A TEST'S OUTPUT HOLDS ITS CHILD'S LIBTEST REPORT"
         step("every test, each in a process of its own", verdict, out + err)
 
         code, out, err = run(ws, env, "-p", "t", "sleeps", BLAZE_TEST_TIMEOUT="2",
