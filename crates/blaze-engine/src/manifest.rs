@@ -57,8 +57,8 @@ pub(crate) fn mode() -> Option<Mode> {
 fn configures(name: &str) -> bool {
     const NOT_OF_THE_CODE: &[&str] = &[
         "BLAZE_STATS",
-        "BLAZE_TRACE",
-        "BLAZE_TRACE_CONST",
+        "BLAZE_PROFILE",
+        "BLAZE_PROFILE_CONST",
         "BLAZE_MEMORY",
         "BLAZE_MANIFEST",
         "BLAZE_HOME",
@@ -194,6 +194,7 @@ pub(crate) fn key(db: &RootDatabase, args: &Args, table_is_empty: bool) -> Optio
     hasher.field(&path(&args.base));
     hasher.field(&[
         args.shared as u8,
+        args.staticlib as u8,
         args.cfg_test as u8,
         args.own_target as u8,
         args.unit_test as u8,

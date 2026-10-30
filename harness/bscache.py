@@ -354,7 +354,7 @@ SYSTEM_LIB_DIRS = ["/usr/lib", "/usr/lib64", "/usr/local/lib", "/lib", "/lib64",
 LINK_ARGS = ["-pthread", "-rdynamic", "-nostartfiles", "-Wl,--as-needed", "-Wl,--no-as-needed",
              "-Wl,--gc-sections", "-Wl,--export-dynamic", "-Wl,-z,relro", "-Wl,-z,now",
              "-Wl,-z,noexecstack", "-Wl,-z,nodelete", "-Wl,-undefined,dynamic_lookup",
-             "-Wl,-dead_strip", "-Wl,-headerpad_max_install_names"]
+             "-Wl,-dead_strip", "-Wl,-headerpad_max_install_names", "-ObjC", "-Wl,-ObjC"]
 LINK_ARG_PREFIXES = ["-Wl,--export-dynamic-symbol=", "-Wl,-soname,", "-Wl,-install_name,@rpath/",
                      "-Wl,-exported_symbol,", "-Wl,--version-script="]
 CARGO_GIVES = ["CARGO", "CARGO_MANIFEST_DIR", "CARGO_MANIFEST_PATH", "CARGO_MANIFEST_LINKS",

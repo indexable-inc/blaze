@@ -83,6 +83,11 @@ jobs:
   tests:
     name: tests
     if: inputs.harnesses == ''
+    # After the build, whose store it starts from: in the `gate` and `warm` tiers the build job
+    # compiles every library the test programs are built on, with the keys they ask for
+    # (harness/unittests.py), and hands over what it compiled, so only the crates built with
+    # `cfg(test)` are compiled here.
+    needs: build
     runs-on: ${{ inputs.os }}
     # A store blaze's release has not compiled into yet: 49 min on Linux x86-64, and over an
     # hour on macOS's 7 GB runner (the 16-minute step of 4-cpu Linux had not ended at 48). Long
@@ -113,17 +118,42 @@ jobs:
       # the C compiler and linker are the runner's. cargo's on Windows, with rustup's nightly.
       - if: env.BLAZE != 'true'
         uses: ./.github/actions/toolchain
+      # With the build job's project too, and LLVM: the tests are built with the features the
+      # build ships (harness/unittests.py, FEATURES).
       - if: env.BLAZE == 'true'
         id: blaze
         uses: ./.github/actions/blaze
         with:
           job: tests
+          llvm: true
+          also: build
+      # What this run's build job compiled, which main's remote has only once main pushes it:
+      # a pull request's build pushes nowhere.
+      - if: env.BLAZE == 'true' && (inputs.tier == 'gate' || inputs.tier == 'warm')
+        uses: actions/download-artifact@v8
+        with:
+          name: store-${{ inputs.platform }}
+          path: ${{ runner.temp }}/handoff
+      # Each pack is named by the hash of its bytes, which is checked here before the store
+      # has it (and again by the daemon as it opens the store).
+      - if: env.BLAZE == 'true' && (inputs.tier == 'gate' || inputs.tier == 'warm')
+        name: the build job's packs into the store
+        working-directory: ${{ runner.temp }}/handoff
+        run: |
+          while read -r pack; do
+            [ -f "$pack" ] || { echo "::error::the build job's pack $pack is not in its artifact"; exit 1; }
+            $PYTHON -c 'import hashlib, sys; sys.exit(hashlib.file_digest(open(sys.argv[1], "rb"), "sha256").hexdigest() + ".pack" != sys.argv[1])' "$pack" \
+              || { echo "::error::the build job's pack $pack is not what it is named by"; exit 1; }
+            mv "$pack" "$BLAZE_CACHE/$pack"
+          done < packs.txt
+          echo "$(wc -l < packs.txt | tr -d ' ') packs of the build job's put in the store"
       # A limit of its own, under the job's: a cold store's tests ran past the job's 90 minutes
       # on 2026-10-28, which cancelled the push after them, so no run after it found them
       # compiled. Run out here, the step fails and main's push still runs.
       - if: env.BLAZE == 'true'
         timeout-minutes: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 335 || startsWith(inputs.os, 'macos') && 220 || 150 }}
-        run: $PYTHON harness/unittests.py
+        run: |
+          $PYTHON harness/unittests.py '{"args": ["--events", "json"]}'
       - if: env.BLAZE != 'true'
         run: |
           $PYTHON harness/unittests.py '{"cargo": true}'
@@ -147,8 +177,9 @@ jobs:
   build:
     name: build
     runs-on: ${{ inputs.os }}
-    # As in the tests job.
-    timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 90 }}
+    # A store blaze's release has not compiled into builds for about 97 minutes on Linux
+    # x86-64 (docs/unit-keys.md), and longer on macOS's 7 GB runner.
+    timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 150 }}
     # The remote's write token and signing key, for main's push alone.
     environment: ${{ github.ref == 'refs/heads/main' && inputs.tier == 'warm' && !startsWith(inputs.os, 'windows') && 'cache-writer' || '' }}
     env:
@@ -190,11 +221,19 @@ jobs:
         with:
           job: build
           llvm: true
-      # Against the LLVM blaze pins. On Windows, which has no Nix, the build is against the static
-      # C runtime, and names libraries of the SDK that the linker is not otherwise shown.
-      - name: blaze build -p blaze-engine --release --features llvm
+      # The packs the store has before the build, so that what it adds can be handed on.
+      - if: env.BLAZE == 'true'
+        run: find "$BLAZE_CACHE" -maxdepth 1 -name '*.pack' -exec basename {} \; | sort > "$RUNNER_TEMP/packs-pulled.txt"
+      # Against the LLVM blaze pins. blaze's build is of every package the unit tests are of,
+      # with their features and profile (harness/unittests.py), so that its libraries are the
+      # ones the tests job's programs are built on. Every one of them is a dependency of
+      # blaze-engine, and each has the features it has in blaze-engine's build alone. On
+      # Windows, which has no Nix, the build is against the static C runtime, and names
+      # libraries of the SDK that the linker is not otherwise shown.
+      - name: blaze build --release --features blaze-engine/llvm, of what the unit tests are built on
         if: env.BLAZE == 'true'
-        run: blaze build -p blaze-engine --release --features llvm --locked
+        run: |
+          $PYTHON harness/unittests.py '{"build": true}'
       - name: cargo build -p blaze-engine --release --features llvm
         if: env.BLAZE != 'true'
         run: |
@@ -205,8 +244,30 @@ jobs:
           else
             nix develop --command cargo build -p blaze-engine --release --features llvm --locked
           fi
-      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && inputs.tier == 'warm' && steps.blaze.outcome == 'success'
+      # The daemon ends first: its last pack seals when it does.
+      - if: always() && env.BLAZE == 'true' && steps.blaze.outcome == 'success'
         run: blaze stop
+      # What the build added to the store, for the tests job (`needs: build`), which pulls the
+      # same keys; a hard link each, since the store and the runner's temporary directory are
+      # one disk. packs.txt lists them, so that a build that added none still hands over a list.
+      - id: handoff
+        if: env.BLAZE == 'true' && inputs.harnesses == '' && (inputs.tier == 'gate' || inputs.tier == 'warm')
+        run: |
+          dir="$RUNNER_TEMP/handoff"
+          mkdir -p "$dir"
+          find "$BLAZE_CACHE" -maxdepth 1 -name '*.pack' -exec basename {} \; | sort > "$RUNNER_TEMP/packs-built.txt"
+          comm -13 "$RUNNER_TEMP/packs-pulled.txt" "$RUNNER_TEMP/packs-built.txt" > "$dir/packs.txt"
+          while read -r pack; do ln "$BLAZE_CACHE/$pack" "$dir/$pack"; done < "$dir/packs.txt"
+          echo "$(wc -l < "$dir/packs.txt" | tr -d ' ') packs, $(du -sh "$dir" | cut -f1), for the tests job" | tee -a "$GITHUB_STEP_SUMMARY"
+      # Packs are compressed already.
+      - if: steps.handoff.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: store-${{ inputs.platform }}
+          path: ${{ runner.temp }}/handoff
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
       - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && inputs.tier == 'warm' && steps.blaze.outcome == 'success'
         uses: ./.github/actions/blaze-remote
         with:

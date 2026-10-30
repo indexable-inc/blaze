@@ -136,8 +136,8 @@ build, which says which and why; nothing is handed to cargo or rustc:
 What blaze does not build yet fails the same way, saying what: the targets `--bins`,
 `--examples`, `--tests`, `--benches` and `--all-targets` pick, several `--target`s,
 `--target-dir`, `--message-format`, `-Z`, and `--build-plan` and `--unit-graph`, and a
-library whose crate types include `staticlib` or `dylib` when the build would write it (a
-plain `build`, or `--lib`): blaze does not link one yet, and says which
+library whose crate types include `dylib` when the build would write it (a plain `build`,
+or `--lib`): blaze does not link one yet, and says which
 ([#262](https://github.com/indexable-inc/blaze/issues/262)). A library's `cdylib` (a native
 Node addon, a Python extension, a plugin) is a program of the build: a plain `build` or
 `--lib` links it as a shared library at cargo's path (`target/debug/lib<name>.so`, `.dylib`
@@ -146,7 +146,14 @@ names with `#[no_mangle]` or `#[export_name]` and nothing else, with the package
 `cargo:rustc-link-arg` and `cargo:rustc-cdylib-link-arg`. Each build after an edit compiles
 what changed on what the worker loaded and links the library again; it is not spliced, so an
 exported function an edit adds is exported. A host that loaded the library (node, python)
-loads it again to see the edit. A build of other libraries alone (`--lib`, or a workspace with
+loads it again to see the edit. A library's `staticlib` (dynamo's C API) is built as its
+`cdylib` would be, and that shared library is linked beside it, which leaves out what its
+exports do not reach: a function blaze cannot compile that they reach fails the build. It is
+written at cargo's path (`target/debug/lib<name>.a`), and holds blaze's objects of what the
+exports reach, the standard library's object, and, as rustc bundles them, the members of each static
+native library the crates link (a build script's `rustc-link-lib=static=`, a `#[link]` of
+`kind = "static"`) but one that says `-bundle`. What they link shared is for the program that
+links the archive to name, as with rustc's. A build of other libraries alone (`--lib`, or a workspace with
 no program) is the daemon's check of them: blaze writes no `rlib` for cargo, and says what it
 finds.
 
@@ -1069,6 +1076,17 @@ second, over that, the daemon stops the worker asked longest ago, and the next b
 workspace is cargo's while a worker loads it again. A worker that is answering or loading is
 never stopped, nor is the one asked last, nor any while a program takes live edits.
 
+A worker whose first build compiled from cold holds about twice what one started from the
+store holds: 4.4 GB against 2.3 GB for a 94-crate program, and 5.2 GB against 2.2 GB once
+edited, whose edits it also built in 1.9 s against 0.23 s, expanding again the macros it did
+not yet know to keep no state
+([#1299](https://github.com/indexable-inc/blaze/issues/1299)). Once the store has all that
+build kept, the worker writes `settles` beside its socket; after it has gone 10 s unasked,
+and while no program takes live edits, the daemon lets it go and starts a worker from the
+store in its place, which keeps the old one's log as `log.cold`. A build asked meanwhile
+waits for the new worker as for any that loads. A worker of several checkouts is not
+swapped.
+
 A client and a daemon built from different sources do not talk to each other. A daemon that
 gets a build request from another version stops its workers and exits, and the client
 starts its own.
@@ -1189,7 +1207,7 @@ started it. To change one, run `blaze stop` first.
 | `BLAZE_HOME` | the daemon's directory (also read by every client) | see above |
 | `BLAZE_IDLE_SECS` | seconds without a request before the daemon exits; 0 is never | 1800 |
 | `BLAZE_MEMORY_MAX` | the most the workers hold together, a size such as `6G`, or `off` | half the machine's memory (on Linux, or of what its control group allows) |
-| `BLAZE_MEMORY_BUDGET` | the limit of the memory budget the daemon says at start (`memory budget:` in its log; [memory-budget.md](memory-budget.md)), a size such as `12G`, or `off`; the budget is that less what other processes hold and a reserve of 5% (at least 512 MB) | the machine's memory, or the fewest its control groups' `memory.max` and `memory.high` allow |
+| `BLAZE_MEMORY_BUDGET` | the limit of the memory budget the daemon says at start (`memory budget:` in its log; [memory-budget.md](memory-budget.md)), a size such as `12G`, or `off`; the budget is that less what other processes hold and a reserve of 5% (at least 512 MB); a worker builds programs side by side only as it allows, each not yet measured alone (`waiting for memory:` in the log); `off` builds them all at once | the machine's memory, or the fewest its control groups' `memory.max` and `memory.high` allow |
 | `BLAZE_SPARE` | `ready` keeps a spare worker with the library loaded at all times, for the next project; `0` starts none, and a workspace loads once cargo has built it | a spare for each build of a new workspace, as it begins |
 | `BLAZE_OWN_BASE_MEMORY` | the most a worker may hold while it builds its own base in the background, a size such as `40G`, past which it gives that base up and edits patch rustc's executable; `off` is no bound | a quarter of the machine's memory (on Linux, or of what its control group allows) |
 | `BLAZE_LRU` | how many values of the queries a build in full holds the most of a worker keeps once the build is over, `mir=N,runtime=N,compiled=N,inlinable=N` (lowered MIR, runtime and monomorphized MIR, each instance's code, bodies to inline); 0 keeps every value. One let go is computed again when an edit asks for it ([#261](https://github.com/indexable-inc/blaze/issues/261)) | `mir=2048,runtime=2048,compiled=16384,inlinable=8192` |
