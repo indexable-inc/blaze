@@ -37,9 +37,11 @@
 //! in a state it did not expect is skipped or refused. A run process whose daemon is gone wakes
 //! every second and finds its channel hung up.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 use crate::channel::Channel;
 use crate::fence::Words;
@@ -188,12 +190,13 @@ fn answered(words: &impl Words, index: usize, generation: u64) -> Result<(), u64
 /// [`answered`], spinning for up to `spin` while it is not.
 fn answered_within(words: &impl Words, index: usize, generation: u64, spin: Duration) -> Result<(), u64> {
     let start = Instant::now();
+    let mut relax = blaze_spin::SpinWait::new();
     loop {
         let seen = answered(words, index, generation);
         if seen.is_ok() || start.elapsed() >= spin {
             return seen;
         }
-        std::hint::spin_loop();
+        relax.relax();
     }
 }
 
@@ -339,12 +342,12 @@ impl Run {
     /// Ends the process, `why` its run's error (the first one, when ended twice). Only while it
     /// has not been reaped: on macOS the process ID is all the daemon holds of it.
     pub(crate) fn kill(&self, why: &str) -> Result<(), Error> {
-        self.killed.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert_with(|| why.to_owned());
+        self.killed.lock().get_or_insert_with(|| why.to_owned());
         self.remote.kill().map_err(|it| Error::new(format!("ending process {}: {it}", self.pid)))
     }
 
     pub(crate) fn killed(&self) -> Option<String> {
-        self.killed.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        self.killed.lock().clone()
     }
 }
 
@@ -367,6 +370,7 @@ impl Reader {
     /// it lives until the next call. Blocks until one comes. An error when the process hung up
     /// (it ended) or wrote an ask no slot holds (end it).
     pub fn recv(&mut self) -> Result<Frame<'_>, Error> {
+        let mut relax = blaze_spin::SpinWait::new();
         loop {
             if let Some((index, generation, kind)) = take(&self.run.words, self.next, &mut self.body)? {
                 self.next = (index + 1) % SLOTS;
@@ -375,7 +379,7 @@ impl Reader {
             }
             // The rings of asks taken while spinning are drained by the next `wait_ring`.
             if self.last.is_some_and(|last| last.elapsed() < READER_SPIN) {
-                std::hint::spin_loop();
+                relax.relax();
                 continue;
             }
             if !self.run.bells.wait_ring(self.channel.stream())? {

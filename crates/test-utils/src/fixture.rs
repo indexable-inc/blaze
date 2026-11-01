@@ -64,7 +64,7 @@
 
 use std::iter;
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use stdx::trim_indent;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -118,7 +118,7 @@ pub struct Fixture {
     /// Specifies environment variables.
     ///
     /// Syntax: `env:PATH=/bin,RUST_LOG=debug`
-    pub env: FxHashMap<String, String>,
+    pub env: HashMap<String, String>,
     /// Specifies extra crate-level attributes injected at the top of the crate root file.
     /// This must be used with `crate` meta.
     ///
@@ -297,7 +297,7 @@ impl FixtureWithProjectMeta {
         let mut extern_prelude = None;
         let mut edition = None;
         let mut cfgs = Vec::new();
-        let mut env = FxHashMap::default();
+        let mut env = HashMap::default();
         let mut introduce_new_source_root = None;
         let mut library = false;
         for component in components {

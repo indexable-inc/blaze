@@ -209,7 +209,7 @@ fn token_at<T>(it: TokenAtOffset<T>, f: impl Fn(T) -> (SyntaxKind, TextRange)) -
 
 /// Every answer of the views of `tree` against the cursors'.
 fn check(tree: &Arc<FlatTree>) {
-    let cursor = Cursor::new_flat_root(tree.clone());
+    let cursor = Cursor::new_flat_root(Arc::clone(tree));
     let view = View::root(tree);
 
     let cursors: Vec<CursorElement> = cursor.descendants_with_tokens().collect();

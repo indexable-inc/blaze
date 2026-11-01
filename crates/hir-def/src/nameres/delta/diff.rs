@@ -5,7 +5,7 @@
 
 use base_db::Db;
 use blaze_dbsp::{Pos, Weight};
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_hash::{HashMap, HashSet};
 
 use super::state::{CrateState, Key};
 use crate::{
@@ -69,7 +69,7 @@ fn unnamed(scope: &ItemScope) -> impl Iterator<Item = crate::per_ns::PerNs> + '_
 pub(super) struct Items {
     pub(super) impls: Vec<(ImplId, Pos)>,
     pub(super) derive_impls: Vec<(BuiltinDeriveImplId, Pos)>,
-    pub(super) traits: FxHashSet<TraitId>,
+    pub(super) traits: HashSet<TraitId>,
 }
 
 impl Items {
@@ -101,12 +101,12 @@ pub(super) fn items(
 }
 
 fn weighted<T: Copy + Eq + std::hash::Hash>(
-    held: &mut FxHashMap<T, Pos>,
+    held: &mut HashMap<T, Pos>,
     old: &[(T, Pos)],
     new: Vec<(T, Pos)>,
     out: &mut Vec<(T, Pos, Weight)>,
 ) {
-    let now: FxHashSet<T> = new.iter().map(|&(it, _)| it).collect(); // alloc: the touched modules' impls, once per write that changed them
+    let now: HashSet<T> = new.iter().map(|&(it, _)| it).collect(); // alloc: the touched modules' impls, once per write that changed them
     for &(it, _) in old {
         if !now.contains(&it)
             && let Some(pos) = held.remove(&it)
@@ -132,7 +132,7 @@ fn weighted<T: Copy + Eq + std::hash::Hash>(
 /// change visited every group, which this follows at the same cost.
 pub(super) fn update_positions(state: &mut CrateState) -> Vec<ModuleId> {
     let mut moved = Vec::new(); // alloc: the groups that moved, once per change of the tree
-    let mut now: FxHashMap<ModuleId, Pos> = FxHashMap::default();
+    let mut now: HashMap<ModuleId, Pos> = HashMap::default();
     now.reserve(state.groups.len());
     // Group order is DFS preorder: a parent's position is known before its children's.
     for (&group, g) in &state.groups {

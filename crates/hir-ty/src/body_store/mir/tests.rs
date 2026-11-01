@@ -12,6 +12,8 @@ use std::sync::Arc;
 use base_db::{Db, all_crates};
 use blaze_alloc_count::measure;
 use blaze_format::Aligned;
+use blaze_hash::HashMap;
+use blaze_query::db::Setter;
 use hir_def::{
     AdtId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, ModuleDefId, StructId, VariantId,
     deps::ImageStore,
@@ -22,9 +24,7 @@ use hir_def::{
 };
 use hir_expand::name::Name;
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
-use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::Ty as _;
-use blaze_query::db::Setter;
 
 use super::{RAN, built, decode, encode, lookup_mir, place};
 use crate::{
@@ -32,13 +32,15 @@ use crate::{
     body_store::{
         BodyFacts, Flushed, Lookup, Mode, Step, StepCounts,
         record::{self, AnswerKey, ShapeRef},
-        tests::{BUILD, Defs, FIXTURE, Memory, Session, db_of, function, second, session, without_steps},
+        tests::{
+            BUILD, Defs, FIXTURE, Memory, Session, db_of, function, second, session, without_steps,
+        },
     },
     db::{InternedClosure, InternedClosureId},
     mir::{
-        AggregateKind, BasicBlock, Inlined, Local, LocalId, MirBody, MirLowerError, MirOwner, MirPhase,
-        MirSpan, Operand, OperandKind, Place, Projection, ProjectionElem, Rvalue, Statement,
-        StatementKind, Terminator, TerminatorKind,
+        AggregateKind, BasicBlock, Inlined, Local, LocalId, MirBody, MirLowerError, MirOwner,
+        MirPhase, MirSpan, Operand, OperandKind, Place, Projection, ProjectionElem, Rvalue,
+        Statement, StatementKind, Terminator, TerminatorKind,
     },
     next_solver::{DbInterner, Ty, default_types, goal_store::solver_version},
 };
@@ -228,7 +230,7 @@ fn mir_of<'db>(db: &'db Db, owner: MirOwner<'db>) -> MirBody<'db> {
         start_block: start,
         owner: InferBodyId::DefWithBodyId(def),
         binding_locals,
-        upvar_locals: FxHashMap::default(),
+        upvar_locals: HashMap::default(),
         param_locals: vec![n],
         promoted_locals: Vec::new(),
         closures: if closure { Vec::new() } else { vec![closure_of(db, def)] },
@@ -510,7 +512,7 @@ fn located_mir<'db>(db: &'db Db, def: DefWithBodyId, fixture: &str) -> MirBody<'
         start_block: start,
         owner: InferBodyId::DefWithBodyId(def),
         binding_locals,
-        upvar_locals: FxHashMap::default(),
+        upvar_locals: HashMap::default(),
         param_locals: Vec::new(),
         promoted_locals: Vec::new(),
         closures: Vec::new(),

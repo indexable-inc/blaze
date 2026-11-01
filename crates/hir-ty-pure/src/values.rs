@@ -17,14 +17,15 @@
 //!   environment read.
 
 use base_db::Db;
+use blaze_hash::HashMap;
 use hir_ty::{
     MemoryMap, PointerCast,
     db::HirDatabase,
     drop::is_freeze,
     method_resolution::lookup_impl_const,
     next_solver::{
-        AliasConst, AliasConstKind, Allocation, AllocationData, Const, ConstKind,
-        FreeConstAliasId, InherentAssocConstId, TraitAssocConstId, Ty, TyKind, infer::InferCtxt,
+        AliasConst, AliasConstKind, Allocation, AllocationData, Const, ConstKind, FreeConstAliasId,
+        InherentAssocConstId, TraitAssocConstId, Ty, TyKind, infer::InferCtxt,
     },
     traits::ParamEnvAndCrate,
 };
@@ -33,7 +34,6 @@ use hir_ty_mir::mir::{
     StatementKind, StoredPlace, TerminatorKind, return_slot,
 };
 use intern::Symbol;
-use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::IntoKind;
 use smallvec::SmallVec;
 
@@ -110,7 +110,7 @@ pub(crate) struct Values<'a, 'db> {
     body: &'a MirBody<'db>,
     abs: Box<[Abs]>,
     /// Each constant operand read so far, by its address in `body`.
-    texts: FxHashMap<usize, Abs>,
+    texts: HashMap<usize, Abs>,
 }
 
 fn index(local: LocalId) -> usize {
@@ -209,7 +209,7 @@ impl<'a, 'db> Values<'a, 'db> {
             infcx,
             body,
             abs: vec![Abs::Unset; locals].into_boxed_slice(), // alloc: one slot per local, once per body
-            texts: FxHashMap::default(),
+            texts: HashMap::default(),
         };
         let (roots, escaped) = values.borrows(flows);
         for (i, &param) in body.param_locals.iter().enumerate() {

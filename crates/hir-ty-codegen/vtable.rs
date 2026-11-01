@@ -3,8 +3,8 @@
 
 #![forbid(unsafe_code)]
 
+use blaze_hash::HashSet;
 use hir_def::{AssocItemId, FunctionId, TraitId};
-use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     Binder, Interner, RegionKind, TypeFoldable, TypeFolder, TypeSuperFoldable,
     inherent::{Clause as _, IntoKind as _},
@@ -42,7 +42,7 @@ impl<'db> VtableLayout<'db> {
         let mut walk = Walk {
             interner,
             plain,
-            visited: FxHashSet::from_iter([trait_ref]),
+            visited: HashSet::from_iter([trait_ref]),
             // alloc: the layout's own lists, returned in it
             slots: Vec::new(),
             // alloc: the layout's own lists, returned in it
@@ -86,7 +86,7 @@ pub(super) enum Upcast {
 struct Walk<'a, 'db, P> {
     interner: DbInterner<'db>,
     plain: &'a P,
-    visited: FxHashSet<TraitRef<'db>>,
+    visited: HashSet<TraitRef<'db>>,
     slots: Vec<Slot<'db>>,
     prefixes: Vec<TraitRef<'db>>,
     /// Set once a trait with methods has been laid out: every later supertrait is no longer

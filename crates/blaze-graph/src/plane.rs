@@ -61,15 +61,16 @@
 use std::{
     borrow::Cow,
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap, hash_map::Entry},
+    collections::{BinaryHeap, hash_map::Entry},
     fmt,
-    hash::{BuildHasherDefault, Hash, Hasher},
+    hash::{Hash, Hasher},
 };
 
+use blaze_hash::{ByHash, HashMap};
 use blaze_mem::{Handle, RegionVec, Slab, Tag as MemTag};
 use blaze_protocol::events::{Event, Level, NodeKind, NodeState, Record};
 use blaze_radix as radix;
-use rustc_hash::FxHashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::machine::{Error, NodeId, Outcome, Pool, Spec};
@@ -914,28 +915,8 @@ impl Batch {
     }
 }
 
-/// Keys of tasks, by the key's own bits.
-type ByKey<V> = HashMap<Key, V, BuildHasherDefault<KeyHasher>>;
-
-/// The hash of a [`Key`] is the `u64` it hashes as: a content hash is hashed again by nothing.
-#[derive(Default)]
-struct KeyHasher(u64);
-
-impl Hasher for KeyHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write_u64(&mut self, word: u64) {
-        self.0 = word;
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.0 = (self.0.rotate_left(5) ^ u64::from(byte)).wrapping_mul(0x517c_c1b7_2722_0a95);
-        }
-    }
-}
+/// Keys of tasks, by the key's own bits: a [`Key`] hashes as its first word.
+type ByKey<V> = ByHash<Key, V>;
 
 /// A node of an open request that has not settled ([`Plane::unsettled`]).
 #[derive(Clone, Copy, Debug)]
@@ -957,7 +938,7 @@ pub struct Plane<M = NoMemo> {
     keys: RegionVec<Key>,
     node_slots: Slots<NodeSlot>,
     /// Each node by its id: its slot, or while a batch is checked its [`place`].
-    index: FxHashMap<NodeId, NodeHandle>,
+    index: HashMap<NodeId, NodeHandle>,
     /// The task columns, by slot, and which slots are live.
     tasks: RegionVec<TaskRow>,
     task_keys: RegionVec<Key>,
@@ -965,7 +946,7 @@ pub struct Plane<M = NoMemo> {
     /// Each request's room, by slot, and which slots are live.
     requests: RegionVec<Request>,
     request_slots: Slots<RequestSlot>,
-    request_index: FxHashMap<RequestId, RequestHandle>,
+    request_index: HashMap<RequestId, RequestHandle>,
     next_seq: u64,
     /// The database's memo, asked once a keyed node is ready and its key is not in flight.
     memo: M,
@@ -1045,13 +1026,13 @@ impl<M: Memo> Plane<M> {
             states: column(MAX_NODES),
             keys: column(MAX_NODES),
             node_slots: Slots::new(MAX_NODES),
-            index: FxHashMap::default(),
+            index: HashMap::default(),
             tasks: column(MAX_TASKS),
             task_keys: column(MAX_TASKS),
             task_slots: Slots::new(MAX_TASKS),
             requests: column(MAX_REQUESTS),
             request_slots: Slots::new(MAX_REQUESTS),
-            request_index: FxHashMap::default(),
+            request_index: HashMap::default(),
             next_seq: 0,
             memo,
             flight: ByKey::default(),
@@ -2583,7 +2564,7 @@ fn new_task(
 }
 
 /// Takes the ids of the first `len` nodes of a batch refused back out of the index.
-fn unindex(index: &mut FxHashMap<NodeId, NodeHandle>, nodes: &(impl Given + ?Sized), len: usize) {
+fn unindex(index: &mut HashMap<NodeId, NodeHandle>, nodes: &(impl Given + ?Sized), len: usize) {
     for at in 0..len {
         index.remove(&nodes.id(at));
     }

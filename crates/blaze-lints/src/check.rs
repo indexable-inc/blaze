@@ -14,6 +14,7 @@ use std::{
 
 use base_db::{Db, EditionedFileId};
 use blaze_diagnostics::model;
+use blaze_hash::{HashMap, HashSet};
 use cfg::{CfgAtom, CfgDiff, CfgExpr, CfgOptions};
 use hir::{HasAttrs as _, HirFileId, InFile};
 use hir_def::{
@@ -23,12 +24,12 @@ use hir_def::{
     nameres::crate_def_map,
 };
 use hir_expand::{AstId, MacroCallId, MacroCallKind, MacroDefKind};
-use rustc_hash::{FxHashMap, FxHashSet};
 use span::{AstIdMap, Edition};
 use syntax::{
-    AstPtr, FlatTree, NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
-    WalkEvent,
-    view::{self as ast, AstNode as _, AstToken as _, HasAttrs as _, HasName as _, HasVisibility as _},
+    AstPtr, FlatTree, NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange, TextSize, WalkEvent,
+    view::{
+        self as ast, AstNode as _, AstToken as _, HasAttrs as _, HasName as _, HasVisibility as _,
+    },
 };
 
 use crate::{
@@ -39,8 +40,8 @@ use crate::{
     level::{CommandLine, Levels, Lint, Set, Source, Spec, Target},
     lints::{self, Implemented, On},
     query::{
-        self, BodyAt, Expect, FileNames, Finding, Found as FoundLint, LintSet, Lints, ModuleFile, Named,
-        Place, Plan,
+        self, BodyAt, Expect, FileNames, Finding, Found as FoundLint, LintSet, Lints, ModuleFile,
+        Named, Place, Plan,
     },
 };
 
@@ -126,8 +127,8 @@ struct Driver<'q> {
     name_of: NameOf<'q>,
     command_line: On,
     files: Vec<File<'q>>,
-    by_id: FxHashMap<EditionedFileId, usize>,
-    sets: FxHashMap<On, LintSet>,
+    by_id: HashMap<EditionedFileId, usize>,
+    sets: HashMap<On, LintSet>,
     pending: Vec<Pending>,
     expectations: Vec<Expectation>,
 }
@@ -157,8 +158,8 @@ impl<'q> Driver<'q> {
             name_of,
             command_line,
             files: Vec::new(),
-            by_id: FxHashMap::default(),
-            sets: FxHashMap::default(),
+            by_id: HashMap::default(),
+            sets: HashMap::default(),
             pending: Vec::new(),
             expectations: Vec::new(),
         }
@@ -351,8 +352,8 @@ impl<'q> Driver<'q> {
         let mut pending = std::mem::take(&mut self.pending);
         pending.sort_by(|a, b| a.order.cmp(&b.order));
         let mut found = Vec::new();
-        let mut fulfilled: FxHashSet<Span> = FxHashSet::default();
-        let mut sets_of: FxHashMap<(usize, TextRange), (Vec<Set>, bool)> = FxHashMap::default();
+        let mut fulfilled: HashSet<Span> = HashSet::default();
+        let mut sets_of: HashMap<(usize, TextRange), (Vec<Set>, bool)> = HashMap::default();
         for Pending { lint, file, at, mut diagnostic, .. } in pending {
             let (sets, test_only) =
                 sets_of.entry((file, at)).or_insert_with(|| self.sets_at(file, at)).clone();
@@ -431,7 +432,7 @@ pub(crate) fn names_of(db: &Db, file: EditionedFileId) -> FileNames {
 pub(crate) fn plan_of(db: &Db, krate: base_db::Crate) -> Plan {
     // alloc: the query's value and its worklist, once per crate and edit
     let mut files: Vec<ModuleFile> = Vec::new();
-    let mut seen: FxHashSet<EditionedFileId> = FxHashSet::default();
+    let mut seen: HashSet<EditionedFileId> = HashSet::default();
     for module in hir::Crate::from(krate).modules(db) {
         let Some(file) = module.definition_source_file_id(db).file_id() else { continue };
         if !seen.insert(file) {
@@ -666,12 +667,12 @@ struct Walking {
 /// What the items a query walks are, by where they are written.
 #[derive(Default)]
 struct Items {
-    defs: FxHashMap<Key, ModuleDefId>,
-    impls: FxHashMap<Key, ImplId>,
+    defs: HashMap<Key, ModuleDefId>,
+    impls: HashMap<Key, ImplId>,
     /// The macro calls of items and statements, and the items an attribute macro is on.
-    calls: FxHashMap<Key, MacroCallId>,
+    calls: HashMap<Key, MacroCallId>,
     /// The calls of each `#[derive]` of an ADT, in the order of the attributes.
-    derives: FxHashMap<Key, Vec<Box<[Option<MacroCallId>]>>>,
+    derives: HashMap<Key, Vec<Box<[Option<MacroCallId>]>>>,
 }
 
 type Key = (HirFileId, SyntaxNodePtr);
@@ -693,6 +694,8 @@ pub(crate) struct Cx<'q: 't, 't> {
     items: OnceCell<Items>,
     /// The crate's [`query::famous_defs`], read once per query.
     famous_defs: OnceCell<&'q [Option<hir::ModuleDef>]>,
+    /// The crate's [`lints::disallowed::disallowed_defs`], read once per query.
+    disallowed: OnceCell<&'q lints::disallowed::Resolved>,
     /// The expansions read, with the call of each.
     trees: RefCell<Vec<(&'q FlatTree, MacroCallId)>>,
     walking: Walking,
@@ -724,6 +727,7 @@ impl<'q: 't, 't> Cx<'q, 't> {
             sema: OnceCell::new(),
             items: OnceCell::new(),
             famous_defs: OnceCell::new(),
+            disallowed: OnceCell::new(),
             trees: RefCell::new(Vec::new()),
             walking: Walking::default(),
             found: Vec::new(),
@@ -808,6 +812,11 @@ impl<'q: 't, 't> Cx<'q, 't> {
     /// Whether the walk is in the file's own tree, not in an expansion of a macro.
     pub(crate) fn in_file(&self) -> bool {
         self.walking.expansion.is_none() && self.walking.input.is_none()
+    }
+
+    /// The outermost macro call of the file the walk is in the expansion of, as written there.
+    pub(crate) fn call_at(&self) -> Option<TextRange> {
+        self.walking.call_at
     }
 
     /// Whether the walk is in the arguments of a function-like macro call, as `vec!` is in
@@ -1009,6 +1018,15 @@ impl<'q: 't, 't> Cx<'q, 't> {
 
     /// The item at `path` in the crate `path[0]` (`core`, `alloc`, `std`): one perfect hash of
     /// the path into what the crate resolved of [`famous::KNOWN`].
+    /// The `disallowed-*` entries of the crate's configuration, resolved.
+    pub(crate) fn disallowed(&self) -> &'q lints::disallowed::Resolved {
+        self.disallowed.get_or_init(|| {
+            // clone: the configuration, once per query that reads the entries
+            let key = lints::disallowed::ConfKey::new(self.db, self.conf.clone());
+            lints::disallowed::disallowed_defs(self.db, self.krate, key)
+        })
+    }
+
     pub(crate) fn std_def(&self, path: &[&str]) -> Option<hir::ModuleDef> {
         let krate = path.first()?;
         if !matches!(*krate, "core" | "alloc" | "std") {

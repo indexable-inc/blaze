@@ -8,6 +8,7 @@ pub mod view;
 use std::{cell::RefCell, mem, ops};
 
 use base_db::{Db, all_crates};
+use blaze_hash::{HashMap, HashSet};
 use either::Either;
 use hir_def::{
     DefWithBodyId, ExpressionStoreOwnerId, GenericDefId, TraitId, VariantId,
@@ -22,7 +23,6 @@ use hir_ty::{
     next_solver::AnyImplId,
 };
 use hir_ty_unsafeck::unsafe_operations;
-use rustc_hash::{FxHashMap, FxHashSet};
 use span::FileId;
 
 use crate::{
@@ -125,8 +125,8 @@ impl<'db> TypeInfo<'db> {
 }
 
 type DefWithoutBodyWithAnonConsts = Either<GenericDefId, VariantId>;
-type ExprToAnonConst<'db> = FxHashMap<ExprId, AnonConstId<'db>>;
-type DefAnonConstsMap<'db> = FxHashMap<DefWithoutBodyWithAnonConsts, ExprToAnonConst<'db>>;
+type ExprToAnonConst<'db> = HashMap<ExprId, AnonConstId<'db>>;
+type DefAnonConstsMap<'db> = HashMap<DefWithoutBodyWithAnonConsts, ExprToAnonConst<'db>>;
 
 pub struct SemanticsImpl<'db> {
     pub db: &'db Db,
@@ -187,10 +187,10 @@ impl<'db> SemanticsImpl<'db> {
         }
     }
 
-    pub fn get_unsafe_ops(&self, def: ExpressionStoreOwner) -> FxHashSet<ExprOrPatSource> {
+    pub fn get_unsafe_ops(&self, def: ExpressionStoreOwner) -> HashSet<ExprOrPatSource> {
         let Ok(def) = ExpressionStoreOwnerId::try_from(def) else { return Default::default() };
         let (body, source_map) = ExpressionStore::with_source_map(self.db, def);
-        let mut res = FxHashSet::default();
+        let mut res = HashSet::default();
         self.with_all_infers_for_store(def, &mut |infer| {
             for root in body.expr_roots() {
                 unsafe_operations(self.db, infer, def, body, root, &mut |node, _| {
@@ -212,12 +212,6 @@ impl<'db> SemanticsImpl<'db> {
         // alloc: copy out of the cache borrow, inline for the common single module
         self.with_ctx(|ctx| ctx.file_to_def(file).to_owned()).into_iter().map(Module::from)
     }
-
-    fn hir_file_to_module_defs(&self, file: HirFileId) -> impl Iterator<Item = Module> {
-        // FIXME: Do we need to care about inline modules for macro expansions?
-        self.file_to_module_defs(file.original_file_respecting_includes(self.db).file_id(self.db))
-    }
-
     fn populate_anon_const_cache_for<'a>(
         &self,
         cache: &'a mut DefAnonConstsMap<'db>,
@@ -454,10 +448,10 @@ impl<'db> SemanticsScope<'db> {
 }
 
 #[derive(Debug)]
-pub struct VisibleTraits(pub FxHashSet<TraitId>);
+pub struct VisibleTraits(pub HashSet<TraitId>);
 
 impl ops::Deref for VisibleTraits {
-    type Target = FxHashSet<TraitId>;
+    type Target = HashSet<TraitId>;
 
     fn deref(&self) -> &Self::Target {
         &self.0

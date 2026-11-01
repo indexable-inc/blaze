@@ -48,6 +48,7 @@ use std::{
     alloc::{AllocError, Allocator, Layout},
     cell::Cell,
     mem::{self, ManuallyDrop, MaybeUninit},
+    panic::Location,
     ptr::{self, NonNull},
     slice, str,
     sync::atomic::{AtomicU32, Ordering},
@@ -166,6 +167,24 @@ pub struct Frame {
     lent: Cell<bool>,
     /// The bytes an outer task's frame lent this one, `start..end`; empty when none.
     window: (usize, usize),
+    /// [`sealed`] of `id` while the frame is alive, [`UNSEALED`] once dropped: what [`task`]
+    /// checks of the frame a thread says encloses it before using it.
+    seal: Cell<u64>,
+    /// Where the frame was made: for a task's, the call of [`task`]. Named when a later task
+    /// finds this frame dropped where its thread says its enclosing task's is.
+    opened_at: &'static Location<'static>,
+    /// The thread whose task stack the task's end put back (its [`STACK`]'s address), 0 until it
+    /// ends: whether a dropped frame a thread still names was ended on that thread or another.
+    ended_on: Cell<usize>,
+}
+
+/// The high half of a live frame's seal, its id the low half.
+const SEAL: u64 = 0x5ea1_f4a3 << 32;
+/// A dropped frame's seal.
+const UNSEALED: u64 = 0xdead_f4a3_dead_f4a3;
+
+fn sealed(id: u32) -> u64 {
+    SEAL | u64::from(id)
 }
 
 // SAFETY: a frame owns its blocks, and every value in them is borrowed from it. A frame handed
@@ -184,15 +203,18 @@ pub struct Marker {
 
 impl Frame {
     /// A frame for tasks of `tag`, of at most [`FRAME_RESERVE`]: no memory until it is used.
+    #[track_caller]
     pub fn new(tag: Tag) -> Result<Frame, MemError> {
         Frame::with_reserve(FRAME_RESERVE, tag)
     }
 
     /// A frame of at most `bytes`, which takes blocks as it is used.
+    #[track_caller]
     pub fn with_reserve(bytes: usize, tag: Tag) -> Result<Frame, MemError> {
         Ok(Frame::empty(bytes, tag, IDS.fetch_add(1, Ordering::Relaxed), false))
     }
 
+    #[track_caller]
     fn empty(limit: usize, tag: Tag, id: u32, task: bool) -> Frame {
         Frame {
             cursor: Cell::new(ptr::without_provenance_mut(EMPTY)),
@@ -211,12 +233,16 @@ impl Frame {
             task,
             lent: Cell::new(false),
             window: (0, 0),
+            seal: Cell::new(sealed(id)),
+            opened_at: Location::caller(),
+            ended_on: Cell::new(0),
         }
     }
 
     /// A task's frame that starts in the rest of the current chunk of `outer`, the enclosing
     /// task's, when enough is left; else empty. `outer` stops short of the rest until
     /// [`Frame::take_back`].
+    #[track_caller]
     fn inner(outer: &Frame, tag: Tag, id: u32) -> (Frame, Option<usize>) {
         let mut frame = Frame::empty(FRAME_RESERVE, tag, id, true);
         let current = outer.current.get();
@@ -585,7 +611,7 @@ impl Frame {
     pub fn alloc_layout(&self, layout: Layout) -> NonNull<u8> {
         match self.try_alloc_layout(layout) {
             Ok(ptr) => ptr,
-            Err(error) => fail(error),
+            Err(error) => fail(&error),
         }
     }
 
@@ -664,7 +690,7 @@ impl Frame {
     pub fn alloc_uninit_slice<T>(&self, len: usize) -> &mut [MaybeUninit<T>] {
         let layout = match Layout::array::<T>(len) {
             Ok(layout) => layout,
-            Err(_) => fail(MemError::TooLarge { tag: self.tag(), what: "a frame slice", wanted: len }),
+            Err(_) => fail(&MemError::TooLarge { tag: self.tag(), what: "a frame slice", wanted: len }),
         };
         let ptr = self.alloc_layout(layout).cast::<MaybeUninit<T>>();
         // SAFETY: fresh memory of this frame for `len` elements, aligned, handed out once and
@@ -890,6 +916,10 @@ impl Drop for Frame {
             self.release(block, false);
             block = next;
         }
+        // SAFETY: `seal` is this frame's own field, alive until `drop` returns. Volatile, as a
+        // store to an object about to die is otherwise one the compiler may drop, and a stale
+        // pointer to this frame must find it unsealed.
+        unsafe { self.seal.as_ptr().write_volatile(UNSEALED) };
     }
 }
 
@@ -1209,6 +1239,90 @@ unsafe fn innermost<'a>() -> Option<&'a Frame> {
     unsafe { frame.as_ref() }
 }
 
+/// Panics, naming the frame, its owner and task `starting`, when `outer`, the frame the thread
+/// says encloses `starting`, is not a live task's frame: one dropped, or memory that never was a
+/// frame. That is a thread-local carried wrong across a job's switch (a job resumed or started
+/// on a thread whose current frame is another job's), which used as is corrupts both.
+#[cold]
+#[inline(never)]
+fn refuse_unmapped(outer: *const Frame, starting: u32) -> ! {
+    panic!(
+        "blaze-mem: task {starting} starts inside the frame at {outer:p}, which this thread's \
+         stack names as the enclosing task's, and no frame can be there: it is {}; a task frame \
+         was carried wrong across a job's switch, or a number was stored as a frame. Task \
+         {starting} starts at:\n{}",
+        if outer.addr() < LOWEST { "below the lowest address mapped" } else { "not aligned as a frame is" },
+        std::backtrace::Backtrace::force_capture()
+    )
+}
+
+/// No address below this is mapped: Linux's default `vm.mmap_min_addr`, and far below macOS's
+/// zero page.
+const LOWEST: usize = 1 << 16;
+
+#[cold]
+#[inline(never)]
+fn refuse_outer(outer: *const Frame, seal: u64, owner: u32, starting: u32) -> ! {
+    let why = if seal == UNSEALED { "dropped" } else { "not a frame, or overwritten" };
+    // A frame's drop writes only its seal, so a frame sealed as dropped still has its other
+    // bytes as they were; any other seal says the bytes are not a frame's, and nothing more is
+    // read of them.
+    let owned = if seal == UNSEALED {
+        let opened_at = outer.wrapping_byte_add(mem::offset_of!(Frame, opened_at)).cast::<&'static Location<'static>>();
+        let ended_on = outer.wrapping_byte_add(mem::offset_of!(Frame, ended_on)).cast::<usize>();
+        // SAFETY: the `opened_at` field of the dropped frame's bytes, as they were when it was
+        // alive: a `&'static Location`, which a drop leaves as it was.
+        let opened_at = unsafe { opened_at.read_volatile() };
+        // SAFETY: the `ended_on` field of the same bytes; a `Cell<usize>` is a `usize`.
+        let ended_on = unsafe { ended_on.read_volatile() };
+        let here = STACK.try_with(|stack| ptr::from_ref(stack).addr()).unwrap_or(0);
+        let ended = match ended_on {
+            0 => "ended by no task's end",
+            on if on == here => "ended on this thread",
+            _ => "ended on another thread",
+        };
+        // alloc: once, for the panic's message
+        format!(" Task {owner} was opened at {opened_at} and {ended}.")
+    } else {
+        String::new()
+    };
+    panic!(
+        "blaze-mem: task {starting} starts inside the frame at {outer:p}, which this thread's \
+         stack names as the enclosing task's, and it is {why}: its seal is {seal:#x}, where a \
+         live frame of its owner, task {owner}, has {:#x}; a task frame was carried wrong \
+         across a job's switch.{owned} Task {starting} starts at:\n{}",
+        sealed(owner),
+        std::backtrace::Backtrace::force_capture()
+    )
+}
+
+/// [`refuse_outer`] unless `outer` is null or a live frame.
+#[inline]
+fn check_outer(outer: *const Frame, starting: u32) {
+    if outer.is_null() {
+        return;
+    }
+    if outer.addr() < LOWEST || !outer.is_aligned() {
+        refuse_unmapped(outer, starting);
+    }
+    // Only the two fields are read, at their offsets, with no reference to the frame made.
+    // `outer` is aligned and points at a live frame, or, when a thread-local was carried wrong,
+    // at the stack memory a dropped one was in: a fiber's stack, which the scheduler keeps
+    // mapped for its next job, so the reads are of mapped bytes (were they not, the read faults
+    // and the daemon's signal line names it). Volatile, so each read is of the memory now and
+    // not a value the compiler assumed of a frame it believes alive.
+    let seal_at = outer.wrapping_byte_add(mem::offset_of!(Frame, seal)).cast::<u64>();
+    let id_at = outer.wrapping_byte_add(mem::offset_of!(Frame, id)).cast::<u32>();
+    // SAFETY: `seal_at` is the `seal` field of the frame-sized, aligned bytes at `outer`, as
+    // above; a `Cell<u64>` is a `u64`.
+    let seal = unsafe { seal_at.read_volatile() };
+    // SAFETY: `id_at` is the `id` field of the same bytes, as above.
+    let owner = unsafe { id_at.read_volatile() };
+    if seal != sealed(owner) {
+        refuse_outer(outer, seal, owner, starting);
+    }
+}
+
 /// Runs a task of `tag` with a frame of its own, empty, and frees it when `f` returns or
 /// unwinds. A task inside a task, at any depth, gets another frame, so the inner end frees only
 /// the inner task's memory. What `f` returns cannot borrow the frame.
@@ -1245,6 +1359,7 @@ pub fn task<R>(tag: Tag, f: impl FnOnce(&Frame) -> R) -> R {
             let held = self.below + self.frame.peak() + grew;
             // A thread being torn down has no stack left to put back.
             _ = STACK.try_with(|stack| {
+                self.frame.ended_on.set(ptr::from_ref(stack).addr());
                 stack.current.set(self.outer);
                 if self.outer.is_null() {
                     stack.cancelling.set(false);
@@ -1261,8 +1376,9 @@ pub fn task<R>(tag: Tag, f: impl FnOnce(&Frame) -> R) -> R {
     let (outer, outer_below, id) = STACK
         .try_with(|stack| (stack.current.get(), stack.below.get(), task_id(stack)))
         .unwrap_or_else(|_| (ptr::null(), 0, IDS.fetch_add(1, Ordering::Relaxed)));
+    check_outer(outer, id);
     // SAFETY: `outer` is the enclosing task's frame, alive while this call, made from inside
-    // its closure, runs; null outside any.
+    // its closure, runs; null outside any. `check_outer` refused one that is not.
     let outer_frame = unsafe { outer.as_ref() };
     let outer_used = outer_frame.map_or(0, Frame::used);
     let below = outer_below + outer_used;
@@ -1429,3 +1545,64 @@ pub fn collect<'f, T>(frame: &'f Frame, items: impl IntoIterator<Item = T>) -> V
 }
 
 const _: () = assert!(mem::size_of::<Marker>() == 16);
+
+#[cfg(test)]
+mod tests {
+    use std::{mem::MaybeUninit, panic};
+
+    use super::*;
+
+    /// What `task` panics with when this thread's stack names `stale` as the enclosing frame.
+    fn started_inside(stale: *const Frame) -> String {
+        let before = STACK.with(|stack| stack.current.replace(stale));
+        let got = panic::catch_unwind(|| task(Tag::Other, |_| ()));
+        STACK.with(|stack| stack.current.set(before));
+        let payload = got.expect_err("a task inside a frame that is not live panics");
+        payload.downcast_ref::<String>().cloned().expect("the panic's text is formatted")
+    }
+
+    #[test]
+    fn a_task_inside_a_dropped_frame_panics_naming_the_frame_its_owner_and_the_task() {
+        let mut slot = MaybeUninit::new(Frame::empty(FRAME_RESERVE, Tag::Other, 7, true));
+        let stale: *const Frame = slot.as_ptr();
+        // SAFETY: the frame was written just above and is dropped once; its bytes stay, as a
+        // fiber's stack's do after the task on it ends.
+        unsafe { slot.assume_init_drop() };
+        let text = started_inside(stale);
+        assert!(text.contains(&format!("inside the frame at {stale:p}")), "{text}");
+        assert!(text.contains("it is dropped: its seal is 0xdeadf4a3deadf4a3"), "{text}");
+        assert!(text.contains("its owner, task 7,"), "{text}");
+        assert!(text.contains("blaze-mem: task "), "{text}");
+        assert!(text.contains("Task 7 was opened at ") && text.contains("frame.rs:"), "{text}");
+        assert!(text.contains("and ended by no task's end."), "{text}");
+    }
+
+    #[test]
+    fn a_task_inside_memory_that_never_was_a_frame_panics_naming_it() {
+        let junk = [0u64; 64];
+        assert!(mem::size_of::<Frame>() <= mem::size_of_val(&junk));
+        let stale = junk.as_ptr().cast::<Frame>();
+        let text = started_inside(stale);
+        assert!(text.contains("it is not a frame, or overwritten: its seal is 0x0"), "{text}");
+    }
+
+    #[test]
+    fn a_task_inside_a_small_number_taken_for_a_frame_panics_before_reading_it() {
+        for at in [0x8usize, 0x40, LOWEST - 1] {
+            let text = started_inside(ptr::without_provenance(at));
+            assert!(text.contains("is below the lowest address mapped"), "{text}");
+        }
+        let junk = [0u64; 64];
+        let skewed = junk.as_ptr().cast::<u8>().wrapping_add(1).cast::<Frame>();
+        assert!(started_inside(skewed).contains("is not aligned as a frame is"));
+    }
+
+    #[test]
+    fn a_task_inside_a_live_task_starts_in_its_frame() {
+        let inner = task(Tag::Other, |outer| {
+            let at: *const Frame = outer;
+            task(Tag::Other, |_| STACK.with(|stack| stack.current.get()) != at)
+        });
+        assert!(inner, "the inner task's frame is current inside it");
+    }
+}

@@ -30,14 +30,14 @@ use std::{
     net::TcpListener,
     path::Path,
     sync::{
-        Arc, Mutex, MutexGuard, OnceLock, PoisonError,
+        Arc, OnceLock,
         atomic::{AtomicU32, AtomicUsize, Ordering},
-        mpsc,
     },
 };
 
 use blaze_protocol::events::{Event, Record};
 use kept::{KEPT, Kept};
+use parking_lot::{Mutex, MutexGuard};
 use world::{Answer, Applied, Program, World};
 
 /// The most bytes a page may have waiting to be sent: one that falls this far behind is hung
@@ -56,21 +56,25 @@ const FRAME: usize = 1 << 20;
 #[derive(Default)]
 pub struct Graphs {
     roots: Arc<Roots>,
-    thread: OnceLock<Result<mpsc::Sender<Asked>, String>>,
+    thread: OnceLock<Result<crossbeam_channel::Sender<Asked>, String>>,
 }
 
 enum Asked {
     Record { root: u32, build: u64, record: Record },
-    Start(mpsc::Sender<Result<(), String>>),
-    Follow(mpsc::Sender<Result<Following, String>>),
-    Rest { method: String, path: String, answer: mpsc::Sender<Result<Answer, String>> },
+    Start(crossbeam_channel::Sender<Result<(), String>>),
+    Follow(crossbeam_channel::Sender<Result<Following, String>>),
+    Rest {
+        method: String,
+        path: String,
+        answer: crossbeam_channel::Sender<Result<Answer, String>>,
+    },
     #[cfg(test)]
-    Kept(mpsc::Sender<Vec<(u64, kept::Kind)>>),
+    Kept(crossbeam_channel::Sender<Vec<(u64, kept::Kind)>>),
 }
 
 /// What a page is sent, in order, and how many bytes of it it has not taken yet.
 pub struct Following {
-    told: mpsc::Receiver<Arc<[u8]>>,
+    told: crossbeam_channel::Receiver<Arc<[u8]>>,
     waiting: Arc<AtomicUsize>,
 }
 
@@ -89,8 +93,8 @@ impl Following {
     pub fn next(&self, wait: std::time::Duration) -> Next {
         match self.told.recv_timeout(wait) {
             Ok(message) => self.took(message),
-            Err(mpsc::RecvTimeoutError::Timeout) => Next::Nothing,
-            Err(mpsc::RecvTimeoutError::Disconnected) => Next::Gone,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Next::Nothing,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Next::Gone,
         }
     }
 
@@ -120,14 +124,14 @@ impl Graphs {
     /// The messages a page is sent from now on: the snapshot of the workspace shown, its last
     /// build's records, and every one after as it comes.
     pub fn follow(&self) -> Result<Following, String> {
-        let (to, following) = mpsc::channel();
+        let (to, following) = crossbeam_channel::unbounded();
         self.ask(Asked::Follow(to))?;
         following.recv().map_err(|_| gone())?
     }
 
     /// What Flecs's REST answers `method` of `path`, over the world.
     pub fn rest(&self, method: &str, path: &str) -> Result<Answer, String> {
-        let (answer, answered) = mpsc::channel();
+        let (answer, answered) = crossbeam_channel::unbounded();
         // alloc: the edge, once per REST request
         self.ask(Asked::Rest { method: method.to_owned(), path: path.to_owned(), answer })?;
         answered.recv().map_err(|_| gone())?
@@ -135,7 +139,7 @@ impl Graphs {
 
     /// Makes the world, from what was kept until now.
     fn start(&self) -> Result<(), String> {
-        let (to, started) = mpsc::channel();
+        let (to, started) = crossbeam_channel::unbounded();
         self.ask(Asked::Start(to))?;
         started.recv().map_err(|_| gone())?
     }
@@ -143,7 +147,7 @@ impl Graphs {
     /// The build and kind of each record kept of the workspace whose build began first.
     #[cfg(test)]
     fn kept(&self) -> Vec<(u64, kept::Kind)> {
-        let (to, kept) = mpsc::channel();
+        let (to, kept) = crossbeam_channel::unbounded();
         self.ask(Asked::Kept(to)).unwrap();
         kept.recv().unwrap()
     }
@@ -152,7 +156,7 @@ impl Graphs {
         self.thread()?.send(asked).map_err(|_| gone())
     }
 
-    fn thread(&self) -> Result<&mpsc::Sender<Asked>, String> {
+    fn thread(&self) -> Result<&crossbeam_channel::Sender<Asked>, String> {
         let roots = &self.roots;
         // clone: an Arc's count, once, as the thread starts; the error's is an error path
         self.thread.get_or_init(|| spawn(roots.clone())).as_ref().map_err(Clone::clone)
@@ -245,8 +249,8 @@ impl Roots {
 }
 
 /// Starts the world's thread.
-fn spawn(roots: Arc<Roots>) -> Result<mpsc::Sender<Asked>, String> {
-    let (to, asked) = mpsc::channel();
+fn spawn(roots: Arc<Roots>) -> Result<crossbeam_channel::Sender<Asked>, String> {
+    let (to, asked) = crossbeam_channel::unbounded();
     std::thread::Builder::new()
         .name("blaze-web-world".into())
         .spawn(move || Thread { roots, kept: Kept::default(), world: None }.run(asked))
@@ -264,7 +268,7 @@ struct Thread {
 }
 
 impl Thread {
-    fn run(mut self, asked: mpsc::Receiver<Asked>) {
+    fn run(mut self, asked: crossbeam_channel::Receiver<Asked>) {
         while let Ok(first) = asked.recv() {
             self.answer(first);
             for next in asked.try_iter().take(BATCH - 1) {
@@ -343,7 +347,7 @@ struct State {
 }
 
 struct Follower {
-    to: mpsc::Sender<Arc<[u8]>>,
+    to: crossbeam_channel::Sender<Arc<[u8]>>,
     waiting: Arc<AtomicUsize>,
 }
 
@@ -427,7 +431,7 @@ impl State {
 
     fn follow(&mut self) -> Following {
         self.flush();
-        let (to, told) = mpsc::channel();
+        let (to, told) = crossbeam_channel::unbounded();
         let follower = Follower { to, waiting: Arc::default() };
         // clone: an Arc's count, once per page
         let waiting = follower.waiting.clone();
@@ -491,7 +495,7 @@ fn gzip(bytes: &[u8]) -> Option<Arc<[u8]>> {
 
 /// A lock whose holder panicked holds what it held whole: it is only ever taken to add a root.
 fn lock<T>(it: &Mutex<T>) -> MutexGuard<'_, T> {
-    it.lock().unwrap_or_else(PoisonError::into_inner)
+    it.lock()
 }
 
 /// The page's server, once started.

@@ -8,6 +8,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, anyhow, bail};
+use blaze_hash::HashMap;
 use cargo_platform::Platform;
 use cargo_util_schemas::core::{PackageIdSpec, PartialVersion};
 use cargo_util_schemas::manifest::{
@@ -15,7 +16,6 @@ use cargo_util_schemas::manifest::{
     StringOrBool, TomlDependency, TomlDetailedDependency, TomlInheritedDependency, TomlLints,
     TomlManifest, TomlPackage, TomlPackageBuild, TomlWorkspace, VecStringOrBool,
 };
-use rustc_hash::FxHashMap;
 use url::Url;
 
 use crate::config::Config;
@@ -23,8 +23,8 @@ use crate::config::path::ConfigRelativePath;
 use crate::dependency::{DepKind, Dependency, FeatureMap, build_summary_features};
 use crate::diagnostic::ManifestDiagnostic;
 use crate::edit_distance::closest_msg;
-use crate::files::Files;
 use crate::features::{Edition, Feature, Features, ResolveBehavior};
+use crate::files::Files;
 use crate::paths::normalize_path;
 use crate::profiles::validate_profiles;
 use crate::source::{self, CRATES_IO_INDEX, CRATES_IO_REGISTRY, GitReference, SourceId, into_url};
@@ -36,12 +36,12 @@ use crate::workspace::find_workspace_root;
 /// Every file is read through the configuration's [`Files`].
 pub struct Context<F: Files> {
     pub config: Config<F>,
-    pub(crate) ws_roots: RefCell<FxHashMap<PathBuf, WorkspaceRootConfig>>,
+    pub(crate) ws_roots: RefCell<HashMap<PathBuf, WorkspaceRootConfig>>,
 }
 
 impl<F: Files> Context<F> {
     pub fn new(config: Config<F>) -> Context<F> {
-        Context { config, ws_roots: RefCell::new(FxHashMap::default()) }
+        Context { config, ws_roots: RefCell::new(HashMap::default()) }
     }
 
     pub fn files(&self) -> &F {
@@ -325,7 +325,7 @@ pub struct Manifest {
     pub custom_metadata: Option<toml::Value>,
     pub publish: Option<Vec<String>>,
     pub replace: Vec<(PackageIdSpec, Dependency)>,
-    pub patch: FxHashMap<Url, Vec<Dependency>>,
+    pub patch: HashMap<Url, Vec<Dependency>>,
     pub workspace: WorkspaceConfig,
     pub unstable_features: Features,
     pub edition: Edition,
@@ -341,7 +341,7 @@ pub struct Manifest {
 #[derive(Debug)]
 pub struct VirtualManifest {
     pub replace: Vec<(PackageIdSpec, Dependency)>,
-    pub patch: FxHashMap<Url, Vec<Dependency>>,
+    pub patch: HashMap<Url, Vec<Dependency>>,
     pub workspace: WorkspaceConfig,
     pub unstable_features: Features,
     pub resolve_behavior: Option<ResolveBehavior>,
@@ -1298,7 +1298,7 @@ fn to_real_manifest<F: Files>(
     let patch = patch(&normalized_toml, &mut manifest_ctx)?;
 
     {
-        let mut names_sources = FxHashMap::default();
+        let mut names_sources = HashMap::default();
         for dep in &deps {
             let name = dep.name_in_toml();
             let prev = names_sources.insert(name, &dep.source_id);
@@ -1558,8 +1558,8 @@ fn replace<F: Files>(
 fn patch<F: Files>(
     me: &TomlManifest,
     manifest_ctx: &mut ManifestContext<'_, '_, F>,
-) -> anyhow::Result<FxHashMap<Url, Vec<Dependency>>> {
-    let mut patch = FxHashMap::default();
+) -> anyhow::Result<HashMap<Url, Vec<Dependency>>> {
+    let mut patch = HashMap::default();
     for (toml_url, deps) in me.patch.iter().flatten() {
         let url = match &toml_url[..] {
             CRATES_IO_REGISTRY => CRATES_IO_INDEX.parse().unwrap(),

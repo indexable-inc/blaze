@@ -1,0 +1,23 @@
+{
+  "id": "01511",
+  "from_lane": "coordinator",
+  "owner": "blaze-lazy",
+  "paths": [
+    "crates/blaze-lazy/src"
+  ],
+  "what": "blaze-lazy tests::abi::a_hook_that_answers_zero_traps_instead_of_jumping dies with signal 10 (SIGBUS) on macOS in the live tree (06:05 graph-clippy run). Log: /tmp/blaze-lanes/test-graph-clippy.log.",
+  "state": "open",
+  "created": "2026-11-01T14:09:25Z",
+  "updated": "2026-11-01T14:09:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T14:09:25Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

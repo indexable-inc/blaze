@@ -26,6 +26,7 @@ mod tests;
 
 use base_db::{Crate, Db};
 use blaze_codegen::{CodegenError, InstanceKey};
+use blaze_hash::HashSet;
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 use hir_def::{
@@ -36,7 +37,6 @@ use hir_def::{
 use hir_expand::name::Name;
 use hir_ty::db::HirDatabase;
 use intern::sym;
-use rustc_hash::FxHashSet;
 
 use super::{HirFrontend, HirInstance, HirStatic, Kind, frontend::root_in};
 use crate::{compile_time_only, home::Homes};
@@ -90,9 +90,9 @@ pub struct Roots {
 #[derive(Default)]
 struct Listed {
     roots: Vec<HirInstance>,
-    seen: FxHashSet<HirInstance>,
+    seen: HashSet<HirInstance>,
     statics: Vec<HirStatic>,
-    seen_statics: FxHashSet<HirStatic>,
+    seen_statics: HashSet<HirStatic>,
 }
 
 impl Listed {
@@ -258,9 +258,9 @@ fn entry_fn(db: &Db, krate: Crate) -> Result<Option<FunctionId>, &'static str> {
 fn library(db: &Db, homes: &mut Homes, krate: Crate, listed: &mut Listed) {
     let def_map = crate_def_map(db, krate);
     let local = |module: ModuleId| module.krate(db) == krate;
-    let mut adts = FxHashSet::default();
-    let mut traits = FxHashSet::default();
-    let mut seen = FxHashSet::default();
+    let mut adts = HashSet::default();
+    let mut traits = HashSet::default();
+    let mut seen = HashSet::default();
     // alloc: once a library, the modules it names
     let mut stack = vec![def_map.crate_root(db)];
     seen.insert(def_map.crate_root(db));

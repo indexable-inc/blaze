@@ -3,9 +3,9 @@
 //! Follows rustc's `compiler/rustc_hir_analysis/src/collect.rs` (`FieldUniquenessCheckContext`,
 //! `lower_variant`) and its `FieldAlreadyDeclared::NotNested` (MIT or Apache-2.0).
 
+use blaze_hash::HashMap;
 use blaze_items::{Fact, ItemId};
 use hir::{FieldSourceView, InFile, Name};
-use rustc_hash::FxHashMap;
 use syntax::{TextRange, view::AstNode as _};
 
 use crate::{
@@ -17,7 +17,7 @@ use crate::{
 pub(super) fn check(cx: &Cx<'_, '_>, adts: &[hir::Adt]) -> Vec<Found> {
     // alloc: empty, allocates only when a field is declared twice
     let mut found = Vec::new();
-    let mut seen = FxHashMap::default();
+    let mut seen = HashMap::default();
     for &adt in adts {
         match adt {
             hir::Adt::Struct(it) => check_variant(cx, adt, it.into(), &mut seen, &mut found),
@@ -38,7 +38,7 @@ fn check_variant(
     cx: &Cx<'_, '_>,
     adt: hir::Adt,
     variant: hir::Variant,
-    seen: &mut FxHashMap<Name, InFile<TextRange>>,
+    seen: &mut HashMap<Name, InFile<TextRange>>,
     found: &mut Vec<Found>,
 ) {
     seen.clear();

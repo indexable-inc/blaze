@@ -96,7 +96,7 @@ fn validate_node(node: Node<'_>, errors: &mut Vec<SyntaxError>) {
     }
 }
 
-fn rustc_unescape_error_to_string(err: EscapeError) -> (&'static str, bool) {
+fn rustc_unescape_error_to_string(err: &EscapeError) -> (&'static str, bool) {
     use EscapeError as EE;
 
     #[rustfmt::skip]
@@ -181,7 +181,7 @@ fn validate_literal(literal: ast::Literal<'_>, acc: &mut Vec<SyntaxError>) {
     // FIXME: lift this lambda refactor to `fn` (https://github.com/rust-lang/rust-analyzer/pull/2834#discussion_r366199205)
     let mut push_err = |prefix_len, off, err: EscapeError| {
         let off = token.text_range().start() + TextSize::try_from(off + prefix_len).unwrap();
-        let (message, is_err) = rustc_unescape_error_to_string(err);
+        let (message, is_err) = rustc_unescape_error_to_string(&err);
         // FIXME: Emit lexer warnings
         if is_err {
             acc.push(SyntaxError::new_at_offset(message, off));

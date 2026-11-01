@@ -9,6 +9,7 @@
 //! kept apart names no address, only the place of one in `.debug_addr`.
 
 use blaze_format::cursor::Reader;
+use blaze_hash::HashMap;
 use cranelift_codegen::gimli::{
     self, DW_AT_GNU_addr_base, DW_AT_GNU_dwo_id, DW_AT_GNU_dwo_name, DW_AT_GNU_ranges_base,
     DW_AT_comp_dir, DW_AT_low_pc, DW_AT_ranges, DW_AT_stmt_list, DW_CHILDREN_no,
@@ -22,7 +23,6 @@ use cranelift_object::object::{
     self, BinaryFormat, SectionFlags, SectionKind, elf,
     write::{Object, StandardSegment},
 };
-use rustc_hash::FxHashMap;
 
 use super::{Section, SectionWriter, Sidecar, Target};
 
@@ -109,9 +109,9 @@ pub(super) struct Split {
     /// Of the unit being added, as [`Split::locations`] finds them: the place among the
     /// relocations of its location lists of the one at each offset, the place in
     /// `.debug_addr` of each address they name, and where each list is now by where it was.
-    loc_relocs: FxHashMap<u64, usize>,
-    indices: FxHashMap<(u32, i64), u64>,
-    lists: FxHashMap<i64, usize>,
+    loc_relocs: HashMap<u64, usize>,
+    indices: HashMap<(u32, i64), u64>,
+    lists: HashMap<i64, usize>,
     files: Vec<Sidecar>,
 }
 
@@ -133,9 +133,9 @@ impl Split {
             ranges: SectionWriter::default(),
             addr: SectionWriter::default(),
             loc_apart: SectionWriter::default(),
-            loc_relocs: FxHashMap::default(),
-            indices: FxHashMap::default(),
-            lists: FxHashMap::default(),
+            loc_relocs: HashMap::default(),
+            indices: HashMap::default(),
+            lists: HashMap::default(),
             // alloc: once per object, one file pushed for each unit of up to 256 functions
             files: Vec::new(),
         }

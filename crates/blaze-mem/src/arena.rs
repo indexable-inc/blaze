@@ -329,7 +329,7 @@ impl<'a> ArenaLocal<'a> {
     pub fn alloc_layout(&self, layout: Layout) -> NonNull<u8> {
         match self.try_alloc_layout(layout) {
             Ok(ptr) => ptr,
-            Err(error) => fail(error),
+            Err(error) => fail(&error),
         }
     }
 
@@ -350,7 +350,7 @@ impl<'a> ArenaLocal<'a> {
     pub fn alloc_uninit_slice<T>(&self, len: usize) -> &'a mut [MaybeUninit<T>] {
         let layout = match Layout::array::<T>(len) {
             Ok(layout) => layout,
-            Err(_) => fail(MemError::TooLarge {
+            Err(_) => fail(&MemError::TooLarge {
                 tag: self.arena.tag,
                 what: "an arena slice",
                 wanted: len,

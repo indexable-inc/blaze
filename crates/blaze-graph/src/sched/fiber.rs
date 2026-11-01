@@ -35,7 +35,7 @@ use std::{
     panic::{self, AssertUnwindSafe},
     ptr,
     sync::{
-        Arc, LazyLock, Mutex, MutexGuard, Once, OnceLock,
+        Arc, LazyLock, Once, OnceLock,
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle, Thread},
@@ -46,6 +46,7 @@ use corosensei::{
     Coroutine, CoroutineResult, Yielder,
     stack::{DefaultStack, Stack},
 };
+use parking_lot::{Mutex, MutexGuard};
 
 use super::{CoreId, CounterId, Cores, Cycle, JobId, OWN, Spawn, Stats, Suspend, Wait, World, Yielded};
 use crate::Key;
@@ -204,6 +205,7 @@ struct State<W: Work> {
     live: u32,
     idle: Vec<Fiber<W::Job>>,
     /// Boxes for parked jobs' carried thread-locals, kept for the next job to park.
+    #[allow(clippy::vec_box, reason = "each box moves whole into a `Slot::Parked`, which holds it boxed to stay small")]
     spare_taken: Vec<Box<Taken>>,
     closing: bool,
     joiner: Option<Thread>,
@@ -274,17 +276,20 @@ static GLOBAL: LazyLock<Mutex<Global>> = LazyLock::new(|| {
     })
 });
 
-/// The process's scheduler, locked: always before a driver's own lock.
 #[cfg(test)]
 thread_local! {
     /// How many times this thread took the scheduler's lock.
     pub(crate) static GLOBAL_TAKEN: Cell<u64> = const { Cell::new(0) };
 }
 
+/// The process's scheduler, locked: always before a driver's own lock.
 pub(super) fn global() -> MutexGuard<'static, Global> {
     #[cfg(test)]
     GLOBAL_TAKEN.with(|it| it.set(it.get() + 1));
-    GLOBAL.lock().expect("the scheduler's lock: a call into the scheduler panicked")
+    match GLOBAL.try_lock() {
+        Some(held) => held,
+        None => crate::wait::wait(crate::wait::WaitOn::Lock("the scheduler"), None, || GLOBAL.lock()),
+    }
 }
 
 /// Does what the scheduler decided, for every member whose jobs it changed: a member of its
@@ -375,7 +380,7 @@ struct Shared<W: Work> {
 impl<W: Work> Shared<W> {
     fn lock(&self) -> Locked<'_, W> {
         let global = global();
-        let state = self.state.lock().expect("a driver's lock: a call into the scheduler panicked");
+        let state = self.state.lock();
         Locked { global, state, member: self.member }
     }
 
@@ -1243,11 +1248,10 @@ fn worker<W: Work>(shared: &Arc<Shared<W>>, me: u32) {
 
 /// Spins, then parks, until the core is woken, the stop is set or `deadline` passes.
 fn idle<W: Work>(shared: &Shared<W>, slot: &CoreSlot, deadline: Option<u64>) {
-    let mut spins = 0;
+    let (mut spins, mut spin) = (0, crate::spin::SpinWait::new());
     while !slot.woken.load(Ordering::Acquire) && !shared.stop.load(Ordering::Acquire) {
-        if spins < shared.config.spin {
+        if spins < shared.config.spin && spin.pause() {
             spins += 1;
-            std::hint::spin_loop();
             continue;
         }
         match deadline {

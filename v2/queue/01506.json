@@ -1,0 +1,23 @@
+{
+  "id": "01506",
+  "from_lane": "no-fallback-front-lints-suspend",
+  "owner": "may-suspend",
+  "paths": [
+    "crates/hir-ty-suspend/src/check.rs"
+  ],
+  "what": "hir_ty_suspend::on_fiber(db, krate) lists only FunctionIds (Def::Fn). blaze::blocking_on_pool (crates/blaze-lints/src/blaze/blocking_on_pool.rs) needs the closures that run on a fiber or pool thread too (e.g. the closure handed to the driver's spawn, its body is in the spawning function), so a blocking call written in `spawn(move || rx.recv())` is found. Ask: a fact listing the on-fiber closures (ClosureId or InferBodyId), or on_fiber returning the Def of each instance; blaze-lints will read it, not walk itself.",
+  "state": "open",
+  "created": "2026-11-01T13:49:56Z",
+  "updated": "2026-11-01T13:49:56Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T13:49:56Z",
+      "by": "no-fallback-front-lints-suspend",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

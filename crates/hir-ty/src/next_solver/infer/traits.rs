@@ -19,8 +19,7 @@ use tracing::debug;
 use crate::{
     Span,
     next_solver::{
-        Clause, DbInterner, Goal, ParamEnv, PolyTraitClause, Predicate, TraitClause,
-        TraitRef, Ty,
+        Clause, DbInterner, Goal, ParamEnv, PolyTraitClause, Predicate, TraitClause, TraitRef, Ty,
     },
 };
 
@@ -294,9 +293,7 @@ fn pred_known_to_hold_modulo_regions<'db>(
 
 #[cfg(test)]
 mod tests {
-    use std::hash::{BuildHasher, BuildHasherDefault};
-
-    use rustc_hash::FxHasher;
+    use std::hash::BuildHasher;
 
     use super::{Obligation, ObligationCause};
     use crate::next_solver::ParamEnv;
@@ -312,7 +309,7 @@ mod tests {
 
     #[test]
     fn eq_and_hash_ignore_cause_and_depth() {
-        let hasher = BuildHasherDefault::<FxHasher>::default();
+        let hasher = blaze_hash::FixedState;
         let (a, b) = (obligation(7, 0), obligation(7, 5));
         assert_eq!(a, b);
         assert_eq!(hasher.hash_one(a), hasher.hash_one(b));
@@ -332,7 +329,7 @@ mod tests {
     /// goal; none of that may touch the heap.
     #[test]
     fn obligation_hot_path_allocates_nothing() {
-        let hasher = BuildHasherDefault::<FxHasher>::default();
+        let hasher = blaze_hash::FixedState;
         // `ParamEnv::empty` initializes the default interned values once.
         let parent = obligation(1, 4);
         let mut sum = 0u64;

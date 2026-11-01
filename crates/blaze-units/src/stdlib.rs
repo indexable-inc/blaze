@@ -16,12 +16,14 @@ pub mod target;
 #[cfg(test)]
 mod tests;
 
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_query::{Cancelled, Cx, Database, Query, QueryKind};
-use rustc_hash::FxHashMap;
 
 use crate::load::{Foreign, ForeignAsk, ForeignProfile, key_id};
-use crate::query::{CborBytes, LoadError, Mount, Origin, StdGraph, StdKey, StdPlanned, StdUnits, kinds, producer};
+use crate::query::{
+    CborBytes, LoadError, Mount, Origin, StdGraph, StdKey, StdPlanned, StdUnits, kinds, producer,
+};
 use crate::schema::Mode;
 
 /// Where the library is named for a release of rustc at `commit`: rustc's own std has these
@@ -192,7 +194,7 @@ fn checked(ask: &ForeignAsk, graph: &StdGraph) -> Result<(), String> {
     if graph.plans.len() != graph.units.len() {
         return Err(format!("the load planned {} of the standard library's {} units", graph.plans.len(), graph.units.len()));
     }
-    let mut names: FxHashMap<&str, &str> = FxHashMap::with_capacity_and_hasher(graph.packages.len(), Default::default());
+    let mut names: HashMap<&str, &str> = HashMap::with_capacity_and_hasher(graph.packages.len(), Default::default());
     names.extend(graph.packages.iter().map(|it| (it.id.as_str(), it.name.as_str())));
     let name_of = |pkg_id: &str| names.get(pkg_id).copied();
     for unit in &graph.units {

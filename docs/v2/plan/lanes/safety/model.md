@@ -76,6 +76,9 @@ The `std` API, path for path, so the switch is a `use`:
   time out at once (a branch); untimed waits get no spurious wakeup (as loom). `OnceLock`
   keeps its value in `std`'s cell: a `static` cell an earlier execution set stays set, as one
   set before the model (its initializer must do no operation the model sees).
+- `sync::lot::{Mutex, RwLock, Condvar}` (2026-11-01): the same locks with `parking_lot`'s API,
+  for a switch whose normal side is `parking_lot`: no poisoning, `try_lock` an `Option`, and a
+  wait (`wait`, `wait_for`, `wait_until`, `wait_while`, `wait_while_for`) on `&mut` the guard.
 - `thread::{spawn, Builder, JoinHandle, Thread, ThreadId, current, yield_now, sleep (a yield),
   park, park_timeout (may return at once: a branch), available_parallelism (2 in a model),
   panicking, Result, LocalKey, AccessError}`; `hint::spin_loop` (a yield);

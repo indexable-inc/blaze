@@ -40,6 +40,7 @@ pub use plain::Plain;
 use std::fmt::{self, Write as _};
 use std::hash::BuildHasher;
 
+use blaze_hash::{FixedState, HashMap};
 use blaze_ids::radix;
 use blaze_protocol::events::{
     Cache, Cause, CrateState, Event, Fns, Level, NodeBatch, NodeKind, NodeState, Order, Record,
@@ -47,7 +48,6 @@ use blaze_protocol::events::{
 };
 use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
-use rustc_hash::{FxBuildHasher, FxHashMap};
 
 /// The longest a plain rendering says nothing while a step is under way.
 pub const HEARTBEAT_NS: u64 = 15_000_000_000;
@@ -107,11 +107,11 @@ pub struct Build {
 /// (tests: `indexes_agree`).
 #[derive(Default, Debug)]
 struct Index {
-    /// The row of [`Build::crates`] of each name, by its FxHash: 4 bytes a crate, one hash
+    /// The row of [`Build::crates`] of each name, by its hash: 4 bytes a crate, one hash
     /// and one compare of names a lookup, the name kept once, in its row.
     rows: HashTable<u32>,
     /// The index in [`Build::graph`] of the node said last with each id.
-    nodes: FxHashMap<u32, u32>,
+    nodes: HashMap<u32, u32>,
     /// The steps under way, by index in [`Build::steps`], in the order they began.
     open: Vec<u32>,
     /// Each kind of step begun, in the order it first began ([`Build::strip_into`]).
@@ -197,11 +197,11 @@ fn unknown(fns: Fns) -> bool {
 impl Index {
     /// The row named `name`, a new one waiting from `at` if none is.
     fn row(&mut self, crates: &mut Vec<Crated>, name: &str, at: u64) -> usize {
-        let hash = FxBuildHasher.hash_one(name);
+        let hash = FixedState.hash_one(name);
         let entry = self.rows.entry(
             hash,
             |&row| crates[row as usize].name == name,
-            |&row| FxBuildHasher.hash_one(crates[row as usize].name.as_str()),
+            |&row| FixedState.hash_one(crates[row as usize].name.as_str()),
         );
         match entry {
             Entry::Occupied(it) => *it.get() as usize,

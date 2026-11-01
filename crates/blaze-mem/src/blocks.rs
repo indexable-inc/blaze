@@ -244,7 +244,7 @@ impl<T> Slice<T> {
             // SAFETY: the block holds `len` values of `T` aligned (taken with `T`'s size times
             // `len` and its alignment), `at < len`, and the place is not yet a value: `len`
             // counts the values made so far, so a panic in `make` drops those alone.
-            unsafe { first.add(at).write(value) };
+            unsafe { first.as_ptr().wrapping_add(at).write(value) };
             slice.len = at + 1;
         }
         Ok(slice)

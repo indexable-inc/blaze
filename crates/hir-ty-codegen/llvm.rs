@@ -33,6 +33,7 @@
 
 use std::{cell::RefCell, collections::hash_map::Entry, fmt, sync::Once};
 
+use blaze_hash::{HashMap, HashSet};
 use cranelift_codegen::ir::{self, Opcode, Type};
 use inkwell::{
     AddressSpace, GlobalVisibility, OptimizationLevel,
@@ -42,8 +43,8 @@ use inkwell::{
     llvm_sys::{
         support::LLVMParseCommandLineOptions,
         transforms::pass_builder::{
-            LLVMBlazeCreatePasses, LLVMBlazeDisposePasses, LLVMBlazeHasFeature, LLVMBlazeOpaquePasses,
-            LLVMBlazeRunPasses,
+            LLVMBlazeCreatePasses, LLVMBlazeDisposePasses, LLVMBlazeHasFeature,
+            LLVMBlazeOpaquePasses, LLVMBlazeRunPasses,
         },
     },
     memory_buffer::MemoryBuffer,
@@ -54,7 +55,6 @@ use inkwell::{
     types::{AnyType, BasicTypeEnum},
     values::{BasicValueEnum, FunctionValue, GlobalValue, IntValue, PointerValue},
 };
-use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use super::{
@@ -241,14 +241,14 @@ fn compiled(
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
         // alloc: once per module; `Wants` (fragment.rs) lists these, and the lowering looks them up
-        let constants: FxHashMap<u32, &[u8]> = recorder.constants().collect();
+        let constants: HashMap<u32, &[u8]> = recorder.constants().collect();
         // alloc: once per module, as `constants`
-        let statics: FxHashSet<u32> = recorder.statics().collect();
+        let statics: HashSet<u32> = recorder.statics().collect();
         let resume = recorder.resume();
         let memcmp = recorder.memcmp();
         let blocks_asm = recorder.asm_blocks();
         // alloc: once per module, as `constants`
-        let readonly: FxHashMap<u32, &super::ConstBlob> = recorder.readonly().collect();
+        let readonly: HashMap<u32, &super::ConstBlob> = recorder.readonly().collect();
         told_constants(
             context,
             &module,
@@ -299,7 +299,7 @@ fn compiled(
                 marked: false,
             }));
             // Every body shown is declared before any is defined, as one may call another.
-            let mut by_id = FxHashMap::default();
+            let mut by_id = HashMap::default();
             for (it, defined) in std::iter::zip(&seen, &shown) {
                 if let Ok(function) = Lowering::add(context, &module, defined) {
                     mark_hint(context, function, it.hint);
@@ -682,13 +682,13 @@ pub(super) fn export(
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
         // alloc: once per export; `Wants` (fragment.rs) lists these, and the lowering looks them up
-        let constants: FxHashMap<u32, &[u8]> = recorder.constants().collect();
+        let constants: HashMap<u32, &[u8]> = recorder.constants().collect();
         // alloc: once per export, as `constants`
-        let statics: FxHashSet<u32> = recorder.statics().collect();
+        let statics: HashSet<u32> = recorder.statics().collect();
         let own = Defined { name: OWN, func, pointees, named: &[], weights: None, marked: false };
         let function = Lowering::add(context, &module, &own)?;
         mark_hint(context, function, hint);
-        let shown = FxHashMap::default();
+        let shown = HashMap::default();
         let (resume, memcmp) = (recorder.resume(), recorder.memcmp());
         let blocks_asm = recorder.asm_blocks();
         Lowering::define(
@@ -1371,7 +1371,7 @@ struct Machine {
     // Before the context, which has to outlive them and their passes. By level, what they
     // build with for PGO and the target features they are told: a daemon builds a dev job
     // with the host's and a release job with the baseline's.
-    machines: FxHashMap<(Optimization, Option<pgo::Wanted>, super::Features), Machinery>,
+    machines: HashMap<(Optimization, Option<pgo::Wanted>, super::Features), Machinery>,
     context: Option<Context>,
     /// How many modules were made in the context.
     modules: usize,
@@ -1584,7 +1584,7 @@ impl std::ops::Deref for SymbolName {
 fn told_constants<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
-    readonly: &FxHashMap<u32, &super::ConstBlob>,
+    readonly: &HashMap<u32, &super::ConstBlob>,
     pointer: usize,
 ) {
     let i8 = context.i8_type();
@@ -1677,7 +1677,7 @@ fn told_constants<'ctx>(
 fn retold_bytes<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
-    readonly: &FxHashMap<u32, &super::ConstBlob>,
+    readonly: &HashMap<u32, &super::ConstBlob>,
 ) {
     for (&index, blob) in readonly {
         if !blob.points_nowhere() || blob.bytes.is_empty() {

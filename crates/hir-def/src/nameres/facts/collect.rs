@@ -10,6 +10,7 @@
 use std::alloc::Allocator;
 
 use base_db::{BuiltDependency, Crate, CrateOrigin, Db, LangCrateOrigin};
+use blaze_hash::HashMap;
 use blaze_mem::{Frame, Tag};
 use cfg::CfgExpr;
 use either::Either;
@@ -21,17 +22,16 @@ use hir_expand::{
     proc_macro::{CustomProcMacroExpander, ProcMacros},
 };
 use intern::{Symbol, sym};
-use rustc_hash::FxHashMap;
 use span::{Edition, FileAstId, ROOT_ERASED_FILE_AST_ID};
 use syntax::ast;
 use triomphe::Arc;
 
 use crate::{
     AdtId, AstId, AstIdWithPath, BuiltinDeriveImplId, BuiltinDeriveImplLoc, ConstLoc, EnumLoc,
-    ExternBlockLoc, ExternCrateId, ExternCrateLoc, FunctionId, FunctionLoc, ImplLoc,
-    Intern, ItemContainerId, Macro2Id, Macro2Loc, MacroExpander, MacroRulesId,
-    MacroRulesLoc, MacroRulesLocFlags, ModuleDefId, ModuleId, ProcMacroId, ProcMacroLoc,
-    StaticLoc, StructLoc, TraitLoc, TypeAliasLoc, UnionLoc, UseLoc, file_item_tree,
+    ExternBlockLoc, ExternCrateId, ExternCrateLoc, FunctionId, FunctionLoc, ImplLoc, Intern,
+    ItemContainerId, Macro2Id, Macro2Loc, MacroExpander, MacroRulesId, MacroRulesLoc,
+    MacroRulesLocFlags, ModuleDefId, ModuleId, ProcMacroId, ProcMacroLoc, StaticLoc, StructLoc,
+    TraitLoc, TypeAliasLoc, UnionLoc, UseLoc, file_item_tree,
     item_scope::{ImportOrExternCrate, ItemScope, PerNsGlobImports},
     item_tree::{
         self, Attrs, AttrsOrCfgRef, ImportAlias, ImportKind, ItemTree, ItemTreeAstId, Macro2,
@@ -39,9 +39,8 @@ use crate::{
     },
     macro_call_as_call_id,
     nameres::{
-        BuiltinShadowMode, DefMap, DefMapCrateData, DiagnosticsByModule, LocalDefMap,
-        MacroSubNs, ModuleData, ModuleOrigin, ModulesMap, ModulesSlot, ResolveMode,
-        crate_def_map,
+        BuiltinShadowMode, DefMap, DefMapCrateData, DiagnosticsByModule, LocalDefMap, MacroSubNs,
+        ModuleData, ModuleOrigin, ModulesMap, ModulesSlot, ResolveMode, crate_def_map,
         diagnostics::{DefDiagnostic, PreludeError},
         enable_builtin_derive_fast_path,
         mod_resolution::ModDir,
@@ -54,8 +53,9 @@ use crate::{
 };
 
 use super::{
-    FrameMap, FrameVec, map_in,
+    FrameMap, FrameVec,
     env::{Ancestor, ChildMode, ChildRequest, CollectCx, CollectEnv, SideTables, Sink},
+    map_in,
     ops::{DeclOp, ImportOp, ImportSource, Inherited, MacroOp, MacroOpKind, OpLog},
     queries::{
         self, CrateEnvKey, Decl, DeclItems, DeclKey, EnvKey, ModuleDecls, Rows, RowsKey, Scope,
@@ -312,8 +312,8 @@ pub(crate) fn expand_all(
 thread_local! {
     /// The scope each `module_decls` execution's `DeclSink` held at its end, by key. The
     /// `TestDB` runs its queries on the calling thread.
-    static HELD: std::cell::RefCell<FxHashMap<DeclKey, crate::nameres::BuildingScope>> =
-        std::cell::RefCell::new(FxHashMap::default());
+    static HELD: std::cell::RefCell<HashMap<DeclKey, crate::nameres::BuildingScope>> =
+        std::cell::RefCell::new(HashMap::default());
 }
 
 /// The scope the last execution of `module_decls(key)` on this thread held at its end.
@@ -473,8 +473,8 @@ impl<'a, 'db, 'f> DeclSink<'a, 'db, 'f> {
             root: queries::crate_root(db, decl.krate),
             modules: ModulesSlot::Unit { own: ModulesMap::new(), rows },
             prelude: None,
-            macro_use_prelude: FxHashMap::default(),
-            derive_helpers_in_scope: FxHashMap::default(),
+            macro_use_prelude: HashMap::default(),
+            derive_helpers_in_scope: HashMap::default(),
             session_macros: false,
             diagnostics: Vec::new(), // alloc: empty, the view's diagnostics go to the log
             diagnostics_by_module: DiagnosticsByModule::default(),
@@ -2354,9 +2354,9 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
 
 #[cfg(test)]
 mod tests {
+    use hir_expand::fixture;
     use hir_expand::name::Name;
     use intern::Symbol;
-    use hir_expand::fixture;
 
     use crate::{
         ModuleId,

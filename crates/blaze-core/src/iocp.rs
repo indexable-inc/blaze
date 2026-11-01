@@ -65,9 +65,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use blaze_hash::HashMap;
 use blaze_mem::{Slab, Tag as MemTag};
 use crossbeam_channel::{Receiver, Sender};
-use rustc_hash::FxHashMap;
 use windows_sys::Win32::{
     Foundation::{
         ERROR_BROKEN_PIPE, ERROR_CONNECTION_ABORTED, ERROR_HANDLE_EOF, ERROR_NETNAME_DELETED,
@@ -87,8 +87,8 @@ use self::{
     sys::{BUFFER, Buffer, Buffers, Head, KEY_EXIT, KEY_IO, KEY_JOB, KEY_WAKE, KEY_WARM, Port},
 };
 use crate::{
-    Address, Command, Completion, Confine, Confined, Conn, Cursor, Done, Driver, Effect, FileName, IoError,
-    RECV_MOST, Sandbox, Tag,
+    Address, Command, Completion, Confine, Confined, Conn, Cursor, Done, Driver, Effect, FileName,
+    IoError, RECV_MOST, Sandbox, Tag,
     handoff::Wake,
     wheel::{self, Wheel},
 };
@@ -424,7 +424,7 @@ pub struct Iocp {
     /// The launcher runs are handed to now.
     warm_now: Option<WarmId>,
     /// The runs in flight in it, by the run the frame names.
-    runs: FxHashMap<u64, SpawnId>,
+    runs: HashMap<u64, SpawnId>,
     /// The last run handed.
     run: u64,
     /// Frames not yet written to the launcher, in the order of their spawns.
@@ -433,8 +433,8 @@ pub struct Iocp {
     failing: Vec<SpawnId>,
     dirs: RunDirs,
     files: Slab<Cached>,
-    readers: FxHashMap<FileName, FileId>,
-    appenders: FxHashMap<FileName, FileId>,
+    readers: HashMap<FileName, FileId>,
+    appenders: HashMap<FileName, FileId>,
     /// Every request in flight. Dropped only once none is (`Drop`): the kernel may write any
     /// of their entries until its packet is taken.
     requests: ManuallyDrop<Slab<Request>>,
@@ -447,11 +447,11 @@ pub struct Iocp {
     ready: Vec<Completion>,
     /// By ticks since `start`: due, then the order they were asked for.
     timers: Wheel<Tag>,
-    watches: FxHashMap<Tag, Id>,
-    journals: FxHashMap<Tag, Journaling>,
-    listens: FxHashMap<Tag, Id>,
+    watches: HashMap<Tag, Id>,
+    journals: HashMap<Tag, Journaling>,
+    listens: HashMap<Tag, Id>,
     spawns: Slab<Spawned>,
-    spawning: FxHashMap<Tag, SpawnId>,
+    spawning: HashMap<Tag, SpawnId>,
     conns: Slab<Connection>,
     entries: [OVERLAPPED_ENTRY; ENTRIES],
     in_flight: usize,
@@ -468,9 +468,9 @@ pub struct Iocp {
 // tied to the thread that made it; the driver is used from one thread at a time (`&mut self`).
 unsafe impl Send for Iocp {}
 
-fn reserved<K, V>() -> FxHashMap<K, V> {
+fn reserved<K, V>() -> HashMap<K, V> {
     // alloc: setup, the room of a map of what is named by tag.
-    FxHashMap::with_capacity_and_hasher(TAGGED, Default::default())
+    HashMap::with_capacity_and_hasher(TAGGED, Default::default())
 }
 
 impl Iocp {
@@ -531,9 +531,9 @@ impl Iocp {
             dirs,
             files: Slab::new(FILES, MemTag::Io).map_err(mem)?,
             // alloc: setup, room for every handle kept.
-            readers: FxHashMap::with_capacity_and_hasher(CACHED, Default::default()),
+            readers: HashMap::with_capacity_and_hasher(CACHED, Default::default()),
             // alloc: as above.
-            appenders: FxHashMap::with_capacity_and_hasher(CACHED, Default::default()),
+            appenders: HashMap::with_capacity_and_hasher(CACHED, Default::default()),
             requests: ManuallyDrop::new(Slab::new(REQUESTS, MemTag::Io).map_err(mem)?),
             stale: 0,
             buffers: ManuallyDrop::new(Buffers::new(BUFFERS).map_err(mem)?),
@@ -2164,7 +2164,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        Answer, Confined, Exit, Handed, Journaled, Lost, Names, Sandbox, Stamp, Traced, run_until_idle, threads::Threads,
+        Answer, Confined, Exit, Handed, Journaled, Lost, Names, Sandbox, Stamp, Traced,
+        run_until_idle, threads::Threads,
     };
 
     fn name(it: &str) -> FileName {
@@ -2383,7 +2384,7 @@ mod tests {
                 handles.map(|it| (it != 0).then(|| unsafe { OwnedHandle::from_raw_handle(it as usize as RawHandle) }));
             std::thread::spawn(move || {
                 drop((stdin, stderr));
-                std::thread::sleep(Duration::from_millis(wait.into()));
+                blaze_spin::busy(Duration::from_millis(wait.into()));
                 let answered = if code == ASTRAY { run + 1_000_000 } else { run };
                 let code = match code {
                     HOLD => {
@@ -3022,7 +3023,7 @@ mod tests {
         for seed in 0..64 {
             let mut rng = crate::sim::Rng::new(seed);
             let mut slab: Slab<Model> = Slab::new(1 << 12, MemTag::Io).unwrap();
-            let mut map: FxHashMap<u64, Tag> = FxHashMap::default();
+            let mut map: HashMap<u64, Tag> = HashMap::default();
             let mut next = 0u64;
             let (mut live, mut ended): (Vec<(u64, Of)>, Vec<(u64, Of)>) = (Vec::new(), Vec::new());
             for _ in 0..2000 {

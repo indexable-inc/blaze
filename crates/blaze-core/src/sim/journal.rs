@@ -5,7 +5,7 @@
 //! resets, truncates or loses parts of it to check that a watcher names each loss and looks
 //! again only where it was.
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 use super::SimFile;
 use crate::{Cursor, FileName, Journaled, Lost, S_IFDIR, S_IFLNK, S_IFREG, Stamp};
@@ -42,7 +42,7 @@ pub(super) struct Disk {
     clock: u64,
     next_ino: u64,
     /// Every file and directory there, by name.
-    inodes: FxHashMap<FileName, Inode>,
+    inodes: HashMap<FileName, Inode>,
     /// The journal's ID, the sequence number of its oldest entry kept, and its entries.
     id: u64,
     first: u64,
@@ -83,7 +83,7 @@ impl Disk {
     /// move as on a real disk (a directory's mtime moves when a name in it is made or goes; a
     /// directory is there while a file is under it), and the journal records it. Returns the
     /// cursor after the change.
-    pub(super) fn touched(&mut self, file: &FileName, files: &FxHashMap<FileName, SimFile>) -> Cursor {
+    pub(super) fn touched(&mut self, file: &FileName, files: &HashMap<FileName, SimFile>) -> Cursor {
         let there = files.contains_key(file);
         let now = self.tick();
         let renamed = self.renamed_to.as_ref() == Some(file);
@@ -136,7 +136,7 @@ impl Disk {
 
     /// A name under the directories above `name` went: those left with nothing go too, and
     /// the first left with something has a name fewer.
-    fn left(&mut self, name: &FileName, files: &FxHashMap<FileName, SimFile>) {
+    fn left(&mut self, name: &FileName, files: &HashMap<FileName, SimFile>) {
         // clone: a name of the simulated disk's, walked up.
         let mut at = name.clone();
         while let Some(up) = parent(&at) {
@@ -185,7 +185,7 @@ impl Disk {
         &mut self,
         name: &FileName,
         modified_ns: u64,
-        files: &FxHashMap<FileName, SimFile>,
+        files: &HashMap<FileName, SimFile>,
     ) -> bool {
         if self.stamp(name, files) == Stamp::GONE {
             return false;
@@ -204,7 +204,7 @@ impl Disk {
     }
 
     /// What `name` is now.
-    pub(super) fn stamp(&mut self, name: &FileName, files: &FxHashMap<FileName, SimFile>) -> Stamp {
+    pub(super) fn stamp(&mut self, name: &FileName, files: &HashMap<FileName, SimFile>) -> Stamp {
         if let Some(file) = files.get(name) {
             if !self.inodes.contains_key(name) {
                 let inode = self.new_inode();
@@ -242,7 +242,7 @@ impl Disk {
     pub(super) fn entries(
         &mut self,
         dir: &FileName,
-        files: &FxHashMap<FileName, SimFile>,
+        files: &HashMap<FileName, SimFile>,
     ) -> Option<Vec<(FileName, Stamp)>> {
         if files.contains_key(dir) {
             return None;

@@ -85,12 +85,12 @@ enum Def {
 struct Facts<'db> {
     body: &'db MirBody<'db>,
     func: Option<FunctionId>,
-    preds: FxHashMap<BasicBlockId, u32>,
+    preds: HashMap<BasicBlockId, u32>,
     /// The first MIR block of the block of rustc's each is part of.
-    head: FxHashMap<BasicBlockId, BasicBlockId>,
-    defs: FxHashMap<LocalId, Vec<Def>>,
+    head: HashMap<BasicBlockId, BasicBlockId>,
+    defs: HashMap<LocalId, Vec<Def>>,
     /// Locals used through a projection or borrowed.
-    tangled: FxHashSet<LocalId>,
+    tangled: HashSet<LocalId>,
 }
 
 fn mark_projected(facts: &mut Facts<'_>, op: &Operand) {
@@ -184,10 +184,10 @@ impl<'db> Facts<'db> {
         let mut facts = Facts {
             body,
             func: body.owner.as_function(),
-            preds: FxHashMap::default(),
-            head: FxHashMap::default(),
-            defs: FxHashMap::default(),
-            tangled: FxHashSet::default(),
+            preds: HashMap::default(),
+            head: HashMap::default(),
+            defs: HashMap::default(),
+            tangled: HashSet::default(),
         };
         for &param in &body.param_locals {
             facts.defs.entry(param).or_default().push(Def::Param);
@@ -195,7 +195,7 @@ impl<'db> Facts<'db> {
         let operand = mark_projected;
         // The block each goes on in, where it goes there alone: a call of an intrinsic never
         // unwinds, whatever the MIR says.
-        let mut goes_on: FxHashMap<BasicBlockId, BasicBlockId> = FxHashMap::default();
+        let mut goes_on: HashMap<BasicBlockId, BasicBlockId> = HashMap::default();
         for (id, block) in body.basic_blocks.iter() {
             for (at, statement) in block.statements.iter().enumerate() {
                 let StatementKind::Assign(place, rvalue) = &statement.kind else { continue };
@@ -1404,7 +1404,7 @@ impl<'db> FunctionCx<'_, 'db> {
     fn wrapper(&mut self, func: FunctionId) -> Result<Option<Wrapper>> {
         let db = self.cg.db;
         let Ok((body, _)) = root_body(db, func) else { return Ok(None) };
-        let mut of: FxHashMap<LocalId, (usize, bool)> = FxHashMap::default();
+        let mut of: HashMap<LocalId, (usize, bool)> = HashMap::default();
         for (i, &param) in body.param_locals.iter().enumerate() {
             of.insert(param, (i, false));
         }
@@ -1569,7 +1569,7 @@ fn inline_cost<'db>(
         }
         _ => false,
     };
-    let mut reached = FxHashSet::default();
+    let mut reached = HashSet::default();
     let mut work: SmallVec<[BasicBlockId; 16]> = SmallVec::from_slice(&[body.start_block]);
     while let Some(id) = work.pop() {
         if !reached.insert(id) {

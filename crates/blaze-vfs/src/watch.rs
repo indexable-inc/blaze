@@ -39,9 +39,9 @@ use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use blaze_core::{
     Completion, Cursor, Done, Effect, FileName, IoError, Lost, Names, S_IFMT, Stamp, Tag,
 };
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::ContentId;
 use blaze_mem::Slab;
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     Commit, Mode, Op, Vfs,
@@ -148,7 +148,7 @@ struct Batch {
     slots: Vec<Slot>,
     /// Each slot by name, once a listing may add names to it (the swept names are found in
     /// `names`).
-    index: FxHashMap<PathId, usize>,
+    index: HashMap<PathId, usize>,
     /// Stamps and listings in flight: it commits once none is and every slot is looked at.
     open: u32,
     /// The directory a rescan looks at the subtree of.
@@ -156,7 +156,7 @@ struct Batch {
     /// The directory a [`Lost::Unnamed`] lists alone: its slots are what was in it.
     relist: Option<PathId>,
     /// Each gone file the head had, by its inode: a name new to the batch with its stamp is it.
-    gone: FxHashMap<u64, usize>,
+    gone: HashMap<u64, usize>,
     /// The journal's place once this is committed, and whether it then has told everything
     /// from before the watch.
     cursor: Option<Cursor>,
@@ -174,11 +174,11 @@ impl Batch {
             forced: Vec::new(),
             // alloc: none until a path changed; its room is kept as the batch is reused.
             slots: Vec::new(),
-            index: FxHashMap::default(),
+            index: HashMap::default(),
             open: 1,
             rescan: None,
             relist: None,
-            gone: FxHashMap::default(),
+            gone: HashMap::default(),
             cursor: None,
             caught_up: false,
         }
@@ -326,7 +326,7 @@ struct Work {
     moves: Vec<(usize, usize)>,
     taken: Vec<PathId>,
     renames: Vec<(PathId, PathId)>,
-    renamed: FxHashSet<usize>,
+    renamed: HashSet<usize>,
     sources: Vec<PathId>,
     early: Vec<PathId>,
     late: Vec<PathId>,
@@ -348,7 +348,7 @@ pub struct Watcher {
     /// Looks in flight, by their tag past `tags + FIRST`: a slot is reused once its look is in.
     pending: Slab<Pending>,
     /// What this watcher's commits left at each name, while batches told before them wait.
-    ours: FxHashMap<PathId, Seen>,
+    ours: HashMap<PathId, Seen>,
     /// Every name a batch, a look in flight or `ours` holds; cleared once none is.
     paths: Paths,
     /// Committed batches, emptied, and the stamp buffer the driver last gave back.
@@ -380,7 +380,7 @@ impl Watcher {
             first: 0,
             pending: Slab::new(MOST_IN_FLIGHT, blaze_mem::Tag::Vfs)
                 .unwrap_or_else(|error| panic!("the looks in flight of a watch: {error}")),
-            ours: FxHashMap::default(),
+            ours: HashMap::default(),
             paths: Paths::default(),
             // alloc: none until a batch commits; then at most `SPARE_BATCHES`, reused.
             spare: Vec::new(),
@@ -938,7 +938,7 @@ impl Watcher {
             let Some(batch) = batch_in(batches, *first, number) else { unreachable!("a listing of no batch") };
             batch.open -= 1;
             if batch.relist == Some(dir) {
-                let there: FxHashMap<&str, Stamp> =
+                let there: HashMap<&str, Stamp> =
                     // alloc: once per relisting, by the directory's names.
                     entries.iter().map(|(it, stamp)| (it.as_str(), *stamp)).collect();
                 for (at, slot) in batch.slots.iter_mut().enumerate().filter(|(_, it)| it.look.is_none()) {
@@ -1184,7 +1184,7 @@ impl Watcher {
 
 /// Whether the watcher's commits left `name` as `now`: it put that there, or `name` is gone
 /// because they replaced or deleted something above it.
-fn made(ours: &FxHashMap<PathId, Seen>, paths: &Paths, below: usize, name: PathId, now: Seen) -> bool {
+fn made(ours: &HashMap<PathId, Seen>, paths: &Paths, below: usize, name: PathId, now: Seen) -> bool {
     if ours.get(&name) == Some(&now) {
         return true;
     }

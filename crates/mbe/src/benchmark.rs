@@ -1,8 +1,8 @@
 //! This module add real world mbe example for benchmark tests
 
 use base_db::Db;
+use blaze_hash::HashMap;
 use intern::Symbol;
-use rustc_hash::FxHashMap;
 use stdx::itertools::Itertools;
 use syntax::view::{self as ast, AstNode as _, HasName as _};
 use syntax_bridge::{
@@ -58,7 +58,7 @@ fn benchmark_expand_macro_rules() {
     assert_eq!(hash, 450144);
 }
 
-pub(crate) fn macro_rules_fixtures() -> FxHashMap<String, DeclarativeMacro> {
+pub(crate) fn macro_rules_fixtures() -> HashMap<String, DeclarativeMacro> {
     macro_rules_fixtures_tt()
         .into_iter()
         .sorted_by(|(a, _), (b, _)| a.cmp(b))
@@ -66,7 +66,7 @@ pub(crate) fn macro_rules_fixtures() -> FxHashMap<String, DeclarativeMacro> {
         .collect()
 }
 
-fn macro_rules_fixtures_tt() -> FxHashMap<String, tt::TopSubtree> {
+fn macro_rules_fixtures_tt() -> HashMap<String, tt::TopSubtree> {
     let fixture = bench_fixture::numerous_macro_rules();
     let parse = syntax::SourceFile::parse(&fixture, span::Edition::CURRENT);
     assert!(parse.errors().is_empty(), "the macro_rules fixture parses");
@@ -91,7 +91,7 @@ fn macro_rules_fixtures_tt() -> FxHashMap<String, tt::TopSubtree> {
 /// Generate random invocation fixtures from rules
 pub(crate) fn invocation_fixtures(
     db: &Db,
-    rules: &FxHashMap<String, DeclarativeMacro>,
+    rules: &HashMap<String, DeclarativeMacro>,
 ) -> Vec<(String, tt::TopSubtree)> {
     let mut seed = 123456789;
     let mut res = Vec::new();

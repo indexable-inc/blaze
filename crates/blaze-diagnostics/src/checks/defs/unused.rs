@@ -11,13 +11,16 @@
 //! `UnusedGenericParameterHelp`) (MIT or Apache-2.0). The variances are hir-ty's
 //! `variances_of`.
 
+use blaze_hash::HashSet;
 use blaze_items::{Fact, ItemId};
 use hir::PathResolution;
-use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 use syntax::{
     TextRange, WalkEvent,
-    view::{self as ast, AstNode as _, HasGenericArgs as _, HasGenericParams as _, HasName as _, HasTypeBounds as _},
+    view::{
+        self as ast, AstNode as _, HasGenericArgs as _, HasGenericParams as _, HasName as _,
+        HasTypeBounds as _,
+    },
 };
 
 use crate::{
@@ -29,8 +32,8 @@ use crate::{
 /// A predicate `<inputs as Trait>::Assoc == outputs`: the parameters it reads, and those it
 /// constrains once all of those are.
 struct Projection {
-    inputs: FxHashSet<hir::GenericParam>,
-    outputs: FxHashSet<hir::GenericParam>,
+    inputs: HashSet<hir::GenericParam>,
+    outputs: HashSet<hir::GenericParam>,
 }
 
 pub(super) fn check<'db>(cx: &Cx<'_, 'db>, adt: hir::Adt) -> Vec<Found> {
@@ -49,7 +52,7 @@ pub(super) fn check<'db>(cx: &Cx<'_, 'db>, adt: hir::Adt) -> Vec<Found> {
     let params: Vec<(hir::GenericParam, ast::GenericParam<'db>)> =
         // alloc: only for an ADT with a bivariant parameter, mostly the error
         list.generic_params().filter_map(|it| Some((cx.vsema.to_def(it)?, it))).collect();
-    let mut constrained: FxHashSet<hir::GenericParam> = params
+    let mut constrained: HashSet<hir::GenericParam> = params
         .iter()
         .filter(|(param, _)| !bivariant(*param))
         .map(|(param, _)| *param)
@@ -273,7 +276,7 @@ fn written_bounds<'db>(
 
 /// rustc's `identify_constrained_generic_params` of an ADT's predicates: a parameter an
 /// associated type binding equates with is constrained once all that the projection reads are.
-fn identify_constrained<'db>(cx: &Cx<'_, 'db>, node: ast::Adt<'db>, constrained: &mut FxHashSet<hir::GenericParam>) {
+fn identify_constrained<'db>(cx: &Cx<'_, 'db>, node: ast::Adt<'db>, constrained: &mut HashSet<hir::GenericParam>) {
     // alloc: only for an ADT with a bivariant parameter
     let mut projections = Vec::new();
     if let Some(list) = node.generic_param_list() {
@@ -282,14 +285,14 @@ fn identify_constrained<'db>(cx: &Cx<'_, 'db>, node: ast::Adt<'db>, constrained:
             let (Some(def), Some(bounds)) = (cx.vsema.to_def(param), param.type_bound_list()) else {
                 continue;
             };
-            let inputs = FxHashSet::from_iter([hir::GenericParam::TypeParam(def)]);
+            let inputs = HashSet::from_iter([hir::GenericParam::TypeParam(def)]);
             bound_projections(cx, &inputs, bounds, &mut projections);
         }
     }
     if let Some(clause) = node.where_clause() {
         for pred in clause.predicates() {
             let (Some(ty), Some(bounds)) = (pred.ty(), pred.type_bound_list()) else { continue };
-            let mut inputs = FxHashSet::default();
+            let mut inputs = HashSet::default();
             params_in(cx, ty.syntax(), true, &mut inputs);
             bound_projections(cx, &inputs, bounds, &mut projections);
         }
@@ -313,7 +316,7 @@ fn identify_constrained<'db>(cx: &Cx<'_, 'db>, node: ast::Adt<'db>, constrained:
 /// those of associated type bounds (`Trait<Assoc: Other<B = U>>`) included.
 fn bound_projections<'db>(
     cx: &Cx<'_, 'db>,
-    inputs: &FxHashSet<hir::GenericParam>,
+    inputs: &HashSet<hir::GenericParam>,
     bounds: ast::TypeBoundList<'db>,
     out: &mut Vec<Projection>,
 ) {
@@ -336,7 +339,7 @@ fn bound_projections<'db>(
                 params_in(cx, own.syntax(), true, &mut inputs);
             }
             if let Some(ty) = arg.ty() {
-                let mut outputs = FxHashSet::default();
+                let mut outputs = HashSet::default();
                 params_in(cx, ty.syntax(), false, &mut outputs);
                 // clone: only for an ADT with a bivariant parameter
                 out.push(Projection { inputs: inputs.clone(), outputs });
@@ -497,8 +500,8 @@ fn is_explicitly_bounded<'db>(
 /// name declared twice, whose every use is then an error, and a lifetime declared again or
 /// named `'static` or `'_`, whose name is `ParamName::Error`.
 struct Invalid {
-    names: FxHashSet<String>,
-    lifetimes: FxHashSet<TextRange>,
+    names: HashSet<String>,
+    lifetimes: HashSet<TextRange>,
 }
 
 impl Invalid {
@@ -507,7 +510,7 @@ impl Invalid {
         let mut lifetimes: SmallVec<[ast::Lifetime<'t>; 4]> = SmallVec::new();
         let mut names: SmallVec<[ast::Name<'t>; 4]> = SmallVec::new();
         // alloc: empty unless a parameter is declared twice, an error
-        let mut invalid = Invalid { names: FxHashSet::default(), lifetimes: FxHashSet::default() };
+        let mut invalid = Invalid { names: HashSet::default(), lifetimes: HashSet::default() };
         for param in list.generic_params() {
             match param {
                 ast::GenericParam::LifetimeParam(it) => {
@@ -571,7 +574,7 @@ fn is_probably_cyclical(cx: &Cx<'_, '_>, adt: hir::Adt) -> bool {
 
 /// Every type in the fields of `adt` and, once each, of the ADTs they hold, until `stop` says.
 fn walk_fields(cx: &Cx<'_, '_>, adt: hir::Adt, mut stop: impl FnMut(&hir::Type<'_>, Option<hir::Adt>) -> bool) {
-    let mut seen = FxHashSet::from_iter([adt]);
+    let mut seen = HashSet::from_iter([adt]);
     // alloc: only for an ADT with a bivariant parameter
     let mut queue = vec![adt];
     while let Some(adt) = queue.pop() {

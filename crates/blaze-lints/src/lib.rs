@@ -7,11 +7,13 @@
 //! is a diagnostic as data, written by [`blaze_diagnostics::emit`] as rustc writes it, in text
 //! and in JSON.
 
+pub mod baseline;
 mod blaze;
 pub mod check;
 pub mod conf;
 pub mod diag;
 mod famous;
+pub mod fix;
 pub mod level;
 mod lints;
 pub mod manifest;

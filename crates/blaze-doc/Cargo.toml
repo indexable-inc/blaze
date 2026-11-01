@@ -16,15 +16,16 @@ doctest = false
 [dependencies]
 base-db.workspace = true
 blaze-graph.workspace = true
+blaze-hash.workspace = true
 either.workspace = true
 hir.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
 intern.workspace = true
+parking_lot.workspace = true
 parser.workspace = true
 # `html`: `push_html`; `simd`: its escaping with SSE where the target has it.
 pulldown-cmark = { workspace = true, features = ["html", "simd"] }
-rustc-hash.workspace = true
 serde_json.workspace = true
 span.workspace = true
 stdx.workspace = true

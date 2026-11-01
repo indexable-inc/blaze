@@ -2,16 +2,18 @@
 //! (`blaze_lower::Lowered::served_db`), its build scripts run and its proc macros built and
 //! loaded in the sandbox by the daemon. Nothing here loads a workspace or runs anything.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use base_db::{Crate, CrateOrigin, Db};
+use blaze_hash::{HashMap, HashSet};
 use blaze_query::db::Setter as _;
 use cfg::CfgAtom;
-use intern::sym;
 use hir_expand::proc_macro::{
-    CrateProcMacros, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacros,
+    CrateProcMacros, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
+    ProcMacros,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
+use intern::sym;
+use parking_lot::Mutex;
 
 use super::{Call, Dep, Expansion, Expansions, File, Kind, Krate, Macro, Origin, Pack, Root};
 
@@ -24,6 +26,9 @@ struct Recorder {
     inner: Arc<dyn ProcMacroExpander>,
     expansions: Arc<Mutex<Expansions>>,
 }
+
+/// An expansion that panicked records nothing: the expansions kept are each whole.
+impl std::panic::RefUnwindSafe for Recorder {}
 
 impl ProcMacroExpander for Recorder {
     fn requires_session(&self) -> bool {
@@ -72,7 +77,7 @@ impl Recorder {
             Ok(output) => Ok(output.to_string()),
             Err(ProcMacroExpansionError::Panic(why) | ProcMacroExpansionError::System(why)) => Err(why.clone()),
         };
-        self.expansions.lock().unwrap_or_else(|it| it.into_inner()).insert(call, recorded);
+        self.expansions.lock().insert(call, recorded);
     }
 }
 
@@ -83,7 +88,7 @@ fn name(db: &Db, krate: Crate) -> Option<String> {
 /// The crates `program` is made of, dependencies first. Of a proc macro crate only what its
 /// macros expand to is needed, so none of its dependencies are.
 fn closure(db: &Db, program: Crate) -> Vec<Crate> {
-    fn visit(db: &Db, krate: Crate, seen: &mut FxHashSet<Crate>, out: &mut Vec<Crate>) {
+    fn visit(db: &Db, krate: Crate, seen: &mut HashSet<Crate>, out: &mut Vec<Crate>) {
         if seen.insert(krate) {
             let data = krate.data(db);
             if !data.target_kind.is_proc_macro() {
@@ -95,7 +100,7 @@ fn closure(db: &Db, program: Crate) -> Vec<Crate> {
         }
     }
     let mut crates = Vec::new();
-    visit(db, program, &mut FxHashSet::default(), &mut crates);
+    visit(db, program, &mut HashSet::default(), &mut crates);
     crates
 }
 
@@ -108,7 +113,7 @@ pub fn record(db: &mut Db, program: Crate, expand: impl FnOnce(&Db, &[Crate])) -
 
     let expansions = Arc::new(Mutex::new(Expansions::default()));
     let loaded = ProcMacros::get(reading).by_crate(reading).clone();
-    let recording: FxHashMap<_, _> = loaded
+    let recording: HashMap<_, _> = loaded
         .iter()
         .map(|(&krate, macros)| {
             let macros = macros.macros().map(|macros| {
@@ -134,10 +139,10 @@ pub fn record(db: &mut Db, program: Crate, expand: impl FnOnce(&Db, &[Crate])) -
     let db = &*db;
     expand(db, &crates);
 
-    let index: FxHashMap<Crate, usize> = crates.iter().enumerate().map(|(at, &it)| (it, at)).collect();
+    let index: HashMap<Crate, usize> = crates.iter().enumerate().map(|(at, &it)| (it, at)).collect();
     let mut pack = Pack { main: program.data(db).root_file_id.index(), ..Pack::default() };
-    let mut roots = FxHashSet::default();
-    let mut modules = FxHashSet::default();
+    let mut roots = HashSet::default();
+    let mut modules = HashSet::default();
     for &krate in &crates {
         let mut pending = vec![hir::Crate::from(krate).root_module(db)];
         while let Some(module) = pending.pop() {
@@ -221,7 +226,7 @@ pub fn record(db: &mut Db, program: Crate, expand: impl FnOnce(&Db, &[Crate])) -
             macros: data.target_kind.is_proc_macro().then(|| macros.unwrap_or_default()),
         });
     }
-    let expansions = std::mem::take(&mut *expansions.lock().unwrap_or_else(|it| it.into_inner()));
+    let expansions = std::mem::take(&mut *expansions.lock());
     pack.expansions = expansions.into_iter().map(|(call, output)| Expansion { call, output }).collect();
     pack.expansions.sort_by(|a, b| {
         (&a.call.krate, &a.call.name, &a.call.input, &a.call.attr).cmp(&(

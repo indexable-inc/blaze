@@ -119,17 +119,17 @@ fn registry_loc() -> SourceId {
 }
 
 pub(crate) fn pkg<T: ToPkgId>(name: T) -> Summary {
-    pkg_dep(name, Vec::new())
+    pkg_dep(&name, Vec::new())
 }
 
-pub(crate) fn pkg_dep<T: ToPkgId>(name: T, dep: Vec<Dependency>) -> Summary {
+pub(crate) fn pkg_dep<T: ToPkgId>(name: &T, dep: Vec<Dependency>) -> Summary {
     let pkgid = name.to_pkgid();
     let link = if pkgid.name().ends_with("-sys") { Some(pkgid.name()) } else { None };
     Summary::new(name.to_pkgid(), dep, &BTreeMap::new(), link, None).unwrap()
 }
 
 pub(crate) fn pkg_dep_with<T: ToPkgId>(
-    name: T,
+    name: &T,
     dep: Vec<Dependency>,
     features: &[(&'static str, &[&'static str])],
 ) -> Summary {
@@ -142,7 +142,7 @@ pub(crate) fn pkg_dep_with<T: ToPkgId>(
     Summary::new(name.to_pkgid(), dep, &features, link, None).unwrap()
 }
 
-pub(crate) fn pkg_dep_link<T: ToPkgId>(name: T, link: &str, dep: Vec<Dependency>) -> Summary {
+pub(crate) fn pkg_dep_link<T: ToPkgId>(name: &T, link: &str, dep: Vec<Dependency>) -> Summary {
     Summary::new(name.to_pkgid(), dep, &BTreeMap::new(), Some(link), None).unwrap()
 }
 

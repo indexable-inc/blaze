@@ -7,10 +7,10 @@
     "crates/hir-ty-mir/src/mir/eval/foreign.rs"
   ],
   "what": "## fastcompile-macros 9: codegen (hir-ty-mir's evaluator): inherited overflow checks of a run take the running crate's `-C overflow-checks`\n\nWhere: `crates/hir-ty-mir/src/mir/eval.rs` `Evaluator::checks_overflow` (line ~1207), and a setter beside `set_budget` in `eval/foreign.rs`.\n\nWhat is wrong: for a body that inherits its overflow checks from the crate that uses it (core's `#[rustc_inherit_overflow_checks]` operator impls, `Sum`, `Step`), `body_checks_overflow` is `None` and `checks_overflow` takes `unwrap_or(true)`: overflow always panics. rustc compiles that code with the using crate's `-C overflow-checks`. A proc macro built under `--release` has overflow checks off (cargo's release profile), so under rustc `iter.sum::<u32>()` wraps where blaze's evaluator panics: a superset-of-rust difference, and now a difference between blaze's two tiers too, since the compiled tier builds that code with the macro crate's setting (`blaze-macro-eval/src/tier/build.rs` `policy`).\n\nWhat (narrowest, nothing changes unless set):\n\n```rust\n/// The `-C overflow-checks` of the crate a run's code is compiled as: what a body that\n/// inherits its checks uses. Unset, such a body checks (a constant's evaluation).\npub fn set_inherited_overflow_checks(&mut self, checks: bool);\n```\n\nand in `checks_overflow`, `body_checks_overflow(..).unwrap_or(self.inherited.unwrap_or(true))`. blaze-macro-eval's `run.rs` `on_evaluator` then sets it to `hir_ty_mir::mir::overflow::crate_checks_overflow(db, macro_crate).unwrap_or(false)`; I write that line once this lands.",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T00:07:30Z",
-  "updated": "2026-11-01T00:07:30Z",
-  "taken_by": null,
+  "updated": "2026-11-01T12:49:57Z",
+  "taken_by": "codegen",
   "why": null,
   "source": null,
   "history": [
@@ -19,6 +19,18 @@
       "by": "fastcompile-macros",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T12:49:57Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T12:49:57Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "Evaluator::set_inherited_overflow_checks (hir-ty-mir eval/foreign.rs) sets inherited_overflow_checks; checks_overflow (eval.rs) uses body_checks_overflow(..).unwrap_or(inherited.unwrap_or(true)). Test tests/mir/eval.rs a_body_that_inherits_its_overflow_checks_takes_those_of_the_crate_the_run_is_compiled_as (false wraps, true and unset panic). ra clean, not built."
     }
   ]
 }

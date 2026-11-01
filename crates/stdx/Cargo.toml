@@ -18,6 +18,7 @@ tracing.workspace = true
 # Think twice before adding anything here
 
 [dev-dependencies]
+crossbeam-channel.workspace = true
 hegeltest.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]

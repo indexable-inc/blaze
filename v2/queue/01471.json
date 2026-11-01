@@ -8,10 +8,10 @@
     "crates/hir-ty-codegen/v2.rs"
   ],
   "what": "Dead after 01362 (cargo): the daemon no longer builds a proc macro natively or appends its __blaze_proc_macros list (blaze_macro_eval::load runs its MIR and finds its macros from the def map, blaze-macro-eval run.rs functions). So hir-ty-codegen v2 RootKind::ProcMacro, roots/proc_macros.rs (roots, MODULE, HirFrontend::proc_macro_list) and the proc_macro_list re-export in v2.rs have no caller. Delete them (one way per job); tell cargo and blaze-cargo serve/unit/codegen.rs root_kind drops its Makes::Shared { proc_macro: true } arm (cargo will make it an error naming that a proc macro builds no code). Also update the run.rs functions doc comment that names the list.",
-  "state": "open",
+  "state": "taken",
   "created": "2026-11-01T07:21:54Z",
-  "updated": "2026-11-01T07:21:54Z",
-  "taken_by": null,
+  "updated": "2026-11-01T12:49:39Z",
+  "taken_by": "codegen",
   "why": null,
   "source": null,
   "history": [
@@ -19,6 +19,12 @@
       "at": "2026-11-01T07:21:54Z",
       "by": "cargo",
       "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T12:49:39Z",
+      "by": "codegen",
+      "action": "take",
       "note": ""
     }
   ]

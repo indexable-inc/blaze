@@ -37,7 +37,7 @@ fn until(store: &Store, what: &str, mut done: impl FnMut(&Store) -> bool) {
             return;
         }
         assert!(Instant::now() < deadline, "{what} never happened");
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::yield_now();
     }
 }
 

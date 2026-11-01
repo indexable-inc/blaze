@@ -1,14 +1,11 @@
 //! Each call of a proc macro as the front end made it, with what blaze-macro-eval's expander
 //! gave (the output the front end goes on with).
 
-use std::{
-    any::Any,
-    fmt,
-    sync::{Arc, Mutex},
-};
+use std::{any::Any, fmt, sync::Arc};
 
 use base_db::{ContentId, Crate, Db, Env};
 use hir_expand::proc_macro::{ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind};
+use parking_lot::Mutex;
 use span::Span;
 use tt::TopSubtree;
 
@@ -125,6 +122,9 @@ pub(crate) struct Recorder {
     records: Records,
 }
 
+/// A call that panicked records nothing: the records kept are each whole.
+impl std::panic::RefUnwindSafe for Recorder {}
+
 impl Recorder {
     /// `eval`, of crate `krate`, recording into `records`.
     pub(crate) fn wrap(krate: &str, eval: ProcMacro, records: &Records) -> ProcMacro {
@@ -158,7 +158,7 @@ impl Recorder {
             mixed_site: call.mixed_site,
             current_dir: call.current_dir.to_owned(),
         };
-        self.records.lock().unwrap_or_else(|it| it.into_inner()).push(Record { call: recorded, eval });
+        self.records.lock().push(Record { call: recorded, eval });
         expanded
     }
 }

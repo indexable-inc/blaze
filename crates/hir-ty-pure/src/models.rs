@@ -12,6 +12,7 @@
 use std::fmt::Write as _;
 
 use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
+use blaze_hash::HashMap;
 use either::Either;
 use hir_def::{
     AdtId, FunctionId, HasModule, ImplId, ItemContainerId, Lookup, ModuleDefId, ModuleId, TraitId,
@@ -27,7 +28,6 @@ use hir_ty::{
     next_solver::{SimplifiedType, SolverDefId, TyKind},
 };
 use intern::Symbol;
-use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::IntoKind;
 
 use crate::{Abs, Effects, Root, allowed_env, safe_relative};
@@ -205,7 +205,7 @@ pub fn check_resolved(db: &Db, std_crate: Crate) -> Vec<&'static str> {
 /// One toolchain crate's models, by function, and the paths of its table it does not have.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Models {
-    by_fn: FxHashMap<FunctionId, Model>,
+    by_fn: HashMap<FunctionId, Model>,
     unresolved: Box<[&'static str]>,
 }
 
@@ -215,14 +215,14 @@ pub struct Models {
 pub fn crate_models(db: &Db, krate: Crate) -> Models {
     blaze_mem::frame::task(blaze_mem::Tag::Mir, |_| {
         let Some(home) = toolchain(&krate.data(db).origin) else {
-            return Models { by_fn: FxHashMap::default(), unresolved: Box::default() };
+            return Models { by_fn: HashMap::default(), unresolved: Box::default() };
         };
         let table = match home {
             Home::Core => CORE,
             Home::Alloc => ALLOC,
             Home::Std => STD,
         };
-        let mut by_fn = FxHashMap::with_capacity_and_hasher(table.len() * 4, Default::default());
+        let mut by_fn = HashMap::with_capacity_and_hasher(table.len() * 4, Default::default());
         // alloc: once per toolchain crate, the paths a stale table misses
         let mut unresolved = Vec::new();
         let resolver = Resolver { db, krate };
@@ -708,7 +708,7 @@ const CORE: &[Entry] = &[
 
 /// The foreign functions `krate` declares that are the allocator's (by attribute or link name)
 /// or the panic runtime's (by link name), into `by_fn`.
-fn foreign(db: &Db, krate: Crate, by_fn: &mut FxHashMap<FunctionId, Model>) {
+fn foreign(db: &Db, krate: Crate, by_fn: &mut HashMap<FunctionId, Model>) {
     let allocator = AttrFlags::RUSTC_ALLOCATOR
         | AttrFlags::RUSTC_DEALLOCATOR
         | AttrFlags::RUSTC_REALLOCATOR

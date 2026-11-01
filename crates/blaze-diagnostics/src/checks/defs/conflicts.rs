@@ -15,12 +15,12 @@
 
 use std::hash::BuildHasher as _;
 
+use blaze_hash::{FixedState, HashMap};
 use blaze_ids::radix;
 use blaze_items::ItemId;
 use either::Either;
 use hashbrown::HashTable;
 use hir::{InFile, PathResolution};
-use rustc_hash::{FxBuildHasher, FxHashMap};
 use syntax::{
     TextRange, TextSize,
     view::{self as ast, AstNode, HasAttrs, HasName as _},
@@ -188,7 +188,7 @@ impl Scope {
 pub(super) fn check(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<Found> {
     // alloc: empty, allocates nothing until a conflict
     let mut found = Vec::new();
-    let mut seen: FxHashMap<String, InFile<TextRange>> = FxHashMap::default();
+    let mut seen: HashMap<String, InFile<TextRange>> = HashMap::default();
     let Some(&first) = scopes.first() else { return found };
     let root = cx.krate.root_module(cx.db);
     let extern_prelude = ExternPrelude::of(cx, root);
@@ -212,12 +212,12 @@ pub(super) fn check(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<Found> {
 
 /// The names of the crate's extern prelude, with whether an `extern crate` item put each there.
 struct ExternPrelude {
-    names: FxHashMap<String, bool>,
+    names: HashMap<String, bool>,
 }
 
 impl ExternPrelude {
     fn of(cx: &Cx<'_, '_>, root: hir::Module) -> ExternPrelude {
-        let mut names: FxHashMap<String, bool> = cx
+        let mut names: HashMap<String, bool> = cx
             .krate
             .dependencies_iter(cx.db)
             // alloc: setup, once per check: the crate's dependencies
@@ -240,7 +240,7 @@ impl ExternPrelude {
 }
 
 fn hash_of(scope: &Scope, binding: &Binding) -> u64 {
-    FxBuildHasher.hash_one((scope.name(binding.name), binding.ns))
+    FixedState.hash_one((scope.name(binding.name), binding.ns))
 }
 
 /// Each binding of `scope` in the order rustc plants them, each conflict reported as rustc
@@ -249,7 +249,7 @@ fn plant(
     cx: &Cx<'_, '_>,
     scope: &mut Scope,
     extern_prelude: &ExternPrelude,
-    seen: &mut FxHashMap<String, InFile<TextRange>>,
+    seen: &mut HashMap<String, InFile<TextRange>>,
     found: &mut Vec<Found>,
 ) {
     let mut planted = std::mem::take(&mut scope.planted);

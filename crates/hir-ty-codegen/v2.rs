@@ -322,7 +322,7 @@ pub(crate) enum DataPlace {
 
 /// A crate the build compiles for its build scripts and proc macros, not for the program.
 #[derive(Default, Debug)]
-pub struct BuildTime(pub rustc_hash::FxHashSet<Crate>);
+pub struct BuildTime(pub blaze_hash::HashSet<Crate>);
 
 /// The error of `unit`, saying `what`.
 pub(crate) fn failed(unit: &Unit, what: impl std::fmt::Display) -> CodegenError {

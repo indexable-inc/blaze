@@ -12,7 +12,7 @@ mod tests;
 
 use std::fmt;
 
-use rustc_hash::FxHashSet;
+use blaze_hash::HashSet;
 
 use intern::{Symbol, sym};
 
@@ -31,12 +31,12 @@ pub use dnf::DnfExpr;
 /// See: <https://doc.rust-lang.org/reference/conditional-compilation.html#set-configuration-options>
 #[derive(Clone, PartialEq, Eq)]
 pub struct CfgOptions {
-    enabled: FxHashSet<CfgAtom>,
+    enabled: HashSet<CfgAtom>,
 }
 
 impl Default for CfgOptions {
     fn default() -> Self {
-        Self { enabled: FxHashSet::from_iter([CfgAtom::Flag(sym::true_)]) }
+        Self { enabled: HashSet::from_iter([CfgAtom::Flag(sym::true_)]) }
     }
 }
 
@@ -136,22 +136,22 @@ impl Extend<CfgAtom> for CfgOptions {
 }
 
 impl IntoIterator for CfgOptions {
-    type Item = <FxHashSet<CfgAtom> as IntoIterator>::Item;
+    type Item = <HashSet<CfgAtom> as IntoIterator>::Item;
 
-    type IntoIter = <FxHashSet<CfgAtom> as IntoIterator>::IntoIter;
+    type IntoIter = <HashSet<CfgAtom> as IntoIterator>::IntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
-        <FxHashSet<CfgAtom> as IntoIterator>::into_iter(self.enabled)
+        <HashSet<CfgAtom> as IntoIterator>::into_iter(self.enabled)
     }
 }
 
 impl<'a> IntoIterator for &'a CfgOptions {
-    type Item = <&'a FxHashSet<CfgAtom> as IntoIterator>::Item;
+    type Item = <&'a HashSet<CfgAtom> as IntoIterator>::Item;
 
-    type IntoIter = <&'a FxHashSet<CfgAtom> as IntoIterator>::IntoIter;
+    type IntoIter = <&'a HashSet<CfgAtom> as IntoIterator>::IntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
-        <&FxHashSet<CfgAtom> as IntoIterator>::into_iter(&self.enabled)
+        <&HashSet<CfgAtom> as IntoIterator>::into_iter(&self.enabled)
     }
 }
 

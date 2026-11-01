@@ -7,7 +7,8 @@ use std::{
     mem,
 };
 
-use base_db::{Db, Crate, FxIndexMap};
+use base_db::{Crate, Db, FxIndexMap};
+use blaze_hash::HashSet;
 use either::Either;
 use hir_def::{
     CallableDefId, ExpressionStoreOwnerId, FindPathConfig, GenericDefId, HasModule,
@@ -40,7 +41,6 @@ use rustc_apfloat::{
     ieee::{Half as f16, Quad as f128},
 };
 use rustc_ast_ir::FloatTy;
-use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     AliasTyKind, BoundVarIndexKind, CoroutineArgsParts, InferTy, IsRigid, RegionKind, Upcast,
     inherent::{GenericArgs as _, IntoKind, Term as _, Ty as _, Tys as _},
@@ -58,8 +58,8 @@ use crate::{
     next_solver::{
         AliasConstKind, AliasTy, Allocation, Clause, ClauseKind, Const, ConstKind, DbInterner,
         ExistentialPredicate, FnSig, FreeConstAliasId, GenericArg, GenericArgKind, GenericArgs,
-        InherentAssocConstId, ParamEnv, PolyFnSig, Region, Term, TermId, TermKind, TraitAssocConstId,
-        TraitClause, TraitRef, Ty, TyKind, TypingMode, Unnormalized, ValTree,
+        InherentAssocConstId, ParamEnv, PolyFnSig, Region, Term, TermId, TermKind,
+        TraitAssocConstId, TraitClause, TraitRef, Ty, TyKind, TypingMode, Unnormalized, ValTree,
         abi::Safety,
         infer::{DbInternerInferExt, traits::ObligationCause},
     },
@@ -134,7 +134,7 @@ pub struct HirFormatter<'a, 'db> {
     /// ```
     /// So, record the projection types met while formatting bounds and
     /// prevent recursing into their bounds to avoid infinite loops.
-    currently_formatting_bounds: FxHashSet<AliasTy<'db>>,
+    currently_formatting_bounds: HashSet<AliasTy<'db>>,
     /// Whether formatting `impl Trait1 + Trait2` or `dyn Trait1 + Trait2` needs parentheses around it,
     /// for example when formatting `&(impl Trait1 + Trait2)`.
     trait_bounds_need_parens: bool,

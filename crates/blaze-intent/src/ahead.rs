@@ -6,7 +6,8 @@
 //! Selection is libtest's: a test is selected when its name contains any of the filters, and
 //! every test when there are none.
 
-use blaze_ids::{prehashed::ByHash, radix};
+use blaze_hash::ByHash;
+use blaze_ids::radix;
 use blaze_items::CodeHash;
 use memchr::memmem::Finder;
 

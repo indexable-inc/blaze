@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
+use blaze_hash::{HashMap, HashSet};
 use hegel::TestCase;
 use hegel::generators as gs;
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::*;
 
@@ -82,18 +82,18 @@ struct Sim {
     jobs: u32,
     rank: Vec<u64>,
     /// A parallel map's job and its counter.
-    maps: FxHashMap<u32, CounterId>,
+    maps: HashMap<u32, CounterId>,
     /// Each counter's jobs.
-    counted: FxHashMap<u32, Vec<u32>>,
-    waits: FxHashMap<u32, ModelWait>,
+    counted: HashMap<u32, Vec<u32>>,
+    waits: HashMap<u32, ModelWait>,
     /// Key number to claimer (`None` for the driver's).
-    flights: FxHashMap<u32, Option<u32>>,
+    flights: HashMap<u32, Option<u32>>,
     next_key: u32,
     woken: Vec<u32>,
     /// Cores whose move flag is set.
-    flags: FxHashSet<u32>,
-    ran: FxHashSet<u32>,
-    done: FxHashSet<u32>,
+    flags: HashSet<u32>,
+    ran: HashSet<u32>,
+    done: HashSet<u32>,
 }
 
 const MAX_SIM_JOBS: u32 = 120;
@@ -105,15 +105,15 @@ impl Sim {
             mode,
             jobs: 0,
             rank: Vec::new(),
-            maps: FxHashMap::default(),
-            counted: FxHashMap::default(),
-            waits: FxHashMap::default(),
-            flights: FxHashMap::default(),
+            maps: HashMap::default(),
+            counted: HashMap::default(),
+            waits: HashMap::default(),
+            flights: HashMap::default(),
             next_key: 0,
             woken: Vec::new(),
-            flags: FxHashSet::default(),
-            ran: FxHashSet::default(),
-            done: FxHashSet::default(),
+            flags: HashSet::default(),
+            ran: HashSet::default(),
+            done: HashSet::default(),
         }
     }
 
@@ -224,7 +224,7 @@ impl Sim {
 
     /// Whether the model's waits reach `job` from `wait`.
     fn reaches(&self, job: u32, wait: ModelWait) -> bool {
-        let mut seen = FxHashSet::default();
+        let mut seen = HashSet::default();
         let mut todo: VecDeque<u32> = self.resolve(wait).into();
         while let Some(next) = todo.pop_front() {
             if next == job {

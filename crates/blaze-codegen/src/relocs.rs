@@ -11,9 +11,9 @@ use std::{
     hash::{BuildHasher, Hash},
 };
 
+use blaze_hash::FixedState;
 use blaze_mem::Frame;
 use hashbrown::HashTable;
-use rustc_hash::FxBuildHasher;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -154,13 +154,13 @@ impl<T: Eq + Hash> Distinct<T> {
 
 /// The index of `target` among `targets`, pushed when it is new; `index` finds each by hash.
 fn index_in<T: Eq + Hash, A: Allocator>(targets: &mut Vec<T>, index: &mut HashTable<u32, A>, target: T) -> u32 {
-    let hash = FxBuildHasher.hash_one(&target);
+    let hash = FixedState.hash_one(&target);
     if let Some(&at) = index.find(hash, |&at| targets[at as usize] == target) {
         return at;
     }
     let at = u32::try_from(targets.len()).expect("fewer than 2^32 targets");
     targets.push(target);
-    index.insert_unique(hash, at, |&at| FxBuildHasher.hash_one(&targets[at as usize]));
+    index.insert_unique(hash, at, |&at| FixedState.hash_one(&targets[at as usize]));
     at
 }
 
@@ -476,11 +476,11 @@ fn check_parts<T: Eq + Hash, A: Allocator>(
     }
     let mut index = HashTable::with_capacity_in(targets.len(), alloc);
     for (at, target) in targets.iter().enumerate() {
-        let hash = FxBuildHasher.hash_one(target);
+        let hash = FixedState.hash_one(target);
         if index.find(hash, |&it: &u32| targets[it as usize] == *target).is_some() {
             return Err("a relocation target listed twice");
         }
-        index.insert_unique(hash, at as u32, |&it| FxBuildHasher.hash_one(&targets[it as usize]));
+        index.insert_unique(hash, at as u32, |&it| FixedState.hash_one(&targets[it as usize]));
     }
     if wide.len() != wide_rows {
         return Err("wide addends not one for each wide relocation");

@@ -8,8 +8,8 @@
 //! item cannot be reached where it is declared; a glob from a module that cannot be reached is
 //! inlined item by item; `#[doc(hidden)]` drops the item or the re-export.
 
-use std::sync::Mutex;
-
+use base_db::{Db, LangCrateOrigin};
+use blaze_hash::{HashMap, HashSet, SharedMap};
 use hir::{
     AsAssocItem, AssocItem, AssocItemContainer, Crate, HasAttrs, HasVisibility, Macro, MacroKind,
     Module, ModuleDef, Visibility,
@@ -18,8 +18,6 @@ use hir_def::{
     item_scope::{ImportOrExternCrate, ImportOrGlob},
     per_ns::PerNs,
 };
-use base_db::{Db, LangCrateOrigin};
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     TestOnly,
@@ -66,14 +64,14 @@ pub(crate) struct Places {
     pub(crate) crates: Vec<Documented>,
     /// Each crate's placements; `[0]` is its root module.
     pub(crate) placed: Vec<Vec<Placed>>,
-    canonical: FxHashMap<ModuleDef, (usize, usize)>,
+    canonical: HashMap<ModuleDef, (usize, usize)>,
     /// Each crate's own page of the items it places, inlined ones of other crates included.
-    own: Vec<FxHashMap<ModuleDef, usize>>,
+    own: Vec<HashMap<ModuleDef, usize>>,
     /// The page of an item of a crate not documented here, found once: on doc.rust-lang.org for
     /// the sysroot's crates, under its `html_root_url` for a crate that has one.
-    elsewhere: Mutex<FxHashMap<ModuleDef, Option<ItemRef>>>,
+    elsewhere: SharedMap<ModuleDef, Option<ItemRef>>,
     /// Each crate not documented here: its `html_root_url`.
-    roots: Mutex<FxHashMap<Crate, Option<String>>>,
+    roots: SharedMap<Crate, Option<String>>,
     test_only: TestOnly,
 }
 
@@ -218,7 +216,7 @@ impl<'a> Linking<'a> {
         if self.crates.iter().any(|it| it.krate == krate) {
             return None;
         }
-        if let Some(found) = self.elsewhere.lock().unwrap().get(&def) {
+        if let Some(found) = self.elsewhere.pin().get(&def) {
             return found.clone();
         }
         let found = match lang_crate_name(db, krate) {
@@ -230,19 +228,19 @@ impl<'a> Linking<'a> {
                 it
             }),
         };
-        self.elsewhere.lock().unwrap().insert(def, found.clone());
+        self.elsewhere.pin().insert(def, found.clone());
         found
     }
 
     fn html_root_url(&self, db: &Db, krate: Crate) -> Option<String> {
-        if let Some(found) = self.roots.lock().unwrap().get(&krate) {
+        if let Some(found) = self.roots.pin().get(&krate) {
             return found.clone();
         }
         let found = match krate.root_module(db).definition_source_view(db).value {
             hir::ModuleSourceView::SourceFile(file) => crate::attrs::html_root_url(file),
             _ => None,
         };
-        self.roots.lock().unwrap().insert(krate, found.clone());
+        self.roots.pin().insert(krate, found.clone());
         found
     }
 }
@@ -445,10 +443,10 @@ pub(crate) fn place(db: &Db, crates: Vec<Documented>, test_only: TestOnly) -> Pl
     let placed: Vec<Vec<Placed>> = base_db::par_map(crates.len(), |at| {
         hir::attach_db_allow_change(db, || Walker::new(db, &crates[at]).walk())
     });
-    let mut canonical: FxHashMap<ModuleDef, ((u8, usize), (usize, usize))> = FxHashMap::default();
-    let mut own: Vec<FxHashMap<ModuleDef, usize>> = vec![];
+    let mut canonical: HashMap<ModuleDef, ((u8, usize), (usize, usize))> = HashMap::default();
+    let mut own: Vec<HashMap<ModuleDef, usize>> = vec![];
     for (krate, list) in placed.iter().enumerate() {
-        let mut here: FxHashMap<ModuleDef, ((u8, usize), usize)> = FxHashMap::default();
+        let mut here: HashMap<ModuleDef, ((u8, usize), usize)> = HashMap::default();
         for (at, placed) in list.iter().enumerate() {
             let own = krate_of(db, placed.def) == Some(crates[krate].krate);
             let rank = match (own, placed.via.is_none()) {
@@ -480,8 +478,8 @@ pub(crate) fn place(db: &Db, crates: Vec<Documented>, test_only: TestOnly) -> Pl
         placed,
         canonical: canonical.into_iter().map(|(def, (_, at))| (def, at)).collect(),
         own,
-        elsewhere: Mutex::default(),
-        roots: Mutex::default(),
+        elsewhere: SharedMap::default(),
+        roots: SharedMap::default(),
         test_only,
     }
 }
@@ -492,7 +490,7 @@ struct Walker<'a> {
     private: bool,
     out: Vec<Placed>,
     /// Modules being walked, so a module that re-exports its parent does not loop.
-    walking: FxHashSet<Module>,
+    walking: HashSet<Module>,
 }
 
 impl<'a> Walker<'a> {
@@ -502,7 +500,7 @@ impl<'a> Walker<'a> {
             krate: documented.krate,
             private: documented.private,
             out: vec![],
-            walking: FxHashSet::default(),
+            walking: HashSet::default(),
         }
     }
 
@@ -562,7 +560,7 @@ impl<'a> Walker<'a> {
         let db = self.db;
         let id: hir_def::ModuleId = module.into();
         let scope = id.def_map(db).module(db, id).scope(db);
-        let mut seen_globs = FxHashSet::default();
+        let mut seen_globs = HashSet::default();
         let entries: Vec<(hir::Name, PerNs)> =
             scope.entries().map(|(name, per_ns)| (name.clone(), per_ns)).collect();
         for (name, per_ns) in entries {
@@ -591,7 +589,7 @@ impl<'a> Walker<'a> {
                     item.vis == hir_def::visibility::Visibility::Public,
                 ));
             }
-            let mut done: FxHashSet<ModuleDef> = FxHashSet::default();
+            let mut done: HashSet<ModuleDef> = HashSet::default();
             for (def, import, public) in defs {
                 if !done.insert(def) {
                     continue;
@@ -613,7 +611,7 @@ impl<'a> Walker<'a> {
         def: ModuleDef,
         import: Option<ImportOrExternCrate>,
         public: bool,
-        seen_globs: &mut FxHashSet<hir_def::item_scope::GlobId>,
+        seen_globs: &mut HashSet<hir_def::item_scope::GlobId>,
     ) {
         let db = self.db;
         if matches!(def, ModuleDef::BuiltinType(_) | ModuleDef::EnumVariant(_)) {
@@ -862,8 +860,8 @@ impl UseAttrs {
 impl Places {
     /// The crates a documented crate's docs may link to and list impls from: itself and every
     /// crate it depends on, directly or not, but for its tests alone.
-    pub(crate) fn upstream(&self, db: &Db, krate: Crate) -> FxHashSet<Crate> {
-        let mut seen = FxHashSet::default();
+    pub(crate) fn upstream(&self, db: &Db, krate: Crate) -> HashSet<Crate> {
+        let mut seen = HashSet::default();
         let mut stack = vec![krate];
         while let Some(it) = stack.pop() {
             if seen.insert(it) {
@@ -883,8 +881,8 @@ impl Places {
     /// compiler's own. Of the sysroot's crates, which rust-analyzer makes dependencies of every
     /// crate, `core` is linked; `std` and `alloc` unless the crate is `#![no_std]`, `proc_macro`
     /// for a crate of procedural macros, and any of them the crate names with `extern crate`.
-    pub(crate) fn linked(&self, db: &Db, krate: Crate) -> FxHashSet<Crate> {
-        let mut seen = FxHashSet::default();
+    pub(crate) fn linked(&self, db: &Db, krate: Crate) -> HashSet<Crate> {
+        let mut seen = HashSet::default();
         let mut stack = vec![krate];
         while let Some(it) = stack.pop() {
             if !seen.insert(it) {

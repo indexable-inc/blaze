@@ -13,6 +13,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use base_db::{Db, all_crates};
 use blaze_alloc_count::measure;
 use blaze_format::{Aligned, FormatError, open_as};
+use blaze_hash::HashMap;
 use hir_def::{
     AdtId, ConstId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, FieldId, FunctionId,
     ModuleDefId, StaticId, StructId, UnionId, VariantId,
@@ -20,11 +21,10 @@ use hir_def::{
     hir::{AsmOptions, AsmPiece, ClosureKind, Expr, InlineAsmRegOrRegClass},
     nameres::crate_def_map,
 };
+use hir_expand::fixture;
 use la_arena::{Arena, ArenaMap};
-use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::Ty as _;
 use smallvec::smallvec;
-use hir_expand::fixture;
 
 use super::{MirRoot, SCHEMA, idx, read, write};
 use crate::{
@@ -413,7 +413,7 @@ fn sample<'db>(db: &'db Db, it: &Items<'db>) -> MirBody<'db> {
             },
         ]),
     };
-    let mut upvar_locals = FxHashMap::default();
+    let mut upvar_locals = HashMap::default();
     upvar_locals.insert(
         idx(5),
         vec![
@@ -537,7 +537,7 @@ fn an_empty_body_reads_back_equal() {
         start_block: idx(0),
         owner: InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(it.callee)),
         binding_locals: ArenaMap::default(),
-        upvar_locals: FxHashMap::default(),
+        upvar_locals: HashMap::default(),
         param_locals: Vec::new(),
         promoted_locals: Vec::new(),
         closures: Vec::new(),
@@ -571,7 +571,7 @@ fn equal_bodies_write_equal_bytes() {
     let mut reordered = body.clone(); // clone: a test's copy
     let mut entries: Vec<_> = reordered.upvar_locals.drain().collect();
     entries.reverse();
-    let mut map = FxHashMap::with_capacity_and_hasher(64, Default::default());
+    let mut map = HashMap::with_capacity_and_hasher(64, Default::default());
     map.extend(entries);
     reordered.upvar_locals = map;
     assert_eq!(reordered, body);

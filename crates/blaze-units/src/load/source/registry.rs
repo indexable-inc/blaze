@@ -10,12 +10,12 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use anyhow::bail;
+use blaze_hash::HashMap;
 use blaze_query::{Cancelled, Cx};
 use blaze_resolve::{
     Dependency, IndexSummary, MemRegistry, OptVersionReq, QueryKind, Registry, SourceId,
     query_pinned,
 };
-use rustc_hash::FxHashMap;
 
 use super::{IndexFile, Sources};
 use crate::index::{Lines, index_summary};
@@ -32,7 +32,7 @@ pub(crate) struct Index<'s, 'c, 'db> {
     cx: RefCell<&'c mut Cx<'db>>,
     pinned: MemRegistry,
     /// Each index file read, by its registry and the name asked for.
-    files: RefCell<FxHashMap<SourceId, FxHashMap<String, Rc<Lines>>>>,
+    files: RefCell<HashMap<SourceId, HashMap<String, Rc<Lines>>>>,
     needs: RefCell<Vec<Fetch>>,
     cancelled: Cell<bool>,
 }

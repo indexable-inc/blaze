@@ -8,19 +8,21 @@
 use std::sync::Arc;
 
 use annotate_snippets::{AnnotationKind, Group, Patch, Renderer, Snippet};
+use blaze_hash::HashMap;
 use blaze_ids::radix;
 use hegel::TestCase;
 use hegel::generators as gs;
-use rustc_hash::FxHashMap;
 use serde::Serialize;
 
 use super::{Style, WIDTH};
-use crate::model::{Applicability, Child, Code, Diag, Level, MultiSpan, Span, Sublevel, Suggestion, SuggestionStyle};
+use crate::model::{
+    Applicability, Child, Code, Diag, Level, MultiSpan, Span, Sublevel, Suggestion, SuggestionStyle,
+};
 
 const MAX_SUGGESTIONS: usize = 4;
 
 pub(super) struct Sources {
-    files: FxHashMap<String, Option<Arc<File>>>,
+    files: HashMap<String, Option<Arc<File>>>,
 }
 
 pub(super) struct File {
@@ -691,10 +693,10 @@ fn the_emitter_writes_what_the_reference_wrote(tc: TestCase) {
     let mut ours = super::Sources::of(files.clone());
     let mut theirs = Sources::of(files);
     let rendered = written(&diag, &mut theirs, style);
-    assert_eq!(&super::written(&diag, &mut ours, style), &rendered);
-    let json: serde_json::Value = serde_json::from_str(&super::json(&diag, &mut ours, style)).unwrap();
+    assert_eq!(&super::written(&diag, &mut ours, style).unwrap(), &rendered);
+    let json: serde_json::Value = serde_json::from_str(&super::json(&diag, &mut ours, style).unwrap()).unwrap();
     let expected = serde_json::to_value(self::json(&diag, &mut theirs, rendered.clone())).unwrap();
     assert_eq!(&json, &expected);
-    let given: serde_json::Value = serde_json::from_str(&super::json_rendered(&diag, &mut ours, rendered)).unwrap();
+    let given: serde_json::Value = serde_json::from_str(&super::json_rendered(&diag, &mut ours, rendered).unwrap()).unwrap();
     assert_eq!(given, json);
 }

@@ -18,6 +18,8 @@
 use std::cmp::Ordering;
 
 use base_db::{Crate, Db};
+use blaze_hash::{HashMap, HashSet};
+use blaze_query::db::{AsId, FromId};
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, CallableDefId, DefWithBodyId, FunctionId, GenericParamId, HasModule,
@@ -47,14 +49,10 @@ use hir_ty_mir::mir::{
     StoredPlace, TerminatorKind, is_by_move_coroutine, normalize_or_keep, return_slot,
 };
 use intern::{Symbol, sym};
-use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     Interner as _,
-    inherent::{
-        BoundExistentialPredicates as _, Clause as _, GenericArgs as _, IntoKind as _,
-    },
+    inherent::{BoundExistentialPredicates as _, Clause as _, GenericArgs as _, IntoKind as _},
 };
-use blaze_query::db::{AsId, FromId};
 use smallvec::SmallVec;
 
 use crate::{
@@ -249,9 +247,9 @@ fn reached<'a>(
     db: &Db,
     stored: &StoredParamEnvAndCrate,
     roots: impl Iterator<Item = &'a Instance>,
-) -> (Vec<Instance>, FxHashMap<Instance, u32>) {
+) -> (Vec<Instance>, HashMap<Instance, u32>) {
     let mut order: Vec<Instance> = Vec::new(); // alloc: the instances, once per script
-    let mut index: FxHashMap<Instance, u32> = FxHashMap::default();
+    let mut index: HashMap<Instance, u32> = HashMap::default();
     let mut stack: Vec<(usize, usize)> = Vec::new(); // alloc: the walk's path, once per script
     for root in roots {
         if index.contains_key(root) {
@@ -383,9 +381,9 @@ struct Walk<'a, 'db> {
     sites: Vec<Site>,
     flows: Vec<Flow>,
     own: Option<String>,
-    dropped: FxHashSet<Ty<'db>>,
-    statics: FxHashSet<StaticId>,
-    code: FxHashMap<(Ty<'db>, bool), bool>,
+    dropped: HashSet<Ty<'db>>,
+    statics: HashSet<StaticId>,
+    code: HashMap<(Ty<'db>, bool), bool>,
 }
 
 fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>) -> Summary {
@@ -584,9 +582,9 @@ impl<'a, 'db> Walk<'a, 'db> {
             // alloc: one flow per block, once per body
             flows: vec![Flow::Unknown; body.map_or(0, |it| it.basic_blocks.len())],
             own: None,
-            dropped: FxHashSet::default(),
-            statics: FxHashSet::default(),
-            code: FxHashMap::default(),
+            dropped: HashSet::default(),
+            statics: HashSet::default(),
+            code: HashMap::default(),
         }
     }
 
@@ -1038,11 +1036,11 @@ impl<'a, 'db> Walk<'a, 'db> {
         let trait_ref = cx
             .interner
             .instantiate_bound_regions_with_erased(principal.with_self_ty(cx.interner, concrete));
-        let mut seen = FxHashSet::default();
+        let mut seen = HashSet::default();
         self.trait_methods(trait_ref, &mut seen);
     }
 
-    fn trait_methods(&mut self, trait_ref: TraitRef<'db>, seen: &mut FxHashSet<TraitRef<'db>>) {
+    fn trait_methods(&mut self, trait_ref: TraitRef<'db>, seen: &mut HashSet<TraitRef<'db>>) {
         if !seen.insert(trait_ref) {
             return;
         }
@@ -1147,7 +1145,7 @@ impl<'a, 'db> Walk<'a, 'db> {
             return;
         }
         let mut dyns: SmallVec<[Ty<'db>; 2]> = SmallVec::new();
-        self.scan(ty, true, &mut FxHashSet::default(), &mut dyns);
+        self.scan(ty, true, &mut HashSet::default(), &mut dyns);
         for pointee in map.vtable.tys() {
             match pointee.kind() {
                 TyKind::FnDef(def, args) => {
@@ -1175,7 +1173,7 @@ impl<'a, 'db> Walk<'a, 'db> {
         if let Some(&known) = self.code.get(&(ty, raw)) {
             return known;
         }
-        let holds = self.scan(ty, raw, &mut FxHashSet::default(), &mut SmallVec::new());
+        let holds = self.scan(ty, raw, &mut HashSet::default(), &mut SmallVec::new());
         self.code.insert((ty, raw), holds);
         holds
     }
@@ -1184,7 +1182,7 @@ impl<'a, 'db> Walk<'a, 'db> {
         &self,
         ty: Ty<'db>,
         raw: bool,
-        seen: &mut FxHashSet<Ty<'db>>,
+        seen: &mut HashSet<Ty<'db>>,
         dyns: &mut SmallVec<[Ty<'db>; 2]>,
     ) -> bool {
         let cx = self.cx;

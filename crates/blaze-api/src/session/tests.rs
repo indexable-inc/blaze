@@ -13,6 +13,13 @@ use blaze_query::{Database, QueryKey, QueryKind};
 use blaze_vfs::{Change, ChangeKind, Mode, Op, View, Vfs};
 
 use super::{Daemon, Session};
+
+/// The build a test's daemon says it is: a path, so a Status's copy of it allocates as the
+/// daemon's does.
+static BUILD: std::sync::LazyLock<crate::Build> = std::sync::LazyLock::new(|| crate::Build {
+    id: ContentId([7; 32]),
+    exe: crate::Executable { path: "/opt/blaze/bin/blaze".to_owned(), len: 1 << 20, modified_ns: 5, inode: 6 },
+});
 use crate::{
     ApiError, Arrived, Diagnostic, Edit, Edited, EditedItem, How, Level, Reach, Reply, Request,
     RequestRef, Response, Status, Target, Targets, TestOutcome, TestResult, Ub, ViewRef,
@@ -66,6 +73,7 @@ impl World {
             db: &self.db,
             builder: &mut self.builder,
             pid: 30,
+            build: &BUILD,
             memory_bytes: 10,
             budget_bytes: 20,
             memory: counters,
@@ -454,7 +462,8 @@ fn status_lists_every_connections_requests_sorted() {
     world.request(2, 8, Request::Check { view: head("main"), targets: targets() });
     world.request(1, 5, Request::Check { view: head("main"), targets: targets() });
     world.request(1, 1, Request::Open { view: head("main") });
-    let status = Status { pid: 30, requests: vec![5, 8], views: 3, history: None, memory_bytes: 10, budget_bytes: 20 };
+    let status =
+        Status { pid: 30, requests: vec![5, 8], views: 3, history: None, memory_bytes: 10, budget_bytes: 20, build: BUILD.clone() };
     assert_eq!(world.request(3, 1, Request::Status), [reply(3, 1, Response::Status(status)), done(3, 1, true)]);
 }
 
@@ -474,6 +483,7 @@ fn a_warm_status_allocates_only_its_replys_list_of_requests() {
             db: &*db,
             builder,
             pid: 30,
+            build: &BUILD,
             memory_bytes: 10,
             budget_bytes: 20,
             memory: counters,
@@ -482,7 +492,7 @@ fn a_warm_status_allocates_only_its_replys_list_of_requests() {
         };
         let from = to(2, id);
         let arrived = Arrived::Request { from, request: Request::Status };
-        blaze_alloc_count::assert_at_most(1, "a warm Status: its reply's list of requests", || {
+        blaze_alloc_count::assert_at_most(2, "a warm Status: its reply's list of requests and its executable's path", || {
             session.arrive(&mut cx, arrived, &mut out)
         });
         let status = Status {
@@ -492,6 +502,7 @@ fn a_warm_status_allocates_only_its_replys_list_of_requests() {
             history: None,
             memory_bytes: 10,
             budget_bytes: 20,
+            build: BUILD.clone(),
         };
         assert_eq!(out, [reply(2, id, Response::Status(status)), done(2, id, true)]);
     }
@@ -821,6 +832,7 @@ fn a_warm_start_and_finish_of_a_job_allocates_nothing() {
             db: &*db,
             builder: &mut *builder,
             pid: 30,
+            build: &BUILD,
             memory_bytes: 10,
             budget_bytes: 20,
             memory: counters,
@@ -837,6 +849,7 @@ fn a_warm_start_and_finish_of_a_job_allocates_nothing() {
             db: &*db,
             builder: &mut *builder,
             pid: 30,
+            build: &BUILD,
             memory_bytes: 10,
             budget_bytes: 20,
             memory: counters,

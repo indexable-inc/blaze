@@ -4,7 +4,7 @@
 
 use std::{
     path::PathBuf,
-    sync::{Arc, atomic::AtomicBool},
+    sync::Arc,
     time::Instant,
 };
 
@@ -76,9 +76,9 @@ impl Answer {
 }
 
 /// The answer to `request`. `hello` is the session's to answer; asked here it is a bug of the
-/// caller, said as `bad_args`. Setting `stop` kills a DuckDB query under way, answered
-/// `cancelled`.
-pub(crate) fn answer(cx: &Context, request: Request, stop: &AtomicBool) -> Result<Answer, WireError> {
+/// caller, said as `bad_args`. A message on `stop`, or its sender gone, kills a DuckDB query under
+/// way, answered `cancelled`.
+pub(crate) fn answer(cx: &Context, request: Request, stop: &sql::Stop) -> Result<Answer, WireError> {
     match request {
         Request::Hello { .. } => Err(WireError::new(Kind::BadArgs, "hello is answered by the session")),
         Request::Builds {} => {
@@ -152,7 +152,7 @@ fn overlapping(build: u64, t0_ns: i64, t1_ns: i64) -> String {
 }
 
 /// Runs `sql` over the history.
-fn run(cx: &Context, sql: &str, stop: &AtomicBool) -> Result<Vec<RecordBatch>, WireError> {
+fn run(cx: &Context, sql: &str, stop: &sql::Stop) -> Result<Vec<RecordBatch>, WireError> {
     let Some(duckdb) = &cx.history.duckdb else {
         let message = "the daemon was started with no DuckDB to query the history with: \
                        `blaze explore` passes the one `nix run .#duckdb` pins";
@@ -175,7 +175,7 @@ fn run(cx: &Context, sql: &str, stop: &AtomicBool) -> Result<Vec<RecordBatch>, W
 }
 
 /// The answer of op `op`: the result of `sql`, the SQL in the header; and its row count.
-fn query(cx: &Context, op: &'static str, sql: &str, stop: &AtomicBool) -> Result<(Answer, usize), WireError> {
+fn query(cx: &Context, op: &'static str, sql: &str, stop: &sql::Stop) -> Result<(Answer, usize), WireError> {
     let batches = run(cx, sql, stop)?;
     let table = Table::of(batches);
     let rows = table.as_ref().map_or(0, Table::rows);
@@ -183,7 +183,7 @@ fn query(cx: &Context, op: &'static str, sql: &str, stop: &AtomicBool) -> Result
 }
 
 /// `Ok` when the history has build `build`, else `no_such_build`.
-fn known_build(cx: &Context, build: u64, stop: &AtomicBool) -> Result<(), WireError> {
+fn known_build(cx: &Context, build: u64, stop: &sql::Stop) -> Result<(), WireError> {
     let found = run(cx, &format!("SELECT build_id FROM builds WHERE build_id = {build} LIMIT 1"), stop)?;
     if found.iter().any(|it| it.num_rows() > 0) {
         return Ok(());
@@ -263,7 +263,7 @@ mod tests {
     use super::*;
 
     fn answer(cx: &Context, request: Request) -> Result<Answer, WireError> {
-        super::answer(cx, request, &AtomicBool::new(false))
+        super::answer(cx, request, &crossbeam_channel::never())
     }
 
     fn cx() -> Context {

@@ -26,10 +26,10 @@ use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::radix;
 use blaze_inproc::ask;
 use blaze_mem::{Handle, Slab, Tag};
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::LazyId;
 
@@ -97,11 +97,11 @@ pub struct Fetcher {
     target: Vec<u64>,
     queues: [VecDeque<LazyId>; PRIORITIES],
     /// The first and last waiter of each function being asked for.
-    waiters: FxHashMap<u32, (Handle<Waiting>, Handle<Waiting>)>,
+    waiters: HashMap<u32, (Handle<Waiting>, Handle<Waiting>)>,
     waiting: Slab<Waiting>,
-    failures: FxHashMap<u32, Arc<str>>,
+    failures: HashMap<u32, Arc<str>>,
     /// Whether a failed function was asked for: stopped once.
-    stopped: FxHashSet<u32>,
+    stopped: HashSet<u32>,
     workers: u32,
     running: u32,
     running_background: u32,
@@ -120,10 +120,10 @@ impl Fetcher {
             priority: vec![Priority::Idle; count], // alloc: setup, a column per run
             target: vec![0; count], // alloc: setup, a column per run
             queues: Default::default(),
-            waiters: FxHashMap::default(),
+            waiters: HashMap::default(),
             waiting,
-            failures: FxHashMap::default(),
-            stopped: FxHashSet::default(),
+            failures: HashMap::default(),
+            stopped: HashSet::default(),
             workers: workers.max(1),
             running: 0,
             running_background: 0,

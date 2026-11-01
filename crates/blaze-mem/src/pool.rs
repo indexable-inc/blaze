@@ -264,7 +264,7 @@ impl<'p, T> Cache<'p, T> {
     pub fn alloc(&mut self, value: T) -> Pooled<'p, T> {
         match self.try_alloc(value) {
             Ok(pooled) => pooled,
-            Err(error) => fail(error),
+            Err(error) => fail(&error),
         }
     }
 
@@ -499,7 +499,7 @@ impl<'p, T> Cache<'p, Counted<T>> {
     pub fn share(&mut self, value: T) -> Shared<'p, T> {
         match self.try_share(value) {
             Ok(shared) => shared,
-            Err(error) => fail(error),
+            Err(error) => fail(&error),
         }
     }
 }
@@ -523,19 +523,20 @@ impl<'p, E: Clone, const N: usize> Cache<'p, Counted<[E; N]>> {
         let slot = ptr.as_ptr();
         // SAFETY: a free slot is committed, aligned for `Counted<[E; N]>`, holds no value and is
         // held by this cache alone; its fields are written through raw pointers, never read.
-        let items = unsafe {
-            (&raw mut (*slot).owners).write(AtomicU32::new(1));
-            (&raw mut (*slot).value).cast::<E>()
-        };
+        let owners = unsafe { &raw mut (*slot).owners };
+        // SAFETY: as above: the slot's count, written once, before anything reads it.
+        unsafe { owners.write(AtomicU32::new(1)) };
+        // SAFETY: as above: a place of the slot, taken without reading it.
+        let items = unsafe { &raw mut (*slot).value }.cast::<E>();
         let mut written = Written { pool: self.pool, index, items, len: 0 };
         for item in head {
             // SAFETY: `written.len < head.len() <= N`: in the array, and nothing is there yet.
-            unsafe { items.add(written.len).write(item.clone()) }; // clone: the copy into the slot is this call's work
+            unsafe { items.wrapping_add(written.len).write(item.clone()) }; // clone: the copy into the slot is this call's work
             written.len += 1;
         }
         while written.len < N {
             // SAFETY: as above, `written.len < N`.
-            unsafe { items.add(written.len).write(fill.clone()) }; // clone: the copy into the slot is this call's work
+            unsafe { items.wrapping_add(written.len).write(fill.clone()) }; // clone: the copy into the slot is this call's work
             written.len += 1;
         }
         mem::forget(written);
@@ -548,7 +549,7 @@ impl<'p, E: Clone, const N: usize> Cache<'p, Counted<[E; N]>> {
     pub fn share_from(&mut self, head: &[E], fill: &E) -> Shared<'p, [E; N]> {
         match self.try_share_from(head, fill) {
             Ok(shared) => shared,
-            Err(error) => fail(error),
+            Err(error) => fail(&error),
         }
     }
 }

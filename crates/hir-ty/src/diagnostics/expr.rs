@@ -3,6 +3,7 @@
 //! fields, etc.
 
 use base_db::Db;
+use blaze_hash::HashSet;
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, CallableDefId, DefWithBodyId, EnumVariantId, HasModule, ItemContainerId,
@@ -13,7 +14,6 @@ use hir_def::{
     resolver::{ValueNs, resolver_for_scope},
 };
 use intern::sym;
-use rustc_hash::FxHashSet;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
 use syntax::{AstNode, ast};
 
@@ -439,7 +439,7 @@ pub fn record_literal_missing_fields<'db>(
 
     let variant_data = variant_def.fields(db);
 
-    let specified_fields: FxHashSet<_> = fields.iter().map(|f| &f.name).collect();
+    let specified_fields: HashSet<_> = fields.iter().map(|f| &f.name).collect();
     // don't show missing fields if:
     // - has ..expr
     // - or has default value + ..
@@ -493,7 +493,7 @@ pub fn record_pattern_missing_fields<'db>(
 
     let variant_data = variant_def.fields(db);
 
-    let specified_fields: FxHashSet<_> = fields.iter().map(|f| &f.name).collect();
+    let specified_fields: HashSet<_> = fields.iter().map(|f| &f.name).collect();
     // don't show missing fields if:
     // - in code
     // - or has ..

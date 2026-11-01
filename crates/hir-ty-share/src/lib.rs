@@ -21,7 +21,9 @@
 //!
 //! Every query is the query database's, memoized by (instance, environment, options): a hit is one lookup.
 //! A cycle of instances (polymorphic recursion, a recursive type's drop glue) gives every
-//! instance in it [`Unshared::Recursive`], the same whichever is asked first.
+//! instance in it [`Unshared::Recursive`], the same whichever is asked first. A chain whose
+//! arguments grow with each call has no cycle and no end: past the `#![recursion_limit]` of
+//! the crate it started in, it stops the build ([`Unshared::RecursionLimit`]).
 
 #![forbid(unsafe_code)]
 
@@ -228,6 +230,25 @@ pub enum Unshared {
     Unhashable(String),
     /// The body has a place whose type the key does not read.
     Shape(&'static str),
+    /// A chain of calls instantiates one body more times than the `#![recursion_limit]` of
+    /// the crate the chain started in (rustc's collector, `check_recursion_limit`): arguments
+    /// that grow with each call (`fn f<T>(x: T) { f((x,)) }`) never end. The build stops; it
+    /// is never keyed by the instance's arguments in place of a share key.
+    RecursionLimit {
+        /// The crate the chain started in, whose limit it is.
+        krate: String,
+        /// The body instantiated past the limit.
+        body: String,
+        /// How many times the body is on the chain, this instance with them.
+        depth: u32,
+        limit: u32,
+        /// The instance past the limit.
+        instance: String,
+        /// The chain's first ten and last three instances, each its callee with its
+        /// arguments, outermost first, and how many are between: the first ten name where the
+        /// arguments begin to grow, which rustc's instances never do in a program it builds.
+        chain: Vec<String>,
+    },
 }
 
 impl fmt::Display for Unshared {
@@ -244,6 +265,13 @@ impl fmt::Display for Unshared {
             Unshared::ConstEval(what) => write!(f, "a constant: {what}"),
             Unshared::Unhashable(what) => f.write_str(what),
             Unshared::Shape(what) => write!(f, "its body has {what}, whose type the key does not read"),
+            Unshared::RecursionLimit { krate, body, depth, limit, instance, chain } => write!(
+                f,
+                "reached the recursion limit while instantiating `{instance}`: `{body}` is instantiated \
+                 {depth} times in one chain of calls, past crate `{krate}`'s recursion_limit of {limit} \
+                 (`#![recursion_limit = \"N\"]` raises it); the chain: {}",
+                chain.join(" -> ")
+            ),
         }
     }
 }

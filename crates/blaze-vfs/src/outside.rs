@@ -34,11 +34,11 @@ use std::{
 };
 
 use blaze_core::{Completion, Done, Effect, FileName, Tag};
+use blaze_hash::FixedHasher;
 use blaze_mem::{AppendVec, MemError, RegionVec};
-use rustc_hash::FxHasher;
 
 use crate::sync::{
-    Mutex, PoisonError,
+    Mutex,
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 
@@ -128,7 +128,7 @@ struct Hot {
 /// The directories watched outside every view, append-only, in columns over reserved regions
 /// tagged [`blaze_mem::Tag::Vfs`] that one writer (under `adding`) appends to and readers read
 /// with no lock: never moved, so nothing is copied as they grow and a `&` into them lives as long
-/// as the table. A directory is found by an `FxHash` of its bytes in an open-addressed index of
+/// as the table. A directory is found by a hash of its bytes in an open-addressed index of
 /// `u64` places (the hash's high half and the number plus one, 0 empty), grown by rehashing into
 /// a table twice the size laid after it in `places`, the old ones kept for readers still probing
 /// them. A lookup compares the bytes, so two paths of one hash are two directories.
@@ -170,7 +170,7 @@ fn tag(key: &[u8]) -> u32 {
 /// Calls `each(end, tag)` for each directory at or above `bytes`, shortest first: `bytes[..end]`
 /// and its [`tag`], in one pass over the bytes. Stops when `each` says false.
 fn prefixes(bytes: &[u8], mut each: impl FnMut(usize, u32) -> bool) {
-    let mut hasher = FxHasher::default();
+    let mut hasher = FixedHasher::default();
     let mut start = 0;
     for at in 0..=bytes.len() {
         if at < bytes.len() && !is_separator(bytes[at]) {
@@ -329,7 +329,7 @@ impl Dirs {
         if self.covered(key) {
             return;
         }
-        let _adding = self.adding.lock().unwrap_or_else(PoisonError::into_inner);
+        let _adding = self.adding.lock();
         if self.covered(key) {
             return;
         }

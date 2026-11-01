@@ -15,8 +15,8 @@
 
 use std::{fmt, hash::Hash, sync::Arc};
 
+use blaze_hash::{HashMap, HashSet};
 use intern::{Interned, Symbol, impl_internable};
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{Aggregate, DebugType, Field, Tag, TypeIndex, Variant};
 
@@ -86,7 +86,7 @@ pub(super) trait Found {
 pub(super) fn resolve<F: Found>(found: &mut F, key: &F::Key) -> Option<TypeSet> {
     // alloc: empty, allocates nothing on a hit; filled once per type no set was kept of
     let (stack, parts) = (Vec::new(), Vec::new());
-    let mut search = Search { found, on: FxHashMap::default(), stack, parts };
+    let mut search = Search { found, on: HashMap::default(), stack, parts };
     match search.key(key, 0).0 {
         Seen::Done(Some(Part::Type(set))) => Some(set),
         _ => None,
@@ -106,7 +106,7 @@ enum Seen {
 struct Search<'a, F: Found> {
     found: &'a mut F,
     /// The place on `stack` of each type there.
-    on: FxHashMap<F::Key, usize>,
+    on: HashMap<F::Key, usize>,
     stack: Vec<Pending<F::Key>>,
     /// The parts of the [`Node`] being made, for [`node`].
     parts: Vec<Option<Part>>,
@@ -378,7 +378,7 @@ impl TypeSet {
 
     /// The set of the first of `types`, which name each other by their places among them.
     fn of_list(types: &[DebugType]) -> TypeSet {
-        let mut listed = Listed { types, sets: FxHashMap::default() };
+        let mut listed = Listed { types, sets: HashMap::default() };
         resolve(&mut listed, &0).unwrap_or_else(|| {
             let told = Told::Struct(Shape {
                 name: Symbol::intern("()"),
@@ -400,7 +400,7 @@ impl PartialEq for TypeSet {
     /// Whether the two tell the same: types made of each other are the same where nothing
     /// else tells them apart.
     fn eq(&self, other: &Self) -> bool {
-        fn same(one: &TypeSet, other: &TypeSet, assumed: &mut FxHashSet<(usize, usize)>) -> bool {
+        fn same(one: &TypeSet, other: &TypeSet, assumed: &mut HashSet<(usize, usize)>) -> bool {
             if one.at() == other.at() || !assumed.insert((one.at(), other.at())) {
                 return true;
             }
@@ -412,7 +412,7 @@ impl PartialEq for TypeSet {
                     _ => false,
                 })
         }
-        same(self, other, &mut FxHashSet::default())
+        same(self, other, &mut HashSet::default())
     }
 }
 
@@ -444,9 +444,9 @@ struct Flat {
     /// not looked up yet.
     types: Vec<(Interned<Told>, Vec<Option<TypeIndex>>)>,
     /// The place of each type already in the list, by where it is.
-    places: FxHashMap<usize, TypeIndex>,
+    places: HashMap<usize, TypeIndex>,
     /// The first type of each name in the list.
-    names: FxHashMap<Symbol, TypeIndex>,
+    names: HashMap<Symbol, TypeIndex>,
     /// The [`Part::Named`]s, by the type and the part, to look up once all are in.
     named: Vec<(TypeIndex, usize, Symbol)>,
 }
@@ -485,7 +485,7 @@ impl Flat {
 /// A list of types read from the store, for [`resolve`] to put a set together from.
 struct Listed<'a> {
     types: &'a [DebugType],
-    sets: FxHashMap<TypeIndex, Option<TypeSet>>,
+    sets: HashMap<TypeIndex, Option<TypeSet>>,
 }
 
 impl Found for Listed<'_> {
@@ -706,7 +706,7 @@ mod tests {
 
     /// Types by their names, each made of the ones it names.
     #[derive(Default)]
-    struct Named(Vec<(&'static str, Vec<&'static str>)>, FxHashMap<&'static str, Option<TypeSet>>);
+    struct Named(Vec<(&'static str, Vec<&'static str>)>, HashMap<&'static str, Option<TypeSet>>);
 
     impl Found for Named {
         type Key = &'static str;
@@ -733,7 +733,7 @@ mod tests {
     fn a_type_made_of_itself_through_a_parameter() {
         // `struct Tree { children: Vec<Tree> }`, as the parameter of the `Vec` names it.
         let types = vec![("Tree", vec!["Vec<Tree>", "u8"]), ("Vec<Tree>", vec!["Tree"])];
-        let mut found = Named(types, FxHashMap::default());
+        let mut found = Named(types, HashMap::default());
         let tree = resolve(&mut found, &"Tree").unwrap();
         assert_eq!(part(&tree, &[0, 0]).at(), tree.at());
         // The `u8`, which nothing tells of, is left out with its parameter.
@@ -760,7 +760,7 @@ mod tests {
         let names: Vec<&'static str> =
             (0..40).map(|at| &*Box::leak(format!("T{at}").into_boxed_str())).collect();
         let types = names.iter().map(|name| (*name, names.clone())).collect();
-        let mut found = Named(types, FxHashMap::default());
+        let mut found = Named(types, HashMap::default());
         let set = resolve(&mut found, &names[0]).unwrap();
         assert_eq!(set.to_vec().len(), 40);
         assert_eq!(found.1.len(), 40);

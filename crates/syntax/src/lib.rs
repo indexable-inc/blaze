@@ -430,7 +430,7 @@ impl ast::Expr {
     pub fn parse(text: &str, edition: Edition) -> Parse<ast::Expr> {
         let _p = tracing::info_span!("Expr::parse").entered();
         let (tree, errors) =
-            parsing::parse_text_at(text.into(), parser::TopEntryPoint::Expr, edition);
+            parsing::parse_text_at(&text.into(), parser::TopEntryPoint::Expr, edition);
         let root = tree.root();
 
         assert!(
@@ -448,7 +448,7 @@ impl ast::MacroStmts {
     pub fn parse(text: &str, edition: Edition) -> Parse<ast::MacroStmts> {
         let _p = tracing::info_span!("MacroStmts::parse").entered();
         let (tree, errors) =
-            parsing::parse_text_at(text.into(), parser::TopEntryPoint::MacroStmts, edition);
+            parsing::parse_text_at(&text.into(), parser::TopEntryPoint::MacroStmts, edition);
         assert_eq!(tree.root().kind(), SyntaxKind::MACRO_STMTS);
         Parse::new(tree, errors)
     }
@@ -461,11 +461,11 @@ impl<T> Drop for Parse<T> {
         let Some(tree) = self.tree.take().and_then(Tree::into_unique) else {
             return;
         };
-        static PARSE_DROP_THREAD: std::sync::OnceLock<std::sync::mpsc::Sender<FlatTree>> =
+        static PARSE_DROP_THREAD: std::sync::OnceLock<crossbeam_channel::Sender<FlatTree>> =
             std::sync::OnceLock::new();
         PARSE_DROP_THREAD
             .get_or_init(|| {
-                let (sender, receiver) = std::sync::mpsc::channel::<FlatTree>();
+                let (sender, receiver) = crossbeam_channel::unbounded::<FlatTree>();
                 std::thread::Builder::new()
                     .name("ParseNodeDropper".to_owned())
                     .spawn(move || {
@@ -475,6 +475,7 @@ impl<T> Drop for Parse<T> {
                             // then drain the entire channel
                             while receiver.try_recv().is_ok() {}
                             // and sleep for a bit
+                            #[allow(clippy::disallowed_methods, reason = "a thread of its own that batches drops: no job waits on it")]
                             std::thread::sleep(std::time::Duration::from_millis(100));
                         }
                         // why do this over just a `receiver.iter().for_each(drop)`? To reduce contention on the channel lock.
@@ -500,7 +501,7 @@ impl SourceFile {
     /// A full parse of `text`, whose tree shares it: the parse costs the tree's arrays only.
     pub fn parse_shared(text: impl Into<Text>, edition: Edition) -> Parse<SourceFile> {
         let _p = tracing::info_span!("SourceFile::parse").entered();
-        let (tree, errors) = parsing::parse_text(text.into(), edition, false);
+        let (tree, errors) = parsing::parse_text(&text.into(), edition, false);
         let root = tree.root();
 
         assert_eq!(root.kind(), SyntaxKind::SOURCE_FILE);
@@ -514,7 +515,7 @@ impl SourceFile {
     /// Its errors: [`Parse::errors`], [`Parse::errors_with_bodies`].
     pub fn parse_outline(text: impl Into<Text>, edition: Edition) -> Parse<SourceFile> {
         let _p = tracing::info_span!("SourceFile::parse_outline").entered();
-        let (tree, errors) = parsing::parse_text(text.into(), edition, true);
+        let (tree, errors) = parsing::parse_text(&text.into(), edition, true);
         let root = tree.root();
 
         assert_eq!(root.kind(), SyntaxKind::SOURCE_FILE);

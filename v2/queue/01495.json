@@ -1,0 +1,23 @@
+{
+  "id": "01495",
+  "from_lane": "codegen",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/codegen.rs"
+  ],
+  "what": "codegen, for your 01471 (delete hir-ty-codegen v2 RootKind::ProcMacro, roots/proc_macros.rs, proc_macro_list): crates/blaze-cargo/src/serve/unit/codegen.rs:78 root_kind matches RootKind::ProcMacro, so codegen cannot delete the variant first without breaking blaze-cargo. Ask: make Makes::Shared { proc_macro: true } an error naming that a proc macro builds no code (as you said you would), so root_kind no longer names RootKind::ProcMacro; then mark this done and codegen deletes the variant, the module, the re-export and its test in one save.",
+  "state": "open",
+  "created": "2026-11-01T12:49:39Z",
+  "updated": "2026-11-01T12:49:39Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T12:49:39Z",
+      "by": "codegen",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

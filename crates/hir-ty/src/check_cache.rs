@@ -19,12 +19,12 @@ mod tests;
 use std::sync::{Arc, LazyLock};
 
 use base_db::{Crate, Db};
+use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Domain, Hasher};
 use hir_def::{
     DefWithBodyId, HasModule,
     deps::{Held as _, ImageBuf, body_key, crate_name},
 };
-use rustc_hash::FxHashMap;
 
 pub(crate) use self::ids::{Relocate, id_bits, id_of, in_scope, outside};
 use self::{
@@ -77,7 +77,7 @@ pub fn open(bytes: &[u8]) -> Result<(), String> {
 /// Has `db` serve the bodies of each crate of `parts` from its part, which [`open`] accepted:
 /// one that does not open here is a panic naming its crate. The same parts as now (the same
 /// buffers) change nothing.
-pub fn set_served(db: &mut Db, parts: FxHashMap<Crate, ImageBuf>) {
+pub fn set_served(db: &mut Db, parts: HashMap<Crate, ImageBuf>) {
     use blaze_query::db::{Durability, Setter};
     for (&krate, buf) in &parts {
         if let Err(why) = part::open(buf.bytes()) {
@@ -139,7 +139,7 @@ pub(crate) struct ServedBodies {
 /// The parts, by crate. Compares by identity: [`set_served`] gives a new one only when a part
 /// changed.
 #[derive(Clone)]
-pub(crate) struct Served(Arc<FxHashMap<Crate, ImageBuf>>);
+pub(crate) struct Served(Arc<HashMap<Crate, ImageBuf>>);
 
 impl PartialEq for Served {
     fn eq(&self, other: &Served) -> bool {

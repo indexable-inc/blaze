@@ -7,24 +7,25 @@
 use std::{
     cell::RefCell,
     fmt::Write,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, OnceLock},
 };
 
+use blaze_hash::HashMap;
+use blaze_query::db::FromId;
 use hir_def::{
     AdtId, AssocItemId, CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup, ModuleDefId,
     StaticId, TraitId, expr_store::Body, item_scope::ItemScope, nameres::crate_def_map,
 };
 use hir_expand::{HirFileId, MacroCallKind};
+use parking_lot::Mutex;
 use rustc_ast_ir::Mutability;
-use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     AliasTy, AliasTyKind, BoundVarIndexKind, ExistentialPredicate, GenericArgKind, RegionKind,
     inherent::{IntoKind, Safety as _, Term as _},
 };
-use blaze_query::db::FromId;
 use span::ErasedFileAstId;
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 
 use super::{Instance, InstanceDef, SymbolResolver};
 use hir_ty::{
@@ -125,8 +126,8 @@ fn declared(
 /// The statics and the functions without type parameters that one build of a crate declares.
 #[derive(Default)]
 struct Listed {
-    statics: FxHashMap<String, StaticId>,
-    functions: FxHashMap<String, Vec<FunctionId>>,
+    statics: HashMap<String, StaticId>,
+    functions: HashMap<String, Vec<FunctionId>>,
 }
 
 /// A file by its path as `named` has it, or for what a macro wrote by the call that wrote it.

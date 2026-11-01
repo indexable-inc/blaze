@@ -4,10 +4,16 @@
 //! non-const one of the same call; the message and span of a desugaring follow std's types,
 //! which minicore's don't spell the same, so those tests check the kind and code.
 
-use hir_def::{AssocItemId, DefWithBodyId, expr_store::Body};
+use hir_def::{
+    AssocItemId, DefWithBodyId,
+    expr_store::{Body, ExpressionStore},
+};
+use hir_ty::InferenceResult;
 use hir_ty_mir::mir::{
     MirSpan,
-    const_check::{ClosureNote, ConstCheckDiagnostic, ConstCheckKind, Desugaring, const_check},
+    const_check::{
+        ClosureNote, ConstCheckDiagnostic, ConstCheckKind, Desugaring, anon_const_check, const_check,
+    },
 };
 use hir_expand::fixture;
 
@@ -42,6 +48,44 @@ fn check(
         };
         const_check(&db, def).diagnostics.iter().map(|it| (it.clone(), at(it.span))).collect()
     })
+}
+
+/// What `anon_const_check` reports in each anonymous constant of the function `name`'s body,
+/// with the text its span covers.
+#[track_caller]
+fn check_anon_consts(minicore: &str, src: &str, name: &str) -> Vec<(ConstCheckDiagnostic, String)> {
+    let fx = fixture::db(&format!("//- minicore: {minicore}\n{src}"));
+    let _ = fx.only_file();
+    let db = fx.into_db();
+    hir_ty::attach_db(&db, || {
+        let func = function(&db, name);
+        let mut found = Vec::new();
+        for &konst in InferenceResult::of(&db, func).defined_anon_consts() {
+            let map = ExpressionStore::with_source_map(&db, konst.loc(&db).owner).1;
+            for it in &anon_const_check(&db, konst).diagnostics {
+                let MirSpan::ExprId(expr) = it.span else { panic!("a span of no expression: {:?}", it.span) };
+                let range = map.expr_syntax(expr).expect("written syntax").value.text_range();
+                let text = src[usize::from(range.start())..usize::from(range.end())].to_owned();
+                found.push((it.clone(), text));
+            }
+        }
+        found
+    })
+}
+
+/// `[0; f(2)]` in a function that is no const context: the array length is a constant of its
+/// own, which rustc const checks, and a call of a function that is not `const` is refused there.
+#[test]
+fn a_non_const_call_in_an_array_length_is_refused() {
+    let src = "fn f(x: usize) -> usize { x }\nfn main() {\n    let _ = [0u8; f(2)];\n}\n";
+    let found = check_anon_consts("sized", src, "main");
+    let [(refused, at)] = &found[..] else { panic!("{} diagnostics", found.len()) };
+    assert_eq!(at, "f(2)");
+    assert_eq!(refused.code, "E0015");
+    assert!(matches!(refused.kind, ConstCheckKind::NonConstFn { conditionally: false, .. }));
+    assert!(refused.message.contains("`f`") && refused.message.contains("constants"), "{}", refused.message);
+    let callable = src.replace("fn f", "const fn f");
+    assert_eq!(reported(&check_anon_consts("sized", &callable, "main")), NONE);
 }
 
 /// The code, message and source text of each diagnostic.

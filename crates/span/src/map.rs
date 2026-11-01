@@ -995,7 +995,7 @@ mod tests {
                 let want = RealSpanMap::from_file(file(), &filtered, range.len());
                 let within = map.within(range);
                 assert_eq!(within, want, "{n} anchors, within {range:?}");
-                let hash = |it: &RealSpanMap| rustc_hash::FxBuildHasher.hash_one(it);
+                let hash = |it: &RealSpanMap| blaze_hash::FixedState.hash_one(it);
                 assert_eq!(hash(&within), hash(&want));
                 assert_eq!(map.start_of(ast_id, start), want_start(&pairs, ast_id, start));
             }
@@ -1079,7 +1079,7 @@ mod tests {
             for (b, b_lengths) in &maps {
                 assert_eq!(a == b, a_lengths == b_lengths);
                 if a == b {
-                    let hash = |it: &RealSpanMap| rustc_hash::FxBuildHasher.hash_one(it);
+                    let hash = |it: &RealSpanMap| blaze_hash::FixedState.hash_one(it);
                     assert_eq!(hash(a), hash(b));
                 }
             }
@@ -1259,7 +1259,7 @@ mod tests {
             for (b, b_pairs) in &maps {
                 assert_eq!(a == b, a_pairs.0 == b_pairs.0);
                 if a == b {
-                    let hash = |it: &SpanMap| rustc_hash::FxBuildHasher.hash_one(it);
+                    let hash = |it: &SpanMap| blaze_hash::FixedState.hash_one(it);
                     assert_eq!(hash(a), hash(b));
                 }
             }

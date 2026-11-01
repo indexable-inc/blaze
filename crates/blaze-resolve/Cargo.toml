@@ -15,9 +15,9 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-source.workspace = true
-rustc-hash.workspace = true
 cargo-platform.workspace = true
 imbl.workspace = true
 semver.workspace = true
@@ -29,6 +29,8 @@ unicode-ident.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+blaze-spin.workspace = true
+parking_lot.workspace = true
 serde_json.workspace = true
 
 [lints]

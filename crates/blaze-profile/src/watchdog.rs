@@ -11,7 +11,7 @@
 
 use std::{fmt, time::Duration};
 
-use crate::flight::{self, ThreadNow};
+use crate::flight::{self, OpenSpan, ThreadNow};
 
 /// How much of the flight recorder a stall keeps: the stretch it was quiet and some before.
 const KEPT: Duration = Duration::from_secs(120);
@@ -115,18 +115,70 @@ impl fmt::Display for Stall {
             return f.write_str("; no thread is inside a span");
         }
         f.write_str("; the threads inside spans:")?;
-        for thread in &self.threads {
-            write!(f, "\n  {} (tid {}):", thread.name, thread.tid)?;
-            for (i, span) in thread.open.iter().enumerate() {
-                let sep = if i == 0 { " " } else { " > " };
-                write!(f, "{sep}{} ({:.1} s)", span.name, secs(span.for_ns))?;
-            }
-            if thread.deeper > 0 {
-                write!(f, " > {} more", thread.deeper)?;
+        threads(f, &self.threads)
+    }
+}
+
+/// What every thread is inside now, read on demand rather than on a stall: for a client that
+/// sees nothing finish (`blaze debug running`, a harness's own watchdog) while the daemon's
+/// counts still move.
+#[derive(Debug)]
+pub struct Running {
+    pub threads: Vec<ThreadNow>,
+}
+
+/// Every thread read now.
+pub fn running() -> Running {
+    Running { threads: flight::threads_now() }
+}
+
+impl fmt::Display for Running {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.threads.len() {
+            0 => f.write_str("blaze running: no thread is inside a span"),
+            n => {
+                write!(f, "blaze running: {n} threads inside spans:")?;
+                threads(f, &self.threads)
             }
         }
-        Ok(())
     }
+}
+
+/// Each thread on a line of its own: its spans outermost first, each with what it is of.
+fn threads(f: &mut fmt::Formatter<'_>, threads: &[ThreadNow]) -> fmt::Result {
+    for thread in threads {
+        write!(f, "\n  {} (tid {}):", thread.name, thread.tid)?;
+        for (i, span) in thread.open.iter().enumerate() {
+            f.write_str(if i == 0 { " " } else { " > " })?;
+            open_span(f, span)?;
+        }
+        if thread.deeper > 0 {
+            write!(f, " > {} more", thread.deeper)?;
+        }
+    }
+    Ok(())
+}
+
+/// `name `function` of crate, unit u, awaiting what, run by owner (12.3 s)`, each part only when
+/// the span has it.
+pub fn open_span(f: &mut impl fmt::Write, span: &OpenSpan) -> fmt::Result {
+    f.write_str(span.name)?;
+    if let Some(function) = &span.function {
+        write!(f, " `{function}`")?;
+    }
+    if let Some(krate) = &span.krate {
+        write!(f, " of {krate}")?;
+    }
+    if let Some(unit) = &span.unit {
+        write!(f, ", unit {unit}")?;
+    }
+    if let Some(awaits) = &span.awaits {
+        write!(f, ", awaiting {awaits}")?;
+    }
+    if let Some(owner) = span.owner {
+        write!(f, ", run by task {owner}")?;
+    }
+    write!(f, " ({:.1} s)", span.for_ns as f64 / 1e9)
 }
 
 impl fmt::Debug for Stall {
@@ -145,7 +197,9 @@ impl std::error::Error for Stall {}
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier, Condvar, Mutex};
+    use std::sync::{Arc, Barrier};
+
+    use parking_lot::{Condvar, Mutex};
 
     use super::*;
 
@@ -162,9 +216,9 @@ mod tests {
         let _wait = tracing::info_span!(target: "blaze", "waits on the next job").entered();
         ready.wait();
         let (released, cv) = gate;
-        let mut released = released.lock().unwrap();
+        let mut released = released.lock();
         while !*released {
-            released = cv.wait(released).unwrap();
+            cv.wait(&mut released);
         }
     }
 
@@ -201,7 +255,7 @@ mod tests {
         };
         let error = stall(quiet, JOBS, still::SPANS);
         let (released, cv) = &*gate;
-        *released.lock().unwrap() = true;
+        *released.lock() = true;
         cv.notify_all();
         for worker in workers {
             worker.join().unwrap();
@@ -274,5 +328,50 @@ mod tests {
             watchdog.tick(511 * SEC, 6, true),
             Some(Quiet { since_ns: 501 * SEC, for_ns: 10 * SEC })
         );
+    }
+
+    #[test]
+    fn running_names_the_query_key_each_worker_is_inside_and_what_it_waits_on() {
+        crate::install();
+        let ready = Barrier::new(2);
+        let gate = (Mutex::new(false), Condvar::new());
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("worker running".to_owned())
+                .spawn_scoped(scope, || {
+                    let _unit = tracing::info_span!(target: "blaze", "unit bodies", krate = "sonic-rs").entered();
+                    let _query = tracing::info_span!(
+                        target: "blaze",
+                        "infer_query",
+                        function = "sonic_rs::serde::de::Deserializer::parse",
+                        unit = "sonic_rs.3"
+                    )
+                    .entered();
+                    let _wait =
+                        tracing::info_span!(target: "blaze", "wait", awaits = "trait_solve `T: Sized`", owner = 7u64)
+                            .entered();
+                    ready.wait();
+                    let (released, cv) = &gate;
+                    let mut released = released.lock();
+                    while !*released {
+                        cv.wait(&mut released);
+                    }
+                })
+                .unwrap();
+            ready.wait();
+            let running = running();
+            let text = running.to_string();
+            *gate.0.lock() = true;
+            gate.1.notify_all();
+            let line = text.lines().find(|it| it.contains("worker running")).unwrap_or_else(|| panic!("{text}"));
+            for said in [
+                "unit bodies of sonic-rs (",
+                "infer_query `sonic_rs::serde::de::Deserializer::parse`, unit sonic_rs.3 (",
+                "wait, awaiting trait_solve `T: Sized`, run by task 7 (",
+            ] {
+                assert!(line.contains(said), "the line says `{said}`: {line}");
+            }
+            assert!(text.starts_with("blaze running: "), "{text}");
+        });
     }
 }

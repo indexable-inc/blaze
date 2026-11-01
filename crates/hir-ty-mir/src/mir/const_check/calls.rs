@@ -14,6 +14,7 @@ use hir_def::{
     signatures::{FnFlags, FunctionSignature},
 };
 use hir_ty::{
+    InferBodyId,
     db::HirDatabase,
     effects::{
         body_constness, const_call_error, const_param_env, fn_is_const, impl_is_const,
@@ -23,7 +24,10 @@ use hir_ty::{
     next_solver::{GenericArgs, Ty, TyKind, default_types},
 };
 use intern::Symbol;
-use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
+use rustc_type_ir::{
+    BoundConstness,
+    inherent::{GenericArgs as _, IntoKind},
+};
 
 use super::{
     Checker, ClosureNote, ConstCheckKind, Desugaring, MirSpan, Operand, Status, described,
@@ -229,7 +233,7 @@ impl<'db> Checker<'_, 'db> {
             it if it == lang.TryTraitFromOutput => Desugaring::TryBlockFromOutput,
             _ => return None,
         };
-        let source_map = &hir_def::expr_store::Body::with_source_map(self.db, self.def).1;
+        let source_map = self.source_map();
         let (Ok(call), Ok(callee)) = (source_map.expr_syntax(expr), source_map.expr_syntax(path))
         else {
             return None;
@@ -240,8 +244,12 @@ impl<'db> Checker<'_, 'db> {
     /// rustc's `revalidate_conditional_constness` of a callee with `[const]` bounds: whether
     /// they hold in this body.
     fn conditions_hold(&self, callee: FunctionId, fn_args: GenericArgs<'db>) -> bool {
-        let Some(constness) = body_constness(self.db, self.def) else { return true };
-        let env = const_param_env(self.db, self.def.generic_def(self.db));
+        let constness = match self.owner {
+            InferBodyId::DefWithBodyId(def) => body_constness(self.db, def),
+            InferBodyId::AnonConstId(_) => Some(BoundConstness::Const),
+        };
+        let Some(constness) = constness else { return true };
+        let env = const_param_env(self.db, self.owner.generic_def(self.db));
         const_call_error(self.db, env, constness, callee, fn_args).is_none()
     }
 
@@ -367,7 +375,7 @@ impl<'db> Checker<'_, 'db> {
             Some(stability::ConstStability {
                 level: stability::Level::Unstable { feature, .. }, ..
             }) => {
-                if const_stable_indirect && stability::allows_unstable(db, self.def, span, feature) {
+                if const_stable_indirect && stability::allows_unstable(db, self.owner, span, feature) {
                     return;
                 }
                 // clone: a `Symbol`, a count bumped
@@ -417,7 +425,7 @@ impl<'db> Checker<'_, 'db> {
             }) => {
                 let safe_to_expose = stability::safe_to_expose(db, item, self.krate);
                 let allows = |feature: &intern::Symbol| {
-                    stability::allows_unstable(db, self.def, span, feature)
+                    stability::allows_unstable(db, self.owner, span, feature)
                 };
                 if (allows(feature) || implied_by.as_ref().is_some_and(allows)) && safe_to_expose {
                     return;

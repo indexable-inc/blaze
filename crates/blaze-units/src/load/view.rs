@@ -4,21 +4,21 @@
 
 use std::path::Path;
 
+use blaze_hash::HashMap;
+use blaze_manifest::config::schema::FeatureUnification;
 use blaze_manifest::files::Files;
 use blaze_manifest::manifest::Manifest;
 use blaze_manifest::{Config, Workspace};
 use blaze_query::{Cancelled, Cx};
-use blaze_manifest::config::schema::FeatureUnification;
 use blaze_resolve::resolver::{CliFeatures, Members, ResolveBehavior};
 use blaze_resolve::{Cfg, PackageId, PackageIdSpec, Resolve, Summary};
-use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use super::files::{Mounts, Snap};
-use crate::Read;
 use super::invocation::Asking;
 use super::manifest::{WorkspaceQuery, in_workspace};
 use super::{Select, Staged, view_spec};
+use crate::Read;
 use crate::query::{Fetch, LoadError};
 use crate::stdlib::target::{self as platform, CfgArgs};
 
@@ -51,8 +51,8 @@ pub struct ViewResolved<'a, F: Files> {
     pub behavior: ResolveBehavior,
     pub unification: FeatureUnification,
     /// What was read of every package of the resolve, and its manifest and where that is.
-    pub reads: &'a FxHashMap<PackageId, Read>,
-    pub manifests: &'a FxHashMap<PackageId, (&'a Path, &'a Manifest)>,
+    pub reads: &'a HashMap<PackageId, Read>,
+    pub manifests: &'a HashMap<PackageId, (&'a Path, &'a Manifest)>,
     /// The machine the build runs on.
     pub host: &'a str,
     /// What cargo warns of while reading the workspace and selecting its packages.

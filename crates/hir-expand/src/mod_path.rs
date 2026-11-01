@@ -531,7 +531,7 @@ mod tests {
                 assert_eq!(a == b, model(a) == model(b));
                 assert_eq!(a.cmp(b), model(a).cmp(&model(b)), "{a:?} {b:?}");
                 if a == b {
-                    let hash = |it: &ModPath| rustc_hash::FxBuildHasher.hash_one(it);
+                    let hash = |it: &ModPath| blaze_hash::FixedState.hash_one(it);
                     assert_eq!(hash(a), hash(b));
                 }
             }

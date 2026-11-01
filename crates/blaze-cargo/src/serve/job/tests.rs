@@ -40,12 +40,12 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         cancelled: Arc::new(AtomicBool::new(false)),
         stage: Stage::Over,
         value: None,
-        updating: FxHashSet::default(),
+        updating: HashSet::default(),
         queries: Vec::new(),
         built: None,
         borrowed: Vec::new(),
         placing: 0,
-        busy: FxHashMap::default(),
+        busy: HashMap::default(),
         held: Vec::new(),
         look: 0,
         awaiting: None,
@@ -430,4 +430,18 @@ fn an_output_path_is_interned_once_and_found_among_its_units_outputs() {
     let c = paths.find(&[b], "/w/target/debug/c");
     assert_eq!(&*paths.names[c as usize], "/w/target/debug/c");
     assert!(paths.take_images(&[a, b, c]).is_empty());
+}
+
+/// A job that ends while its request is open cancels it when not ok and closes it when ok
+/// (once); one that ends after the plane finished its request, before the job read so, does
+/// neither, where the plane would refuse ("request 1 is not open").
+#[test]
+fn a_job_ending_after_the_plane_finished_its_request_neither_cancels_nor_closes_it() {
+    assert_eq!(at_its_end(true, false, false), (true, false));
+    assert_eq!(at_its_end(true, false, true), (true, false));
+    assert_eq!(at_its_end(true, true, false), (false, true));
+    assert_eq!(at_its_end(true, true, true), (false, false));
+    for (ok, closed) in [(false, false), (false, true), (true, false), (true, true)] {
+        assert_eq!(at_its_end(false, ok, closed), (false, false), "ok {ok}, closed {closed}");
+    }
 }

@@ -6,13 +6,14 @@ use std::{
     fmt,
     ptr::{self, NonNull},
     sync::{
-        Mutex, OnceLock, PoisonError,
+        OnceLock,
         atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
     },
 };
 
 use blaze_graph::{Key, pump::Flights};
 use blaze_mem::Tag;
+use parking_lot::Mutex;
 
 use super::{
     Event, EventKind,
@@ -434,9 +435,9 @@ impl Storage {
         if self.keep {
             return;
         }
-        let count = self.lru.get_mut().unwrap_or_else(PoisonError::into_inner).len();
+        let count = self.lru.get_mut().len();
         for at in 0..count {
-            let index = self.lru.get_mut().unwrap_or_else(PoisonError::into_inner)[at];
+            let index = self.lru.get_mut()[at];
             if let Some(sweep) = ingredient::vtable(index).and_then(|it| it.sweep) {
                 sweep(self, index);
             }
@@ -444,7 +445,7 @@ impl Storage {
     }
 
     pub(crate) fn add_lru(&self, index: u32) {
-        self.lru.lock().unwrap_or_else(PoisonError::into_inner).push(index);
+        self.lru.lock().push(index);
     }
 
     /// The ingredient that owns `id`'s page.
@@ -662,7 +663,7 @@ impl Storage {
     #[cold]
     #[inline(never)]
     fn make_table<T: Table>(&self, index: u32) -> &T {
-        let _one = self.making.lock().unwrap_or_else(PoisonError::into_inner);
+        let _one = self.making.lock();
         if let Some(table) = self.table::<T>(index) {
             return table;
         }
@@ -815,7 +816,7 @@ impl Ids {
         heap: &Heap,
         layout: (usize, usize),
     ) -> usize {
-        let _one = self.making.lock().unwrap_or_else(PoisonError::into_inner);
+        let _one = self.making.lock();
         self.pages.ensure(k + 1);
         if let page @ 1.. = self.pages.get(k).load(Ordering::Acquire) {
             return page as usize;

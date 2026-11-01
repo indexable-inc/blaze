@@ -324,6 +324,7 @@ fn timer(timeout: Duration) -> Result<(), String> {
         .name("timer".to_owned())  // alloc: a thread's name, once at start
         .spawn(move || {
             loop {
+                #[allow(clippy::disallowed_methods, reason = "the input's limit on the wall clock: what runs past it says nothing")]
                 std::thread::sleep(Duration::from_millis((limit / 4).clamp(10, 1000)));
                 let since = RUNNING_SINCE.load(Ordering::Acquire);
                 if since != 0 && now_ms().saturating_sub(since - 1) > limit {
@@ -389,6 +390,7 @@ fn jobs(options: &Options, out: &Path) -> Result<ExitCode, String> {
         if running == 0 {
             return Ok(ExitCode::SUCCESS);
         }
+        #[allow(clippy::disallowed_methods, reason = "std waits on one child, not the first of many, and the rest must stay killable")]
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -459,6 +461,7 @@ fn report(finding: Finding, input: &[u8]) {
 #[inline(never)]
 fn watchdog(timeout: u64) {
     loop {
+        #[allow(clippy::disallowed_methods, reason = "the input's limit on the wall clock: what runs past it says nothing")]
         std::thread::sleep(Duration::from_millis((timeout / 4).clamp(10, 1000)));
         if raw::claim_timed_out(now_ms(), timeout) {
             eprintln!("blaze-fuzzer: an input ran past {timeout} ms");

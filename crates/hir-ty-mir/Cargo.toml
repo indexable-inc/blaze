@@ -13,12 +13,12 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
+blaze-hash.workspace = true
 itertools.workspace = true
 arrayvec.workspace = true
 smallvec.workspace = true
 either.workspace = true
 tracing = { workspace = true, features = ["attributes"] }
-rustc-hash.workspace = true
 hashbrown.workspace = true
 la-arena.workspace = true
 triomphe.workspace = true
@@ -59,6 +59,7 @@ blaze-alloc-count.workspace = true
 blaze-units = { workspace = true, features = ["query"] }
 hir.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
+parking_lot.workspace = true
 test-utils.workspace = true
 
 [features]

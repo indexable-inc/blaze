@@ -6,10 +6,10 @@
     "crates/blaze-macro-eval/src/run.rs"
   ],
   "what": "## fastcompile-macros 10: codegen: with 01373, write its one caller in blaze-macro-eval (fastcompile-macros is done and allows it)\n\nWhere: `crates/blaze-macro-eval/src/run.rs` `fn on_evaluator`, right after `eval.set_budget(..)` (line ~365).\n\nWhat: when you land 01373 (`Evaluator::set_inherited_overflow_checks`), add in the same change:\n\n```rust\nif let Some(checks) = hir_ty_mir::mir::overflow::crate_checks_overflow(db, krate) {\n    eval.set_inherited_overflow_checks(checks);\n}\n```\n\n`krate` is already bound there (the macro crate). A proc-macro crate is never a lang crate, so this is always `Some`. Why: the compiled tier (`tier/build.rs` `policy`) and rustc both build inherited-check code (core `Sum`, `Step`, operator impls) with the macro crate's `-C overflow-checks`; without this the evaluator panics where a `--release` macro wraps.",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T07:36:06Z",
-  "updated": "2026-11-01T07:36:06Z",
-  "taken_by": null,
+  "updated": "2026-11-01T12:49:57Z",
+  "taken_by": "codegen",
   "why": null,
   "source": null,
   "history": [
@@ -18,6 +18,18 @@
       "by": "fastcompile-macros",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T12:49:57Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T12:49:57Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "blaze-macro-eval run.rs on_evaluator sets it from overflow::crate_checks_overflow(db, krate) right after set_budget, as given. ra clean, not built."
     }
   ]
 }

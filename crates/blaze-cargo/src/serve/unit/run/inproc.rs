@@ -6,7 +6,7 @@
 //! message over the channel a piece at a time, and says what became of it, answered by
 //! [`serve`] ([`blaze_live::patch::ask`]). What a `run` and a test binary both start through.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::sync::Arc;
 
 use blaze_core::Command;
 use blaze_ids::ContentId;
@@ -16,6 +16,8 @@ use blaze_inproc::{CodeMemory, CodeRange, Format};
 use blaze_link::{DevRun, Image, Staged};
 use blaze_live::patch::Answer;
 use blaze_live::patch::ask::{self, ANSWER, ANSWERED, NO_PATCH, NO_TIERS, PATCH, PATCH_ASK, TIERS_ASK};
+use crossbeam_queue::SegQueue;
+use parking_lot::{Mutex, MutexGuard};
 
 #[cfg(test)]
 mod tests;
@@ -50,7 +52,7 @@ struct Patch {
 
 /// What a program's runs failed with outside their own output: a start hook that never
 /// attached, an ask that could not be answered, a patch a run did not apply.
-type Failures = Arc<Mutex<Vec<String>>>;
+type Failures = Arc<SegQueue<String>>;
 
 /// A dev executable in its code memory, which every run and test process of it maps.
 pub(crate) struct Loaded {
@@ -79,7 +81,7 @@ pub(crate) fn load(host: &Arc<Host>, name: &str, image: &mut Image, staged: Stag
     let file = host::Image { key: ContentId::of(DOMAIN, &bytes).0, len, store: None };
     let patch: Arc<Mutex<Patch>> = Arc::default();
     let failures: Failures = Arc::default();
-    let (sessions, started) = mpsc::channel();
+    let (sessions, started) = crossbeam_channel::unbounded();
     let program = Arc::new(Program::new(host.clone(), Arc::new(Mutex::new(memory)), file, sessions));
     let (to_patch, to_failures) = (patch.clone(), failures.clone());
     std::thread::Builder::new()
@@ -131,14 +133,15 @@ impl Loaded {
 
     /// What the runs failed with since the last call, outside their own output.
     pub(crate) fn failures(&self) -> Vec<String> {
-        std::mem::take(&mut *lock(&self.failures))
+        // alloc: the failures, few, once a run
+        std::iter::from_fn(|| self.failures.pop()).collect()
     }
 
 }
 
 /// Hands each started run's session to a thread that serves its asks, until the program is
 /// dropped; a start that failed is kept as a failure.
-fn sessions_of(started: mpsc::Receiver<Result<Session, blaze_inproc::Error>>, patch: Arc<Mutex<Patch>>, failures: Failures) {
+fn sessions_of(started: crossbeam_channel::Receiver<Result<Session, blaze_inproc::Error>>, patch: Arc<Mutex<Patch>>, failures: Failures) {
     for session in started {
         match session {
             Ok(session) => {
@@ -149,17 +152,17 @@ fn sessions_of(started: mpsc::Receiver<Result<Session, blaze_inproc::Error>>, pa
                     .name("blaze dev run asks".to_owned())
                     .spawn(move || serve(session, &its_patch, &its_failures));
                 if let Err(error) = spawned {
-                    lock(&failures).push(format!("serving process {pid}'s asks: {error}"));
+                    failures.push(format!("serving process {pid}'s asks: {error}"));
                 }
             }
-            Err(error) => lock(&failures).push(error.to_string()),
+            Err(error) => failures.push(error.to_string()),
         }
     }
 }
 
 /// Answers one run's asks until it hangs up: `blaze-live`'s, and a refusal naming the kind
 /// for any other.
-fn serve(session: Session, patch: &Mutex<Patch>, failures: &Mutex<Vec<String>>) {
+fn serve(session: Session, patch: &Mutex<Patch>, failures: &SegQueue<String>) {
     let pid = session.pid;
     let (mut reader, sender) = session.split();
     // alloc: once per run, the answers' body, reused
@@ -175,7 +178,7 @@ fn serve(session: Session, patch: &Mutex<Patch>, failures: &Mutex<Vec<String>>) 
         if let Err(error) = sent {
             let why = format!("answering process {pid}'s ask {seq}: {error}");
             let _ = sender.kill(&why);
-            lock(failures).push(why);
+            failures.push(why);
             return;
         }
     }
@@ -187,7 +190,7 @@ fn answer(
     frame: &Frame<'_>,
     patch: &Patch,
     pid: u32,
-    failures: &Mutex<Vec<String>>,
+    failures: &SegQueue<String>,
     body: &mut Vec<u8>,
 ) -> Result<Kind, String> {
     body.clear();
@@ -206,10 +209,11 @@ fn answer(
         ANSWER => {
             match Answer::decode(frame.body).map_err(|why| format!("an answer: {why}"))? {
                 Answer::Applied { .. } => {}
-                Answer::RolledBack { generation, to, why } => lock(failures)
-                    .push(format!("process {pid} rolled generation {generation} back to {to}: {why}")),
+                Answer::RolledBack { generation, to, why } => {
+                    failures.push(format!("process {pid} rolled generation {generation} back to {to}: {why}"))
+                }
                 Answer::Declined { generation, why } => {
-                    lock(failures).push(format!("process {pid} did not apply generation {generation}: {why}"))
+                    failures.push(format!("process {pid} did not apply generation {generation}: {why}"))
                 }
             }
             Ok(ANSWERED)
@@ -226,5 +230,5 @@ fn answer(
 }
 
 fn lock<T>(it: &Mutex<T>) -> MutexGuard<'_, T> {
-    it.lock().unwrap_or_else(PoisonError::into_inner)
+    it.lock()
 }

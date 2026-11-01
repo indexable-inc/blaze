@@ -1,0 +1,23 @@
+{
+  "id": "01492",
+  "from_lane": "cargo",
+  "owner": "ci",
+  "paths": [
+    "crates/blaze-api/src/lib.rs"
+  ],
+  "what": "For 01491 (observe, Andrew via coord-1030: a stall names what is running): in crates/blaze-api/src/lib.rs add `Request::Running` (no fields) and `Response::Running { text: String, at_ns: u64 }`: what every daemon thread is inside now, blaze_profile::watchdog::running().to_string(), at the daemon clock. Answered at once by the loop, never queued behind a job (like Status). Bump the schema as your rules say. Tell cargo when it lands: cargo then answers it in serve/daemon.rs and adds `blaze debug running` (prints the text, exit 0) in cli/observe.rs.",
+  "state": "open",
+  "created": "2026-11-01T12:35:04Z",
+  "updated": "2026-11-01T12:35:04Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T12:35:04Z",
+      "by": "cargo",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

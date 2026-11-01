@@ -10,8 +10,8 @@
 
 use blaze_core::{Cursor, FileName, Names, Stamp};
 use blaze_format::cursor::{self, Put as _, Reader, Wanted};
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
-use rustc_hash::FxHashMap;
 
 use crate::section::Section;
 
@@ -81,12 +81,12 @@ pub(crate) struct Disk {
     pub(crate) root: Option<ContentId>,
     base: Option<Base>,
     /// Paths changed since `base`, by name under the driver's root: [`Stamp::GONE`] for one gone.
-    over: FxHashMap<Box<str>, Stamp>,
+    over: HashMap<Box<str>, Stamp>,
 }
 
 impl Disk {
     pub(crate) fn new(dir: FileName) -> Disk {
-        Disk { dir, cursor: Cursor::None, root: None, base: None, over: FxHashMap::default() }
+        Disk { dir, cursor: Cursor::None, root: None, base: None, over: HashMap::default() }
     }
 
     /// What `name` was when last seen; `None` for a name not seen or gone.
@@ -243,7 +243,7 @@ impl Disk {
 /// Every watched head's [`Disk`].
 #[derive(Default)]
 pub(crate) struct Disks {
-    pub(crate) by_head: FxHashMap<Box<str>, Disk>,
+    pub(crate) by_head: HashMap<Box<str>, Disk>,
 }
 
 impl Disks {
@@ -349,7 +349,7 @@ impl Disks {
                 }
                 last = stop;
             }
-            let disk = Disk { dir, cursor, root, base: Some(base), over: FxHashMap::default() };
+            let disk = Disk { dir, cursor, root, base: Some(base), over: HashMap::default() };
             disks.by_head.insert(head.into(), disk);
         }
         Ok(disks)

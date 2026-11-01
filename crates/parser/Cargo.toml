@@ -26,6 +26,7 @@ edition.workspace = true
 winnow.workspace = true
 
 [dev-dependencies]
+crossbeam-channel.workspace = true
 expect-test.workspace = true
 
 blaze-alloc-count.workspace = true

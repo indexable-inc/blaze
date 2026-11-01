@@ -23,8 +23,8 @@
 //! util.rs` (`parse_version`), `compiler/rustc_span/src/symbol.rs` (`find_similar`) and
 //! `compiler/rustc_span/src/source_map.rs` (`span_extend_to_line`) (MIT or Apache-2.0).
 
+use blaze_hash::{HashMap, HashSet};
 use hir::InFile;
-use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use stdx::edit_distance::find_best_match_for_name;
 use syntax::{
@@ -38,8 +38,8 @@ use crate::{
     lints::{
         registry::LintId,
         syntax::{
-            source_fact,
             attrs::{Attr, Owner, Target, features::table, owners},
+            source_fact,
         },
     },
     lower::{Found, Phase},
@@ -68,7 +68,7 @@ pub(super) fn check(cx: &Cx<'_, '_>, owners: &[Owner<'_>], features: &Features) 
         found.push(Found::lint(diag, Phase::Items, lint_at));
     };
 
-    let mut lang = FxHashSet::default();
+    let mut lang = HashSet::default();
     for enabled in &features.lang {
         if let Some(since) = enabled.since {
             lint(&mut found, stable(cx, enabled.at, &enabled.name, since));
@@ -207,9 +207,9 @@ enum Stability {
 #[derive(Default)]
 struct Library {
     /// Each feature with what the first attribute naming it says of it and where that is.
-    features: FxHashMap<String, (Stability, InFile<TextRange>)>,
+    features: HashMap<String, (Stability, InFile<TextRange>)>,
     /// Each `implied_by` of the crate's unstable definitions, with the feature it implies.
-    implications: FxHashMap<String, String>,
+    implications: HashMap<String, String>,
     removed: Vec<Removed>,
 }
 
@@ -296,7 +296,7 @@ impl<'a, 'c, 'db> Libraries<'a, 'c, 'db> {
     }
 
     /// rustc's `all_implications`: the crate's own, then each crate's in order.
-    fn implications(&mut self, local: &Library) -> FxHashMap<String, String> {
+    fn implications(&mut self, local: &Library) -> HashMap<String, String> {
         self.load_all();
         // clone: once per check, only when a stable feature is enabled
         let mut all = local.implications.clone();
@@ -327,13 +327,13 @@ fn needs_all(library: &Library, remaining: &Remaining) -> bool {
 struct Check<'a, 'c, 'db> {
     cx: &'a Cx<'c, 'db>,
     remaining: &'a mut Remaining,
-    implications: &'a mut FxHashMap<String, String>,
+    implications: &'a mut HashMap<String, String>,
     /// Whether `stable_features` may fire anywhere in the crate ([`Cx::lint_may_fire`]): when
     /// it can't, a stable feature is passed over with nothing read or built for it.
     stable_lint: bool,
     /// rustc's `all_implications`, read once a library has a stable feature the crate enables
     /// ([`needs_all`]) and `stable_lint` holds.
-    all: Option<&'a FxHashMap<String, String>>,
+    all: Option<&'a HashMap<String, String>>,
     found: &'a mut Vec<Found>,
     lint_at: InFile<syntax::SyntaxNodePtr>,
 }
@@ -435,7 +435,7 @@ fn similar<'a>(names: &[&'a str], feature: &str) -> Option<&'a str> {
 /// The crates rustc loads besides the crate (`tcx.crates(())`): its dependencies and theirs, each
 /// once, depth first in the order the crate graph lists them.
 fn crates(cx: &Cx<'_, '_>) -> Vec<hir::Crate> {
-    let mut seen = FxHashSet::default();
+    let mut seen = HashSet::default();
     seen.insert(cx.krate);
     // alloc: setup, once per check that enables a library feature
     let mut order = Vec::new();

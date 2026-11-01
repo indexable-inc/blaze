@@ -2,6 +2,12 @@
 //! which a thread blocks while another holds it (`rt/locks.rs`); the data is in `std`'s lock,
 //! which the model only ever hands to the thread it lets hold it, so `std`'s side never
 //! contends. Releasing is no schedule point (as loom's): the releaser's next operation is.
+#![expect(
+    clippy::disallowed_types,
+    reason = "the model of `std`'s locks, poisoning included, keeps the data in `std`'s own"
+)]
+
+pub mod lot;
 
 use std::{
     fmt,

@@ -25,9 +25,9 @@ mod table;
 
 pub(crate) use cfg::{cfg_entry, target_compact, try_gate, try_gate_target};
 
+use blaze_hash::HashMap;
 use blaze_items::Fact;
 use hir::{HirFileId, InFile};
-use rustc_hash::FxHashMap;
 use syntax::{
     SyntaxNodePtr, TextRange, WalkEvent,
     view::{self as ast, AstNode as _},
@@ -137,7 +137,7 @@ fn explain(feature: &str, name: &str) -> String {
 /// nothing after a `cfg` that does not, nor in the node), the predicate of each `cfg!`, and the
 /// [`gate`]s of a macro call's attributes.
 pub(super) fn expansion(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner<'_>], features: &Features) -> Vec<Found> {
-    let calls: FxHashMap<InFile<SyntaxNodePtr>, &Owner<'_>> =
+    let calls: HashMap<InFile<SyntaxNodePtr>, &Owner<'_>> =
         // alloc: setup, the macro calls' owners, once per check
         owners.iter().filter(|it| it.target == Target::MacroCall).map(|it| (it.at(), it)).collect();
     // alloc: empty, allocates only when a gate is hit

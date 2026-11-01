@@ -8,10 +8,10 @@
     "crates/blaze-codegen/src/imports.rs"
   ],
   "what": "The self-build wall (repro #12, coord 21:5x: fix-and-run loop, I am on it; FYI and for review since these are your paths). Failing test: crates/blaze-engine/tests/repro.rs a_bin_using_a_path_dependencys_thread_local_builds (fixture tests/repro/<same>: a bin over a copy of blaze-reclaim, whose thread_local! value has a Drop). On main c0ecb0b8d5 with llvm a cold `blaze build` exits 101 in 55 s: 16 functions fail release.rs:271 \"imports b62027ad1803, which nothing it builds calls\", deterministic. Ruled out by reading: imports_of patchable filter (Mode::Output, nothing patchable), summary store key (stored() = instance key), key() vs requests_of target kinds (same). I edited hir-ty-codegen/v2/release.rs:269 so the error says whether a merged import body calls the orphan (merge lost it) or none does (summaries call it where the exported bodies do not); a self-run with it is requested. Run: cargo test -p blaze-engine --features llvm --test repro -- a_bin_using_a_path_dependencys_thread_local_builds --nocapture",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T05:08:33Z",
-  "updated": "2026-11-01T05:08:33Z",
-  "taken_by": null,
+  "updated": "2026-11-01T12:51:16Z",
+  "taken_by": "codegen",
   "why": null,
   "source": null,
   "history": [
@@ -20,6 +20,18 @@
       "by": "repro",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T12:51:16Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T12:51:16Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "Reviewed: the release.rs orphan-import message (merge lost the call vs. summaries only) is kept. Cause was a summary flown under the unit key alone; fixed by driver.rs summarized(stored, refs), test a_summary_names_the_callees_its_body_calls, both in the tree."
     }
   ]
 }

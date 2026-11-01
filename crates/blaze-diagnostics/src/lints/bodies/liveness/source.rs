@@ -12,22 +12,24 @@
 //! `compiler/rustc_middle/src/ty/closure.rs` (`CapturedPlace::to_string`, `get_path_span`)
 //! (MIT or Apache-2.0).
 
-use hir_ty::db::HirDatabase;
+use blaze_hash::{HashMap, HashSet};
 use hir::{HasVisibility as _, InFile, ItemInNs};
 use hir_def::{
     AdtId, HasModule as _, ItemContainerId, Lookup as _,
     attrs::AttrFlags,
-    hir::{BindingAnnotation, BindingId, Expr, ExprId, ExprOrPatId, Literal, Pat, PatId, Statement},
+    hir::{
+        BindingAnnotation, BindingId, Expr, ExprId, ExprOrPatId, Literal, Pat, PatId, Statement,
+    },
     resolver::ValueNs,
     src::HasSource as _,
 };
+use hir_ty::db::HirDatabase;
 use hir_ty::{
     ValueTyDefId,
     closure_analysis::{CapturedPlace, ProjectionKind},
     mir::MirSpan,
     next_solver::{Ty, TyKind},
 };
-use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::IntoKind as _;
 use syntax::{
     SmolStr, SyntaxNodePtr, TextRange, ToSmolStr as _,
@@ -52,20 +54,20 @@ pub(super) enum Decl {
 /// What the source of a body tells about its bindings and assignments, for the body and the
 /// closures in it.
 pub(super) struct Source {
-    decls: FxHashMap<BindingId, Decl>,
+    decls: HashMap<BindingId, Decl>,
     /// The place an assignment `place = value` assigns, as the span its MIR assigns it at,
     /// with the assignment: the span rustc gives the assignment is the assignment's.
-    assigns: FxHashMap<MirSpan, ExprId>,
+    assigns: HashMap<MirSpan, ExprId>,
     /// The span of what an assignment assigns, by its value, for those whose value is an
     /// operator rustc builds into the place (`x = x + 1`).
-    assigned_by_value: FxHashMap<ExprId, MirSpan>,
+    assigned_by_value: HashMap<ExprId, MirSpan>,
 }
 
 impl Source {
     pub(super) fn new(b: &BodyCx<'_, '_, '_>) -> Source {
         let store = b.store();
         let mut source =
-            Source { decls: FxHashMap::default(), assigns: FxHashMap::default(), assigned_by_value: FxHashMap::default() };
+            Source { decls: HashMap::default(), assigns: HashMap::default(), assigned_by_value: HashMap::default() };
         for param in b.body.params.iter() {
             source.matched(b, param.formal, MirSpan::PatId(param.formal));
             source.matched(b, param.user_written, MirSpan::PatId(param.user_written));
@@ -305,8 +307,8 @@ pub(super) fn string_literals(b: &BodyCx<'_, '_, '_>, root: ExprId) -> Vec<(Span
 }
 
 /// The bindings a path of the body built from `root` names: rustc's `is_local_used_in_source`.
-pub(super) fn used_in_source(b: &BodyCx<'_, '_, '_>, root: ExprId) -> FxHashSet<BindingId> {
-    let mut used = FxHashSet::default();
+pub(super) fn used_in_source(b: &BodyCx<'_, '_, '_>, root: ExprId) -> HashSet<BindingId> {
+    let mut used = HashSet::default();
     own_exprs(b, root, |expr, it| {
         if let Expr::Path(_) = it
             && let Some(ValueNs::LocalBinding(binding)) = util::path_value(b, expr)

@@ -7,7 +7,7 @@
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use blaze_api::{
@@ -30,6 +30,7 @@ use blaze_units::{
     schema::{Mode, Profile, Strip, Stripped, Target, Unit, UnitDep, UnitGraph},
 };
 use blaze_vfs::{Change, Op, ViewId};
+use parking_lot::Mutex;
 
 use super::{
     Daemon, Options,
@@ -68,6 +69,8 @@ thread_local! {
     static APPLIES: Cell<usize> = const { Cell::new(0) };
     /// The build script's run whose write panics as it is applied, as a maintainer's would.
     static PANICS_RUN: Cell<Option<usize>> = const { Cell::new(None) };
+    /// The unit whose compile panics, as a bug of blaze's would.
+    static PANICS_COMPILE: Cell<Option<usize>> = const { Cell::new(None) };
     /// Each compile's unit, and the runs applied in the front end it read.
     static SEEN: RefCell<Vec<(usize, Vec<usize>)>> = const { RefCell::new(Vec::new()) };
     /// Each phase of a unit's compile as it ran, in order.
@@ -311,7 +314,7 @@ impl Steps for Fake {
     type Runs = FakeRuns;
 
     fn fetch(&self, fetch: &Fetch) -> Result<Source, ApiError> {
-        *self.fetched.lock().unwrap().entry(fetch.at.clone()).or_default() += 1;
+        *self.fetched.lock().entry(fetch.at.clone()).or_default() += 1;
         let source = match fetch.kind {
             FetchKind::IndexFile => Source {
                 files: vec![SourceFile { path: "dep".into(), bytes: b"{}\n".to_vec(), mode: blaze_vfs::Mode::Regular }],
@@ -622,6 +625,7 @@ impl Front<Fake> for FakeFront {
     fn compile(&self, reader: FakeReader, unit: usize, phase: Phase, _: &mut Vec<Image<Fake>>) -> Result<Option<Compiled>, Failed> {
         assert_ne!(self.goal, Goal::Reach, "a reach compiles nothing");
         PHASES.with(|it| it.borrow_mut().push((unit, phase)));
+        assert_ne!(PANICS_COMPILE.get(), Some(unit), "serve-test: the unit's compile panics");
         if phase == Phase::Names {
             SEEN.with(|it| it.borrow_mut().push((unit, reader.0.runs.clone())));
             if unit == 0 && KEEP.get() {
@@ -646,6 +650,10 @@ impl Front<Fake> for FakeFront {
             false => Vec::new(),
         };
         Ok(Some(Compiled { diagnostics, ok: true, puts, share, outputs, artifact: None, macros: None, links: Vec::new() }))
+    }
+
+    fn refused(&self, _: usize, what: String) -> Diagnostic {
+        Diagnostic { level: Level::Error, rendered: format!("error: {what}\n"), ..warning_of_app(&what) }
     }
 
     fn script(&self, unit: usize, _: u64) -> Result<FakeRuns, ApiError> {
@@ -749,6 +757,7 @@ fn options() -> Options {
         env: vec![("PATH".into(), "/bin".into()), ("HOME".into(), "/home/u".into())],
         host: "x86_64-unknown-linux-gnu".into(),
         color: false,
+        build: blaze_api::Build::default(),
         // A table of its own: each daemon drives one, and tests run at once.
         outside: Box::leak(Box::new(blaze_vfs::outside::Dirs::new())),
         #[cfg(unix)]
@@ -879,6 +888,35 @@ fn restart(mut daemon: SimDaemon, steps: &Arc<Fake>, seed: u64) -> SimDaemon {
         assert!(turns < TURNS, "the daemon never stopped");
     }
     start(daemon.into_driver(), steps, seed)
+}
+
+/// The daemon listens once `start` returns, before its first turn: `blaze serve` then says so
+/// and writes the ready byte the CLI that started it waits for, and that CLI connects at once.
+#[test]
+fn a_started_daemon_is_reached_before_its_first_turn() {
+    let sim = Sim::new(62, Faults::default());
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 62);
+    let reached = daemon.driver().dial(&Address::Unix(name(SOCKET)));
+    assert!(reached.is_ok(), "a client that connects as start returns finds nothing: {reached:?}");
+}
+
+/// The same on this machine's own driver and file system, as the CLI meets it: `blaze serve`
+/// says it listens once `start` returns (and one turn has heard the bind), and the CLI
+/// connects at once, with no retry.
+#[cfg(unix)]
+#[test]
+fn a_cli_that_connects_as_the_daemon_says_it_listens_finds_its_socket() {
+    // Under /tmp: a socket's path is at most about a hundred bytes, which a deeper temporary
+    // directory may pass.
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::create_dir_all(root.path().join(SOCKET).parent().unwrap()).unwrap();
+    let driver = blaze_core::native(root.path(), 2).unwrap();
+    let steps = Arc::new(Fake::default());
+    let daemon = Daemon::start(driver, options(), steps, Runner::Inline(Inline::new(63))).unwrap_or_else(|why| panic!("{why}"));
+    let reached = std::os::unix::net::UnixStream::connect(root.path().join(SOCKET));
+    assert!(reached.is_ok(), "a CLI that connects as start returns finds no socket: {reached:?}");
+    drop(daemon);
 }
 
 #[test]
@@ -1079,7 +1117,7 @@ fn the_mount_table_survives_a_restart() {
     let got = client.wait(&mut daemon, id);
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
     assert!(!got.iter().any(|it| matches!(it, Response::Fetched { .. })), "nothing fetched again: {got:#?}");
-    let fetched = steps.fetched.lock().unwrap().clone();
+    let fetched = steps.fetched.lock().clone();
     assert!(fetched.values().all(|&it| it == 1), "each source fetched once: {fetched:?}");
     assert_eq!(LIBRARY_READS.get(), 1, "the library's files are read once, not again by the next daemon");
 }
@@ -1155,6 +1193,29 @@ fn a_start_from_the_image_runs_no_load_again() {
     // symbol before the restart restored them.
     let loads = PLANS.with(Cell::get);
     assert_eq!(loads == 0, daemon.warm(), "the load ran again exactly when the database started empty ({loads})");
+}
+
+#[test]
+fn a_daemon_stopped_as_its_first_build_answers_writes_the_image_the_next_start_restores() {
+    let mut sim = Sim::new(9, Faults::default());
+    checkout(&mut sim, "[package]\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 9);
+    assert!(daemon.started().restored.is_none(), "the first start has no image");
+    let mut client = dial(&mut daemon);
+    let id = client.send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
+    assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
+    // Stopped before the loop turns idle, where a build's image is otherwise asked.
+    let mut daemon = restart(daemon, &steps, 10);
+    assert!(daemon.driver().exists(&name(&format!("{STATE}/db/image"))), "the stop wrote the build's image");
+    // A second daemon in one process can't take the image's symbols (`Cold::Interned`); every
+    // other start opens it.
+    let started = daemon.started();
+    assert!(
+        started.restored.is_some() || matches!(started.cold, Some(super::daemon::Cold::Interned)),
+        "the next start opens the stop's image: {started}"
+    );
+    assert!(!matches!(started.cold, Some(super::daemon::Cold::NoImage)), "{started}");
 }
 
 #[test]
@@ -1331,6 +1392,81 @@ fn a_write_that_panics_fails_the_units_after_it_and_keep_going_builds_the_rest()
     let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, id);
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the daemon builds the next: {got:#?}");
+}
+
+/// A unit whose compile panics, as blaze-diagnostics did on a span past its file's end (the
+/// self-build of 2026-11-01 04:37), fails with the panic's text as an error of that unit, not
+/// of the job, while keep-going builds its sibling, and the daemon answers the next request:
+/// the build script's compile (unit 1) panics, its run (2) and the program (3) are never
+/// compiled, and dep's library (unit 0) is.
+#[test]
+fn a_unit_whose_compile_panics_fails_with_the_panic_while_its_sibling_builds() {
+    PHASES.with(|it| it.borrow_mut().clear());
+    PANICS_COMPILE.set(Some(1));
+    let mut sim = Sim::new(45, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 45);
+    let mut client = dial(&mut daemon);
+    let cargo = blaze_api::Cargo {
+        cwd: "/w".into(),
+        env: Vec::new(),
+        args: vec!["--keep-going".into()],
+        root: "/w".into(),
+        color: false,
+        files: Vec::new(),
+        width: None,
+        command: "build".into(),
+        refused: None,
+        verbose: 0,
+    };
+    let targets = Targets { cargo: Some(cargo), ..agent() };
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets });
+    let got = client.wait(&mut daemon, id);
+    PANICS_COMPILE.set(None);
+
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    let said = got.iter().any(|it| {
+        matches!(it, Response::Diagnostic(diagnostic) if diagnostic.level == Level::Error
+            && diagnostic.message.contains("panicked")
+            && diagnostic.message.contains("serve-test: the unit's compile panics"))
+    });
+    assert!(said, "the unit's error names the panic: {got:#?}");
+    let job_failed = got.iter().any(|it| matches!(it, Response::Error(error) if error.what.contains("panicked")));
+    assert!(!job_failed, "the panic fails its unit, not the job: {got:#?}");
+    let ran = PHASES.with(|it| it.take());
+    assert!(ran.contains(&(0, Phase::Store)), "dep's library, the sibling, is built: {ran:?}");
+    assert!(!ran.iter().any(|it| it.0 == 3), "the program, after the build script, is never compiled: {ran:?}");
+
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the daemon builds the next: {got:#?}");
+}
+
+/// A stop (what SIGTERM asks) right after a build failed on a unit's panicking compile writes
+/// the image, and the next start opens it: a caught panic leaves nothing that skips the write.
+#[test]
+fn a_daemon_stopped_after_a_build_failed_on_a_panic_writes_the_image_the_next_start_opens() {
+    PANICS_COMPILE.set(Some(1));
+    let mut sim = Sim::new(46, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 46);
+    let mut client = dial(&mut daemon);
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    PANICS_COMPILE.set(None);
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+
+    let image = name(&format!("{STATE}/db/image"));
+    let mut daemon = restart(daemon, &steps, 47);
+    assert!(daemon.driver().exists(&image), "the stop wrote the failed build's image");
+    let started = daemon.started();
+    assert!(
+        started.restored.is_some() || matches!(started.cold, Some(super::daemon::Cold::Interned)),
+        "the next start opens the stop's image: {started}"
+    );
+    assert!(!matches!(started.cold, Some(super::daemon::Cold::NoImage)), "{started}");
 }
 
 #[test]
@@ -1641,6 +1777,30 @@ fn every_request_ends_once_over_many_seeds() {
     }
 }
 
+/// Daemon B started on A's state while A still ends (writing its image): B says it waits, does
+/// not start while A holds the state, and starts as A ends, naming its own pid in the lock.
+#[cfg(unix)]
+#[test]
+fn a_daemon_started_while_the_one_before_it_ends_waits_for_it_and_then_holds_the_state() {
+    use std::io::Read as _;
+    let state = tempfile::tempdir().unwrap();
+    let a = super::hold(state.path(), None).unwrap();
+    let lock = state.path().join("serve.lock");
+    assert_eq!(std::fs::read_to_string(&lock).unwrap(), std::process::id().to_string());
+    let (mut heard, said) = std::io::pipe().unwrap();
+    let said: std::os::fd::OwnedFd = said.into();
+    let mut said = std::fs::File::from(said);
+    let path = state.path().to_owned();
+    let b = std::thread::spawn(move || super::hold(&path, Some(&mut said)).map(drop));
+    let mut byte = [0u8; 1];
+    heard.read_exact(&mut byte).unwrap();
+    assert_eq!(super::Phase::of(byte[0]), Some(super::Phase::Waiting));
+    assert!(!b.is_finished(), "B started while A still held the state");
+    drop(a);
+    b.join().unwrap().unwrap();
+    assert_eq!(std::fs::read_to_string(&lock).unwrap(), std::process::id().to_string());
+}
+
 #[test]
 fn serve_takes_activated_alone_and_names_it_among_its_flags() {
     let parse = |args: &[&str]| super::parse(args.iter().map(std::ffi::OsString::from));
@@ -1649,7 +1809,7 @@ fn serve_takes_activated_alone_and_names_it_among_its_flags() {
     assert_eq!(args.socket.as_deref(), Some(std::path::Path::new("/run/b.sock")));
     assert!(!parse(&[]).unwrap().activated);
     let refused = parse(&["--activated=yes"]).err().unwrap().to_string();
-    assert!(refused.contains("`--activated`, not `--activated=yes`"), "{refused}");
+    assert!(refused.contains("`--activated` and `--ready-fd N`, not `--activated=yes`"), "{refused}");
 }
 
 #[test]

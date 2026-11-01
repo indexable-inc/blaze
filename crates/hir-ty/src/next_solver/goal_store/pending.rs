@@ -8,14 +8,12 @@
 use std::{
     collections::hash_map::Entry as Slot,
     mem,
-    sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
-use rustc_hash::FxHashMap;
+use parking_lot::Mutex;
 
 use super::{Answer, FactRef, Refusal, record};
 
@@ -40,7 +38,7 @@ struct Padded(Mutex<Shard>);
 #[derive(Default)]
 struct Shard {
     bytes: Vec<u8>,
-    inexpressible: FxHashMap<&'static str, u64>,
+    inexpressible: HashMap<&'static str, u64>,
     unhashable: u64,
     too_long: u64,
     dropped: u64,
@@ -68,9 +66,9 @@ impl Pending {
         Pending { shards: (0..SHARDS).map(|_| Padded::default()).collect() }
     }
 
-    fn shard(&self) -> std::sync::MutexGuard<'_, Shard> {
+    fn shard(&self) -> parking_lot::MutexGuard<'_, Shard> {
         let at = SHARD.with(|at| *at);
-        self.shards[at].0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.shards[at].0.lock()
     }
 
     pub(super) fn push(
@@ -124,11 +122,11 @@ impl Pending {
     pub(super) fn take(&self) -> (Vec<Vec<u8>>, Tallies) {
         let mut tallies = Tallies::default();
         // alloc: flush, once per build
-        let mut inexpressible = FxHashMap::<&'static str, u64>::default();
+        let mut inexpressible = HashMap::<&'static str, u64>::default();
         // alloc: flush, once per build
         let mut buffers = Vec::with_capacity(SHARDS);
         for shard in &self.shards {
-            let mut shard = shard.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut shard = shard.0.lock();
             buffers.push(mem::take(&mut shard.bytes));
             for (name, count) in shard.inexpressible.drain() {
                 *inexpressible.entry(name).or_default() += count;

@@ -3,10 +3,10 @@
 //! dense index, and every key's `Debug` names its module. Each query here is a thin entry; the
 //! work is in `collect`, `unit`, `macros` and `driver`.
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
+use blaze_hash::HashMap;
 use blaze_mem::{Tag, frame};
 use hir_expand::{mod_path::ModPath, name::Name};
-use rustc_hash::FxHashMap;
 use triomphe::Arc;
 
 use crate::{
@@ -204,7 +204,7 @@ pub(crate) const NO_ROUND: u32 = u32::MAX;
 pub(crate) struct RoundModules {
     pub(crate) order: Box<[ModuleId]>,
     pub(crate) rows: Box<[ModuleRow]>,
-    pub(crate) index: FxHashMap<ModuleId, u32>,
+    pub(crate) index: HashMap<ModuleId, u32>,
     /// Per module: [`RoundModules::STEP`], [`RoundModules::GAINS`], [`RoundModules::PENDING`].
     pub(crate) flags: Box<[u8]>,
     /// The modules with `STEP` or `GAINS`, ascending: those with a directive this round or ops

@@ -27,14 +27,15 @@ mod image;
 mod tests;
 
 use std::fmt;
-use std::sync::{Mutex, MutexGuard};
 
 use blaze_codegen::Arch;
 use blaze_ids::radix;
+use parking_lot::Mutex;
 
 use crate::model::{
     Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Reserve, SectionName, Special, Writer,
 };
+use crate::reset::{self, Reset};
 use crate::{Format, LinkError, NativeKind, Output, OutputKind};
 
 pub(crate) use coff::asked_libraries;
@@ -124,17 +125,10 @@ pub(crate) struct Pe {
 }
 
 impl Pe {
-    /// The last tables, when the output is incremental; a poisoned lock (a synthesis that
-    /// panicked) gives them empty, so the next synthesis builds every table.
-    pub(crate) fn last(&self) -> Option<MutexGuard<'_, image::Last>> {
-        self.last.as_ref().map(|it| match it.lock() {
-            Ok(last) => last,
-            Err(poisoned) => {
-                let mut last = poisoned.into_inner();
-                *last = image::Last::default();
-                last
-            }
-        })
+    /// The last tables, when the output is incremental; a synthesis that panicked holding them
+    /// leaves them empty, so the next synthesis builds every table.
+    pub(crate) fn last(&self) -> Option<Reset<'_, image::Last>> {
+        self.last.as_ref().map(reset::lock)
     }
 
     pub(crate) fn dll(&self) -> bool {

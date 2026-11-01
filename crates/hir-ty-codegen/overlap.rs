@@ -12,13 +12,13 @@
 
 #![forbid(unsafe_code)]
 
+use blaze_hash::HashMap;
+use blaze_ids::bits::BitMatrix;
+use blaze_mem::Frame;
 use cranelift_codegen::{
     entity::{EntitySet, SecondaryMap, packed_option::PackedOption},
     ir::{self, InstructionData},
 };
-use blaze_ids::bits::{BitMatrix, BitSet};
-use blaze_mem::Frame;
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use super::fragment::Named;
@@ -30,7 +30,7 @@ pub(super) struct FrameLocals {
     /// By index in `slots`.
     pub(super) conflicts: BitMatrix<usize>,
     /// Where in `slots` a local kept in a register puts the slot it gets when it needs one.
-    pub(super) lazy: FxHashMap<hir_ty_mir::mir::LocalId, usize>,
+    pub(super) lazy: HashMap<hir_ty_mir::mir::LocalId, usize>,
 }
 
 /// Shares the slots of `frame` between locals that never hold storage at once, and has
@@ -169,38 +169,25 @@ fn share_slots_in(
     for slot in named.iter() {
         addressed[slot.as_u32() as usize] = true;
     }
-    let mut order: Vec<usize, &Frame> = Vec::with_capacity_in(frame.slots.len(), scratch);
+    let mut members: Vec<(usize, u64), &Frame> = Vec::with_capacity_in(frame.slots.len(), scratch);
     for (at, slot) in frame.slots.iter().enumerate() {
         let Some(slot) = *slot else { continue };
         if !addressed[slot.as_u32() as usize] {
             func.sized_stack_slots[slot].size = 0;
         } else if only.is_none_or(|only| only.contains(slot)) {
-            order.push(at);
+            members.push((at, u64::from(func.sized_stack_slots[slot].size)));
         }
     }
     let slot = |at: usize| frame.slots[at].expect("a local's slot");
-    let size = |func: &ir::Function, at: usize| func.sized_stack_slots[slot(at)].size;
-    blaze_ids::radix::sort_by_key(&mut order, |&at| {
-        blaze_ids::radix::pack_64(u64::from(!size(func, at)), at as u64)
-    });
-    // Each group: the slot it keeps, and every local any of its members conflicts with (the
-    // rows of its members, or'ed), so that whether one more fits is one bit.
-    let mut groups: Vec<(ir::StackSlot, BitSet<usize>), &Frame> = Vec::new_in(scratch);
+    let shared = hir_ty_mir::mir::share_greedily(&members, &frame.conflicts, scratch);
     let mut moved: SecondaryMap<ir::StackSlot, PackedOption<ir::StackSlot>> = SecondaryMap::new();
     let mut any = false;
-    for at in order {
-        let found = groups.iter().position(|group| !group.1.contains(at));
-        let first = found.is_none();
-        let index = found.unwrap_or_else(|| {
-            groups.push((slot(at), BitSet::new(frame.slots.len())));
-            groups.len() - 1
-        });
-        let into = &mut groups[index];
-        into.1.union_with(&frame.conflicts.row(at));
-        if first {
+    for (member, &(at, _)) in members.iter().enumerate() {
+        let first = shared.first[shared.group_of[member] as usize] as usize;
+        if first == member {
             continue;
         }
-        let (kept, slot) = (into.0, slot(at));
+        let (kept, slot) = (slot(members[first].0), slot(at));
         let (size, align_shift) =
             (func.sized_stack_slots[slot].size, func.sized_stack_slots[slot].align_shift);
         let into = &mut func.sized_stack_slots[kept];
@@ -248,20 +235,20 @@ fn slot_mut(inst: &mut InstructionData) -> Option<&mut ir::StackSlot> {
 
 #[cfg(test)]
 mod tests {
+    use blaze_hash::HashSet;
     use blaze_ids::rng::SplitMix64;
     use cranelift_codegen::ir::{
         InstBuilder, StackSlotData, StackSlotKind,
         types::{I32, I64},
     };
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-    use rustc_hash::FxHashSet;
 
     use super::*;
 
     /// [`escaping`] as it was, with hash maps.
-    fn escaping_model(func: &ir::Function) -> FxHashSet<ir::StackSlot> {
+    fn escaping_model(func: &ir::Function) -> HashSet<ir::StackSlot> {
         let dfg = &func.dfg;
-        let mut of: FxHashMap<ir::Value, ir::StackSlot> = FxHashMap::default();
+        let mut of: HashMap<ir::Value, ir::StackSlot> = HashMap::default();
         loop {
             let known = of.len();
             for block in func.layout.blocks() {
@@ -282,7 +269,7 @@ mod tests {
                 break;
             }
         }
-        let mut escaping = FxHashSet::default();
+        let mut escaping = HashSet::default();
         for block in func.layout.blocks() {
             for inst in func.layout.block_insts(block) {
                 let followed = match dfg.insts[inst] {
@@ -313,12 +300,12 @@ mod tests {
         func: &mut ir::Function,
         frame: &FrameLocals,
         named: &mut [ir::StackSlot],
-        only: Option<&FxHashSet<ir::StackSlot>>,
+        only: Option<&HashSet<ir::StackSlot>>,
     ) {
         if frame.slots.is_empty() {
             return;
         }
-        let mut used = FxHashSet::default();
+        let mut used = HashSet::default();
         for block in func.layout.blocks() {
             for inst in func.layout.block_insts(block) {
                 used.extend(func.dfg.inst_values(inst).map(|it| func.dfg.resolve_aliases(it)));
@@ -357,7 +344,7 @@ mod tests {
                 None => groups.push(vec![at]),
             }
         }
-        let mut moved: FxHashMap<ir::StackSlot, ir::StackSlot> = FxHashMap::default();
+        let mut moved: HashMap<ir::StackSlot, ir::StackSlot> = HashMap::default();
         for group in groups.iter().filter(|it| it.len() > 1) {
             let kept = slot(group[0]);
             for &at in &group[1..] {
@@ -449,7 +436,7 @@ mod tests {
             }
         }
         let named = slots.iter().copied().filter(|_| random.below(4) == 0).collect();
-        let lazy = FxHashMap::default();
+        let lazy = HashMap::default();
         (func, FrameLocals { slots: frame_slots, conflicts, lazy }, named)
     }
 

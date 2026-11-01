@@ -12,7 +12,7 @@ use std::{
     num::NonZero,
     panic::Location,
     rc::Rc,
-    sync::{Arc, PoisonError},
+    sync::Arc,
     time::Duration,
 };
 
@@ -66,12 +66,12 @@ impl Builder {
         }
         let name: Option<Arc<str>> = self.name.map(Arc::from);
         // alloc: the spawned thread's result, once per spawn, as std's `spawn`
-        let result = Arc::new(std::sync::Mutex::new(None));
+        let result = Arc::new(parking_lot::Mutex::new(None));
         let slot = Arc::clone(&result);
         // alloc: the spawned thread's body, once per spawn, as std's `spawn`
         let body = coro::Job::Spawned(Box::new(move || {
             let out = f();
-            *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(out);
+            *slot.lock() = Some(out);
             drop(slot);
             rt::thread_end();
         }));
@@ -100,7 +100,7 @@ pub struct JoinHandle<T> {
 
 enum Handle<T> {
     Std(std::thread::JoinHandle<T>, Thread),
-    Model { tid: Tid, result: Arc<std::sync::Mutex<Option<T>>>, thread: Thread },
+    Model { tid: Tid, result: Arc<parking_lot::Mutex<Option<T>>>, thread: Thread },
 }
 
 impl<T> JoinHandle<T> {
@@ -113,7 +113,7 @@ impl<T> JoinHandle<T> {
             Handle::Model { tid, result, .. } => {
                 rt::join(Location::caller(), tid)
                     .expect("blaze-check: a model thread joined outside its model");
-                let out = result.lock().unwrap_or_else(PoisonError::into_inner).take();
+                let out = result.lock().take();
                 Ok(out.expect("blaze-check: a joined model thread left its result"))
             }
         }

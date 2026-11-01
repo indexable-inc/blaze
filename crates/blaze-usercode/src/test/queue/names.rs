@@ -1,5 +1,5 @@
 //! Names interned to `u32` IDs, in the order first seen: their bytes in one buffer and an
-//! open-addressed index of their FxHash, so a name seen again costs one hash and one compare
+//! open-addressed index of their hash, so a name seen again costs one hash and one compare
 //! and allocates nothing. A record's paths and variables and a hello's test names go through
 //! one of these on the way in; from then on a line is a `u32`.
 //!
@@ -7,7 +7,7 @@
 
 use std::hash::BuildHasher;
 
-use rustc_hash::FxBuildHasher;
+use blaze_hash::FixedState;
 
 /// The most names one table holds: an ID fits in 29 bits, beside a 3-bit tag.
 pub(super) const MOST: u32 = 1 << 29;
@@ -48,13 +48,13 @@ impl Names {
         if self.index.is_empty() {
             return None;
         }
-        self.slot(name, FxBuildHasher.hash_one(name)).1
+        self.slot(name, FixedState.hash_one(name)).1
     }
 
     /// The ID of `name`, interned now if it was not; `None` once the table is full ([`MOST`]
     /// names, or 4 GiB of them).
     pub(super) fn intern(&mut self, name: &str) -> Option<u32> {
-        let hash = FxBuildHasher.hash_one(name);
+        let hash = FixedState.hash_one(name);
         if !self.index.is_empty()
             && let (_, Some(id)) = self.slot(name, hash)
         {
@@ -111,8 +111,8 @@ impl Names {
 
 #[cfg(test)]
 mod tests {
+    use blaze_hash::HashMap;
     use blaze_ids::rng::SplitMix64;
-    use rustc_hash::FxHashMap;
 
     use super::*;
 
@@ -136,7 +136,7 @@ mod tests {
     fn names_intern_as_a_map_would() {
         let mut rng = SplitMix64::new(0x853c_49e6_748f_ea9b);
         let mut names = Names::new();
-        let mut map: FxHashMap<String, u32> = FxHashMap::default();
+        let mut map: HashMap<String, u32> = HashMap::default();
         for _ in 0..20_000 {
             let name = format!("/ws/{}", rng.below(3_000));
             let next = map.len() as u32;

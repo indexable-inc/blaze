@@ -20,9 +20,9 @@
 //! named yet: most crates name each in a `use`, and lowering a body is the costly part.
 
 use base_db::{Crate, CrateOrigin, Db};
+use blaze_hash::HashSet;
 use either::Either;
 use hir_expand::{HirFileId, MacroCallId};
-use rustc_hash::FxHashSet;
 use syntax::{
     NodeOrToken, SyntaxKind, T, WalkEvent,
     view::{self as ast, AstNode as _, Node, Token},
@@ -53,7 +53,7 @@ pub fn named_dependencies(db: &Db, krate: Crate) -> Box<[Crate]> {
         return dependencies.iter().map(|it| it.crate_id).collect();
     }
     // Names are unique among a crate's dependencies: each is its `--extern` name.
-    let unnamed: FxHashSet<&str> = dependencies
+    let unnamed: HashSet<&str> = dependencies
         .iter()
         .filter(|it| !matches!(it.crate_id.data(db).origin, CrateOrigin::Lang(_)))
         .map(|it| it.name.as_str())
@@ -62,9 +62,9 @@ pub fn named_dependencies(db: &Db, krate: Crate) -> Box<[Crate]> {
     let mut walk = Walk {
         db,
         cfg: krate.cfg_options(db),
-        named: FxHashSet::default(),
+        named: HashSet::default(),
         unnamed,
-        read: FxHashSet::default(),
+        read: HashSet::default(),
     };
     walk.crate_(krate);
     dependencies
@@ -82,10 +82,10 @@ struct Walk<'db> {
     db: &'db Db,
     cfg: &'db cfg::CfgOptions,
     /// The dependencies not named yet, by the name the crate has for them.
-    unnamed: FxHashSet<&'db str>,
-    named: FxHashSet<&'db str>,
+    unnamed: HashSet<&'db str>,
+    named: HashSet<&'db str>,
     /// The files and expansions read.
-    read: FxHashSet<HirFileId>,
+    read: HashSet<HirFileId>,
 }
 
 impl<'db> Walk<'db> {
@@ -97,7 +97,7 @@ impl<'db> Walk<'db> {
         self.expansions_of(def_map);
         let mut owners = crate_body_owners(self.db, krate);
         // alloc: one set per crate's walk
-        let mut seen: FxHashSet<_> = owners.iter().copied().collect();
+        let mut seen: HashSet<_> = owners.iter().copied().collect();
         owners.reverse();
         while !self.unnamed.is_empty()
             && let Some(owner) = owners.pop()

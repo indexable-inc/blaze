@@ -10,14 +10,14 @@
 
 use std::sync::LazyLock;
 
-use base_db::{Db, Crate, FileId};
+use base_db::{Crate, Db, FileId};
+use blaze_hash::HashSet;
+use blaze_query::db::FromId as _;
 use hir_def::{CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup};
-use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     AliasTy, AliasTyKind, TypeSuperVisitable, TypeVisitable, TypeVisitor,
     inherent::{BoundExistentialPredicates as _, IntoKind, SliceLike as _},
 };
-use blaze_query::db::FromId as _;
 use smallvec::SmallVec;
 
 use hir_ty::{
@@ -33,7 +33,7 @@ use super::{Instance, InstanceDef};
 /// The crates the name of an instance mentions.
 struct Mentions<'db> {
     db: &'db Db,
-    crates: FxHashSet<Crate>,
+    crates: HashSet<Crate>,
     /// The bodies it has the code of or mentions a type of.
     bodies: SmallVec<[DefWithBodyId; 4]>,
     /// Of those, the ones it mentions a coroutine of, whose layout is of the whole body.
@@ -50,7 +50,7 @@ struct Mentions<'db> {
     opaque: bool,
     /// The types looked into so far. The type of a future holds those of the futures it
     /// awaits, each of which holds its own, so the same few are reached along very many ways.
-    seen: FxHashSet<Ty<'db>>,
+    seen: HashSet<Ty<'db>>,
 }
 
 impl<'db> Mentions<'db> {
@@ -61,14 +61,14 @@ impl<'db> Mentions<'db> {
     fn looking(db: &'db Db, instance: &Instance, reveal: bool) -> Mentions<'db> {
         let mut mentions = Mentions {
             db,
-            crates: FxHashSet::default(),
+            crates: HashSet::default(),
             bodies: SmallVec::new(),
             coroutines: SmallVec::new(),
             reveal,
             revealing: 0,
             hidden: SmallVec::new(),
             opaque: false,
-            seen: FxHashSet::default(),
+            seen: HashSet::default(),
         };
         match instance.def {
             InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => {

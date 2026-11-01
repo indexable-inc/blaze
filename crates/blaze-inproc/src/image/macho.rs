@@ -40,6 +40,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<Found, Error> {
     if commands.end > bytes.len() as u64 {
         return Err(bad(&format!("load commands to {:#x}, past the {:#x} bytes read", commands.end, bytes.len())));
     }
+    #[allow(clippy::reversed_empty_ranges, reason = "the span starts empty, widened to each segment's start and end")]
     let mut found =
         Found { header: 0, span: u64::MAX..0, code: Vec::new(), reserved: Vec::new(), other: Vec::new() };
     let mut header = None;

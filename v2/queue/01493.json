@@ -1,0 +1,23 @@
+{
+  "id": "01493",
+  "from_lane": "tests-misc-lints",
+  "owner": "dedup",
+  "paths": [
+    "crates/blaze-lints/Cargo.toml"
+  ],
+  "what": "Add blaze-intent.workspace = true to [dependencies] of crates/blaze-lints/Cargo.toml (after blaze-diagnostics). blaze-lints builds the MachineApplicable fixes of blaze::std_lock, std_mpsc and fx_hash with blaze_intent::retarget, the resolver shared with Edit::Replace, and blaze fix applies them through blaze_intent::file::Working::splice. There is no cycle: blaze-intent does not depend on blaze-lints. Until this lands, blaze-lints code that names blaze_intent does not compile, so I hold it back.",
+  "state": "open",
+  "created": "2026-11-01T12:48:08Z",
+  "updated": "2026-11-01T12:48:08Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T12:48:08Z",
+      "by": "tests-misc-lints",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

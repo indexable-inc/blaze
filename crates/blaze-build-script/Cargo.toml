@@ -15,9 +15,9 @@ doctest = false
 
 [dependencies]
 blaze-core.workspace = true
+blaze-hash.workspace = true
 blaze-mem.workspace = true
 memchr.workspace = true
-rustc-hash.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
 

@@ -9,20 +9,21 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use base_db::{
-    AbsPathBuf, CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateWorkspaceData, Db,
-    DependencyBuilder, FileId, FileSet, LangCrateOrigin, SourceRoot, TargetKind, VfsPath,
+    AbsPathBuf, CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateWorkspaceData,
+    Db, DependencyBuilder, FileId, FileSet, LangCrateOrigin, SourceRoot, TargetKind, VfsPath,
     target::{Arch, TargetData},
 };
+use blaze_hash::HashMap;
 use cfg::CfgAtom;
 use hir_expand::proc_macro::{
     ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
     ProcMacrosBuilder,
 };
 use intern::Symbol;
-use rustc_hash::FxHashMap;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use span::Edition;
 
@@ -123,7 +124,7 @@ pub struct Expansion {
 /// a call the pack has no expansion of: `None` when it has no such macro.
 pub type Builtin = fn(&Call) -> Option<Result<String, String>>;
 
-pub type Expansions = FxHashMap<Call, Result<String, String>>;
+pub type Expansions = HashMap<Call, Result<String, String>>;
 
 /// A proc macro that is the expansions it had when the pack was made.
 #[derive(Debug)]
@@ -135,6 +136,9 @@ struct Replay {
     /// Calls there was no expansion for.
     missed: Arc<Mutex<Vec<Call>>>,
 }
+
+/// A call that panicked adds no miss: the misses kept are each whole.
+impl std::panic::RefUnwindSafe for Replay {}
 
 impl ProcMacroExpander for Replay {
     fn expand(&self, _: &Db, call: ProcMacroCall<'_>) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
@@ -148,7 +152,7 @@ impl ProcMacroExpander for Replay {
             Some(output) => output.clone(),
             None => (self.builtin)(&recorded).unwrap_or_else(|| {
                 let missed = format!("no expansion of `{}` was recorded for this input", recorded.name);
-                self.missed.lock().unwrap_or_else(|it| it.into_inner()).push(recorded);
+                self.missed.lock().push(recorded);
                 Err(missed)
             }),
         };
@@ -198,7 +202,7 @@ impl Kind {
 
 impl Pack {
     pub fn project(self, builtin: Builtin) -> Result<Project, String> {
-        let paths: FxHashMap<u32, &str> = self.files.iter().map(|it| (it.id, &*it.path)).collect();
+        let paths: HashMap<u32, &str> = self.files.iter().map(|it| (it.id, &*it.path)).collect();
         let roots = self
             .roots
             .iter()

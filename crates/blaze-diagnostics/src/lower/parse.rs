@@ -14,9 +14,9 @@
 //! it recovers): what it reports in a form rustc has is written as rustc writes it, the rest in
 //! the parser's own words, always an error (`v2/requests/diagnostics.md`).
 
+use blaze_hash::HashSet;
 use blaze_ids::radix;
 use hir::{HirFileId, InFile};
-use rustc_hash::FxHashSet;
 use syntax::{
     Edition, LexedStr, SyntaxError, SyntaxKind, TextRange, TextSize,
     view::{self as ast, AstNode as _},
@@ -237,7 +237,7 @@ fn lower_file(
     let mut literals: Vec<&SyntaxError> = Vec::new();
     // alloc: the error's parts, for an error hir found
     let mut validation: Vec<&SyntaxError> = Vec::new();
-    let mut seen: FxHashSet<(String, TextRange)> = FxHashSet::default();
+    let mut seen: HashSet<(String, TextRange)> = HashSet::default();
     for error in errors {
         // alloc: the error's text, for an error hir found
         if is_lexer_error(error) || !seen.insert((error.to_string(), error.range())) {

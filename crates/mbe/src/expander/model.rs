@@ -7,7 +7,7 @@ mod matcher;
 mod transcriber;
 
 use base_db::Db;
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use span::Span;
 use syntax_bridge::to_matcher_input;
 use tt::{DelimSpan, iter::TtIter};
@@ -77,7 +77,7 @@ pub(crate) fn expand_rules(
 /// repetition the metavariable is in.
 #[derive(Debug, Default, Clone)] // clone: the `#[cfg(test)]` model of the old matcher, which copies bindings per fork
 struct Bindings<'a> {
-    inner: FxHashMap<MetaVar, Binding<'a>>,
+    inner: HashMap<MetaVar, Binding<'a>>,
 }
 
 #[derive(Debug, Clone)] // clone: as `Bindings`, test-only

@@ -33,6 +33,8 @@ use std::{
     thread,
 };
 
+use crossbeam_queue::SegQueue;
+
 pub use crate::pool::Scope;
 use crate::{
     pool,
@@ -135,9 +137,10 @@ unsafe impl<'a, T: Send> Source for SliceMut<'a, T> {
     }
 
     unsafe fn item(&self, at: usize) -> &'a mut T {
-        // SAFETY: `at < len` within the slice borrowed for `'a`, and this is the one call for
-        // `at`, so the reference is unique.
-        unsafe { &mut *self.at.add(at) }
+        // SAFETY: `at < len` within the slice borrowed for `'a`.
+        let item = unsafe { self.at.add(at) };
+        // SAFETY: this is the one call for `at`, so the reference into that slice is unique.
+        unsafe { &mut *item }
     }
 }
 
@@ -177,14 +180,18 @@ unsafe impl<T: Send> Source for Owned<T> {
     }
 
     unsafe fn item(&self, at: usize) -> T {
-        // SAFETY: `at < len`, an item still in the buffer, read once.
-        unsafe { self.at.add(at).read() }
+        // SAFETY: `at < len`, within the buffer.
+        let item = unsafe { self.at.add(at) };
+        // SAFETY: the item is still in the buffer and read once.
+        unsafe { item.read() }
     }
 
     unsafe fn rest(&self, from: usize) {
         if from < self.len {
+            // SAFETY: `from < len`, within the buffer of items not taken.
+            let rest = unsafe { self.at.add(from) };
             // SAFETY: the items from `from` on were never taken, and are dropped once, here.
-            unsafe { ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.at.add(from), self.len - from)) };
+            unsafe { ptr::drop_in_place(ptr::slice_from_raw_parts_mut(rest, self.len - from)) };
         }
     }
 }
@@ -222,16 +229,18 @@ unsafe impl<A: Source, B: Source> Source for Zip<A, B> {
     }
 
     unsafe fn item(&self, at: usize) -> (A::Item, B::Item) {
-        // SAFETY: `at` is below both lengths and taken once, as asked of this call.
-        unsafe { (self.0.item(at), self.1.item(at)) }
+        // SAFETY: `at` is below the first source's length and taken once, as asked of this call.
+        let first = unsafe { self.0.item(at) };
+        // SAFETY: `at` is below the second source's length and taken once, as asked of this call.
+        let second = unsafe { self.1.item(at) };
+        (first, second)
     }
 
     unsafe fn rest(&self, from: usize) {
-        // SAFETY: as asked of this call, for each side.
-        unsafe {
-            self.0.rest(from);
-            self.1.rest(from);
-        }
+        // SAFETY: as asked of this call, for the first side.
+        unsafe { self.0.rest(from) };
+        // SAFETY: as asked of this call, for the second side.
+        unsafe { self.1.rest(from) };
     }
 }
 
@@ -303,9 +312,11 @@ unsafe impl<'a, T: Send> Source for ChunksMut<'a, T> {
     unsafe fn item(&self, at: usize) -> &'a mut [T] {
         let start = at * self.size;
         let end = (start + self.size).min(self.items.len);
-        // SAFETY: `at < len`, so `start < end <= len`, within the slice borrowed for `'a`; the
-        // pieces of distinct indices are disjoint and each is made once.
-        unsafe { slice::from_raw_parts_mut(self.items.at.add(start), end - start) }
+        // SAFETY: `at < len`, so `start < end <= len`, within the slice borrowed for `'a`.
+        let items = unsafe { self.items.at.add(start) };
+        // SAFETY: `start..end` is within that slice; pieces of distinct indices are disjoint
+        // and each is made once.
+        unsafe { slice::from_raw_parts_mut(items, end - start) }
     }
 }
 
@@ -490,8 +501,7 @@ pub fn for_each_giving_way(
     // dyn: a panic's payload, as `catch_unwind` gives it
     gave_way: impl Fn(&(dyn Any + Send)) -> bool + Sync,
 ) -> Vec<usize> {
-    // alloc: the tasks that gave way, few, once per batch
-    let again = Lock::new(Vec::new());
+    let again: SegQueue<usize> = SegQueue::new();
     // dyn: as above
     let other: Lock<Option<Box<dyn Any + Send>>> = Lock::new(None);
     let near = pool::group();
@@ -501,17 +511,18 @@ pub fn for_each_giving_way(
             scope.submit(near, move || task(at), move |ran| {
                 let Err(panic) = ran else { return };
                 if gave_way(&*panic) {
-                    again.lock().push(at);
+                    again.push(at);
                 } else {
-                    other.lock().get_or_insert(panic);
+                    other.lock_said("a loop's first panic").get_or_insert(panic);
                 }
             });
         }
     });
-    if let Some(panic) = other.lock().take() {
+    if let Some(panic) = other.lock_said("a loop's first panic").take() {
         resume_unwind(panic);
     }
-    let mut again = std::mem::take(&mut *again.lock());
+    // alloc: the tasks that gave way, few, once per batch
+    let mut again: Vec<usize> = std::iter::from_fn(|| again.pop()).collect();
     again.sort_unstable();
     again
 }
@@ -538,8 +549,7 @@ fn split<St>(len: usize, again: bool, init: impl Fn() -> St + Sync, run: impl Fn
     let failed = AtomicBool::new(false);
     // dyn: a panic's payload, as `catch_unwind` gives it
     let panic: Lock<Option<Box<dyn Any + Send>>> = Lock::new(None);
-    // alloc: empty unless an item gives way
-    let gave: Lock<Vec<usize>> = Lock::new(Vec::new());
+    let gave: SegQueue<usize> = SegQueue::new();
     let claim = |here: bool| {
         let mut state = None;
         while !failed.load(Ordering::Relaxed) {
@@ -561,14 +571,14 @@ fn split<St>(len: usize, again: bool, init: impl Fn() -> St + Sync, run: impl Fn
                 }
                 // The unwound item may have left the state half used.
                 state = None;
-                gave.lock().push(at);
+                gave.push(at);
             }
         }
     };
     let caught = |ran: thread::Result<()>| {
         if let Err(it) = ran {
             failed.store(true, Ordering::Relaxed);
-            panic.lock().get_or_insert(it);
+            panic.lock_said("a loop's first panic").get_or_insert(it);
         }
     };
     pool::scope_here(|scope| {
@@ -580,8 +590,9 @@ fn split<St>(len: usize, again: bool, init: impl Fn() -> St + Sync, run: impl Fn
     if let Some(it) = panic.into_inner() {
         resume_unwind(it);
     }
-    let mut gave = gave.into_inner();
     if !gave.is_empty() {
+        // alloc: the items that gave way, few; rerun in index order
+        let mut gave: Vec<usize> = gave.into_iter().collect();
         gave.sort_unstable();
         let mut state = init();
         for at in gave {
@@ -603,8 +614,10 @@ impl<R> Out<R> {
     /// # Safety
     /// `at` is within the buffer's capacity and no other call writes it.
     unsafe fn write(&self, at: usize, value: R) {
-        // SAFETY: the caller's.
-        unsafe { self.0.add(at).write(value) }
+        // SAFETY: the caller guarantees `at` is within the buffer's capacity.
+        let item = unsafe { self.0.add(at) };
+        // SAFETY: the caller guarantees no other call writes this index.
+        unsafe { item.write(value) }
     }
 }
 
@@ -720,7 +733,7 @@ where
             }
             if let Some(made) = f(item) {
                 first.fetch_min(at, Ordering::Relaxed);
-                let mut found = found.lock();
+                let mut found = found.lock_said("a search's find");
                 if found.as_ref().is_none_or(|&(was, _)| at < was) {
                     *found = Some((at, made));
                 }
@@ -755,7 +768,7 @@ pub fn all<I: IntoSource>(items: I, f: impl Fn(I::Item) -> bool + Sync) -> bool 
 mod tests {
     use std::{
         sync::{
-            Arc, Mutex,
+            Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
@@ -763,6 +776,7 @@ mod tests {
 
     use blaze_ids::rng::SplitMix64 as Rng;
     use crossbeam_channel::unbounded;
+    use parking_lot::Mutex;
 
     use crate::{Cancelled, Key, pool::Pool, pump::Flights, topology::Topology};
 
@@ -777,7 +791,7 @@ mod tests {
         let pool = Arc::new(Pool::new(&Topology::flat(2), false).unwrap());
         let (tx, rx) = unbounded::<Vec<u64>>();
         for _ in 0..2 {
-            let (inner, tx) = (pool.clone(), tx.clone());
+            let (inner, tx) = (Arc::clone(&pool), tx.clone());
             pool.submit(
                 None,
                 move || {
@@ -824,10 +838,10 @@ mod tests {
                             },
                             |it| asked = Some(it.unwrap()),
                         );
-                        // Not pumping, so the job is the other worker's.
-                        while !started.load(Ordering::Acquire) {
-                            std::hint::spin_loop();
-                        }
+                        // Busy here, so the job is the other worker's.
+                        crate::spin::SpinWait::within("the other worker to start the scope's job", LONG, || {
+                            started.load(Ordering::Acquire)
+                        });
                     });
                     Ok(())
                 });
@@ -865,10 +879,10 @@ mod tests {
                             },
                             |it| asked = Some(it.unwrap()),
                         );
-                        while !asking.load(Ordering::Acquire) {
-                            std::hint::spin_loop();
-                        }
-                        std::thread::sleep(Duration::from_millis(50));
+                        crate::spin::SpinWait::within("the other worker to ask for the key", LONG, || {
+                            asking.load(Ordering::Acquire)
+                        });
+                        crate::spin::busy(Duration::from_millis(50));
                         Ok(5)
                     });
                     assert_eq!(ran, Ok(5));
@@ -1081,7 +1095,7 @@ mod tests {
         let pool = Pool::new(&Topology::flat(3), false).unwrap();
         pool.install(|| {
             let drops = Arc::new(AtomicUsize::new(0));
-            let make = |n: usize| (0..n).map(|_| Counted(drops.clone())).collect::<Vec<_>>();
+            let make = |n: usize| (0..n).map(|_| Counted(Arc::clone(&drops))).collect::<Vec<_>>();
             super::for_each(make(1000), drop);
             assert_eq!(drops.swap(0, Ordering::SeqCst), 1000);
             let found = super::find_map_first(super::enumerate(make(1000)), |(at, it)| (at == 10).then_some(it));
@@ -1106,14 +1120,14 @@ mod tests {
             pool.install(|| {
                 super::for_each(0..10_000usize, |at| {
                     assert_ne!(at, 5_000, "item five thousand");
-                    *ran.lock().unwrap() += 1;
+                    *ran.lock() += 1;
                 });
             });
         }));
         let panic = caught.expect_err("the item's panic reaches the caller");
         let text = panic.downcast_ref::<String>().map_or("", String::as_str);
         assert!(text.contains("item five thousand"), "{text}");
-        assert!(*ran.lock().unwrap() < 10_000);
+        assert!(*ran.lock() < 10_000);
         assert_eq!(pool.install(|| super::map(0..100usize, |it| it + 1)), (1..101).collect::<Vec<_>>());
     }
 }

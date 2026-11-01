@@ -267,7 +267,7 @@ pub fn machine_budget(margin: u64) -> io::Result<Budget> {
     // alloc: the budget's name, once per daemon start
     limits.extend(rlimit_as()?.map(|bytes| (bytes, "the process's RLIMIT_AS".to_owned())));
     let in_use = machine_in_use(own())?;
-    least(limits, in_use, margin)
+    least(limits, in_use.as_ref(), margin)
 }
 
 #[cfg(target_os = "linux")]
@@ -491,7 +491,7 @@ fn gb(bytes: u64) -> String {
 /// The least of `limits`, less what others use (`in_use`) and `margin`, named by what each was.
 fn least(
     limits: Vec<(u64, String)>,
-    in_use: Option<(u64, String)>,
+    in_use: Option<&(u64, String)>,
     margin: u64,
 ) -> io::Result<Budget> {
     let (bytes, from) = limits
@@ -730,7 +730,7 @@ mod tests {
                     .to_owned()
             ))
         );
-        let budget = least(linux_limits(&tree.0).unwrap(), in_use, GB / 2).unwrap();
+        let budget = least(linux_limits(&tree.0).unwrap(), in_use.as_ref(), GB / 2).unwrap();
         assert_eq!(budget.bytes, 4 * GB - GB - GB / 2);
         assert_eq!(
             budget.from,
@@ -741,7 +741,7 @@ mod tests {
         // Blaze holding more than the count says (it counts late) leaves others none.
         assert_eq!(linux_in_use(&tree.0, 4 * GB).unwrap().map(|it| it.0), Some(0));
         // Others that leave nothing are an error naming them.
-        let full = least(vec![(4 * GB, "x".to_owned())], Some((4 * GB, "y".to_owned())), 0);
+        let full = least(vec![(4 * GB, "x".to_owned())], Some(&(4 * GB, "y".to_owned())), 0);
         let why = full.unwrap_err();
         assert_eq!(why.kind(), io::ErrorKind::InvalidInput);
         assert!(why.to_string().contains("less y and a margin"), "{why}");

@@ -26,10 +26,10 @@ mod lex;
 
 use std::{borrow::Cow, collections::hash_map};
 
+use blaze_hash::{HashMap, HashSet};
 use blaze_mem::Frame;
 use hir::{HirFileId, InFile};
 use hir_expand::MacroDefKind;
-use rustc_hash::{FxHashMap, FxHashSet};
 use span::{Edition, FileId};
 use syntax::{SyntaxKind, SyntaxNodePtr, TextRange};
 
@@ -132,7 +132,7 @@ struct Source {
 /// The files rustc lexes, in the order it loads them: the crate's modules, then what
 /// `include!` reads.
 fn sources<'f>(cx: &Cx<'f, '_>, walk: &Walk<'_>) -> Vec<Source, &'f Frame> {
-    let mut seen = FxHashSet::default();
+    let mut seen = HashSet::default();
     let mut sources = Vec::new_in(cx.frame());
     for tree in walk.files() {
         let Some(file) = tree.file.file_id() else { continue };
@@ -182,7 +182,7 @@ struct Entry {
 /// rustc's `SymbolGallery`: each identifier's symbol and where it was first seen.
 #[derive(Default)]
 struct Gallery<'db> {
-    symbols: FxHashMap<Cow<'db, str>, Entry>,
+    symbols: HashMap<Cow<'db, str>, Entry>,
 }
 
 /// A symbol of the gallery, as `check_crate` takes them: sorted by where they were seen.
@@ -199,7 +199,7 @@ impl<'db> Gallery<'db> {
     /// they are called from are lexed. A symbol borrows the expansion's text, which the
     /// database keeps, unless NFC changes it.
     fn add_proc_macro_idents(&mut self, cx: &Cx<'_, 'db>, walk: &Walk<'db>, sources: &[Source]) {
-        let mut index: Option<FxHashMap<FileId, u32>> = None;
+        let mut index: Option<HashMap<FileId, u32>> = None;
         for tree in &walk.trees {
             let Some(call) = tree.call else { continue };
             if !matches!(call.loc(cx.db).def.kind, MacroDefKind::ProcMacro(..)) {

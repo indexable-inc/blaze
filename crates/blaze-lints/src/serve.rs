@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 
 use base_db::{Crate, Db, FileId};
 use blaze_diagnostics::{
-    emit::{self, Sources, Style},
+    emit::{self, Sources, Style, Unplaced},
     model::{Child, Diag},
 };
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_hash::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -81,7 +81,7 @@ pub struct Message {
 #[derive(Debug, Default)]
 pub struct Setups {
     /// By manifest directory: each setup made there, with what it was made of.
-    by_dir: FxHashMap<PathBuf, Vec<(SetupOf, Result<Setup, String>)>>,
+    by_dir: HashMap<PathBuf, Vec<(SetupOf, Result<Setup, String>)>>,
 }
 
 /// What of a [`Package`] its [`Setup`] is made from, besides its manifest directory.
@@ -170,7 +170,7 @@ pub fn answer_with<P: AsRef<Path>>(
     let setups = &*setups;
     // alloc: a request's packages, once per request
     let mut chosen: Vec<Option<&Setup>> = Vec::with_capacity(ask.packages.len());
-    let mut by_dir: FxHashMap<&Path, usize> = FxHashMap::default();
+    let mut by_dir: HashMap<&Path, usize> = HashMap::default();
     for (at, package) in ask.packages.iter().enumerate() {
         by_dir.entry(package.manifest_dir.as_path()).or_insert(at);
         match setups.get(package) {
@@ -189,7 +189,7 @@ pub fn answer_with<P: AsRef<Path>>(
     };
     // A crate built for its tests as well is linted once, as that build: what it finds outside
     // `cfg(test)` is what the plain build finds.
-    let tested: FxHashSet<FileId> = crates
+    let tested: HashSet<FileId> = crates
         .iter()
         .filter(|&&it| has_tests(it))
         .map(|&it| hir::Crate::from(it).root_file(db))
@@ -215,13 +215,20 @@ pub fn answer_with<P: AsRef<Path>>(
             }
         };
         let plain: Vec<&Found> = found.iter().filter(|it| !it.test_only).collect();
-        let test = has_tests.then(|| written(found.iter(), &mut sources, &read, style));
-        answer.crates.push(Linted {
-            package: ask.packages[at].name.clone(),
-            root: root_path,
-            plain: written(plain.into_iter(), &mut sources, &read, style),
-            test,
-        });
+        let lints = (|| {
+            let test = has_tests.then(|| written(found.iter(), &mut sources, &read, style)).transpose()?;
+            Ok::<_, Unplaced>((written(plain.into_iter(), &mut sources, &read, style)?, test))
+        })();
+        match lints {
+            Ok((plain, test)) => answer.crates.push(Linted {
+                package: ask.packages[at].name.clone(),
+                root: root_path,
+                plain,
+                test,
+            }),
+            // clone: a package's error, once per request it fails in
+            Err(why) => answer.failed.push((ask.packages[at].name.clone(), why.to_string())),
+        }
     }
     answer
 }
@@ -235,29 +242,30 @@ fn setup(package: &Package) -> Result<Setup, String> {
 
 /// The diagnostics of one build, as rustc writes them: what is said once a build is said with
 /// the first diagnostic that has it, and a diagnostic said again is not. The files they point
-/// into that `sources` has not read yet are read by `read`.
+/// into that `sources` has not read yet are read by `read`; a span of one it can't read, or
+/// past its end, fails them all.
 pub(crate) fn written<'a>(
     found: impl Iterator<Item = &'a Found>,
     sources: &mut Sources,
     read: impl Fn(&str) -> Option<String>,
     style: Style,
-) -> Vec<Message> {
+) -> Result<Vec<Message>, Unplaced> {
     let found: Vec<&Found> = found.collect();
     for name in sources.unread(found.iter().map(|it| &it.diagnostic)) {
         sources.add(name, read(name));
     }
-    let mut once: FxHashSet<Child> = FxHashSet::default();
-    let mut seen = FxHashSet::default();
+    let mut once: HashSet<Child> = HashSet::default();
+    let mut seen = HashSet::default();
     let mut messages = Vec::new();
     for Found { diagnostic, .. } in found {
         // clone: a diagnostic of the crate, once per build it is written in
         let mut diagnostic: Diag = diagnostic.clone();
         diagnostic.children.retain(|child| !child.once || once.insert(child.clone()));
-        let rendered = emit::written(&diagnostic, sources, style);
+        let rendered = emit::written(&diagnostic, sources, style)?;
         if !seen.insert(rendered.clone()) {
             continue;
         }
-        let json = emit::json_rendered(&diagnostic, sources, rendered.clone());
+        let json = emit::json_rendered(&diagnostic, sources, rendered.clone())?;
         messages.push(Message {
             json: if style.ansi { json } else { cargo_order(&json) },
             rendered,
@@ -265,7 +273,7 @@ pub(crate) fn written<'a>(
             fixable: diagnostic.is_fixable(),
         });
     }
-    messages
+    Ok(messages)
 }
 
 /// rustc's JSON line `line` as cargo writes it again when it takes the colours out of

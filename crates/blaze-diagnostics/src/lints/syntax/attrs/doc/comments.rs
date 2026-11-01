@@ -9,8 +9,8 @@
 //! lints are buffered at) and `compiler/rustc_expand/src/diagnostics.rs`
 //! (`MacroCallUnusedDocComment`) (MIT or Apache-2.0).
 
+use blaze_hash::HashMap;
 use hir::{HirFileId, InFile};
-use rustc_hash::FxHashMap;
 use syntax::{
     SyntaxKind, SyntaxNodePtr, TextRange,
     view::{self as ast, AstNode, CommentShape, HasLoopBody as _, HasName as _},
@@ -136,12 +136,12 @@ fn is_block(node: ast::Node<'_>) -> bool {
 
 /// The `mod` items module files are declared by, found once when a lint needs one.
 #[derive(Default)]
-pub(in crate::lints::syntax::attrs) struct Modules(Option<FxHashMap<HirFileId, InFile<SyntaxNodePtr>>>);
+pub(in crate::lints::syntax::attrs) struct Modules(Option<HashMap<HirFileId, InFile<SyntaxNodePtr>>>);
 
 impl Modules {
     fn declaration(&mut self, cx: &Cx<'_, '_>, file: HirFileId) -> Option<InFile<SyntaxNodePtr>> {
         let declared = self.0.get_or_insert_with(|| {
-            let mut declared = FxHashMap::default();
+            let mut declared = HashMap::default();
             for module in crate::checks::modules(cx) {
                 if let Some(file) = module.as_source_file_id(cx.db)
                     && let Some(declaration) = module.declaration_source_view(cx.db)

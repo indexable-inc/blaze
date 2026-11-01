@@ -27,8 +27,8 @@ use std::{
     path::Path,
 };
 
+use blaze_hash::HashMap;
 use blaze_mem::{RegionVec, Tag as MemTag};
-use rustc_hash::FxHashMap;
 
 use crate::{Done, FileName, utf8::push_lossy};
 
@@ -467,7 +467,7 @@ struct Inotify {
 pub(crate) struct Room {
     /// Each directory watched, by its watch, relative to the root ("" for the root), in
     /// `names`.
-    dirs: FxHashMap<i32, Span>,
+    dirs: HashMap<i32, Span>,
     names: Strings,
     root: Vec<u8>,
     /// The watched directory. inotify watches an inode, not a name: once it is deleted or
@@ -482,7 +482,7 @@ pub(crate) struct Room {
 impl Room {
     fn new() -> io::Result<Room> {
         Ok(Room {
-            dirs: FxHashMap::default(),
+            dirs: HashMap::default(),
             names: Strings::new()?,
             root: Vec::new(), // alloc: none, an empty vector, filled once and reused.
             top: String::new(), // alloc: none, filled once and reused.
@@ -648,8 +648,8 @@ mod tests {
         for seed in 0..32 {
             let mut rng = crate::sim::Rng::new(seed);
             let mut strings = Strings::new().unwrap();
-            let mut ours: FxHashMap<u32, Span> = FxHashMap::default();
-            let mut theirs: FxHashMap<u32, String> = FxHashMap::default();
+            let mut ours: HashMap<u32, Span> = HashMap::default();
+            let mut theirs: HashMap<u32, String> = HashMap::default();
             for step in 0..4_000u32 {
                 let key = rng.below(64) as u32;
                 if rng.below(3) == 0 {

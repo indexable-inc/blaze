@@ -1503,7 +1503,7 @@ pub mod kinds {
     mod tests {
         use std::path::Path;
 
-        use rustc_hash::FxHashSet;
+        use blaze_hash::HashSet;
 
         use super::*;
 
@@ -1511,8 +1511,8 @@ pub mod kinds {
         fn kinds_are_distinct_and_hir_tys() {
             assert!(blaze_query::kinds::FRONT.start <= RANGE.start);
             assert!(RANGE.end <= blaze_query::kinds::FRONT.end);
-            let mut numbers = FxHashSet::default();
-            let mut names = FxHashSet::default();
+            let mut numbers = HashSet::default();
+            let mut names = HashSet::default();
             for &(kind, name) in ALL {
                 assert!(RANGE.contains(&kind.0), "{name}: {:#x} is not hir-ty's", kind.0);
                 assert!(numbers.insert(kind), "{name}: {:#x} is given twice", kind.0);

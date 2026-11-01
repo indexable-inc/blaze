@@ -15,7 +15,7 @@ use hir_def::{
 };
 use rustc_abi::HasDataLayout as _;
 use rustc_ast_ir::Mutability;
-use rustc_hash::FxBuildHasher;
+use blaze_hash::FixedState;
 use rustc_type_ir::{
     TypeVisitableExt as _,
     inherent::{IntoKind as _, Ty as _},
@@ -1233,7 +1233,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         let variant_fields = variant.fields(self.db);
         let mut field_map = hashbrown::HashMap::with_capacity_and_hasher_in(
             variant_fields.len(),
-            FxBuildHasher,
+            FixedState,
             self.frame,
         );
         field_map.extend(variant_fields.fields().iter().map(|(i, field)| (&field.name, i)));
@@ -1242,7 +1242,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 
         // Keep track of which fields have already appeared in the pattern.
         let mut used_fields =
-            hashbrown::HashMap::with_capacity_and_hasher_in(fields.len(), FxBuildHasher, self.frame);
+            hashbrown::HashMap::with_capacity_and_hasher_in(fields.len(), FixedState, self.frame);
 
         let mut inexistent_fields = Vec::new_in(self.frame);
         // Typecheck each field.

@@ -26,17 +26,17 @@ mod check_cfg;
 mod delims;
 mod early;
 
-pub use check_cfg::CheckCfg;
 pub(crate) use self::early::validation::pretty;
+pub use check_cfg::CheckCfg;
 
 use std::collections::hash_map::Entry;
 
+use blaze_hash::HashMap;
 use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
 use cfg::{CfgExpr, CfgOptions};
 use hir::{HirFileId, InFile, MacroCallId, ModuleSourceView};
 use hir_def::AdtId;
-use rustc_hash::FxHashMap;
 use syntax::{
     FlatTree, SyntaxKind, SyntaxNodePtr, TextRange, WalkEvent,
     view::{self as ast, AstNode as _, HasAttrs as _, HasName as _},
@@ -196,9 +196,9 @@ pub(crate) struct Walk<'db> {
     pub(crate) trees: Vec<Tree<'db>>,
     /// The crate's cfg: `--cfg` and the target's.
     pub(crate) cfg: &'db CfgOptions,
-    index: FxHashMap<HirFileId, usize>,
+    index: HashMap<HirFileId, usize>,
     /// Each module of the crate by the order rustc checks it in (`checks::modules`).
-    modules: FxHashMap<hir::Module, usize>,
+    modules: HashMap<hir::Module, usize>,
 }
 
 impl<'db> Walk<'db> {
@@ -208,11 +208,11 @@ impl<'db> Walk<'db> {
             // alloc: setup, the walk is made once per check (`Cx::walk`)
             trees: Vec::new(),
             cfg: cx.krate.cfg(cx.db),
-            index: FxHashMap::default(),
+            index: HashMap::default(),
             // alloc: setup, as above
             modules: modules.iter().enumerate().map(|(rank, it)| (*it, rank)).collect(),
         };
-        let mut places: FxHashMap<HirFileId, Vec<(u32, u32)>> = FxHashMap::default();
+        let mut places: HashMap<HirFileId, Vec<(u32, u32)>> = HashMap::default();
         for module in modules {
             let Some(file) = module.as_source_file_id(cx.db) else { continue };
             let file_id = HirFileId::from(file);
@@ -564,7 +564,7 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, cmd: &CommandLine) -> Vec<Found> {
 /// rustc's `par_hir_for_each_module`), in it every item whose module it is, then for the
 /// crate root the crate's own attributes. A module file's inner attributes are of its `mod`
 /// item, checked in the module that has it.
-fn checked_in(cx: &Cx<'_, '_>, modules: &FxHashMap<hir::Module, usize>, at: InFile<SyntaxNodePtr>) -> (usize, bool) {
+fn checked_in(cx: &Cx<'_, '_>, modules: &HashMap<hir::Module, usize>, at: InFile<SyntaxNodePtr>) -> (usize, bool) {
     let node = cx.syntax_view(at);
     let rank = |module: hir::Module| modules.get(&module).copied().unwrap_or(usize::MAX);
     if let Some(file) = ast::SourceFile::cast(node.value) {
@@ -866,8 +866,8 @@ extern "C" {
                 let mut again = Walk {
                     trees: Vec::with_capacity(1),
                     cfg: walk.cfg,
-                    index: FxHashMap::with_capacity_and_hasher(1, Default::default()),
-                    modules: FxHashMap::default(),
+                    index: HashMap::with_capacity_and_hasher(1, Default::default()),
+                    modules: HashMap::default(),
                 };
                 blaze_alloc_count::assert_at_most(4, "the walk of a tree", || {
                     again.add(cx, tree.file, tree.root, Vec::new());

@@ -7,9 +7,9 @@
 use std::mem;
 
 use base_db::{ConstEvalBudget, Db};
+use blaze_hash::HashMap;
 use hir_def::{FunctionId, StaticId, attrs::AttrFlags};
 use la_arena::ArenaMap;
-use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::IntoKind;
 use smallvec::SmallVec;
 
@@ -62,30 +62,30 @@ pub(super) struct Embedder<'db, M: Machine<'db>> {
     // dyn: the embedder's, one per evaluation and reached only by the calls it claims
     foreign: Option<Box<dyn Foreign<'db, M> + 'db>>,
     /// [`Foreign::claims`] of each function asked about.
-    claims: FxHashMap<FunctionId, bool>,
+    claims: HashMap<FunctionId, bool>,
     /// The arguments of a claimed call, end to end, kept for the next one.
     args: Vec<u8>,
     /// The return place of a claimed call, kept for the next one.
     ret: Vec<u8>,
     /// With [`Evaluator::track_statics`], each static's bytes as first written, by where its
     /// memory starts.
-    first_statics: Option<FxHashMap<usize, Box<[u8]>>>,
+    first_statics: Option<HashMap<usize, Box<[u8]>>>,
     /// What [`Evaluator::preset_static`] gave, until the static is first used (each thread's
     /// first use, for a `#[thread_local]` one).
-    preset_statics: FxHashMap<StaticId, Box<[u8]>>,
+    preset_statics: HashMap<StaticId, Box<[u8]>>,
 }
 
 impl<'db, M: Machine<'db>> Default for Embedder<'db, M> {
     fn default() -> Self {
         Embedder {
             foreign: None,
-            claims: FxHashMap::default(),
+            claims: HashMap::default(),
             // alloc: none until the first claimed call, then reused
             args: Vec::new(),
             // alloc: none until the first claimed call, then reused
             ret: Vec::new(),
             first_statics: None,
-            preset_statics: FxHashMap::default(),
+            preset_statics: HashMap::default(),
         }
     }
 }
@@ -166,6 +166,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         self.budget = budget;
         self.steps_left = budget.steps;
         self.lint_mark = super::lint_mark(self.limits_frames, budget.steps);
+    }
+
+    /// The `-C overflow-checks` of the crate a run's code is compiled as: what a body that
+    /// inherits its checks uses. Unset, such a body checks (a constant's evaluation).
+    pub fn set_inherited_overflow_checks(&mut self, checks: bool) {
+        self.inherited_overflow_checks = Some(checks);
     }
 
     /// From now on, each static's bytes as first written (its initializer, or what

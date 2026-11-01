@@ -34,11 +34,11 @@ pub mod sources;
 #[cfg(feature = "query")]
 pub mod stdlib;
 
+use blaze_hash::HashMap;
 use blaze_manifest::manifest::Manifest;
 use blaze_manifest::profiles::Profiles;
 use blaze_resolve::resolver::ResolvedFeatures;
 use blaze_resolve::{Cfg, PackageId, Platform, Resolve};
-use rustc_hash::FxHashMap;
 
 pub use read::Read;
 pub use schema::UnitGraph;
@@ -208,7 +208,7 @@ pub struct Package<'a> {
 /// Everything a unit graph is made from.
 pub struct Request<'a> {
     /// Every package of the resolve, by its id.
-    pub packages: &'a FxHashMap<PackageId, Package<'a>>,
+    pub packages: &'a HashMap<PackageId, Package<'a>>,
     /// The resolve of the build (cargo's `targeted_resolve`).
     pub resolve: &'a Resolve,
     /// The features the feature resolver activated for the build.

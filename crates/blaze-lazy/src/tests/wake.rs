@@ -35,6 +35,11 @@ fn start<C: Compiler>(count: u32, compiler: C, workers: u32) -> (Runner<C, Addre
     (runner, mail)
 }
 
+/// Waits until all `workers` of `runner` sleep.
+fn asleep<C: Compiler>(runner: &Runner<C, Addresses, Mail>, workers: u32) {
+    blaze_spin::SpinWait::within("every worker to sleep", Duration::from_secs(60), || runner.parked() == workers);
+}
+
 fn ready<C: Compiler>(runner: &Runner<C, Addresses, Mail>, mail: &Mailbox, seq: u32, lazy: u32) {
     runner.frame(0, ASK_KIND, seq, &wire::ask(u64::from(seq), lazy)).unwrap();
     let (kind, body) = mail.wait(0, seq);
@@ -51,12 +56,12 @@ fn asks_while_spinning_and_after_every_worker_sleeps_are_each_answered() {
             ready(&runner, &mail, lazy + 1, lazy);
             // Even asks come while a worker spins; odd ones after every worker went to sleep.
             if lazy % 2 == 1 {
-                std::thread::sleep(Duration::from_millis(2));
+                asleep(&runner, workers);
             }
         }
         let closed = runner.close();
         assert_eq!(closed.compiles, 8, "{workers} workers");
-        assert_eq!(compiler.seen.lock().unwrap().len(), 8);
+        assert_eq!(compiler.seen.lock().len(), 8);
     }
 }
 
@@ -65,7 +70,7 @@ fn a_burst_of_asks_is_compiled_once_each_across_the_workers() {
     const FUNCTIONS: u32 = 64;
     let compiler = Counting { delay: Duration::from_millis(1), ..Counting::default() };
     let (runner, mail) = start(FUNCTIONS, compiler.clone(), 4);
-    std::thread::sleep(Duration::from_millis(2));
+    asleep(&runner, 4);
     for lazy in 0..FUNCTIONS {
         runner.frame(0, ASK_KIND, lazy + 1, &wire::ask(u64::from(lazy + 1), lazy)).unwrap();
     }
@@ -75,7 +80,7 @@ fn a_burst_of_asks_is_compiled_once_each_across_the_workers() {
     }
     let closed = runner.close();
     assert_eq!(closed.compiles, u64::from(FUNCTIONS));
-    let seen = compiler.seen.lock().unwrap();
+    let seen = compiler.seen.lock();
     let distinct: std::collections::HashSet<_> = seen.iter().collect();
     assert_eq!((seen.len(), distinct.len()), (FUNCTIONS as usize, FUNCTIONS as usize), "each compiled once");
 }
@@ -98,12 +103,12 @@ fn prefetched_callees_are_taken_by_sleeping_workers() {
         }
     }
     let (runner, mail) = start(8, Calls, 3);
-    std::thread::sleep(Duration::from_millis(2));
+    asleep(&runner, 3);
     ready(&runner, &mail, 1, 0);
     let deadline = Instant::now() + Duration::from_secs(60);
     while (1..8).any(|n| runner.target(&key(n)).is_none()) {
         assert!(Instant::now() < deadline, "the callees prefetched within a minute");
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::yield_now();
     }
     for lazy in 1..8 {
         ready(&runner, &mail, lazy + 1, lazy);
@@ -115,22 +120,24 @@ fn prefetched_callees_are_taken_by_sleeping_workers() {
 fn a_prefetch_from_the_daemon_wakes_a_sleeping_worker() {
     let compiler = Counting::default();
     let (runner, _mail) = start(4, compiler.clone(), 2);
-    std::thread::sleep(Duration::from_millis(2));
+    asleep(&runner, 2);
     runner.want(&[crate::LazyId(3)], Priority::History);
     let deadline = Instant::now() + Duration::from_secs(60);
     while runner.target(&key(3)).is_none() {
         assert!(Instant::now() < deadline, "the prefetch within a minute");
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::yield_now();
     }
     assert_eq!(runner.close().compiles, 1);
 }
 
 #[test]
 fn a_close_ends_spinning_and_sleeping_workers_at_once() {
-    for pause in [Duration::ZERO, Duration::from_millis(2)] {
+    for sleeping in [false, true] {
         let (runner, mail) = start(2, Counting::default(), 4);
         ready(&runner, &mail, 1, 0);
-        std::thread::sleep(pause);
+        if sleeping {
+            asleep(&runner, 4);
+        }
         let start = Instant::now();
         runner.close();
         assert!(start.elapsed() < Duration::from_secs(5), "closed in {:?}", start.elapsed());

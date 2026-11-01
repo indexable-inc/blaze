@@ -1,8 +1,8 @@
 //! The resolve's packages, interned once to a dense [`Pkg`] in `PackageId` order, with what the
 //! tree reads of each.
 
+use blaze_hash::{FixedState, HashMap};
 use blaze_resolve::{InternedString, PackageId, PackageIdSpec, Resolve};
-use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use blaze_ids::bits::BitSet as Bits;
 
@@ -20,8 +20,8 @@ impl Pkg {
 /// What was read of every package of the resolve: blaze-metadata's, or the database's load.
 #[derive(Clone, Copy)]
 pub(crate) enum Reads<'a> {
-    Metadata(&'a FxHashMap<PackageId, blaze_metadata::Read>),
-    Units(&'a FxHashMap<PackageId, blaze_units::Read>),
+    Metadata(&'a HashMap<PackageId, blaze_metadata::Read>),
+    Units(&'a HashMap<PackageId, blaze_units::Read>),
 }
 
 /// What the tree reads of one package.
@@ -59,7 +59,7 @@ impl<'a> Reads<'a> {
 /// The resolve's packages, each hashed once here and indexed by [`Pkg`] after.
 pub(crate) struct Table<'a> {
     ids: Vec<PackageId>,
-    index: FxHashMap<PackageId, Pkg>,
+    index: HashMap<PackageId, Pkg>,
     info: Vec<Option<Info<'a>>>,
 }
 
@@ -70,7 +70,7 @@ impl<'a> Table<'a> {
         ids.extend(resolve.iter());
         // The resolve keeps its packages in an ordered map, so this only checks the order.
         ids.sort_unstable();
-        let mut index = FxHashMap::with_capacity_and_hasher(len, FxBuildHasher);
+        let mut index = HashMap::with_capacity_and_hasher(len, FixedState);
         let mut info = Vec::with_capacity(len);
         for (i, &id) in ids.iter().enumerate() {
             let pkg = Pkg(u32::try_from(i).expect("fewer than 2^32 packages"));

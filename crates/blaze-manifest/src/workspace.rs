@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use annotate_snippets::{Level, Renderer};
 use anyhow::{Context as _, bail};
+use blaze_hash::{HashMap, HashSet};
 use cargo_util_schemas::manifest::TomlProfiles;
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::features::{Edition, Features, ResolveBehavior};
 use crate::files::Files;
@@ -89,13 +89,13 @@ fn find_root_iter<'a, F: Files>(
 pub struct Workspace<'c, F: Files> {
     ctx: &'c Context<F>,
     current_manifest: PathBuf,
-    packages: FxHashMap<PathBuf, EitherManifest>,
+    packages: HashMap<PathBuf, EitherManifest>,
     root_manifest: Option<PathBuf>,
     target_dir: Option<PathBuf>,
     build_dir: Option<PathBuf>,
     /// In the order cargo finds them, which is the order `cargo metadata` prints them.
     members: Vec<PathBuf>,
-    member_set: FxHashSet<PathBuf>,
+    member_set: HashSet<PathBuf>,
     default_members: Vec<PathBuf>,
     resolve_behavior: ResolveBehavior,
     custom_metadata: Option<toml::Value>,
@@ -107,12 +107,12 @@ impl<'c, F: Files> Workspace<'c, F> {
         let mut ws = Workspace {
             ctx,
             current_manifest: manifest_path.to_owned(),
-            packages: FxHashMap::default(),
+            packages: HashMap::default(),
             root_manifest: None,
             target_dir: None,
             build_dir: None,
             members: Vec::new(),
-            member_set: FxHashSet::default(),
+            member_set: HashSet::default(),
             default_members: Vec::new(),
             resolve_behavior: ResolveBehavior::V1,
             custom_metadata: None,
@@ -404,7 +404,7 @@ impl<'c, F: Files> Workspace<'c, F> {
     }
 
     fn validate_unique_names(&self) -> anyhow::Result<()> {
-        let mut names = FxHashMap::default();
+        let mut names = HashMap::default();
         for member in &self.members {
             let name = match self.get(member) {
                 EitherManifest::Real(m) => &m.package_id.name,

@@ -36,7 +36,7 @@ const _: () = {
 /// The schema of an image buffer: its root record's, and the version of what the parts are.
 pub const IMAGE_SCHEMA: SchemaHash = blaze_format::schema_of(&[
     SchemaPart::Str("blaze v2 dependency image"),
-    SchemaPart::U64(1),
+    SchemaPart::U64(2),
     SchemaPart::Schema(<Root as Record>::SCHEMA),
 ]);
 

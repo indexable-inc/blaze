@@ -16,11 +16,12 @@
 //! bug, never a reason to use the live one.
 
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use base_db::{FileId, VfsPath};
 use blaze_format::cursor::{Put, Reader};
+use blaze_hash::{HashMap, HashSet};
 use cfg::{CfgAtom, CfgExpr};
 use either::Either;
 use hir_expand::{
@@ -35,7 +36,7 @@ use hir_expand::{
 };
 use intern::Symbol;
 use la_arena::{Idx, RawIdx};
-use rustc_hash::{FxHashMap, FxHashSet};
+use parking_lot::Mutex;
 use smallvec::SmallVec;
 use span::{
     Edition, ErasedFileAstId, FileAstId, Span, SpanAnchor, SyntaxContext, TextRange, TextSize,
@@ -47,13 +48,11 @@ use triomphe::Arc as TArc;
 use tt::{Delimiter, DelimiterKind, IdentIsRaw, Leaf, LitKind, Spacing, Subtree, TokenTree};
 
 use crate::{
-    AdtId, AstId, BlockId, BuiltinDeriveImplId, BuiltinDeriveImplLoc, ConstLoc,
-    DefWithBodyId, EnumLoc, EnumVariantId, EnumVariantLoc, ExternBlockId, ExternBlockLoc,
-    ExternCrateId, ExternCrateLoc, FunctionLoc, FxIndexMap, ImplId, ImplLoc, Intern,
-    ItemContainerId, Lookup,
+    AdtId, AstId, BlockId, BuiltinDeriveImplId, BuiltinDeriveImplLoc, ConstLoc, DefWithBodyId,
+    EnumLoc, EnumVariantId, EnumVariantLoc, ExternBlockId, ExternBlockLoc, ExternCrateId,
+    ExternCrateLoc, FunctionLoc, FxIndexMap, ImplId, ImplLoc, Intern, ItemContainerId, Lookup,
     Macro2Loc, MacroExpander, MacroId, MacroRulesLoc, MacroRulesLocFlags, ModuleDefId, ModuleId,
-    ProcMacroLoc, StaticLoc, StructLoc, TraitLoc, TypeAliasLoc, UnionLoc, UseId,
-    UseLoc,
+    ProcMacroLoc, StaticLoc, StructLoc, TraitLoc, TypeAliasLoc, UnionLoc, UseId, UseLoc,
     builtin_derive::BuiltinDeriveImplTrait,
     builtin_type::BuiltinType,
     expr_store::Body,
@@ -102,11 +101,11 @@ pub struct Frozen {
 #[blaze_query::input(singleton, debug)]
 pub struct FrozenDefMaps {
     #[returns(ref)]
-    pub maps: Arc<FxHashMap<Crate, Frozen>>,
+    pub maps: Arc<HashMap<Crate, Frozen>>,
 }
 
 /// Has name resolution use `maps`.
-pub fn set(db: &mut Db, maps: FxHashMap<Crate, Frozen>) {
+pub fn set(db: &mut Db, maps: HashMap<Crate, Frozen>) {
     use blaze_query::db::{Durability, Setter};
     // alloc: Check/Verify only, which record differences; never when serving
     let maps = Arc::new(maps);
@@ -130,8 +129,8 @@ pub fn set(db: &mut Db, maps: FxHashMap<Crate, Frozen>) {
 struct Differences(Mutex<Vec<(Crate, &'static str, String)>>);
 
 impl Differences {
-    fn found(&self) -> std::sync::MutexGuard<'_, Vec<(Crate, &'static str, String)>> {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn found(&self) -> parking_lot::MutexGuard<'_, Vec<(Crate, &'static str, String)>> {
+        self.0.lock()
     }
 
     fn take(&self) -> Vec<(Crate, &'static str, String)> {
@@ -274,11 +273,11 @@ pub fn unreadable(db: &Db, krate: Crate, bytes: &[u8]) -> Option<String> {
 #[blaze_query::input(singleton, debug)]
 pub struct FrozenLangItems {
     #[returns(ref)]
-    pub maps: Arc<FxHashMap<Crate, Frozen>>,
+    pub maps: Arc<HashMap<Crate, Frozen>>,
 }
 
 /// Has finding the lang items of a crate use `maps`.
-pub fn set_lang_items(db: &mut Db, maps: FxHashMap<Crate, Frozen>) {
+pub fn set_lang_items(db: &mut Db, maps: HashMap<Crate, Frozen>) {
     use blaze_query::db::{Durability, Setter};
     // alloc: once per load of the frozen bytes
     let maps = Arc::new(maps);
@@ -366,7 +365,7 @@ fn closure(db: &Db, krate: Crate) -> Vec<Crate> {
     // alloc: encoding, once per crate per image write (not on a build's path)
     let mut order = vec![krate];
     // alloc: encoding, once per crate per image write (not on a build's path)
-    let mut seen: FxHashSet<Crate> = order.iter().copied().collect();
+    let mut seen: HashSet<Crate> = order.iter().copied().collect();
     let mut at = 0;
     while let Some(&next) = order.get(at) {
         at += 1;
@@ -481,24 +480,24 @@ pub struct Enc<'a> {
     /// Writing a fingerprint: macro calls and syntax contexts are written as hashes of what
     /// they are, and nothing is named by an index.
     fingerprinting: bool,
-    crates: FxHashMap<Crate, u32>,
+    crates: HashMap<Crate, u32>,
     closure: Vec<Crate>,
-    dirs: FxHashMap<u32, String>,
+    dirs: HashMap<u32, String>,
     /// The crates of the closure whose root is in each source root, in the closure's order.
-    owners: FxHashMap<base_db::SourceRootId, Vec<u32>>,
+    owners: HashMap<base_db::SourceRootId, Vec<u32>>,
     /// Each file: the crate it is named from and its path from that crate's root.
-    file_names: FxHashMap<FileId, (u32, String)>,
-    files: FxHashMap<FileId, u32>,
+    file_names: HashMap<FileId, (u32, String)>,
+    files: HashMap<FileId, u32>,
     /// The files named, in the order of their index.
     file_order: Vec<FileId>,
-    calls: FxHashMap<MacroCallId, u32>,
-    contexts: FxHashMap<SyntaxContext, u32>,
-    call_hashes: FxHashMap<MacroCallId, u128>,
-    context_hashes: FxHashMap<SyntaxContext, u128>,
-    modules: FxHashMap<ModuleId, (u32, u32)>,
-    indexed: FxHashSet<Crate>,
+    calls: HashMap<MacroCallId, u32>,
+    contexts: HashMap<SyntaxContext, u32>,
+    call_hashes: HashMap<MacroCallId, u128>,
+    context_hashes: HashMap<SyntaxContext, u128>,
+    modules: HashMap<ModuleId, (u32, u32)>,
+    indexed: HashSet<Crate>,
     /// The body each block that was looked for is in.
-    block_owners: FxHashMap<BlockId, DefWithBodyId>,
+    block_owners: HashMap<BlockId, DefWithBodyId>,
     out_dirs: Vec<(u32, String)>,
 }
 
@@ -549,19 +548,19 @@ impl<'a> Enc<'a> {
             fingerprinting: false,
             crates,
             closure,
-            dirs: FxHashMap::default(),
-            owners: FxHashMap::default(),
-            file_names: FxHashMap::default(),
-            files: FxHashMap::default(),
+            dirs: HashMap::default(),
+            owners: HashMap::default(),
+            file_names: HashMap::default(),
+            files: HashMap::default(),
             // alloc: encoding, once per crate per image write (not on a build's path)
             file_order: Vec::new(),
-            calls: FxHashMap::default(),
-            contexts: FxHashMap::default(),
-            call_hashes: FxHashMap::default(),
-            context_hashes: FxHashMap::default(),
-            modules: FxHashMap::default(),
-            indexed: FxHashSet::default(),
-            block_owners: FxHashMap::default(),
+            calls: HashMap::default(),
+            contexts: HashMap::default(),
+            call_hashes: HashMap::default(),
+            context_hashes: HashMap::default(),
+            modules: HashMap::default(),
+            indexed: HashSet::default(),
+            block_owners: HashMap::default(),
             out_dirs,
         }
     }
@@ -1840,9 +1839,10 @@ impl Enc<'_> {
                 self.mod_path(path)?;
                 match err {
                     ExpandErrorKind::ProcMacroAttrExpansionDisabled => self.u8(0),
-                    ExpandErrorKind::MissingProcMacroExpander(krate) => {
+                    ExpandErrorKind::MissingProcMacroExpander { krate, why } => {
                         self.u8(1);
                         self.krate(*krate)?;
+                        self.str(why)?;
                     }
                     ExpandErrorKind::MacroDisabled => self.u8(2),
                     ExpandErrorKind::MacroDefinition => self.u8(3),
@@ -1986,7 +1986,7 @@ impl Enc<'_> {
             return Err("a def map whose root is not its first module".to_owned());
         }
         self.usize(table.len())?;
-        let index: FxHashMap<ModuleId, u32> =
+        let index: HashMap<ModuleId, u32> =
             // alloc: encoding, once per crate per image write (not on a build's path)
             table.keys().enumerate().map(|(i, &it)| (it, i as u32)).collect();
         for (id, data) in table.iter() {
@@ -2162,7 +2162,7 @@ pub struct Dec<'a> {
     closure: Vec<Crate>,
     /// The files of each crate of the closure by their path from its root, read when first
     /// needed.
-    paths: FxHashMap<u32, (String, bool, base_db::SourceRootId)>,
+    paths: HashMap<u32, (String, bool, base_db::SourceRootId)>,
     files: Vec<FileId>,
     calls: Vec<MacroCallId>,
     contexts: Vec<SyntaxContext>,
@@ -2170,7 +2170,7 @@ pub struct Dec<'a> {
     own: Vec<ModuleId>,
     /// Reading the crate's own `DefMap`, whose modules are `own`.
     in_def_map: bool,
-    modules: FxHashMap<u32, Vec<ModuleId>>,
+    modules: HashMap<u32, Vec<ModuleId>>,
 }
 
 impl<'a> Dec<'a> {
@@ -2180,7 +2180,7 @@ impl<'a> Dec<'a> {
             r: Reader::new(bytes),
             krate,
             closure: closure(db, krate),
-            paths: FxHashMap::default(),
+            paths: HashMap::default(),
             // alloc: the decoded map's own storage, once per crate served
             files: Vec::new(),
             // alloc: the decoded map's own storage, once per crate served
@@ -2190,7 +2190,7 @@ impl<'a> Dec<'a> {
             // alloc: the decoded map's own storage, once per crate served
             own: Vec::new(),
             in_def_map: false,
-            modules: FxHashMap::default(),
+            modules: HashMap::default(),
         }
     }
 
@@ -3201,7 +3201,7 @@ impl Dec<'_> {
                 let path = self.mod_path()?;
                 let err = match self.u8()? {
                     0 => ExpandErrorKind::ProcMacroAttrExpansionDisabled,
-                    1 => ExpandErrorKind::MissingProcMacroExpander(self.krate()?),
+                    1 => ExpandErrorKind::MissingProcMacroExpander { krate: self.krate()?, why: self.str()?.into() },
                     2 => ExpandErrorKind::MacroDisabled,
                     3 => ExpandErrorKind::MacroDefinition,
                     4 => ExpandErrorKind::RecursionOverflow,
@@ -3610,7 +3610,7 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
 
     #[test]
     fn read_back_writes_the_same_bytes() {
-        let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+        let _turn = TURN.lock();
         let bytes = frozen();
         let db = with(Mode::Verify, &bytes);
         for (name, written) in &bytes {
@@ -3627,7 +3627,7 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
         let krate = crate_named(db, name);
         let def_map = super::super::crate_def_map(db, krate);
         let table = def_map.table(db);
-        let modules: FxHashMap<ModuleId, (u32, u32)> =
+        let modules: HashMap<ModuleId, (u32, u32)> =
             table.keys().enumerate().map(|(index, &it)| (it, (0, index as u32))).collect();
         (table.iter())
             .map(|(_, module)| {
@@ -3854,7 +3854,7 @@ pub mod inside { pub fn f() {} }
 
     #[test]
     fn checking_finds_a_difference() {
-        let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+        let _turn = TURN.lock();
         let mut bytes = frozen();
         let db = with(Mode::Check, &bytes);
         _ = super::super::crate_def_map(&db, crate_named(&db, "main"));

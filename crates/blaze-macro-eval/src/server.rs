@@ -12,10 +12,10 @@
 use std::{fmt::Write as _, ops::Bound};
 
 use base_db::Db;
-use proc_macro_api::bridge::spans::{self, spanned};
-use intern::Symbol;
+use blaze_hash::HashMap;
 use blaze_lower::{SubRequest, SubResponse};
-use rustc_hash::FxHashMap;
+use intern::Symbol;
+use proc_macro_api::bridge::spans::{self, spanned};
 use span::{Edition, FIXUP_ERASED_FILE_AST_ID_MARKER, Span, TextRange, TextSize};
 
 use crate::{
@@ -40,7 +40,7 @@ pub(crate) struct Server {
     /// `streams[h - 1]` is the stream of handle `h`, `None` once the client took it.
     streams: Vec<Option<Stream>>,
     spans: Vec<Span>,
-    span_handles: FxHashMap<Span, u32>,
+    span_handles: HashMap<Span, u32>,
     /// `Span::save_span`'s, by the index it gave.
     saved: Vec<Span>,
     /// The def, call and mixed sites.
@@ -177,7 +177,7 @@ impl Server {
             // alloc: once per expansion, its tables, which grow with what it builds
             streams: Vec::new(),
             spans: Vec::new(), // alloc: once per expansion, as above
-            span_handles: FxHashMap::default(),
+            span_handles: HashMap::default(),
             saved: Vec::new(), // alloc: once per expansion, as above
             sites,
             edition,

@@ -25,6 +25,7 @@ unsandboxed-tests = [
 [dependencies]
 anyhow.workspace = true
 blaze-diagnostics.workspace = true
+blaze-hash.workspace = true
 blaze-item-hash.workspace = true
 blaze-items.workspace = true
 hir.workspace = true
@@ -37,12 +38,12 @@ blaze-doc.workspace = true
 # `blaze pack`'s pack, made in the daemon (`serve::unit::pack`). It names no code generator, so
 # blaze-wasm's `wasm` feature never reaches this build.
 blaze-wasm-pack.workspace = true
+parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tracing.workspace = true
 cfg.workspace = true
 intern.workspace = true
-rustc-hash.workspace = true
 blaze-sha256.workspace = true
 toml.workspace = true
 
@@ -106,6 +107,7 @@ blaze-link.workspace = true
 blaze-lower.workspace = true
 base-db.workspace = true
 crossbeam-channel.workspace = true
+crossbeam-queue.workspace = true
 # `extended`: the `mi_collect` binding.
 libmimalloc-sys = { workspace = true, features = ["extended"] }
 

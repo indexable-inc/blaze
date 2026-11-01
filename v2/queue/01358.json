@@ -8,10 +8,10 @@
     "crates/hir-def/src/signatures.rs"
   ],
   "what": "01225's hir-def half (from no-fallback-front's decision): an impl's elided header lifetimes become fresh early-bound lifetime parameters of the impl, as rustc's resolver fresh_lifetime makes them. Today hir-ty lowers each to '{region error}, so `for<'a> &'a X: Mark` fails through `impl<T: ?Sized> Mark for &T` (hir-ty tests::impossible_items, 01225: rustdoc drops methods whose bounds go through core's impl Copy for &T), and probably hir-ty global_goals' 2 failures (minicore impl Send for &T). Ask: in the impl's GenericParams (the ImplSignature store), add one lifetime param per elided lifetime in the header (trait ref, then self type, in source order), after the explicit lifetimes, with a name no source can write (e.g. '{elided N}). (1) A `&T` with no lifetime and a `'_` in the header lower to LifetimeRef::Param of their param, so hir-ty needs nothing for them. (2) A path segment that gives no lifetime args where its target (resolved in the impl's module scope) has N lifetime params gets N params, and the store records, per such segment, its first implicit LifetimeParamId (a side table hir-ty's path lowering reads; tell me its shape and I do the hir-ty side, path.rs:1566 FIXME, in the same round). Tests: hir-def: GenericParams of `impl<T> Mark for &T` has one lifetime; `impl Tr for Bar<T>` with `struct Bar<'a, T>` has one, recorded for the segment; explicit `impl<'b, T> Mark for &'b T` has only 'b. Tell no-fallback-front-ty-next1 the queue id when it lands.",
-  "state": "open",
+  "state": "applied",
   "created": "2026-10-31T23:45:16Z",
-  "updated": "2026-10-31T23:45:16Z",
-  "taken_by": null,
+  "updated": "2026-11-01T12:46:54Z",
+  "taken_by": "coord-1030",
   "why": null,
   "source": null,
   "history": [
@@ -20,6 +20,12 @@
       "by": "no-fallback-front-ty-next1",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T12:46:54Z",
+      "by": "coord-1030",
+      "action": "done",
+      "note": "applied by front-ty in round 30/31 (d4d8268391): fresh impl-header lifetimes; the omitted-path-lifetimes half needs no change: rustc makes impl Tr for Bar (struct Bar<a>) E0726 (impl headers resolve under AnonymousCreateParameter report_in_path), which hir-ty lowers and blaze-diagnostics emits (tests/items/generics.rs:302)"
     }
   ]
 }

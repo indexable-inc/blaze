@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     fmt::Display,
-    hash::{BuildHasherDefault, Hash, Hasher},
+    hash::{Hash, Hasher},
     iter,
 };
 
@@ -19,7 +19,6 @@ use hir_expand::{mod_path::ModPath, name::Name};
 use intern::Symbol;
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 use macros::{GenericTypeVisitable, TypeFoldable, TypeVisitable};
-use rustc_hash::{FxHashMap, FxHasher};
 use rustc_type_ir::{
     CoroutineArgs, GenericTypeVisitable,
     inherent::{GenericArgs as _, IntoKind, Ty as _},
@@ -1556,7 +1555,8 @@ pub struct MirBody<'db> {
     pub start_block: BasicBlockId,
     pub owner: InferBodyId<'db>,
     pub binding_locals: ArenaMap<BindingId, LocalId>,
-    pub upvar_locals: FxHashMap<BindingId, Vec<(LocalId, crate::closure_analysis::Place)>>,
+    pub upvar_locals:
+        blaze_hash::HashMap<BindingId, Vec<(LocalId, crate::closure_analysis::Place)>>,
     pub param_locals: Vec<LocalId>,
     /// Temporaries that hold a constant and are borrowed for `'static`, as in `&[1, 2]`. The
     /// value has to outlive the call.
@@ -1668,7 +1668,7 @@ impl Hash for MirBody<'_> {
 /// `raw` keeping their order, and each value is found again by its key; straight into `state`,
 /// with no hasher per entry.
 fn hash_by_key<K: Hash + Eq + Copy, V: Hash, H: Hasher>(
-    map: &FxHashMap<K, V>,
+    map: &blaze_hash::HashMap<K, V>,
     raw: impl Fn(K) -> u32,
     from_raw: impl Fn(u32) -> K,
     state: &mut H,
@@ -1938,7 +1938,7 @@ impl<'db> MirBody<'db> {
         &mut self,
         infcx: &InferCtxt<'db>,
         env: ParamEnv<'db>,
-        copy: &mut FxHashMap<Ty<'db>, bool>,
+        copy: &mut blaze_hash::HashMap<Ty<'db>, bool>,
     ) {
         let mut blocks = std::mem::take(&mut self.basic_blocks);
         let mut mark = |operand: &mut Operand| {
@@ -2210,8 +2210,9 @@ impl<'db> PlaceTy<'db> {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, GenericTypeVisitable)] // clone: inside a constant's `ComplexMemoryMap`
 pub struct VTableMap<'db> {
-    /// Fx hashed as `FxHashMap`, with the hasher `rustc_type_ir` can visit.
-    ty_to_id: HashMap<Ty<'db>, usize, BuildHasherDefault<FxHasher>>,
+    /// Hashed by `blaze_hash::FixedHasher` through `BuildHasherDefault`, the hasher
+    /// `rustc_type_ir` can visit.
+    ty_to_id: HashMap<Ty<'db>, usize, std::hash::BuildHasherDefault<blaze_hash::FixedHasher>>,
     id_to_ty: Vec<Ty<'db>>,
 }
 
@@ -2614,7 +2615,6 @@ impl MirStage {
 #[cfg(test)]
 mod tests {
     use la_arena::{Idx, RawIdx};
-    use rustc_hash::FxHashMap;
 
     use super::{
         AssertKind, LocalId, MirOptLevel, MirOptions, Operand, OperandKind, Place, hash_by_key,
@@ -2707,7 +2707,8 @@ mod tests {
         use super::{Inlined, InlinedPromoted, InlinedScope, InlinedSpan, MirSpan};
 
         let expr = |n: u32| MirSpan::ExprId(ExprId::from_raw(RawIdx::from(n)));
-        let hash = |inlined: &Inlined<'_>| blaze_ids::Hasher::new("hir-ty test").std(inlined).finish();
+        let hash =
+            |inlined: &Inlined<'_>| blaze_ids::Hasher::new("hir-ty test").std(inlined).finish();
         let empty = Inlined::default();
         assert!(empty.is_empty());
         let mut scoped = Inlined::default();
@@ -2731,9 +2732,9 @@ mod tests {
         assert_eq!(hash(&scoped), hash(&scoped.clone()));
     }
 
-    fn digest(map: &FxHashMap<u32, Vec<u32>>) -> blaze_ids::ContentId {
+    fn digest(map: &blaze_hash::HashMap<u32, Vec<u32>>) -> blaze_ids::ContentId {
         let mut hasher = blaze_ids::Hasher::new("hir-ty test");
-        hash_by_key(map, |key| key, |raw| raw, &mut blaze_ids::StdHash(&mut hasher));
+        hash_by_key(map, |key| key, |raw| raw, &mut blaze_hash::Blake3Hasher(&mut hasher));
         hasher.finish()
     }
 
@@ -2750,8 +2751,8 @@ mod tests {
     fn map(
         entries: impl IntoIterator<Item = (u32, Vec<u32>)>,
         capacity: usize,
-    ) -> FxHashMap<u32, Vec<u32>> {
-        let mut map = FxHashMap::with_capacity_and_hasher(capacity, Default::default());
+    ) -> blaze_hash::HashMap<u32, Vec<u32>> {
+        let mut map = blaze_hash::HashMap::with_capacity_and_hasher(capacity, Default::default());
         map.extend(entries);
         map
     }

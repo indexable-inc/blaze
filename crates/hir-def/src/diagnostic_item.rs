@@ -2,11 +2,11 @@
 //! `diagnostic_items` (one crate) and `all_diagnostic_items` (a crate and those it depends on)
 //! collect them. The name one item has is [`AttrFlags::diagnostic_item`].
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
+use blaze_hash::{FixedState, HashMap};
 use blaze_mem::frame::Frame;
 use hashbrown::hash_map::Entry;
 use intern::Symbol;
-use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::{
     AssocItemId, AttrDefId, HasModule, ModuleDefId, ModuleId,
@@ -25,7 +25,7 @@ mod tests;
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DiagnosticItems {
     /// The item each diagnostic item names.
-    pub by_name: FxHashMap<Symbol, AttrDefId>,
+    pub by_name: HashMap<Symbol, AttrDefId>,
     /// Each name given to a second item, which rustc refuses ("duplicate diagnostic item"):
     /// the name, the item `by_name` keeps for it, and the other. In a crate's own items, the
     /// first in the def map's order is kept; across crates, the crate asked about, then its
@@ -40,7 +40,7 @@ impl DiagnosticItems {
     }
 }
 
-type FrameMap<'f> = hashbrown::HashMap<Symbol, AttrDefId, FxBuildHasher, &'f Frame>;
+type FrameMap<'f> = hashbrown::HashMap<Symbol, AttrDefId, FixedState, &'f Frame>;
 type Duplicates<'f> = Vec<(Symbol, AttrDefId, AttrDefId), &'f Frame>;
 
 /// Gives `name` to `owner` unless an item has it already; a second item is a duplicate.
@@ -65,7 +65,7 @@ fn insert(
 /// The memo's value, made once at its size from what a run gathered in its frame.
 fn settle(mut by_name: FrameMap<'_>, mut duplicates: Duplicates<'_>) -> DiagnosticItems {
     // alloc: the memo's map, exact
-    let mut result = FxHashMap::with_capacity_and_hasher(by_name.len(), FxBuildHasher);
+    let mut result = HashMap::with_capacity_and_hasher(by_name.len(), FixedState);
     result.extend(by_name.drain());
     // alloc: the memo's duplicates, exact
     DiagnosticItems { by_name: result, duplicates: duplicates.drain(..).collect() }
@@ -82,7 +82,7 @@ pub fn crate_diagnostic_items(db: &Db, krate: Crate) -> DiagnosticItems {
     blaze_mem::frame::current(|frame| {
         let mut collect = Collect {
             db,
-            by_name: hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame),
+            by_name: hashbrown::HashMap::with_hasher_in(FixedState, frame),
             duplicates: Vec::new_in(frame),
         };
         for (module, data) in crate_def_map(db, krate).modules(db) {
@@ -110,7 +110,7 @@ pub fn diagnostic_items(db: &Db, krate: Crate) -> DiagnosticItems {
         // `CrateData::dependencies` lists the sysroot crates even for `#![no_std]` and
         // `#![no_core]` crates, which rustc does not load; the extern prelude is what name
         // resolution settled on.
-        let mut seen = hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame);
+        let mut seen = hashbrown::HashSet::with_hasher_in(FixedState, frame);
         seen.insert(krate);
         let mut queue = Vec::new_in(frame);
         queue.push(krate);
@@ -124,7 +124,7 @@ pub fn diagnostic_items(db: &Db, krate: Crate) -> DiagnosticItems {
                 }
             }
         }
-        let mut by_name = hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame);
+        let mut by_name = hashbrown::HashMap::with_hasher_in(FixedState, frame);
         by_name.extend(own.by_name.iter().map(|(&name, &owner)| (name, owner)));
         let mut duplicates = Vec::new_in(frame);
         duplicates.extend(own.duplicates.iter().copied());

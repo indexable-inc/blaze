@@ -5,15 +5,15 @@ use std::sync::Arc;
 
 use base_db::{Crate, Db, all_crates};
 use blaze_format::Aligned;
+use blaze_hash::HashMap;
 use hir_def::{
     DefWithBodyId, LoweringMode, expr_store::Body, nameres::demand::crate_body_owners,
     signatures::FunctionSignature,
 };
+use hir_expand::fixture;
 use hir_expand::name::Name;
 use hir_ty::{InferBodyId, check_cache, db::HirDatabase, infer_query_with_inspect};
 use hir_ty_mir::mir::lower_body_to_mir;
-use rustc_hash::FxHashMap;
-use hir_expand::fixture;
 
 use crate::checked;
 
@@ -53,7 +53,7 @@ fn served(passed: fn(DefWithBodyId) -> bool) -> (Db, Crate) {
     let mut db = fixture::db(FIXTURE).into_db();
     let dep = crate_named(&db, "dep");
     // alloc: test setup
-    let mut parts = FxHashMap::default();
+    let mut parts = HashMap::default();
     // alloc: test setup
     parts.insert(dep, Arc::new(Aligned::copy_from(&bytes)) as hir_def::deps::ImageBuf);
     check_cache::set_served(&mut db, parts);

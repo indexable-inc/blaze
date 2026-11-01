@@ -8,7 +8,7 @@ use rustc_ast_ir::{FloatTy, IntTy, UintTy};
 pub use tls_cache::clear_tls_solver_cache;
 pub use tls_db::{attach_db, attach_db_allow_change, with_attached_db};
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use hir_def::{
     AdtId, CallableDefId, EnumId, GenericDefId, GenericParamId, HasModule, ItemContainerId,
     StructId, TraitId, TypeAliasId, UnionId, VariantId,
@@ -21,10 +21,10 @@ use hir_def::{
         TraitFlags, TraitSignature, UnionSignature,
     },
 };
-use rustc_abi::ExternAbi;
-use rustc_index::bit_set::DenseBitSet;
 use intern::sym;
+use rustc_abi::ExternAbi;
 use rustc_abi::Size;
+use rustc_index::bit_set::DenseBitSet;
 use rustc_type_ir::{
     AliasConstKind, BoundVar, BoundVarIndexKind, CanonicalParamEnvCache, ConstKind,
     CoroutineWitnessTypes, DebruijnIndex, EarlyBinder, Flags, FnSigKind, GenericArgKind,
@@ -32,9 +32,7 @@ use rustc_type_ir::{
     TypeFlags, TypeVisitableExt, ValTreeKind, Variance, VisitorResult,
     error::TypeError,
     fast_reject,
-    inherent::{
-        self, GenericArgs as _, GenericsOf, IntoKind, SliceLike as _, Span as _, Ty as _,
-    },
+    inherent::{self, GenericArgs as _, GenericsOf, IntoKind, SliceLike as _, Span as _, Ty as _},
     lang_items::{SolverAdtLangItem, SolverProjectionLangItem, SolverTraitLangItem},
     search_graph::RequiredDepth,
     solve::{AdtDestructorKind, QueryResult, SizedTraitKind},
@@ -47,10 +45,10 @@ use crate::{
     lower::GenericPredicates,
     method_resolution::{SelfTyKey, TraitImpls},
     next_solver::{
-        AdtIdWrapper, AliasTermKind, AnonConstIdWrapper, AnyImplId, BoundConst,
-        CallableIdWrapper, CanonicalVarKind, ClosureIdWrapper, Consts, CoroutineClosureIdWrapper,
-        CoroutineIdWrapper, Ctor, FnSig, FreeConstAliasId, FreeTermAliasId, FreeTyAliasId,
-        FxIndexMap, ImplOrTraitAssocConstId, ImplOrTraitAssocTermId, ImplOrTraitAssocTyId,
+        AdtIdWrapper, AliasTermKind, AnonConstIdWrapper, AnyImplId, BoundConst, CallableIdWrapper,
+        CanonicalVarKind, ClosureIdWrapper, Consts, CoroutineClosureIdWrapper, CoroutineIdWrapper,
+        Ctor, FnSig, FreeConstAliasId, FreeTermAliasId, FreeTyAliasId, FxIndexMap,
+        ImplOrTraitAssocConstId, ImplOrTraitAssocTermId, ImplOrTraitAssocTyId,
         InherentAssocConstId, InherentAssocTermId, InherentAssocTyId, InternedConst,
         InternedRegion, LateParamRegionKind, OpaqueTyIdWrapper, OpaqueTypeKey, RegionAssumptions,
         Scalar, ScalarInt, SimplifiedType, SolverContext, SolverDefIds, TermId, TraitAssocConstId,
@@ -65,10 +63,10 @@ use super::{
     ParamTy, PredefinedOpaques, Predicate, SolverDefId, StoredTy, Term, Ty, TyKind, Tys, ValTree,
     ValueConst,
     abi::Safety,
+    features::Features,
     fold::{BoundVarReplacer, BoundVarReplacerDelegate, FnMutDelegate},
     generics::{Generics, generics},
     persist,
-    features::Features,
     region::{BoundRegion, BoundRegionKind, EarlyParamRegion, Region},
     util::adt_sizedness_constraint,
 };
@@ -3199,7 +3197,6 @@ mod tls_db {
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
-            mpsc,
         };
 
         use blaze_graph::{Key, pool::Pool, pump::Flights, topology::Topology};
@@ -3223,7 +3220,7 @@ mod tls_db {
                 let mut bytes = [0u8; 32];
                 bytes[..4].copy_from_slice(&round.to_le_bytes());
                 let key = Key(bytes);
-                let (tx, rx) = mpsc::channel::<Result<(), String>>();
+                let (tx, rx) = crossbeam_channel::unbounded::<Result<(), String>>();
                 let waiting = Arc::new(AtomicUsize::new(0));
                 let held = flights.get_or_run(key, || {
                     for (at, db) in dbs.iter().enumerate() {
@@ -3249,10 +3246,10 @@ mod tls_db {
                             move |it| _ = tx.send(it.map_err(|_| format!("job {at} of round {round} panicked"))),
                         );
                     }
-                    while waiting.load(Ordering::SeqCst) < 2 {
-                        std::thread::yield_now();
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    blaze_graph::spin::SpinWait::within("both jobs to wait", std::time::Duration::from_secs(60), || {
+                        waiting.load(Ordering::SeqCst) >= 2
+                    });
+                    blaze_graph::spin::busy(std::time::Duration::from_millis(2));
                     Ok(round)
                 });
                 assert_eq!(held, Ok(round));
@@ -3284,7 +3281,7 @@ mod tls_db {
             let pool = Pool::new(&Topology::flat(1), false).unwrap();
             let flights = Arc::new(Flights::<u32>::new());
             let run = |what: &'static str, f: Box<dyn FnOnce() + Send>| {
-                let (tx, rx) = mpsc::channel::<Result<(), String>>();
+                let (tx, rx) = crossbeam_channel::unbounded::<Result<(), String>>();
                 pool.submit(None, f, move |it| _ = tx.send(it.map_err(|_| format!("{what} panicked"))));
                 rx.recv().unwrap().unwrap();
             };
@@ -3300,9 +3297,9 @@ mod tls_db {
                     bytes[4] = 1;
                     Key(bytes)
                 });
-                let (tx, rx) = mpsc::channel::<Result<u32, String>>();
+                let (tx, rx) = crossbeam_channel::unbounded::<Result<u32, String>>();
                 let waiting = Arc::new(AtomicUsize::new(0));
-                let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
                 let parked = |count: usize| {
                     while waiting.load(Ordering::SeqCst) < count {
                         std::thread::yield_now();
@@ -3328,7 +3325,7 @@ mod tls_db {
                                 super::attach_db_allow_change(&db, wait);
                             }
                             assert_eq!(attached_here(), None, "a job kept a database it detached");
-                            order.lock().unwrap().push(mine);
+                            order.lock().push(mine);
                             mine
                         },
                         move |it| _ = tx.send(it.map_err(|_| format!("job {mine} of round {round} panicked"))),
@@ -3343,7 +3340,7 @@ mod tls_db {
                         Ok(round)
                     });
                     assert_eq!(held, Ok(round));
-                    while order.lock().unwrap().len() < 1 {
+                    while order.lock().len() < 1 {
                         std::thread::yield_now();
                     }
                     Ok(round)
@@ -3352,7 +3349,7 @@ mod tls_db {
                 let mut ended = [rx.recv().unwrap(), rx.recv().unwrap()];
                 ended.sort();
                 assert_eq!(ended, [Ok(0), Ok(1)]);
-                assert_eq!(*order.lock().unwrap(), [1, 0], "the jobs did not resume in the swapped order");
+                assert_eq!(*order.lock(), [1, 0], "the jobs did not resume in the swapped order");
                 run(
                     "a later job",
                     Box::new(|| assert_eq!(attached_here(), None, "a job came on to its worker's database")),
@@ -3422,13 +3419,11 @@ pub(crate) mod table {
         mem::ManuallyDrop,
         num::NonZeroU32,
         ptr,
-        sync::{
-            Mutex, MutexGuard, PoisonError,
-            atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering},
-        },
+        sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering},
     };
 
-    use rustc_hash::FxBuildHasher;
+    use blaze_hash::FixedState;
+    use parking_lot::{Mutex, MutexGuard};
     use rustc_type_ir::{DebruijnIndex, TypeFlags};
 
     /// A type a table holds under its `'static` name: a table is a `static`, and every value in
@@ -3743,11 +3738,11 @@ pub(crate) mod table {
         }
     }
 
-    /// The hash a value is found by: its Fx hash, mixed (murmur's finalizer) so that its top
+    /// The hash a value is found by: its hash, mixed (murmur's finalizer) so that its top
     /// bits pick a shard and its low half a slot.
     #[inline]
     fn hash_of<T: Hash + ?Sized>(value: &T) -> u64 {
-        let hash = FxBuildHasher.hash_one(value);
+        let hash = FixedState.hash_one(value);
         let hash = (hash ^ (hash >> 33)).wrapping_mul(0xff51_afd7_ed55_8ccd);
         let hash = (hash ^ (hash >> 33)).wrapping_mul(0xc4ce_b9fe_1a85_ec53);
         hash ^ (hash >> 33)
@@ -3900,7 +3895,7 @@ pub(crate) mod table {
         /// or the lock to insert one.
         fn lock(&self, hash: u64, same: impl FnMut(NonZeroU32) -> bool) -> Entry<'_> {
             let shard = self.shard(hash);
-            let len = shard.len.lock().unwrap_or_else(PoisonError::into_inner);
+            let len = shard.len.lock();
             match self.find(hash, same) {
                 Some(row) => Entry::Found(row),
                 None => Entry::Vacant(Vacant { shard, len, hash: hash as u32 }),

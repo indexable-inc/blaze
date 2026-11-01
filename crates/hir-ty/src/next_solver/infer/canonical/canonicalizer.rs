@@ -7,7 +7,7 @@
 
 use std::marker::PhantomData;
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use rustc_index::Idx;
 use rustc_type_ir::InferTy::{self, FloatVar, IntVar, TyVar};
 use rustc_type_ir::inherent::{IntoKind as _, Ty as _};
@@ -260,14 +260,14 @@ struct Canonicalizer<'cx, 'db, M> {
     query_state: &'cx mut OriginalQueryValues<'db>,
     // Note that indices is only used once `var_values` is big enough to be
     // heap-allocated.
-    indices: FxHashMap<GenericArg<'db>, BoundVar>,
+    indices: HashMap<GenericArg<'db>, BoundVar>,
     /// Maps each `sub_unification_table_root_var` to the index of the first
     /// variable which used it.
     ///
     /// This means in case two type variables have the same sub relations root,
     /// we set the `sub_root` of the second variable to the position of the first.
     /// Otherwise the `sub_root` of each type variable is just its own position.
-    sub_root_lookup_table: FxHashMap<TyVid, usize>,
+    sub_root_lookup_table: HashMap<TyVid, usize>,
     needs_canonical_flags: TypeFlags,
 
     binder_index: DebruijnIndex,
@@ -520,7 +520,7 @@ impl<'cx, 'db, M: CanonicalizeMode> Canonicalizer<'cx, 'db, M> {
             needs_canonical_flags,
             variables: SmallVec::from_slice(base.var_kinds.as_slice()),
             query_state,
-            indices: FxHashMap::default(),
+            indices: HashMap::default(),
             sub_root_lookup_table: Default::default(),
             binder_index: DebruijnIndex::ZERO,
             mode: PhantomData,

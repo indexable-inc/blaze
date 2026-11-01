@@ -9,17 +9,17 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context as _, bail};
+use blaze_hash::{HashMap, HashSet};
 use cargo_util_schemas::core::PackageIdSpec;
 use cargo_util_schemas::manifest::{
     ProfileName, ProfilePackageSpec, StringOrBool, TomlDebugInfo, TomlProfile, TomlProfiles,
     TomlTrimPaths,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 
 use crate::config::{CliUnstable, CompileKind, Config};
-use crate::files::Files;
 use crate::features::{Feature, Features};
+use crate::files::Files;
 use crate::manifest::PackageId;
 
 fn spec_matches(spec: &PackageIdSpec, pkg: &PackageId) -> bool {
@@ -48,8 +48,8 @@ fn spec_matches(spec: &PackageIdSpec, pkg: &PackageId) -> bool {
 #[derive(Clone, Debug)]
 pub struct Profiles {
     incremental: Option<bool>,
-    dir_names: FxHashMap<String, String>,
-    by_name: FxHashMap<String, ProfileMaker>,
+    dir_names: HashMap<String, String>,
+    by_name: HashMap<String, ProfileMaker>,
     original_profiles: BTreeMap<String, TomlProfile>,
     requested_profile: String,
     rustc_host: String,
@@ -75,7 +75,7 @@ impl Profiles {
         let mut makers = Profiles {
             incremental,
             dir_names: predefined_dir_names(),
-            by_name: FxHashMap::default(),
+            by_name: HashMap::default(),
             original_profiles: profiles.clone(),
             requested_profile: requested_profile.to_owned(),
             rustc_host: rustc_host.to_owned(),
@@ -124,7 +124,7 @@ impl Profiles {
             }
             return Ok(());
         }
-        let mut set = FxHashSet::default();
+        let mut set = HashSet::default();
         set.insert(name.to_owned());
         let maker = self.process_chain(name, profile, &mut set, profiles)?;
         self.by_name.insert(name.to_owned(), maker);
@@ -135,7 +135,7 @@ impl Profiles {
         &mut self,
         name: &str,
         profile: &TomlProfile,
-        set: &mut FxHashSet<String>,
+        set: &mut HashSet<String>,
         profiles: &BTreeMap<String, TomlProfile>,
     ) -> anyhow::Result<ProfileMaker> {
         let mut maker = match &profile.inherits {
@@ -280,7 +280,7 @@ fn is_ci<F: Files>(config: &Config<F>) -> bool {
     config.env("CI").is_some() || config.env("TF_BUILD").is_some()
 }
 
-fn predefined_dir_names() -> FxHashMap<String, String> {
+fn predefined_dir_names() -> HashMap<String, String> {
     [("dev", "debug"), ("test", "debug"), ("bench", "release")]
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
@@ -723,7 +723,7 @@ fn merge_config_profiles<F: Files>(
         }
         None => BTreeMap::new(),
     };
-    let mut check_to_add = FxHashSet::default();
+    let mut check_to_add = HashSet::default();
     check_to_add.insert(requested_profile.to_owned());
     for (name, profile) in &mut profiles {
         if let Some(config_profile) = get_config_profile(features, config, name)? {
@@ -736,7 +736,7 @@ fn merge_config_profiles<F: Files>(
     for name in ["dev", "release", "debug", "test", "bench"] {
         check_to_add.insert(name.to_owned());
     }
-    let mut current = FxHashSet::default();
+    let mut current = HashSet::default();
     while !check_to_add.is_empty() {
         std::mem::swap(&mut current, &mut check_to_add);
         for name in current.drain() {

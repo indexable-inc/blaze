@@ -26,7 +26,7 @@ fn ui_lint(name: &str, source: &str, lint: &str) -> String {
         .diags
         .iter()
         .filter(|it| it.code.as_ref().is_some_and(|code| code.as_str() == lint))
-        .map(|it| emit::written(it, &sources, style))
+        .map(|it| emit::written(it, &sources, style).unwrap())
         .collect();
     normalized(&written)
 }

@@ -58,8 +58,9 @@ impl SyntaxText {
     }
 
     pub fn slice<R: private::SyntaxTextRange>(&self, range: R) -> SyntaxText {
-        let start = range.start().unwrap_or_default();
-        let end = range.end().unwrap_or(self.len());
+        let asked = range.bounds();
+        let start = asked.0.unwrap_or_default();
+        let end = asked.1.unwrap_or(self.len());
         assert!(start <= end);
         let len = end - start;
         let start = self.range.start() + start;
@@ -68,7 +69,7 @@ impl SyntaxText {
             start <= end,
             "invalid slice, range: {:?}, slice: {:?}",
             self.range,
-            (range.start(), range.end()),
+            asked,
         );
         let range = TextRange::new(start, end);
         assert!(
@@ -218,52 +219,36 @@ mod private {
     use crate::{TextRange, TextSize};
 
     pub trait SyntaxTextRange {
-        fn start(&self) -> Option<TextSize>;
-        fn end(&self) -> Option<TextSize>;
+        fn bounds(self) -> (Option<TextSize>, Option<TextSize>);
     }
 
     impl SyntaxTextRange for TextRange {
-        fn start(&self) -> Option<TextSize> {
-            Some(TextRange::start(*self))
-        }
-        fn end(&self) -> Option<TextSize> {
-            Some(TextRange::end(*self))
+        fn bounds(self) -> (Option<TextSize>, Option<TextSize>) {
+            (Some(self.start()), Some(self.end()))
         }
     }
 
     impl SyntaxTextRange for ops::Range<TextSize> {
-        fn start(&self) -> Option<TextSize> {
-            Some(self.start)
-        }
-        fn end(&self) -> Option<TextSize> {
-            Some(self.end)
+        fn bounds(self) -> (Option<TextSize>, Option<TextSize>) {
+            (Some(self.start), Some(self.end))
         }
     }
 
     impl SyntaxTextRange for ops::RangeFrom<TextSize> {
-        fn start(&self) -> Option<TextSize> {
-            Some(self.start)
-        }
-        fn end(&self) -> Option<TextSize> {
-            None
+        fn bounds(self) -> (Option<TextSize>, Option<TextSize>) {
+            (Some(self.start), None)
         }
     }
 
     impl SyntaxTextRange for ops::RangeTo<TextSize> {
-        fn start(&self) -> Option<TextSize> {
-            None
-        }
-        fn end(&self) -> Option<TextSize> {
-            Some(self.end)
+        fn bounds(self) -> (Option<TextSize>, Option<TextSize>) {
+            (None, Some(self.end))
         }
     }
 
     impl SyntaxTextRange for ops::RangeFull {
-        fn start(&self) -> Option<TextSize> {
-            None
-        }
-        fn end(&self) -> Option<TextSize> {
-            None
+        fn bounds(self) -> (Option<TextSize>, Option<TextSize>) {
+            (None, None)
         }
     }
 }

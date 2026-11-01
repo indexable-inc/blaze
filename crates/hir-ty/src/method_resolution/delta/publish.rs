@@ -16,12 +16,12 @@ use std::sync::Arc;
 
 use base_db::{Crate, Db};
 use blaze_dbsp::{Pos, SliceHasher};
+use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Hasher};
+use blaze_query::db::Setter;
 use hir_def::{BuiltinDeriveImplId, ImplId, ModuleId, TraitId, nameres::crate_def_map};
 use hir_expand::name::Name;
-use rustc_hash::FxHashMap;
 use rustc_type_ir::fast_reject::SimplifiedType as S;
-use blaze_query::db::Setter;
 
 use super::head::{Head, HeadDef};
 
@@ -97,11 +97,11 @@ pub struct SliceDirectory {
     #[returns(copy)]
     pub krate: Crate,
     #[returns(ref)]
-    pub traits: Arc<FxHashMap<TraitId, TraitImplsSlice>>,
+    pub traits: Arc<HashMap<TraitId, TraitImplsSlice>>,
     #[returns(ref)]
-    pub heads: Arc<FxHashMap<Head, InherentSlice>>,
+    pub heads: Arc<HashMap<Head, InherentSlice>>,
     #[returns(ref)]
-    pub names: Arc<FxHashMap<Name, CandidateSlice>>,
+    pub names: Arc<HashMap<Name, CandidateSlice>>,
     #[returns(ref)]
     pub body_modules: Arc<[ModuleId]>,
 }
@@ -110,7 +110,7 @@ pub struct SliceDirectory {
 #[blaze_query::input(singleton, debug)]
 pub struct ImplSlices {
     #[returns(ref)]
-    pub crates: Arc<FxHashMap<Crate, SliceDirectory>>,
+    pub crates: Arc<HashMap<Crate, SliceDirectory>>,
 }
 
 /// The directory of `krate`. A crate the impls maintainer never went over, and which no
@@ -445,9 +445,9 @@ pub(crate) fn candidate_rows_hash(db: &Db, name: Name, rows: &CandidateRows) -> 
 #[derive(Default)]
 pub(crate) struct Published {
     directory: Option<SliceDirectory>,
-    traits: FxHashMap<TraitId, TraitImplsSlice>,
-    heads: FxHashMap<Head, InherentSlice>,
-    names: FxHashMap<Name, CandidateSlice>,
+    traits: HashMap<TraitId, TraitImplsSlice>,
+    heads: HashMap<Head, InherentSlice>,
+    names: HashMap<Name, CandidateSlice>,
     body_modules: Arc<[ModuleId]>,
     /// Keys first seen in this write, which the directory gains at [`Published::finish`].
     new_traits: bool,
@@ -606,7 +606,7 @@ fn register(db: &mut Db, krate: Crate, directory: SliceDirectory) {
             all.set_crates(db).to(Arc::new(crates));
         }
         None => {
-            let mut crates = FxHashMap::default();
+            let mut crates = HashMap::default();
             crates.insert(krate, directory);
             // alloc: the singleton's map, once per database
             _ = ImplSlices::new(db, Arc::new(crates));

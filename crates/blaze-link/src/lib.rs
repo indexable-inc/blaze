@@ -37,6 +37,7 @@ mod place;
 mod position;
 pub mod premap;
 mod reloc;
+mod reset;
 mod sanitize;
 mod stage;
 mod state;
@@ -56,17 +57,20 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::path::PathBuf;
 
 use blaze_codegen::{CompiledFunction, InstanceKey, Static, Target};
 use blaze_core::{Effect, FileName};
+use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::ItemKey;
 use blaze_mem::Frame;
-use rustc_hash::FxHashMap;
 
-pub use output::{Debug, DevRun, Format, Live, Native, NativeKind, Output, OutputKind, Platform};
-pub use position::{COLUMN, LINE, LOCATION_ALIGN, LOCATION_SIZE, Position, SpanTable, file_name, location};
 pub use lazy::{LazyPlacer, Slots};
+pub use output::{Debug, DevRun, Format, Live, Native, NativeKind, Output, OutputKind, Platform};
+pub use position::{
+    COLUMN, LINE, LOCATION_ALIGN, LOCATION_SIZE, Position, SpanTable, file_name, location,
+};
 pub use premap::{NoOutside, Outside};
 
 use commit::{Pending, Undo, Writes};
@@ -145,15 +149,15 @@ impl fmt::Debug for Staged {
 pub struct LinkError {
     pub function: Option<InstanceKey>,
     pub what: String,
-    /// Set when an incremental image refused the stage because its layout has no room for it:
-    /// only a link of the image from scratch ([`Image::new`]) can take the change.
+    /// Why, typed, where the caller can act on it ([`Refusal`]).
     pub refusal: Option<Refusal>,
 }
 
-/// Why an incremental image refused a stage it was laid out too small or without the room for.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Why a link was refused, where the caller can act on it.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Refusal {
-    /// A region the image kept needs `need` bytes and has room for `room`.
+    /// A region the image kept needs `need` bytes and has room for `room`: only a link of the
+    /// image from scratch ([`Image::new`]) can take the change, as for the next three.
     NoRoom { need: u64, room: u64 },
     /// The stage needs a region the image was laid out without.
     NoRegion,
@@ -161,12 +165,46 @@ pub enum Refusal {
     TableFull { slots: u32 },
     /// The image's thread-locals would move in the run's area.
     TlsMoved,
+    /// A native library on the link line is in none of the directories searched.
+    NotFound(Box<NotFound>),
+}
+
+/// A native library the link line names that no directory searched has.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct NotFound {
+    /// The library as the line names it: a `-l` name, a `/DEFAULTLIB`, an `LC_LINKER_OPTION`'s.
+    pub library: String,
+    /// The file names tried in each directory, in the order tried.
+    pub files: Vec<String>,
+    /// Every directory searched, in order, and what named it.
+    pub searched: Vec<(PathBuf, Searched)>,
+}
+
+/// What named a directory a native library was searched in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Searched {
+    /// The link's own `-L`s: the crates' `cargo:rustc-link-search`, `-L` flags.
+    Link,
+    /// The C driver's linker job (`-L`, `-F`): nix's `NIX_LDFLAGS`, `LIBRARY_PATH`, the
+    /// driver's own.
+    CDriver,
+    /// The toolchain's own: the SDK's, `-print-search-dirs`', `LIB`'s, wasi-libc's.
+    Toolchain,
 }
 
 impl LinkError {
-    /// The refusal, when the image refused the stage for want of room ([`Refusal`]).
-    pub fn no_room(&self) -> Option<Refusal> {
-        self.refusal
+    /// The refusal, when the image refused the stage for want of room: [`Refusal::NoRoom`],
+    /// `NoRegion`, `TableFull` or `TlsMoved`.
+    pub fn no_room(&self) -> Option<&Refusal> {
+        self.refusal.as_ref().filter(|it| !matches!(it, Refusal::NotFound(_)))
+    }
+
+    /// The native library not found, and every directory it was searched in.
+    pub fn not_found(&self) -> Option<&NotFound> {
+        match &self.refusal {
+            Some(Refusal::NotFound(it)) => Some(it),
+            _ => None,
+        }
     }
 }
 
@@ -191,7 +229,7 @@ pub struct Image {
     writer: Formats,
     plan: Plan,
     symbols: Symbols,
-    objects: FxHashMap<Obj, native::Read>,
+    objects: HashMap<Obj, native::Read>,
     state: State,
     history: VecDeque<Undo>,
     pending: Option<Pending>,
@@ -277,7 +315,7 @@ impl Image {
             plan,
             // alloc: error path
             symbols: Symbols::new().map_err(|error| fail(error.to_string()))?,
-            objects: FxHashMap::default(),
+            objects: HashMap::default(),
             state: State::new(),
             history: VecDeque::with_capacity(commit::HISTORY + 1),
             pending: None,

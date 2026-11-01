@@ -113,7 +113,7 @@ impl SyntaxEditor {
     pub fn add_generic_param(
         &self,
         node: &impl ast::HasGenericParams,
-        new_param: ast::GenericParam,
+        new_param: &ast::GenericParam,
     ) {
         let make = self.make();
         match node.generic_param_list() {
@@ -390,7 +390,7 @@ impl ast::VariantList {
 }
 
 impl ast::Fn {
-    pub fn replace_or_insert_body(&self, editor: &SyntaxEditor, body: ast::BlockExpr) {
+    pub fn replace_or_insert_body(&self, editor: &SyntaxEditor, body: &ast::BlockExpr) {
         let make = editor.make();
         if let Some(old_body) = self.body() {
             editor.replace(old_body.syntax(), body.syntax());

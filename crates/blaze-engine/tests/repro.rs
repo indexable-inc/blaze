@@ -107,6 +107,7 @@ impl Case {
                     stderr.join().unwrap()
                 );
             }
+            #[allow(clippy::disallowed_methods, reason = "std has no timed wait on a child, and a daemon it starts may hold its pipes open past its exit")]
             thread::sleep(Duration::from_millis(50));
         };
         Out { ok: status.success(), stdout: stdout.join().unwrap(), stderr: stderr.join().unwrap() }

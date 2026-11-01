@@ -1,9 +1,10 @@
 //! To make attribute macros work reliably when typing, we need to take care to
 //! fix up syntax errors in the code we're passing to them.
 
+use blaze_hash::FixedState;
 use blaze_mem::Frame;
 use intern::sym;
-use rustc_hash::FxBuildHasher;
+use smallvec::smallvec;
 use span::{
     ErasedFileAstId, FIXUP_ERASED_FILE_AST_ID_MARKER, ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor,
     SyntaxContext,
@@ -13,7 +14,6 @@ use syntax::{
     SyntaxKind, TextRange, TextSize, match_ast,
     view::{self, AstNode as _, HasLoopBody as _, NodeId},
 };
-use smallvec::smallvec;
 use syntax_bridge::{Appended, DocCommentDesugarMode, Removed};
 use thin_vec::ThinVec;
 use tt::{Spacing, TransformTtAction, transform_tt};
@@ -38,8 +38,8 @@ impl<'f, K> SyntaxFixups<'f, K> {
     /// No fixups, their maps in `frame`.
     pub(crate) fn new_in(frame: &'f Frame) -> Self {
         SyntaxFixups {
-            append: Appended::with_hasher_in(FxBuildHasher, frame),
-            remove: Removed::with_hasher_in(FxBuildHasher, frame),
+            append: Appended::with_hasher_in(FixedState, frame),
+            remove: Removed::with_hasher_in(FixedState, frame),
             undo_info: SyntaxFixupUndoInfo::NONE,
         }
     }

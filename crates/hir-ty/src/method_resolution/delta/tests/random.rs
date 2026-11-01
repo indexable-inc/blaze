@@ -11,16 +11,14 @@
 use std::fmt::Write as _;
 
 use base_db::{Crate, Db};
+use blaze_hash::HashMap;
 use hir_def::{ImplId, TraitId};
 use hir_expand::name::Name;
 use intern::Symbol;
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use super::{Loaded, check, impl_keys, trait_named, trait_names};
-use crate::method_resolution::delta::{
-    LastWrite, candidate_set_hash, impl_set_hash, key::ImplKey,
-};
+use crate::method_resolution::delta::{LastWrite, candidate_set_hash, impl_set_hash, key::ImplKey};
 
 const TRAITS: [&str; 2] = ["T0", "T1"];
 const ITEMS: [&str; 4] = ["fn m(&self);", "fn n(&self) {}", "const K: u8;", "type Ty;"];
@@ -281,8 +279,8 @@ impl Model {
 fn check_delta(
     db: &mut Db,
     krate: Crate,
-    keys: &mut FxHashMap<ImplId, ImplKey>,
-    names: &mut FxHashMap<TraitId, SmallVec<[Name; 8]>>,
+    keys: &mut HashMap<ImplId, ImplKey>,
+    names: &mut HashMap<TraitId, SmallVec<[Name; 8]>>,
     what: &str,
     failures: &mut String,
 ) {

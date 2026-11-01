@@ -23,7 +23,7 @@
 //! snapshot whose failure always reaches one further out, or a context that is thrown away, is
 //! left out (`rule_snapshot`): rolling back once restores what rolling back twice does.
 
-use rustc_hash::FxHasher;
+use blaze_hash::FixedHasher;
 use rustc_type_ir::{
     Interner as _, TypeVisitableExt, fold_regions,
     inherent::{Clause as _, IntoKind, Ty as _},
@@ -89,7 +89,7 @@ impl Default for UnsizeMemo<'_> {
 impl<'db> UnsizeMemo<'db> {
     #[inline]
     fn slot(key: (Ty<'db>, Ty<'db>)) -> usize {
-        let mut hasher = FxHasher::default();
+        let mut hasher = FixedHasher::default();
         key.hash(&mut hasher);
         (hasher.finish() >> (64 - SLOTS.trailing_zeros())) as usize
     }

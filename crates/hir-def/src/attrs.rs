@@ -25,7 +25,9 @@
 use std::{borrow::Cow, convert::Infallible, iter::Peekable, ops::ControlFlow};
 
 use base_db::{Crate, Db, EditionedFileId};
+use blaze_hash::HashSet;
 use blaze_mem::Frame;
+use blaze_query::db::{AsId, FromId};
 use cfg::{CfgExpr, CfgOptions};
 use either::Either;
 use hir_expand::{
@@ -38,8 +40,6 @@ use intern::Symbol;
 use itertools::Itertools;
 use la_arena::ArenaMap;
 use rustc_abi::ReprOptions;
-use rustc_hash::FxHashSet;
-use blaze_query::db::{AsId, FromId};
 use smallvec::SmallVec;
 use span::AstIdNode;
 use syntax::{
@@ -1943,15 +1943,15 @@ impl AttrFlags {
     }
 
     #[inline]
-    pub fn target_features(db: &Db, owner: FunctionId) -> &FxHashSet<Symbol> {
+    pub fn target_features(db: &Db, owner: FunctionId) -> &HashSet<Symbol> {
         if !AttrFlags::query(db, owner.into()).contains(AttrFlags::HAS_TARGET_FEATURE) {
-            return const { &FxHashSet::with_hasher(rustc_hash::FxBuildHasher) };
+            return const { &HashSet::with_hasher(blaze_hash::FixedState) };
         }
 
         return target_features(db, owner);
 
         #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
-        fn target_features(db: &Db, owner: FunctionId) -> FxHashSet<Symbol> {
+        fn target_features(db: &Db, owner: FunctionId) -> HashSet<Symbol> {
             blaze_mem::frame::current(|frame| {
                 let mut found = Vec::new_in(frame);
                 collect_attrs::<Infallible>(db, owner.into(), |attr| {
@@ -1983,7 +1983,7 @@ impl AttrFlags {
                 // alloc: the memo's set, once: room for every feature named (a feature named
                 // twice is the one case with room to spare)
                 let mut set =
-                    FxHashSet::with_capacity_and_hasher(found.len(), Default::default());
+                    HashSet::with_capacity_and_hasher(found.len(), Default::default());
                 set.extend(found.drain(..));
                 set
             })

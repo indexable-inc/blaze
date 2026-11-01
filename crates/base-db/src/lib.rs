@@ -44,32 +44,32 @@ pub use crate::{
     input::{
         BuiltCrateData, BuiltDependency, Crate, CrateBuilder, CrateBuilderId, CrateDataBuilder,
         CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateType, CrateTypes,
-        CratesIdMap, CratesMap,
-        DependencyBuilder, Env, ExtraCrateData, LangCrateOrigin, ProcMacroLoadingError,
-        ProcMacroPaths, ReleaseChannel, SourceRoot, SourceRootId, TargetKind, UniqueCrateData,
+        CratesIdMap, CratesMap, DependencyBuilder, Env, ExtraCrateData, LangCrateOrigin,
+        ProcMacroLoadingError, ProcMacroPaths, ReleaseChannel, SourceRoot, SourceRootId,
+        TargetKind, UniqueCrateData,
     },
     maintain::{Maintained, Maintainer, Reads, Written},
     named::NAMED_PATHS_DOMAIN,
     reparse::Reparse,
     view::{ViewChange, ViewError, ViewFile, ViewRoot},
 };
-pub use blaze_ids::ContentId;
-use blaze_ids::Hasher;
-use rustc_hash::FxHashSet;
-use blaze_query::db::{Durability, Setter};
-pub use blaze_query::db::{par_for_each, par_map};
-pub use semver::{BuildMetadata, Prerelease, Version, VersionReq};
-use triomphe::Arc;
 pub use crate::{
     file_set::{FileSet, FileSetConfig, FileSetConfigBuilder},
     source_path::{AnchoredPath, AnchoredPathBuf, VfsPath},
 };
+use blaze_hash::HashSet;
+pub use blaze_ids::ContentId;
+use blaze_ids::Hasher;
+use blaze_query::db::{Durability, Setter};
+pub use blaze_query::db::{par_for_each, par_map};
 pub use paths::{AbsPath, AbsPathBuf};
+pub use semver::{BuildMetadata, Prerelease, Version, VersionReq};
 pub use span::FileId;
+use triomphe::Arc;
 
-pub type FxIndexSet<T> = indexmap::IndexSet<T, rustc_hash::FxBuildHasher>;
+pub type FxIndexSet<T> = indexmap::IndexSet<T, blaze_hash::FixedState>;
 pub type FxIndexMap<K, V> =
-    indexmap::IndexMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
+    indexmap::IndexMap<K, V, blaze_hash::FixedState>;
 
 #[macro_export]
 macro_rules! impl_intern_key {
@@ -100,7 +100,7 @@ pub const DEFAULT_BORROWCK_LRU_CAP: u16 = 2024;
 #[blaze_query::input(singleton, debug)]
 pub struct LibraryRoots {
     #[returns(ref)]
-    pub roots: FxHashSet<SourceRootId>,
+    pub roots: HashSet<SourceRootId>,
 }
 
 /// The set of "local" (that is, from the current workspace) roots.
@@ -108,7 +108,7 @@ pub struct LibraryRoots {
 #[blaze_query::input(singleton, debug)]
 pub struct LocalRoots {
     #[returns(ref)]
-    pub roots: FxHashSet<SourceRootId>,
+    pub roots: HashSet<SourceRootId>,
 }
 
 /// The variables of the process a build is for, which `env!` and `option_env!` read where

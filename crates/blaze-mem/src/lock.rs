@@ -2,8 +2,9 @@
 //! cache's shards and writers): `std`'s mutex on macOS boxes a pthread mutex on its first lock,
 //! which a table made per interner pays once per lock it has.
 //!
-//! It spins a little, then yields, so it is for sections a few instructions long: a holder
-//! that is preempted makes waiters give up their time slice, not burn it. It does not poison:
+//! It spins a little, then yields ([`blaze_spin::SpinWait::until`], which panics naming it once
+//! a wait runs past any section that short), so it is for sections a few instructions long: a
+//! holder that is preempted makes waiters give up their time slice, not burn it. It does not poison:
 //! a holder that panics releases it, and what it guarded is as the panic left it.
 
 use std::{
@@ -12,15 +13,9 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
-#[cfg(blaze_check)]
-use blaze_check::{hint::spin_loop, thread::yield_now};
-#[cfg(not(blaze_check))]
-use std::{hint::spin_loop, thread::yield_now};
+use blaze_spin::SpinWait;
 
 use crate::sync::atomic::{AtomicBool, Ordering};
-
-/// Spins before each yield while the lock is held.
-const SPINS: u32 = 64;
 
 pub struct SpinLock<T> {
     held: AtomicBool,
@@ -50,20 +45,10 @@ impl<T> SpinLock<T> {
 
     #[cold]
     fn wait(&self) {
-        loop {
-            for _ in 0..SPINS {
-                if !self.held.load(Ordering::Relaxed)
-                    && self
-                        .held
-                        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                        .is_ok()
-                {
-                    return;
-                }
-                spin_loop();
-            }
-            yield_now();
-        }
+        SpinWait::until("a `SpinLock`, held for a few instructions", || {
+            !self.held.load(Ordering::Relaxed)
+                && self.held.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()
+        });
     }
 
     pub fn get_mut(&mut self) -> &mut T {

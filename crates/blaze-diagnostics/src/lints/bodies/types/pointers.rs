@@ -19,6 +19,7 @@ pub(crate) mod reference_casting;
 use std::ops::ControlFlow;
 
 use base_db::Db;
+use blaze_hash::HashMap;
 use hir::{InFile, db::HirDatabase};
 use hir_def::{
     DefWithBodyId, FunctionId, HasModule, Lookup,
@@ -29,7 +30,6 @@ use hir_def::{
 use hir_expand::attrs::{AstPathExt as _, expand_cfg_attr_view};
 use hir_ty::{ParamEnvAndCrate, next_solver::Ty};
 use intern::Symbol;
-use rustc_hash::FxHashMap;
 use syntax::view::{self as ast, AstNode, HasAttrs};
 
 use super::util;
@@ -113,11 +113,11 @@ pub(super) fn is_zero(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
 #[derive(Default)]
 pub(super) struct Inits {
     owner: Option<DefWithBodyId>,
-    map: FxHashMap<BindingId, ExprId>,
+    map: HashMap<BindingId, ExprId>,
 }
 
 impl Inits {
-    pub(super) fn of(&mut self, b: &BodyCx<'_, '_, '_>) -> &FxHashMap<BindingId, ExprId> {
+    pub(super) fn of(&mut self, b: &BodyCx<'_, '_, '_>) -> &HashMap<BindingId, ExprId> {
         if self.owner != Some(b.owner) {
             self.owner = Some(b.owner);
             self.map.clear();
@@ -152,7 +152,7 @@ impl Inits {
 
 /// rustc's `LateContext::expr_or_init`: through blocks, and from a path to a local binding to
 /// what initialized it, while there is one.
-pub(super) fn expr_or_init(b: &BodyCx<'_, '_, '_>, inits: &FxHashMap<BindingId, ExprId>, expr: ExprId) -> ExprId {
+pub(super) fn expr_or_init(b: &BodyCx<'_, '_, '_>, inits: &HashMap<BindingId, ExprId>, expr: ExprId) -> ExprId {
     let mut expr = util::peel_blocks(b, expr);
     while let Expr::Path(_) = b.store().expr(expr)
         && let Some(ValueNs::LocalBinding(id)) = util::path_value(b, expr)
@@ -166,7 +166,7 @@ pub(super) fn expr_or_init(b: &BodyCx<'_, '_, '_>, inits: &FxHashMap<BindingId, 
 /// rustc's `peel_casts`: through blocks, `as` casts, `.cast()`, `.cast_mut()`, `.cast_const()`,
 /// `ptr::from_ref`, `UnsafeCell::raw_get`, `mem::transmute` and the initializers of local
 /// bindings, to the expression the pointer comes from.
-pub(super) fn peel_casts(b: &BodyCx<'_, '_, '_>, inits: &FxHashMap<BindingId, ExprId>, expr: ExprId) -> ExprId {
+pub(super) fn peel_casts(b: &BodyCx<'_, '_, '_>, inits: &HashMap<BindingId, ExprId>, expr: ExprId) -> ExprId {
     let mut e = expr;
     loop {
         e = util::peel_blocks(b, e);

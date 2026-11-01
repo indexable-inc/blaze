@@ -1,7 +1,8 @@
 //! Name resolution façade.
 use std::{cell::RefCell, fmt, iter, mem, ops::ControlFlow};
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
+use blaze_hash::HashSet;
 use blaze_mem::scratch::Scratch;
 use hir_expand::{
     MacroDefId,
@@ -9,7 +10,6 @@ use hir_expand::{
     name::{AsName, Name},
 };
 use intern::{Symbol, sym};
-use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 use span::SyntaxContext;
 use syntax::{SyntaxKind, view::HasName};
@@ -894,8 +894,8 @@ impl<'db> Resolver<'db> {
             .map(|(name, module_id)| (*name, module_id.0))
     }
 
-    pub fn traits_in_scope(&self, db: &Db) -> FxHashSet<TraitId> {
-        let mut traits = FxHashSet::default();
+    pub fn traits_in_scope(&self, db: &Db) -> HashSet<TraitId> {
+        let mut traits = HashSet::default();
         self.traits_in_scope_into(db, &mut traits);
         traits
     }

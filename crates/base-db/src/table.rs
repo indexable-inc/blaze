@@ -13,14 +13,15 @@
 use std::{
     marker::PhantomData,
     sync::{
-        Mutex, OnceLock, PoisonError,
+        OnceLock,
         atomic::{AtomicU32, Ordering},
     },
 };
 
 use blaze_mem::{AppendVec, Tag};
-use intern::swiss::Index;
 use blaze_query::db::{AsId, FromId, Id};
+use intern::swiss::Index;
+use parking_lot::Mutex;
 
 /// A query input per ID up to [`Column::MAX`]: a word of the input's ID per ID, 0 for none
 /// (no ID is 0), in one region reserved for `MAX + 1` words and committed as
@@ -171,7 +172,7 @@ impl<T> Table<T> {
             // alloc: a shard, on its first insert.
             Box::new(Shard { lock: Mutex::new(0), index: Index::new() })
         });
-        let mut count = shard.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut count = shard.lock.lock();
         if let Some(found) = self.probe(shard, hash, &eq) {
             return (found, false);
         }
@@ -194,12 +195,12 @@ impl<T> Table<T> {
     }
 }
 
-/// The hash a [`Table`] is keyed by: `FxHash`, as every key is the build's own (paths and names
+/// The hash a [`Table`] is keyed by: `blaze_hash::FixedState`, as every key is the build's own (paths and names
 /// its sources wrote), never an attacker's.
 #[inline]
 pub(crate) fn hash_of(key: impl std::hash::Hash) -> u64 {
     use std::hash::BuildHasher;
-    rustc_hash::FxBuildHasher.hash_one(key)
+    blaze_hash::FixedState.hash_one(key)
 }
 
 /// What a shard's [`Index`] is keyed by: the shard is the hash's top bits, so the index's tag

@@ -21,11 +21,11 @@ use std::{
     },
 };
 
+use blaze_hash::FixedHasher;
 use blaze_ids::{ContentId, Hasher, Interner, Sharded};
 use blaze_mem::{Tag, frame};
 use blaze_query::{Cancelled, Cx};
 use blaze_vfs::outside::{Cover, Dirs};
-use rustc_hash::FxHasher;
 
 use crate::trace::{DIRECTORY, Entry, Inputs, Names, listing, os_bytes};
 
@@ -195,14 +195,14 @@ impl Files {
         FILES.get_or_init(Files::new)
     }
 
-    /// Where `path`'s answer is kept: two seeded FxHash passes, mixed, in place of BLAKE3,
+    /// Where `path`'s answer is kept: two seeded `FixedHasher` passes, mixed, in place of BLAKE3,
     /// which costs ten times the rest of a check. The table never leaves the process, and
     /// [`Vouched::path`] is compared on each find, so two paths that collide are told apart
     /// (the later one is looked at on the disk every time).
     fn path_id(path: &Path) -> ContentId {
         let bytes = path.as_os_str().as_encoded_bytes();
-        let pass = |seed: usize| {
-            let mut hasher = FxHasher::with_seed(seed);
+        let pass = |seed: u64| {
+            let mut hasher = FixedHasher::with_seed(seed);
             hasher.write(bytes);
             mix(hasher.finish())
         };

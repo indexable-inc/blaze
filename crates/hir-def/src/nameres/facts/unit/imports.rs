@@ -14,10 +14,10 @@ use std::{
     iter, mem,
 };
 
+use blaze_hash::FixedState;
 use blaze_mem::Frame;
 use hashbrown::{HashMap, hash_map::Entry};
 use hir_expand::name::Name;
-use rustc_hash::FxBuildHasher;
 
 use crate::{
     ModuleId,
@@ -128,7 +128,7 @@ pub(super) struct Imports<A: Allocator + Clone = Global> {
     pub(super) indeterminate: Vec<(u32, PerNs), A>,
     /// Plain imports by the module and the name they bind, in index order: head and tail of a
     /// list linked through `next_named`.
-    named: HashMap<(ModuleId, Name), (u32, u32), FxBuildHasher, A>,
+    named: HashMap<(ModuleId, Name), (u32, u32), FixedState, A>,
     next_named: Vec<u32, A>,
 }
 
@@ -171,7 +171,7 @@ impl<A: Allocator + Clone> Imports<A> {
             list: Vec::new_in(a()),
             seq: Vec::new_in(a()),
             indeterminate: Vec::new_in(a()),
-            named: HashMap::with_hasher_in(FxBuildHasher, a()),
+            named: HashMap::with_hasher_in(FixedState, a()),
             next_named: Vec::new_in(a()),
         }
     }
@@ -468,9 +468,9 @@ pub(super) struct ImporterEdge<K, T> {
 pub(super) struct ImporterLists<K, T, A: Allocator + Clone = Global> {
     edges: Vec<ImporterEdge<K, T>, A>,
     /// Head and tail of each source's list.
-    heads: HashMap<K, (u32, u32), FxBuildHasher, A>,
+    heads: HashMap<K, (u32, u32), FixedState, A>,
     /// The edge of each `(source, importer)`.
-    by_pair: HashMap<(K, K), u32, FxBuildHasher, A>,
+    by_pair: HashMap<(K, K), u32, FixedState, A>,
 }
 
 impl<K, T, A: Allocator + Clone> ImporterLists<K, T, A> {
@@ -479,8 +479,8 @@ impl<K, T, A: Allocator + Clone> ImporterLists<K, T, A> {
         let a = || alloc.clone();
         ImporterLists {
             edges: Vec::new_in(a()),
-            heads: HashMap::with_hasher_in(FxBuildHasher, a()),
-            by_pair: HashMap::with_hasher_in(FxBuildHasher, a()),
+            heads: HashMap::with_hasher_in(FixedState, a()),
+            by_pair: HashMap::with_hasher_in(FixedState, a()),
         }
     }
 }

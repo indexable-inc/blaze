@@ -11,6 +11,7 @@
 use std::cell::OnceCell;
 
 use base_db::{CrateOrigin, LangCrateOrigin};
+use blaze_hash::FixedState;
 use blaze_mem::Frame;
 use hashbrown::hash_map::Entry;
 use hir_def::{
@@ -26,7 +27,6 @@ use hir_def::{
 };
 use hir_expand::name::Name;
 use intern::{Symbol, sym};
-use rustc_hash::FxBuildHasher;
 use syntax::{
     SyntaxKind, WalkEvent,
     view::{self as ast, AstNode as _},
@@ -35,13 +35,13 @@ use syntax::{
 use crate::cx::Cx;
 
 /// A hash map in the check's frame.
-type Map<'f, K, V> = hashbrown::HashMap<K, V, FxBuildHasher, &'f Frame>;
-type Set<'f, K> = hashbrown::HashSet<K, FxBuildHasher, &'f Frame>;
+type Map<'f, K, V> = hashbrown::HashMap<K, V, FixedState, &'f Frame>;
+type Set<'f, K> = hashbrown::HashSet<K, FixedState, &'f Frame>;
 /// A column in the check's frame.
 type Column<'f, T> = Vec<T, &'f Frame>;
 
 fn map<K, V>(frame: &Frame) -> Map<'_, K, V> {
-    hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame)
+    hashbrown::HashMap::with_hasher_in(FixedState, frame)
 }
 
 /// A definition a path names: rustc's `DefId`, of the kinds diagnostics print.
@@ -520,7 +520,7 @@ impl<'f> Printing<'f> {
         let tree = Tree::new(cx, frame, &direct);
         trimmed_names(frame, &tree, &mut unique);
         let mut trimmed: Map<'f, Def, Name> =
-            hashbrown::HashMap::with_capacity_and_hasher_in(unique.len(), FxBuildHasher, frame);
+            hashbrown::HashMap::with_capacity_and_hasher_in(unique.len(), FixedState, frame);
         for ((_, name), def) in unique {
             let Some(def) = def else { continue };
             match trimmed.entry(def) {
@@ -566,7 +566,7 @@ fn local_names<'f>(
 ) {
     let db = cx.db;
     let mut bodies: Column<'f, DefWithBodyId> = Vec::new_in(frame);
-    let mut seen_bodies: Set<'f, DefWithBodyId> = hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame);
+    let mut seen_bodies: Set<'f, DefWithBodyId> = hashbrown::HashSet::with_hasher_in(FixedState, frame);
     let def_map = crate_def_map(db, cx.krate.into());
     let mut scopes: Column<'f, &ItemScope> = Vec::new_in(frame);
     scopes.extend(def_map.modules(db).map(|(_, data)| data.scope(db)));
@@ -709,7 +709,7 @@ fn trimmed_names(frame: &Frame, tree: &Tree<'_>, unique: &mut Map<'_, (Ns, Name)
 /// `#[doc(hidden)]` re-export only where there is no other.
 fn visible_parent_map<'f>(cx: &Cx<'_, '_>, frame: &'f Frame, tree: &Tree<'_>) -> Map<'f, Def, Def> {
     let mut map: Map<'f, Def, Def> =
-        hashbrown::HashMap::with_capacity_and_hasher_in(tree.rows.len(), FxBuildHasher, frame);
+        hashbrown::HashMap::with_capacity_and_hasher_in(tree.rows.len(), FixedState, frame);
     let mut fallback: Column<'_, (Def, Def)> = Vec::new_in(frame);
     let mut queue: Column<'_, usize> = Vec::with_capacity_in(tree.defs.len(), frame);
     queue.extend(0..tree.roots);

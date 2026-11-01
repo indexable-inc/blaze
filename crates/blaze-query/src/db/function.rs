@@ -757,7 +757,9 @@ fn durability_of(done: &Ran) -> u32 {
 /// Stores the run's edges as the row's, forgetting its old ones.
 fn store_edges(storage: &Storage, header: &Header, at: u32) {
     let span = local::with(|local| {
+        debug_assert_eq!(at as usize + 1, local.frames.len(), "a run's edges are stored while it is the top frame");
         let start = local.frames[at as usize].edges_start as usize;
+        local.dedup_from(start);
         storage.push_edges(&local.edges[start..])
     });
     let old = header.edges.swap(span, Ordering::Relaxed);

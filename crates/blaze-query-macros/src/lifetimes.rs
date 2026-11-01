@@ -2,8 +2,8 @@
 //! lifetime to `'static` (what a row stores), and `Self` to the type a tracked `impl` is for.
 
 // alloc: expansion time, once per annotated item; no query runs this
-use std::collections::HashSet;
 
+use blaze_hash::HashSet;
 use proc_macro2::Span;
 use quote::quote;
 use syn::visit_mut::{self, VisitMut};
@@ -149,7 +149,7 @@ pub(crate) fn conjure(signature: &syn::Signature, also: Option<&Type>, span: Spa
             self.0.insert(lifetime.ident.to_string());
         }
     }
-    let mut used = Used(HashSet::new());
+    let mut used = Used(HashSet::default());
     // clone: expansion time, a signature searched
     used.visit_signature_mut(&mut signature.clone());
     if let Some(ty) = also {

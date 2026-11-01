@@ -13,11 +13,7 @@
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::Arc,
     thread::JoinHandle,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -153,7 +149,7 @@ pub fn start(config: Config) -> Result<Explorer, StartError> {
     let rotation = Rotation::new(unix_now_s()?);
     let cert = Cert::make(rotation.current()).map_err(StartError::Cert)?;
     let identity = cert.identity().map_err(StartError::Cert)?;
-    let (ready_to, ready) = mpsc::channel::<Result<Arc<Shared>, StartError>>();
+    let (ready_to, ready) = crossbeam_channel::unbounded::<Result<Arc<Shared>, StartError>>();
     let (stop, stopped) = oneshot::channel();
     let thread = std::thread::Builder::new()
         .name("blaze-explore".to_owned())
@@ -373,8 +369,9 @@ async fn stream(
         }
     };
     let cx = Arc::clone(&shared.cx);
-    let stop = Stop(Arc::new(AtomicBool::new(false)));
-    let stopping = Arc::clone(&stop.0);
+    // Dropped as the stream ends however it ends (answered, stopped by the page, the session
+    // gone, the server stopping): the sender gone kills a DuckDB query still under way.
+    let (_stop, stopping) = crossbeam_channel::bounded::<()>(0);
     let work = tokio::task::spawn_blocking(move || encode(ops::answer(&cx, request, &stopping), started));
     let bytes = tokio::select! {
         done = work => match done {
@@ -384,16 +381,6 @@ async fn stream(
         _ = send.stopped() => return,
     };
     send_bytes(&mut send, &bytes).await;
-}
-
-/// Set when a request's stream ends however it ends (answered, stopped by the page, the
-/// session gone, the server stopping), which kills a DuckDB query still under way.
-struct Stop(Arc<AtomicBool>);
-
-impl Drop for Stop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
 }
 
 async fn refuse(mut send: SendStream, recv: RecvStream) {

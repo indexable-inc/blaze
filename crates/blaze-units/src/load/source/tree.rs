@@ -6,9 +6,9 @@
 use std::collections::BTreeMap;
 
 use anyhow::anyhow;
+use blaze_hash::HashSet;
 use blaze_query::{Cancelled, Cx};
 use blaze_resolve::PackageId;
-use rustc_hash::FxHashSet;
 use semver::Version;
 use serde::Deserialize;
 
@@ -27,7 +27,7 @@ struct Package {
 #[derive(Default)]
 struct Walk {
     packages: Vec<Package>,
-    visited: FxHashSet<String>,
+    visited: HashSet<String>,
     errors: Vec<anyhow::Error>,
 }
 

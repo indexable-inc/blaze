@@ -2,11 +2,11 @@
 
 use std::{collections::hash_map::Entry, fmt::Debug, mem, ops::ControlFlow};
 
+use blaze_hash::HashMap;
 use hir_def::{
     AssocItemId,
     signatures::{ConstSignature, TypeAliasSignature},
 };
-use rustc_hash::FxHashMap;
 use rustc_next_trait_solver::{delegate::SolverDelegate, solve::SearchStorage};
 use rustc_type_ir::{
     AliasTyKind, CanonicalizerState, ClausePolarity, GenericArgKind, InferCtxtLike, InferTy,
@@ -25,9 +25,9 @@ use smallvec::smallvec;
 use tracing::debug;
 
 use crate::{
-    db::HirDatabase,
     ParamEnvAndCrate, Span,
     consteval::ConstEvalError,
+    db::HirDatabase,
     lower::GenericPredicates,
     mir::MirLowerError,
     next_solver::{
@@ -483,7 +483,7 @@ impl<'db> SolverDelegate for SolverContext<'db> {
             return;
         }
         let base = into.len();
-        let mut seen: Option<FxHashMap<RegionConstraint<'db>, usize>> = None;
+        let mut seen: Option<HashMap<RegionConstraint<'db>, usize>> = None;
         self.0.for_each_query_region_constraint(|constraint, visible| {
             if says_nothing(constraint) {
                 return;

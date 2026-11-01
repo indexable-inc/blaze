@@ -13,7 +13,7 @@ use blaze_codegen::{Target, backend::FrontRef, template::Refs};
 use blaze_mem::Frame;
 use cranelift_codegen::ir;
 use hashbrown::HashTable;
-use rustc_hash::FxBuildHasher;
+use blaze_hash::FixedState;
 use hir_def::{
     FunctionId, ItemContainerId, Lookup, StaticId,
     attrs::AttrFlags,
@@ -210,12 +210,12 @@ pub(crate) struct Placer<'a, A: Allocator = Global> {
 fn hash(it: &Ref) -> u64 {
     match it {
         FrontRef::Extern(name) => symbol_hash(name),
-        other => FxBuildHasher.hash_one(other),
+        other => FixedState.hash_one(other),
     }
 }
 
 fn symbol_hash(name: &str) -> u64 {
-    FxBuildHasher.hash_one(name)
+    FixedState.hash_one(name)
 }
 
 impl<'a> Placer<'a> {

@@ -13,15 +13,17 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::{
-        Mutex, MutexGuard, OnceLock, PoisonError,
+        OnceLock,
         atomic::{AtomicU32, Ordering},
     },
 };
 
+use parking_lot::{Mutex, MutexGuard};
+
 use blaze_format::cursor::Put;
 use blaze_ids::ContentId;
 use blaze_mem::{Frame, Tag, frame, scratch};
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use blaze_query::db::{Durability, Setter};
 use smallvec::SmallVec;
 use triomphe::Arc;
@@ -123,13 +125,13 @@ struct View {
 pub(crate) struct Writer {
     /// The inputs of files that had text and lost it (bytes that are not UTF-8), kept so that
     /// what read them reruns if they get text again.
-    pub(crate) parked: FxHashMap<FileId, FileText>,
+    pub(crate) parked: HashMap<FileId, FileText>,
     /// The content IDs of each source root's files, from which its own is kept.
-    pub(crate) root_contents: FxHashMap<SourceRootId, RootContent>,
+    pub(crate) root_contents: HashMap<SourceRootId, RootContent>,
     /// The source roots whose [`RootContent`] has each file.
     pub(crate) in_roots: ByFile<SmallVec<[SourceRootId; 1]>>,
     /// Every path a source root has named, with its file: a path keeps its file for good.
-    pub(crate) by_path: FxHashMap<VfsPath, FileId>,
+    pub(crate) by_path: HashMap<VfsPath, FileId>,
     /// The blaze-vfs content ID each file was last set from by [`Files::set_view_root`].
     pub(crate) view_ids: ByFile<ContentId>,
     /// Where [`Files::unused_file_id`] starts looking for an unused file ID.
@@ -140,7 +142,7 @@ pub(crate) struct Writer {
     /// these.
     pub(crate) free_crate_attrs: Vec<FileId>,
     /// The index of each view base's paths that [`Files::set_view_root`] keeps.
-    pub(crate) views: FxHashMap<AbsPathBuf, ViewIndex>,
+    pub(crate) views: HashMap<AbsPathBuf, ViewIndex>,
     /// `by_path` as queries read it, across source roots ([`crate::named`]).
     pub(crate) named: Named,
     /// An empty source root, which a root's input holds while its own is edited out of it.
@@ -272,7 +274,7 @@ impl fmt::Debug for Files {
 
 impl Files {
     pub(crate) fn lock(&self) -> MutexGuard<'_, Writer> {
-        self.writer.lock().unwrap_or_else(PoisonError::into_inner)
+        self.writer.lock()
     }
 
     /// Every file's text, by file ID.
@@ -1082,7 +1084,7 @@ pub(crate) struct RootContent {
     /// it in place ([`Files::set_view_root`]).
     pub(crate) one_to_one: bool,
     /// Each file's entry in `entries`.
-    files: FxHashMap<FileId, u32>,
+    files: HashMap<FileId, u32>,
     entries: Vec<Entry>,
     /// Entries no file has, for the next file to take.
     free_entries: Vec<u32>,
@@ -1157,7 +1159,7 @@ impl RootContent {
         RootContent {
             is_library,
             one_to_one: false,
-            files: FxHashMap::default(),
+            files: HashMap::default(),
             entries: Vec::new(), // alloc: none until a file is put in; grows with the root (setup).
             free_entries: Vec::new(), // alloc: as above, with the files taken out.
             // alloc: once per source root set (setup).
@@ -1524,7 +1526,7 @@ impl RootContent {
     /// hashed in one batch, then the inner nodes a batch a depth, deepest first, then the
     /// roots in one.
     pub(crate) fn refresh(
-        contents: &mut FxHashMap<SourceRootId, RootContent>,
+        contents: &mut HashMap<SourceRootId, RootContent>,
         roots: &[SourceRootId],
         frame: &Frame,
     ) {
@@ -1546,7 +1548,7 @@ impl RootContent {
         if refreshed.is_empty() {
             return;
         }
-        fn of(contents: &FxHashMap<SourceRootId, RootContent>, root: SourceRootId) -> &RootContent {
+        fn of(contents: &HashMap<SourceRootId, RootContent>, root: SourceRootId) -> &RootContent {
             contents.get(&root).expect("a root out of date has its content")
         }
         let mut bytes = scratch::lend_bytes();

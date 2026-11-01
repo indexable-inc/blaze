@@ -13,12 +13,12 @@
 use std::hash::{Hash, Hasher};
 
 use blaze_build_script::apply::{GraphUnit, to_link_in};
+use blaze_hash::{FixedHasher, HashMap};
 use blaze_ids::{bits::BitSet, radix::Csr};
 use blaze_units::{
     query::Units,
     schema::{Mode, Unit},
 };
-use rustc_hash::{FxHashMap, FxHasher};
 
 use super::error::UnitError;
 
@@ -124,12 +124,12 @@ pub(crate) struct Graph {
     lib_packages: BitSet<u32>,
     /// Units by [`target_hash`] of what they build, each hash's units in order: how an artifact
     /// finds its unit with no string built.
-    by_target: FxHashMap<u64, Vec<u32>>,
+    by_target: HashMap<u64, Vec<u32>>,
 }
 
 /// What a unit builds, hashed: its package, target name and kinds, and mode.
 pub(crate) fn target_hash(pkg_id: &str, name: &str, kinds: &[impl AsRef<str>], mode: Mode) -> u64 {
-    let mut hasher = FxHasher::default();
+    let mut hasher = FixedHasher::default();
     pkg_id.hash(&mut hasher);
     name.hash(&mut hasher);
     kinds.len().hash(&mut hasher);
@@ -168,7 +168,7 @@ impl Graph {
     pub(crate) fn new(units: &Units) -> Result<Graph, UnitError> {
         let all = &units.graph.units;
         let count = all.len();
-        let packages: FxHashMap<&str, u32> =
+        let packages: HashMap<&str, u32> =
             units.packages.iter().enumerate().map(|(at, it)| (it.id.as_str(), at as u32)).collect();
         let package: Vec<u32> = all
             .iter()
@@ -215,7 +215,7 @@ impl Graph {
             flags,
             build_time: BitSet::<u32>::new(count),
             lib_packages: BitSet::<u32>::new(units.packages.len()),
-            by_target: FxHashMap::default(),
+            by_target: HashMap::default(),
         };
         for (at, unit) in all.iter().enumerate() {
             if unit.target.is_lib() {
@@ -228,7 +228,7 @@ impl Graph {
             graph.by_target.entry(hash).or_default().push(at as u32);
         }
 
-        let mut memo = FxHashMap::default();
+        let mut memo = HashMap::default();
         memo.reserve(count);
         let node = |at: &u32| graph.graph_unit(all, *at);
         let mut link_start = Vec::with_capacity(count + 1);

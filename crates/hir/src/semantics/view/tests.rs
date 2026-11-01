@@ -87,8 +87,8 @@ fn roots<'db>(
 /// the same id is what the stored files hold.
 fn stable_ids(out: &str) -> String {
     use std::fmt::Write as _;
-    let mut labels = rustc_hash::FxHashMap::<(&str, &str), usize>::default();
-    let mut counts = rustc_hash::FxHashMap::<&str, usize>::default();
+    let mut labels = blaze_hash::HashMap::<(&str, &str), usize>::default();
+    let mut counts = blaze_hash::HashMap::<&str, usize>::default();
     let mut result = String::with_capacity(out.len());
     let (mut at, mut copied) = (0, 0);
     while let Some(found) = out[at..].find("Id(") {
@@ -374,6 +374,42 @@ fn source_view_of_every_def() {
         }
         assert!(checked > 20, "{checked} defs checked");
         expect_file!["expect/source_view.txt"].assert_eq(&stable_ids(&out));
+    });
+}
+
+#[test]
+fn a_file_only_a_block_declares_is_a_module_whose_paths_resolve() {
+    // No crate def map lists `m.rs`: only `main`'s block's def map has the module `m`.
+    let fx = fixture::db(
+        r#"
+//- /main.rs crate:main
+pub fn d() {}
+fn main() {
+    #[path = "m.rs"]
+    mod m;
+}
+//- /m.rs
+pub fn inner() {
+    crate::d();
+}
+"#,
+    );
+    let m = *fx.files().last().expect("m.rs");
+    let db = fx.into_db();
+    crate::attach_db(&db, || {
+        let vsema = Semantics::new(&db);
+        assert!(vsema.file_to_module_def(m.file_id(&db)).is_some(), "m.rs is the module `m` of `main`'s block");
+        assert!(vsema.find_parent_file(HirFileId::from(m)).is_some(), "the `mod m;` declaring m.rs");
+        let root = vsema.parse(m).syntax();
+        let path = root
+            .descendants()
+            .filter_map(view::Path::cast)
+            .find(|it| it.qualifier().is_some())
+            .expect("`crate::d`");
+        assert!(
+            matches!(vsema.resolve_path(path), Some(crate::PathResolution::Def(ModuleDef::Function(_)))),
+            "`crate::d` in m.rs resolves to the function `d`"
+        );
     });
 }
 

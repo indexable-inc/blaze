@@ -192,8 +192,8 @@ impl<E> Copy for Import<'_, E> {}
 /// relocation points. [`laid_out`] keys the compile on it.
 pub fn release_refs(own: &Refs, imported: &[&Refs]) -> (Vec<crate::Target>, Vec<u32>) {
     let total = own.len() + imported.iter().map(|it| it.len()).sum::<usize>();
-    let mut first: rustc_hash::FxHashMap<ContentId, u32> =
-        rustc_hash::FxHashMap::with_capacity_and_hasher(total, Default::default());
+    let mut first: blaze_hash::HashMap<ContentId, u32> =
+        blaze_hash::HashMap::with_capacity_and_hasher(total, Default::default());
     // alloc: the release unit's references, kept by its job
     let mut refs = own.to_vec();
     // alloc: the release unit's layout, hashed into its key and dropped

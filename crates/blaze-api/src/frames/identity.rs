@@ -302,7 +302,7 @@ impl Gen {
     }
 
     fn edit(&mut self) -> Edit {
-        match self.below(9) {
+        match self.below(10) {
             0 => Edit::ReplaceBody { body: self.text(), item: self.target() },
             1 => Edit::ReplaceSignature { item: self.target(), signature: self.text() },
             2 => Edit::ReplaceItem { item: self.target(), text: self.text() },
@@ -311,7 +311,8 @@ impl Gen {
             5 => Edit::AddItem { file: self.text(), into: self.maybe(Gen::text), text: self.text() },
             6 => Edit::RemoveItem { item: self.target() },
             7 => Edit::AddUse { file: self.text(), into: self.maybe(Gen::text), path: self.text() },
-            _ => Edit::Rename { to: self.text(), item: self.target() },
+            8 => Edit::Rename { to: self.text(), item: self.target() },
+            _ => Edit::Replace { to: self.text(), from: self.text() },
         }
     }
 
@@ -559,6 +560,10 @@ impl Gen {
                 requests: self.many(depth, Gen::wide),
                 budget_bytes: self.wide(),
                 memory_bytes: self.wide(),
+                build: crate::Build {
+                    id: self.id(),
+                    exe: crate::Executable { path: self.text(), len: self.wide(), modified_ns: self.wide(), inode: self.wide() },
+                },
             }),
             13 => Response::Done { ok: self.yes() },
             14 => Response::Error(ApiError { at: self.maybe(Gen::text), what: self.text() }),

@@ -15,10 +15,6 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
     thread::JoinHandle,
     time::Duration,
 };
@@ -168,10 +164,10 @@ struct Subscriber {
     frame: Frame,
 }
 
-/// A live SQL query running on its thread: `stop` kills its DuckDB.
+/// A live SQL query running on its thread: a message on `stop` kills its DuckDB.
 struct Querying {
     to: RequestRef,
-    stop: Arc<AtomicBool>,
+    stop: crossbeam_channel::Sender<()>,
 }
 
 /// What a query's thread answered.
@@ -278,9 +274,9 @@ impl Observe {
             let what = format!("the daemon was started with no {DUCKDB}: `nix run .#duckdb` names the DuckDB it runs");  // alloc: error path
             return fail(out, to, ApiError::new(what, Some("blaze debug sql --live".to_owned())));  // alloc: error path
         };
-        let stop = Arc::new(AtomicBool::new(false));  // alloc: once a query
+        let (stop, stopped) = crossbeam_channel::bounded(1);  // alloc: once a query
         // clone: once a query, for its thread
-        let (duckdb, dir, stopped, answered) = (duckdb.clone(), profiling.dir.clone(), Arc::clone(&stop), self.answered_to.clone());
+        let (duckdb, dir, answered) = (duckdb.clone(), profiling.dir.clone(), self.answered_to.clone());
         let window = Duration::from_secs(u64::from(last_s));
         let spawned = std::thread::Builder::new().name("blaze-sql".to_owned()).spawn(move || {  // alloc: once a query
             let query = sql::Query { duckdb: &duckdb, history: &dir, sql: &sql };
@@ -300,7 +296,7 @@ impl Observe {
     pub fn gone(&mut self, conn: Conn) {
         self.live.retain(|it| it.to.conn != conn);
         for querying in self.querying.iter().filter(|it| it.to.conn == conn) {
-            querying.stop.store(true, Ordering::Relaxed);
+            _ = querying.stop.try_send(());
         }
     }
 
@@ -361,7 +357,7 @@ impl Observe {
             out.push(Reply { to: it.to, response: Response::Done { ok: true } });
         }
         for querying in &self.querying {
-            querying.stop.store(true, Ordering::Relaxed);
+            _ = querying.stop.try_send(());
         }
         self.explorer = None;
     }

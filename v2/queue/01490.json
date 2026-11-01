@@ -1,0 +1,23 @@
+{
+  "id": "01490",
+  "from_lane": "observe",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/job.rs"
+  ],
+  "what": "observe (Andrew 2026-11-01 03:31, item 5). At each build request end, where job.rs makes its BuildRow (`row()`, line ~938), call `db.storage().take_counts(|kind, executed, verified, reran| blaze_profile::query_counts(blaze_profile::QueryCounts { build: request.0, kind, executed, verified, reran }))` once take_counts lands (queued to db). Also FYI: I added `tree: None, blaze: None` to the BuildRow literal in job.rs row(): blaze-profile History::build_ended now fills builds.tree (blaze-v2-proof tree digest of the workspace) and builds.blaze (blaze executable hash) on the history thread.",
+  "state": "open",
+  "created": "2026-11-01T11:53:10Z",
+  "updated": "2026-11-01T11:53:10Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T11:53:10Z",
+      "by": "observe",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

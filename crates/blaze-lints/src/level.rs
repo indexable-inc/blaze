@@ -33,12 +33,12 @@ pub enum Target {
     Rustc(String),
     /// Lints of blaze's own (`blaze::`): bit `i` for [`blaze::Lint::ALL`]`[i]`, one for a
     /// lint, several for the group `blaze::hot`.
-    Blaze(u8),
+    Blaze(u32),
 }
 
 /// The lints of the group `blaze::hot` ([`blaze::HOT`]: the four hot lints, not the parallel ones), as a
 /// [`Target::Blaze`] has them.
-const BLAZE_HOT: u8 = {
+const BLAZE_HOT: u32 = {
     let mut bits = 0;
     let mut at = 0;
     while at < blaze::HOT.len() {
@@ -48,9 +48,11 @@ const BLAZE_HOT: u8 = {
     bits
 };
 
-pub(crate) const fn blaze_bit(lint: blaze::Lint) -> u8 {
-    1 << lint as u8
+pub(crate) const fn blaze_bit(lint: blaze::Lint) -> u32 {
+    1 << lint as u32
 }
+
+const _: () = assert!(blaze::Lint::ALL.len() <= u32::BITS as usize);
 
 impl Target {
     /// What `name`, as an attribute or flag writes it, sets the level of, if it is a lint this
@@ -76,7 +78,7 @@ impl Target {
     }
 
     /// The lints of blaze's own `blaze::<name>` stands for, as a [`Target::Blaze`] has them.
-    pub(crate) fn blaze(name: &str) -> Option<u8> {
+    pub(crate) fn blaze(name: &str) -> Option<u32> {
         if name == "hot" {
             return Some(BLAZE_HOT);
         }

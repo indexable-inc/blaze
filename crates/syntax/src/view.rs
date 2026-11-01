@@ -320,6 +320,7 @@ pub fn try_to_node<'t>(ptr: SyntaxNodePtr, root: Node<'t>) -> Option<Node<'t>> {
 impl<N: crate::AstNode + Typed> AstPtr<N> {
     /// An `AstPtr` to the node a view stands for.
     #[inline]
+    #[allow(clippy::needless_pass_by_value, reason = "a view is a copied handle, taken as views are passed everywhere")]
     pub fn of<'t>(node: N::Of<'t>) -> AstPtr<N> {
         let syntax = <N::Of<'t> as AstNode<'t>>::syntax(&node);
         AstPtr::try_from_raw(ptr(syntax)).expect("a view casts to its handle type")

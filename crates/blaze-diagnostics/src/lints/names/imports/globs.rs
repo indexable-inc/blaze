@@ -16,7 +16,7 @@
 use hir::{InFile, ModuleDef, view::HasSourceView as _};
 use hir_def::{MacroId, ModuleDefId, ModuleId, visibility::Visibility};
 use hir_expand::{mod_path::ModPath, name::Name};
-use rustc_hash::FxBuildHasher;
+use blaze_hash::FixedState;
 use smallvec::SmallVec;
 use syntax::view::{self as ast, AstNode as _, HasVisibility, Node};
 
@@ -41,8 +41,8 @@ pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, uses: &Uses<'_, 'db>) -> Vec<Found> {
             }
         }
     }
-    let mut seen: hashbrown::HashSet<ModuleId, FxBuildHasher, _> =
-        hashbrown::HashSet::with_capacity_and_hasher_in(uses.globs.len(), FxBuildHasher, cx.frame());
+    let mut seen: hashbrown::HashSet<ModuleId, FixedState, _> =
+        hashbrown::HashSet::with_capacity_and_hasher_in(uses.globs.len(), FixedState, cx.frame());
     for module in uses.items.iter().map(|it| it.module) {
         if uses.globs.contains_key(&module) && seen.insert(module) {
             found.extend(reexports(cx, uses, module));
@@ -168,7 +168,7 @@ fn reexports<'db>(cx: &Cx<'_, 'db>, uses: &Uses<'_, 'db>, module: ModuleId) -> V
     let here = module.def_map(db).module(db, module).scope(db);
     let frame = cx.frame();
     let mut names: Vec<Name, _> = Vec::new_in(frame);
-    let mut seen: hashbrown::HashSet<Name, FxBuildHasher, _> = hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame);
+    let mut seen: hashbrown::HashSet<Name, FixedState, _> = hashbrown::HashSet::with_hasher_in(FixedState, frame);
     for (_, _, from) in &globs {
         for (name, _) in from.def_map(db).module(db, *from).scope(db).entries() {
             if seen.insert(*name) {

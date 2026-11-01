@@ -178,7 +178,7 @@ fn a_grant() -> Grant {
     Grant {
         format: Format::Elf,
         header: layout.header,
-        span: layout.span.clone(),
+        span: layout.span,
         objects: vec![
             (0x10_0000, Rights::Code),
             (0x2_0000, Rights::Words),
@@ -351,7 +351,7 @@ fn a_grants_writes_and_lookups_round_trip_and_refuse_short_or_oversized_counts()
     // A name's length past the body, and past the most a name may have.
     let name = lookups + 4 + 17;
     assert_eq!(bytes[name..name + 4], 6u32.to_le_bytes());
-    let mut forged = bytes.clone();
+    let mut forged = bytes;
     forged[name..name + 4].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(Grant::decode(&forged).is_err());
     let long = "x".repeat(MOST_NAME + 1);
@@ -363,7 +363,7 @@ fn a_grants_writes_and_lookups_round_trip_and_refuse_short_or_oversized_counts()
     assert!(oversized.check_binds().is_err());
     let error = Grant::decode(&encoded(&oversized)).unwrap_err();
     assert!(error.what.contains(&format!("{} bytes", MOST_NAME + 1)), "{error}");
-    let mut most = Grant { names: long[..MOST_NAME].to_owned(), ..oversized.clone() };
+    let mut most = Grant { names: long[..MOST_NAME].to_owned(), ..oversized };
     most.lookups[0].len = MOST_NAME as u32;
     assert_eq!(Grant::decode(&encoded(&most)), Ok(most));
     assert!(MOST_BINDS * 17 > frame::MOST_BODY as usize, "the frame bounds what a grant carries first");
@@ -486,7 +486,11 @@ fn a_strong_miss_fails_the_start_naming_it_and_is_never_stored() {
     assert!(copied.untouched(0x11_0020) && copied.untouched(0x11_0030), "a strong miss stored");
     assert_eq!(copied.word(0x11_0028), 0, "the weak one is still 0");
 
-    let names: String = (0..12).map(|it| format!("f{it:02}")).collect();
+    use std::fmt::Write as _;
+    let names = (0..12).fold(String::new(), |mut names, it| {
+        write!(names, "f{it:02}").unwrap();
+        names
+    });
     let many = Grant {
         writes: Vec::new(),
         lookups: (0..12).map(|it| Lookup { place: 0x11_0100 + 8 * it as u64, addend: 0, weak: false, name: 3 * it, len: 3 }).collect(),
@@ -898,12 +902,14 @@ mod linux {
         assert_eq!(call(image.at + at), 7);
 
         let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let entry = image.at + at;
         let runner = {
-            let stop = stop.clone();
+            let (stop, calls) = (stop.clone(), calls.clone());
             std::thread::spawn(move || {
                 let (mut sevens, mut eights) = (0u64, 0u64);
                 while !stop.load(Ordering::Relaxed) || eights == 0 {
+                    calls.fetch_add(1, Ordering::Relaxed);
                     match call(entry) {
                         7 => {
                             assert_eq!(eights, 0, "the old code after the patch was seen");
@@ -916,14 +922,17 @@ mod linux {
                 (sevens, eights)
             })
         };
-        std::thread::sleep(Duration::from_millis(20));
+        let ran_since = |since: u64, what: &str| {
+            blaze_spin::SpinWait::within(what, Duration::from_secs(10), || calls.load(Ordering::Relaxed) > since);
+        };
+        ran_since(0, "the running thread to call the code");
         let (mut channel, _, _) = connected();
         let granted = [sys::granted(memory.object(), Rights::Code).unwrap()];
         let overlay =
             Overlay { object: 0, offset: 0, len: page, at: 0x1000_0000, access: Access::Execute, place: Place::Code, image: false };
         sys::overlay(&mut channel, &granted, &[overlay], image.at.wrapping_sub(0x1000_0000)).unwrap();
         assert_eq!(image.bytes(), memory.bytes(CodeRange { offset: 0, len: page }).unwrap());
-        std::thread::sleep(Duration::from_millis(20));
+        ran_since(calls.load(Ordering::Relaxed) + 1, "the running thread to call the code through the overlay");
 
         memory.write(b, &returning(8)).unwrap();
         memory.publish(CodeRange { offset: b, len: 16 }).unwrap();
@@ -933,7 +942,7 @@ mod linux {
         stop.store(true, Ordering::Relaxed);
         while !runner.is_finished() {
             assert!(Instant::now() < deadline, "the running thread never saw the patch");
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::yield_now();
         }
         let (sevens, eights) = runner.join().unwrap();
         assert!(sevens > 0 && eights > 0);
@@ -1176,9 +1185,10 @@ mod linux {
 
     #[cfg(feature = "host")]
     mod host {
-        use std::sync::{Arc, Mutex, mpsc};
+        use std::sync::Arc;
 
         use blaze_core::{Command, Sandbox};
+        use parking_lot::Mutex;
 
         use super::*;
         use crate::handshake::HOST_VAR;
@@ -1357,7 +1367,7 @@ mod linux {
             std::fs::create_dir_all(&dir).unwrap();
             let host = Arc::new(Host::new(&dir.join("host")).unwrap());
             let memory = Arc::new(Mutex::new(memory));
-            let (sessions, got) = mpsc::channel();
+            let (sessions, got) = crossbeam_channel::unbounded();
             let image = Image { key: [9; 32], len: 2 * page, store: None };
             let program = Program::new(host, memory.clone(), image, sessions);
             let command = || Command {
@@ -1376,9 +1386,9 @@ mod linux {
             let _channel = play_hook(&spawned, &own, 0);
             let session = got.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
             assert_eq!(session.pid, pid);
-            assert!(memory.lock().unwrap().processes.iter().any(|it| it.pid == pid && !it.forks));
+            assert!(memory.lock().processes.iter().any(|it| it.pid == pid && !it.forks));
             program.exited(started);
-            assert!(memory.lock().unwrap().processes.is_empty());
+            assert!(memory.lock().processes.is_empty());
             program.exited(started);
 
             let (spawned, started) = program.command(command(), true).unwrap();
@@ -1386,7 +1396,7 @@ mod linux {
             let _channel = play_hook(&spawned, &own, 0);
             let ended = got.recv_timeout(Duration::from_secs(10)).unwrap();
             assert!(ended.is_err_and(|it| it.what.contains("ended while")));
-            assert!(memory.lock().unwrap().processes.is_empty());
+            assert!(memory.lock().processes.is_empty());
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

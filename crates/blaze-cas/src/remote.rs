@@ -47,8 +47,8 @@ use std::collections::{VecDeque, hash_map};
 
 use blaze_core::{Address, Completion, Conn, Done, Effect, IoError, RECV_MOST, Tag, Tags};
 use blaze_format::cursor::{self, Put as _, Reader};
+use blaze_hash::HashMap;
 use blaze_ids::{ContentId, fuse::Fuse8, radix};
-use rustc_hash::FxHashMap;
 
 use crate::{Asked, ByHash, Corrupt, Entry, Key, Kind, Remote, Store};
 
@@ -725,9 +725,9 @@ pub struct Server {
     closing: Vec<Tag>,
     failed: Option<IoError>,
     /// Sorted by connection once, where [`Server::stop`] hangs them up.
-    peers: FxHashMap<Conn, Peer>,
+    peers: HashMap<Conn, Peer>,
     /// The connection of each send and receive in flight.
-    ops: FxHashMap<Tag, Conn>,
+    ops: HashMap<Tag, Conn>,
     /// The frames of the filter of its store a peer is sent when it connects: a full one, then
     /// the deltas since. Empty until the first peer.
     filters: Vec<Vec<u8>>,
@@ -776,8 +776,8 @@ impl Server {
             // alloc: empty, allocates nothing; once per server, setup.
             closing: Vec::new(),
             failed: None,
-            peers: FxHashMap::default(),
-            ops: FxHashMap::default(),
+            peers: HashMap::default(),
+            ops: HashMap::default(),
             // alloc: empty, allocates nothing; once per server, setup.
             filters: Vec::new(),
             full_keys: 0,

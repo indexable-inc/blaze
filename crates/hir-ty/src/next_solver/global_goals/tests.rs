@@ -4,7 +4,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fmt::Write as _,
-    sync::{Barrier, Mutex},
+    sync::Barrier,
     thread,
 };
 
@@ -14,8 +14,9 @@ use hir_def::{
     nameres::crate_def_map,
     signatures::{EnumSignature, FunctionSignature, StructSignature, TraitSignature},
 };
-use rustc_type_ir::{Interner as _, MayBeErased, Upcast, inherent::Ty as _};
 use hir_expand::fixture;
+use parking_lot::Mutex;
+use rustc_type_ir::{Interner as _, MayBeErased, Upcast, inherent::Ty as _};
 
 use super::{GoalKey, mode_tag, shape, switch, table::Table};
 use crate::{
@@ -75,14 +76,14 @@ fn the_table_agrees_with_a_locked_map_under_eight_threads() {
                         Some(value) => assert_eq!(value, value_of(key)),
                         None => {
                             table.insert(key, value_of(key));
-                            reference.lock().unwrap().insert(key, value_of(key));
+                            reference.lock().insert(key, value_of(key));
                         }
                     }
                 }
             });
         }
     });
-    let reference = reference.into_inner().unwrap();
+    let reference = reference.into_inner();
     assert!(reference.len() > 2 * 2048, "the test must fill more than the first level");
     for key in &keys {
         assert_eq!(table.get(*key), reference.get(key).copied(), "{key:?}");

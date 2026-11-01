@@ -32,6 +32,15 @@ SELECT * FROM read_parquet(@heap_by_owner, union_by_name = true);
 CREATE OR REPLACE VIEW switches AS
 SELECT * FROM read_parquet(@switches, union_by_name = true);
 
+CREATE OR REPLACE VIEW errors AS
+SELECT * FROM read_parquet(@errors, union_by_name = true);
+
+CREATE OR REPLACE VIEW links AS
+SELECT * FROM read_parquet(@links, union_by_name = true);
+
+CREATE OR REPLACE VIEW crate_deps AS
+SELECT * FROM read_parquet(@crate_deps, union_by_name = true);
+
 -- One row a time a job on a fiber parked: its `parked` switch and the `resumed` one after it,
 -- with the thread before and after; `resumed_ns` and `thread_after` are null while it still
 -- waits. `moved` says it resumed on another thread. A `wait_kind` of moved is the scheduler

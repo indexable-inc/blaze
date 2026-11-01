@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: lane observe, step 3: the flight recorder's Parquet history (crates/blaze-profile/src/history.rs), the DuckDB views and named queries over it (sql/views.sql, sql/examples.sql, src/views.rs), `blaze debug sql` running the pinned DuckDB CLI (src/sql.rs), and the flush's speed of light.
+summary: lane observe, step 3: the flight recorder's Parquet history, its errors table and `blaze debug diff` (crates/blaze-profile/src/history.rs), the DuckDB views and named queries over it (sql/views.sql, sql/examples.sql, src/views.rs), `blaze debug sql` running the pinned DuckDB CLI (src/sql.rs), and the flush's speed of light.
 date: 2026-10-31
 ---
 # The history
@@ -116,6 +116,29 @@ file. If DuckDB refuses the query, the result is `SqlError::Duckdb` with DuckDB'
 the query and the script, and the scratch directory is kept so the script can be read.
 `sql::run_live(query, window)` first writes the recorder's last `window` as
 `live.<table>.parquet` (`history::write_live`), then queries it beside the history.
+
+## Errors as rows
+
+Each error a build says is a row of the `errors` table (schema.rs; `crates/blaze-profile/src/errors.rs`):
+the build, the crate and the unit (`serde (build script)`), a stable `kind`, the function or
+instance it is of, its first line, why (its first help or note, or a refused function's reason)
+and its place. `kind` is rustc's code (`E0277`) or a deny lint's name when the error has one,
+else blaze's: `derive-panic`, `attr-panic`, `macro-panic`, `expand-failed`,
+`link-native-missing`, `link-failed`, `template-refs`, `refused`, `daemon-panic`, `uncoded`.
+The error naming the functions blaze could not compile is a row a function, `template-refs`
+when the template's references failed (its reason the innermost one), `refused` otherwise.
+The daemon gives each error diagnostic to `errors::rows` and the rows to `History::errored`,
+written by the build's flush. `errors::from_log` reads a build's printed log the same way, for
+builds from before the table. Named queries: `derive_panics_per_build`, `errors_by_kind`.
+
+## `blaze debug diff A B`
+
+`crates/blaze-profile/src/diff.rs`. A side is a build of the history (its number, read through
+DuckDB in one run for both) or a build log (a path: its errors by `from_log`, its phases from the
+`phases.tsv` of the `BLAZE_PROFILE` directory the log names). It prints the phases (every span
+of a name, whole wall time) and units (the time of a unit's five `unit ...` spans, by crate)
+whose time changed, most first, at most 10 each, and the error kinds B has that A has not, and
+those gone. What a side did not record it says, with why; a log has no unit's time.
 
 ## Speed of light: the flush
 

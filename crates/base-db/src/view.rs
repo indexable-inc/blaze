@@ -22,7 +22,7 @@ use std::{borrow::Cow, cell::RefCell, fmt};
 
 use blaze_ids::{ContentId, radix};
 use blaze_mem::{Frame, Tag, frame, scratch::Scratch};
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use blaze_hash::{FixedState, HashMap};
 use blaze_query::db::{Durability, Setter};
 use triomphe::Arc;
 use crate::{AbsPath, AbsPathBuf, FileId, FileSet, FileSetConfig, VfsPath};
@@ -124,7 +124,7 @@ pub(crate) struct ViewIndex {
 }
 
 impl ViewIndex {
-    pub(crate) fn new(base: &AbsPath, by_path: &FxHashMap<VfsPath, FileId>) -> ViewIndex {
+    pub(crate) fn new(base: &AbsPath, by_path: &HashMap<VfsPath, FileId>) -> ViewIndex {
         let mut index = ViewIndex::default();
         for (path, &file) in by_path {
             index.note(base, path, file);
@@ -282,8 +282,8 @@ impl Files {
         frame: &'f Frame,
     ) -> Result<Plan<'f>, ViewError> {
         let call = index.begin();
-        let mut fresh: hashbrown::HashSet<&str, FxBuildHasher, &Frame> =
-            hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame);
+        let mut fresh: hashbrown::HashSet<&str, FixedState, &Frame> =
+            hashbrown::HashSet::with_hasher_in(FixedState, frame);
         let mut plan = Plan {
             writes: Vec::new_in(frame),
             added: Vec::new_in(frame),
@@ -503,8 +503,8 @@ impl Files {
 
         for &root in roots {
             let input = self.source_root(root);
-            let mut gone: hashbrown::HashSet<FileId, FxBuildHasher, &Frame> =
-                hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame);
+            let mut gone: hashbrown::HashSet<FileId, FixedState, &Frame> =
+                hashbrown::HashSet::with_hasher_in(FixedState, frame);
             gone.extend(plan.removed.iter().filter(|it| it.0 == root).map(|it| it.1));
             // The root's set, taken out of its input to be edited where it is: no reader holds
             // it by then (they read it by reference), so `make_mut` copies nothing.
@@ -577,7 +577,7 @@ impl Files {
 /// file at one path and each path for one file.
 fn rebuilt<'p>(
     old: &SourceRoot,
-    gone: &hashbrown::HashSet<FileId, FxBuildHasher, &Frame>,
+    gone: &hashbrown::HashSet<FileId, FixedState, &Frame>,
     added: impl Iterator<Item = &'p (FileId, SourceRootId, VfsPath)>,
 ) -> (SourceRoot, bool) {
     let mut files = FileSet::default();

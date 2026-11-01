@@ -22,7 +22,7 @@ use std::{
     path::Path,
 };
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_hash::{HashMap, HashSet};
 use windows_sys::Win32::{
     Foundation::{
         ERROR_ACCESS_DENIED, ERROR_CANT_ACCESS_FILE, ERROR_DELETE_PENDING, ERROR_FILE_NOT_FOUND,
@@ -241,11 +241,11 @@ impl How {
 pub(super) struct Names {
     dir: FileName,
     root: u128,
-    dirs: FxHashMap<u128, Place>,
+    dirs: HashMap<u128, Place>,
     /// The names [`Place`]s point at; the watched directory's is the first.
     paths: Vec<FileName>,
     /// Files of this read already named where they are now.
-    seen: FxHashSet<u128>,
+    seen: HashSet<u128>,
     files: Vec<FileName>,
     lost: Vec<(FileName, Lost)>,
     /// The watched directory itself moved or went: the watch ends after this read.
@@ -255,7 +255,7 @@ pub(super) struct Names {
 
 impl Names {
     pub(super) fn new(dir: FileName, root: u128) -> Names {
-        let mut dirs = FxHashMap::default();
+        let mut dirs = HashMap::default();
         dirs.insert(root, Place::Under(0));
         // alloc: setup, once per watch; the buffers are reused for its life.
         Names {
@@ -264,7 +264,7 @@ impl Names {
             dir,
             root,
             dirs,
-            seen: FxHashSet::default(),
+            seen: HashSet::default(),
             // alloc: setup.
             files: Vec::new(),
             lost: Vec::new(), // alloc: setup.
@@ -974,7 +974,7 @@ mod tests {
     /// A volume as a map of where each reference number is now.
     #[derive(Default)]
     struct Fake {
-        now: FxHashMap<u128, Found>,
+        now: HashMap<u128, Found>,
         moved: bool,
         asked: Vec<u128>,
     }

@@ -702,8 +702,8 @@ fn exempt() {
 mod fiber_boundary {
     use base_db::FileId;
     use blaze_diagnostics::emit::{Sources, Style};
+    use blaze_hash::HashMap;
     use hir_expand::fixture;
-    use rustc_hash::FxHashMap;
 
     use crate::{
         check::{Setup, check},
@@ -747,7 +747,7 @@ pub mod sched {
                 .into_iter()
                 .find(|it| it.display_name(&db).is_some_and(|it| it.to_string() == linted))
                 .expect("the fixture has the crate linted");
-            let mut names: FxHashMap<FileId, String> = FxHashMap::default();
+            let mut names: HashMap<FileId, String> = HashMap::default();
             let mut texts = Vec::new();
             for krate in hir::Crate::all(&db) {
                 for module in krate.modules(&db) {
@@ -771,6 +771,7 @@ pub mod sched {
             let found = check(&db, krate, &setup, &name_of).expect("every file of the crates is named");
             let mut sources = Sources::of(texts);
             crate::serve::written(found.iter(), &mut sources, |_| None, Style::default())
+                .expect("every file a lint points into is given")
                 .into_iter()
                 .map(|it| it.rendered)
                 .collect()

@@ -8,7 +8,9 @@ use std::{
     ops::Range,
 };
 
-use base_db::{Db, ConstEvalBudget, Crate};
+use base_db::{ConstEvalBudget, Crate, Db};
+use blaze_hash::{HashMap, HashSet};
+use blaze_hashcons::Interned;
 use either::Either;
 use hir_def::{
     AdtId, DefWithBodyId, EnumVariantId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId,
@@ -29,14 +31,12 @@ use rustc_apfloat::{
     ieee::{Double, Half as f16, Quad as f128, Single},
 };
 use rustc_ast_ir::Mutability;
-use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::{SmallVec, smallvec};
 use rustc_type_ir::{
     AliasTyKind,
     inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _},
 };
+use smallvec::{SmallVec, smallvec};
 use triomphe::Arc;
-use blaze_hashcons::Interned;
 
 use crate::{
     CallableDefId, ComplexMemoryMap, InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate,
@@ -75,10 +75,8 @@ mod threads;
 mod unwind;
 
 use hooks::Hooks;
+use machine::{Access, EvalThread, Machine, MemKind, Plain, Ptr, RetagMode, Shadow, Site, TypedCx};
 use provenance::Provenance;
-use machine::{
-    Access, EvalThread, Machine, MemKind, Plain, Ptr, RetagMode, Shadow, Site, TypedCx,
-};
 
 macro_rules! from_bytes {
     // A `usize` of the target, which is as wide as what holds it.
@@ -332,12 +330,12 @@ impl std::ops::Deref for VariantLayout {
 /// The provenances the machine gave the evaluation's pointers, each once, by [`ProvId`].
 struct Provs<P> {
     list: Vec<P>,
-    index: FxHashMap<P, u32>,
+    index: HashMap<P, u32>,
 }
 
 impl<P> Default for Provs<P> {
     fn default() -> Self {
-        Provs { list: Vec::new(), index: FxHashMap::default() } // alloc: empty, allocates nothing
+        Provs { list: Vec::new(), index: HashMap::default() } // alloc: empty, allocates nothing
     }
 }
 
@@ -358,15 +356,15 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     heap_blocks: BTreeMap<usize, HeapBlock>,
     /// The offsets of freed heap blocks, by size class and alignment, for the next block of
     /// that class and alignment.
-    free_blocks: FxHashMap<(usize, usize), Vec<usize>>,
+    free_blocks: HashMap<(usize, usize), Vec<usize>>,
     /// Where a promoted temporary of a body (`&[1, 2]`) is: in the heap, as its borrow
     /// outlives the call, once for every call of the body.
-    promoted: FxHashMap<(usize, LocalId), Address>,
+    promoted: HashMap<(usize, LocalId), Address>,
     /// Whether dropping a value of a type does anything ([`Self::has_drop_glue`]).
-    drop_glue: FxHashMap<Ty<'db>, bool>,
+    drop_glue: HashMap<Ty<'db>, bool>,
     /// Where the value of a constant operand is, once read: the program never writes it, so
     /// every use of the constant reads the same copy.
-    constants: FxHashMap<Either<Const<'db>, Allocation<'db>>, Interval>,
+    constants: HashMap<Either<Const<'db>, Allocation<'db>>, Interval>,
     code_stack: Vec<StackFrame<'db>>,
     /// Emptied `code_stack`s, for the nested runs of [`Self::interpret_mir`].
     spare_code_stacks: Vec<Vec<StackFrame<'db>>>,
@@ -392,7 +390,7 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     /// The running thread's destructors to call when its start function returns.
     at_exit: Vec<(usize, Address)>,
     /// The running thread's `#[thread_local]` statics, as [`Self::static_locations`].
-    thread_statics: FxHashMap<StaticId, Address>,
+    thread_statics: HashMap<StaticId, Address>,
     /// What the thread shims keep for the whole process: pthread keys, signal actions.
     process: shim::Process,
     /// The virtual clock, in nanoseconds since the run started.
@@ -414,13 +412,13 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     panic_handler: std::cell::OnceCell<Option<FunctionId>>,
     /// Stores the global location of the statics. We const evaluate every static first time we need it
     /// and see it's missing, then we add it to this to reuse.
-    static_locations: FxHashMap<StaticId, Address>,
+    static_locations: HashMap<StaticId, Address>,
     /// The memory of each evaluated static, as start and size.
     static_memory: Vec<(usize, usize, StaticId)>,
     /// The statics whose value is read, when the others are left unevaluated: a static that
     /// is only pointed to needs no value, and may itself point back at the one being
     /// evaluated. `None` evaluates every static that is named.
-    read_statics: Option<FxHashSet<StaticId>>,
+    read_statics: Option<HashSet<StaticId>>,
     /// Heap memory standing in for the statics left unevaluated, as start and size.
     unevaluated_statics: Vec<(usize, usize, StaticId)>,
     /// The unevaluated static whose memory was read, which fails the evaluation.
@@ -436,16 +434,16 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     random_state: blaze_rng::SplitMix64,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
-    layout_cache: RefCell<FxHashMap<Ty<'db>, Interned<'static, InternedLayout>>>,
-    projected_ty_cache: RefCell<FxHashMap<(PlaceTy<'db>, PlaceElem), PlaceTy<'db>>>,
-    not_special_fn_cache: RefCell<FxHashSet<FunctionId>>,
-    mir_or_dyn_index_cache: RefCell<FxHashMap<(FunctionId, GenericArgs<'db>), MirOrDynIndex<'db>>>,
+    layout_cache: RefCell<HashMap<Ty<'db>, Interned<'static, InternedLayout>>>,
+    projected_ty_cache: RefCell<HashMap<(PlaceTy<'db>, PlaceElem), PlaceTy<'db>>>,
+    not_special_fn_cache: RefCell<HashSet<FunctionId>>,
+    mir_or_dyn_index_cache: RefCell<HashMap<(FunctionId, GenericArgs<'db>), MirOrDynIndex<'db>>>,
     /// Constantly dropping and creating `Locals` is very costly. We store
     /// old locals that we normally want to drop here, to reuse their allocations
     /// later.
-    unused_locals_store: RefCell<FxHashMap<InferBodyId<'db>, Vec<Locals<'db>>>>,
+    unused_locals_store: RefCell<HashMap<InferBodyId<'db>, Vec<Locals<'db>>>>,
     /// [`Self::storage_marked`] of each body run under a machine, by the body's address.
-    storage_marked: RefCell<FxHashMap<usize, Arc<FxHashSet<LocalId>>>>,
+    storage_marked: RefCell<HashMap<usize, Arc<HashSet<LocalId>>>>,
     cached_ptr_size: usize,
     cached_fn_trait_func: Option<FunctionId>,
     cached_fn_mut_trait_func: Option<FunctionId>,
@@ -461,6 +459,10 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     /// [`Self::steps_left`] once [`LINT_TERMINATOR_LIMIT`] steps are spent, when the evaluation
     /// is of a constant's or static's initializer; `u64::MAX`, which it never is, otherwise.
     lint_mark: u64,
+    /// The `-C overflow-checks` of the crate a run's code is compiled as, which a body that
+    /// inherits its checks takes ([`Self::set_inherited_overflow_checks`]). Unset, such a body
+    /// checks, as a constant's evaluation does.
+    inherited_overflow_checks: Option<bool>,
     /// An additional limit on stack depth, to prevent stack overflow
     stack_depth_limit: usize,
     /// Every call takes a frame of [`Self::stack_depth_limit`], which is the crate's recursion
@@ -750,7 +752,7 @@ pub fn interpret_mir<'db>(
     trait_env: Option<ParamEnvAndCrate<'db>>,
 ) -> Result<'db, (Result<'db, Allocation<'db>>, MirOutput)> {
     let ty = body.locals[return_slot()].ty.as_ref();
-    let mut read_statics = FxHashSet::default();
+    let mut read_statics = HashSet::default();
     loop {
         let mut evaluator = Evaluator::with_machine(
             db,
@@ -832,7 +834,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         // const eval, which cannot read them as integers, so no other value is computed from
         // an id's bytes: comparing two (`IS_UNIT` in core) and reflection's counts, sizes and
         // names are answered.
-        if !self.type_ids.is_empty() && !self.holds_no_type_id(ty, &mut FxHashSet::default()) {
+        if !self.type_ids.is_empty() && !self.holds_no_type_id(ty, &mut HashSet::default()) {
             let of = |it: &TypeIdOf<'db>| match *it {
                 TypeIdOf::Ty(ty) => Some(ty),
                 TypeIdOf::Field { .. } => None,
@@ -940,10 +942,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             heap: vec![0],
             stack_allocations: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             heap_blocks: BTreeMap::new(),
-            free_blocks: FxHashMap::default(),
-            promoted: FxHashMap::default(),
-            drop_glue: FxHashMap::default(),
-            constants: FxHashMap::default(),
+            free_blocks: HashMap::default(),
+            promoted: HashMap::default(),
+            drop_glue: HashMap::default(),
+            constants: HashMap::default(),
             code_stack: vec![], // alloc: empty, allocates nothing; one per evaluation
             spare_code_stacks: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             spare_args: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
@@ -956,7 +958,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             waiting: None,
             yielded: false,
             at_exit: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
-            thread_statics: FxHashMap::default(),
+            thread_statics: HashMap::default(),
             process: shim::Process::default(),
             clock: 0,
             wait_counter: 0,
@@ -989,6 +991,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             budget,
             steps_left: budget.steps,
             lint_mark: lint_mark(limits_frames, budget.steps),
+            inherited_overflow_checks: None,
             layout_cache: RefCell::new(Default::default()),
             projected_ty_cache: RefCell::new(Default::default()),
             not_special_fn_cache: RefCell::new(Default::default()),
@@ -1207,10 +1210,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     /// Whether arithmetic of the body being evaluated panics when it overflows. A function's
     /// does what the code compiled from it does. The initializer of a constant, a static or a
-    /// discriminant always checks, as rustc builds it, whatever `-C overflow-checks` says.
+    /// discriminant always checks, as rustc builds it, whatever `-C overflow-checks` says. A
+    /// function that inherits its checks takes those of the crate the run is compiled as.
     fn checks_overflow(&self, locals: &Locals<'db>) -> bool {
         !matches!(locals.body.owner, InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(_)))
-            || crate::mir::overflow::body_checks_overflow(self.db, locals.body).unwrap_or(true)
+            || crate::mir::overflow::body_checks_overflow(self.db, locals.body)
+                .unwrap_or(self.inherited_overflow_checks.unwrap_or(true))
     }
 
     fn operand_ty(&self, o: &Operand, locals: &Locals<'db>) -> Result<'db, Ty<'db>> {
@@ -1932,13 +1937,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     /// The locals of `body` with storage statements, which are live only from a `StorageLive`.
-    fn storage_marked(&self, body: &'db MirBody<'db>) -> Arc<FxHashSet<LocalId>> {
+    fn storage_marked(&self, body: &'db MirBody<'db>) -> Arc<HashSet<LocalId>> {
         let key = std::ptr::from_ref(body) as usize;
         if let Some(it) = self.storage_marked.borrow().get(&key) {
             // clone: an `Arc`
             return it.clone();
         }
-        let marked: FxHashSet<LocalId> = body
+        let marked: HashSet<LocalId> = body
             .basic_blocks
             .iter()
             .flat_map(|(_, block)| &block.statements)
@@ -4309,7 +4314,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// Whether no value of the type has a `TypeId` in it or behind its references. A type
     /// this cannot see through, as a raw pointer or a `dyn`, is taken to have one; one met
     /// again in `seen`, through a reference to itself, adds nothing.
-    fn holds_no_type_id(&self, ty: Ty<'db>, seen: &mut FxHashSet<Ty<'db>>) -> bool {
+    fn holds_no_type_id(&self, ty: Ty<'db>, seen: &mut HashSet<Ty<'db>>) -> bool {
         if !seen.insert(ty) {
             return true;
         }
@@ -4649,7 +4654,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     fn patch_addresses(
         &mut self,
-        patch_map: &FxHashMap<usize, usize>,
+        patch_map: &HashMap<usize, usize>,
         source: &MemoryMap<'db>,
         ty_of_bytes: impl Fn(&[u8]) -> Result<'db, Ty<'db>> + Copy,
         addr: Address,

@@ -43,7 +43,7 @@ impl Tree {
     }
 
     pub fn root(&self) -> SyntaxNode {
-        SyntaxNode::new_flat_root(self.0.clone()) // clone: a handle root's count; goes with the handles
+        SyntaxNode::new_flat_root(Arc::clone(&self.0)) // clone: a handle root's count; goes with the handles
     }
 
     pub fn flat(&self) -> &Arc<FlatTree> {

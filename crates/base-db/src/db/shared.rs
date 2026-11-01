@@ -5,12 +5,10 @@
 //! every reader ([`blaze_query::db::Storage::stop_readers`]), then waits for each to let go:
 //! no task forks the database here, they share the one `Db`.
 
-use std::{
-    ops::Deref,
-    sync::{Arc, Condvar, Mutex},
-};
+use std::{ops::Deref, sync::Arc};
 
 use blaze_query::db::Database as _;
+use parking_lot::{Condvar, Mutex};
 
 use super::Db;
 
@@ -45,7 +43,7 @@ struct Left(Arc<Gone>);
 
 impl Drop for Left {
     fn drop(&mut self) {
-        let _held = self.0.lock.lock().unwrap_or_else(|it| it.into_inner());
+        let _held = self.0.lock.lock();
         self.0.left.notify_all();
     }
 }
@@ -73,10 +71,11 @@ impl Shared {
     pub fn write(&mut self) -> &mut Db {
         if Arc::strong_count(&self.db) > 1 {
             self.db.storage().stop_readers();
-            let mut held = self.gone.lock.lock().unwrap_or_else(|it| it.into_inner());
-            while Arc::strong_count(&self.db) > 1 {
-                held = self.gone.left.wait(held).unwrap_or_else(|it| it.into_inner());
-            }
+            let held = blaze_graph::wait::lock(&self.gone.lock, "db readers left");
+            let db = &self.db;
+            drop(blaze_graph::wait::wait_until(&self.gone.left, held, "db readers gone", |_| {
+                Arc::strong_count(db) == 1
+            }));
         }
         let db = Arc::get_mut(&mut self.db)
             .expect("a reader of the database is held past its last `Reader`: only `Reader`s clone it");

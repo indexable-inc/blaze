@@ -2,7 +2,7 @@
 //! takes the op; an edit of a range that does not meet what changed is moved to where that
 //! range is now; anything else is refused with the path, so the agent decides.
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 use crate::{
     CommitError, Op,
@@ -17,7 +17,7 @@ pub(crate) fn rebase(
     head: NodeId,
     ops: &[Op],
 ) -> Result<Vec<Option<Op>>, CommitError> {
-    let mut touched: FxHashMap<&str, usize> = FxHashMap::default();
+    let mut touched: HashMap<&str, usize> = HashMap::default();
     for op in ops {
         for path in op_paths(op) {
             *touched.entry(path).or_default() += 1;

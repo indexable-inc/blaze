@@ -39,11 +39,14 @@ mod tests;
 
 use std::{cell::Cell, collections::HashMap, fmt};
 
+use base_db::FileSetConfig;
 use base_db::{
-    AbsPathBuf, ConstEvalBudget, ContentId, Crate, CrateWorkspaceData, Env, FileId, FileSet, LibraryRoots,
-    LocalRoots, SourceRoot, SourceRootId, VfsPath, ViewChange, ViewFile, ViewRoot,
+    AbsPathBuf, ConstEvalBudget, ContentId, Crate, CrateWorkspaceData, Env, FileId, FileSet,
+    LibraryRoots, LocalRoots, SourceRoot, SourceRootId, VfsPath, ViewChange, ViewFile, ViewRoot,
 };
+use blaze_hash::HashSet;
 use blaze_ids::{Hasher, radix};
+use blaze_query::db::{Database as _, Durability, Setter};
 use blaze_units::{
     query::{BuildConfig, PackagePlan, Units},
     schema::{Mode, Unit},
@@ -51,10 +54,7 @@ use blaze_units::{
 };
 use cfg::{CfgAtom, CfgOptions};
 use hir_expand::proc_macro::{CrateProcMacros, ProcMacros};
-use rustc_hash::{FxHashMap, FxHashSet};
-use blaze_query::db::{Database as _, Durability, Setter};
 use triomphe::Arc;
-use base_db::FileSetConfig;
 
 pub use base_db::{Db, ProcMacroLoadingError};
 pub use hir_expand::proc_macro::{ProcMacro, ProcMacroLoadResult};
@@ -131,10 +131,10 @@ pub struct Lowered {
     /// place when no task does.
     paths: std::sync::Arc<HashMap<FileId, String>>,
     /// Each crate's identity worked out since the last write ([`Lowered::identity`]).
-    identities: FxHashMap<Crate, ContentId>,
+    identities: blaze_hash::HashMap<Crate, ContentId>,
     /// Each root (an alias) [`Lowered::append_roots`] made since the last [`Lowered::refresh`],
     /// with the unit it was first made for and the content ID of the module it was given.
-    appended: FxHashMap<FileId, (usize, ContentId)>,
+    appended: blaze_hash::HashMap<FileId, (usize, ContentId)>,
     /// Each directory read into the front end, as [`Lowered::refresh`] reads it again.
     loads: Vec<Load>,
     /// The root of the view its files were read from.
@@ -220,7 +220,7 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
             units.plans.len()
         )));
     }
-    let packages: FxHashMap<&str, &PackagePlan> =
+    let packages: blaze_hash::HashMap<&str, &PackagePlan> =
         units.packages.iter().map(|it| (it.id.as_str(), it)).collect();
     let package_of = |unit: &Unit| {
         packages.get(unit.pkg_id.as_str()).copied().ok_or_else(|| {
@@ -234,20 +234,20 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
     for unit in &units.graph.units {
         whats.push(crates::describe(package_of(unit)?, unit));
     }
-    let package_index: FxHashMap<&str, usize> =
+    let package_index: blaze_hash::HashMap<&str, usize> =
         units.packages.iter().enumerate().map(|(index, it)| (it.id.as_str(), index)).collect();
     let mut const_plan = const_macros::plan(units, &package_index, &whats)?;
 
     // One source root per package with a unit, in the order of `units.packages`, but one for
     // every package of the standard library; each directory read is one root's, the innermost
     // when one is in another's.
-    let mut used: FxHashMap<&str, bool> = FxHashMap::default();
+    let mut used: blaze_hash::HashMap<&str, bool> = blaze_hash::HashMap::default();
     for unit in &units.graph.units {
         *used.entry(unit.pkg_id.as_str()).or_default() |= unit.is_std;
     }
     let mut library: Vec<bool> = Vec::new();
-    let mut set_of: FxHashMap<&str, usize> = FxHashMap::default();
-    let mut loads: FxHashMap<String, usize> = FxHashMap::default();
+    let mut set_of: blaze_hash::HashMap<&str, usize> = blaze_hash::HashMap::default();
+    let mut loads: blaze_hash::HashMap<String, usize> = blaze_hash::HashMap::default();
     let mut std_set = None;
     for package in &units.packages {
         let Some(&is_std) = used.get(package.id.as_str()) else { continue };
@@ -274,7 +274,7 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
         library.push(true);
         library.len() - 1
     });
-    let mut excluded: FxHashSet<String> = FxHashSet::default();
+    let mut excluded: HashSet<String> = HashSet::default();
     excluded.insert(units.target_dir.clone());
     excluded.insert(units.build_dir.clone());
     for (index, unit) in units.graph.units.iter().enumerate() {
@@ -320,7 +320,7 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
     }
     let other = SourceRootId(library.len() as u32);
     db.set_source_root_with_durability(other, Arc::new(SourceRoot::new_local(FileSet::default())), Durability::LOW);
-    let roots = |library_too: bool| -> FxHashSet<SourceRootId> {
+    let roots = |library_too: bool| -> HashSet<SourceRootId> {
         (0..=library.len())
             .filter(|&it| library.get(it).copied().unwrap_or(false) == library_too)
             .map(|it| SourceRootId(it as u32))
@@ -396,7 +396,7 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
     let order = crates::topological(units, &whats, &const_plan.after)?;
     let mut all = Vec::with_capacity(order.len());
     // alloc: once a lowering, the crates made by their root file, for the units after to share.
-    let mut made: FxHashMap<FileId, Vec<Made>> = FxHashMap::default();
+    let mut made: blaze_hash::HashMap<FileId, Vec<Made>> = blaze_hash::HashMap::default();
     let mut const_listed = Vec::new();
     let mut const_made = Vec::new();
     for index in order {
@@ -553,7 +553,7 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
     }
     base_db::set_all_crates_with_durability(&mut db, all, Durability::MEDIUM);
 
-    let not_built: FxHashMap<Crate, Arc<CrateProcMacros>> = lowerings
+    let not_built: blaze_hash::HashMap<Crate, Arc<CrateProcMacros>> = lowerings
         .iter()
         .filter(|it| it.proc_macro)
         .filter_map(|it| it.krate)
@@ -572,8 +572,8 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
         applied: (0..unit_count).map(|_| Vec::new()).collect(),
         crates: std::sync::Arc::new(Crates { units: lowerings, sets: library.len() }),
         paths: std::sync::Arc::new(paths),
-        identities: FxHashMap::default(),
-        appended: FxHashMap::default(),
+        identities: blaze_hash::HashMap::default(),
+        appended: blaze_hash::HashMap::default(),
         loads: read,
         view: root,
         workspace_root,
@@ -865,7 +865,7 @@ const IDENTITY: &str = "blaze v2 cargo unit identity 3";
 
 /// [`Lowered::identity`] of `krate`, each crate of its closure worked out once into `known`,
 /// dependencies first, with a stack of its own rather than the thread's.
-fn identity_of(db: &Db, krate: Crate, known: &mut FxHashMap<Crate, ContentId>) -> ContentId {
+fn identity_of(db: &Db, krate: Crate, known: &mut blaze_hash::HashMap<Crate, ContentId>) -> ContentId {
     if let Some(identity) = known.get(&krate) {
         return *identity;
     }

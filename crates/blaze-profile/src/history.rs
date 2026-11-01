@@ -37,7 +37,10 @@ use parquet::{
 use crate::{
     batches::{self, Process},
     clock,
+    errors::{self, ErrorRow},
+    facts::{self, CrateDepRow, LinkRow},
     flight::{self, Cursor, Read, SpanRow},
+    identity,
     sampler::{self, Sample},
     schema::{self, Column, Table, Type},
     symbols,
@@ -102,6 +105,11 @@ pub struct BuildRow {
     pub hits: Option<u64>,
     pub misses: Option<u64>,
     pub joined: Option<u64>,
+    /// [`identity::tree_digest`] of `workspace`: given by [`History::build_ended`] when `None`
+    /// and `workspace` is a directory.
+    pub tree: Option<String>,
+    /// [`identity::binary`]: given by [`History::build_ended`] when `None`.
+    pub blaze: Option<String>,
 }
 
 /// What a flush wrote.
@@ -114,6 +122,9 @@ pub struct Flushed {
     pub builds: usize,
     pub samples: usize,
     pub switches: usize,
+    pub errors: usize,
+    pub links: usize,
+    pub crate_deps: usize,
     pub files: u32,
     pub bytes: u64,
     /// Rows the rings wrote over before this flush read them, CPU samples included.
@@ -127,6 +138,8 @@ pub enum HistoryError {
     Io { path: PathBuf, doing: &'static str, error: io::Error },
     Parquet { path: PathBuf, table: &'static str, error: ParquetError },
     Arrow { table: &'static str, error: ArrowError },
+    /// What a build was of could not be told: its tree's digest, or blaze's own hash.
+    Identity { what: &'static str, path: PathBuf, error: io::Error },
 }
 
 impl fmt::Display for HistoryError {
@@ -141,6 +154,9 @@ impl fmt::Display for HistoryError {
             HistoryError::Arrow { table, error } => {
                 write!(f, "the profile history: making the {table} table's rows: {error}")
             }
+            HistoryError::Identity { what, path, error } => {
+                write!(f, "the profile history: {what} {}: {error}", path.display())
+            }
         }
     }
 }
@@ -151,6 +167,7 @@ impl std::error::Error for HistoryError {
             HistoryError::Io { error, .. } => Some(error),
             HistoryError::Parquet { error, .. } => Some(error),
             HistoryError::Arrow { error, .. } => Some(error),
+            HistoryError::Identity { error, .. } => Some(error),
         }
     }
 }
@@ -283,6 +300,8 @@ pub fn builds(rows: &[BuildRow]) -> Result<RecordBatch, ArrowError> {
         column(UInt64Array::from_iter(rows.iter().map(|it| it.hits))),
         column(UInt64Array::from_iter(rows.iter().map(|it| it.misses))),
         column(UInt64Array::from_iter(rows.iter().map(|it| it.joined))),
+        column(StringArray::from_iter(rows.iter().map(|it| it.tree.as_deref()))),
+        column(StringArray::from_iter(rows.iter().map(|it| it.blaze.as_deref()))),
     ];
     RecordBatch::try_new(batches::schema_of(&schema::BUILDS), columns)
 }
@@ -317,6 +336,11 @@ pub struct History {
     seq: u64,
     /// Builds that ended since the last flush: written by the next.
     ended: Vec<BuildRow>,
+    /// Errors builds said since the last flush: written by the next.
+    errors: Vec<ErrorRow>,
+    /// Images builds linked, and the crate graphs they built, since the last flush.
+    links: Vec<LinkRow>,
+    crate_deps: Vec<CrateDepRow>,
     /// The files written, oldest first, and their bytes all told.
     kept: VecDeque<Kept>,
     total: u64,
@@ -325,6 +349,11 @@ pub struct History {
     /// The CPU sampler's samples taken so far, and a flush's new ones.
     sampled: u64,
     samples: Vec<Sample>,
+    /// [`identity::binary`], once a history: every build of this process ran it.
+    blaze: String,
+    /// A build's identity that could not be told since the last flush: the next flush writes
+    /// its row without it, then answers this.
+    unidentified: Option<HistoryError>,
 }
 
 impl History {
@@ -355,6 +384,11 @@ impl History {
         let total = kept.iter().map(|it| it.bytes).sum();
         let mut writer = Writer::new();
         writer.schemas(dir)?;
+        let blaze = identity::binary().map_err(|error| HistoryError::Identity {
+            what: "hashing blaze's own executable",
+            path: std::env::current_exe().unwrap_or_default(),
+            error,
+        })?;
         let mut history = History {
             // alloc: once a history
             dir: dir.to_owned(),
@@ -368,12 +402,20 @@ impl History {
             seq,
             // alloc: once a history
             ended: Vec::new(),
+            // alloc: once a history
+            errors: Vec::new(),
+            // alloc: once a history
+            links: Vec::new(),
+            // alloc: once a history
+            crate_deps: Vec::new(),
             kept: kept.into(),
             total,
             last_build,
             sampled: 0,
             // alloc: once a history
             samples: Vec::new(),
+            blaze,
+            unidentified: None,
         };
         history.trim()?;
         Ok(history)
@@ -392,8 +434,44 @@ impl History {
 
     /// Notes a build that ended, for the next flush to write; the flush for its build
     /// ([`History::flush`] with `Some(row.build_id)`) also gives its spans the build's commit.
-    pub fn build_ended(&mut self, row: BuildRow) {
+    /// The row's `blaze` and `tree` are told here when not given: on the history's thread, never
+    /// the build's. A tree that can't be digested leaves `tree` null, and the next flush answers
+    /// why.
+    pub fn build_ended(&mut self, mut row: BuildRow) {
+        if row.blaze.is_none() {
+            // clone: a hash, once a build
+            row.blaze = Some(self.blaze.clone());
+        }
+        let workspace = Path::new(&row.workspace);
+        if row.tree.is_none() && workspace.is_dir() {
+            match identity::tree_digest(workspace) {
+                Ok(tree) => row.tree = Some(tree),
+                Err(error) => {
+                    self.unidentified = Some(HistoryError::Identity {
+                        what: "digesting the source tree of the build's workspace",
+                        // alloc: an error
+                        path: workspace.to_owned(),
+                        error,
+                    });
+                }
+            }
+        }
         self.ended.push(row);
+    }
+
+    /// Notes errors a build said ([`errors::rows`]), for the next flush to write.
+    pub fn errored(&mut self, rows: impl IntoIterator<Item = ErrorRow>) {
+        self.errors.extend(rows);
+    }
+
+    /// Notes the images a build linked and how, for the next flush to write.
+    pub fn linked(&mut self, rows: impl IntoIterator<Item = LinkRow>) {
+        self.links.extend(rows);
+    }
+
+    /// Notes the crate graph a build built, one row an edge, for the next flush to write.
+    pub fn crate_graph(&mut self, rows: impl IntoIterator<Item = CrateDepRow>) {
+        self.crate_deps.extend(rows);
     }
 
     /// Writes what the rings hold that is new since the last flush, and the builds that ended
@@ -428,6 +506,9 @@ impl History {
         let counters =
             [batches::counters(&self.read.counters, self.process).map_err(arrow_error(&schema::COUNTERS))?];
         let builds = [builds(&self.ended).map_err(arrow_error(&schema::BUILDS))?];
+        let errors = [errors::batch(&self.errors).map_err(arrow_error(&schema::ERRORS))?];
+        let links = [facts::links(&self.links).map_err(arrow_error(&schema::LINKS))?];
+        let crate_deps = [facts::crate_deps(&self.crate_deps).map_err(arrow_error(&schema::CRATE_DEPS))?];
         let switches =
             [batches::switches(&self.read.switches, self.process).map_err(arrow_error(&schema::SWITCHES))?];
         self.samples.clear();
@@ -441,17 +522,23 @@ impl History {
             builds: rows(&builds),
             samples: rows(&samples),
             switches: rows(&switches),
+            errors: rows(&errors),
+            links: rows(&links),
+            crate_deps: rows(&crate_deps),
             skipped: self.read.skipped + samples_skipped,
             ..Flushed::default()
         };
         let build = build.unwrap_or(0);
         self.last_build = self.last_build.max(build);
-        let tables: [(&'static Table, &[RecordBatch]); 5] = [
+        let tables: [(&'static Table, &[RecordBatch]); 8] = [
             (&schema::SPANS, &spans),
             (&schema::COUNTERS, &counters),
             (&schema::BUILDS, &builds),
             (&schema::SAMPLES, &samples),
             (&schema::SWITCHES, &switches),
+            (&schema::ERRORS, &errors),
+            (&schema::LINKS, &links),
+            (&schema::CRATE_DEPS, &crate_deps),
         ];
         for (table, parts) in tables {
             if rows(parts) == 0 {
@@ -466,8 +553,14 @@ impl History {
             flushed.bytes += bytes;
         }
         self.ended.clear();
+        self.errors.clear();
+        self.links.clear();
+        self.crate_deps.clear();
         flushed.deleted = self.trim()?;
-        Ok(flushed)
+        match self.unidentified.take() {
+            Some(error) => Err(error),
+            None => Ok(flushed),
+        }
     }
 
     /// The flush's CPU samples as a `samples` batch, their frames named.
@@ -584,6 +677,8 @@ mod tests {
             hits: Some(10),
             misses: Some(2),
             joined: None,
+            tree: Some("7".repeat(64)),
+            blaze: Some("b".repeat(64)),
         }
     }
 
@@ -605,6 +700,8 @@ mod tests {
             krate: 0,
             function: 0,
             unit: 0,
+            awaits: 0,
+            owner: (i % 4 == 0).then_some(i),
         };
         let spans: Vec<SpanRow> = (0..40).map(span).collect();
         let process = Process { pid: 9, name: "blaze test", commit: Some("abc") };
@@ -616,6 +713,7 @@ mod tests {
                 t_ns: i as i64,
                 value: i as u64 * 3,
                 fiber: None,
+                query_kind: 0,
             })
             .collect();
         let counters = batches::counters(&counters, process).unwrap();
@@ -637,6 +735,68 @@ mod tests {
         let names = outcome.values().as_string::<i32>();
         assert_eq!(names.value(outcome.keys().value(1) as usize), "stalled");
         assert!(fs::read_dir(&dir).unwrap().all(|it| !it.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+    }
+
+    #[test]
+    fn a_builds_row_names_the_tree_it_built_and_the_blaze_that_ran_it() {
+        let dir = scratch("identity");
+        let workspace = dir.join("work");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let mut history = History::open(&dir.join("profile"), CAP_BYTES).unwrap();
+        let built = |history: &mut History, build_id| {
+            let row = BuildRow {
+                workspace: workspace.to_str().unwrap().into(),
+                tree: None,
+                blaze: None,
+                ..row(build_id, Outcome::Ok)
+            };
+            history.build_ended(row);
+            let flushed = history.flush(Some(build_id)).unwrap();
+            let read = read_back(&dir.join(format!("profile/{build_id}-{:08}.builds.parquet", flushed.seq)));
+            let string = |name: &str| {
+                read[0].column(schema::BUILDS.column(name).unwrap()).as_string::<i32>().value(0).to_owned()
+            };
+            (string("tree"), string("blaze"))
+        };
+        let (tree, blaze) = built(&mut history, 51);
+        assert_eq!(tree, identity::tree_digest(&workspace).unwrap());
+        assert_eq!(blaze, identity::binary().unwrap());
+
+        fs::write(workspace.join("src/main.rs"), "fn main() { }\n").unwrap();
+        let (edited, same_blaze) = built(&mut history, 52);
+        assert_ne!(edited, tree, "a build of an edited tree names another tree");
+        assert_eq!(same_blaze, blaze);
+        _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_images_a_build_linked_and_its_crate_graph_are_written_at_the_next_flush() {
+        use crate::facts::{CrateDepRow, DepKind, LinkOutcome, LinkRow};
+        let dir = scratch("facts");
+        let mut history = History::open(&dir, CAP_BYTES).unwrap();
+        history.linked([LinkRow {
+            build_id: 61,
+            image: "app (bin)".into(),
+            krate: Some("app".into()),
+            outcome: LinkOutcome::Patched,
+            dur_ns: Some(7),
+        }]);
+        history.crate_graph([
+            CrateDepRow { build_id: 61, krate: "app".into(), dep: "serde".into(), kind: DepKind::Normal },
+            CrateDepRow { build_id: 61, krate: "app".into(), dep: "cc".into(), kind: DepKind::Build },
+        ]);
+        let flushed = history.flush(Some(61)).unwrap();
+        assert_eq!((flushed.links, flushed.crate_deps), (1, 2));
+        let links = read_back(&dir.join(format!("61-{:08}.links.parquet", flushed.seq)));
+        let image = links[0].column(schema::LINKS.column("image").unwrap()).as_string::<i32>().value(0);
+        assert_eq!(image, "app (bin)");
+        let deps = read_back(&dir.join(format!("61-{:08}.crate_deps.parquet", flushed.seq)));
+        assert_eq!(deps.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+
+        let again = history.flush(Some(62)).unwrap();
+        assert_eq!((again.links, again.crate_deps), (0, 0), "a flush writes each row once");
+        _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -734,6 +894,8 @@ mod tests {
                 krate: 0,
                 function: functions[(i % 1000) as usize],
                 unit: 0,
+                awaits: 0,
+                owner: None,
             })
             .collect();
         let dir = scratch("cost");

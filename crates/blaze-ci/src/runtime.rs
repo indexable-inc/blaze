@@ -26,14 +26,15 @@ use std::{
     io::Write,
     net::TcpListener,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError, mpsc},
+    sync::Arc,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use blaze_api::{ApiError, Request, Response, ViewRef, client::Client};
+use blaze_hash::HashMap;
 use blaze_vfs::{Op, View};
-use rustc_hash::FxHashMap;
+use parking_lot::Mutex;
 
 use crate::{
     CheckRun,
@@ -62,8 +63,8 @@ pub(crate) struct Shared {
     pub(crate) socket: PathBuf,
     pub(crate) git: Mutex<Git>,
     pub(crate) github: Arc<Mutex<GitHub>>,
-    pub(crate) pins: mpsc::Sender<pins::Command>,
-    pub(crate) service: mpsc::Sender<Input>,
+    pub(crate) pins: crossbeam_channel::Sender<pins::Command>,
+    pub(crate) service: crossbeam_channel::Sender<Input>,
 }
 
 /// Runs the service until it can't: returns only with why it stopped.
@@ -83,11 +84,11 @@ pub fn serve(config: &Config) -> Result<Infallible, String> {
         // alloc: error path
         .map_err(|error| format!("the webhook could not listen on {}: {error}", config.webhook.listen))?;
 
-    let (to_service, inputs) = mpsc::channel();
-    let (to_pins, pin_commands) = mpsc::channel();
+    let (to_service, inputs) = crossbeam_channel::unbounded();
+    let (to_pins, pin_commands) = crossbeam_channel::unbounded();
     let mut lanes = Vec::with_capacity(POST_LANES);
     for lane in 0..POST_LANES {
-        let (to_lane, posts) = mpsc::channel();
+        let (to_lane, posts) = crossbeam_channel::unbounded();
         // alloc: clone: a lane's client and sender, once at start
         let (client, service) = (Arc::new(Mutex::new(github.lane())), to_service.clone());
         thread::Builder::new()
@@ -135,7 +136,7 @@ pub fn serve(config: &Config) -> Result<Infallible, String> {
 
     let mut out = Vec::new(); // alloc: once, at start, the outputs reused for every step
     let mut service = Service::new(Settings::of(config), state, &mut out);
-    let mut workers = FxHashMap::default();
+    let mut workers = HashMap::default();
     loop {
         let mut changed = false;
         for output in out.drain(..) {
@@ -180,7 +181,7 @@ pub(crate) const POST_LANES: usize = 8;
 /// The GitHub lanes, each a thread running [`post`] on a connection of its own. A run's posts
 /// all go to one lane, so they are sent in order and a superseded update is still dropped.
 pub(crate) struct Posts {
-    pub(crate) lanes: Vec<mpsc::Sender<Post>>,
+    pub(crate) lanes: Vec<crossbeam_channel::Sender<Post>>,
 }
 
 impl Posts {
@@ -195,7 +196,7 @@ fn dispatch(
     config: &Config,
     shared: &Arc<Shared>,
     to_github: &Posts,
-    workers: &mut FxHashMap<JobId, mpsc::Sender<worker::Command>>,
+    workers: &mut HashMap<JobId, crossbeam_channel::Sender<worker::Command>>,
     changed: &mut bool,
     output: Output,
 ) {
@@ -294,12 +295,12 @@ fn take_snapshot(socket: &Path, config: &SnapshotConfig, name: &str) -> Result<s
 /// while its creation is answered, costs one request, not three.
 pub(crate) fn post(
     github: Arc<Mutex<impl Checks>>,
-    posts: mpsc::Receiver<Post>,
-    service: mpsc::Sender<Input>,
+    posts: crossbeam_channel::Receiver<Post>,
+    service: crossbeam_channel::Sender<Input>,
     backoff: Duration,
 ) {
     let mut waiting: Vec<Post> = Vec::new(); // alloc: once per lane, reused for every post
-    let mut last: FxHashMap<u64, usize> = FxHashMap::default();
+    let mut last: HashMap<u64, usize> = HashMap::default();
     while let Ok(first) = posts.recv() {
         waiting.push(first);
         waiting.extend(posts.try_iter());
@@ -321,10 +322,15 @@ pub(crate) fn post(
 }
 
 /// One post, retried; a creation's id goes back to the service.
-fn send(github: &Mutex<impl Checks>, post: Post, service: &mpsc::Sender<Input>, backoff: Duration) {
+fn send(
+    github: &Mutex<impl Checks>,
+    post: Post,
+    service: &crossbeam_channel::Sender<Input>,
+    backoff: Duration,
+) {
     match post {
         Post::Create { run, check } => {
-            let result = retry(backoff, || github.lock().unwrap_or_else(PoisonError::into_inner).create(&check));
+            let result = retry(backoff, || github.lock().create(&check));
             let result = result.map_err(|error| {
                 let what = format!( // alloc: error path
                     "creating check run {} on {} failed {} times: {error}",
@@ -338,7 +344,7 @@ fn send(github: &Mutex<impl Checks>, post: Post, service: &mpsc::Sender<Input>, 
             let _ = service.send(Input::Created { run, result });
         }
         Post::Update { run, id, check } => {
-            let result = retry(backoff, || github.lock().unwrap_or_else(PoisonError::into_inner).update(id, &check));
+            let result = retry(backoff, || github.lock().update(id, &check));
             if let Err(error) = result {
                 log(&format!( // alloc: error path
                     "updating check run {} ({id}, run {}) on {} to {:?} failed {} times: {error}",
@@ -354,17 +360,19 @@ fn send(github: &Mutex<impl Checks>, post: Post, service: &mpsc::Sender<Input>, 
 }
 
 fn retry<T>(backoff: Duration, mut attempt: impl FnMut() -> Result<T, GitHubError>) -> Result<T, GitHubError> {
-    let mut wait = backoff;
-    for _ in 0..GITHUB_RETRIES {
+    for tried in 0..GITHUB_RETRIES {
         match attempt() {
             Ok(it) => return Ok(it),
-            Err(_) => {
-                thread::sleep(wait);
-                wait *= 2;
-            }
+            // GitHub's answer says nothing of when a retry would pass.
+            Err(_) => crate::hold(waited(backoff, tried)),
         }
     }
     attempt()
+}
+
+/// The wait after failed try `tried` (from 0) of a post: `backoff`, doubled each time.
+pub(crate) fn waited(backoff: Duration, tried: u32) -> Duration {
+    backoff.saturating_mul(1 << tried)
 }
 
 /// `ops` cut into requests of at most `most` bytes each, in order; always at least one, maybe

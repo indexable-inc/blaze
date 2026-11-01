@@ -5,10 +5,15 @@
 //! drop impl, a constant's or static's value) changes one.
 
 use base_db::Db;
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher};
 use blaze_item_hash::identity::identity;
 use blaze_items::{ItemId, item_key};
-use hir_def::{DefWithBodyId, StaticId, signatures::{StaticFlags, StaticSignature}};
+use blaze_query::db::FromId;
+use hir_def::{
+    DefWithBodyId, StaticId,
+    signatures::{StaticFlags, StaticSignature},
+};
 use hir_ty::{
     InferBodyId, MemoryMap, ParamEnvAndCrate,
     db::{ClosureKey, HirDatabase, InternedClosure, InternedClosureId, InternedCoroutineId},
@@ -20,8 +25,6 @@ use hir_ty::{
 };
 use hir_ty_mir::mir::{MirBody, Operand, OperandKind};
 use hir_ty_share::identity as share;
-use rustc_hash::{FxHashMap, FxHashSet};
-use blaze_query::db::FromId;
 
 use crate::{
     models::tag,
@@ -41,7 +44,7 @@ pub(crate) fn of(
     env: &StoredParamEnvAndCrate,
     order: &[Instance],
     callees: &[&[Instance]],
-    index: &FxHashMap<Instance, u32>,
+    index: &HashMap<Instance, u32>,
 ) -> Result<ContentId, String> {
     let mut h = Hasher::new(DOMAIN);
     h.update(&(order.len() as u32).to_le_bytes());
@@ -104,8 +107,8 @@ pub(crate) fn content(
         infcx,
         env,
         h,
-        tys: FxHashSet::default(),
-        statics: FxHashSet::default(),
+        tys: HashSet::default(),
+        statics: HashSet::default(),
     };
     facts.body(body)?;
     Ok(facts.h.finish())
@@ -134,8 +137,8 @@ struct Facts<'db> {
     infcx: InferCtxt<'db>,
     env: ParamEnvAndCrate<'db>,
     h: Hasher,
-    tys: FxHashSet<Ty<'db>>,
-    statics: FxHashSet<StaticId>,
+    tys: HashSet<Ty<'db>>,
+    statics: HashSet<StaticId>,
 }
 
 impl<'db> Facts<'db> {

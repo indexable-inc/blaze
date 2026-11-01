@@ -17,7 +17,7 @@
 //! A thread holds bytes of one cap at a time: [`set_cap`] takes effect on a thread once its
 //! frames hold none of the cap before.
 
-use std::{cell::Cell, fmt, marker::PhantomData, ptr, sync::mpsc};
+use std::{cell::Cell, fmt, marker::PhantomData, ptr};
 
 use crate::sync::{
     Condvar, Mutex, MutexGuard, PoisonError,
@@ -36,7 +36,7 @@ pub struct Cap(&'static Shared);
 
 /// What a [`Cap`] says each time what it holds passes `spill_at`: the bytes over it, for a
 /// spiller that moves cold values out of memory. The reserve that passed it only sends.
-pub struct Spills(mpsc::Receiver<u64>);
+pub struct Spills(crossbeam_channel::Receiver<u64>);
 
 impl Spills {
     /// The next pass of `spill_at`, waiting for it.
@@ -50,6 +50,13 @@ impl Spills {
     }
 }
 
+#[cfg_attr(
+    not(blaze_check),
+    expect(
+        clippy::disallowed_types,
+        reason = "std's `Mutex` and `Condvar` for the backstop's wait (a reserve past `limit` blocks until bytes are given back), a cold lock inside the allocator (brief-locks.md's exception): parking_lot's parking table would allocate from within an allocation; holding threads reserve and give back with atomics"
+    )
+)]
 struct Shared {
     limit: u64,
     spill_at: u64,
@@ -58,7 +65,7 @@ struct Shared {
     above: AtomicBool,
     /// Reserves registered as waiting, so a give-back knows to wake them.
     waiting: AtomicU64,
-    spills: mpsc::Sender<u64>,
+    spills: crossbeam_channel::Sender<u64>,
     state: Mutex<State>,
     changed: Condvar,
 }
@@ -80,12 +87,18 @@ struct Waiter {
 }
 
 /// Why a reserve was refused.
+#[derive(Clone, Copy)]
 pub(crate) enum Refused {
     /// Every holder waited and this wait was the newest.
     Cancelled,
     /// More than the whole limit: no wait would end.
     TooBig { limit: u64 },
 }
+
+// Under the model checker each model thread has its own: model threads share an OS thread,
+// whose `std` value would carry what one execution's thread held into the next's.
+#[cfg(blaze_check)]
+use blaze_check::thread_local;
 
 thread_local! {
     /// The cap the calling thread holds bytes of, and how many.
@@ -100,7 +113,7 @@ static INSTALLED: std::sync::atomic::AtomicPtr<Shared> =
 impl Cap {
     /// A cap of `limit` bytes, and what hears each time it passes `spill_at`.
     pub fn new(limit: u64, spill_at: u64) -> (Cap, Spills) {
-        let (spills, heard) = mpsc::channel();
+        let (spills, heard) = crossbeam_channel::unbounded();
         let state = State {
             holders: 0,
             // alloc: once per cap, room for the waiters of a machine's workers
@@ -108,6 +121,13 @@ impl Cap {
             next_wait: 0,
         };
         // alloc: once per cap; it lives as long as the process, since a thread's holding names it
+        #[cfg_attr(
+            not(blaze_check),
+            expect(
+                clippy::disallowed_types,
+                reason = "`Shared::state` and `changed`: a cold lock inside the allocator (brief-locks.md's exception): parking_lot's parking table would allocate from within an allocation"
+            )
+        )]
         let shared: &'static Shared = Box::leak(Box::new(Shared {
             limit,
             spill_at,
@@ -237,6 +257,13 @@ pub(crate) fn frame_release(bytes: usize) {
 }
 
 impl Shared {
+    #[cfg_attr(
+        not(blaze_check),
+        expect(
+            clippy::disallowed_types,
+            reason = "the guard of `Shared::state`: a cold lock inside the allocator (brief-locks.md's exception): parking_lot's parking table would allocate from within an allocation"
+        )
+    )]
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }

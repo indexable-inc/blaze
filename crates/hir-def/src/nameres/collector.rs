@@ -10,7 +10,8 @@ use std::{
     ops::Range,
 };
 
-use base_db::{Db, BuiltDependency, Crate, CrateOrigin, LangCrateOrigin};
+use base_db::{BuiltDependency, Crate, CrateOrigin, Db, LangCrateOrigin};
+use blaze_hash::{HashMap, HashSet};
 use blaze_mem::Tag;
 use cfg::{CfgAtom, CfgExpr, CfgOptions};
 use either::Either;
@@ -26,7 +27,6 @@ use hir_expand::{
 use intern::{Symbol, sym};
 use itertools::izip;
 use la_arena::Idx;
-use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use span::{Edition, FileAstId, ROOT_ERASED_FILE_AST_ID, SyntaxContext};
 use stdx::always;
@@ -34,12 +34,11 @@ use syntax::ast;
 use triomphe::Arc;
 
 use crate::{
-    AdtId, AstId, AstIdWithPath, BuiltinDeriveImplId, BuiltinDeriveImplLoc, ConstLoc,
-    EnumLoc, ExternBlockLoc, ExternCrateId, ExternCrateLoc, FunctionId, FunctionLoc, FxIndexMap,
-    ImplLoc, Intern, ItemContainerId, Lookup, Macro2Id, Macro2Loc, MacroExpander, MacroId,
-    MacroRulesId, MacroRulesLoc, MacroRulesLocFlags, ModuleDefId, ModuleId, ProcMacroId,
-    ProcMacroLoc, StaticLoc, StructLoc, TraitLoc, TypeAliasLoc, UnionLoc, UnresolvedMacro, UseId,
-    UseLoc, file_item_tree,
+    AdtId, AstId, AstIdWithPath, BuiltinDeriveImplId, BuiltinDeriveImplLoc, ConstLoc, EnumLoc,
+    ExternBlockLoc, ExternCrateId, ExternCrateLoc, FunctionId, FunctionLoc, FxIndexMap, ImplLoc,
+    Intern, ItemContainerId, Lookup, Macro2Id, Macro2Loc, MacroExpander, MacroId, MacroRulesId,
+    MacroRulesLoc, MacroRulesLocFlags, ModuleDefId, ModuleId, ProcMacroId, ProcMacroLoc, StaticLoc,
+    StructLoc, TraitLoc, TypeAliasLoc, UnionLoc, UnresolvedMacro, UseId, UseLoc, file_item_tree,
     item_scope::{
         GlobAmbiguity, GlobId, ImportId, ImportOrExternCrate, ImportOrGlob, ItemInNs,
         PerNsGlobImports, UnderscoreImport,
@@ -115,7 +114,7 @@ pub(super) fn collect_defs(
         unresolved_macros: Vec::new(), // alloc: empty
         expand_eager_with_unresolved_args: false,
         deferred_eager_call: false,
-        mod_dirs: FxHashMap::default(),
+        mod_dirs: HashMap::default(),
         cfg_options,
         proc_macros,
         from_glob_import: Default::default(),
@@ -317,7 +316,7 @@ struct Imports<'db> {
     indeterminate: Vec<(u32, PerNs)>,
     /// Plain imports by the module and the name they bind, in index order: head and tail of a
     /// list linked through `next_named`.
-    named: FxHashMap<(ModuleId, Name), (u32, u32)>,
+    named: HashMap<(ModuleId, Name), (u32, u32)>,
     next_named: Vec<u32>,
     phase: Phase,
     pending_unresolved: BinaryHeap<Reverse<u32>>,
@@ -325,7 +324,7 @@ struct Imports<'db> {
     pending_indeterminate: BinaryHeap<Reverse<u32>>,
     deferred_indeterminate: Vec<u32>,
     /// Head of each key's list of waiting imports in `edges`.
-    waits: FxHashMap<WaitOn, u32>,
+    waits: HashMap<WaitOn, u32>,
     edges: Vec<WaitEdge>,
     /// Head of the edges unlinked from every key, reused before `edges` grows.
     free_edge: u32,
@@ -351,14 +350,14 @@ impl<'db> Imports<'db> {
             queued: Vec::new(),
             seq: Vec::new(),
             indeterminate: Vec::new(),
-            named: FxHashMap::default(),
+            named: HashMap::default(),
             next_named: Vec::new(),
             phase: Phase::Idle,
             pending_unresolved: BinaryHeap::new(),
             deferred_unresolved: Vec::new(),
             pending_indeterminate: BinaryHeap::new(),
             deferred_indeterminate: Vec::new(),
-            waits: FxHashMap::default(),
+            waits: HashMap::default(),
             edges: Vec::new(),
             free_edge: NONE,
             any_waiters: Vec::new(),
@@ -637,17 +636,17 @@ struct ImporterEdge<K, T> {
 struct ImporterLists<K, T> {
     edges: Vec<ImporterEdge<K, T>>,
     /// Head and tail of each source's list.
-    heads: FxHashMap<K, (u32, u32)>,
+    heads: HashMap<K, (u32, u32)>,
     /// The edge of each `(source, importer)`.
-    by_pair: FxHashMap<(K, K), u32>,
+    by_pair: HashMap<(K, K), u32>,
 }
 
 impl<K: Copy + Eq + std::hash::Hash, T: Copy> ImporterLists<K, T> {
     fn new() -> Self {
         ImporterLists {
             edges: Vec::new(), // alloc: empty
-            heads: FxHashMap::default(),
-            by_pair: FxHashMap::default(),
+            heads: HashMap::default(),
+            by_pair: HashMap::default(),
         }
     }
 
@@ -778,8 +777,8 @@ struct DefCollector<'db> {
     // We'd like to avoid emitting a diagnostics avalanche when some `extern crate` doesn't
     // resolve. When we emit diagnostics for unresolved imports, we only do so if the import
     // doesn't start with an unresolved crate's name.
-    unresolved_extern_crates: FxHashSet<Name>,
-    mod_dirs: FxHashMap<ModuleId, ModDir>,
+    unresolved_extern_crates: HashSet<Name>,
+    mod_dirs: HashMap<ModuleId, ModDir>,
     cfg_options: &'db CfgOptions,
     /// List of procedural macros defined by this crate. This is read from the dynamic library
     /// built by the build system, and is the list of proc-macros we can actually expand. It is
@@ -795,16 +794,16 @@ struct DefCollector<'db> {
     /// This also stores the attributes to skip when we resolve derive helpers and non-macro
     /// non-builtin attributes in general.
     // FIXME: There has to be a better way to do this
-    skip_attrs: FxHashMap<InFile<ModItemId>, AttrId>,
+    skip_attrs: HashMap<InFile<ModItemId>, AttrId>,
     /// When we expand attributes, we need to censor all previous active attributes
     /// on the same item. Therefore, this holds all active attributes that we already
     /// expanded.
-    prev_active_attrs: FxHashMap<AstId<ast::Item>, SmallVec<[AttrId; 1]>>,
+    prev_active_attrs: HashMap<AstId<ast::Item>, SmallVec<[AttrId; 1]>>,
     /// To save memory, we do not really expand builtin derives. Instead, we save them as a `BuiltinDeriveImplId`.
     ///
     /// However, we can only do that when the derive is directly above the item, and there is no attribute in between.
     /// Otherwise, all sorts of weird things can happen, like the item name resolving to something else.
-    deferred_builtin_derives: FxHashMap<AstId<ast::Item>, Vec<DeferredBuiltinDerive>>,
+    deferred_builtin_derives: HashMap<AstId<ast::Item>, Vec<DeferredBuiltinDerive>>,
     /// Each macro path that resolved, in the order it did.
     resolved_macro_paths: Vec<ResolvedMacroPath>,
     derive_helper_uses: Vec<DeriveHelperUse>,
@@ -2633,7 +2632,7 @@ impl<'db> DefCollector<'db> {
                         // because proc macros are disabled, or building the
                         // proc macro crate failed), report this and skip
                         // expansion like we would if it was disabled
-                        if let Some(err) = exp.as_expand_error(def.krate) {
+                        if let Some(err) = exp.as_expand_error(self.db, def.krate) {
                             self.def_map.diagnostics.push(DefDiagnostic::macro_error(
                                 directive.module_id,
                                 ast_id,
@@ -3010,7 +3009,7 @@ impl<'db> DefCollector<'db> {
                 );
             }
         }
-        let mut seen = FxHashSet::default();
+        let mut seen = HashSet::default();
         uses.retain(|&it| seen.insert(it));
         NameRecords {
             uses: uses.into_boxed_slice(),
@@ -3050,7 +3049,7 @@ impl<'db> ModCollector<'_, 'db> {
         let module_id = self.module_id;
         let consider_deferred_derives =
             |file_id: HirFileId,
-             deferred_derives: &mut FxHashMap<_, Vec<DeferredBuiltinDerive>>,
+             deferred_derives: &mut HashMap<_, Vec<DeferredBuiltinDerive>>,
              ast_id: FileAstId<ast::Adt>,
              id: AdtId,
              def_map: &mut DefMap| {

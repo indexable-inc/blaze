@@ -15,35 +15,36 @@ use std::{convert::Infallible, marker::PhantomData, num::NonZeroU32};
 use blaze_format::{
     ALIGN, FormatError, Part, Record, SchemaHash, Slice, Writer, record_at, schema_of,
 };
-use hir_def::{AdtId, ConstParamId, GenericDefId, LifetimeParamId, TypeOrConstParamId, TypeParamId};
+use blaze_hash::HashMap;
+use hir_def::{
+    AdtId, ConstParamId, GenericDefId, LifetimeParamId, TypeOrConstParamId, TypeParamId,
+};
 use la_arena::{Idx, RawIdx};
 use rustc_abi::{ExternAbi, Size};
 use rustc_ast_ir::{FloatTy, IntTy, Mutability, UintTy};
-use rustc_hash::FxHashMap;
 use rustc_type_ir::{
     Alias, AliasConstKind, BoundConstness, BoundVar, BoundVarIndexKind, ClausePolarity, ConstVid,
-    DebruijnIndex, FloatVid, InferConst, InferTy, IntVid, IsRigid, RegionVid, TyVid,
-    TypeVisitable, UniverseIndex,
-    inherent::IntoKind,
+    DebruijnIndex, FloatVid, InferConst, InferTy, IntVid, IsRigid, RegionVid, TyVid, TypeVisitable,
+    UniverseIndex, inherent::IntoKind,
 };
 use smallvec::SmallVec;
 
 use super::{
-    AdtDef, AliasTermKind, AnonConstIdWrapper, AliasTyKind, Binder, BoundConst, BoundExistentialPredicate,
-    BoundExistentialPredicates, BoundRegion, BoundRegionKind, BoundTy, BoundTyKind, BoundVarKinds,
-    BoundVariableKind, CallableIdWrapper, Clause, ClauseKind, Clauses, ClosureIdWrapper,
-    CoercePredicate, Const, ConstKind, Consts, CoroutineClosureIdWrapper, CoroutineIdWrapper, Ctor,
-    DbInterner, EarlyParamRegion, ErrorGuaranteed, ExistentialPredicate, ExistentialProjection,
-    ExistentialTraitRef, ExprConst, FnHeader, FnSigKind, FreeConstAliasId, FreeTermAliasId,
-    FreeTyAliasId, GenericArg, GenericArgKind, GenericArgs,
-    HostEffectClause, ImplOrTraitAssocConstId, ImplOrTraitAssocTermId, ImplOrTraitAssocTyId,
-    InherentAssocConstId, InherentAssocTermId, InherentAssocTyId, InternedConst, InternedRegion,
-    LateParamRegion, NormalizesTo, OpaqueTyIdWrapper, OutlivesClause, ParamConst, ParamTy,
-    PatList, Pattern, PatternKind, PlaceholderConst, PlaceholderRegion, PlaceholderType, Predicate,
-    PredicateKind, ProjectionClause, Region, RegionKind, ScalarInt, SolverDefId, SubtypePredicate,
-    Term, TermKind, TraitAssocConstId, TraitAssocTermId, TraitAssocTyId, TraitClause,
-    TraitIdWrapper, TraitRef, Ty, TyKind, TypeAliasIdWrapper, Tys, ValTree, ValTreeKind,
-    ValueConst, abi::Safety, ensure_sufficient_stack, interner::Symbol,
+    AdtDef, AliasTermKind, AliasTyKind, AnonConstIdWrapper, Binder, BoundConst,
+    BoundExistentialPredicate, BoundExistentialPredicates, BoundRegion, BoundRegionKind, BoundTy,
+    BoundTyKind, BoundVarKinds, BoundVariableKind, CallableIdWrapper, Clause, ClauseKind, Clauses,
+    ClosureIdWrapper, CoercePredicate, Const, ConstKind, Consts, CoroutineClosureIdWrapper,
+    CoroutineIdWrapper, Ctor, DbInterner, EarlyParamRegion, ErrorGuaranteed, ExistentialPredicate,
+    ExistentialProjection, ExistentialTraitRef, ExprConst, FnHeader, FnSigKind, FreeConstAliasId,
+    FreeTermAliasId, FreeTyAliasId, GenericArg, GenericArgKind, GenericArgs, HostEffectClause,
+    ImplOrTraitAssocConstId, ImplOrTraitAssocTermId, ImplOrTraitAssocTyId, InherentAssocConstId,
+    InherentAssocTermId, InherentAssocTyId, InternedConst, InternedRegion, LateParamRegion,
+    NormalizesTo, OpaqueTyIdWrapper, OutlivesClause, ParamConst, ParamTy, PatList, Pattern,
+    PatternKind, PlaceholderConst, PlaceholderRegion, PlaceholderType, Predicate, PredicateKind,
+    ProjectionClause, Region, RegionKind, ScalarInt, SolverDefId, SubtypePredicate, Term, TermKind,
+    TraitAssocConstId, TraitAssocTermId, TraitAssocTyId, TraitClause, TraitIdWrapper, TraitRef, Ty,
+    TyKind, TypeAliasIdWrapper, Tys, ValTree, ValTreeKind, ValueConst, abi::Safety,
+    ensure_sufficient_stack, interner::Symbol,
 };
 
 /// Where a value's words go.
@@ -1765,13 +1766,13 @@ pub const TABLE_SCHEMA: SchemaHash = schema_of(&[
 /// of its own, each once: each is named by its place in the table, from the `u32` its method
 /// returns.
 ///
-/// Cost: a value already written is one Fx hash of a `u64` key and one probe. A new one is
+/// Cost: a value already written is one hash of a `u64` key and one probe. A new one is
 /// written to `words` once, its children first; the words of the values being written wait
 /// in `pending`, one stack reused for the whole table, so writing allocates only as the table
 /// grows.
 pub struct TyTableWriter<'db> {
     /// The place of each value written, by kind and row.
-    places: FxHashMap<(Kind, NonZeroU32), u32>,
+    places: HashMap<(Kind, NonZeroU32), u32>,
     nodes: Vec<NodeRec>,
     words: Vec<u32>,
     /// The words of the values being written, innermost last.
@@ -1788,7 +1789,7 @@ impl<'db> TyTableWriter<'db> {
     fn empty() -> Self {
         // alloc: none until the first value; one writer's buffers per table written.
         TyTableWriter {
-            places: FxHashMap::default(),
+            places: HashMap::default(),
             // alloc: as above.
             nodes: Vec::new(),
             // alloc: as above.
@@ -2065,9 +2066,9 @@ mod tests {
     use std::{collections::HashSet, sync::Barrier};
 
     use blaze_format::{Aligned, HEADER_LEN, Writer};
+    use blaze_query::db::FromId;
     use hir_def::{CallableDefId, FunctionId, TypeAliasId};
     use rustc_type_ir::{FlagComputation, Flags, INNERMOST, TypeFlags};
-    use blaze_query::db::FromId;
 
     use super::*;
     use crate::next_solver::TermId;

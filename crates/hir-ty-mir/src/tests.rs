@@ -25,26 +25,25 @@ mod traits;
 mod variance;
 
 use base_db::{Crate, EditionedFileId};
+use blaze_hash::HashMap;
 use expect_test::Expect;
 use hir_def::{
-    AdtId, AssocItemId, DefWithBodyId, GenericDefId, HasModule, ModuleDefId, ModuleId,
-    VariantId,
+    AdtId, AssocItemId, DefWithBodyId, GenericDefId, HasModule, ModuleDefId, ModuleId, VariantId,
     expr_store::{Body, ExpressionStore, ExpressionStoreSourceMap, SelfParamPtr},
     hir::{BindingId, ClosureKind, Expr, ExprId, Pat, PatId},
     item_scope::ItemScope,
     nameres::DefMap,
     type_ref::TypeRefId,
 };
+use hir_expand::fixture;
 use hir_expand::{FileRange, InFile};
 use itertools::Itertools;
-use rustc_hash::FxHashMap;
 use stdx::format_to;
 use syntax::{
     SyntaxNode,
     ast::{self, AstNode, HasName},
     view::{self, AstNode as _},
 };
-use hir_expand::fixture;
 
 use crate::{
     Adjustment, InferBodyId, InferenceDiagnostic, InferenceResult,
@@ -202,9 +201,9 @@ fn check_impl(
 
     crate::attach_db(&db, || {
         let mut had_annotations = false;
-        let mut mismatches = FxHashMap::default();
-        let mut types = FxHashMap::default();
-        let mut adjustments = FxHashMap::default();
+        let mut mismatches = HashMap::default();
+        let mut types = HashMap::default();
+        let mut adjustments = HashMap::default();
         for (file_id, annotations) in db.extract_annotations() {
             for (range, expected) in annotations {
                 let file_range = FileRange { file_id, range };
@@ -409,7 +408,7 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
                     }
                     _ => None,
                 })
-                .collect::<FxHashMap<_, _>>();
+                .collect::<HashMap<_, _>>();
             let mut mismatches: Vec<(InFile<SyntaxNode>, (Ty<'_>, Ty<'_>))> = Vec::new();
 
             if let Some((binding_id, syntax_ptr)) = self_param {

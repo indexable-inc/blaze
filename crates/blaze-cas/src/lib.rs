@@ -58,26 +58,26 @@ use std::{collections::VecDeque, fmt, sync::Arc};
 
 use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
 use blaze_format::{SchemaHash, tiers::BufferColumns};
-use blaze_ids::{ContentId, Hasher, prehashed::ByHash, radix};
+use blaze_hash::{ByHash, HashMap, HashSet};
+use blaze_ids::{ContentId, Hasher, radix};
 use blaze_reclaim::{Grace, Limbo};
 pub use blaze_reclaim::{Guard, enter};
-use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
+pub use crate::disk::content_of;
 use crate::disk::{
     DICTIONARY_DOMAIN, DictionaryRef, ExternalRef, Form, HEAD_FILE, Head, IndexRef, Loc,
     NO_DICTIONARY, PACK_HEADER, PackRef, RECORD_HEADER, RecordHeader, SCHEMA_PREFIX,
 };
-pub use crate::disk::content_of;
-pub use crate::handle::Handle;
-pub use crate::peers::SharedConfig;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub use crate::driven::Driven;
 use crate::flags::{FLAGS, Flag, Row};
-use crate::read::{ExternalView, Index, Look, PackView, Place, Seg, Shared, Spot, TierView, View};
+pub use crate::handle::Handle;
+pub use crate::peers::SharedConfig;
 pub use crate::read::Pinned;
-use crate::segment::{COPY, Chunk, ChunkRef, FRAME, Own, Segment};
+use crate::read::{ExternalView, Index, Look, PackView, Place, Seg, Shared, Spot, TierView, View};
 pub use crate::segment::Writer;
+use crate::segment::{COPY, Chunk, ChunkRef, FRAME, Own, Segment};
 use crate::table::{Held, Table};
 
 /// The format of everything in a store's directory. A store of another refuses to open, naming
@@ -569,7 +569,7 @@ pub(crate) enum Use {
 /// The tags a store asks with, and what each asked for.
 struct Tags {
     range: blaze_core::Tags,
-    ops: FxHashMap<Tag, Op>,
+    ops: HashMap<Tag, Op>,
 }
 
 impl Tags {
@@ -887,7 +887,7 @@ impl Store {
         // clone: setup, once per store
         let drains = vec![Drain::new(own.segment().clone())];
         Store {
-            tags: Tags { range: blaze_core::Tags::new(config.tags), ops: FxHashMap::default() },
+            tags: Tags { range: blaze_core::Tags::new(config.tags), ops: HashMap::default() },
             config,
             tiers,
             broken: None,
@@ -2232,7 +2232,7 @@ impl Store {
     /// segment is not held, nor does it shadow the record the table held before. A slot that
     /// is not whole is in `bad`.
     fn index_entries(&self, bad: &mut Vec<(Key, &'static str)>) -> Vec<(Key, Loc)> {
-        let mut moved: FxHashMap<Key, (Seg, Loc)> = FxHashMap::default();
+        let mut moved: HashMap<Key, (Seg, Loc)> = HashMap::default();
         for it in self.pending.iter().chain([&self.draining]).flat_map(|it| &it.moves) {
             moved.insert(it.key, (it.from, it.to));
         }
@@ -2240,7 +2240,7 @@ impl Store {
         let own = &self.tiers[0];
         let indexed = own.index.as_ref().map_or(0, |it| it.table().count() as usize);
         let mut out = Vec::with_capacity(own.delta.len() + indexed);
-        let mut taken = FxHashSet::default();
+        let mut taken = HashSet::default();
         for (_, spot) in own.delta.iter(held) {
             let loc = match spot.place {
                 Place::Pack(loc) => Some(loc),

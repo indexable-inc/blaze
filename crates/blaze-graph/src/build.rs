@@ -199,15 +199,14 @@ mod tests {
     /// second request of the same build compiles nothing the database has.
     #[test]
     fn store_writes_overlap_compiles_and_a_second_request_reuses_them() {
-        use std::{
-            collections::HashMap,
-            sync::{Arc, Mutex},
-        };
+        use std::{collections::HashMap, sync::Arc};
+
+        use parking_lot::Mutex;
 
         let db: Arc<Mutex<HashMap<Key, crate::machine::Outcome>>> = Arc::default();
         let memo = {
-            let db = db.clone();
-            move |key: Key| db.lock().unwrap().get(&key).cloned()
+            let db = Arc::clone(&db);
+            move |key: Key| db.lock().get(&key).cloned()
         };
         let config = PlaneConfig { io: 1, work: 1, budget: None, starve_after: 4 };
         let mut plane = Plane::with_memo(config, memo).unwrap();
@@ -241,7 +240,7 @@ mod tests {
                 ran.push(id);
                 // The value is in the database before its Done, as a task's must be.
                 if let Some(key) = keys.get(&id) {
-                    db.lock().unwrap().insert(*key, crate::machine::Outcome::Built);
+                    db.lock().insert(*key, crate::machine::Outcome::Built);
                 }
                 outputs = plane
                     .step(PlaneInput::Done {

@@ -10,7 +10,7 @@
 //! shift, a pop and a compare. The same calls give the same addresses in every region and
 //! run, so an expansion that hashes addresses is as reproducible as one that doesn't.
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 use super::region::{GRANULE, Region};
 use crate::guest::Stop;
@@ -34,10 +34,10 @@ pub(crate) struct Heap {
     /// Per class: what is left of the chunk it carves from, `(next, end)`.
     carve: [(u32, u32); CLASSES],
     /// Freed large blocks by their granules.
-    large: FxHashMap<u32, Vec<u32>>,
+    large: HashMap<u32, Vec<u32>>,
     /// Size and alignment of each block `malloc` and its family gave, which C's `free` and
     /// `realloc` don't say.
-    c_blocks: FxHashMap<u32, (u64, u64)>,
+    c_blocks: HashMap<u32, (u64, u64)>,
 }
 
 /// Where a block of `size` bytes aligned to `align` comes from.
@@ -85,8 +85,8 @@ impl Heap {
             top: heap.start,
             free: Default::default(),
             carve: [(0, 0); CLASSES],
-            large: FxHashMap::default(),
-            c_blocks: FxHashMap::default(),
+            large: HashMap::default(),
+            c_blocks: HashMap::default(),
         }
     }
 

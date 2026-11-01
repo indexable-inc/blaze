@@ -13,8 +13,8 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
+blaze-hash.workspace = true
 cov-mark.workspace = true
-rustc-hash.workspace = true
 smallvec.workspace = true
 arrayvec.workspace = true
 rustc_lexer.workspace = true

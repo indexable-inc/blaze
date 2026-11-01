@@ -15,8 +15,8 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+blaze-hash.workspace = true
 blaze-ids.workspace = true
-rustc-hash.workspace = true
 # The hasher cargo names a source's directories with.
 rustc-stable-hash.workspace = true
 semver.workspace = true

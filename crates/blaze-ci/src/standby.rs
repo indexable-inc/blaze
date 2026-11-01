@@ -9,7 +9,6 @@
 
 use std::{
     net::SocketAddr,
-    sync::mpsc,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -118,7 +117,7 @@ fn now() -> u64 {
 /// One poll: the primary's daemon answers [`Request::Status`] with `ok` within `within`. A
 /// poll that hangs is a miss; its thread is left to end on its own.
 fn poll(primary: SocketAddr, token: &str, within: Duration) -> Result<(), String> {
-    let (done, wait) = mpsc::channel();
+    let (done, wait) = crossbeam_channel::unbounded();
     // alloc: once per poll, every few seconds, the token its thread owns
     let token = token.to_owned();
     thread::spawn(move || {
@@ -159,7 +158,7 @@ pub fn run(config: &StandbyConfig) -> Result<(i32, String), ConfigError> {
             Action::Poll { at } => {
                 let wait = at.saturating_sub(now());
                 if wait > 0 {
-                    thread::sleep(Duration::from_secs(wait));
+                    crate::hold(Duration::from_secs(wait));
                 }
                 let polled = poll(config.primary, &token, within);
                 if let Err(why) = &polled {

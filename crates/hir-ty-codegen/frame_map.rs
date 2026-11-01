@@ -4,27 +4,27 @@
 
 use std::{marker::PhantomData, ops::Index};
 
+use blaze_hash::FixedState;
 use blaze_mem::Frame;
 use la_arena::{Idx, RawIdx};
-use rustc_hash::FxBuildHasher;
 
-/// An `FxHashMap` in a frame. Only for a map nothing iterates where the order shows: its order
+/// An `HashMap` in a frame. Only for a map nothing iterates where the order shows: its order
 /// is the table's.
-pub(crate) type FrameHashMap<'f, K, V> = hashbrown::HashMap<K, V, FxBuildHasher, &'f Frame>;
+pub(crate) type FrameHashMap<'f, K, V> = hashbrown::HashMap<K, V, FixedState, &'f Frame>;
 
-/// An `FxHashSet` in a frame, as [`FrameHashMap`].
-pub(crate) type FrameHashSet<'f, T> = hashbrown::HashSet<T, FxBuildHasher, &'f Frame>;
+/// An `HashSet` in a frame, as [`FrameHashMap`].
+pub(crate) type FrameHashSet<'f, T> = hashbrown::HashSet<T, FixedState, &'f Frame>;
 
 pub(crate) fn hash_map<'f, K, V>(frame: &'f Frame) -> FrameHashMap<'f, K, V> {
-    hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame)
+    hashbrown::HashMap::with_hasher_in(FixedState, frame)
 }
 
 pub(crate) fn hash_map_with_capacity<'f, K, V>(capacity: usize, frame: &'f Frame) -> FrameHashMap<'f, K, V> {
-    hashbrown::HashMap::with_capacity_and_hasher_in(capacity, FxBuildHasher, frame)
+    hashbrown::HashMap::with_capacity_and_hasher_in(capacity, FixedState, frame)
 }
 
 pub(crate) fn hash_set<'f, T>(frame: &'f Frame) -> FrameHashSet<'f, T> {
-    hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame)
+    hashbrown::HashSet::with_hasher_in(FixedState, frame)
 }
 
 /// A value for some of an arena's indices, by index, in a frame: `la_arena::ArenaMap`'s layout

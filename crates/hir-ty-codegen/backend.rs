@@ -10,12 +10,13 @@ use std::{
     collections::BTreeMap,
     fmt,
     sync::{
-        Mutex, OnceLock,
+        OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
+use parking_lot::Mutex;
 use stdx::time::Instant;
 
 use super::{CodegenError, Result, debuginfo::SlotPlaces, fragment::Code, fragment::Recorder};
@@ -489,11 +490,11 @@ impl Registry {
         };
         for counts in self.all() {
             counts.take(&mut taken.sums);
-            let alone = std::mem::take(&mut *counts.alone.lock().unwrap_or_else(|e| e.into_inner()));
+            let alone = std::mem::take(&mut *counts.alone.lock());
             for (reason, count) in alone {
                 *taken.alone.entry(reason).or_default() += count;
             }
-            if let Some(times) = counts.passes.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            if let Some(times) = counts.passes.lock().take() {
                 taken.passes.get_or_insert_with(Default::default).add(&times);
             }
         }
@@ -645,7 +646,7 @@ impl Tally {
     #[cfg(feature = "llvm")]
     pub(super) fn alone(&self, reason: &str, functions: usize) {
         let counts = counts();
-        let mut alone = counts.alone.lock().unwrap_or_else(|e| e.into_inner());
+        let mut alone = counts.alone.lock();
         match alone.get_mut(reason) {
             Some(count) => *count += functions,
             // alloc: once per distinct reason, the first time it is counted
@@ -670,7 +671,7 @@ impl Tally {
             return;
         }
         let times = cranelift_codegen::timing::take_current();
-        let mut passes = counts.passes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut passes = counts.passes.lock();
         passes.get_or_insert_with(Default::default).add(&times);
     }
 
@@ -801,7 +802,7 @@ mod tests {
             std::thread::scope(|scope| {
                 scope.spawn(|| {
                     let counts = registry.claim();
-                    *counts.alone.lock().unwrap().entry(reason.to_owned()).or_default() += n;
+                    *counts.alone.lock().entry(reason.to_owned()).or_default() += n;
                     counts.release();
                 });
             });

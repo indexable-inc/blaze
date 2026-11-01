@@ -11,9 +11,11 @@
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use super::{Cells, Driver, Policy, Promote, Recompile, Tier};
 
@@ -82,7 +84,7 @@ pub struct Runner<M: Cells + Send + Sync + 'static, R: Recompile> {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    mutex.lock()
 }
 
 impl<M: Cells + Send + Sync + 'static, R: Recompile> Runner<M, R> {
@@ -213,7 +215,7 @@ impl<M: Cells + Send + Sync + 'static, R: Recompile> Shared<M, R> {
             }
             let now = Instant::now();
             if now < next {
-                state = self.tick.wait_timeout(state, next - now).unwrap_or_else(PoisonError::into_inner).0;
+                self.tick.wait_for(&mut state, next - now);
                 continue;
             }
             next = now + self.period;
@@ -256,7 +258,7 @@ impl<M: Cells + Send + Sync + 'static, R: Recompile> Shared<M, R> {
                     if let Some(promote) = state.queue.pop_front() {
                         break promote;
                     }
-                    state = self.work.wait(state).unwrap_or_else(PoisonError::into_inner);
+                    self.work.wait(&mut state);
                 }
             };
             let Promote { function, to } = promote;

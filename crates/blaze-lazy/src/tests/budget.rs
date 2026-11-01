@@ -3,7 +3,7 @@
 //! go in the fetcher's slab), a warm round of asks and answers, or a lone hit, answered by the
 //! thread that read it.
 
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use blaze_alloc_count::{assert_at_most, measure};
@@ -11,6 +11,7 @@ use blaze_codegen::{Arch, CompiledFunction, InstanceKey};
 use blaze_inproc::frame::Kind;
 use blaze_items::{CodeHash, ItemKey};
 use blaze_stencil::tier::Tier;
+use parking_lot::{Condvar, Mutex};
 
 use super::flight::{Addresses, Counting, session};
 use super::{compiled, function, id, key};
@@ -33,7 +34,7 @@ struct Kept(Arc<Last>);
 
 impl Answers for Kept {
     fn send(&self, _: u32, seq: u32, kind: Kind, body: &[u8]) {
-        let mut answer = self.0.answer.lock().unwrap();
+        let mut answer = self.0.answer.lock();
         let len = body.len().min(READY_LEN);
         answer.2[..len].copy_from_slice(&body[..len]);
         answer.0 = seq;
@@ -55,10 +56,10 @@ impl Kept {
     /// The answer to frame `seq`, once it comes: its kind and bytes.
     fn wait(&self, seq: u32) -> (Kind, [u8; READY_LEN], usize) {
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut answer = self.0.answer.lock().unwrap();
+        let mut answer = self.0.answer.lock();
         while answer.0 != seq {
             let left = deadline.checked_duration_since(Instant::now()).expect("an answer within a minute");
-            answer = self.0.arrived.wait_timeout(answer, left).unwrap().0;
+            self.0.arrived.wait_for(&mut answer, left);
         }
         (answer.1, answer.2, answer.3)
     }
@@ -156,7 +157,7 @@ fn a_lone_hit_of_a_warm_runner_allocates_nothing() {
     runner.frame(0, ASK_KIND, 1, &wire::ask(1, 0)).unwrap();
     assert_eq!(kept.wait(1).0, READY_KIND);
     let asked = wire::ask(2, 1);
-    std::thread::sleep(Duration::from_millis(1));
+    super::hit::pause();
     assert_at_most(0, "a lone hit, answered by the reading thread", || runner.frame(0, ASK_KIND, 2, &asked).unwrap());
     let (kind, bytes, _) = kept.wait(2);
     assert_eq!(kind, READY_KIND);

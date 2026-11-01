@@ -1,6 +1,6 @@
 use std::hash::Hash;
 
-use rustc_hash::FxHashSet;
+use blaze_hash::HashSet;
 
 /// The DRed over-delete closure: from `seeds`, every node `step` reaches, each once, in BFS
 /// order; `out` is cleared first. `step(n, next)` appends `n`'s successors to `next`.
@@ -18,7 +18,7 @@ pub fn closure<N: Copy + Eq + Hash>(
 /// reaches no more nodes than an earlier one allocates nothing.
 #[derive(Debug)]
 pub struct Closure<N> {
-    seen: FxHashSet<N>,
+    seen: HashSet<N>,
     next: Vec<N>,
 }
 
@@ -30,7 +30,7 @@ impl<N: Copy + Eq + Hash> Default for Closure<N> {
 
 impl<N: Copy + Eq + Hash> Closure<N> {
     pub fn new() -> Self {
-        Closure { seen: FxHashSet::default(), next: Vec::new() } // alloc: setup: empty buffers, grown once and kept
+        Closure { seen: HashSet::default(), next: Vec::new() } // alloc: setup: empty buffers, grown once and kept
     }
 
     /// `O(nodes reached + edges stepped)`, one set probe per edge.

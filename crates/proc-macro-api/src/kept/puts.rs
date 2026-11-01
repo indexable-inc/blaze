@@ -10,10 +10,7 @@
 
 use std::{
     cell::RefCell,
-    sync::{
-        Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use blaze_cas::{Store, Ticket};
@@ -22,6 +19,7 @@ use blaze_usercode::{
     RunKey,
     index::{self, KeepError},
 };
+use crossbeam_queue::SegQueue;
 
 /// One expansion to keep: its run, what it read, and the value kept of it.
 #[derive(Debug)]
@@ -50,13 +48,15 @@ thread_local! {
     static PUTS: Buffer = const { Buffer(RefCell::new(Vec::new())) }; // alloc: none, an empty buffer
 }
 
-/// The puts of threads that ended before they were taken, for the next [`take_puts`]. Locked
-/// only as a thread ends with puts left and by a take that sees [`ORPHANED`].
-static ORPHANS: Mutex<Vec<Put>> = Mutex::new(Vec::new()); // alloc: none, an empty buffer
+/// The puts of threads that ended before they were taken, for the next [`take_puts`]. Pushed
+/// only as a thread ends with puts left, and drained by a take that sees [`ORPHANED`].
+static ORPHANS: SegQueue<Put> = SegQueue::new();
 static ORPHANED: AtomicBool = AtomicBool::new(false);
 
 fn orphan(puts: impl IntoIterator<Item = Put>) {
-    ORPHANS.lock().unwrap_or_else(|it| it.into_inner()).extend(puts);
+    for put in puts {
+        ORPHANS.push(put);
+    }
     ORPHANED.store(true, Ordering::Release);
 }
 
@@ -75,7 +75,7 @@ pub fn put(put: Put) {
 pub fn take_puts() -> Vec<Put> {
     let mut puts = PUTS.try_with(|it| std::mem::take(&mut *it.0.borrow_mut())).unwrap_or_default();
     if ORPHANED.load(Ordering::Acquire) && ORPHANED.swap(false, Ordering::AcqRel) {
-        puts.append(&mut ORPHANS.lock().unwrap_or_else(|it| it.into_inner()));
+        puts.extend(std::iter::from_fn(|| ORPHANS.pop()));
     }
     puts
 }

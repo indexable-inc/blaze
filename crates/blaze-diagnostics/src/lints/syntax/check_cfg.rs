@@ -244,9 +244,11 @@ fn invalid(spec: &str, notes: Vec<String>) -> Diag {
     diag
 }
 
-/// An error of the command line as rustc writes it: it points into no file.
+/// An error of the command line as rustc writes it: it points into no file, so no span of it
+/// is refused; one that were would be the error's text instead.
 fn rendered(diag: &Diag) -> String {
     crate::emit::rendered(diag, &Sources::of(std::iter::empty()), Style::default())
+        .unwrap_or_else(|why| why.to_string())
 }
 
 /// One `--cfg` value as rustc's `parse_cfg` reads it for a crate of `edition`: its name, and

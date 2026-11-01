@@ -12,15 +12,15 @@ use std::{num::NonZero, ops::ControlFlow};
 use base_db::{Crate, CrateOrigin, Db};
 use cfg::CfgOptions;
 use hir_def::{
-    AttrDefId, DefWithBodyId, FunctionId, HasModule, ImplId, ItemContainerId, Lookup, TraitId,
+    AttrDefId, FunctionId, HasModule, ImplId, ItemContainerId, Lookup, TraitId,
     attrs::stability::{Stability, StabilityLevel, stability},
-    expr_store::Body,
+    expr_store::ExpressionStore,
     signatures::FunctionSignature,
     src::HasSource,
     unstable_features::UnstableFeatures,
 };
 use hir_expand::{MacroCallId, MacroDefKind, attrs::expand_cfg_attr_view};
-use hir_ty::effects::trait_is_const;
+use hir_ty::{InferBodyId, effects::trait_is_const};
 use intern::Symbol;
 use syntax::{
     NodeOrToken, SyntaxKind,
@@ -135,14 +135,14 @@ pub(super) fn forces_unstable(db: &Db, krate: Crate) -> bool {
     matches!(krate.data(db).origin, CrateOrigin::Lang(_))
 }
 
-/// `Span::allows_unstable(feature)` of the call at `at` in `def`'s body (an expression, or the
+/// `Span::allows_unstable(feature)` of the call at `at` in `owner`'s body (an expression, or the
 /// pattern whose comparison it is): the macro whose expansion made it is written
 /// `#[allow_internal_unstable(.., feature, ..)]`. rustc reads the expansion off the hygiene of
 /// the call's span; here it is that of the call's first token, or the macro whose expansion the
 /// call is in. A call in a macro's argument is allowed when either macro allows it, where rustc
 /// asks only the one whose tokens it is.
-pub(super) fn allows_unstable(db: &Db, def: DefWithBodyId, at: MirSpan, feature: &Symbol) -> bool {
-    let source_map = &Body::with_source_map(db, def).1;
+pub(super) fn allows_unstable(db: &Db, owner: InferBodyId<'_>, at: MirSpan, feature: &Symbol) -> bool {
+    let source_map = ExpressionStore::with_source_map(db, owner.expression_store_owner(db)).1;
     let (file_id, range) = match at {
         MirSpan::ExprId(expr) => match source_map.expr_syntax(expr) {
             Ok(it) => (it.file_id, it.value.text_range()),

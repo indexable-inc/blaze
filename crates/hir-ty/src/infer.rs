@@ -4302,7 +4302,7 @@ mod tests {
         ];
         blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
             let mut ours = TupleFieldTypes::new_in(frame);
-            let mut theirs = indexmap::IndexSet::<Tys<'_>, rustc_hash::FxBuildHasher>::default();
+            let mut theirs = indexmap::IndexSet::<Tys<'_>, blaze_hash::FixedState>::default();
             for step in 0..64usize {
                 let tys = lists[(step * 7 + step / 5) % lists.len()];
                 assert_eq!(ours.insert(tys) as usize, theirs.insert_full(tys).0, "step {step}");

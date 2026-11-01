@@ -1,12 +1,13 @@
 //! `box_collection`: `Box` of a std collection (`Box<Vec<T>>`, `Box<String>`), which is on the
 //! heap already. This file is also clippy's `Types` pass, which checks the types written in
-//! signatures, fields, constants and statics, and runs `vec_box` and `rc_buffer` as well.
+//! signatures, fields, constants and statics, and runs `vec_box`, `rc_buffer` and `rc_mutex` as
+//! well.
 //!
 //! Follows clippy's `clippy_lints/src/types/mod.rs` (`Types::check_ty` and the `check_*` hooks
 //! that call it) and `types/box_collection.rs` (MIT or Apache-2.0), ported from what is known of
 //! their source at rust-lang/rust's nightly of 2026-10: no reference checkout of clippy was at
 //! hand. Where `check_ty` stops at a type another lint of the pass reports (`borrowed_box`,
-//! `redundant_allocation`, `option_option`, `linked_list`, `rc_mutex`, `owned_cow`,
+//! `redundant_allocation`, `option_option`, `linked_list`, `owned_cow`,
 //! `type_complexity`), so does this, those lints not being reported here. As in clippy, the
 //! paths of a `let`'s type or a closure's signature are not looked at (`in_body`), and with
 //! `avoid-breaking-exported-api` (the default) what another crate can name is left alone.
@@ -166,7 +167,10 @@ pub(super) fn generic_tys<'t>(path: ast::PathType<'t>) -> impl Iterator<Item = a
 }
 
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
-    let lints = Implemented::BoxCollection.bit() | Implemented::VecBox.bit() | Implemented::RcBuffer.bit();
+    let lints = Implemented::BoxCollection.bit()
+        | Implemented::VecBox.bit()
+        | Implemented::RcBuffer.bit()
+        | super::rc_mutex::LINT.bit();
     if !cx.on_any(lints) {
         return;
     }
@@ -343,10 +347,10 @@ impl<'q, 't> Pass<'_, 'q, 't> {
         triggered |= vec_box::check(self.cx, path, outer);
         let first = generic_tys(path).next();
         let first_std = first.and_then(|it| std_of(self.cx, it));
-        // `option_option`, `linked_list`, `rc_mutex` and `owned_cow`, not reported here.
+        triggered |= super::rc_mutex::check(self.cx, path, outer);
+        // `option_option`, `linked_list` and `owned_cow`, not reported here.
         triggered |= outer == Std::Option && first_std == Some(Std::Option);
         triggered |= outer == Std::LinkedList;
-        triggered |= outer == Std::Rc && first_std == Some(Std::Mutex);
         triggered |= outer == Std::Cow
             && matches!(first_std, Some(Std::String | Std::Vec | Std::OsString | Std::PathBuf));
         triggered

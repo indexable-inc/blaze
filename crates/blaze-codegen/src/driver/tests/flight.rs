@@ -2,10 +2,9 @@
 //! function they share (`syn`'s, `quote`'s, `cc`'s) is prepared and compiled once between
 //! them, by whichever reaches it first, and each build makes what it would alone.
 
-use std::{
-    sync::{Barrier, Mutex},
-    time::Duration,
-};
+use std::{sync::Barrier, time::Duration};
+
+use parking_lot::Mutex;
 
 use super::*;
 
@@ -31,7 +30,7 @@ impl Prepare for Slow {
         id: &u32,
         refs: &crate::template::Refs,
     ) -> Result<(Shape, Prepared), CodegenError> {
-        self.prepared.lock().unwrap().push(unit.instance.key());
+        self.prepared.lock().push(unit.instance.key());
         self.machine.prepare(program, unit, spec, id, refs)
     }
 
@@ -53,8 +52,8 @@ impl Prepare for Slow {
         refs: &crate::template::Refs,
         imports: Option<(&Imports, &[Import<'_, u8>])>,
     ) -> Result<Emitted, CodegenError> {
-        std::thread::sleep(Duration::from_millis(10));
-        self.emitted.lock().unwrap().push(unit.instance.key());
+        blaze_graph::spin::busy(Duration::from_millis(10));
+        self.emitted.lock().push(unit.instance.key());
         self.machine.emit(unit, spec, prepared, refs, imports)
     }
 
@@ -129,7 +128,7 @@ fn alone(program: &Program, policy: &Policy, root: u32) -> Built {
 }
 
 fn sorted(keys: &Mutex<Vec<InstanceKey>>) -> Vec<InstanceKey> {
-    let mut keys = keys.lock().unwrap().clone();
+    let mut keys = keys.lock().clone();
     keys.sort();
     keys
 }

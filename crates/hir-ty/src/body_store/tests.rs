@@ -5,13 +5,15 @@
 //! is stored only when it passes; a corrupt record and a verify mismatch are errors naming the
 //! body; and a hit allocates only what decoding the result does.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use base_db::{Crate, Db, all_crates};
 use blaze_alloc_count::{assert_at_most, measure};
 use blaze_format::Aligned;
+use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Hasher};
 use blaze_query::QueryKind;
+use blaze_query::db::Setter;
 use hir_def::{
     AdtId, ConstId, DefWithBodyId, EnumId, EnumVariantId, FunctionId, ImplId, StaticId, StructId,
     TraitId, TypeAliasId, UnionId,
@@ -20,14 +22,13 @@ use hir_def::{
     nameres::{crate_def_map, demand::crate_body_owners},
     signatures::FunctionSignature,
 };
-use hir_expand::name::Name;
-use rustc_hash::FxHashMap;
-use blaze_query::db::Setter;
 use hir_expand::fixture;
+use hir_expand::name::Name;
+use parking_lot::Mutex;
 
 use super::{
-    BodyFacts, Classified, Flushed, Lookup, Mode, Step, StepCounts, capture, infer, install, lookup_inference,
-    lookup_passed, offer_passed,
+    BodyFacts, Classified, Flushed, Lookup, Mode, Step, StepCounts, capture, infer, install,
+    lookup_inference, lookup_passed, offer_passed,
     record::{self, AnswerKey, ShapeRef},
     step_value,
 };
@@ -111,27 +112,27 @@ const BODIES: [&str; 4] = ["uses_show", "plain", "seven", "closures"];
 /// A store in memory, which refuses a second put of a key with other bytes as the store does.
 #[derive(Default)]
 pub(super) struct Memory {
-    images: Mutex<FxHashMap<ContentId, Arc<Aligned>>>,
+    images: Mutex<HashMap<ContentId, Arc<Aligned>>>,
 }
 
 impl Memory {
     pub(super) fn len(&self) -> usize {
-        self.images.lock().unwrap().len()
+        self.images.lock().len()
     }
 
     /// Puts `bytes` under `key` whatever it held: a store that went bad.
     pub(super) fn set(&self, key: ContentId, bytes: &[u8]) {
-        self.images.lock().unwrap().insert(key, Arc::new(Aligned::copy_from(bytes)));
+        self.images.lock().insert(key, Arc::new(Aligned::copy_from(bytes)));
     }
 }
 
 impl ImageStore for Memory {
     fn get(&self, key: &ContentId) -> Result<Option<ImageBuf>, String> {
-        Ok(self.images.lock().unwrap().get(key).map(|it| it.clone() as ImageBuf))
+        Ok(self.images.lock().get(key).map(|it| it.clone() as ImageBuf))
     }
 
     fn put(&self, key: ContentId, value: Vec<u8>) -> Result<(), String> {
-        let mut images = self.images.lock().unwrap();
+        let mut images = self.images.lock();
         match images.get(&key) {
             Some(kept) if kept[..] != value[..] => Err(format!("{key:?} kept with other bytes")),
             Some(_) => Ok(()),
@@ -149,7 +150,7 @@ impl ImageStore for Memory {
 
 /// The items every test database's keys name: a key is the hash of an item's portable form in
 /// `main`'s table (frontend-deps' frozen encoding), kept so another database finds it again.
-pub(super) type Defs = Arc<Mutex<FxHashMap<ContentId, (u8, Vec<u8>)>>>;
+pub(super) type Defs = Arc<Mutex<HashMap<ContentId, (u8, Vec<u8>)>>>;
 
 /// Lane item-hash's part, for tests, one per database: a body's identity is its key and its HIR
 /// printed (no ids, no spans); every read of an impl table is [`IMPLS`], `refuse` is refused, and
@@ -157,7 +158,7 @@ pub(super) type Defs = Arc<Mutex<FxHashMap<ContentId, (u8, Vec<u8>)>>>;
 pub(super) struct TestFacts {
     defs: Defs,
     main: Crate,
-    identities: Mutex<FxHashMap<DefWithBodyId, Option<ContentId>>>,
+    identities: Mutex<HashMap<DefWithBodyId, Option<ContentId>>>,
     refuse: Option<&'static str>,
     names: Mutex<Vec<&'static str>>,
 }
@@ -198,14 +199,14 @@ fn portable(def: SolverDefId<'_>) -> (u8, PortableIds) {
 
 impl BodyFacts for TestFacts {
     fn identity(&self, db: &Db, def: DefWithBodyId) -> Option<ContentId> {
-        if let Some(&known) = self.identities.lock().unwrap().get(&def) {
+        if let Some(&known) = self.identities.lock().get(&def) {
             return known;
         }
         let identity = body_key(db, def).map(|key| {
             let printed = Body::of(db, def).pretty_print(db, def, span::Edition::CURRENT);
             Hasher::new("blaze v2 item store test identity").id(&key).part(printed.as_bytes()).finish()
         });
-        self.identities.lock().unwrap().insert(def, identity);
+        self.identities.lock().insert(def, identity);
         identity
     }
 
@@ -218,7 +219,7 @@ impl BodyFacts for TestFacts {
         _: blaze_query::db::ReadKind,
         name: &'static str,
     ) -> Classified {
-        self.names.lock().unwrap().push(name);
+        self.names.lock().push(name);
         if self.refuse == Some(name) {
             return Classified::Refused;
         }
@@ -241,12 +242,12 @@ impl BodyFacts for TestFacts {
         let (tag, ids) = portable(def);
         let bytes = ids.encode(db, self.main).expect("a test item has a portable form");
         let key = Hasher::new("blaze v2 item store test def").update(&[tag]).part(&bytes).finish();
-        self.defs.lock().unwrap().insert(key, (tag, bytes));
+        self.defs.lock().insert(key, (tag, bytes));
         key
     }
 
     fn def_of<'db>(&self, db: &'db Db, _: DefWithBodyId, key: ContentId) -> Option<SolverDefId<'db>> {
-        let (tag, bytes) = self.defs.lock().unwrap().get(&key)?.clone();
+        let (tag, bytes) = self.defs.lock().get(&key)?.clone();
         let ids = PortableIds::decode(db, self.main, &bytes).ok()?;
         match tag {
             0 => ids.get::<FunctionId>(0).map(SolverDefId::FunctionId),
@@ -306,11 +307,11 @@ fn stable(db: &Db, facts: &TestFacts, def: DefWithBodyId) -> Vec<u8> {
 }
 
 /// The first database's bodies, inferred and flushed into a new store.
-fn stored(mode: Mode) -> (Arc<Memory>, Defs, FxHashMap<&'static str, Vec<u8>>) {
+fn stored(mode: Mode) -> (Arc<Memory>, Defs, HashMap<&'static str, Vec<u8>>) {
     let memory = Arc::new(Memory::default());
     let defs = Defs::default();
     let first = session(db_of(FIXTURE), &memory, &defs, None, mode);
-    let mut forms = FxHashMap::default();
+    let mut forms = HashMap::default();
     for name in BODIES {
         let def = function(&first.db, name);
         forms.insert(name, stable(&first.db, &first.facts, def));
@@ -438,9 +439,9 @@ fn an_added_impl_misses_only_where_the_shape_lists_the_impls() {
     {
         let first = session(db_of(FIXTURE), &Arc::new(Memory::default()), &defs, None, Mode::Serve);
         let names = |def| {
-            first.facts.names.lock().unwrap().clear();
+            first.facts.names.lock().clear();
             let _ = InferenceResult::of(&first.db, def);
-            first.facts.names.lock().unwrap().clone()
+            first.facts.names.lock().clone()
         };
         let show = names(function(&first.db, "uses_show"));
         assert!(show.iter().any(|it| is_impl_table(it)), "a method call reads an impl table: {show:?}");
@@ -467,7 +468,7 @@ fn a_refused_read_is_tallied_by_name_and_nothing_is_stored() {
     let defs = Defs::default();
     let learn = session(db_of(FIXTURE), &Arc::new(Memory::default()), &defs, None, Mode::Serve);
     let _ = InferenceResult::of(&learn.db, function(&learn.db, "seven"));
-    let read = *learn.facts.names.lock().unwrap().first().expect("an inference reads something");
+    let read = *learn.facts.names.lock().first().expect("an inference reads something");
     drop(learn);
 
     let memory = Arc::new(Memory::default());

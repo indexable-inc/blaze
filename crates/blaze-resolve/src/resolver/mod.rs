@@ -67,7 +67,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use rustc_hash::FxBuildHasher;
+use blaze_hash::FixedState;
 use tracing::{debug, trace};
 
 use crate::interning::InternedString;
@@ -92,8 +92,8 @@ pub use self::version_prefs::VersionOrdering;
 pub use self::version_prefs::VersionPreferences;
 
 pub(crate) type CargoResult<T> = anyhow::Result<T>;
-pub(crate) type HashMap<K, V> = rustc_hash::FxHashMap<K, V>;
-pub(crate) type HashSet<K> = rustc_hash::FxHashSet<K>;
+pub(crate) type HashMap<K, V> = blaze_hash::HashMap<K, V>;
+pub(crate) type HashSet<K> = blaze_hash::HashSet<K>;
 
 mod conflict_cache;
 mod context;
@@ -980,9 +980,9 @@ fn check_cycles(resolve: &Resolve) -> CargoResult<()> {
     // We visit each node at most once and we keep
     // track of the path through the graph as we walk it. If we walk onto the
     // same node twice that's a cycle.
-    let mut checked = HashSet::with_capacity_and_hasher(resolve.len(), FxBuildHasher);
+    let mut checked = HashSet::with_capacity_and_hasher(resolve.len(), FixedState);
     let mut path = Vec::with_capacity(4);
-    let mut visited = HashSet::with_capacity_and_hasher(4, FxBuildHasher);
+    let mut visited = HashSet::with_capacity_and_hasher(4, FixedState);
     for pkg in resolve.iter() {
         if !checked.contains(&pkg) {
             visit(resolve, pkg, &mut visited, &mut path, &mut checked)?

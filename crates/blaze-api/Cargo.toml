@@ -15,13 +15,13 @@ doctest = false
 
 [dependencies]
 blaze-core.workspace = true
+blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
 blaze-protocol.workspace = true
 blaze-query.workspace = true
 blaze-vfs.workspace = true
 memchr.workspace = true
-rustc-hash.workspace = true
 serde = { workspace = true, features = ["derive"] }
 sonic-rs.workspace = true
 

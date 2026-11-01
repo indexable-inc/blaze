@@ -20,17 +20,18 @@
 //!   global trait goals' answers (`hir_ty::next_solver::goal_store`). Each is served with the
 //!   images and stored where they are.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use base_db::{Crate, Db, Env};
 use blaze_api::{ApiError, Diagnostic, Level, ServedCrate, ServedPart};
 use blaze_cas::{Key, Kind};
 use blaze_diagnostics::{Diag, Options, cache};
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::ContentId;
+use blaze_lower::Lowered;
 use hir_def::deps::{Held, ImageBuf, ImageStore, Mode, Served};
 use hir_ty::{body_store, next_solver::goal_store};
-use blaze_lower::Lowered;
-use rustc_hash::{FxHashMap, FxHashSet};
+use parking_lot::Mutex;
 
 use super::{Job, compile, graph};
 use crate::serve::work::Put;
@@ -137,7 +138,7 @@ pub(crate) struct Session {
     checks: Arc<cache::Served>,
     /// Why [`hir_def::deps::store`] wrote no image of each crate it last refused, for the
     /// report of the builds that read the database after ([`served`]).
-    refused: FxHashMap<Crate, String>,
+    refused: HashMap<Crate, String>,
 }
 
 /// The session of `lowered`'s database over `store`, its goal store and item store installed
@@ -165,7 +166,7 @@ pub(crate) fn session(lowered: &Lowered, store: &blaze_cas::Reader, env: &[(Stri
         }
     };
     let checks = Arc::new(cache::Served::default()); // alloc: setup, once per database
-    Ok(Session { installed, items, images, checks, refused: FxHashMap::default() })
+    Ok(Session { installed, items, images, checks, refused: HashMap::default() })
 }
 
 /// What the job's `BLAZE_ITEM_STORE` asks of the item store: unset serves what it holds,
@@ -416,10 +417,10 @@ pub(crate) fn flushed(flushed: &goal_store::Flushed) -> Diagnostic {
 /// why. A crate read from no image is refused both, with the reason [`hir_def::deps::store`]
 /// last gave for it, or [`cache::Refused::NoImage`]'s when it has given none.
 pub(crate) fn served(db: &Db, job: &Job, session: &Session) -> Result<Vec<ServedCrate>, ApiError> {
-    let later = job.later.lock().unwrap_or_else(|it| it.into_inner());
+    let later = job.later.lock();
     // alloc: once per build, one entry per dependency crate checked
-    let outcomes: FxHashMap<Crate, Option<&str>> = later.iter().map(|it| (it.krate, it.refused.as_deref())).collect();
-    let mut seen = FxHashSet::default();
+    let outcomes: HashMap<Crate, Option<&str>> = later.iter().map(|it| (it.krate, it.refused.as_deref())).collect();
+    let mut seen = HashSet::default();
     let mut lines = Vec::new(); // alloc: once per build, one line per dependency library
     for unit in 0..job.graph.len() {
         let Some(krate) = job.crates.krate(unit) else { continue };
@@ -498,7 +499,7 @@ impl Images {
 
     /// What it was asked to keep since the last take, in the order asked.
     fn take_puts(&self) -> Vec<Put> {
-        std::mem::take(&mut *self.puts.lock().unwrap_or_else(|it| it.into_inner()))
+        std::mem::take(&mut *self.puts.lock())
     }
 }
 
@@ -532,7 +533,7 @@ impl ImageStore for Images {
             Ok(None) => {}
             Err(corrupt) => return Err(corrupt.to_string()),
         }
-        let mut puts = self.puts.lock().unwrap_or_else(|it| it.into_inner());
+        let mut puts = self.puts.lock();
         match puts.iter().find(|it| it.key == Key(key)) {
             Some(put) if put.bytes == value => {}
             Some(_) => return Err(format!("two images were made under {key:?}")),

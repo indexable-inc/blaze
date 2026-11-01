@@ -5,11 +5,12 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
 
 use blaze_codegen::memo::Memo;
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
-use rustc_hash::FxHashMap;
+use parking_lot::{Mutex, MutexGuard};
 
 /// How many entries the memo may hold past what the kept front ends used before a job's start
 /// collects it: a collection is a pass over every entry, so it runs only once there is this
@@ -25,7 +26,7 @@ pub(crate) struct Memos {
 #[derive(Default)]
 struct KeptSets {
     next: u64,
-    sets: FxHashMap<u64, Box<[ContentId]>>,
+    sets: HashMap<u64, Box<[ContentId]>>,
     /// The sum of the sets' lengths, at least their union's.
     total: usize,
 }
@@ -98,7 +99,7 @@ impl Drop for Held {
 
 fn lock<T>(it: &Mutex<T>) -> MutexGuard<'_, T> {
     // Nothing is left half-changed under either lock by a panic: each change is one step.
-    it.lock().unwrap_or_else(PoisonError::into_inner)
+    it.lock()
 }
 
 #[cfg(test)]

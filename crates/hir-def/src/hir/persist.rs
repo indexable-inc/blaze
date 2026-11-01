@@ -24,14 +24,14 @@ use std::mem::{offset_of, size_of};
 use std::ops::{Deref, DerefMut};
 
 use blaze_format::{FormatError, Slice, Str, Writer};
+use blaze_hash::{FixedState, HashMap};
 use cfg::{CfgAtom, CfgExpr};
 use hir_expand::{
     HirFileId, InFile, MacroCallId,
     mod_path::{ModPath, PathKind},
     name::Name,
 };
-use intern::{Interned, Internable, Symbol};
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use intern::{Internable, Interned, Symbol};
 use smallvec::SmallVec;
 use span::{Edition, ErasedFileAstId, FileAstId, Span, SpanAnchor, SyntaxContext};
 use syntax::{TextRange, TextSize};
@@ -171,7 +171,7 @@ relocate! {
 #[derive(Default, Debug)]
 pub(crate) struct Relocation {
     entries: Vec<(Kind, u64)>,
-    indexes: FxHashMap<(Kind, u64), u32>,
+    indexes: HashMap<(Kind, u64), u32>,
 }
 
 impl Relocation {
@@ -181,7 +181,7 @@ impl Relocation {
 
     /// The table of a buffer being read: entry `i` is the id index `i` names.
     pub(crate) fn of(entries: Vec<(Kind, u64)>) -> Relocation {
-        Relocation { entries, indexes: FxHashMap::default() }
+        Relocation { entries, indexes: HashMap::default() }
     }
 
     /// The index of the id of `kind` whose bits are `bits`, added when it is new.
@@ -362,10 +362,10 @@ pub(crate) struct WordsBuffers {
     names: Vec<(u32, u32)>,
     /// The last name of each text's hash; earlier names of the same hash are chained in
     /// `same_hash`.
-    by_hash: FxHashMap<u64, u32>,
+    by_hash: HashMap<u64, u32>,
     /// For each name, the name before it with the same hash, [`NO_NAME`] for none.
     same_hash: Vec<u32>,
-    by_symbol: FxHashMap<Symbol, u32>,
+    by_symbol: HashMap<Symbol, u32>,
     /// What [`Words::place`] builds the name column in.
     placed: Vec<Str>,
 }
@@ -503,7 +503,7 @@ impl Words {
     }
 
     fn name(&mut self, text: &str) -> u32 {
-        let hash = FxBuildHasher.hash_one(text);
+        let hash = FixedState.hash_one(text);
         let mut at = self.by_hash.get(&hash).copied().unwrap_or(NO_NAME);
         while at != NO_NAME {
             let (start, len) = self.names[at as usize];
@@ -1327,7 +1327,7 @@ mod tests {
         // A collision: two names chained under one hash are still found by their text.
         let mut w = Words::new();
         let (first, second) = (w.name("x"), w.name("y"));
-        let hash = FxBuildHasher.hash_one("x");
+        let hash = FixedState.hash_one("x");
         w.by_hash.insert(hash, second);
         w.same_hash[second as usize] = first;
         assert_eq!(w.name("x"), first);
@@ -1453,12 +1453,12 @@ mod tests {
     #[test]
     fn jobs_in_scopes_of_their_own_resume_on_one_thread_in_swapped_order_in_their_own() {
         use std::sync::{
-            Arc, Mutex,
+            Arc,
             atomic::{AtomicUsize, Ordering},
-            mpsc,
         };
 
         use blaze_graph::{Key, pool::Pool, pump::Flights, topology::Topology};
+        use parking_lot::Mutex;
 
         fn scopes_here() -> (Option<Option<u64>>, usize) {
             (unrelocated(Kind::Struct, 0), blank_segments(0))
@@ -1467,7 +1467,7 @@ mod tests {
         let pool = Pool::new(&Topology::flat(1), false).unwrap();
         let flights = Arc::new(Flights::<u32>::new());
         let run = |what: &'static str, f: Box<dyn FnOnce() + Send>| {
-            let (tx, rx) = mpsc::channel::<Result<(), String>>();
+            let (tx, rx) = crossbeam_channel::unbounded::<Result<(), String>>();
             pool.submit(None, f, move |it| _ = tx.send(it.map_err(|_| format!("{what} panicked"))));
             rx.recv().unwrap().unwrap();
         };
@@ -1478,7 +1478,7 @@ mod tests {
                 bytes[4] = 2;
                 Key(bytes)
             });
-            let (tx, rx) = mpsc::channel::<Result<u32, String>>();
+            let (tx, rx) = crossbeam_channel::unbounded::<Result<u32, String>>();
             let waiting = Arc::new(AtomicUsize::new(0));
             let order = Arc::new(Mutex::new(Vec::new()));
             let parked = |count: usize| {
@@ -1504,7 +1504,7 @@ mod tests {
                             })
                         });
                         assert_eq!(scopes_here(), (None, 0), "a job kept scopes it left");
-                        order.lock().unwrap().push(mine);
+                        order.lock().push(mine);
                         mine
                     },
                     move |it| _ = tx.send(it.map_err(|_| format!("job {mine} of round {round} panicked"))),
@@ -1519,7 +1519,7 @@ mod tests {
                     Ok(round)
                 });
                 assert_eq!(held, Ok(round));
-                while order.lock().unwrap().is_empty() {
+                while order.lock().is_empty() {
                     std::thread::yield_now();
                 }
                 Ok(round)
@@ -1528,7 +1528,7 @@ mod tests {
             let mut ended = [rx.recv().unwrap(), rx.recv().unwrap()];
             ended.sort();
             assert_eq!(ended, [Ok(0), Ok(1)]);
-            assert_eq!(*order.lock().unwrap(), [1, 0], "the jobs did not resume in the swapped order");
+            assert_eq!(*order.lock(), [1, 0], "the jobs did not resume in the swapped order");
             run("a later job", Box::new(|| assert_eq!(scopes_here(), (None, 0), "a job came on in its worker's scopes")));
         }
     }

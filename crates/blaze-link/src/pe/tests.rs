@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use blaze_bytes::le::{u32 as u32_at, u64 as u64_at};
 use blaze_codegen::Arch;

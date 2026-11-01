@@ -5,13 +5,13 @@
 use std::hint::black_box;
 
 use blaze_alloc_count::assert_at_most;
+use blaze_hash::HashSet;
+use hir_expand::fixture;
 use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::Name,
 };
 use intern::Symbol;
-use rustc_hash::FxHashSet;
-use hir_expand::fixture;
 
 use crate::{
     AssocItemId, DefWithBodyId, TraitId,
@@ -188,7 +188,7 @@ fn the_traits_in_scope_through_a_visitor_allocate_nothing() {
     for it in [tr, local, pre] {
         assert!(all.contains(&it), "{it:?} is not among the traits in scope: {all:?}");
     }
-    let mut kept = FxHashSet::default();
+    let mut kept = HashSet::default();
     resolver.traits_in_scope_into(&db, &mut kept);
 
     let (visited, has) = assert_at_most(0, "the traits in scope through a visitor", || {

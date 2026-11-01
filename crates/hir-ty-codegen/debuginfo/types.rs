@@ -15,15 +15,15 @@ use hir_def::{
     hir::generics::GenericParamDataRef, item_tree::FieldsShape as Written,
 };
 
+use blaze_hash::{Equivalent, HashMap, SharedMap};
 use rustc_abi::{TagEncoding, Variants};
-use rustc_hash::FxHashMap;
 use rustc_type_ir::{
     UintTy,
     inherent::{BoundExistentialPredicates as _, GenericArgs as _, IntoKind},
 };
 
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use intern::{Interned, Symbol};
 
@@ -73,58 +73,52 @@ pub(crate) fn told_type(
 pub(crate) struct Sets(ByEnv<Key, Option<TypeSet>>);
 
 /// What is known of types by the environment they are in, which every thread that compiles
-/// asks of every variable it tells of: in shards by the type, each locked apart, and looked up
-/// without a copy of the environment or the type, whose counts every thread would write to.
-pub(crate) struct ByEnv<K, V>(Box<[Mutex<FxHashMap<StoredParamEnvAndCrate, FxHashMap<K, V>>>]>);
+/// asks of every variable it tells of: one lock-free table, looked up with no lock and without
+/// a copy of the environment or the type, whose counts every thread would write to.
+pub(crate) struct ByEnv<K, V>(SharedMap<(StoredParamEnvAndCrate, K), V>);
 
 impl<K, V> Default for ByEnv<K, V> {
     fn default() -> Self {
-        // alloc: the shards, once per build, setup
-        ByEnv((0..64).map(|_| Mutex::default()).collect())
+        ByEnv(SharedMap::default())
     }
 }
 
-/// The types of `env` in `shard`, a new map the first time.
-fn of_env<'s, K, V>(
-    shard: &'s mut FxHashMap<StoredParamEnvAndCrate, FxHashMap<K, V>>,
-    env: &StoredParamEnvAndCrate,
-) -> &'s mut FxHashMap<K, V> {
-    if !shard.contains_key(env) {
-        // clone: the environment's count, once per environment and shard
-        shard.insert(env.clone(), FxHashMap::default());
+/// A key of [`ByEnv`], borrowed: hashed as the pair is, so a lookup counts nothing.
+struct Of<'a, K>(&'a StoredParamEnvAndCrate, &'a K);
+
+impl<K: std::hash::Hash> std::hash::Hash for Of<'_, K> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+        self.1.hash(state);
     }
-    shard.get_mut(env).expect("the environment's types were put in above")
+}
+
+impl<K: Eq> Equivalent<(StoredParamEnvAndCrate, K)> for Of<'_, K> {
+    fn equivalent(&self, (env, key): &(StoredParamEnvAndCrate, K)) -> bool {
+        self.0 == env && self.1 == key
+    }
 }
 
 impl<K: std::hash::Hash + Eq + Clone, V: Clone> ByEnv<K, V> {
-    fn shard(&self, key: &K) -> MutexGuard<'_, FxHashMap<StoredParamEnvAndCrate, FxHashMap<K, V>>> {
-        use std::hash::BuildHasher as _;
-        let hash = rustc_hash::FxBuildHasher.hash_one(key);
-        let shard = &self.0[(hash >> 32) as usize % self.0.len()];
-        shard.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     pub(crate) fn get(&self, env: &StoredParamEnvAndCrate, key: &K) -> Option<V> {
-        self.shard(key).get(env)?.get(key).cloned()
+        self.0.pin().get(&Of(env, key)).cloned()
     }
 
     pub(crate) fn insert(&self, env: &StoredParamEnvAndCrate, key: &K, value: V) {
-        let mut shard = self.shard(key);
-        // clone: the key kept, a count; once per type kept
-        of_env(&mut *shard, env).insert(key.clone(), value);
+        // clone: the environment and the key kept, counts; once per type kept
+        self.0.pin().insert((env.clone(), key.clone()), value);
     }
 
     /// What was kept of `key` before, or else `value`, kept now.
     pub(crate) fn or_insert(&self, env: &StoredParamEnvAndCrate, key: &K, value: V) -> V {
-        let mut shard = self.shard(key);
-        let types = of_env(&mut *shard, env);
-        if let Some(kept) = types.get(key) {
+        let types = self.0.pin();
+        if let Some(kept) = types.get(&Of(env, key)) {
             // clone: a count of what was kept, which the caller takes owned
             return kept.clone();
         }
-        // clone: the key kept and a count of the value, once per type kept
-        types.insert(key.clone(), value.clone());
-        value
+        // clone: the environment and the key kept, counts; once per type kept. Of two threads
+        // that keep one key at once, the first's value is what both return.
+        types.get_or_insert((env.clone(), key.clone()), value).clone()
     }
 }
 
@@ -188,8 +182,8 @@ struct Types<'db> {
     /// The types the one being told of is made of so far, by the places the [`DebugType`] it
     /// is told as names them by.
     parts: Vec<Made<Key>>,
-    names: FxHashMap<Ty<'db>, Option<String>>,
-    normalized: FxHashMap<Ty<'db>, Ty<'db>>,
+    names: HashMap<Ty<'db>, Option<String>>,
+    normalized: HashMap<Ty<'db>, Ty<'db>>,
 }
 
 impl<'db> Types<'db> {
@@ -203,8 +197,8 @@ impl<'db> Types<'db> {
             infcx,
             // alloc: empty until a type is told of; its parts end in the `Own` kept
             parts: Vec::new(),
-            names: FxHashMap::default(),
-            normalized: FxHashMap::default(),
+            names: HashMap::default(),
+            normalized: HashMap::default(),
         }
     }
 

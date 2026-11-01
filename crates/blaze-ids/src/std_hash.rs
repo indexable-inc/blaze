@@ -1,108 +1,30 @@
-//! A value's derived [`std::hash::Hash`] as bytes the same on every target and in every run:
-//! every integer written little-endian at a fixed width, `usize` and `isize` as 64 bits.
-//!
-//! [`fixed_width_writes!`](crate::fixed_width_writes) is the `write_u8`..`write_isize` half of a
-//! `std::hash::Hasher` that does this, for any hasher with its own `write`; [`StdHash`] is one
-//! over a [`Hasher`], so a type whose `Hash` covers what its `Eq` compares and writes no address
-//! (a foreign type such as `rustc_abi`'s layouts) is hashed as content with [`Hasher::std`]. A
-//! `Hash` that writes an address (an `Interned` of `crates/intern`, a raw pointer) is not
-//! deterministic and must not be fed this way; feed such parts by content ID.
+//! A value's derived [`std::hash::Hash`] fed to a [`Hasher`] through
+//! [`blaze_hash::Blake3Hasher`], integers at a fixed width: [`Hasher::std`].
 
 use std::hash::Hash;
 
+pub use blaze_hash::fixed_width_writes;
+use blaze_hash::{Blake3, Blake3Hasher};
+
 use crate::Hasher;
 
-/// The integer methods of a `std::hash::Hasher`, each writing its argument's little-endian
-/// bytes through `self.write`, `usize` as `u64` and `isize` as `i64`. Goes inside the
-/// `impl std::hash::Hasher for ..` block, beside its own `write` and `finish`.
-#[macro_export]
-macro_rules! fixed_width_writes {
-    () => {
-        #[inline]
-        fn write_u8(&mut self, it: u8) {
-            self.write(&[it]);
-        }
+impl Blake3 for Hasher {
+    #[inline]
+    fn update(&mut self, bytes: &[u8]) {
+        Hasher::update(self, bytes);
+    }
 
-        #[inline]
-        fn write_u16(&mut self, it: u16) {
-            self.write(&it.to_le_bytes());
-        }
-
-        #[inline]
-        fn write_u32(&mut self, it: u32) {
-            self.write(&it.to_le_bytes());
-        }
-
-        #[inline]
-        fn write_u64(&mut self, it: u64) {
-            self.write(&it.to_le_bytes());
-        }
-
-        #[inline]
-        fn write_u128(&mut self, it: u128) {
-            self.write(&it.to_le_bytes());
-        }
-
-        #[inline]
-        fn write_usize(&mut self, it: usize) {
-            self.write(&(it as u64).to_le_bytes());
-        }
-
-        #[inline]
-        fn write_i8(&mut self, it: i8) {
-            self.write(&it.to_le_bytes());
-        }
-
-        #[inline]
-        fn write_i16(&mut self, it: i16) {
-            self.write(&it.to_le_bytes());
-        }
-
-        #[inline]
-        fn write_i32(&mut self, it: i32) {
-            self.write(&it.to_le_bytes());
-        }
-
-        #[inline]
-        fn write_i64(&mut self, it: i64) {
-            self.write(&it.to_le_bytes());
-        }
-
-        #[inline]
-        fn write_i128(&mut self, it: i128) {
-            self.write(&it.to_le_bytes());
-        }
-
-        #[inline]
-        fn write_isize(&mut self, it: isize) {
-            self.write(&(it as i64).to_le_bytes());
-        }
-    };
-}
-
-/// A `std::hash::Hasher` feeding a [`Hasher`], integers at a fixed width.
-pub struct StdHash<'a>(pub &'a mut Hasher);
-
-impl std::hash::Hasher for StdHash<'_> {
-    /// The first 64 bits of what was fed so far: no `Hash` impl reads it, but the trait asks.
-    fn finish(&self) -> u64 {
+    fn first_word(&self) -> u64 {
         let mut word = [0; 8];
-        word.copy_from_slice(&self.0.finish().0[..8]);
+        word.copy_from_slice(&self.finish().0[..8]);
         u64::from_le_bytes(word)
     }
-
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        self.0.update(bytes);
-    }
-
-    crate::fixed_width_writes!();
 }
 
 impl Hasher {
     /// Feeds what `value`'s [`Hash`] writes, integers at a fixed width.
     pub fn std<T: Hash + ?Sized>(&mut self, value: &T) -> &mut Hasher {
-        value.hash(&mut StdHash(self));
+        value.hash(&mut Blake3Hasher(self));
         self
     }
 }

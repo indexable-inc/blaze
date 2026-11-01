@@ -11,7 +11,7 @@ use std::{
     time::SystemTime,
 };
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_hash::{HashMap, HashSet};
 
 use crate::{
     output::{LibraryPath, LinkArgTarget, Output},
@@ -159,7 +159,7 @@ pub struct GraphUnit<U, R> {
 pub fn to_link<U, R, G>(
     unit: U,
     graph: &G,
-    memo: &mut FxHashMap<U, BuildScripts<R>>,
+    memo: &mut HashMap<U, BuildScripts<R>>,
 ) -> BuildScripts<R>
 where
     U: Copy + Eq + Hash,
@@ -176,7 +176,7 @@ where
 pub fn to_link_in<'m, U, R, G>(
     unit: U,
     graph: &G,
-    memo: &'m mut FxHashMap<U, BuildScripts<R>>,
+    memo: &'m mut HashMap<U, BuildScripts<R>>,
 ) -> &'m BuildScripts<R>
 where
     U: Copy + Eq + Hash,
@@ -190,17 +190,13 @@ where
     &memo[&unit]
 }
 
-fn fill<U, R, G>(
-    unit: U,
-    node: GraphUnit<U, R>,
-    graph: &G,
-    memo: &mut FxHashMap<U, BuildScripts<R>>,
-) where
+fn fill<U, R, G>(unit: U, node: GraphUnit<U, R>, graph: &G, memo: &mut HashMap<U, BuildScripts<R>>)
+where
     U: Copy + Eq + Hash,
     R: Copy + Eq + Hash + Ord,
     G: Fn(&U) -> GraphUnit<U, R> + ?Sized,
 {
-    let mut seen = FxHashSet::default();
+    let mut seen = HashSet::default();
     let mut scripts =
         BuildScripts { to_link: Vec::with_capacity(node.own_runs.len()), plugins: BTreeSet::new() };
     for &run in &node.own_runs {
@@ -366,7 +362,7 @@ fn newest(path: &Path) -> Option<SystemTime> {
     if !meta.is_dir() {
         return Some(newest);
     }
-    let mut visited = FxHashSet::default();
+    let mut visited = HashSet::default();
     visited.extend(DirId::of(path, &meta));
     // alloc: setup: one stack per walk, one path per directory below.
     let mut pending = vec![path.to_owned()];

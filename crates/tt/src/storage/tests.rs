@@ -4,9 +4,9 @@
 
 use std::{fmt::Write as _, hash::BuildHasher, path::Path};
 
+use blaze_hash::FixedState;
 use blaze_ids::rng::SplitMix64;
 use hegel::generators as gs;
-use rustc_hash::FxBuildHasher;
 use span::ErasedFileAstId;
 
 use super::{varint::VarintTree, *};
@@ -512,7 +512,7 @@ fn equality_and_hash_are_those_of_the_token_trees() {
             assert_eq!(tree_a == tree_b, same);
             assert_eq!(model_a == model_b, same);
             if same {
-                assert_eq!(FxBuildHasher.hash_one(tree_a), FxBuildHasher.hash_one(tree_b));
+                assert_eq!(FixedState.hash_one(tree_a), FixedState.hash_one(tree_b));
             }
         }
     }
@@ -1055,7 +1055,7 @@ fn literal_codes_are_the_old_ones(tc: hegel::TestCase) {
 
 /// The scan-then-map index the in-process bridge's `Parts::index` had, before it took
 /// [`IndexTable`].
-fn old_index(list: &mut Vec<u32>, map: &mut rustc_hash::FxHashMap<u32, u32>, value: u32) -> u32 {
+fn old_index(list: &mut Vec<u32>, map: &mut blaze_hash::HashMap<u32, u32>, value: u32) -> u32 {
     if list.len() <= SCAN {
         if let Some(at) = list.iter().position(|it| *it == value) {
             return at as u32;
@@ -1078,7 +1078,7 @@ fn old_index(list: &mut Vec<u32>, map: &mut rustc_hash::FxHashMap<u32, u32>, val
 fn index_table_numbers_as_the_old_parts_did(tc: hegel::TestCase) {
     let values: Vec<u32> = tc.draw(gs::vecs(gs::integers().max_value(39)).max_size(199));
     let mut table = IndexTable::default();
-    let (mut list, mut map) = (Vec::new(), rustc_hash::FxHashMap::default());
+    let (mut list, mut map) = (Vec::new(), blaze_hash::HashMap::default());
     for &value in &values {
         assert_eq!(table.index(value), old_index(&mut list, &mut map, value));
     }

@@ -23,16 +23,15 @@
 
 use std::{
     collections::VecDeque,
-    hash::BuildHasher,
-    sync::{Arc, LazyLock, Mutex, OnceLock, atomic::Ordering},
+    sync::{Arc, LazyLock, OnceLock, atomic::Ordering},
 };
 
 use base_db::Db;
+use blaze_hash::{HashSet, SharedMap};
 use cranelift_codegen::ir;
 use hir_def::{attrs::AttrFlags, signatures::FunctionSignature};
 use hir_ty::{db::HirDatabase, next_solver::StoredGenericArgs, traits::StoredParamEnvAndCrate};
 use rustc_abi::ExternAbi;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use super::{
     Instance, InstanceDef,
@@ -100,7 +99,7 @@ pub(super) fn enabled() -> bool {
 /// The exports of what `recorder` calls that its compile imports, and of what those call in
 /// turn, the first first: what a call asks for is in the compile's names from then on.
 pub(super) fn chosen(recorder: &mut Recorder<'_>) -> Vec<Import> {
-    tallied(chosen_for(recorder, &FxHashSet::default(), BUDGET))
+    tallied(chosen_for(recorder, &HashSet::default(), BUDGET))
 }
 
 /// `chosen`, counted as imported.
@@ -116,13 +115,13 @@ pub(super) fn tallied(chosen: Vec<Import>) -> Vec<Import> {
 /// room of all of them and imports none of them: `defined` says which instances it has.
 pub(super) fn chosen_for(
     recorder: &mut Recorder<'_>,
-    defined: &FxHashSet<Instance>,
+    defined: &HashSet<Instance>,
     budget: usize,
 ) -> Vec<Import> {
     let db = recorder.db;
     // alloc: the result, owned by the caller; empty until an import is chosen
     let mut chosen = Vec::new();
-    let mut taken: FxHashSet<u32> = FxHashSet::default();
+    let mut taken: HashSet<u32> = HashSet::default();
     let mut spent = 0;
     // The calls to look at, by the number of the callee among the compile's requests, with
     // the share of a body's room left to it.
@@ -173,13 +172,8 @@ type Key = (InstanceDef, StoredGenericArgs, bool);
 
 /// The exports of the process, each built once: a compile that asks for one another is
 /// building waits for it, and no export asks for another while it is built.
-struct Exports {
-    shards: Vec<Mutex<FxHashMap<Key, Arc<OnceLock<Option<Arc<Export>>>>>>>,
-}
-
-static EXPORTS: LazyLock<Exports> =
-    // alloc: once per process, the table's shards
-    LazyLock::new(|| Exports { shards: (0..64).map(|_| Mutex::default()).collect() });
+static EXPORTS: LazyLock<SharedMap<Key, Arc<OnceLock<Option<Arc<Export>>>>>> =
+    LazyLock::new(Default::default);
 
 /// The export of `instance`, built if no compile asked for it before. `None` for one that is
 /// not imported: too large, a coroutine, or a body LLVM has no lowering for.
@@ -190,10 +184,8 @@ fn export(
 ) -> Option<Arc<Export>> {
     // clone: a refcount of the interned arguments, which the shared table keeps as its key
     let key = (instance.def, instance.args.clone(), instance.checked);
-    let shards = &EXPORTS.shards;
-    let shard = &shards[FxBuildHasher.hash_one(&key) as usize % shards.len()];
-    // clone: the slot's `Arc`, so the shard's lock is let go before the export is built
-    let slot = shard.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_default().clone();
+    // clone: the slot's `Arc`, so the table's guard is let go before the export is built
+    let slot = EXPORTS.pin().get_or_insert_with(key, Arc::default).clone();
     slot.get_or_init(|| {
         let start = stdx::time::Instant::now();
         let built = build(db, instance, env).map(Arc::new);

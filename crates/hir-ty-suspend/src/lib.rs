@@ -9,5 +9,7 @@ mod summary;
 #[cfg(test)]
 mod tests;
 
-pub use check::{Broken, Found, Held, Promise, Site, Why, suspend_check};
+pub use check::{
+    Broken, Found, Held, HeldLocal, Point, Promise, Site, Why, may_suspend_at, on_fiber, suspend_check, suspend_points,
+};
 pub use dispatch::Unseen;

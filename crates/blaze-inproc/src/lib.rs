@@ -671,7 +671,7 @@ impl CodeMemory {
     /// The cells part, to read with no lock while compiles and placements hold this memory.
     pub fn cell_view(&self) -> Option<CellView> {
         let (_, view) = self.cells.as_ref()?;
-        Some(CellView { view: view.clone(), start: self.image + self.arena_len, len: self.cells_len })
+        Some(CellView { view: Arc::clone(view), start: self.image + self.arena_len, len: self.cells_len })
     }
 
     /// Records that the run process `pid` mapped the memory.

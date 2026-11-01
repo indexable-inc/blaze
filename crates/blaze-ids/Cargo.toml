@@ -15,9 +15,11 @@ doctest = false
 
 [dependencies]
 blake3.workspace = true
+blaze-hash.workspace = true
 blaze-radix.workspace = true
 blaze-rng.workspace = true
 blaze-mem.workspace = true
+parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 smallvec.workspace = true
 thin-vec.workspace = true

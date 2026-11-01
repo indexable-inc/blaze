@@ -13,25 +13,26 @@
 
 use std::collections::BTreeMap;
 
+use blaze_hash::FixedState;
 use blaze_ids::radix;
 use blaze_mem::Frame;
 use hir::InFile;
-use rustc_hash::FxBuildHasher;
 use span::Edition;
 use syntax::{SyntaxKind, SyntaxNodePtr};
 use unicode_security::{
-    GeneralSecurityProfile, confusable_detection::skeleton, general_security_profile::IdentifierType,
-    is_potential_mixed_script_confusable_char, mixed_script::AugmentedScriptSet,
+    GeneralSecurityProfile, confusable_detection::skeleton,
+    general_security_profile::IdentifierType, is_potential_mixed_script_confusable_char,
+    mixed_script::AugmentedScriptSet,
 };
 
 use super::{Order, Symbol};
-use stdx::list::Join;
 use crate::{
     cx::Cx,
     lints::syntax::{Emitted, Pass, source_fact},
     lower::Phase,
     model::Diag,
 };
+use stdx::list::Join;
 
 /// The lints of `check_crate` over `symbols`, sorted by where each was first seen, at the
 /// crate root `krate`.
@@ -233,8 +234,8 @@ fn ident_string(name: &str, edition: Edition) -> String {
 /// with, the symbol it is given at). A symbol is confused with the first of the same skeleton
 /// unless both are ASCII; a non-ASCII symbol then takes an ASCII one's place.
 fn confusables<'f>(frame: &'f Frame, symbols: &[Symbol<'_>]) -> Vec<(usize, usize), &'f Frame> {
-    let mut by_skeleton: hashbrown::HashMap<&'f str, (usize, bool), FxBuildHasher, &'f Frame> =
-        hashbrown::HashMap::with_capacity_and_hasher_in(symbols.len(), FxBuildHasher, frame);
+    let mut by_skeleton: hashbrown::HashMap<&'f str, (usize, bool), FixedState, &'f Frame> =
+        hashbrown::HashMap::with_capacity_and_hasher_in(symbols.len(), FixedState, frame);
     let mut pairs = Vec::new_in(frame);
     // alloc: one buffer for the crate, reused across its symbols
     let mut buf = String::new();

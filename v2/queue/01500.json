@@ -1,0 +1,29 @@
+{
+  "id": "01500",
+  "from_lane": "no-fallback-front-lints-errors",
+  "owner": "coordinator",
+  "paths": [
+    "crates/test-utils/src/minicore.rs"
+  ],
+  "what": "minicore result region: add to impl<T, E> Result<T, E>: `pub fn ok(self) -> Option<T>` (under region:option, match Ok(t)=>Some(t), Err(_)=>None), `pub fn map_err<F, O: FnOnce(E) -> F>(self, op: O) -> Result<T, F>` (under region:fn), `pub fn unwrap_or_default(self) -> T where T: crate::default::Default` (under region:default). blaze::dropped_error fixtures (crates/blaze-lints/src/blaze/errors_tests.rs) call them on a core Result.",
+  "state": "applied",
+  "created": "2026-11-01T13:12:30Z",
+  "updated": "2026-11-01T13:25:33Z",
+  "taken_by": "coord-1030",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T13:12:30Z",
+      "by": "no-fallback-front-lints-errors",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T13:25:33Z",
+      "by": "coord-1030",
+      "action": "done",
+      "note": "applied to minicore.rs result region: map_err (region:fn), ok (region:option), unwrap_or_default (region:default). Tested by the queued blaze-lints --lib run."
+    }
+  ]
+}

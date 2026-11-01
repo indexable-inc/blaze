@@ -1624,7 +1624,7 @@ mod tests {
 
     /// The builders as they were before they moved onto the frame, to hold the new ones to.
     mod before {
-        use rustc_hash::FxHashMap;
+        use blaze_hash::HashMap;
 
         use super::super::*;
 
@@ -1641,7 +1641,7 @@ mod tests {
         }
 
         pub(super) fn ty_column<K: DenseKey>(entries: impl IntoIterator<Item = (K, StoredTy)>) -> TyColumn<K> {
-            let mut by_ty: FxHashMap<StoredTy, u32> = FxHashMap::default();
+            let mut by_ty: HashMap<StoredTy, u32> = HashMap::default();
             let mut tys = Vec::new();
             let at = dense(entries)
                 .into_iter()

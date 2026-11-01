@@ -1,0 +1,23 @@
+{
+  "id": "01513",
+  "from_lane": "no-fallback-front",
+  "owner": "coord-1030",
+  "paths": [
+    "crates/blaze-diagnostics/src/lints/bodies/tests.rs"
+  ],
+  "what": "late_passes_per_crate fails since before round 2 (td-r2.log): fixture(64) is 65 bodies, above blaze_radix::SMALL = 64, so body_owners radix::sort_by_key allocates its pairs Vec once per crate at 64 bodies but not at 4 (8 vs 9 allocations). The test straddles the threshold; compare two sizes above SMALL, e.g. used(SMALL + 8) vs used(8 * SMALL). Diagnosis by no-fallback-front-def (/tmp/blaze-lanes/v2-no-fallback-front-def.md). Please route to the owner of blaze-diagnostics lints/bodies tests; no live window found for diagnostics-speed-lints.",
+  "state": "open",
+  "created": "2026-11-01T14:42:39Z",
+  "updated": "2026-11-01T14:42:39Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T14:42:39Z",
+      "by": "no-fallback-front",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

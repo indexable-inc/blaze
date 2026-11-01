@@ -20,6 +20,7 @@ use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 
 use anyhow::{Context as _, bail};
+use blaze_hash::{FixedHasher, HashMap, HashSet};
 use blaze_manifest::config::CompileKind as ProfileKind;
 use blaze_manifest::profiles::{
     Lto, PanicStrategy, Profile, ProfileRoot, Strip, StripInner, UnitFor,
@@ -28,7 +29,6 @@ use blaze_manifest::targets::{CrateType, Target, TargetKind};
 use blaze_resolve::resolver::FeaturesFor;
 use blaze_resolve::{DepKind, Dependency, InternedString, PackageId, Resolve};
 use cargo_util_schemas::manifest::TomlDebugInfo;
-use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use crate::{Filter, Intent, LibRule, Package, Platformed, Request, Rule, order, schema};
 
@@ -192,7 +192,7 @@ use tests::{external, output};
 /// that share its hash.
 #[derive(Default)]
 struct Chains {
-    heads: FxHashMap<u64, u32>,
+    heads: HashMap<u64, u32>,
     /// The entry before each in its chain.
     next: Vec<u32>,
 }
@@ -233,7 +233,7 @@ impl Chains {
 #[derive(Default)]
 struct Names {
     all: Vec<InternedString>,
-    ids: FxHashMap<usize, u32>,
+    ids: HashMap<usize, u32>,
 }
 
 impl Names {
@@ -283,7 +283,7 @@ impl FeatureSets {
     }
 
     fn intern(&mut self, features: &[InternedString]) -> u32 {
-        let mut hasher = FxHasher::default();
+        let mut hasher = FixedHasher::default();
         hasher.write_usize(features.len());
         for it in features {
             hasher.write_usize(it.as_str().as_ptr() as usize);
@@ -352,7 +352,7 @@ impl Profiles {
 }
 
 /// Hashes what `Profile`'s `PartialEq` compares.
-fn hash_class(p: &Profile, h: &mut FxHasher) {
+fn hash_class(p: &Profile, h: &mut FixedHasher) {
     p.opt_level.hash(h);
     match &p.lto {
         Lto::Off => h.write_u8(0),
@@ -387,13 +387,13 @@ fn hash_class(p: &Profile, h: &mut FxHasher) {
 }
 
 fn class_hash(p: &Profile) -> u64 {
-    let mut h = FxHasher::default();
+    let mut h = FixedHasher::default();
     hash_class(p, &mut h);
     h.finish()
 }
 
 fn exact_hash(p: &Profile) -> u64 {
-    let mut h = FxHasher::default();
+    let mut h = FixedHasher::default();
     hash_class(p, &mut h);
     p.name.hash(&mut h);
     (p.root == ProfileRoot::Release).hash(&mut h);
@@ -456,7 +456,7 @@ struct PkgDep<'a> {
     id: PackageId,
     /// Whether the dependent depends on it publicly (cargo's `public_dependencies`).
     public: bool,
-    deps: &'a FxHashSet<Dependency>,
+    deps: &'a HashSet<Dependency>,
 }
 
 /// What decides which of a package's dependencies a unit builds with (cargo's `State::deps`).
@@ -616,7 +616,7 @@ struct Shared {
     /// The dependencies of the units being shared, a stack of each one's.
     scratch: Vec<Dep>,
     /// A profile with `strip` lowered and its debuginfo settled, by the profile and how.
-    adjusted: FxHashMap<(u32, u8), u32>,
+    adjusted: HashMap<(u32, u8), u32>,
     /// Whether the target's units become the host's (no `--target`).
     to_host: bool,
 }
@@ -651,13 +651,13 @@ struct State<'r, 'a> {
     /// Each kind as a profile reads it.
     profile_kinds: [ProfileKind; 2],
     pkgs: Vec<Pkg<'a>>,
-    pkg_index: FxHashMap<PackageId, u32>,
+    pkg_index: HashMap<PackageId, u32>,
     pkg_deps: Vec<PkgDep<'a>>,
     target_lists: Vec<u32>,
     public: Vec<PackageId>,
 
     units: Vec<Row>,
-    by_key: FxHashMap<Key, u32>,
+    by_key: HashMap<Key, u32>,
     /// Each unit's edges in `built`, in the order computed; [`NONE`] until it is walked.
     ranges: Vec<(u32, u32)>,
     built: Vec<Dep>,
@@ -665,7 +665,7 @@ struct State<'r, 'a> {
 
     profiles: Profiles,
     /// The profile of a package's unit for a use and kind (cargo's `get_profile`).
-    profile_of: FxHashMap<(u32, UnitFor, Kind), u32>,
+    profile_of: HashMap<(u32, UnitFor, Kind), u32>,
     /// The profile of the run of a build script, by the profile of the unit it runs for.
     run_profile_of: Vec<u32>,
     features: FeatureSets,
@@ -673,11 +673,11 @@ struct State<'r, 'a> {
     features_of: Vec<u32>,
     /// cargo's `resolve_all_features` less the package's own: `(dep, feature)` for each
     /// feature on in each dependency, by package, whether dev-dependencies count, and kind.
-    dep_features: FxHashMap<(u32, bool, Kind), (u32, u32)>,
+    dep_features: HashMap<(u32, bool, Kind), (u32, u32)>,
     dep_feature_pairs: Vec<(InternedString, InternedString)>,
     names: Names,
     /// The names a package calls another's target by (cargo's `extern_crate_name_and_dep_name`).
-    extern_names: FxHashMap<(u32, u32, u32), (u32, u32)>,
+    extern_names: HashMap<(u32, u32, u32), (u32, u32)>,
     ranks: Ranks,
 }
 
@@ -742,7 +742,7 @@ impl<'r, 'a> State<'r, 'a> {
         sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         let targets: usize = sorted.iter().map(|it| it.2.manifest.targets.len()).sum();
         let mut pkgs = Vec::with_capacity(n);
-        let mut pkg_index = FxHashMap::with_capacity_and_hasher(n, Default::default());
+        let mut pkg_index = HashMap::with_capacity_and_hasher(n, Default::default());
         let mut target_lists = Vec::with_capacity(targets);
         for (_, id, package) in sorted {
             pkg_index.insert(id, pkgs.len() as u32);
@@ -781,20 +781,20 @@ impl<'r, 'a> State<'r, 'a> {
             target_lists,
             public: Vec::with_capacity(4),
             units: Vec::with_capacity(units),
-            by_key: FxHashMap::with_capacity_and_hasher(units, Default::default()),
+            by_key: HashMap::with_capacity_and_hasher(units, Default::default()),
             ranges: Vec::with_capacity(units),
             built: Vec::with_capacity(units * 4),
             stack: Vec::with_capacity(64),
             profiles: Profiles::default(),
-            profile_of: FxHashMap::with_capacity_and_hasher(n * 2, Default::default()),
+            profile_of: HashMap::with_capacity_and_hasher(n * 2, Default::default()),
             run_profile_of: Vec::with_capacity(8),
             features: FeatureSets::default(),
             // alloc: a column per build.
             features_of: vec![NONE; n * 2],
-            dep_features: FxHashMap::default(),
+            dep_features: HashMap::default(),
             dep_feature_pairs: Vec::with_capacity(16),
             names: Names::default(),
-            extern_names: FxHashMap::with_capacity_and_hasher(n * 4, Default::default()),
+            extern_names: HashMap::with_capacity_and_hasher(n * 4, Default::default()),
             ranks: Ranks::new(n),
         }
     }
@@ -1517,7 +1517,7 @@ impl<'r, 'a> State<'r, 'a> {
             // alloc: a column per build.
             memo: vec![NONE; n],
             scratch: Vec::with_capacity(64),
-            adjusted: FxHashMap::default(),
+            adjusted: HashMap::default(),
             to_host: self.request.target.is_none(),
         };
         shared.offsets.push(0);
@@ -1560,7 +1560,7 @@ impl<'r, 'a> State<'r, 'a> {
         let profile = self.adjusted(sh, row.profile, strip, debuginfo);
         let key = Key { kind, class: self.profiles.class_of[profile as usize], ..row.key };
 
-        let mut hasher = FxHasher::default();
+        let mut hasher = FixedHasher::default();
         key.hash(&mut hasher);
         for dep in &sh.scratch[base..] {
             hasher.write_u32(dep.unit);

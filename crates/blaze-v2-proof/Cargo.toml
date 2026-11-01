@@ -24,6 +24,7 @@ blaze-graph.workspace = true
 blaze-ids.workspace = true
 blaze-protocol.workspace = true
 blaze-query.workspace = true
+parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 

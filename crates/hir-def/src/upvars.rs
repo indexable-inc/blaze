@@ -1,11 +1,11 @@
 //! A simple query to collect tall locals (upvars) a closure use.
 
 use base_db::Db;
+use blaze_hash::{FixedState, HashMap};
 use blaze_ids::radix;
 use blaze_mem::frame::Frame;
 use hir_expand::mod_path::{ModPath, PathKind};
 use intern::{Symbol, sym};
-use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::{
     DefWithBodyId, ExpressionStoreOwnerId, GenericDefId, VariantId,
@@ -71,7 +71,7 @@ impl UpvarsRef<'_> {
 pub fn upvars_mentioned(
     db: &Db,
     owner: ExpressionStoreOwnerId,
-) -> Option<&FxHashMap<ExprId, Upvars>> {
+) -> Option<&HashMap<ExprId, Upvars>> {
     return match owner {
         ExpressionStoreOwnerId::Signature(owner) => signature_upvars_mentioned(db, owner),
         ExpressionStoreOwnerId::Body(owner) => body_upvars_mentioned(db, owner),
@@ -82,7 +82,7 @@ pub fn upvars_mentioned(
     pub fn signature_upvars_mentioned(
         db: &Db,
         owner: GenericDefId,
-    ) -> Option<Box<FxHashMap<ExprId, Upvars>>> {
+    ) -> Option<Box<HashMap<ExprId, Upvars>>> {
         upvars_mentioned_impl(db, owner.into())
     }
 
@@ -90,7 +90,7 @@ pub fn upvars_mentioned(
     pub fn body_upvars_mentioned(
         db: &Db,
         owner: DefWithBodyId,
-    ) -> Option<Box<FxHashMap<ExprId, Upvars>>> {
+    ) -> Option<Box<HashMap<ExprId, Upvars>>> {
         upvars_mentioned_impl(db, owner.into())
     }
 
@@ -98,7 +98,7 @@ pub fn upvars_mentioned(
     pub fn variant_fields_upvars_mentioned(
         db: &Db,
         owner: VariantId,
-    ) -> Option<Box<FxHashMap<ExprId, Upvars>>> {
+    ) -> Option<Box<HashMap<ExprId, Upvars>>> {
         upvars_mentioned_impl(db, owner.into())
     }
 }
@@ -106,7 +106,7 @@ pub fn upvars_mentioned(
 fn upvars_mentioned_impl(
     db: &Db,
     owner: ExpressionStoreOwnerId,
-) -> Option<Box<FxHashMap<ExprId, Upvars>>> {
+) -> Option<Box<HashMap<ExprId, Upvars>>> {
     let store = ExpressionStore::of(db, owner);
     store.expr_roots().next()?;
     // Most bodies have no closure: they need no resolver and no walk.
@@ -114,7 +114,7 @@ fn upvars_mentioned_impl(
         return None;
     }
     blaze_mem::frame::current(|frame| {
-        let mut binding_names = hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame);
+        let mut binding_names = hashbrown::HashSet::with_hasher_in(FixedState, frame);
         binding_names.extend(store.bindings().map(|(_, binding)| *binding.name.symbol()));
         let mut visitor = UpvarsMentionedVisitor {
             db,
@@ -132,7 +132,7 @@ fn upvars_mentioned_impl(
         }
         // alloc: the memo's map, exact
         let mut result =
-            FxHashMap::with_capacity_and_hasher(visitor.closures.len(), FxBuildHasher);
+            HashMap::with_capacity_and_hasher(visitor.closures.len(), FixedState);
         result.extend(visitor.closures.drain(..));
         // alloc: the memo's box, once per body with a capture
         Some(Box::new(result))
@@ -145,7 +145,7 @@ struct UpvarsMentionedVisitor<'db, 'f> {
     owner: ExpressionStoreOwnerId,
     store: &'db ExpressionStore,
     /// The names of the store's bindings: a path that is none of them names no local.
-    binding_names: hashbrown::HashSet<Symbol, FxBuildHasher, &'f Frame>,
+    binding_names: hashbrown::HashSet<Symbol, FixedState, &'f Frame>,
     /// Each closure with upvars and its upvars, in the order walked: a closure's `on_expr` is
     /// its one visit.
     closures: Vec<(ExprId, Upvars), &'f Frame>,
@@ -281,9 +281,9 @@ impl StoreVisitor for UpvarsMentionedVisitor<'_, '_> {
 #[cfg(test)]
 mod tests {
     use expect_test::{Expect, expect};
+    use hir_expand::fixture;
     use itertools::Itertools;
     use span::Edition;
-    use hir_expand::fixture;
 
     use crate::{
         AssocItemId, DefWithBodyId, ModuleDefId, expr_store::Body, nameres::crate_def_map,

@@ -10,14 +10,17 @@ use std::{
 };
 
 use base_db::Db;
-use blaze_format::{ALIGN, FormatError, Part, Persist, Placed, Record, SchemaHash, Slice, Writer, open_as, schema_of};
+use blaze_format::{
+    ALIGN, FormatError, Part, Persist, Placed, Record, SchemaHash, Slice, Writer, open_as,
+    schema_of,
+};
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
+use blaze_query::db::{AsId, FromId};
 use hir_def::{
     AdtId, ConstId, DefWithBodyId, EnumId, EnumVariantId, FunctionId, HasModule, ImplId, StaticId,
     StructId, TraitId, TypeAliasId, UnionId,
 };
-use rustc_hash::FxHashMap;
-use blaze_query::db::{AsId, FromId};
 
 use super::{BodyFacts, INSTALLED, Lookup, Step};
 use crate::{
@@ -244,7 +247,7 @@ pub(super) struct Keyed<'a, 'db> {
     /// Each item's kind, as an `IdKind`'s number, at its index.
     pub(super) kinds: Vec<u8>,
     /// Each key given, with the item it was given for and its index.
-    seen: FxHashMap<ContentId, (IdKind, u64, u32)>,
+    seen: HashMap<ContentId, (IdKind, u64, u32)>,
 }
 
 impl<'a, 'db> Keyed<'a, 'db> {
@@ -255,7 +258,7 @@ impl<'a, 'db> Keyed<'a, 'db> {
         body: DefWithBodyId,
     ) -> Keyed<'a, 'db> {
         // alloc: empty until an item is named; once per body offered
-        Keyed { db, facts, body, keys: Vec::new(), kinds: Vec::new(), seen: FxHashMap::default() }
+        Keyed { db, facts, body, keys: Vec::new(), kinds: Vec::new(), seen: HashMap::default() }
     }
 }
 

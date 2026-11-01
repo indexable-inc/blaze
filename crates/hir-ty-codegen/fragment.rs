@@ -13,6 +13,7 @@ use std::{
 };
 
 use base_db::{Db, FileId};
+use blaze_hash::{FixedHasher, FixedState, HashMap};
 use cranelift_codegen::{
     MachReloc, RelocTarget, binemit,
     ir::{self, Signature},
@@ -25,7 +26,6 @@ use hir_def::{
     DefWithBodyId, FunctionId, StaticId, TraitId,
     hir::{BindingId, ExprId},
 };
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHasher};
 
 use hir_ty::{
     ParamEnvAndCrate,
@@ -913,8 +913,8 @@ pub(super) struct Recorder<'db> {
     /// The places in `wants.requests.datas` of the vtables, by the hash of their key
     /// ([`vtable_hash`]): looked up without cloning a key, whose types clone by refcount.
     vtables: HashTable<Slot>,
-    statics: FxHashMap<StaticId, DataId>,
-    pub(super) layouts: Option<RefCell<FxHashMap<Ty<'db>, (u64, u64)>>>,
+    statics: HashMap<StaticId, DataId>,
+    pub(super) layouts: Option<RefCell<HashMap<Ty<'db>, (u64, u64)>>>,
     /// With `layouts`: each `async fn`'s future as rustc names it, with the offsets of what
     /// each of its variants holds, for `harness/layoutdiff.py` to set against rustc's.
     pub(super) coroutine_layouts: RefCell<Vec<(String, u64, u64)>>,
@@ -924,7 +924,7 @@ pub(super) struct Recorder<'db> {
     pub(super) naked: Option<(String, Vec<Option<ModuleRelocTarget>>)>,
     /// The statements instructions were built for, which their source locations index.
     spans: Vec<MirSpan>,
-    span_ids: FxHashMap<MirSpan, u32>,
+    span_ids: HashMap<MirSpan, u32>,
     /// The locals written with a name that a stack slot of their own tells where they are.
     pub(super) named: Vec<Named>,
     /// The slots of the locals of the body, for [`overlap`](super::overlap) to share.
@@ -988,11 +988,11 @@ struct Reused {
 }
 
 fn vtable_hash(ty: &StoredTy, trait_ref: &Option<(TraitId, StoredGenericArgs)>) -> u64 {
-    FxBuildHasher.hash_one((ty, trait_ref))
+    FixedState.hash_one((ty, trait_ref))
 }
 
 fn func_hash(target: TargetRef<'_>, sig: &Signature) -> u64 {
-    let mut hasher = FxHasher::default();
+    let mut hasher = FixedHasher::default();
     target.hash(&mut hasher);
     sig.hash(&mut hasher);
     hasher.finish()
@@ -1017,7 +1017,7 @@ impl BlobView<'_> {
 
     fn hash(&self) -> u64 {
         let blob = self.blob;
-        let mut hasher = FxHasher::default();
+        let mut hasher = FixedHasher::default();
         (&blob.bytes, blob.align, &blob.type_ids).hash(&mut hasher);
         blob.relocs.len().hash(&mut hasher);
         for &(at, to, addend) in &blob.relocs {
@@ -1142,7 +1142,7 @@ impl Wants {
     /// The `asm!` blocks it calls the wrappers of that go where they are called as LLVM's
     /// inline assembly, by the places of the wrappers among the requests.
     #[cfg(feature = "llvm")]
-    pub(super) fn asm_blocks(&self) -> FxHashMap<u32, &'static super::asm::Inline> {
+    pub(super) fn asm_blocks(&self) -> HashMap<u32, &'static super::asm::Inline> {
         let funcs = self.requests.funcs.iter().enumerate();
         funcs
             .filter_map(|(at, it)| match &it.target {
@@ -1477,14 +1477,14 @@ impl<'db> Recorder<'db> {
             unit: super::v2::build::building(),
             wants: Wants::new(isa),
             vtables: HashTable::new(),
-            statics: FxHashMap::default(),
+            statics: HashMap::default(),
             layouts: (*LAYOUTS).then(RefCell::default),
             coroutine_layouts: RefCell::default(),
             builder_ctx: FunctionBuilderContext::new(),
             naked: None,
             // alloc: empty, allocates nothing, as are the others
             spans: Vec::new(),
-            span_ids: FxHashMap::default(),
+            span_ids: HashMap::default(),
             named: Vec::new(), // alloc: empty, allocates nothing
             frame_locals: None,
             // alloc: empty, allocates nothing
@@ -1749,7 +1749,7 @@ impl<'db> Recorder<'db> {
         func: &mut ir::Function,
     ) -> ir::FuncRef {
         for it in std::iter::once(instance).chain(&body.built_in) {
-            let hash = FxBuildHasher.hash_one(it);
+            let hash = FixedState.hash_one(it);
             let built_in = &mut self.built_in;
             let entry = self.built_in_at.entry(
                 hash,
@@ -1762,7 +1762,7 @@ impl<'db> Recorder<'db> {
                 built_in.push(it.clone());
             }
         }
-        let hash = FxBuildHasher.hash_one(instance);
+        let hash = FixedState.hash_one(instance);
         let reused = self.reused.find(hash, |it| it.hash == hash && it.instance == *instance);
         let at = match reused {
             Some(it) => it.at,
@@ -1945,7 +1945,7 @@ mod tests {
     /// How `Code` hashed its relocations and ELF types when it kept them as `ModuleReloc`s and
     /// a `Vec<(u32, u32)>`, which code in the store is keyed by.
     fn old_hash(relocs: &[ModuleReloc], elf_types: &Vec<(u32, u32)>) -> u64 {
-        let mut state = FxHasher::default();
+        let mut state = FixedHasher::default();
         elf_types.hash(&mut state);
         relocs.len().hash(&mut state);
         for reloc in relocs {
@@ -1979,7 +1979,7 @@ mod tests {
                 let typed = elf_types.iter().find(|it| it.0 == was.offset).map(|it| it.1);
                 assert_eq!(row.elf_type, typed);
             }
-            let mut state = FxHasher::default();
+            let mut state = FixedHasher::default();
             rows.hash_elf_types(&mut state);
             rows.hash_as_module(&mut state);
             assert_eq!(state.finish(), old_hash(&relocs, &elf_types), "seed {seed}");

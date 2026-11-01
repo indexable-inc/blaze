@@ -31,6 +31,8 @@ CODE = (
     "crates/",
     # The patched crates of [patch.crates-io], hashed into BLAZE_SOURCES (blaze-engine/build.rs).
     "vendor/",
+    # ix's linter and rewriter, workspace members, and the rules the workspace check runs.
+    "tools/astlog/",
     # The workspace, the lock file (the build is --locked) and cargo's config ([env]).
     "Cargo.toml",
     "Cargo.lock",

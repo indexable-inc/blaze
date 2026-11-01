@@ -12,9 +12,9 @@
 //! [`MacroReachable::update_from_macro`] is one pass's visit of it.
 
 use base_db::Db;
+use blaze_hash::FixedState;
 use blaze_mem::frame::Frame;
 use hir_expand::MacroDefKind;
-use rustc_hash::FxBuildHasher;
 use span::Transparency;
 
 use crate::{
@@ -74,14 +74,14 @@ pub enum Reached {
 /// holds the fixpoint.
 #[derive(Debug)]
 pub struct MacroReachable<'f> {
-    walked: hashbrown::HashSet<(ModuleId, ModuleId), FxBuildHasher, &'f Frame>,
+    walked: hashbrown::HashSet<(ModuleId, ModuleId), FixedState, &'f Frame>,
     stack: Vec<ModuleId, &'f Frame>,
 }
 
 impl<'f> MacroReachable<'f> {
     pub fn new_in(frame: &'f Frame) -> MacroReachable<'f> {
         MacroReachable {
-            walked: hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame),
+            walked: hashbrown::HashSet::with_hasher_in(FixedState, frame),
             stack: Vec::new_in(frame),
         }
     }

@@ -26,10 +26,10 @@
 use blaze_codegen::{Arch, CompiledFunction, InstanceKey, Static, Target};
 use blaze_core::FileName;
 use blaze_graph::par;
+use blaze_hash::HashSet;
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 use blaze_mem::align::checked_align_up_u64;
-use rustc_hash::FxHashSet;
 
 use crate::arena::{FrameVec, collect_in};
 use crate::model::{self, Apply, Class, Fixup, Holds, Plan, Sym};
@@ -614,7 +614,7 @@ fn binds(state: &State, symbols: &Symbols) -> Result<(Vec<Bind>, Vec<String>), L
         out.push(Bind { place: bind.addr, name, addend: bind.addend, kind: BindKind::Addr, weak: import.weak });
     }
     // alloc: the weakly defined natives, once per prelink
-    let weak: FxHashSet<Sym> = state.resolved.native_defs(&state.inputs).filter(|it| it.weak).map(|it| it.sym).collect();
+    let weak: HashSet<Sym> = state.resolved.native_defs(&state.inputs).filter(|it| it.weak).map(|it| it.sym).collect();
     if !weak.is_empty() {
         for piece in state.live_pieces() {
             let name = |sym: Sym| symbols.name_of(sym).map(str::to_owned);

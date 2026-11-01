@@ -127,7 +127,7 @@ use std::{
     ops::{Index, IndexMut},
 };
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 pub struct Key<K, V, P> {
     _phantom: PhantomData<(K, V, P)>,
@@ -163,12 +163,12 @@ pub struct DynMap {
 
 /// The map of one key: indexing a [`DynMap`] by the key is a field access.
 pub struct KeyMap<K, V> {
-    map: FxHashMap<K, V>,
+    map: HashMap<K, V>,
 }
 
 impl<K, V> Default for KeyMap<K, V> {
     fn default() -> Self {
-        KeyMap { map: FxHashMap::default() }
+        KeyMap { map: HashMap::default() }
     }
 }
 

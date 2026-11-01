@@ -25,6 +25,7 @@ pub(super) use types::{ByEnv, Sets, described};
 
 use blaze_core::decimal::decimal;
 use blaze_format::leb;
+use blaze_hash::{FixedHasher, HashMap};
 use cranelift_codegen::{
     binemit::CodeOffset,
     gimli::{
@@ -57,7 +58,6 @@ use cranelift_object::{
     },
 };
 use intern::{Symbol, sym};
-use rustc_hash::{FxHashMap, FxHasher};
 use serde_derive::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
@@ -518,21 +518,21 @@ pub(super) struct Dwarf {
     /// they are kept apart from what is linked, and the units that are.
     apart: Option<(String, Vec<split::Apart>)>,
     /// What tells the unit functions are being added to from another: what was added.
-    id: FxHasher,
+    id: FixedHasher,
     encoding: Encoding,
     directory: Vec<u8>,
-    files: FxHashMap<String, FileId>,
+    files: HashMap<String, FileId>,
     ranges: Vec<Range>,
     /// The addresses the entries of a unit kept apart name by their place in this list.
     addresses: Vec<Address>,
-    types: FxHashMap<SharedType, UnitEntryId>,
+    types: HashMap<SharedType, UnitEntryId>,
     /// The first entry of each name among `types`.
-    names: FxHashMap<Symbol, UnitEntryId>,
+    names: HashMap<Symbol, UnitEntryId>,
     /// The entry of the type each set seen is of, by where the set is, with the set so that
     /// nothing else comes to be there.
-    sets: FxHashMap<usize, (TypeSet, Option<UnitEntryId>)>,
+    sets: HashMap<usize, (TypeSet, Option<UnitEntryId>)>,
     /// The modules and functions of the unit that a type is written in, by their paths.
-    namespaces: FxHashMap<String, UnitEntryId>,
+    namespaces: HashMap<String, UnitEntryId>,
     /// Whether the variables of the functions are told of, and not their lines alone.
     variables: bool,
     /// Whether each unit is written in sections of its own.
@@ -555,7 +555,7 @@ enum SharedType {
 #[derive(Default)]
 struct FunctionTypes {
     /// By where each type's set is.
-    entries: FxHashMap<usize, UnitEntryId>,
+    entries: HashMap<usize, UnitEntryId>,
     /// How many types the one being told of is inside of.
     inside: u32,
 }
@@ -589,18 +589,18 @@ impl Dwarf {
             full: Written::default(),
             // alloc: empty, allocates nothing: grows by a unit kept apart per unit
             apart: apart.map(|name| (name, Vec::new())),
-            id: FxHasher::default(),
+            id: FixedHasher::default(),
             // alloc: empty, allocates nothing: each unit kept apart takes the ones it names
             addresses: Vec::new(),
             encoding,
             directory,
-            files: FxHashMap::default(),
+            files: HashMap::default(),
             // alloc: empty, allocates nothing: a unit reserves its ranges at its first function
             ranges: Vec::new(),
-            types: FxHashMap::default(),
-            names: FxHashMap::default(),
-            sets: FxHashMap::default(),
-            namespaces: FxHashMap::default(),
+            types: HashMap::default(),
+            names: HashMap::default(),
+            sets: HashMap::default(),
+            namespaces: HashMap::default(),
             variables,
             grouped: false,
             // alloc: empty, allocates nothing: reused for every function
@@ -1313,7 +1313,7 @@ fn place(product: &mut ObjectProduct, sections: Vec<Section>) -> Result<(), Stri
 /// [`place`] for the sections of several [`Dwarf`]s, each of which reads only its own.
 fn place_all(product: &mut ObjectProduct, all: Vec<Vec<Section>>) -> Result<(), String> {
     let macho = product.object.format() == BinaryFormat::MachO;
-    let mut placed = FxHashMap::default();
+    let mut placed = HashMap::default();
     // alloc: once per object, its debug sections
     let mut linked = Vec::new();
     // A section with nothing in it is still there when another says where in it to read. A

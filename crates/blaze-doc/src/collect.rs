@@ -3,13 +3,13 @@
 
 use std::cell::RefCell;
 
+use base_db::Db;
+use blaze_hash::{HashMap, HashSet};
 use either::Either;
 use hir::{
     AssocItem, Crate, HasAttrs, HasCrate, HasVisibility, Impl, InFile, ModuleDef, Visibility,
     view::HasSourceView,
 };
-use base_db::Db;
-use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     SyntaxKind, T, TextRange, TextSize,
     view::{self as ast, AstNode},
@@ -84,8 +84,8 @@ fn reservation(db: &Db, imp: Impl) -> bool {
 /// than the one they are for: of each documented type the impl names as an argument of the
 /// trait (`impl From<Local> for Foreign`), as the self type behind a reference, or inside a
 /// `#[fundamental]` type (`impl Clone for Box<Local>`).
-fn impls_by_trait_arg(db: &Db, places: &Places) -> FxHashMap<hir::Adt, Vec<Impl>> {
-    let mut out: FxHashMap<hir::Adt, Vec<Impl>> = FxHashMap::default();
+fn impls_by_trait_arg(db: &Db, places: &Places) -> HashMap<hir::Adt, Vec<Impl>> {
+    let mut out: HashMap<hir::Adt, Vec<Impl>> = HashMap::default();
     for documented in &places.crates {
         for imp in Impl::all_in_crate(db, documented.krate) {
             let Some(trait_ref) = imp.trait_ref(db) else { continue };
@@ -185,7 +185,7 @@ impl StdItems {
                     auto.push(AutoTrait { trait_, not });
                 }
             }
-            let mut upstream = FxHashSet::default();
+            let mut upstream = HashSet::default();
             for documented in &places.crates {
                 upstream.extend(places.upstream(db, documented.krate));
             }
@@ -231,13 +231,13 @@ struct Builder<'a> {
     places: Linking<'a>,
     files: &'a Files,
     std: &'a StdItems,
-    by_trait_arg: &'a FxHashMap<hir::Adt, Vec<Impl>>,
+    by_trait_arg: &'a HashMap<hir::Adt, Vec<Impl>>,
     krate: usize,
     /// Crates whose impls a type's page lists: the crate's own and its dependencies'. A crate
     /// downstream adds its impls to the pages of its traits, not of the types they are for.
-    allowed: FxHashSet<Crate>,
+    allowed: HashSet<Crate>,
     /// The crates linked into the crate, whose blanket impls apply to its types.
-    linked: FxHashSet<Crate>,
+    linked: HashSet<Crate>,
     warnings: RefCell<Vec<Warning>>,
 }
 
@@ -962,7 +962,7 @@ impl Builder<'_> {
             }
             Some(trait_) => {
                 let trait_items = trait_.items(db);
-                let mut implemented = FxHashSet::default();
+                let mut implemented = HashSet::default();
                 for assoc in own {
                     let name = assoc.name(db);
                     let trait_item = trait_items
@@ -1049,7 +1049,7 @@ impl Builder<'_> {
         let db = self.db;
         let mut out = Impls::default();
         let ty = adt.ty(db);
-        let mut seen = FxHashSet::default();
+        let mut seen = HashSet::default();
         let by_trait_arg = self.by_trait_arg.get(&adt).into_iter().flatten().copied();
         for imp in Impl::all_for_type(db, ty).into_iter().chain(by_trait_arg) {
             if !seen.insert(imp) || !self.impl_shown(imp) {
@@ -1103,7 +1103,7 @@ impl Builder<'_> {
         let (Some(deref), deref_mut) = (self.std.deref, self.std.deref_mut) else { return vec![] };
         let private = self.documented().private;
         let mut out = vec![];
-        let mut seen = FxHashSet::default();
+        let mut seen = HashSet::default();
         let mut ty = adt.ty(db);
         let mut own = Some(adt);
         while let Some(adt) = own

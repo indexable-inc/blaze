@@ -3,8 +3,8 @@
 //! [`handle`] keeps `From` and `CoerceShared`'s target as they read the derive's own item
 //! through handles.
 
+use blaze_hash::HashSet;
 use itertools::izip;
-use rustc_hash::FxHashSet;
 use span::Span;
 use stdx::never;
 use syntax_bridge::DocCommentDesugarMode;
@@ -354,7 +354,7 @@ pub(super) fn parse_adt_from_syntax(
         .flat_map(|param_list| param_list.lifetime_params())
         .filter_map(|param| Some((to_tt(param.syntax()), to_tt(param.lifetime()?.syntax()))))
         .collect();
-    let mut param_type_set: FxHashSet<Name> = FxHashSet::default();
+    let mut param_type_set: HashSet<Name> = HashSet::default();
     let param_types = generic_param_list
         .into_iter()
         .flat_map(|param_list| param_list.type_or_const_params())

@@ -1,0 +1,24 @@
+{
+  "id": "01507",
+  "from_lane": "no-fallback-front-lints-suspend",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.toml",
+    "crates/blaze-lints/baselines/"
+  ],
+  "what": "Levels for the lints of waits (crates/blaze-lints/src/blaze/{held_across_wait,lock_across_query,blocking_on_pool,unnamed_wait}.rs, all registered at Allow, ra clean, fixtures in blaze/waits_tests/). Same two steps as 01501/01502: (1) on the next blaze-lints self-build, lint the workspace once with `--warn=blaze::held_across_wait --warn=blaze::lock_across_query --warn=blaze::blocking_on_pool --warn=blaze::unnamed_wait` and send per-lint hit counts and sites to blaze-v2:=no-fallback-front. (2) deny lints: held_across_wait and lock_across_query get `<lint> = \"deny\"` under `[workspace.metadata.blaze.lints]` in the root Cargo.toml once their count is 0 (we fix or queue the hits first). Warn lints: blocking_on_pool and unnamed_wait get `<lint> = \"warn\"` there plus a first baseline crates/blaze-lints/baselines/blaze.<lint>.txt in baseline.rs format (path<TAB>count, sorted, no zero lines); one with 0 findings goes to deny with no file: say which.",
+  "state": "open",
+  "created": "2026-11-01T13:53:20Z",
+  "updated": "2026-11-01T13:53:20Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T13:53:20Z",
+      "by": "no-fallback-front-lints-suspend",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

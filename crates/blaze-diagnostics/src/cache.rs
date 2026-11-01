@@ -38,7 +38,7 @@ use blaze_format::cursor::{self, Put as _, Reader};
 use blaze_ids::{ContentId, Hasher};
 use hir_def::deps::{Held, ImageBuf, ImageStore, absolute, crate_name};
 use hir_ty_borrowck::Mode;
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_hash::{HashMap, HashSet};
 
 use crate::{
     Files, Options,
@@ -494,13 +494,13 @@ pub struct Served {
     /// The check key ([`bodies_key`] filed by its bodies' reads) of each crate asked whose
     /// bodies part was found: what its dependents' keys and its constants' values
     /// (`hir_ty::consteval::deps`) are made from. Its bodies were given to the database.
-    pub keys: FxHashMap<Crate, ContentId>,
-    outcomes: FxHashMap<Crate, ImageBuf>,
+    pub keys: HashMap<Crate, ContentId>,
+    outcomes: HashMap<Crate, ImageBuf>,
     /// The bodies part of each crate of `keys`: what the database was given.
-    parts: FxHashMap<Crate, ImageBuf>,
+    parts: HashMap<Crate, ImageBuf>,
     /// What each crate asked was looked up under: its base key ([`bodies_key`]) and its outcome's
     /// key, so asking it again under the same is no lookup.
-    asked: FxHashMap<Crate, (ContentId, Option<ContentId>)>,
+    asked: HashMap<Crate, (ContentId, Option<ContentId>)>,
 }
 
 impl Served {
@@ -516,14 +516,14 @@ impl Served {
 fn layers(
     db: &Db,
     crates: impl Iterator<Item = Crate>,
-    known: &FxHashMap<Crate, ContentId>,
+    known: &HashMap<Crate, ContentId>,
 ) -> (Vec<Vec<Crate>>, Vec<(Crate, Crate)>) {
     fn depth(
         db: &Db,
         krate: Crate,
-        asked: &FxHashSet<Crate>,
-        memo: &mut FxHashMap<Crate, Result<usize, Crate>>,
-        known: &FxHashMap<Crate, ContentId>,
+        asked: &HashSet<Crate>,
+        memo: &mut HashMap<Crate, Result<usize, Crate>>,
+        known: &HashMap<Crate, ContentId>,
     ) -> Result<usize, Crate> {
         if let Some(&it) = memo.get(&krate) {
             return it;
@@ -552,8 +552,8 @@ fn layers(
         it
     }
     // alloc: setup: once per session
-    let asked: FxHashSet<Crate> = crates.collect();
-    let mut memo = FxHashMap::default();
+    let asked: HashSet<Crate> = crates.collect();
+    let mut memo = HashMap::default();
     // alloc: setup: once per session
     let mut layers: Vec<Vec<Crate>> = Vec::new();
     // alloc: setup: once per session
@@ -578,7 +578,7 @@ fn layers(
 
 /// The check keys of `krate`'s dependencies, in its dependency list's order, `None` when one has
 /// none.
-fn dep_keys(db: &Db, krate: Crate, keys: &FxHashMap<Crate, ContentId>) -> Option<Vec<ContentId>> {
+fn dep_keys(db: &Db, krate: Crate, keys: &HashMap<Crate, ContentId>) -> Option<Vec<ContentId>> {
     // alloc: once per crate per session
     krate.data(db).dependencies.iter().map(|dep| keys.get(&dep.crate_id).copied()).collect()
 }
@@ -612,7 +612,7 @@ pub fn serve(
     served: &mut Served,
 ) -> Result<(), String> {
     // alloc: setup: once per serve
-    let images: FxHashMap<Crate, (ContentId, Inputs<'_>)> = crates
+    let images: HashMap<Crate, (ContentId, Inputs<'_>)> = crates
         .iter()
         .filter_map(|&(krate, inputs)| Some((krate, (image_key(db, krate)?, inputs))))
         // alloc: setup: once per serve
@@ -737,7 +737,7 @@ pub struct Checked<'a> {
 pub struct Stored {
     /// The check key of each crate whose bodies part was kept, besides those [`Served::keys`]
     /// has: what its constants' values are filed under.
-    pub keys: FxHashMap<Crate, ContentId>,
+    pub keys: HashMap<Crate, ContentId>,
     /// Each crate with a value not kept, and why: with no key, nothing of it is kept; with one,
     /// its bodies part is, and the reason is its outcome's.
     pub refused: Vec<(Crate, Refused)>,
@@ -764,7 +764,7 @@ pub fn store(
 ) -> Result<Stored, String> {
     let mut stored = Stored::default();
     // alloc: setup: once per session
-    let by_crate: FxHashMap<Crate, &Checked<'_>> = checked.iter().map(|it| (it.krate, it)).collect();
+    let by_crate: HashMap<Crate, &Checked<'_>> = checked.iter().map(|it| (it.krate, it)).collect();
     let (layers, left) = layers(db, by_crate.keys().copied(), &served.keys);
     for (krate, dep) in left {
         // alloc: why, once per crate refused

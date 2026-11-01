@@ -80,8 +80,8 @@ impl Registry {
     pub fn fetch(&self, packages: &[Package]) -> anyhow::Result<Vec<(PathBuf, From)>> {
         let _lock = crate::PackageCacheLock::acquire(&self.context().cargo_home)?;
         let next = AtomicUsize::new(0);
-        let results: Vec<std::sync::Mutex<Option<anyhow::Result<(PathBuf, From)>>>> =
-            packages.iter().map(|_| std::sync::Mutex::new(None)).collect();
+        let results: Vec<parking_lot::Mutex<Option<anyhow::Result<(PathBuf, From)>>>> =
+            packages.iter().map(|_| parking_lot::Mutex::new(None)).collect();
         let jobs = self.context().net.jobs.max(1).min(packages.len().max(1));
         std::thread::scope(|scope| {
             for _ in 0..jobs {
@@ -90,16 +90,14 @@ impl Registry {
                         let at = next.fetch_add(1, Ordering::Relaxed);
                         let Some(package) = packages.get(at) else { break };
                         let result = self.fetch_one(package);
-                        if let Ok(mut slot) = results[at].lock() {
-                            *slot = Some(result);
-                        }
+                        *results[at].lock() = Some(result);
                     }
                 });
             }
         });
         let mut out = Vec::with_capacity(packages.len());
         for (package, result) in packages.iter().zip(results) {
-            let result = result.into_inner().ok().flatten().context("a fetch did not finish")?;
+            let result = result.into_inner().context("a fetch did not finish")?;
             out.push(result.with_context(|| format!("failed to download `{package}`"))?);
         }
         Ok(out)

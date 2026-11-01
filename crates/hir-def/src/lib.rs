@@ -66,7 +66,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use base_db::{Db, Crate, impl_intern_key};
+use base_db::{Crate, Db, impl_intern_key};
 use hir_expand::{
     AstId, EditionedFileId, ExpandResult, ExpandTo, HirFileId, InFile, MacroCallId, MacroCallKind,
     MacroCallStyles, MacroDefId, MacroDefKind,
@@ -107,7 +107,7 @@ pub use crate::{
 };
 pub use hir_expand::{Intern, Lookup, tt};
 
-type FxIndexMap<K, V> = indexmap::IndexMap<K, V, rustc_hash::FxBuildHasher>;
+type FxIndexMap<K, V> = indexmap::IndexMap<K, V, blaze_hash::FixedState>;
 
 #[derive(Debug)]
 pub struct ItemLoc<N: AstIdNode> {
@@ -161,7 +161,7 @@ fn hash_ast_id<N, H: Hasher>(id: AstId<N>, state: &mut H) -> u64 {
 // An `AstId` is 12 bytes: the file 8 (a tag word and an id), the file-local id 4.
 const _: () = assert!(size_of::<AstId<ast::Struct>>() == 12);
 
-// 16 bytes per item (module 4, `AstId` 12), no padding; hashed in 3 Fx rounds (module, file,
+// 16 bytes per item (module 4, `AstId` 12), no padding; hashed in 3 writes (module, file,
 // file-local id with the file's variant).
 const _: () = assert!(size_of::<ItemLoc<ast::Struct>>() == 16);
 const _: () = assert!(align_of::<ItemLoc<ast::Struct>>() == 4);
@@ -205,7 +205,7 @@ impl<N: AstIdNode> Hash for AssocItemLoc<N> {
     }
 }
 
-// 20 bytes per item (container 8: a tag word and an id, `AstId` 12); hashed in 3 Fx rounds
+// 20 bytes per item (container 8: a tag word and an id, `AstId` 12); hashed in 3 writes
 // (container, file, file-local id with both variants).
 const _: () = assert!(size_of::<AssocItemLoc<ast::Fn>>() == 20);
 const _: () = assert!(align_of::<AssocItemLoc<ast::Fn>>() == 4);
@@ -390,7 +390,7 @@ impl Hash for BuiltinDeriveImplLoc {
     }
 }
 
-// 20 bytes per impl (adt 8, attr id 4, index 4, trait 1, 3 of padding); hashed in 3 Fx rounds.
+// 20 bytes per impl (adt 8, attr id 4, index 4, trait 1, 3 of padding); hashed in 3 writes.
 const _: () = assert!(size_of::<BuiltinDeriveImplLoc>() == 20);
 
 #[blaze_query::interned(debug, unsafe(no_lifetime))]
@@ -434,7 +434,7 @@ impl Hash for EnumVariantLoc {
     }
 }
 
-// 20 bytes per variant (`AstId` 12, enum 4, name 4), no padding; hashed in 4 Fx rounds (file,
+// 20 bytes per variant (`AstId` 12, enum 4, name 4), no padding; hashed in 4 writes (file,
 // file-local id, enum, name).
 const _: () = assert!(size_of::<EnumVariantLoc>() == 20);
 
@@ -491,7 +491,7 @@ impl Hash for Macro2Loc {
 }
 
 // 20 bytes per macro (module 4, `AstId` 12, expander 2, flag 1, edition 1), no padding; hashed
-// in 3 Fx rounds.
+// in 3 writes.
 const _: () = assert!(size_of::<Macro2Loc>() == 20);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -518,7 +518,7 @@ impl Hash for MacroRulesLoc {
 }
 
 // 20 bytes per macro (module 4, `AstId` 12, expander 2, flags 1, edition 1), no padding; hashed
-// in 3 Fx rounds.
+// in 3 writes.
 const _: () = assert!(size_of::<MacroRulesLoc>() == 20);
 
 bitflags::bitflags! {
@@ -581,7 +581,7 @@ impl Hash for ProcMacroLoc {
 }
 
 // 24 bytes per proc macro (module 4, `AstId` 12, expander 4, kind 1, edition 1, 2 of padding);
-// hashed in 4 Fx rounds (module, file, expander, the rest in one word).
+// hashed in 4 writes (module, file, expander, the rest in one word).
 const _: () = assert!(size_of::<ProcMacroLoc>() == 24);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
@@ -781,7 +781,7 @@ impl ModuleId {
     pub fn macro_use_prelude(
         self,
         db: &Db,
-    ) -> &rustc_hash::FxHashMap<Name, (MacroId, Option<ExternCrateId>)> {
+    ) -> &blaze_hash::HashMap<Name, (MacroId, Option<ExternCrateId>)> {
         crate_def_map(db, self.krate(db)).macro_use_prelude()
     }
 }
@@ -1828,23 +1828,25 @@ mod loc_hash_tests {
         hash::{BuildHasher, Hash},
     };
 
+    use blaze_hash::{FixedState, HashSet};
+    use blaze_query::db::FromId;
     use hir_expand::{
         EditionedFileId, HirFileId, InFile, MacroCallId, MacroCallStyles,
         attrs::AttrId,
-        builtin::{BuiltinAttrExpander, BuiltinDeriveExpander, BuiltinFnLikeExpander, EagerExpander},
+        builtin::{
+            BuiltinAttrExpander, BuiltinDeriveExpander, BuiltinFnLikeExpander, EagerExpander,
+        },
         name::Name,
         proc_macro::{CustomProcMacroExpander, ProcMacroKind},
     };
     use intern::Symbol;
-    use rustc_hash::{FxBuildHasher, FxHashSet};
-    use blaze_query::db::FromId;
     use span::{Edition, ErasedFileAstId, FileAstId};
     use syntax::ast;
 
     use super::*;
 
     fn hash<T: Hash>(it: &T) -> u64 {
-        FxBuildHasher.hash_one(it)
+        FixedState.hash_one(it)
     }
 
     /// An id of an interned struct whose data no test reads.
@@ -1942,7 +1944,7 @@ mod loc_hash_tests {
     #[test]
     fn expander_words_are_distinct() {
         let all = expanders();
-        let words: FxHashSet<u16> = all.iter().map(|it| it.hash_word()).collect();
+        let words: HashSet<u16> = all.iter().map(|it| it.hash_word()).collect();
         assert_eq!(words.len(), all.len());
     }
 

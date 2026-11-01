@@ -15,11 +15,13 @@ doctest = false
 
 [dependencies]
 base64.workspace = true
+blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-protocol.workspace = true
+crossbeam-channel.workspace = true
 flate2 = { workspace = true, features = ["rust_backend"] }
 flecs-c = { workspace = true, features = ["rest"] }
-rustc-hash.workspace = true
+parking_lot.workspace = true
 sha1.workspace = true
 
 [dev-dependencies]

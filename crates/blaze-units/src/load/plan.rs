@@ -19,7 +19,7 @@ use blaze_manifest::manifest::Manifest;
 use blaze_manifest::profiles::{Profile as BaseProfile, ProfileRoot};
 use blaze_manifest::targets::TargetKind;
 use blaze_resolve::PackageId;
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_hash::{HashMap, HashSet};
 
 use self::flags::KindInfo;
 use self::hash::{CompileMode, HashedProfile, LtoUnit, Meta, MetaInput, RustcVersion, TrimPaths};
@@ -39,9 +39,9 @@ pub(crate) struct PlanInput<'a, F: Files> {
     /// The standard library's units' plans, made by its own load; `None` for every other unit.
     pub std_plans: &'a [Option<UnitPlan>],
     /// Every package of the units, by the unit's `pkg_id`.
-    pub packages: &'a FxHashMap<String, (PackageId, Package<'a>)>,
+    pub packages: &'a HashMap<String, (PackageId, Package<'a>)>,
     /// Every package's manifest path, by its id.
-    pub manifests: &'a FxHashMap<PackageId, (&'a Path, &'a Manifest)>,
+    pub manifests: &'a HashMap<PackageId, (&'a Path, &'a Manifest)>,
     /// The graph's roots, as indexes of `units`.
     pub roots: &'a [usize],
     pub config: &'a Config<F>,
@@ -67,7 +67,7 @@ pub(crate) struct PlanInput<'a, F: Files> {
     pub jobs: Option<u32>,
     /// The packages, by the unit's `pkg_id`, whose build scripts run outside the sandbox
     /// (`UnitPlan::unsandboxed`).
-    pub unsandboxed: &'a FxHashSet<&'a str>,
+    pub unsandboxed: &'a HashSet<&'a str>,
 }
 
 pub(crate) struct PlanOutput {
@@ -376,9 +376,9 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
     for &at in input.roots {
         roots[at] = true;
     }
-    let primary: FxHashSet<&str> = input.roots.iter().map(|&at| units[at].pkg_id.as_str()).collect();
-    let mut per_package: FxHashMap<&str, PackageFlags> =
-        FxHashMap::with_capacity_and_hasher(input.packages.len(), Default::default());
+    let primary: HashSet<&str> = input.roots.iter().map(|&at| units[at].pkg_id.as_str()).collect();
+    let mut per_package: HashMap<&str, PackageFlags> =
+        HashMap::with_capacity_and_hasher(input.packages.len(), Default::default());
     let artifact_dir = !matches!(input.intent, Intent::Check { .. } | Intent::Doc { .. });
 
     let mut plans = Vec::with_capacity(units.len());

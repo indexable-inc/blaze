@@ -1200,7 +1200,7 @@ mod view_tests;
 #[cfg(test)]
 pub(in crate::expr_store) mod tests {
     use blaze_ids::rng::SplitMix64;
-    use rustc_hash::FxHashMap;
+    use blaze_hash::HashMap;
     use blaze_query::db::FromId;
     use smallvec::SmallVec;
     use syntax::{SyntaxKind, TextSize};
@@ -1251,7 +1251,7 @@ pub(in crate::expr_store) mod tests {
         for seed in 0..64 {
             let mut rng = SplitMix64::new(seed);
             let mut pushed = Vec::new();
-            let mut model = FxHashMap::default();
+            let mut model = HashMap::default();
             for value in 0..rng.below(300) as u32 {
                 let key = seeded_src(&mut rng);
                 pushed.push((key, value));

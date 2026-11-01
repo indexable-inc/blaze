@@ -85,7 +85,7 @@ impl Ingredient {
     #[cold]
     #[inline(never)]
     fn register(&'static self) -> u32 {
-        let mut count = REGISTERED.lock().unwrap_or_else(|it| it.into_inner());
+        let mut count = REGISTERED.lock();
         // Relaxed: under the lock, which ordered every store of it before us.
         if let index @ 1.. = self.index.load(Ordering::Relaxed) {
             return index;
@@ -116,7 +116,7 @@ pub(crate) fn vtable(index: u32) -> Option<&'static Vtable> {
 
 /// How many ingredients are registered: every number is below this plus one.
 pub(crate) fn registered() -> u32 {
-    *REGISTERED.lock().unwrap_or_else(|it| it.into_inner())
+    *REGISTERED.lock()
 }
 
 /// The name of ingredient `index`, as its macro gave it.

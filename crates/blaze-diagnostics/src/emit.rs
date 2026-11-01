@@ -24,14 +24,16 @@ mod json;
 #[cfg(test)]
 mod reference_tests;
 
-use std::borrow::Cow;
+use std::{borrow::Cow, fmt};
 
 use annotate_snippets::{AnnotationKind, Group, Patch, Renderer, Snippet};
+use blaze_hash::FixedState;
 use blaze_ids::radix;
-use rustc_hash::FxBuildHasher;
 use smallvec::{SmallVec, smallvec};
 
-use crate::model::{Code, Diag, Level, MacroKind, MultiSpan, Span, Sublevel, Suggestion, SuggestionStyle};
+use crate::model::{
+    Code, Diag, Level, MacroKind, MultiSpan, Span, Sublevel, Suggestion, SuggestionStyle,
+};
 
 /// rustc's `MAX_SUGGESTIONS`: the most ways to substitute that one suggestion shows.
 const MAX_SUGGESTIONS: usize = 4;
@@ -73,11 +75,35 @@ fn text_in(name: &str) -> Option<&str> {
 /// [`Sources::add`] before the batch is written.
 #[derive(Default)]
 pub struct Sources {
-    /// Each file's index in `files` by its name, or [`UNREAD`]: one probe of an Fx table per
-    /// lookup.
-    names: hashbrown::HashMap<String, u32, FxBuildHasher>,
+    /// Each file's index in `files` by its name, or [`UNREAD`]: one hash probe per lookup.
+    names: hashbrown::HashMap<String, u32, FixedState>,
     files: Vec<File>,
 }
+
+/// A span a diagnostic can't be written with. rustc always has the files its spans point into,
+/// so one is a bug of whoever made the span or gathered the files' text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unplaced {
+    /// No text of the file was given to [`Sources::add`], or none could be read.
+    Unread { file: String, byte: u32 },
+    /// The file's text ends before the span does.
+    PastEnd { file: String, byte: u32, len: u32 },
+}
+
+impl fmt::Display for Unplaced {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Unplaced::Unread { file, byte } => {
+                write!(f, "a diagnostic's span at byte {byte} of `{file}`, whose text was not read")
+            }
+            Unplaced::PastEnd { file, byte, len } => {
+                write!(f, "a diagnostic's span at byte {byte} of `{file}`, which is {len} bytes long")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Unplaced {}
 
 /// A file as rustc's `SourceFile` holds it: its text without a byte order mark and with each
 /// `\r\n` as `\n` (`normalize_src`), where its lines start, and where what was taken out was.
@@ -206,7 +232,7 @@ impl Sources {
     /// in, that were not given to [`Sources::add`]: each once, in the order first pointed into.
     /// A file with no path is not one: its name carries its text ([`name_with_text`]).
     pub fn unread<'d>(&self, diags: impl IntoIterator<Item = &'d Diag>) -> Vec<&'d str> {
-        let mut seen: hashbrown::HashSet<&'d str, FxBuildHasher> = hashbrown::HashSet::default();
+        let mut seen: hashbrown::HashSet<&'d str, FixedState> = hashbrown::HashSet::default();
         let mut unread = Vec::new(); // alloc: the files diagnostics written point into, the edge
         for diag in diags {
             each_file(diag, &mut |name| {
@@ -243,22 +269,60 @@ impl Sources {
         });
     }
 
+    /// Whether every span `diag` writes is in a file given here, and inside its text: what
+    /// [`written`], [`rendered`] and [`crate::api::diagnostic`] need, checked before they
+    /// place any.
+    pub fn check(&self, diag: &Diag) -> Result<(), Unplaced> {
+        let mut unplaced = None;
+        each_span(diag, &mut |span| {
+            if unplaced.is_none() {
+                unplaced = [span.lo, span.hi].into_iter().find_map(|byte| self.unplaced(&span.file, byte));
+            }
+        });
+        unplaced.map_or(Ok(()), Err)
+    }
+
+    /// Why byte `at` of `name` can't be placed, if it can't: [`Sources::placed`]'s refusals,
+    /// without placing it or indexing a carried text.
+    fn unplaced(&self, name: &str, at: u32) -> Option<Unplaced> {
+        let len = match text_in(name) {
+            Some(text) => text.len() as u32,
+            None => match self.files.get(self.index(name) as usize) {
+                Some(it) => it.len,
+                // alloc: an error's file name, once per diagnostic that can't be written
+                None => return Some(Unplaced::Unread { file: shown(name).to_owned(), byte: at }),
+            },
+        };
+        // alloc: as above
+        (at > len).then(|| Unplaced::PastEnd { file: shown(name).to_owned(), byte: at, len })
+    }
+
     /// The 1-based line and 1-based column (in chars) of byte `at` of `file`.
     pub fn position(&self, file: &str, at: u32) -> Option<(u32, u32)> {
+        self.placed(file, at).ok()
+    }
+
+    /// [`Sources::position`], or why byte `at` of `name` can't be placed.
+    pub fn placed(&self, name: &str, at: u32) -> Result<(u32, u32), Unplaced> {
         let carried;
-        let file = match text_in(file) {
+        let file = match text_in(name) {
             Some(text) => {
                 // alloc: a file with no path, indexed for a span of it written
                 carried = File::new(text.to_owned());
                 &carried
             }
-            None => self.files.get(self.index(file) as usize)?,
+            None => match self.files.get(self.index(name) as usize) {
+                Some(it) => it,
+                // alloc: an error's file name, once per diagnostic that can't be written
+                None => return Err(Unplaced::Unread { file: shown(name).to_owned(), byte: at }),
+            },
         };
         if at > file.len {
-            return None;
+            // alloc: as above
+            return Err(Unplaced::PastEnd { file: shown(name).to_owned(), byte: at, len: file.len });
         }
         let (line, column) = file.position(file.norm(at));
-        Some((line as u32, column as u32 + 1))
+        Ok((line as u32, column as u32 + 1))
     }
 
     /// The index of the file `name` in `files`, or [`UNREAD`].
@@ -333,16 +397,16 @@ impl<'a> Placed<'a> {
         }
     }
 
-    /// The file `span` is in. One blaze can't read is a bug of whoever made the span: rustc
-    /// always has the files its spans point into.
+    /// The file `span` is in.
     fn file_of(&self, span: &Span) -> &'a File {
         self.file_named(&span.file, span.lo, span.hi)
     }
 
-    /// [`Placed::file_of`] a span at `lo..hi` of `name`.
+    /// [`Placed::file_of`] a span at `lo..hi` of `name`. Every writer holds its diagnostic to
+    /// [`Sources::check`] before it places one, so each span's file is here.
     fn file_named(&self, name: &str, lo: u32, hi: u32) -> &'a File {
         self.get(name).unwrap_or_else(|| {
-            panic!("blaze-diagnostics: a span at bytes {lo}..{hi} of `{name}`, a file that can't be read")
+            panic!("blaze-diagnostics: a span at bytes {lo}..{hi} of `{name}` passed `Sources::check` and has no file")
         })
     }
 }
@@ -354,6 +418,12 @@ fn spans_of(span: &MultiSpan) -> impl Iterator<Item = &Span> {
 /// Each file `diag` points into: of its spans, its children's and its suggestions', and of
 /// each macro call and definition they are in. A file may be met more than once.
 fn each_file<'a>(diag: &'a Diag, f: &mut impl FnMut(&'a str)) {
+    each_span(diag, &mut |span| f(&span.file));
+}
+
+/// Each span `diag` writes: its own, its children's and its suggestions', and each macro call
+/// and definition they are in.
+fn each_span<'a>(diag: &'a Diag, f: &mut impl FnMut(&'a Span)) {
     let spans = spans_of(&diag.span)
         .chain(diag.children.iter().flat_map(|it| spans_of(&it.span)))
         .chain(diag.suggestions.iter().flat_map(|it| it.substitutions.iter().flatten().map(|(span, _)| span)));
@@ -362,10 +432,10 @@ fn each_file<'a>(diag: &'a Diag, f: &mut impl FnMut(&'a str)) {
     }
 }
 
-/// The file of `span` and of each macro call and definition it is in.
-fn meet<'a>(mut span: &'a Span, f: &mut impl FnMut(&'a str)) {
+/// `span` and each macro call and definition it is in.
+fn meet<'a>(mut span: &'a Span, f: &mut impl FnMut(&'a Span)) {
     loop {
-        f(&span.file);
+        f(span);
         let Some(expansion) = span.expansion.as_deref() else { return };
         if let Some(def) = &expansion.def_site {
             meet(def, f);
@@ -395,41 +465,47 @@ impl Default for Style {
     }
 }
 
-/// `diag` as rustc writes it, without the empty line it writes after one.
-pub fn rendered(diag: &Diag, sources: &Sources, style: Style) -> String {
-    render(diag, &Placed::new(diag, sources, &Carried::of(diag)), style)
+/// `diag` as rustc writes it, without the empty line it writes after one. Each of these writers
+/// first holds `diag` to [`Sources::check`]: a span `sources` can't place is an error naming
+/// its file, and none is placed after it.
+pub fn rendered(diag: &Diag, sources: &Sources, style: Style) -> Result<String, Unplaced> {
+    sources.check(diag)?;
+    Ok(render(diag, &Placed::new(diag, sources, &Carried::of(diag)), style))
 }
 
 /// `rendered` as rustc writes it to stderr: with the empty line after it (none after short, nor
 /// after a failure note). Under `short` rustc names no error codes to explain (its emitter
 /// can't show them), so one of [`summary`]'s notes naming them is the empty string.
-pub fn written(diag: &Diag, sources: &Sources, style: Style) -> String {
+pub fn written(diag: &Diag, sources: &Sources, style: Style) -> Result<String, Unplaced> {
     if style.short && explains(diag) {
-        return String::new(); // alloc: empty, allocates nothing
+        return Ok(String::new()); // alloc: empty, allocates nothing
     }
-    write(diag, &Placed::new(diag, sources, &Carried::of(diag)), style)
+    sources.check(diag)?;
+    Ok(write(diag, &Placed::new(diag, sources, &Carried::of(diag)), style))
 }
 
 /// rustc's `--error-format=json` line of `diag` (keys in rustc's order), without the newline
 /// after it, its `rendered` as `style` says (`--json=diagnostic-short`,
 /// `--json=diagnostic-rendered-ansi`). Under `short`, one of [`summary`]'s notes naming error
 /// codes to explain is the empty string, as in [`written`].
-pub fn json(diag: &Diag, sources: &Sources, style: Style) -> String {
+pub fn json(diag: &Diag, sources: &Sources, style: Style) -> Result<String, Unplaced> {
     if style.short && explains(diag) {
-        return String::new(); // alloc: empty, allocates nothing
+        return Ok(String::new()); // alloc: empty, allocates nothing
     }
+    sources.check(diag)?;
     let carried = Carried::of(diag);
     let placed = Placed::new(diag, sources, &carried);
     let rendered = write(diag, &placed, style);
-    json::line(diag, &placed, rendered)
+    Ok(json::line(diag, &placed, rendered))
 }
 
 /// [`json`] with `rendered` as its text: [`written`] of `diag` in the same style, made
 /// already.
-pub fn json_rendered(diag: &Diag, sources: &Sources, rendered: String) -> String {
+pub fn json_rendered(diag: &Diag, sources: &Sources, rendered: String) -> Result<String, Unplaced> {
+    sources.check(diag)?;
     let carried = Carried::of(diag);
     let placed = Placed::new(diag, sources, &carried);
-    json::line(diag, &placed, rendered)
+    Ok(json::line(diag, &placed, rendered))
 }
 
 fn write<'a>(diag: &'a Diag, placed: &Placed<'a>, style: Style) -> String {
@@ -1231,11 +1307,11 @@ mod tests {
         assert_eq!(sources.position(&a, 3), Some((1, 4)));
         assert_eq!(sources.position(&b, 15), Some((1, 16)));
         assert_eq!(sources.position(&a, 6), None);
-        let line = json(&second, &sources, Style::default());
+        let line = json(&second, &sources, Style::default()).unwrap();
         assert!(line.contains(r#""file_name":"<crate attribute>""#), "{line}");
         assert!(line.contains(r##""text":"#![feature(foo),feature(bar)]""##), "{line}");
         let style = Style { ui_testing: true, ..Style::default() };
-        let (first, second) = (rendered(&first, &sources, style), rendered(&second, &sources, style));
+        let (first, second) = (rendered(&first, &sources, style).unwrap(), rendered(&second, &sources, style).unwrap());
         assert!(first.contains("--> <crate attribute>:1:4\n") && first.contains("LL | #![(]\n"), "{first}");
         assert!(!first.contains("feature"), "{first}");
         assert!(second.contains("--> <crate attribute>:1:16\n"), "{second}");
@@ -1250,6 +1326,9 @@ mod tests {
         let once = Diag::error(None, "x", at.clone());
         let mut twice = once.clone();
         twice.primary(at);
-        assert_eq!(rendered(&twice, &sources, Style::default()), rendered(&once, &sources, Style::default()));
+        assert_eq!(
+            rendered(&twice, &sources, Style::default()).unwrap(),
+            rendered(&once, &sources, Style::default()).unwrap()
+        );
     }
 }

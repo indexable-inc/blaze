@@ -1,15 +1,16 @@
-//! The macOS sampler (arm64): each tick, every running thread that holds a ring is stopped,
-//! its registers read and its frame pointers walked inside its own stack, and let go.
+//! The macOS sampler (arm64): each tick, every thread that holds a ring is stopped, its
+//! registers read and its frame pointers walked inside its own stack, and let go. A thread
+//! that is not running is sampled too, marked off the CPU: what it blocks in, and whether a
+//! wait span says so, is what the raw-block gate reads.
 
-use std::{
-    sync::{Mutex, MutexGuard},
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
+
+use parking_lot::{Mutex, MutexGuard};
 
 use super::{DEPTH, Sample, Unsampled, keep};
 
 pub(super) const HOW: &str =
-    "each running thread that records spans stopped (thread_suspend) and its frame pointers walked";
+    "each thread that records spans, running or blocked, stopped (thread_suspend) and its frame pointers walked";
 
 /// How often the samples taken are kept.
 const KEEP_EVERY: Duration = Duration::from_millis(100);
@@ -81,7 +82,7 @@ impl Thread {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|it| it.into_inner())
+    mutex.lock()
 }
 
 pub(super) fn check() -> Result<(), Unsampled> {
@@ -100,7 +101,7 @@ pub(super) fn run(hz: u32) {
         for ring in &rings {
             let thread = lock(&ring.sampled);
             if thread.live
-                && let Some(sample) = sample(&thread)
+                && let Some(sample) = sample(&thread, ring)
             {
                 batch.push(sample);
             }
@@ -110,6 +111,7 @@ pub(super) fn run(hz: u32) {
             batch.clear();
             kept = Instant::now();
         }
+        #[allow(clippy::disallowed_methods, reason = "the sampler thread's own timer, a driver's: no pool thread or job waits here")]
         std::thread::sleep(every.saturating_sub(started.elapsed()));
     }
 }
@@ -142,12 +144,10 @@ fn running(thread: &Thread) -> bool {
 
 /// Stops the thread, reads its stack and lets it go: nothing allocated and no lock taken
 /// while it is stopped, since it may hold the allocator's or any other.
-fn sample(thread: &Thread) -> Option<Sample> {
-    if !running(thread) {
-        return None;
-    }
+fn sample(thread: &Thread, ring: &crate::flight::Ring) -> Option<Sample> {
+    let on_cpu = running(thread);
     let at = Instant::now();
-    let mut sample = Sample { at, tid: thread.tid, depth: 0, pcs: [0; DEPTH] };
+    let mut sample = Sample { at, tid: thread.tid, depth: 0, pcs: [0; DEPTH], span: 0, build: 0, on_cpu };
     // SAFETY: the port of a live thread that is not this one (the sampler holds no ring).
     if unsafe { thread_suspend(thread.port) } != libc::KERN_SUCCESS {
         return None;
@@ -161,6 +161,8 @@ fn sample(thread: &Thread) -> Option<Sample> {
     };
     if got == libc::KERN_SUCCESS {
         walk(&state, thread.low, thread.high, &mut sample);
+        sample.span = ring.innermost();
+        sample.build = crate::flight::build_of(sample.span);
     }
     // SAFETY: the thread suspended above, resumed once.
     unsafe { thread_resume(thread.port) };
@@ -215,7 +217,7 @@ mod tests {
         stack[at(8)] = 0x10;
         stack[at(9)] = 0x1003;
         let state = State { fp: aligned, pc: 0x1000, ..State::default() };
-        let mut sample = Sample { at: Instant::now(), tid: 1, depth: 0, pcs: [0; DEPTH] };
+        let mut sample = Sample { at: Instant::now(), tid: 1, depth: 0, pcs: [0; DEPTH], span: 0, build: 0, on_cpu: true };
         walk(&state, base, high, &mut sample);
         assert_eq!(&sample.pcs[..usize::from(sample.depth)], &[0x1000, 0x1001, 0x1002, 0x1003]);
     }

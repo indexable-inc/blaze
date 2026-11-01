@@ -20,12 +20,12 @@ use std::{
 };
 
 use base_db::Nonce;
+use blaze_hash::FixedHasher;
+use blaze_query::db::{AsId, Reads, View};
 use hir_expand::name::Name;
-use rustc_hash::FxHasher;
 use rustc_type_ir::{
     RegionKind, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt, inherent::IntoKind,
 };
-use blaze_query::db::{AsId, Reads, View};
 
 use self::table::{Key, Table};
 use super::{
@@ -80,7 +80,7 @@ const FLAG_SUPERTRAIT_ITEM_SHADOWING: u32 = 1 << 11;
 impl Key for PickKey {
     #[inline]
     fn hint(&self) -> u64 {
-        let mut hasher = FxHasher::default();
+        let mut hasher = FixedHasher::default();
         self.nonce.hash(&mut hasher);
         hasher.write_u64(pair(self.solver_crate, self.resolver_crate));
         hasher.write_u64(pair(self.module, self.self_ty));
@@ -359,7 +359,7 @@ struct StepsKey {
 impl Key for StepsKey {
     #[inline]
     fn hint(&self) -> u64 {
-        let mut hasher = FxHasher::default();
+        let mut hasher = FixedHasher::default();
         self.nonce.hash(&mut hasher);
         hasher.write_u32(self.solver_crate);
         hasher.write_u64(pair(self.self_ty, self.opaques));

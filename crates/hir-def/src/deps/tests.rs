@@ -1,20 +1,21 @@
 use std::{
     any::TypeId,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU8, Ordering::SeqCst},
     },
 };
 
 use base_db::{Crate, CrateOrigin, Db, Env};
 use blaze_format::Aligned;
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
+use hir_expand::fixture;
 use hir_expand::proc_macro::{
     ExpansionReads, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
     ProcMacroKind, report_reads,
 };
-use rustc_hash::FxHashMap;
-use hir_expand::fixture;
+use parking_lot::Mutex;
 
 use super::*;
 use crate::{nameres::frozen, test_db::TestDB, tt::TopSubtree};
@@ -63,14 +64,14 @@ fn crate_named(db: &TestDB, name: &str) -> Crate {
 /// A store in memory, which refuses a second put of a key with other bytes as the store does.
 #[derive(Default)]
 struct Memory {
-    images: Mutex<FxHashMap<ContentId, Arc<Aligned>>>,
+    images: Mutex<HashMap<ContentId, Arc<Aligned>>>,
     gets: Mutex<usize>,
 }
 
 impl ImageStore for Memory {
     fn get(&self, key: &ContentId) -> Result<Option<ImageBuf>, String> {
-        *self.gets.lock().unwrap() += 1;
-        Ok(self.images.lock().unwrap().get(key).map(|it| it.clone() as ImageBuf))
+        *self.gets.lock() += 1;
+        Ok(self.images.lock().get(key).map(|it| it.clone() as ImageBuf))
     }
 
     fn reads_now(&self, _: &Env, shape: &[u8]) -> Result<ContentId, String> {
@@ -78,7 +79,7 @@ impl ImageStore for Memory {
     }
 
     fn put(&self, key: ContentId, image: Vec<u8>) -> Result<(), String> {
-        let mut images = self.images.lock().unwrap();
+        let mut images = self.images.lock();
         match images.get(&key) {
             Some(kept) if kept[..] != image[..] => Err(format!("{key:?} kept with other bytes")),
             Some(_) => Ok(()),
@@ -228,7 +229,7 @@ fn damaged_images_read_within_bounds_or_not_at_all() {
 
 #[test]
 fn every_dependency_is_stored_and_served() {
-    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    let _turn = TURN.lock();
     let (memory, stored) = stored(FIXTURE);
     assert_eq!(stored.refused, Vec::new());
     let mut db = fixture::db(FIXTURE).into_db();
@@ -252,7 +253,7 @@ fn every_dependency_is_stored_and_served() {
 /// and without.
 #[test]
 fn a_stored_image_is_served_under_the_key_store_filed_it_by() {
-    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    let _turn = TURN.lock();
     for fixture in [FIXTURE, READING] {
         let memory = Memory::default();
         let open = || if fixture == READING { reading_db() } else { fixture::db(fixture).into_db() };
@@ -261,7 +262,7 @@ fn a_stored_image_is_served_under_the_key_store_filed_it_by() {
         let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
         let stored = store(&db, &served, &memory).unwrap();
         assert_eq!(stored.filed.len(), stored.written.len());
-        let filed: FxHashMap<String, ContentId> = stored
+        let filed: HashMap<String, ContentId> = stored
             .filed
             .iter()
             .map(|(&krate, &key)| (serve::crate_name(&db, krate), key))
@@ -282,7 +283,7 @@ fn a_stored_image_is_served_under_the_key_store_filed_it_by() {
 /// database's.
 #[test]
 fn a_served_dependency_resolves_as_a_fresh_one() {
-    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    let _turn = TURN.lock();
     let (memory, _) = stored(FIXTURE);
     let fresh = fixture::db(FIXTURE).into_db();
     for mode in [Mode::Serve, Mode::Verify, Mode::Check] {
@@ -311,7 +312,7 @@ fn a_served_dependency_resolves_as_a_fresh_one() {
 
 #[test]
 fn an_unresolved_import_of_a_dependency_is_still_reported() {
-    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    let _turn = TURN.lock();
     let (memory, _) = stored(FIXTURE);
     let mut db = fixture::db(FIXTURE).into_db();
     let crates = all(&db);
@@ -322,7 +323,7 @@ fn an_unresolved_import_of_a_dependency_is_still_reported() {
 
 #[test]
 fn an_edit_to_a_dependency_misses_its_image_and_its_dependents() {
-    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    let _turn = TURN.lock();
     let (memory, _) = stored(FIXTURE);
     let edited = FIXTURE.replace("pub trait Sized {}", "pub trait Sized {}\npub struct More;");
     let mut db = fixture::db(&edited).into_db();
@@ -335,18 +336,17 @@ fn an_edit_to_a_dependency_misses_its_image_and_its_dependents() {
 
 #[test]
 fn an_image_written_under_another_key_is_an_error() {
-    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    let _turn = TURN.lock();
     let (memory, _) = stored(FIXTURE);
     let db = fixture::db(FIXTURE).into_db();
     let lib = crate_named(&db, "lib");
     let key = keys(&db, &[lib], BUILD)[&lib];
     let other = ContentId([3; 32]);
-    let image = memory.images.lock().unwrap()[&key].clone();
-    memory.images.lock().unwrap().insert(other, image.clone());
+    let image = memory.images.lock()[&key].clone();
+    memory.images.lock().insert(other, image.clone());
     memory
         .images
         .lock()
-        .unwrap()
         .insert(key, Arc::new(Aligned::copy_from(&write_image(other, [b"", b"", b""]))));
     let mut db = fixture::db(FIXTURE).into_db();
     let crates = all(&db);
@@ -450,7 +450,7 @@ fn store_reading(memory: &Memory) -> Vec<String> {
 /// and every signature, byte for byte in their portable encodings.
 #[test]
 fn a_crate_with_traced_expansions_resolves_from_its_image_as_a_fresh_one() {
-    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    let _turn = TURN.lock();
     VALUE.store(0, SeqCst);
     let memory = Memory::default();
     let written = store_reading(&memory);
@@ -489,7 +489,7 @@ fn a_crate_with_traced_expansions_resolves_from_its_image_as_a_fresh_one() {
 /// imaged again, it is filed in the same slot under the new value and found.
 #[test]
 fn a_changed_read_misses_the_image_and_the_next_one_is_found() {
-    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    let _turn = TURN.lock();
     VALUE.store(0, SeqCst);
     let memory = Memory::default();
     store_reading(&memory);
@@ -503,7 +503,7 @@ fn a_changed_read_misses_the_image_and_the_next_one_is_found() {
     let stored = store(&db, &served, &memory).unwrap();
     assert!(stored.written.contains(&lib), "{stored:?}");
     let key = served.keys[&lib];
-    let images = memory.images.lock().unwrap();
+    let images = memory.images.lock();
     assert!(images.contains_key(&reads::slot(key, 0)));
     assert!(!images.contains_key(&reads::slot(key, 1)), "the same names share a slot");
     drop(images);
@@ -516,7 +516,7 @@ fn a_changed_read_misses_the_image_and_the_next_one_is_found() {
 /// A rebuilt library of macros is another library: its dependents' keys change with it.
 #[test]
 fn a_key_covers_the_library_of_its_macros() {
-    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    let _turn = TURN.lock();
     let key = || {
         let db = reading_db();
         let lib = crate_named(&db, "lib");
@@ -689,18 +689,18 @@ fn an_image_holding_a_path_of_the_checkout_is_refused() {
 fn the_global_cache_is_read_through_the_local_store() {
     let (global, _) = stored(FIXTURE);
     let local = Memory::default();
-    *global.gets.lock().unwrap() = 0;
+    *global.gets.lock() = 0;
     let through = ReadThrough { local: &local, global: &global };
     let mut db = fixture::db(FIXTURE).into_db();
     let crates = all(&db);
     let served = serve(&mut db, &crates, BUILD, &through, Mode::Serve).unwrap();
     assert_eq!(names(&db, &served.hits), ["core", "lib"]);
-    assert_eq!(*global.gets.lock().unwrap(), 2);
+    assert_eq!(*global.gets.lock(), 2);
     assert_eq!(contents(&local), contents(&global));
     let mut db = fixture::db(FIXTURE).into_db();
     let served = serve(&mut db, &crates, BUILD, &through, Mode::Serve).unwrap();
     assert_eq!(names(&db, &served.hits), ["core", "lib"]);
-    assert_eq!(*global.gets.lock().unwrap(), 2, "the second session reads the local store alone");
+    assert_eq!(*global.gets.lock(), 2, "the second session reads the local store alone");
 }
 
 #[test]
@@ -713,13 +713,13 @@ fn a_crate_with_no_outside_input_is_not_refused() {
 
 #[test]
 fn serving_asks_the_store_once_a_crate() {
-    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    let _turn = TURN.lock();
     let (memory, _) = stored(FIXTURE);
-    *memory.gets.lock().unwrap() = 0;
+    *memory.gets.lock() = 0;
     let mut db = fixture::db(FIXTURE).into_db();
     let crates = all(&db);
     serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
-    assert_eq!(*memory.gets.lock().unwrap(), 2);
+    assert_eq!(*memory.gets.lock(), 2);
 }
 
 /// [`Memory`] whose tasks run on four threads, each taking every fourth.
@@ -751,7 +751,7 @@ impl ImageStore for Threads {
 
 #[test]
 fn tasks_on_threads_store_and_serve_as_in_order() {
-    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    let _turn = TURN.lock();
     let (memory, _) = stored(FIXTURE);
     let threads = Threads::default();
     let mut db = fixture::db(FIXTURE).into_db();
@@ -768,14 +768,14 @@ fn tasks_on_threads_store_and_serve_as_in_order() {
 /// A served image's parts are slices of the buffer the store gave, not copies.
 #[test]
 fn served_parts_are_the_store_s_bytes() {
-    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    let _turn = TURN.lock();
     let (memory, _) = stored(FIXTURE);
     let mut db = fixture::db(FIXTURE).into_db();
     let crates = all(&db);
     serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
     let lib = crate_named(&db, "lib");
     let key = keys(&db, &[lib], BUILD)[&lib];
-    let kept = memory.images.lock().unwrap()[&key].clone();
+    let kept = memory.images.lock()[&key].clone();
     let part = image(&db, lib).unwrap().part(Part::Signatures);
     assert!(kept.as_ptr_range().contains(&part.as_ptr()) || part.is_empty());
 }
@@ -783,7 +783,7 @@ fn served_parts_are_the_store_s_bytes() {
 /// What `memory` keeps, by key.
 fn contents(memory: &Memory) -> Vec<(ContentId, Vec<u8>)> {
     let mut kept: Vec<_> =
-        memory.images.lock().unwrap().iter().map(|(&key, bytes)| (key, bytes.to_vec())).collect();
+        memory.images.lock().iter().map(|(&key, bytes)| (key, bytes.to_vec())).collect();
     kept.sort();
     kept
 }
@@ -816,7 +816,7 @@ fn a_body_s_process_variable_files_a_value_in_a_slot() {
     let key = ContentId([5; 32]);
     let filed = file_by_reads(&db, lib, key, &reads, &memory).unwrap().unwrap();
     assert_ne!(filed, key);
-    assert!(memory.images.lock().unwrap().contains_key(&reads::slot(key, 0)));
+    assert!(memory.images.lock().contains_key(&reads::slot(key, 0)));
     memory.put(filed, b"a check".to_vec()).unwrap();
     assert_eq!(found_in(&db, lib, key, &memory), Some(filed));
     set(&mut db, "2");
@@ -854,7 +854,7 @@ fn a_crate_with_no_body_reads_is_found_under_its_key() {
     let memory = Memory::default();
     let key = ContentId([6; 32]);
     assert_eq!(file_by_reads(&db, lib, key, &reads, &memory).unwrap(), Ok(key));
-    assert!(memory.images.lock().unwrap().is_empty(), "no slot is written");
+    assert!(memory.images.lock().is_empty(), "no slot is written");
     memory.put(key, b"a check".to_vec()).unwrap();
     assert_eq!(found_in(&db, lib, key, &memory), Some(key));
 }
@@ -863,7 +863,7 @@ fn a_crate_with_no_body_reads_is_found_under_its_key() {
 /// read is in its image's key. Resolved, it has them all.
 #[test]
 fn an_imaged_crate_s_checked_reads_leave_out_what_its_image_covers() {
-    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    let _turn = TURN.lock();
     VALUE.store(0, SeqCst);
     let memory = Memory::default();
     store_reading(&memory);
@@ -888,10 +888,10 @@ fn serving_a_crate_at_a_time_adds_to_what_was_served() {
     let (lib, core) = (crate_named(&db, "lib"), crate_named(&db, "core"));
     let first = serve(&mut db, &[core], BUILD, &memory, Mode::Serve).unwrap();
     assert_eq!(first.hits, [core]);
-    let gets = *memory.gets.lock().unwrap();
+    let gets = *memory.gets.lock();
     let second = serve(&mut db, &[lib], BUILD, &memory, Mode::Serve).unwrap();
     assert_eq!(names(&db, &second.hits), ["core", "lib"]);
-    assert_eq!(*memory.gets.lock().unwrap(), gets + 1, "core is kept, not fetched again");
+    assert_eq!(*memory.gets.lock(), gets + 1, "core is kept, not fetched again");
     let raw: &Db = &db;
     let images = DepImages::try_get(raw).unwrap().images(raw);
     assert!(images.contains_key(&lib) && images.contains_key(&core));
@@ -899,7 +899,7 @@ fn serving_a_crate_at_a_time_adds_to_what_was_served() {
     assert!(maps.contains_key(&lib) && maps.contains_key(&core));
     assert!(image_of(raw, core).is_some() && image_of(raw, lib).is_some());
     let again = serve(&mut db, &[lib], BUILD, &memory, Mode::Serve).unwrap();
-    assert_eq!(*memory.gets.lock().unwrap(), gets + 1, "nothing is fetched again");
+    assert_eq!(*memory.gets.lock(), gets + 1, "nothing is fetched again");
     assert_eq!(again.hits, second.hits);
     let other = serve(&mut db, &[lib], ContentId([8; 32]), &memory, Mode::Serve).unwrap();
     assert!(other.hits.is_empty(), "another build has other keys, which have no image");

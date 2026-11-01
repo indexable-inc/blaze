@@ -3,8 +3,9 @@
 //! `#[track_caller]` and panics report. The evaluator of constants and the code generator
 //! both read them.
 
-use blaze_query::db::{Database as _, Setter as _};
 use base_db::Db;
+use blaze_hash::{HashMap, HashSet};
+use blaze_query::db::{Database as _, Setter as _};
 use hir_def::{
     DefWithBodyId, FunctionId, ItemContainerId, Lookup,
     attrs::AttrFlags,
@@ -16,7 +17,6 @@ use hir_expand::{
     FileRange, HirFileId, InFile, MacroDefKind,
     builtin::{BuiltinFnLikeExpander, EagerExpander},
 };
-use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
     view::{self as ast, AstNode, AstToken, Element, Node},
@@ -47,10 +47,10 @@ fn calls_location_macros(db: &Db, body: &Body) -> bool {
 /// build's rule's ([`name_sources`]), not the expander's. The source map changes with every
 /// edit above the body, and this keeps code without such literals from changing with it.
 #[blaze_query::tracked(returns(ref))]
-pub fn location_macros<'db>(db: &'db Db, owner: DefWithBodyId) -> FxHashMap<ExprId, HirFileId> {
+pub fn location_macros<'db>(db: &'db Db, owner: DefWithBodyId) -> HashMap<ExprId, HirFileId> {
     let body = Body::of(db, owner);
     if !calls_location_macros(db, body) {
-        return FxHashMap::default();
+        return HashMap::default();
     }
     let source_map = Body::unmoved_source_map(db, owner);
     body.exprs()
@@ -70,11 +70,11 @@ pub fn location_macros<'db>(db: &'db Db, owner: DefWithBodyId) -> FxHashMap<Expr
 /// move above the body changes no MIR of it. `column!()` stays a literal: a `Location`'s column
 /// is rustc's display width, `column!()`'s counts chars, and no move above a body changes it.
 #[blaze_query::tracked(returns(ref))]
-pub fn line_literals<'db>(db: &'db Db, owner: DefWithBodyId) -> FxHashSet<ExprId> {
+pub fn line_literals<'db>(db: &'db Db, owner: DefWithBodyId) -> HashSet<ExprId> {
     let line = |kind| matches!(kind, MacroDefKind::BuiltIn(_, BuiltinFnLikeExpander::Line));
     let body = Body::of(db, owner);
     if !body.macro_calls().iter().any(|call| line(call.loc(db).def.kind)) {
-        return FxHashSet::default();
+        return HashSet::default();
     }
     let source_map = Body::unmoved_source_map(db, owner);
     body.exprs()
@@ -125,10 +125,10 @@ pub fn location_caller(db: &Db, location: hir_def::StructId) -> Option<FunctionI
 pub fn located_concats<'db>(
     db: &'db Db,
     owner: DefWithBodyId,
-) -> FxHashMap<ExprId, HirFileId> {
+) -> HashMap<ExprId, HirFileId> {
     let body = Body::of(db, owner);
     if !calls_location_macros(db, body) {
-        return FxHashMap::default();
+        return HashMap::default();
     }
     let source_map = Body::unmoved_source_map(db, owner);
     body.exprs()

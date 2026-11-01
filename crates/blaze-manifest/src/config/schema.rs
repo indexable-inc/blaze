@@ -7,7 +7,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::path::Path;
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use serde::Deserialize;
 use serde_untagged::UntaggedEnumVisitor;
 
@@ -271,7 +271,7 @@ impl EnvConfigValue {
     }
 }
 
-pub type EnvConfig = FxHashMap<String, EnvConfigValue>;
+pub type EnvConfig = HashMap<String, EnvConfigValue>;
 
 /// A token or key, which `Debug` does not show.
 #[derive(Clone, Deserialize)]

@@ -13,9 +13,11 @@
 
 use std::{ffi::OsString, fmt::Write as _, path::PathBuf};
 
-use blaze_core::{Address, Command, Completion, Conn, Done, Effect, Exit, FileName, IoError, Sandbox, Tag};
+use blaze_core::{
+    Address, Command, Completion, Conn, Done, Effect, Exit, FileName, IoError, Sandbox, Tag,
+};
+use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Hasher, radix};
-use rustc_hash::FxHashMap;
 
 use crate::confine::LIVE;
 
@@ -126,9 +128,9 @@ struct Process {
 pub struct Pool {
     config: Config,
     next: u64,
-    servers: FxHashMap<Server, Process>,
-    asked: FxHashMap<Tag, Asked>,
-    idle: FxHashMap<WarmKey, Vec<Server>>,
+    servers: HashMap<Server, Process>,
+    asked: HashMap<Tag, Asked>,
+    idle: HashMap<WarmKey, Vec<Server>>,
     count: u32,
 }
 
@@ -137,9 +139,9 @@ impl Pool {
         Pool {
             config,
             next: 0,
-            servers: FxHashMap::default(),
-            asked: FxHashMap::default(),
-            idle: FxHashMap::default(),
+            servers: HashMap::default(),
+            asked: HashMap::default(),
+            idle: HashMap::default(),
             count: 0,
         }
     }

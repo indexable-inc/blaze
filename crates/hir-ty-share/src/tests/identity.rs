@@ -6,11 +6,13 @@
 //! them. `is_plain_data` is checked against the code generator's copy the same way.
 
 use base_db::Db;
+use blaze_hash::HashSet;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, ItemKey, coroutine_code, interface_hash, item_key, key, layout_hash};
 use hegel::TestCase;
 use hegel::generators as gs;
 use hir_def::{AdtId, CallableDefId, ModuleDefId};
+use hir_expand::fixture;
 use hir_ty::{
     InferBodyId, ParamEnvAndCrate, TyDefId,
     consteval::usize_const,
@@ -22,13 +24,11 @@ use hir_ty::{
         infer::{DbInternerInferExt, InferCtxt},
     },
 };
-use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     AliasTyKind, BoundTyKind, BoundVarIndexKind, ExistentialPredicate, GenericArgKind, InferConst,
     PatternKind, TermKind, ValTreeKind,
     inherent::{GenericArgs as _, IntoKind},
 };
-use hir_expand::fixture;
 
 use super::{TestDB, alias, declarations, function};
 use crate::{code, identity, is_plain_data};
@@ -148,7 +148,7 @@ fn old_adt(db: &Db, old: Old, adt: AdtId) -> Result<ContentId, String> {
     h.id(&item_key(db, item).0)
         .id(&interface_hash(db, item).map_err(describe)?.0)
         .id(&layout_hash(db, adt).map_err(describe)?.0);
-    let mut seen: FxHashSet<AdtId> = FxHashSet::default();
+    let mut seen: HashSet<AdtId> = HashSet::default();
     seen.insert(adt);
     let mut next = vec![adt];
     let mut dropping: Vec<(ItemKey, ContentId)> = Vec::new();

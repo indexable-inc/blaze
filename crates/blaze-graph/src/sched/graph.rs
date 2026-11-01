@@ -5,7 +5,7 @@
 //! pool is. It knows nothing of cores: each job's home (its driver and its id there) says
 //! where a woken job goes. No IO, no clock.
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 use super::{CounterId, Cycle, JobId, MAX_JOBS, NONE};
 use crate::Key;
@@ -121,7 +121,7 @@ pub(crate) struct Graph {
     dfs: Vec<u32>,
 
     // Per key flight.
-    keys: FxHashMap<Key, u32>,
+    keys: HashMap<Key, u32>,
     key_name: Vec<Key>,
     key_claimer: Vec<u32>,
     key_waiters: Vec<u32>,
@@ -152,7 +152,7 @@ impl Graph {
             jobs: Vec::with_capacity(jobs),
             epoch: 0,
             dfs: Vec::with_capacity(64),
-            keys: FxHashMap::with_capacity_and_hasher(jobs, Default::default()),
+            keys: HashMap::with_capacity_and_hasher(jobs, Default::default()),
             key_name: Vec::with_capacity(jobs),
             key_claimer: Vec::with_capacity(jobs),
             key_waiters: Vec::with_capacity(jobs),

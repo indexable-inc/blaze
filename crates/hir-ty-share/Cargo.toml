@@ -14,10 +14,11 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-hash.workspace = true
 either.workspace = true
-rustc-hash.workspace = true
 blaze-query.workspace = true
 smallvec.workspace = true
+parking_lot.workspace = true
 
 rustc_abi.workspace = true
 rustc_type_ir.workspace = true

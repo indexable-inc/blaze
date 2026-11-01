@@ -43,6 +43,12 @@ pub enum Edit {
     /// The item and every reference to it, as the front end resolves them in the crates that
     /// can name it; an out-of-line module's file moves with it.
     Rename { to: String, item: Target },
+    /// Every reference that resolves to the item `from` names, retargeted to the item `to`
+    /// names, each a def path from a crate's name (`std::sync::Mutex`,
+    /// `parking_lot::Mutex`), in the view's crates that can name `from`: a `use` of it imports
+    /// `to` instead, a path that qualifies it is rewritten, and a path through one of the
+    /// view's own imports stays, as that import moves.
+    Replace { to: String, from: String },
 }
 
 /// What an edit request did: the ops it commits, and each item they touched.

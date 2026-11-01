@@ -81,13 +81,13 @@ pub(crate) fn included(db: &Db, krate: Crate, out: &mut Vec<PathBuf>) {
 /// closure's files are hashed once a revision.
 #[derive(Default)]
 pub(crate) struct Memo {
-    last: std::sync::Mutex<Option<((Nonce, blaze_query::db::View), ContentId)>>,
+    last: parking_lot::Mutex<Option<((Nonce, blaze_query::db::View), ContentId)>>,
 }
 
 impl Memo {
     pub(crate) fn get(&self, db: &Db, krate: Crate) -> ContentId {
         let now = db.nonce_and_revision();
-        let last = *self.last.lock().unwrap_or_else(|it| it.into_inner());
+        let last = *self.last.lock();
         if let Some((at, code)) = last
             && at == now
         {
@@ -96,7 +96,7 @@ impl Memo {
         // Hashed with no lock held: the hash asks the database, which may wait on another
         // thread's expansion that waits here.
         let code = of(db, krate);
-        *self.last.lock().unwrap_or_else(|it| it.into_inner()) = Some((now, code));
+        *self.last.lock() = Some((now, code));
         code
     }
 }

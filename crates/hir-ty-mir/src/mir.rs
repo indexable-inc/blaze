@@ -75,5 +75,5 @@ pub use optimize::{
     source_span, written_checked_at,
 };
 pub use pretty::{closure_path_suffix, impl_written_at, print_mir_body};
-pub use storage::{FrameStorage, StorageConflicts};
+pub use storage::{FrameStorage, SharedSlots, StorageConflicts, share_greedily};
 pub use transform::{noop_landing_pads, runtime_promoted_mir_body_query};

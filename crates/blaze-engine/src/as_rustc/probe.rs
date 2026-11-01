@@ -18,7 +18,7 @@ use std::{
     collections::HashMap,
     ffi::OsString,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use anyhow::{Context as _, anyhow, bail};
@@ -33,6 +33,7 @@ use blaze_units::{
 use blaze_vfs::{Bytes, Corrupt, Mode, View};
 use cfg::{CfgAtom, CfgOptions};
 use intern::Symbol;
+use parking_lot::Mutex;
 
 /// Where the probe's package is named: under no directory of the machine's, so nothing of it is
 /// read from the disk.
@@ -174,7 +175,7 @@ pub(super) fn check(asked: &Asked<'_>, shown: &str, source: &str, library: &Libr
     if let Some(diag) = diags.iter().find(|it| it.code.as_ref().and_then(Code::error) == Some("E0583")) {
         bail!("blaze reads a probe's one file, and it declares a module in another: {}", diag.message);
     }
-    Ok(Checked { failed: diags.iter().any(Diag::is_error), stderr: written(&diags, asked, shown, source, library) })
+    Ok(Checked { failed: diags.iter().any(Diag::is_error), stderr: written(&diags, asked, shown, source, library)? })
 }
 
 /// What std's build script (`library/std/build.rs`) gives std, set on its crate: the probe's
@@ -230,8 +231,15 @@ fn std_script(lowered: &mut blaze_lower::Lowered, units: &Units, library: &Libra
 }
 
 /// `diags` as rustc writes them to standard error, the files they point into read: the probe's
-/// own as `source`, the library's from its directory.
-fn written(diags: &[Diag], asked: &Asked<'_>, shown: &str, source: &str, library: &Library) -> String {
+/// own as `source`, the library's from its directory. A span of a file neither, or past its
+/// end, fails the probe.
+fn written(
+    diags: &[Diag],
+    asked: &Asked<'_>,
+    shown: &str,
+    source: &str,
+    library: &Library,
+) -> Result<String, emit::Unplaced> {
     let mut sources = emit::Sources::default();
     let named = stdlib::library_at(&library.commit);
     for name in sources.unread(diags) {
@@ -248,16 +256,16 @@ fn written(diags: &[Diag], asked: &Asked<'_>, shown: &str, source: &str, library
     for diag in diags {
         match asked.json {
             true => {
-                let line = emit::json(diag, &sources, asked.style);
+                let line = emit::json(diag, &sources, asked.style)?;
                 if !line.is_empty() {
                     out += &line;
                     out.push('\n');
                 }
             }
-            false => out += &emit::written(diag, &sources, asked.style),
+            false => out += &emit::written(diag, &sources, asked.style)?,
         }
     }
-    out
+    Ok(out)
 }
 
 /// A cfg as `--print cfg` prints it (`unix`, `target_os="linux"`).
@@ -327,13 +335,13 @@ impl ProbeFiles {
     }
 
     fn fail(&self, path: &Path, error: std::io::Error) {
-        let mut failed = self.failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut failed = self.failed.lock();
         failed.get_or_insert_with(|| format!("reading {}: {error}", path.display()));
     }
 
     /// The first file of the library that could not be read, as an error.
     fn failed(&self) -> anyhow::Result<()> {
-        match self.failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
+        match self.failed.lock().as_ref() {
             Some(why) => bail!("the standard library's source: {why}"),
             None => Ok(()),
         }

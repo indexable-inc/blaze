@@ -35,6 +35,8 @@ where cargo would have put it, under `target/`.
   it watches and the memory it holds.
 - `blaze stop` makes the daemon's state durable and stops it. It does not stop by itself;
   `blaze daemon install` has systemd or launchd start it on the first connection instead.
+  A command that finds a daemon of another build of blaze says so in one line, stops it and
+  starts its own; a socket-activated one of another build is refused, naming both.
 
 `b`, `c`, `r` and `t` are short for `build`, `check`, `run` and `test`, and `blaze help
 <command>` lists a command's flags. Those, `serve`, `stop`, `status`, `daemon`, blaze's looks at

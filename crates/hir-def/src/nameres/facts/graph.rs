@@ -14,6 +14,7 @@
 use std::{iter, sync::LazyLock};
 
 use base_db::Crate;
+use blaze_hash::FixedState;
 use blaze_ids::radix::Csr;
 use blaze_mem::Frame;
 use hashbrown::{HashMap, HashSet, hash_map::Entry};
@@ -22,7 +23,6 @@ use hir_expand::{
     name::Name,
 };
 use intern::Symbol;
-use rustc_hash::FxBuildHasher;
 use span::Edition;
 
 use crate::nameres::{
@@ -414,12 +414,12 @@ impl<'a, 'f> Solver<'a, 'f> {
             paths: Vec::with_capacity_in(paths, frame),
             level_path: Vec::with_capacity_in(levels, frame),
             level_first,
-            pair_ids: HashMap::with_capacity_and_hasher_in(estimate, FxBuildHasher, frame),
+            pair_ids: HashMap::with_capacity_and_hasher_in(estimate, FixedState, frame),
             pairs: Vec::with_capacity_in(estimate, frame),
             module_pairs,
             module_globs,
             links: Vec::with_capacity_in(4 * estimate, frame),
-            seen: HashSet::with_capacity_and_hasher_in(estimate, FxBuildHasher, frame),
+            seen: HashSet::with_capacity_and_hasher_in(estimate, FixedState, frame),
             work: Vec::with_capacity_in(estimate, frame),
             prelude_levels: Vec::with_capacity_in(paths, frame),
             edges: Vec::with_capacity_in(2 * levels + modules * (1 + preludes), frame),

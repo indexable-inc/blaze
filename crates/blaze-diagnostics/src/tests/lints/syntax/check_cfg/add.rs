@@ -14,7 +14,7 @@ fn refused(spec: &str) -> Option<String> {
     let diag = check.add_diag(spec, Edition::Edition2015).err()?;
     assert_eq!(check, CheckCfg::default(), "`{spec}` is refused and changed nothing");
     let style = Style { ui_testing: true, ..Style::default() };
-    Some(crate::emit::written(&diag, &Sources::of(std::iter::empty()), style))
+    Some(crate::emit::written(&diag, &Sources::of(std::iter::empty()), style).unwrap())
 }
 
 fn error(spec: &str, notes: &[&str]) -> String {

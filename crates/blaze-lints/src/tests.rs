@@ -3,7 +3,7 @@
 
 use base_db::{Db, FileId};
 use blaze_diagnostics::emit::{Sources, Style};
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use hir_expand::fixture;
 
 use crate::{
@@ -77,19 +77,27 @@ pub(crate) fn lint(fixture: &str, flags: &str) -> String {
 /// databases, with the lints dispatched on the node's kind and as each cast the node for
 /// itself before ([`crate::lints::check_node_by_casts`]): the two write the same.
 pub(crate) fn lint_with(fixture: &str, flags: &str, conf: Conf) -> String {
-    let by_kind = lint_once(fixture, flags, conf.clone());
+    lint_given(fixture, flags, conf, |_| {})
+}
+
+/// [`lint_with`], `given` done to each database's fixture first (a proc-macro crate given its
+/// macros, [`fixture::Fixture::set_proc_macros`]).
+pub(crate) fn lint_given(fixture: &str, flags: &str, conf: Conf, given: fn(&mut fixture::Fixture)) -> String {
+    let by_kind = lint_once(fixture, flags, conf.clone(), given);
     crate::lints::BY_CASTS.set(true);
-    let by_casts = lint_once(fixture, flags, conf);
+    let by_casts = lint_once(fixture, flags, conf, given);
     crate::lints::BY_CASTS.set(false);
     assert_eq!(by_kind, by_casts, "the dispatch on the kind finds what the casts found");
     by_kind
 }
 
-fn lint_once(fixture: &str, flags: &str, conf: Conf) -> String {
-    let db = fixture::db(fixture).into_db();
+fn lint_once(fixture: &str, flags: &str, conf: Conf, given: fn(&mut fixture::Fixture)) -> String {
+    let mut built = fixture::db(fixture);
+    given(&mut built);
+    let db = built.into_db();
     hir::attach_db(&db, || {
         let krate = main_crate(&db);
-        let mut names: FxHashMap<FileId, String> = FxHashMap::default();
+        let mut names: HashMap<FileId, String> = HashMap::default();
         let mut texts = Vec::new();
         for krate in hir::Crate::all(&db) {
             for module in krate.modules(&db) {
@@ -110,6 +118,7 @@ fn lint_once(fixture: &str, flags: &str, conf: Conf) -> String {
         let found = check(&db, krate, &setup, &name_of).expect("every file of the crates is named");
         let mut sources = Sources::of(texts);
         crate::serve::written(found.iter(), &mut sources, |_| None, Style::default())
+            .expect("every file a lint points into is given")
             .into_iter()
             .map(|it| it.rendered)
             .collect()

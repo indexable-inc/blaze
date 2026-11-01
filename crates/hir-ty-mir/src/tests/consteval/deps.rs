@@ -1,16 +1,17 @@
 //! Constants of dependencies served from the store against the same constants evaluated, through
 //! `const_eval` (`hir_ty::consteval::deps`).
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use base_db::{ContentId, Crate, Env, all_crates};
+use blaze_hash::HashMap;
 use hir_def::{
     ConstId, ModuleDefId,
     deps::{Held, ImageBuf, ImageStore, Mode},
     nameres::{crate_def_map, frozen},
 };
-use rustc_hash::FxHashMap;
 use hir_expand::fixture;
+use parking_lot::Mutex;
 
 use crate::{
     consteval::{
@@ -58,16 +59,16 @@ impl Held for Bytes {
 /// A store in memory; [`Memory::replace`] stands for one whose bytes changed under their key.
 #[derive(Default)]
 struct Memory {
-    values: Mutex<FxHashMap<ContentId, Arc<Bytes>>>,
+    values: Mutex<HashMap<ContentId, Arc<Bytes>>>,
 }
 
 impl ImageStore for Memory {
     fn get(&self, key: &ContentId) -> Result<Option<ImageBuf>, String> {
-        Ok(self.values.lock().unwrap().get(key).map(|it| Arc::clone(it) as ImageBuf))
+        Ok(self.values.lock().get(key).map(|it| Arc::clone(it) as ImageBuf))
     }
 
     fn put(&self, key: ContentId, value: Vec<u8>) -> Result<(), String> {
-        let mut values = self.values.lock().unwrap();
+        let mut values = self.values.lock();
         match values.get(&key) {
             Some(kept) if kept.0 != value => Err(format!("{key:?} is kept with other bytes")),
             Some(_) => Ok(()),
@@ -85,7 +86,7 @@ impl ImageStore for Memory {
 
 impl Memory {
     fn replace(&self, change: impl Fn(&mut Vec<u8>)) {
-        for value in self.values.lock().unwrap().values_mut() {
+        for value in self.values.lock().values_mut() {
             let mut bytes = value.0.clone();
             change(&mut bytes);
             *value = Arc::new(Bytes(bytes));
@@ -93,7 +94,7 @@ impl Memory {
     }
 
     fn len(&self) -> usize {
-        self.values.lock().unwrap().len()
+        self.values.lock().len()
     }
 }
 
@@ -130,7 +131,7 @@ fn const_named(db: &TestDB, krate: Crate, name: &str) -> ConstId {
 fn database(store: &Arc<Memory>, base: Option<ContentId>, mode: Mode) -> (TestDB, Crate) {
     let mut db = fixture::db(FIXTURE).into_db();
     let lib = crate_named(&db, "lib");
-    let crates = FxHashMap::from_iter([(lib, base)]);
+    let crates = HashMap::from_iter([(lib, base)]);
     // dyn: hir-ty's `set` takes the driver's store, a boundary (`consteval::deps::Shared::store`)
     set(&mut db, Arc::clone(store) as Arc<dyn ImageStore + Send + Sync>, crates, mode);
     (db, lib)
@@ -152,7 +153,7 @@ fn values(db: &TestDB, krate: Crate, names: &[&str]) -> Vec<String> {
 fn evaluated(store: &Arc<Memory>) -> Vec<String> {
     let (db, lib) = database(store, None, Mode::Serve);
     let evaluated = values(&db, lib, &KEPT);
-    let bases = FxHashMap::from_iter([(lib, BASE)]);
+    let bases = HashMap::from_iter([(lib, BASE)]);
     assert_eq!(drain(&db, &bases), Ok(Drained { written: KEPT.len(), unkeyed: 0 }));
     assert_eq!(store.len(), KEPT.len());
     evaluated
@@ -164,7 +165,7 @@ fn a_served_constant_equals_the_evaluated_one() {
     let evaluated = evaluated(&store);
     let (db, lib) = database(&store, Some(BASE), Mode::Serve);
     assert_eq!(values(&db, lib, &KEPT), evaluated);
-    assert_eq!(drain(&db, &FxHashMap::default()), Ok(Drained::default()), "every one was served");
+    assert_eq!(drain(&db, &HashMap::default()), Ok(Drained::default()), "every one was served");
     let main = crate_named(&db, "main");
     let mine = db.const_eval(const_named(&db, main, "MINE"), GenericArgs::empty(), None).unwrap();
     assert_eq!(mine.memory[..], [2], "a member's constant reads a served one");

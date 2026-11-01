@@ -24,12 +24,12 @@ mod read;
 #[cfg(test)]
 mod tests;
 
-use std::sync::{Mutex, MutexGuard};
-
 use blaze_codegen::Arch;
 use blaze_ids::radix;
+use parking_lot::Mutex;
 
 use crate::model::{Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Reserve, SectionName, Special, Writer};
+use crate::reset::{self, Reset};
 use crate::{Format, LinkError, NativeKind, Output, OutputKind};
 
 /// The ELF header and the most program headers an image has: `PT_PHDR`, `PT_INTERP`, four
@@ -438,17 +438,10 @@ impl Writer for Elf {
 }
 
 impl Elf {
-    /// The kept tables, locked; `None` for an output that keeps none. A lock poisoned by a
-    /// panic mid-build drops what it held.
-    pub(crate) fn last(&self) -> Option<MutexGuard<'_, Last>> {
-        self.last.as_ref().map(|it| match it.lock() {
-            Ok(last) => last,
-            Err(poisoned) => {
-                let mut last = poisoned.into_inner();
-                *last = Last::default();
-                last
-            }
-        })
+    /// The kept tables, locked; `None` for an output that keeps none. A panic mid-build while
+    /// they are held drops what they held.
+    pub(crate) fn last(&self) -> Option<Reset<'_, Last>> {
+        self.last.as_ref().map(reset::lock)
     }
 
     /// The program headers the headers have room for: a dev executable's reservations add

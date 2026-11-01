@@ -16,11 +16,12 @@ doctest = false
 [dependencies]
 anyhow.workspace = true
 blaze-format.workspace = true
+blaze-hash.workspace = true
 blaze-resolve.workspace = true
 blaze-source.workspace = true
 # The index's lines and `[source]` replacement, read as the load reads them.
 blaze-units.workspace = true
-rustc-hash.workspace = true
+parking_lot.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
 serde_json.workspace = true

@@ -133,7 +133,7 @@ impl<T> AppendVec<T> {
     {
         match self.try_extend_from_slice(values) {
             Ok(first) => first,
-            Err(error) => fail(error),
+            Err(error) => fail(&error),
         }
     }
 
@@ -144,7 +144,7 @@ impl<T> AppendVec<T> {
     pub fn append(&self, value: T) -> u32 {
         match self.try_append(value) {
             Ok(index) => index,
-            Err(error) => fail(error),
+            Err(error) => fail(&error),
         }
     }
 
@@ -226,7 +226,7 @@ impl<T> Writer<'_, T> {
     pub fn append(&mut self, value: T) -> u32 {
         match self.try_append(value) {
             Ok(index) => index,
-            Err(error) => fail(error),
+            Err(error) => fail(&error),
         }
     }
 
@@ -253,7 +253,7 @@ impl<T> Writer<'_, T> {
     {
         match self.try_extend_from_slice(values) {
             Ok(first) => first,
-            Err(error) => fail(error),
+            Err(error) => fail(&error),
         }
     }
 
@@ -276,7 +276,7 @@ impl<T> Writer<'_, T> {
     pub fn extend_with(&mut self, count: usize, make: impl FnMut(usize) -> T) -> u32 {
         match self.try_extend_with(count, make) {
             Ok(first) => first,
-            Err(error) => fail(error),
+            Err(error) => fail(&error),
         }
     }
 }

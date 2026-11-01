@@ -8,7 +8,7 @@
 //! `is_in_follow`) and `compiler/rustc_ast/src/token.rs` (`can_begin_type`) (MIT or
 //! Apache-2.0).
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use smallvec::SmallVec;
 use syntax::TextRange;
 
@@ -92,7 +92,7 @@ struct Follow<'m> {
     m: &'m Matchers,
     tokens: &'m Tokens<'m>,
     /// The FIRST set of each repetition's contents, by the repetition.
-    first: FxHashMap<u32, TokenSet>,
+    first: HashMap<u32, TokenSet>,
     out: &'m mut Vec<OrPattern>,
 }
 
@@ -100,7 +100,7 @@ struct Follow<'m> {
 /// arguments) gives. One that is not in delimiters is an error rustc gives elsewhere.
 pub(super) fn check_lhs(m: &Matchers, tokens: &Tokens<'_>, lhs: u32, out: &mut Vec<OrPattern>) {
     let Mtt::Delimited { tts, .. } = *m.at(lhs) else { return };
-    let mut follow = Follow { m, tokens, first: FxHashMap::default(), out };
+    let mut follow = Follow { m, tokens, first: HashMap::default(), out };
     follow.build(tts);
     let _ = follow.core(tts, &TokenSet::empty());
 }

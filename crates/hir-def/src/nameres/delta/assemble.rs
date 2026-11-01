@@ -8,9 +8,9 @@
 //! records of the imports, then of the record ops; the derive helpers in scope).
 
 use base_db::{Crate, Db};
+use blaze_hash::{HashMap, HashSet};
 use blaze_mem::{Frame, Tag};
 use hir_expand::name::Name;
-use rustc_hash::{FxHashMap, FxHashSet};
 use triomphe::Arc;
 
 use super::{
@@ -20,10 +20,14 @@ use super::{
 use crate::{
     ExternCrateId, Lookup, MacroId, ModuleId,
     nameres::{
-        DefMap, DefMapCrateData, DiagnosticsByModule, LocalDefMap, ModulesMap, ModulesSlot, OwnedRecords, ScopeSlot,
+        DefMap, DefMapCrateData, DiagnosticsByModule, LocalDefMap, ModulesMap, ModulesSlot,
+        OwnedRecords, ScopeSlot,
         diagnostics::DefDiagnostic,
         facts::{
-            driver::{Records, copy_diagnostic, in_unresolved_extern_crate, name_records, trait_item_import_diagnostics},
+            driver::{
+                Records, copy_diagnostic, in_unresolved_extern_crate, name_records,
+                trait_item_import_diagnostics,
+            },
             ops::{DeclOp, ImportOp},
             queries, set_in,
         },
@@ -82,8 +86,8 @@ pub(super) fn view(krate: Crate, state: &CrateState, rows: ModulesMap) -> DefMap
         root: state.root,
         modules: ModulesSlot::Maintained { own: ModulesMap::new(), outside: rows },
         prelude: None,
-        macro_use_prelude: FxHashMap::default(),
-        derive_helpers_in_scope: FxHashMap::default(),
+        macro_use_prelude: HashMap::default(),
+        derive_helpers_in_scope: HashMap::default(),
         session_macros: *session_macros,
         names: NameRecords::default(),
         // alloc: empty, the records hold the crate's diagnostics
@@ -102,7 +106,7 @@ pub(super) fn view(krate: Crate, state: &CrateState, rows: ModulesMap) -> DefMap
 pub(super) fn macro_use_prelude(
     krate: Crate,
     state: &CrateState,
-) -> FxHashMap<Name, (MacroId, Option<ExternCrateId>)> {
+) -> HashMap<Name, (MacroId, Option<ExternCrateId>)> {
     let mut view = view(krate, state, ModulesMap::new());
     std::mem::take(&mut view.macro_use_prelude)
 }
@@ -198,7 +202,7 @@ fn records_in(db: &Db, frame: &Frame, state: &CrateState) -> OwnedRecords {
 
     let shares = || groups().map(|it| &it.records);
     let halves = || shares().map(|it| &it.imports).chain(shares().map(|it| &it.macros));
-    let mut seen: FxHashSet<Use> = FxHashSet::default(); // alloc: once per write that changed the records
+    let mut seen: HashSet<Use> = HashSet::default(); // alloc: once per write that changed the records
     let names = NameRecords {
         // alloc: the records' own lists, at exact size, once per write that changed them
         uses: halves().flat_map(|it| it.uses.iter().copied()).filter(|&it| seen.insert(it)).collect(),

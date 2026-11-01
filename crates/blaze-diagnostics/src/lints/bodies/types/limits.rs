@@ -10,6 +10,7 @@
 mod literal;
 
 use base_db::Crate;
+use blaze_hash::HashMap;
 use hir_def::{
     AdtId, EnumId, HasModule as _,
     hir::{BinaryOp, CmpOp, Expr, ExprId, Literal, Ordering, Pat, PatId, UnaryOp},
@@ -17,14 +18,13 @@ use hir_def::{
 };
 use hir_ty::next_solver::{DbInterner, Ty, TyKind};
 use intern::Symbol;
-use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, Ty as _};
 use syntax::view::{self as ast, AstNode as _};
 
 use super::util::{self, Solver};
 use crate::{
     lints::bodies::{
-        BodyCx, ExprKinds, ExprKind, Hooks, LatePass, LintSet, PatKinds, PatKind, lint_set,
+        BodyCx, ExprKind, ExprKinds, Hooks, LatePass, LintSet, PatKind, PatKinds, lint_set,
     },
     lower::{Found, Phase},
     model::{Applicability, Diag, Span, SuggestionStyle},
@@ -49,8 +49,8 @@ pub(crate) struct TypeLimits {
     pointer_bits: Option<u16>,
     option: Option<EnumId>,
     /// Whether an ADT is `NonNull` (its diagnostic item), looked up once per ADT compared as a
-    /// pointer: about 16 bytes an entry, one FxHash probe a lookup.
-    non_null: FxHashMap<AdtId, bool>,
+    /// pointer: about 16 bytes an entry, one hash probe a lookup.
+    non_null: HashMap<AdtId, bool>,
 }
 
 /// The diagnostic items the pass compares with, interned once: a comparison is a pointer
@@ -87,7 +87,7 @@ impl Default for TypeLimits {
             krate: None,
             pointer_bits: None,
             option: None,
-            non_null: FxHashMap::default(),
+            non_null: HashMap::default(),
         }
     }
 }

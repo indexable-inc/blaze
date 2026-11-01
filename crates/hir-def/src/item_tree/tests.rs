@@ -61,22 +61,22 @@ use a::{c, d::{e}};
         expect![[r#"
             #![no_std]
 
-            // AstId: ExternCrate[070B, 0]
+            // AstId: ExternCrate[3133, 0]
             pub(self) extern crate self as renamed;
 
-            // AstId: ExternCrate[1EA5, 0]
+            // AstId: ExternCrate[0ABE, 0]
             pub(in super) extern crate bli;
 
-            // AstId: Use[0000, 0]
+            // AstId: Use[4AF9, 0]
             pub use crate::path::{nested, items as renamed, Trait as _};
 
-            // AstId: Use[0000, 1]
+            // AstId: Use[4AF9, 1]
             pub(self) use globs::*;
 
-            // AstId: Use[0000, 2]
+            // AstId: Use[4AF9, 2]
             pub(self) use crate::{A, B};
 
-            // AstId: Use[0000, 3]
+            // AstId: Use[4AF9, 3]
             pub(self) use a::{c, d::{e}};
         "#]],
     );
@@ -103,18 +103,18 @@ extern "C" {
             #![no_core]
 
             #[on_extern_block]
-            // AstId: ExternBlock[0000, 0]
+            // AstId: ExternBlock[4AF9, 0]
             extern {
                 #[on_extern_type]
-                // AstId: TypeAlias[A09C, 0]
+                // AstId: TypeAlias[0116, 0]
                 pub(self) type ExType;
 
                 #[on_extern_static]
-                // AstId: Static[D85E, 0]
+                // AstId: Static[26B2, 0]
                 pub(self) static EX_STATIC = _;
 
                 #[on_extern_fn]
-                // AstId: Fn[B240, 0]
+                // AstId: Fn[7AA2, 0]
                 pub(self) fn ex_fn;
             }
         "#]],
@@ -155,20 +155,20 @@ enum E {
             #![feature(no_core)]
             #![no_core]
 
-            // AstId: Struct[ED35, 0]
+            // AstId: Struct[7CA4, 0]
             pub(self) struct Unit { ... }
 
             #[derive(Debug)]
-            // AstId: Struct[A47C, 0]
+            // AstId: Struct[24DC, 0]
             pub(self) struct Struct { ... }
 
-            // AstId: Struct[C8C9, 0]
+            // AstId: Struct[2B78, 0]
             pub(self) struct Tuple { ... }
 
-            // AstId: Union[2797, 0]
+            // AstId: Union[D936, 0]
             pub(self) union Ize { ... }
 
-            // AstId: Enum[7D23, 0]
+            // AstId: Enum[4BCF, 0]
             pub(self) enum E { ... }
         "#]],
     );
@@ -196,18 +196,18 @@ trait Tr: SuperTrait + 'lifetime {
             #![feature(no_core)]
             #![no_core]
 
-            // AstId: Static[F7C1, 0]
+            // AstId: Static[3B27, 0]
             pub static ST = _;
 
-            // AstId: Const[84BB, 0]
+            // AstId: Const[09E8, 0]
             pub(self) const _ = _;
 
             #[attr]
             #[inner_attr_in_fn]
-            // AstId: Fn[BE8F, 0]
+            // AstId: Fn[D606, 0]
             pub(self) fn f;
 
-            // AstId: Trait[9320, 0]
+            // AstId: Trait[C96A, 0]
             pub(self) trait Tr { ... }
         "#]],
     );
@@ -232,16 +232,16 @@ mod outline;
             #![feature(no_core)]
             #![no_core]
 
-            // AstId: Module[03AE, 0]
+            // AstId: Module[D85F, 0]
             pub(self) mod inline {
-                // AstId: Use[0000, 0]
+                // AstId: Use[4AF9, 0]
                 pub(self) use super::*;
 
-                // AstId: Fn[2A78, 0]
+                // AstId: Fn[E3BC, 0]
                 pub(self) fn fn_in_module;
             }
 
-            // AstId: Module[C08B, 0]
+            // AstId: Module[83E7, 0]
             pub(self) mod outline;
         "##]],
     );
@@ -263,13 +263,13 @@ m!();
             #![feature(no_core)]
             #![no_core]
 
-            // AstId: MacroRules[7E68, 0]
+            // AstId: MacroRules[2FDA, 0]
             macro_rules! m { ... }
 
-            // AstId: MacroDef[1C1E, 0]
+            // AstId: MacroDef[5D7C, 0]
             pub macro m2 { ... }
 
-            // AstId: MacroCall[7E68, 0], SyntaxContextId: ROOT2024, ExpandTo: Items
+            // AstId: MacroCall[46AE, 0], SyntaxContextId: ROOT2024, ExpandTo: Items
             m!(...);
         "#]],
     );
@@ -285,7 +285,7 @@ pub(self) struct S;
             #![feature(no_core)]
             #![no_core]
 
-            // AstId: Struct[5024, 0]
+            // AstId: Struct[5682, 0]
             pub(self) struct S { ... }
         "#]],
     )

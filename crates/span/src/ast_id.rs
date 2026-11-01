@@ -38,9 +38,9 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use blaze_hash::{FixedState, HashMap};
 use blaze_ids::{bits::BitArray, radix};
 use blaze_mem::{Frame, Tag, frame, scratch::Scratch};
-use rustc_hash::{FxBuildHasher, FxHashMap};
 use syntax::{
     AstNode, AstPtr, FlatTree, SyntaxKind, SyntaxNodePtr, TextRange, TextSize, ast, view::NodeId,
 };
@@ -503,12 +503,12 @@ fn block_expr_ast_id(
 /// The next index of each kind and hash value, keyed by both in one word (`kind << 16 | hash`),
 /// so a key hashes with one multiply.
 #[derive(Default)]
-struct ErasedAstIdNextIndexMap(FxHashMap<u32, u32>);
+struct ErasedAstIdNextIndexMap(HashMap<u32, u32>);
 
 impl ErasedAstIdNextIndexMap {
     #[inline]
     fn new_id(&mut self, kind: ErasedFileAstIdKind, data: impl Hash) -> ErasedFileAstId {
-        let hash = FxBuildHasher.hash_one(&data);
+        let hash = FixedState.hash_one(&data);
         let initial_hash = u16_hash(hash);
         // Even though 2^INDEX_BITS=1024 items with the same hash seems like a lot,
         // it could happen with macro calls or `use`s in macro-generated files. So we want
@@ -1206,8 +1206,8 @@ fn place_bodies(frame: &Frame, tree: &Arc<FlatTree>, found: &[(u32, ErasedFileAs
     placed.extend(found.iter().map(|&(at, owner)| {
         let range = tree.range(at);
         let slots = u32::from(range.len()) / (INDEX_MASK + 1) + 1;
-        let first_slot = take_slots(&mut used, u16_hash(FxBuildHasher.hash_one(owner)), slots);
-        Placed { range, first_slot, slots, text_hash: FxBuildHasher.hash_one(&source[range]), at }
+        let first_slot = take_slots(&mut used, u16_hash(FixedState.hash_one(owner)), slots);
+        Placed { range, first_slot, slots, text_hash: FixedState.hash_one(&source[range]), at }
     }));
     Bodies::new(tree, &mut placed)
 }
@@ -1534,8 +1534,8 @@ mod tests {
         sync::Arc,
     };
 
+    use blaze_hash::{FixedState, HashMap, HashSet};
     use blaze_ids::rng::SplitMix64;
-    use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
     use syntax::{
         AstNode, AstPtr, Edition, Parse, SourceFile, SyntaxKind, SyntaxNode, SyntaxNodePtr,
         TextRange, TextSize,
@@ -1780,9 +1780,9 @@ fn foo() {
             let full = full_of(&text);
             let full_map = AstIdMap::from_view(full.root());
             let want = ids(&full_map);
-            let distinct: FxHashSet<_> = want.iter().map(|&(_, id)| id).collect();
+            let distinct: HashSet<_> = want.iter().map(|&(_, id)| id).collect();
             assert_eq!(distinct.len(), want.len(), "{path}: two nodes have one id");
-            let with_id: FxHashSet<_> = want.iter().map(|&(ptr, _)| ptr).collect();
+            let with_id: HashSet<_> = want.iter().map(|&(ptr, _)| ptr).collect();
             for node in full.root().descendants() {
                 let ptr = view::ptr(node);
                 if ErasedFileAstId::should_alloc(node.kind()).is_some() {
@@ -1798,7 +1798,7 @@ fn foo() {
                 let map = AstIdMap::from_view(outline.root());
                 assert!(parsed(&outline).is_empty(), "{path}: making the map parsed a body");
                 assert!(map == full_map, "{path}: the outline's map is not the full parse's");
-                assert_eq!(FxBuildHasher.hash_one(&map), FxBuildHasher.hash_one(&full_map));
+                assert_eq!(FixedState.hash_one(&map), FixedState.hash_one(&full_map));
                 let mut order: Vec<_> = want.iter().copied().collect();
                 if reverse {
                     order.reverse();
@@ -1826,8 +1826,8 @@ fn foo() {
                     });
                 }
             });
-            let got: FxHashMap<_, _> = ids(&map).into_iter().collect();
-            assert!(got == want.into_iter().collect::<FxHashMap<_, _>>(), "{path}: `ptrs` differ");
+            let got: HashMap<_, _> = ids(&map).into_iter().collect();
+            assert!(got == want.into_iter().collect::<HashMap<_, _>>(), "{path}: `ptrs` differ");
         }
     }
 
@@ -1880,7 +1880,7 @@ fn foo() {
         let want = ids(&full_map);
         assert_eq!(count(&want, SyntaxKind::FN), 5000);
         assert_eq!(count(&want, SyntaxKind::MACRO_CALL), 3 * 5000);
-        let distinct: FxHashSet<_> = want.iter().map(|&(_, id)| id).collect();
+        let distinct: HashSet<_> = want.iter().map(|&(_, id)| id).collect();
         assert_eq!(distinct.len(), want.len());
         let map = AstIdMap::from_view(outline_of(&text).root());
         for &(ptr, id) in want.iter().rev() {
@@ -2150,7 +2150,7 @@ fn foo() {
     }
 
     /// The indexes give what hash maps of the stored ids give (the layout before, which kept
-    /// `FxHashMap`s by node and by id), for every node of a file and for ids no node has.
+    /// `HashMap`s by node and by id), for every node of a file and for ids no node has.
     #[test]
     fn lookups_agree_with_maps_of_the_stored_ids() {
         for (path, text) in corpus() {
@@ -2159,8 +2159,8 @@ fn foo() {
             let outline = outline_of(&text);
             for map in [AstIdMap::from_view(full.root()), AstIdMap::from_view(outline.root())] {
                 let stored = stored(&map);
-                let by_ptr: FxHashMap<_, _> = stored.iter().copied().collect();
-                let by_id: FxHashMap<_, _> = stored.iter().map(|&(ptr, id)| (id, ptr)).collect();
+                let by_ptr: HashMap<_, _> = stored.iter().copied().collect();
+                let by_id: HashMap<_, _> = stored.iter().map(|&(ptr, id)| (id, ptr)).collect();
                 assert_eq!(by_ptr.len(), stored.len(), "{path}: a node is kept twice");
                 assert_eq!(by_id.len(), stored.len(), "{path}: an id is kept twice");
                 for node in full.root().descendants() {
@@ -2216,7 +2216,7 @@ fn foo() {
             let a = AstIdMap::from_view(full_of(&text).root());
             let b = AstIdMap::from_view(outline_of(&text).root());
             assert!(a == b, "{path}");
-            assert_eq!(FxBuildHasher.hash_one(&a), FxBuildHasher.hash_one(&b), "{path}");
+            assert_eq!(FixedState.hash_one(&a), FixedState.hash_one(&b), "{path}");
             let more: Arc<str> = format!("{text}\nstruct BlazeOneMore;\n").into();
             let c = AstIdMap::from_view(full_of(&more).root());
             assert!(a != c, "{path}: another item, the same map");
@@ -2232,11 +2232,11 @@ fn foo() {
         use super::{ErasedAstIdNextIndexMap, ErasedFileAstIdKind as Kind, INDEX_BITS, pack};
 
         #[derive(Default)]
-        struct Pairs(FxHashMap<(Kind, u16), u32>);
+        struct Pairs(HashMap<(Kind, u16), u32>);
 
         impl Pairs {
             fn new_id(&mut self, kind: Kind, data: u64) -> ErasedFileAstId {
-                let initial_hash = super::u16_hash(FxBuildHasher.hash_one(data));
+                let initial_hash = super::u16_hash(FixedState.hash_one(data));
                 let mut hash = initial_hash;
                 let index = loop {
                     match self.0.entry((kind, hash)) {
@@ -2363,7 +2363,7 @@ fn foo() {
             for parse in parses(&text) {
                 let got = AstIdMap::from_view(parse.root());
                 assert!(got == want, "{path}: an outline's map is not the full parse's");
-                assert_eq!(FxBuildHasher.hash_one(&got), FxBuildHasher.hash_one(&want), "{path}");
+                assert_eq!(FixedState.hash_one(&got), FixedState.hash_one(&want), "{path}");
                 assert_eq!(got.entries, want.entries, "{path}: the entries");
                 assert_eq!(stored(&got), stored(&want), "{path}: the ids, the bodies' too");
 
@@ -2383,9 +2383,9 @@ fn foo() {
     fn by_node(
         ids: Vec<(SyntaxNodePtr, ErasedFileAstId)>,
         what: &str,
-    ) -> FxHashMap<SyntaxNodePtr, ErasedFileAstId> {
+    ) -> HashMap<SyntaxNodePtr, ErasedFileAstId> {
         let len = ids.len();
-        let map: FxHashMap<_, _> = ids.into_iter().collect();
+        let map: HashMap<_, _> = ids.into_iter().collect();
         assert_eq!(map.len(), len, "{what}: a node is kept twice");
         map
     }

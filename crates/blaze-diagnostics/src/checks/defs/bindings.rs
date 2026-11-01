@@ -6,6 +6,7 @@
 //! `IdentifierBoundMoreThanOnceInParameterList` and `IdentifierBoundMoreThanOnceInSamePattern`
 //! (MIT or Apache-2.0).
 
+use blaze_hash::{HashMap, HashSet};
 use blaze_items::{Fact, ItemId};
 use hir::{EditionedFileId, InFile, Name};
 use hir_def::{
@@ -14,7 +15,6 @@ use hir_def::{
     hir::{Pat, PatId},
     nameres::demand::every_body,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     SyntaxNodePtr, TextSize, ast as tag,
     view::{self as ast, AstNode as _, HasName as _},
@@ -39,11 +39,11 @@ pub(super) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
 /// What [`check_body`] keeps of one body, cleared and reused for the next.
 #[derive(Default)]
 struct Scratch {
-    parent: FxHashMap<PatId, PatId>,
-    seen: FxHashSet<InFile<SyntaxNodePtr>>,
+    parent: HashMap<PatId, PatId>,
+    seen: HashSet<InFile<SyntaxNodePtr>>,
     roots: Vec<Root>,
     /// The product context of each parameter list, its parameters' names in it.
-    lists: FxHashMap<InFile<SyntaxNodePtr>, Ctx>,
+    lists: HashMap<InFile<SyntaxNodePtr>, Ctx>,
     ctxs: Vec<Ctx>,
 }
 
@@ -123,16 +123,16 @@ struct Root {
 /// rustc's `PatBoundCtx` with the names bound in it.
 struct Ctx {
     product: bool,
-    names: FxHashSet<(Name, HygieneId)>,
+    names: HashSet<(Name, HygieneId)>,
 }
 
 impl Ctx {
     fn product() -> Ctx {
-        Ctx { product: true, names: FxHashSet::default() }
+        Ctx { product: true, names: HashSet::default() }
     }
 
     fn or() -> Ctx {
-        Ctx { product: false, names: FxHashSet::default() }
+        Ctx { product: false, names: HashSet::default() }
     }
 }
 

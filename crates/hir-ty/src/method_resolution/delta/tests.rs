@@ -15,6 +15,7 @@ use std::fmt::Write as _;
 
 use base_db::{Crate, Db, Maintained, all_crates};
 use blaze_dbsp::Work;
+use blaze_hash::HashMap;
 use blaze_mem::Tag;
 use hir_def::{
     BuiltinDeriveImplId, ImplId, ModuleDefId, ModuleId, TraitId,
@@ -23,14 +24,13 @@ use hir_def::{
     signatures::TraitSignature,
 };
 use hir_expand::{fixture, name::Name};
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use span::FileId;
 
 use super::{
     head::{Head, try_head},
-    key::{ImplKey, assoc_names, derive_key, impl_key},
     install_identities,
+    key::{ImplKey, assoc_names, derive_key, impl_key},
     publish::{
         candidate_rows_hash, candidate_slice_hash, directory, inherent_rows_hash,
         inherent_slice_hash, location, module_rank, trait_rows_hash, trait_slice_hash,
@@ -163,9 +163,8 @@ fn check_slices(db: &Db, krate: Crate, what: &str, failures: &mut String) {
         Vec<ModuleId>,
     );
     let lang = lang_items(db, krate);
-    let mut by_trait: FxHashMap<TraitId, TraitExpected> = FxHashMap::default();
-    let mut by_head: FxHashMap<Head, (Vec<(ModuleId, ImplId)>, Vec<ModuleId>)> =
-        FxHashMap::default();
+    let mut by_trait: HashMap<TraitId, TraitExpected> = HashMap::default();
+    let mut by_head: HashMap<Head, (Vec<(ModuleId, ImplId)>, Vec<ModuleId>)> = HashMap::default();
     let mut body_modules = Vec::new();
     for (module, _) in crate_def_map(db, krate).modules(db) {
         for &trait_ in trait_bodies(db, module).traits.iter() {
@@ -244,7 +243,7 @@ fn check_slices(db: &Db, krate: Crate, what: &str, failures: &mut String) {
 
 /// Every candidate slice against the traits declared in the crate's modules by item name.
 fn check_candidates(db: &Db, krate: Crate, what: &str, failures: &mut String) {
-    let mut by_name: FxHashMap<Name, Vec<TraitId>> = FxHashMap::default();
+    let mut by_name: HashMap<Name, Vec<TraitId>> = HashMap::default();
     let mut names = SmallVec::new();
     for trait_ in declared_traits(db, krate) {
         assoc_names(db, trait_, &mut names);
@@ -272,8 +271,8 @@ fn check_candidates(db: &Db, krate: Crate, what: &str, failures: &mut String) {
 }
 
 /// Every impl of `krate`'s modules with its key, as made from scratch.
-pub(super) fn impl_keys(db: &Db, krate: Crate) -> FxHashMap<ImplId, ImplKey> {
-    let mut out = FxHashMap::default();
+pub(super) fn impl_keys(db: &Db, krate: Crate) -> HashMap<ImplId, ImplKey> {
+    let mut out = HashMap::default();
     for (module, _) in crate_def_map(db, krate).modules(db) {
         let impls = module_impls(db, module);
         out.extend(impls.trait_impls.iter().map(|&imp| (imp, impl_key(db, imp, true))));
@@ -283,8 +282,8 @@ pub(super) fn impl_keys(db: &Db, krate: Crate) -> FxHashMap<ImplId, ImplKey> {
 }
 
 /// Every trait declared in `krate`'s modules with its item names.
-pub(super) fn trait_names(db: &Db, krate: Crate) -> FxHashMap<TraitId, SmallVec<[Name; 8]>> {
-    let mut out = FxHashMap::default();
+pub(super) fn trait_names(db: &Db, krate: Crate) -> HashMap<TraitId, SmallVec<[Name; 8]>> {
+    let mut out = HashMap::default();
     for trait_ in declared_traits(db, krate) {
         let mut names = SmallVec::new();
         assoc_names(db, trait_, &mut names);

@@ -34,7 +34,7 @@ use std::{
     ops::ControlFlow,
     ptr::{self, NonNull},
     sync::{
-        Arc, LazyLock, Mutex, OnceLock,
+        Arc, LazyLock, OnceLock,
         atomic::{AtomicPtr, AtomicUsize, Ordering},
     },
 };
@@ -44,6 +44,7 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_query::QueryKind;
 use blaze_reclaim::Limbo;
 use hir_def::deps::ImageStore;
+use parking_lot::Mutex;
 
 use super::{
     DbInterner, SolverDefId,
@@ -409,7 +410,7 @@ impl Store {
     }
 
     fn fail(&self, why: String) {
-        let mut error = self.error.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut error = self.error.lock();
         error.get_or_insert(why);
     }
 
@@ -624,7 +625,7 @@ impl Installed {
                 Wrote::SlotsFull => flushed.slots_full += 1,
             }
         }
-        if let Some(why) = store.error.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+        if let Some(why) = store.error.lock().take() {
             return Err(why);
         }
         Ok(flushed)
@@ -639,7 +640,7 @@ impl Drop for Installed {
         // SAFETY: made by `Box::into_raw` in `install`, and unlinked by the swap above, which only
         // this guard makes; readers that loaded it are covered by the limbo's grace.
         let store = unsafe { Box::from_raw(held) };
-        let mut limbo = LIMBO.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut limbo = LIMBO.lock();
         limbo.retire(store);
         // alloc: `Limbo::collect` frees; it is not an iterator's.
         limbo.collect();

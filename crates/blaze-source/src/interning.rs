@@ -78,7 +78,7 @@ impl PartialEq<&str> for InternedString {
 }
 
 impl Hash for InternedString {
-    // Hashed as the string so that a `FxHashMap<InternedString, _>` can be read with a `&str`.
+    // Hashed as the string so that a `HashMap<InternedString, _>` can be read with a `&str`.
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.inner.hash(state);
     }
@@ -131,7 +131,7 @@ impl fmt::Display for InternedString {
 #[cfg(test)]
 mod tests {
     use super::InternedString;
-    use rustc_hash::FxHashMap;
+    use blaze_hash::HashMap;
 
     #[test]
     fn same_string_same_pointer() {
@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn ordered_and_looked_up_as_str() {
         assert!(InternedString::new("a") < InternedString::new("b"));
-        let mut map = FxHashMap::default();
+        let mut map = HashMap::default();
         map.insert(InternedString::new("default"), 1);
         assert_eq!(map.get("default"), Some(&1));
     }

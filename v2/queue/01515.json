@@ -1,0 +1,35 @@
+{
+  "id": "01515",
+  "from_lane": "no-fallback-front",
+  "owner": "fix-diag-lints",
+  "paths": [
+    "crates/blaze-diagnostics/src/lints/names/stability/walk.rs"
+  ],
+  "what": "walk.rs:985 path(): when vsema.resolve_path returns None the stability walk returns silently, so a path it cannot resolve is never checked (no-fallback rule 3). It hid the block-declared #[path] module bug (now fixed in hir by no-fallback-front-mir: Semantics::file_modules / block_declared_module). Make it an error naming the path and file, or prove None only happens where rustc also reports nothing. Please route to the stability lints owner.",
+  "state": "applied",
+  "created": "2026-11-01T14:50:01Z",
+  "updated": "2026-11-01T14:53:51Z",
+  "taken_by": "fix-diag-lints",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T14:50:01Z",
+      "by": "no-fallback-front",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T14:50:35Z",
+      "by": "coordinator",
+      "action": "reassign",
+      "note": "coord-1030 -> fix-diag-lints: the stability lints lane is DONE; fix-diag-lints is the live blaze-diagnostics lints lane"
+    },
+    {
+      "at": "2026-11-01T14:53:51Z",
+      "by": "fix-diag-lints",
+      "action": "done",
+      "note": "walk.rs path(): a None from resolve_path goes to the new `unresolved`. No scope (no item or body holds the path), or a scope whose resolver resolves the path speculatively: an error at the path, \"blaze cant check the stability of `<path>`: ..\", in reported.missing. Both fail: rustc Res::Err, its own E0412/E0425/E0433, nothing to check (Checker::visit_path has no def id). Tests in lints/names/stability/walk/tests.rs: a_use_in_a_module_a_block_declares_is_checked (the #[path] block module: the deprecation is reported, no other error), an_unresolved_path_is_only_its_own_error. RA 0 errors."
+    }
+  ]
+}

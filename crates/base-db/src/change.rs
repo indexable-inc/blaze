@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-use rustc_hash::FxHashSet;
+use blaze_hash::HashSet;
 use blaze_query::db::{Durability, Setter as _};
 use triomphe::Arc;
 use crate::FileId;
@@ -51,8 +51,8 @@ impl FileChange {
     pub fn apply(self, db: &mut Db) -> Option<CratesIdMap> {
         let _p = tracing::info_span!("FileChange::apply").entered();
         if let Some(roots) = self.roots {
-            let mut local_roots = FxHashSet::default();
-            let mut library_roots = FxHashSet::default();
+            let mut local_roots = HashSet::default();
+            let mut library_roots = HashSet::default();
             for (idx, root) in roots.into_iter().enumerate() {
                 let root_id = SourceRootId(idx as u32);
                 if root.is_library {

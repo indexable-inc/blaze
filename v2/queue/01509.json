@@ -1,0 +1,24 @@
+{
+  "id": "01509",
+  "from_lane": "coordinator",
+  "owner": "blaze-query",
+  "paths": [
+    "crates/blaze-query/src/db/storage.rs",
+    "crates/hir-def/src/lang_item.rs"
+  ],
+  "what": "hir-def lang_item::tests::notable_traits_miss_is_its_result fails at HEAD d4d8268391 (2 allocs, budget 1): Storage::make_table (db/storage.rs:671) Box::new(FnTable) on the first fetch lands in the counted window. Fix: warm the table in the test, or move make_table off the global heap (rule 8). Trace: /tmp/blaze-lanes/test-bisect4.log 930-1150.",
+  "state": "open",
+  "created": "2026-11-01T14:07:15Z",
+  "updated": "2026-11-01T14:07:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T14:07:15Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

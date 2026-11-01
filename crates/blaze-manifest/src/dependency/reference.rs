@@ -1,14 +1,14 @@
 //! blaze-manifest's own `build_feature_map` before it called blaze-resolve's, over `String`s,
 //! kept to check the shared one against: same map, same error, but for which unused optional
-//! dependency an error names (this one took it from an `FxHashMap`, so the tests compare that
+//! dependency an error names (this one took it from an `HashMap`, so the tests compare that
 //! message only where one optional dependency is unused).
 
 use std::collections::BTreeMap;
 use std::fmt;
 
 use anyhow::bail;
+use blaze_hash::{HashMap, HashSet};
 use cargo_util_schemas::manifest::FeatureName;
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::Dependency;
 use crate::edit_distance::closest_msg;
@@ -78,7 +78,7 @@ pub(super) fn build_summary_features(
         }
     }
 
-    let mut dep_map: FxHashMap<&str, bool> = FxHashMap::default();
+    let mut dep_map: HashMap<&str, bool> = HashMap::default();
     for dep in dependencies {
         *dep_map.entry(dep.name_in_toml()).or_insert(false) |= dep.optional;
     }
@@ -90,7 +90,7 @@ pub(super) fn build_summary_features(
         })
         .collect();
 
-    let explicitly_listed: FxHashSet<String> =
+    let explicitly_listed: HashSet<String> =
         map.values().flatten().filter_map(|fv| fv.explicit_dep_name()).map(str::to_owned).collect();
 
     for dep in dependencies {
@@ -192,7 +192,7 @@ pub(super) fn build_summary_features(
         }
     }
 
-    let used: FxHashSet<&str> = map
+    let used: HashSet<&str> = map
         .values()
         .flatten()
         .filter_map(|fv| match fv {

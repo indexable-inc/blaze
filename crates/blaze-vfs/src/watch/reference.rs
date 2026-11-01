@@ -7,9 +7,9 @@ use std::{collections::VecDeque, sync::Arc};
 use blaze_core::{
     Completion, Cursor, Done, Effect, FileName, IoError, Lost, Names, S_IFMT, Stamp, Tag,
 };
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::ContentId;
 use blaze_mem::Slab;
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::Watched;
 use crate::{
@@ -72,7 +72,7 @@ struct Batch {
     slots: Vec<Slot>,
     /// Each slot by name, once a listing may add names to it (the swept names are found in
     /// `names`).
-    index: FxHashMap<Box<str>, usize>,
+    index: HashMap<Box<str>, usize>,
     /// Stamps and listings in flight: it commits once none is and every slot is looked at.
     open: u32,
     /// The subtree a rescan looks at, relative to the watched directory.
@@ -80,7 +80,7 @@ struct Batch {
     /// The directory a [`Lost::Unnamed`] lists alone: its slots are what was in it.
     relist: Option<FileName>,
     /// Each gone file the head had, by its inode: a name new to the batch with its stamp is it.
-    gone: FxHashMap<u64, usize>,
+    gone: HashMap<u64, usize>,
     /// The journal's place once this is committed, and whether it then has told everything
     /// from before the watch.
     cursor: Option<Cursor>,
@@ -97,11 +97,11 @@ impl Batch {
             // alloc: none unless a path changed.
             forced: Vec::new(),
             slots,
-            index: FxHashMap::default(),
+            index: HashMap::default(),
             open: 1,
             rescan,
             relist,
-            gone: FxHashMap::default(),
+            gone: HashMap::default(),
             cursor: None,
             caught_up: false,
         }
@@ -210,7 +210,7 @@ pub struct Watcher {
     /// Looks in flight, by their tag past `tags + FIRST`: a slot is reused once its look is in.
     pending: Slab<Pending>,
     /// What this watcher's commits left at each path, while batches told before them wait.
-    ours: FxHashMap<String, Seen>,
+    ours: HashMap<String, Seen>,
 }
 
 impl Watcher {
@@ -231,7 +231,7 @@ impl Watcher {
             first: 0,
             pending: Slab::new(MOST_IN_FLIGHT, blaze_mem::Tag::Vfs)
                 .unwrap_or_else(|error| panic!("the looks in flight of a watch: {error}")),
-            ours: FxHashMap::default(),
+            ours: HashMap::default(),
         }
     }
 
@@ -534,7 +534,7 @@ impl Watcher {
         let below = self.below.len();
         // alloc: none unless a path changed.
         let mut slots: Vec<Slot> = Vec::new();
-        let mut index: FxHashMap<Box<str>, usize> = FxHashMap::default();
+        let mut index: HashMap<Box<str>, usize> = HashMap::default();
         if let Some(disk) = self.disk(vfs) {
             disk.children(dir.as_str(), |name, saved| {
                 let file = FileName::new(name).expect("a column's name is a name");
@@ -718,7 +718,7 @@ impl Watcher {
             let Some(batch) = self.batch(number) else { unreachable!("a listing of no batch") };
             batch.open -= 1;
             if batch.relist.as_ref() == Some(dir) {
-                let there: FxHashMap<&str, Stamp> =
+                let there: HashMap<&str, Stamp> =
                     // alloc: once per batch.
                     entries.iter().map(|(it, stamp)| (it.as_str(), *stamp)).collect();
                 for (at, slot) in batch.slots.iter_mut().enumerate().filter(|(_, it)| it.look.is_none()) {
@@ -888,7 +888,7 @@ impl Watcher {
         let mut again = Vec::new();
         // alloc: none unless a path changed.
         let mut renames: Vec<(String, String)> = Vec::new();
-        let mut renamed = FxHashSet::default();
+        let mut renamed = HashSet::default();
         for (at, from) in moves {
             let (target, source) = (&batch.slots[at], &batch.slots[from]);
             let Some((id, mode)) = source.was else { unreachable!("a move is from a file the head had") };

@@ -96,9 +96,7 @@ impl Scale {
             // A pairing read less than 100 µs after the origin's would be off by its own
             // skew (tens of ns) over too short a time: wait out the rest of the 100 µs, once.
             let (ticks, at) = if at.duration_since(began).as_micros() < 100 {
-                while began.elapsed().as_micros() < 100 {
-                    std::hint::spin_loop();
-                }
+                blaze_graph::spin::busy(std::time::Duration::from_micros(100).saturating_sub(began.elapsed()));
                 (self::ticks(), Instant::now())
             } else {
                 (ticks, at)
@@ -140,7 +138,7 @@ mod tests {
     fn ticks_read_back_as_the_instants_they_were_read_at() {
         let before = Instant::now();
         let tick = ticks();
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        blaze_graph::spin::busy(std::time::Duration::from_millis(2));
         let scale = Scale::now();
         let at = scale.instant(tick);
         let off = at.max(before).duration_since(at.min(before));
@@ -153,7 +151,7 @@ mod tests {
     fn ticks_map_onto_the_monotonic_clock() {
         let before = mono_ns();
         let tick = ticks();
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        blaze_graph::spin::busy(std::time::Duration::from_millis(2));
         let scale = Scale::now();
         let off = (scale.mono(tick) - before).abs();
         assert!(off < 200_000, "a tick mapped {off} ns from the clock read beside it");

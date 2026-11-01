@@ -19,13 +19,13 @@ mod keys;
 use std::fmt;
 
 use base_db::{Crate, Db, FileId};
+use blaze_hash::HashSet;
 use blaze_ids::ContentId;
+use blaze_query::db::{Database as _, DatabaseKeyIndex, Durability, EventKind};
 use hir_def::{
     AssocItemId, DefWithBodyId, FunctionId, Lookup, ModuleDefId, nameres::crate_def_map,
     signatures::FunctionSignature, src::HasSource,
 };
-use rustc_hash::FxHashSet;
-use blaze_query::db::{Database as _, DatabaseKeyIndex, Durability, EventKind};
 use syntax::{TextRange, TextSize};
 
 pub use codegen::Codegen;
@@ -160,8 +160,8 @@ pub struct Harness {
     codegen: Option<Codegen>,
     /// Every key executed or validated by a pass so far: a key executed outside it is work
     /// an edit's new text asked for, not work done again.
-    seen: FxHashSet<DatabaseKeyIndex>,
-    volatile: FxHashSet<DatabaseKeyIndex>,
+    seen: HashSet<DatabaseKeyIndex>,
+    volatile: HashSet<DatabaseKeyIndex>,
     interned: Interned,
     /// The cold pass's code hashes and instances: what each undo must give again.
     base: Pass,
@@ -180,8 +180,8 @@ impl Harness {
             bodies,
             modules,
             codegen,
-            seen: FxHashSet::default(),
-            volatile: FxHashSet::default(),
+            seen: HashSet::default(),
+            volatile: HashSet::default(),
             interned: Interned::default(),
             base: Pass::default(),
         };

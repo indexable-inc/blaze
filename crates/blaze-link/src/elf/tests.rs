@@ -4,7 +4,7 @@ use object::{Endianness, SymbolIndex, elf};
 use super::dynamic::{elf_hash, gnu_hash};
 use super::image::section_name;
 use super::{Elf, Segment, in_file, section, writer};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use crate::cow::CowBytes;
 use crate::model::{

@@ -6,7 +6,7 @@
 
 use std::{fmt, hash::Hash};
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 /// A node's index in its tree.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -30,13 +30,13 @@ impl fmt::Debug for UniIndex {
 /// together are `0..mapping.len() + deassigned.len()`.
 #[derive(Debug, Clone)]
 pub(super) struct UniKeyMap<K> {
-    mapping: FxHashMap<K, u32>,
+    mapping: HashMap<K, u32>,
     deassigned: Vec<u32>,
 }
 
 impl<K> Default for UniKeyMap<K> {
     fn default() -> Self {
-        UniKeyMap { mapping: FxHashMap::default(), deassigned: Vec::new() }
+        UniKeyMap { mapping: HashMap::default(), deassigned: Vec::new() }
     }
 }
 

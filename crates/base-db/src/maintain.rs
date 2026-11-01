@@ -24,13 +24,14 @@
 use std::{
     any::{Any, TypeId},
     panic::{self, AssertUnwindSafe},
-    sync::{Mutex, MutexGuard, OnceLock, PoisonError},
+    sync::OnceLock,
 };
 
 use blaze_dbsp::Work;
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_mem::{Tag, frame};
-use rustc_hash::FxHashMap;
+use parking_lot::{Mutex, MutexGuard};
 use smallvec::SmallVec;
 use span::FileId;
 
@@ -201,7 +202,7 @@ impl<K: Send + 'static> Batch for Each<K> {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    mutex.lock()
 }
 
 inventory::collect!(Maintainer);
@@ -241,7 +242,7 @@ pub fn maintainers() -> &'static [&'static Maintainer] {
 pub(crate) struct Maintenance {
     /// Behind a lock so a maintainer's reads, on `&Db`, can have it lent ([`Db::lend_state`]).
     // dyn: write-side state, one lookup per maintainer per write
-    state: Mutex<FxHashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+    state: Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     /// Whether a maintainer's reads are running: only they are lent state on `&Db`.
     reading: bool,
     pending: Pending,
@@ -359,9 +360,9 @@ impl Db {
         &mut self,
         f: impl FnOnce(&mut Db, &mut T) -> R,
     ) -> R {
-        let mut state = take_state::<T>(self.maintenance.state.get_mut().unwrap_or_else(PoisonError::into_inner));
+        let mut state = take_state::<T>(self.maintenance.state.get_mut());
         let ran = panic::catch_unwind(AssertUnwindSafe(|| f(self, &mut *state)));
-        put_state(self.maintenance.state.get_mut().unwrap_or_else(PoisonError::into_inner), state, ran)
+        put_state(self.maintenance.state.get_mut(), state, ran)
     }
 
     /// [`Db::with_state`] for a maintainer's reads, which have the database by `&`: `f` gets the
@@ -579,7 +580,7 @@ impl Db {
     /// Drops every maintainer's state, so the next write maintains from empty, and has it
     /// re-check everything.
     fn forget_maintained_state(&mut self) {
-        self.maintenance.state.get_mut().unwrap_or_else(PoisonError::into_inner).clear();
+        self.maintenance.state.get_mut().clear();
         self.maintenance.pending.crates = true;
     }
 }
@@ -591,7 +592,7 @@ struct InUse;
 /// marked out.
 fn take_state<T: Default + Send + Sync + 'static>(
     // dyn: write-side state, one lookup per maintainer per write
-    states: &mut FxHashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    states: &mut HashMap<TypeId, Box<dyn Any + Send + Sync>>,
 ) -> Box<T> {
     let id = TypeId::of::<T>();
     match states.get_mut(&id) {
@@ -618,7 +619,7 @@ fn take_state<T: Default + Send + Sync + 'static>(
 /// goes on with the call's result or its panic.
 fn put_state<T: Send + Sync + 'static, R>(
     // dyn: write-side state, one lookup per maintainer per write
-    states: &mut FxHashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    states: &mut HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     state: Box<T>,
     ran: std::thread::Result<R>,
 ) -> R {

@@ -15,8 +15,8 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
-rustc-hash.workspace = true
 blaze-format = { workspace = true, optional = true }
+blaze-hash.workspace = true
 blaze-ids = { workspace = true, optional = true }
 blaze-radix.workspace = true
 blaze-protocol = { workspace = true, optional = true }

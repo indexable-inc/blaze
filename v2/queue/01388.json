@@ -7,10 +7,10 @@
     "crates/hir/src/diagnostics.rs"
   ],
   "what": "## E0015 and the other const checks never run on an anonymous constant (`[0; f(2)]`, `N` of a generic argument, an enum discriminant expression)\n\n`fn main() { let _ = [0; f(2)]; }` with a non-const `fn f` reports nothing in blaze. rustc reports E0015 \"cannot call non-const function `f` in constants\" at `f(2)`. blaze's check `hir_ty_mir::mir::const_check::const_check(db, def: DefWithBodyId)` (crates/hir-ty-mir/src/mir/const_check.rs:367) and its caller in hir (crates/hir/src/diagnostics.rs:2937) only visit functions, consts and statics. An array length inside a body is an `AnonConstId` (`InferBodyId::AnonConstId`), so it is never const-checked. Code with a non-const call in an array length (or any anonymous constant) is accepted, against no-fallback and superset-of-rust. Fix: key `const_check` and `const_context` by `InferBodyId`, with the context of an anonymous constant (rustc: `ConstContext::Const { inline: false }`). Then have hir's body diagnostics (db lane, cc) const-check each anonymous constant of a body. Test: blaze-diagnostics tests::check::a_non_const_call_in_a_constant_is_refused (#1440).",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T00:19:26Z",
-  "updated": "2026-11-01T00:19:26Z",
-  "taken_by": null,
+  "updated": "2026-11-01T12:55:23Z",
+  "taken_by": "codegen",
   "why": null,
   "source": null,
   "history": [
@@ -19,6 +19,18 @@
       "by": "fix-diag-lints",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T12:55:19Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T12:55:23Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "hir-ty-mir const_check: the checker (Checker, calls.rs, qualifs.rs, stability::allows_unstable) runs over an InferBodyId, its store and source map from ExpressionStore by the owner; const_check(db, DefWithBodyId) unchanged for callers, new tracked anon_const_check(db, AnonConstId) checks an anonymous constant as ConstContext::Const. Test tests/mir/const_check.rs a_non_const_call_in_an_array_length_is_refused (E0015 at f(2), none once f is const). The hir diagnostics half is db 01498. ra clean, not built."
     }
   ]
 }

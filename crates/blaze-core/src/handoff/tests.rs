@@ -18,7 +18,8 @@ mod threads {
         let last = Arc::new(AtomicUsize::new(0));
         let threads: Vec<_> = (0..8)
             .map(|_| {
-                let (claims, taken, last) = (claims.clone(), taken.clone(), last.clone());
+                let (claims, taken, last) =
+                    (Arc::clone(&claims), Arc::clone(&taken), Arc::clone(&last));
                 std::thread::spawn(move || {
                     while let Some(chunk) = claims.claim() {
                         taken[chunk].fetch_add(1, Ordering::Relaxed);

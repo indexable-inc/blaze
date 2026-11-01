@@ -12,7 +12,7 @@ use std::{
     path::Path,
 };
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_hash::{HashMap, HashSet};
 
 use crate::{
     markdown::{self, Context, Ids},
@@ -69,7 +69,7 @@ struct Statics {
 
 fn hash(text: &str) -> String {
     use std::hash::{Hash, Hasher};
-    let mut hasher = rustc_hash::FxHasher::default();
+    let mut hasher = blaze_hash::FixedHasher::default();
     text.hash(&mut hasher);
     format!("{:08x}", hasher.finish() as u32)
 }
@@ -82,7 +82,7 @@ pub fn pages(model: &Model) -> Pages {
         css: format!("static.files/blaze-{}.css", hash(CSS)),
         js: format!("static.files/blaze-{}.js", hash(JS)),
     };
-    let names: FxHashSet<&str> = model.crates.iter().map(|it| it.name.as_str()).collect();
+    let names: HashSet<&str> = model.crates.iter().map(|it| it.name.as_str()).collect();
     let page = |path: String, text: String| Page { path, bytes: text.into_bytes() };
     let mut files = vec![page(statics.css.clone(), CSS.to_owned()), page(statics.js.clone(), JS.to_owned())];
 
@@ -274,7 +274,7 @@ fn search_index(krate: &CrateDoc) -> String {
 
 pub(crate) struct Writer<'a> {
     model: &'a Model,
-    names: &'a FxHashSet<&'a str>,
+    names: &'a HashSet<&'a str>,
     statics: &'a Statics,
     k: usize,
     /// From the page's directory up to the documentation root: `../../`.
@@ -285,7 +285,7 @@ pub(crate) struct Writer<'a> {
 impl<'a> Writer<'a> {
     fn new(
         model: &'a Model,
-        names: &'a FxHashSet<&'a str>,
+        names: &'a HashSet<&'a str>,
         statics: &'a Statics,
         k: usize,
         dir: Vec<String>,
@@ -1146,7 +1146,7 @@ impl<'a> Writer<'a> {
         out.push_str("<main><div class=\"width-limiter\">");
         out.push_str(&self.topbar());
         out.push_str("<section id=\"main-content\" class=\"content\"><div class=\"main-heading\"><h1>List of all items</h1></div>");
-        let mut by_kind: FxHashMap<Kind, Vec<(String, String)>> = FxHashMap::default();
+        let mut by_kind: HashMap<Kind, Vec<(String, String)>> = HashMap::default();
         for item in &krate.items {
             if item.kind == Kind::Module && item.name.is_empty() {
                 continue;

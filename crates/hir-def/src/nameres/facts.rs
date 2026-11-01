@@ -28,9 +28,9 @@ pub(in crate::nameres) mod unit;
 #[cfg(test)]
 pub(in crate::nameres) mod tests;
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
+use blaze_hash::FixedState;
 use blaze_mem::Frame;
-use rustc_hash::FxBuildHasher;
 
 use crate::{
     ModuleId,
@@ -53,16 +53,16 @@ impl UnstableFeatures {
 /// the query returns, and what it returns is built from it at its exact size.
 pub(crate) type FrameVec<'f, T> = Vec<T, &'f Frame>;
 
-pub(crate) type FrameMap<'f, K, V> = hashbrown::HashMap<K, V, FxBuildHasher, &'f Frame>;
+pub(crate) type FrameMap<'f, K, V> = hashbrown::HashMap<K, V, FixedState, &'f Frame>;
 
 pub(crate) fn map_in<'f, K, V>(frame: &'f Frame) -> FrameMap<'f, K, V> {
-    hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame)
+    hashbrown::HashMap::with_hasher_in(FixedState, frame)
 }
 
-pub(crate) type FrameSet<'f, K> = hashbrown::HashSet<K, FxBuildHasher, &'f Frame>;
+pub(crate) type FrameSet<'f, K> = hashbrown::HashSet<K, FixedState, &'f Frame>;
 
 pub(crate) fn set_in<'f, K>(frame: &'f Frame) -> FrameSet<'f, K> {
-    hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame)
+    hashbrown::HashSet::with_hasher_in(FixedState, frame)
 }
 
 /// The crate's def map with every scope handed over (`ScopeSlot::Collected`), diagnostics

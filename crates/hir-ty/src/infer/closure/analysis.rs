@@ -32,6 +32,7 @@
 
 use std::{cmp, iter, mem};
 
+use blaze_hash::{FixedState, HashMap};
 use blaze_mem::Frame;
 use hir_def::{
     expr_store::ExpressionStore,
@@ -45,7 +46,6 @@ use hir_def::{
 use macros::{TypeFoldable, TypeVisitable};
 use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
-use rustc_hash::{FxBuildHasher, FxHashMap};
 use rustc_type_ir::{
     BoundVar, ClosureKind,
     inherent::{AdtDef as _, GenericArgs as _, IntoKind as _, Ty as _},
@@ -231,14 +231,14 @@ impl CapturedPlaceBuf<'_> {
 struct MinCapturesBuf<'f> {
     roots: Vec<(BindingId, Vec<CapturedPlaceBuf<'f>, &'f Frame>), &'f Frame>,
     /// Where each root variable is in `roots`.
-    index: hashbrown::HashMap<BindingId, u32, FxBuildHasher, &'f Frame>,
+    index: hashbrown::HashMap<BindingId, u32, FixedState, &'f Frame>,
 }
 
 impl<'f> MinCapturesBuf<'f> {
     fn new(frame: &'f Frame) -> Self {
         MinCapturesBuf {
             roots: Vec::new_in(frame),
-            index: hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame),
+            index: hashbrown::HashMap::with_hasher_in(FixedState, frame),
         }
     }
 
@@ -263,7 +263,7 @@ impl<'f> MinCapturesBuf<'f> {
 impl<'db, 'f> InferenceContext<'db, 'f> {
     pub(crate) fn closure_analyze(&mut self) {
         let upvars = hir_def::upvars::upvars_mentioned(self.db, self.store_owner)
-            .unwrap_or(const { &FxHashMap::with_hasher(FxBuildHasher) });
+            .unwrap_or(const { &HashMap::with_hasher(FixedState) });
         for root_expr in self.store.expr_roots() {
             self.analyze_closures_in_expr(root_expr, upvars);
         }
@@ -272,7 +272,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         assert!(self.deferred_call_resolutions.is_empty());
     }
 
-    fn analyze_closures_in_expr(&mut self, expr: ExprId, upvars: &'db FxHashMap<ExprId, Upvars>) {
+    fn analyze_closures_in_expr(&mut self, expr: ExprId, upvars: &'db HashMap<ExprId, Upvars>) {
         self.store.walk_child_exprs(expr, |expr| self.analyze_closures_in_expr(expr, upvars));
 
         match self.store.expr(expr) {
@@ -813,7 +813,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         }
 
         let frame = self.frame;
-        let mut dedup_sources_scratch = hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame);
+        let mut dedup_sources_scratch = hashbrown::HashSet::with_hasher_in(FixedState, frame);
 
         for (mut place, capture_info) in capture_information {
             let var_hir_id = match place.base {
@@ -1552,7 +1552,7 @@ fn determine_capture_info<'f>(
 fn determine_capture_sources<'f>(
     kept: &mut CaptureInfoBuf<'f>,
     other: &mut CaptureInfoBuf<'f>,
-    dedup_sources_scratch: &mut hashbrown::HashSet<ExprOrPatIdPacked, FxBuildHasher, &'f Frame>,
+    dedup_sources_scratch: &mut hashbrown::HashSet<ExprOrPatIdPacked, FixedState, &'f Frame>,
     frame: &'f Frame,
 ) -> Sources<'f> {
     dedup_sources_scratch.clear();

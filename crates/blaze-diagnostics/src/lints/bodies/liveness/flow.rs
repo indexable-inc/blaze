@@ -10,13 +10,13 @@
 
 use std::{collections::VecDeque, rc::Rc};
 
+use blaze_hash::HashMap;
 use blaze_ids::bits::{BitMatrix, BitSet};
 use hir_ty::mir::{
-    AggregateKind, AsmOperand, BasicBlockId, LocalId, MirBody, MirSpan, Operand, OperandKind, PlaceElem,
-    ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
+    AggregateKind, AsmOperand, BasicBlockId, LocalId, MirBody, MirSpan, Operand, OperandKind,
+    PlaceElem, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
 };
 use hir_ty::next_solver::Ty;
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 /// An index of a checked place: rustc's `PlaceIndex`.
@@ -328,7 +328,7 @@ pub(super) struct Seen<'m> {
 pub(super) struct Flow<'m, 'p, 'db> {
     pub(super) mir: &'m MirBody<'db>,
     places: &'p Places<'db>,
-    specials: &'p FxHashMap<(u32, u32), Special>,
+    specials: &'p HashMap<(u32, u32), Special>,
     cfg: &'p Cfg,
     kind: CaptureKind,
     /// The state where each block starts, a row per block.
@@ -339,7 +339,7 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
     pub(super) fn new(
         mir: &'m MirBody<'db>,
         places: &'p Places<'db>,
-        specials: &'p FxHashMap<(u32, u32), Special>,
+        specials: &'p HashMap<(u32, u32), Special>,
         cfg: &'p Cfg,
         kind: CaptureKind,
     ) -> Self {

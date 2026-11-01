@@ -6,10 +6,10 @@
     "crates/blaze-codegen/src/driver/owners.rs"
   ],
   "what": "libmimalloc-sys and blake3 build scripts (self-build 00:17) refused at blaze-codegen driver/owners.rs:146: hashbrown RawTable<(cc::CompilerFlag, bool)>::reserve_rehash closure (of build-time cc) goes in the dependency image and refers to <*mut u8>::cast::<(cc::CompilerFlag, bool)>, classed as the workspace one. Reduced: a build script calling cc 1.4.3 Build::is_flag_supported. Test: blaze-engine tests/repro.rs a_build_script_asking_cc_whether_a_flag_is_supported_builds (also needs 01358 for split_ascii_whitespace; the refusal is listed alongside).",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T07:56:51Z",
-  "updated": "2026-11-01T07:56:51Z",
-  "taken_by": null,
+  "updated": "2026-11-01T12:51:16Z",
+  "taken_by": "codegen",
   "why": null,
   "source": null,
   "history": [
@@ -18,6 +18,18 @@
       "by": "repro",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T12:51:16Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T12:51:16Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "Fixed after that run by the round-30 walk merge in blaze-codegen driver.rs: a key two describers share is the image describer whole (owner, refs, name, requester), so the image copy refers to the image callees. Test driver::tests::a_key_the_image_s_describer_shares_is_the_image_s_with_its_references. Rerun asked in 01496; reopen with the new refusal line if it still stops."
     }
   ]
 }

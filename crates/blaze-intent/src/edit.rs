@@ -31,16 +31,18 @@ pub struct Touch {
     pub how: How,
 }
 
-/// The file an edit other than a rename works in, as the request names it.
-pub fn file_of(edit: &Edit) -> &str {
+/// The file an edit works in, as the request names it; `None` for a replace, which works in
+/// every file that names its item.
+pub fn file_of(edit: &Edit) -> Option<&str> {
     match edit {
         Edit::ReplaceBody { item, .. }
         | Edit::ReplaceSignature { item, .. }
         | Edit::ReplaceItem { item, .. }
         | Edit::RemoveItem { item }
-        | Edit::Rename { item, .. } => &item.file,
-        Edit::AddField { strukt, .. } | Edit::RemoveField { strukt, .. } => &strukt.file,
-        Edit::AddItem { file, .. } | Edit::AddUse { file, .. } => file,
+        | Edit::Rename { item, .. } => Some(&item.file),
+        Edit::AddField { strukt, .. } | Edit::RemoveField { strukt, .. } => Some(&strukt.file),
+        Edit::AddItem { file, .. } | Edit::AddUse { file, .. } => Some(file),
+        Edit::Replace { .. } => None,
     }
 }
 
@@ -166,6 +168,7 @@ fn splice_of(file: &Working, index: u32, edit: &Edit, out: &mut Vec<Touch>) -> R
             add_use(file.text(), file.end, scope, used)
         }
         Edit::Rename { .. } => unreachable!("a rename is made by `crate::rename`"),
+        Edit::Replace { .. } => unreachable!("a replace is made by `crate::replace`"),
     }
 }
 
@@ -496,7 +499,7 @@ fn add_item(text: &str, end: usize, scope: Node<'_>, item: &str) -> Result<(Text
 }
 
 /// The splice adding `use used;` after the scope's last use, or before its first item.
-fn add_use(text: &str, end: usize, scope: Node<'_>, used: &str) -> Result<(TextRange, String), String> {
+pub(crate) fn add_use(text: &str, end: usize, scope: Node<'_>, used: &str) -> Result<(TextRange, String), String> {
     let line = format!("use {used};");
     if let Some(last) = items_of(scope).filter(|it| it.kind() == SyntaxKind::USE).last() {
         let indent = indent_at(text, usize::from(last.text_range().start()));

@@ -75,7 +75,8 @@ use std::{
     ops::{Deref, DerefMut, Index, IndexMut},
 };
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
+use blaze_hash::HashMap;
 use blaze_mem::Tag;
 use either::Either;
 use hir_expand::{
@@ -84,7 +85,6 @@ use hir_expand::{
 };
 use intern::{Symbol, sym};
 use itertools::Itertools;
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use span::{Edition, FileAstId, FileId, ROOT_ERASED_FILE_AST_ID};
 use stdx::format_to;
@@ -107,8 +107,8 @@ use crate::{
     visibility::{Visibility, VisibilityExplicitness},
 };
 
-pub use self::path_resolution::ResolvePathResultPrefixInfo;
 pub use self::facts::impls::{ModuleImpls, module_impls};
+pub use self::path_resolution::ResolvePathResultPrefixInfo;
 
 #[cfg(test)]
 thread_local! {
@@ -200,7 +200,7 @@ impl std::hash::Hash for LocalDefMap {
 
 impl LocalDefMap {
     pub(crate) const EMPTY: &Self =
-        &Self { extern_prelude: FxIndexMap::with_hasher(rustc_hash::FxBuildHasher) };
+        &Self { extern_prelude: FxIndexMap::with_hasher(blaze_hash::FixedState) };
 
     fn shrink_to_fit(&mut self) {
         let Self { extern_prelude } = self;
@@ -243,7 +243,7 @@ pub struct DefMap {
     /// `macro_use` prelude that contains macros from `#[macro_use]`'d external crates. Note that
     /// this contains all kinds of macro, not just `macro_rules!` macro.
     /// ExternCrateId being None implies it being imported from the general prelude import.
-    macro_use_prelude: FxHashMap<Name, (MacroId, Option<ExternCrateId>)>,
+    macro_use_prelude: HashMap<Name, (MacroId, Option<ExternCrateId>)>,
 
     /// Tracks which custom derives are in scope for an item, to allow resolution of derive helper
     /// attributes.
@@ -271,7 +271,7 @@ pub struct DefMap {
 }
 
 type DeriveHelpers =
-    FxHashMap<AstId<ast::Item>, Vec<(Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>)>>;
+    HashMap<AstId<ast::Item>, Vec<(Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>)>>;
 
 /// What a collected def map recorded that no resolution reads: how its imports and macro calls
 /// resolved, its diagnostics and the derive helpers in scope of its items.
@@ -349,9 +349,9 @@ impl DiagnosticsByModule {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DefMapCrateData {
     /// Side table for resolving derive helpers.
-    exported_derives: FxHashMap<MacroId, Box<[Name]>>,
-    fn_proc_macro_mapping: FxHashMap<FunctionId, ProcMacroId>,
-    fn_proc_macro_mapping_back: FxHashMap<ProcMacroId, FunctionId>,
+    exported_derives: HashMap<MacroId, Box<[Name]>>,
+    fn_proc_macro_mapping: HashMap<FunctionId, ProcMacroId>,
+    fn_proc_macro_mapping_back: HashMap<ProcMacroId, FunctionId>,
 
     /// Custom tool modules registered with `#![register_tool]`.
     registered_tools: Vec<Symbol>,
@@ -371,9 +371,9 @@ struct DefMapCrateData {
 impl DefMapCrateData {
     fn new(edition: Edition) -> Self {
         Self {
-            exported_derives: FxHashMap::default(),
-            fn_proc_macro_mapping: FxHashMap::default(),
-            fn_proc_macro_mapping_back: FxHashMap::default(),
+            exported_derives: HashMap::default(),
+            fn_proc_macro_mapping: HashMap::default(),
+            fn_proc_macro_mapping_back: HashMap::default(),
             // alloc: once per crate
             registered_tools: PREDEFINED_TOOLS.iter().map(|it| Symbol::intern(it)).collect(),
             unstable_features: UnstableFeatures::default(),
@@ -831,8 +831,8 @@ impl DefMap {
             modules: ModulesSlot::Building(modules),
             krate,
             prelude: None,
-            macro_use_prelude: FxHashMap::default(),
-            derive_helpers_in_scope: FxHashMap::default(),
+            macro_use_prelude: HashMap::default(),
+            derive_helpers_in_scope: HashMap::default(),
             session_macros: false,
             names: uses::NameRecords::default(),
             // alloc: empty; allocates nothing until a diagnostic
@@ -1189,7 +1189,7 @@ impl DefMap {
         self.prelude
     }
 
-    pub(crate) fn macro_use_prelude(&self) -> &FxHashMap<Name, (MacroId, Option<ExternCrateId>)> {
+    pub(crate) fn macro_use_prelude(&self) -> &HashMap<Name, (MacroId, Option<ExternCrateId>)> {
         &self.macro_use_prelude
     }
 
@@ -1632,7 +1632,7 @@ fn sub_namespace_match(
     }
 }
 
-/// A newtype wrapper around `FxHashMap<ModuleId, ModuleData>` that implements `IndexMut`.
+/// A newtype wrapper around `HashMap<ModuleId, ModuleData>` that implements `IndexMut`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ModulesMap {
     inner: FxIndexMap<ModuleId, ModuleData>,

@@ -135,7 +135,9 @@ fn task() -> Port {
 /// An error naming a Mach call and its `kern_return_t`.
 fn kern(what: &str, code: Kern) -> Error {
     // SAFETY: mach_error_string returns a static NUL-terminated string for any code.
-    let reason = unsafe { CStr::from_ptr(mach_error_string(code)) };
+    let reason = unsafe { mach_error_string(code) };
+    // SAFETY: mach_error_string returns a static NUL-terminated string for any code.
+    let reason = unsafe { CStr::from_ptr(reason) };
     Error::new(format!("{what}: kern_return {code:#x} ({})", reason.to_string_lossy()))
 }
 
@@ -345,7 +347,9 @@ impl View {
         // SAFETY: `range` is within the mapping (checked above), which lives as long as `self`;
         // nothing writes it while `&self` is borrowed but atomics on other words and the
         // daemon's `&mut` methods, which can't run meanwhile.
-        Ok(unsafe { std::slice::from_raw_parts(self.at.add(range.start), range.end - range.start) })
+        let at = unsafe { self.at.add(range.start) };
+        // SAFETY: the checked range is within the mapping and lives as long as `self`.
+        Ok(unsafe { std::slice::from_raw_parts(at, range.end - range.start) })
     }
 
     pub(crate) fn bytes_mut(&mut self, range: Range<usize>) -> Result<&mut [u8], Error> {
@@ -357,20 +361,26 @@ impl View {
         }
         // SAFETY: as for `bytes`, and `&mut self` makes this the only borrow; the mapping is
         // writable (checked above).
-        Ok(unsafe { std::slice::from_raw_parts_mut(self.at.add(range.start), range.end - range.start) })
+        let at = unsafe { self.at.add(range.start) };
+        // SAFETY: the checked range is within the writable mapping and `&mut self` is the only borrow.
+        Ok(unsafe { std::slice::from_raw_parts_mut(at, range.end - range.start) })
     }
 
     pub(crate) fn word(&self, at: usize) -> &AtomicU64 {
         assert!(at.is_multiple_of(8) && at + 8 <= self.len, "a word at {at:#x} of a view of {:#x}", self.len);
         // SAFETY: `at` is 8-aligned and in the mapping (asserted), page-aligned itself, so the
         // word is aligned; every access to the word, in this process and others, is atomic.
-        unsafe { AtomicU64::from_ptr(self.at.add(at).cast()) }
+        let ptr = unsafe { self.at.add(at) };
+        // SAFETY: the word is aligned and every access is atomic, as above.
+        unsafe { AtomicU64::from_ptr(ptr.cast()) }
     }
 
     pub(crate) fn word32(&self, at: usize) -> &AtomicU32 {
         assert!(at.is_multiple_of(4) && at + 4 <= self.len, "a word at {at:#x} of a view of {:#x}", self.len);
         // SAFETY: as for `word`, 4-aligned.
-        unsafe { AtomicU32::from_ptr(self.at.add(at).cast()) }
+        let ptr = unsafe { self.at.add(at) };
+        // SAFETY: as for `word`, 4-aligned.
+        unsafe { AtomicU32::from_ptr(ptr.cast()) }
     }
 
     pub(crate) fn publish(&self, range: Range<usize>) {
@@ -380,7 +390,9 @@ impl View {
         // SAFETY: `range` is within this view's mapping (checked above); the maintenance
         // changes no value, and, the caches being physically indexed (`check_icache`), holds
         // for every view of the same pages.
-        unsafe { sys_icache_invalidate(self.at.add(range.start).cast(), range.end - range.start) };
+        let at = unsafe { self.at.add(range.start) };
+        // SAFETY: the checked range is within the mapping; maintenance changes no value.
+        unsafe { sys_icache_invalidate(at.cast(), range.end - range.start) };
     }
 }
 
@@ -407,11 +419,10 @@ impl Drop for Exec {
     fn drop(&mut self) {
         // SAFETY: this `Exec`'s own mappings; every slice of them borrowed `self` or ended with
         // `Exec::new`'s `write`.
-        unsafe {
-            libc::munmap(self.code.cast(), self.code_pages);
-            if !self.data.is_null() {
-                libc::munmap(self.data.cast(), self.data_pages);
-            }
+        unsafe { libc::munmap(self.code.cast(), self.code_pages) };
+        if !self.data.is_null() {
+            // SAFETY: this `Exec` owns the mapping; every slice borrowed `self` or ended with `write`.
+            unsafe { libc::munmap(self.data.cast(), self.data_pages) };
         }
     }
 }
@@ -484,15 +495,14 @@ impl Exec {
         }
         {
             let _writable = JitWritable::new();
-            // SAFETY: the fresh mappings, readable and writable on this thread while
-            // `_writable` lives, which nothing else refers to; `code <= code_pages` and
-            // `data <= data_pages`. `write` can't keep the slices past its return. A null
-            // `data` is only for `data == 0`, so its slice is the empty one at a dangling,
-            // aligned pointer.
-            let (code_bytes, data_bytes) = unsafe {
-                let data_at = if exec.data.is_null() { std::ptr::NonNull::dangling().as_ptr() } else { exec.data };
-                (std::slice::from_raw_parts_mut(exec.code, code), std::slice::from_raw_parts_mut(data_at, data))
-            };
+            let data_at = if exec.data.is_null() { std::ptr::NonNull::dangling().as_ptr() } else { exec.data };
+            // SAFETY: the fresh mappings are readable and writable on this thread while
+            // `_writable` lives, nothing else refers to them, and `code <= code_pages`.
+            // `write` cannot keep the slice past its return.
+            let code_bytes = unsafe { std::slice::from_raw_parts_mut(exec.code, code) };
+            // SAFETY: the fresh data mapping is writable, and `data <= data_pages`; null data
+            // has length zero and uses the aligned dangling pointer. `write` cannot retain it.
+            let data_bytes = unsafe { std::slice::from_raw_parts_mut(data_at, data) };
             write(code_bytes, data_bytes);
         }
         // SAFETY: the code's pages, mapped; the maintenance changes no value.
@@ -525,9 +535,11 @@ fn check_unsigned_code() -> Result<(), Error> {
     CHECKED
         .get_or_init(|| {
             let mut flags: u32 = 0;
+            // SAFETY: getpid has no preconditions.
+            let pid = unsafe { libc::getpid() };
             // SAFETY: CS_OPS_STATUS writes this process's 4-byte code-signing status to `flags`,
             // which is live and writable.
-            let got = unsafe { csops(libc::getpid(), CS_OPS_STATUS, (&raw mut flags).cast(), size_of::<u32>()) };
+            let got = unsafe { csops(pid, CS_OPS_STATUS, (&raw mut flags).cast(), size_of::<u32>()) };
             if got != 0 {
                 return Err(Error::new(format!("csops CS_OPS_STATUS: {}", std::io::Error::last_os_error())));
             }

@@ -17,9 +17,8 @@
 use std::cell::RefCell;
 
 use base_db::{ConstEvalBudget, Crate, CrateOrigin, Db, Env};
-use hir_def::{
-    AssocItemId, FunctionId, HasModule, ModuleDefId, StaticId, nameres::crate_def_map,
-};
+use blaze_hash::HashMap;
+use hir_def::{AssocItemId, FunctionId, HasModule, ModuleDefId, StaticId, nameres::crate_def_map};
 use hir_expand::name::Name;
 use hir_ty::{
     InferBodyId, ParamEnvAndCrate,
@@ -31,7 +30,6 @@ use hir_ty_mir::mir::{
     foreign::{Claimed, Foreign},
 };
 use intern::Symbol;
-use rustc_hash::FxHashMap;
 use span::{Edition, Span};
 
 use crate::{
@@ -129,7 +127,7 @@ pub(crate) struct Ran {
 struct State<'e> {
     server: Server,
     os: Os<'e>,
-    shims: FxHashMap<FunctionId, Shim>,
+    shims: HashMap<FunctionId, Shim>,
     /// Why a claimed call stopped the evaluation.
     stop: Option<Stop>,
     reply: Vec<u8>,
@@ -319,7 +317,7 @@ fn evaluate(
     let state = RefCell::new(State {
         server: Server::new(last.sites, last.edition, last.forced_keywords),
         os: Os::new(env),
-        shims: FxHashMap::default(),
+        shims: HashMap::default(),
         stop: None,
         // alloc: once per run, the replies' buffer
         reply: Vec::new(),
@@ -362,6 +360,9 @@ fn on_evaluator<'db>(
     let owner: InferBodyId<'db> = first.into();
     let mut eval = Evaluator::new(db, owner, Some(env))?;
     eval.set_budget(ConstEvalBudget { steps: u64::MAX, memory: MEMORY });
+    if let Some(checks) = hir_ty_mir::mir::overflow::crate_checks_overflow(db, krate) {
+        eval.set_inherited_overflow_checks(checks);
+    }
     eval.track_statics();
     for (id, bytes) in preset {
         eval.preset_static(*id, bytes);

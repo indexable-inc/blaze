@@ -13,6 +13,10 @@
 //! Codegen asks this once per function. Everything but the result is in the call's frame, and
 //! the sets are reused across blocks, so the result's two boxes are all it allocates.
 
+use blaze_ids::{
+    bits::{BitMatrix, Words, words_for},
+    radix,
+};
 use blaze_mem::{Frame, Tag, frame};
 use either::Either;
 
@@ -42,6 +46,70 @@ impl StorageConflicts {
             || bit(&self.always, b)
             || bit(&self.conflicts[a * self.words..(a + 1) * self.words], b)
     }
+
+    /// [`Self::conflict`] of the first `count` locals as a matrix in `frame`, for
+    /// [`share_greedily`]: no local conflicts with itself there.
+    pub fn matrix_in<'f>(&self, count: usize, frame: &'f Frame) -> BitMatrix<usize, Vec<u64, &'f Frame>> {
+        let mut data = Vec::with_capacity_in(count * words_for(count), frame);
+        data.resize(count * words_for(count), 0);
+        let mut matrix = BitMatrix::from_words(count, count, data);
+        for a in 0..count {
+            for b in (a + 1)..count {
+                if self.conflict(a, b) {
+                    matrix.insert(a, b);
+                    matrix.insert(b, a);
+                }
+            }
+        }
+        matrix
+    }
+}
+
+/// Locals put together by [`share_greedily`], each group to share one piece of the frame.
+pub struct SharedSlots<'f> {
+    /// The group of each member, in the order the members were given.
+    pub group_of: Vec<u32, &'f Frame>,
+    /// Each group's first member, by its place among the members: the group's largest, the
+    /// one whose memory the group keeps.
+    pub first: Vec<u32, &'f Frame>,
+}
+
+/// Groups `members` so that no two of a group may hold storage at once, greedily as LLVM's
+/// stack colouring does: the largest first, ties by row, each into the first group none of
+/// whose members conflicts with it. A member is a row of `conflicts` with its size. Whether one
+/// more fits a group is one bit: a group keeps the rows of its members, or'ed.
+pub fn share_greedily<'f, S: Words>(
+    members: &[(usize, u64)],
+    conflicts: &BitMatrix<usize, S>,
+    frame: &'f Frame,
+) -> SharedSlots<'f> {
+    let count = members.len();
+    let mut order: Vec<u32, &Frame> = Vec::with_capacity_in(count, frame);
+    order.extend(0..count as u32);
+    radix::sort_by_key(&mut order, |&at| {
+        let (row, size) = members[at as usize];
+        radix::pack_64(!size, row as u64)
+    });
+    let row_words = conflicts.row_words();
+    let mut words = Vec::with_capacity_in(count * row_words, frame);
+    words.resize(count * row_words, 0);
+    let mut groups: BitMatrix<usize, Vec<u64, &Frame>> = BitMatrix::from_words(count, row_words * 64, words);
+    let mut group_of = Vec::with_capacity_in(count, frame);
+    group_of.resize(count, 0);
+    let mut first = Vec::new_in(frame);
+    for at in order {
+        let row = members[at as usize].0;
+        let group = match (0..first.len()).find(|&group| !groups.contains(group, row)) {
+            Some(group) => group,
+            None => {
+                first.push(at);
+                first.len() - 1
+            }
+        };
+        groups.union_row_with(group, &conflicts.row(row));
+        group_of[at as usize] = group as u32;
+    }
+    SharedSlots { group_of, first }
 }
 
 fn mentioned(place: &StoredPlace, f: &mut impl FnMut(LocalId)) {
@@ -384,4 +452,30 @@ fn conflicts_in<'f>(
     }
     // alloc: the result, kept by codegen for the function's frame layout
     StorageConflicts { always: Box::from(always.words()), conflicts: Box::from(&matrix[..]), words }
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_ids::bits::BitMatrix;
+    use blaze_mem::{Tag, frame};
+
+    use super::share_greedily;
+
+    #[test]
+    fn locals_join_the_first_group_none_of_whose_members_they_conflict_with() {
+        // Rows 0 and 1 conflict, so do 1 and 2; 0 and 2 may share. Row 3 conflicts with none.
+        let mut conflicts = BitMatrix::new(4, 4);
+        for (a, b) in [(0, 1), (1, 2)] {
+            conflicts.insert(a, b);
+            conflicts.insert(b, a);
+        }
+        frame::task(Tag::Mir, |scratch| {
+            let shared =
+                share_greedily(&[(0, 8), (1, 16), (2, 8), (3, 4)], &conflicts, scratch);
+            // Largest first: row 1 opens a group, row 0 opens the next (ties by row), row 2
+            // joins row 0's, row 3 joins row 1's, the first it fits.
+            assert_eq!(&shared.group_of[..], &[1, 0, 1, 0]);
+            assert_eq!(&shared.first[..], &[1, 0]);
+        });
+    }
 }

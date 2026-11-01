@@ -1,8 +1,9 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use blaze_inproc::frame::{Frame, Kind, kinds};
 use blaze_live::patch::Answer;
 use blaze_live::patch::ask::{self, ANSWER, ANSWERED, NO_PATCH, NO_TIERS, PATCH, PATCH_ASK, TIERS_ASK};
+use crossbeam_queue::SegQueue;
 
 use super::{ARENA, CELLS_PER_FUNCTION, Patch, answer, dev_run};
 
@@ -14,10 +15,10 @@ fn ask(kind: Kind, body: &[u8]) -> Frame<'_> {
 
 /// The answer to `frame` of process [`PID`], and what it kept as failures.
 fn answered(frame: &Frame<'_>, patch: &Patch) -> (Result<(Kind, Vec<u8>), String>, Vec<String>) {
-    let failures = Mutex::new(Vec::new());
+    let failures = SegQueue::new();
     let mut body = Vec::new();
     let kind = answer(frame, patch, PID, &failures, &mut body);
-    (kind.map(|it| (it, body)), failures.into_inner().unwrap())
+    (kind.map(|it| (it, body)), failures.into_iter().collect())
 }
 
 fn patch_of(generation: u64, message: &[u8]) -> Patch {

@@ -23,22 +23,22 @@ mod meta;
 
 use std::borrow::Cow;
 
+use blaze_hash::HashSet;
 use hir::InFile;
-use rustc_hash::FxHashSet;
 use syntax::{
     SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
     view::{self as ast, AstNode},
 };
 
-use self::meta::{Item, Lit, List, MetaArgs, MetaItem};
+use self::meta::{Item, List, Lit, MetaArgs, MetaItem};
 use super::super::{Emitted, Pass, Stage, Walk, source_fact};
 use super::{Args, Attr, Owner, Target, checked, parsed};
-use stdx::list::Join;
 use crate::{
     cx::{Cx, def_range_view, item_range_view, signature_range_view},
     lower::Phase,
     model::{Applicability, Diag, SuggestionStyle},
 };
+use stdx::list::Join;
 
 const INVALID: &str = "invalid_doc_attributes";
 
@@ -580,7 +580,7 @@ impl Parser<'_, '_, '_> {
         let mut any: Option<TextRange> = None;
         let mut first: Option<TextRange> = None;
         let mut has_none = false;
-        let mut seen: FxHashSet<Cow<'_, str>> = FxHashSet::default();
+        let mut seen: HashSet<Cow<'_, str>> = HashSet::default();
         for item in &list.items {
             match item {
                 Item::Lit(lit) => match lit.str() {

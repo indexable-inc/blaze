@@ -1,5 +1,9 @@
 //! The lints, each a port of clippy's (its file says which), and what runs them on a node.
 
+mod allow_attributes;
+mod allow_attributes_without_reason;
+mod arc_with_non_send_sync;
+mod await_holding_invalid;
 mod bool_assert_comparison;
 mod box_collection;
 mod byte_char_slices;
@@ -8,19 +12,29 @@ mod clone_on_ref_ptr;
 mod collapsible_if;
 mod crate_in_macro_def;
 mod dbg_macro;
+pub(crate) mod disallowed;
 mod empty_enums;
-mod format;
+pub(crate) mod format;
 mod format_collect;
 mod get_first;
+pub(crate) mod guards;
 mod implicit_clone;
 mod inefficient_to_string;
+mod infinite_loop;
 mod io_other_error;
+pub(crate) mod iter_over_hash_type;
 mod large_enum_variant;
+mod large_stack_arrays;
+mod large_stack_frames;
 mod large_types_passed_by_value;
+mod let_underscore_future;
+mod let_underscore_must_use;
 mod map_clone;
+mod map_err_ignore;
 mod map_unwrap_or;
 mod match_like_matches_macro;
 mod multiple_unsafe_ops_per_block;
+mod mutex_atomic;
 mod needless_bool;
 mod needless_borrow;
 mod needless_borrows_for_generic_args;
@@ -28,17 +42,23 @@ mod needless_pass_by_value;
 mod needless_return;
 mod new_without_default;
 mod nonstandard_macro_braces;
+mod panic_in_result_fn;
 mod print_stderr;
 mod print_stdout;
 mod rc_buffer;
+mod rc_mutex;
 mod redundant_clone;
 mod redundant_static_lifetimes;
+mod significant_drop_in_scrutinee;
+mod significant_drop_tightening;
 mod single_char_add_str;
 mod str_to_string;
 mod todo;
 mod undocumented_unsafe_blocks;
 mod unnecessary_map_or;
 mod unnecessary_to_owned;
+mod unused_result_ok;
+mod unwrap_in_result;
 mod upper_case_acronyms;
 mod useless_borrows_in_formatting;
 mod useless_format;
@@ -47,7 +67,13 @@ mod utils;
 mod vec_box;
 
 #[cfg(test)]
+mod disallowed_tests;
+#[cfg(test)]
+pub(crate) mod drops_tests;
+#[cfg(test)]
 mod more_clone_tests;
+#[cfg(test)]
+mod more_rules_tests;
 #[cfg(test)]
 mod more_types_tests;
 
@@ -105,6 +131,11 @@ macro_rules! implemented {
 }
 
 implemented! {
+    AllowAttributes = "allow_attributes", Early;
+    AllowAttributesWithoutReason = "allow_attributes_without_reason", Early;
+    ArcWithNonSendSync = "arc_with_non_send_sync", Late;
+    AwaitHoldingLock = "await_holding_lock", Late;
+    AwaitHoldingRefcellRef = "await_holding_refcell_ref", Late;
     BoolAssertComparison = "bool_assert_comparison", Late;
     BoxCollection = "box_collection", Late;
     ByteCharSlices = "byte_char_slices", Late;
@@ -113,18 +144,30 @@ implemented! {
     CollapsibleIf = "collapsible_if", Late;
     CrateInMacroDef = "crate_in_macro_def", Early;
     DbgMacro = "dbg_macro", Late;
+    DisallowedMacros = "disallowed_macros", Late;
+    DisallowedMethods = "disallowed_methods", Late;
+    DisallowedTypes = "disallowed_types", Late;
     EmptyEnums = "empty_enums", Late;
     FormatCollect = "format_collect", Late;
     GetFirst = "get_first", Late;
     ImplicitClone = "implicit_clone", Late;
     InefficientToString = "inefficient_to_string", Late;
+    InfiniteLoop = "infinite_loop", Late;
     IoOtherError = "io_other_error", Late;
+    IterOverHashType = "iter_over_hash_type", Late;
     LargeEnumVariant = "large_enum_variant", Late;
+    LargeStackArrays = "large_stack_arrays", Late;
+    LargeStackFrames = "large_stack_frames", Late;
     LargeTypesPassedByValue = "large_types_passed_by_value", Late;
+    LetUnderscoreFuture = "let_underscore_future", Late;
+    LetUnderscoreMustUse = "let_underscore_must_use", Late;
     MapClone = "map_clone", Late;
+    MapErrIgnore = "map_err_ignore", Late;
     MapUnwrapOr = "map_unwrap_or", Late;
     MatchLikeMatchesMacro = "match_like_matches_macro", Late;
     MultipleUnsafeOpsPerBlock = "multiple_unsafe_ops_per_block", Late;
+    MutexAtomic = "mutex_atomic", Late;
+    MutexInteger = "mutex_integer", Late;
     NeedlessBool = "needless_bool", Late;
     NeedlessBorrow = "needless_borrow", Late;
     NeedlessBorrowsForGenericArgs = "needless_borrows_for_generic_args", Late;
@@ -132,17 +175,23 @@ implemented! {
     NeedlessReturn = "needless_return", Late;
     NewWithoutDefault = "new_without_default", Late;
     NonstandardMacroBraces = "nonstandard_macro_braces", PreExpansion;
+    PanicInResultFn = "panic_in_result_fn", Late;
     PrintStderr = "print_stderr", Late;
     PrintStdout = "print_stdout", Late;
     RcBuffer = "rc_buffer", Late;
+    RcMutex = "rc_mutex", Late;
     RedundantClone = "redundant_clone", Late;
     RedundantStaticLifetimes = "redundant_static_lifetimes", Early;
+    SignificantDropInScrutinee = "significant_drop_in_scrutinee", Late;
+    SignificantDropTightening = "significant_drop_tightening", Late;
     SingleCharAddStr = "single_char_add_str", Late;
     StrToString = "str_to_string", Late;
     Todo = "todo", Late;
     UndocumentedUnsafeBlocks = "undocumented_unsafe_blocks", Late;
     UnnecessaryMapOr = "unnecessary_map_or", Late;
     UnnecessaryToOwned = "unnecessary_to_owned", Late;
+    UnusedResultOk = "unused_result_ok", Late;
+    UnwrapInResult = "unwrap_in_result", Late;
     UpperCaseAcronyms = "upper_case_acronyms", Late;
     UselessBorrowsInFormatting = "useless_borrows_in_formatting", Late;
     UselessFormat = "useless_format", Late;
@@ -152,10 +201,10 @@ implemented! {
 
 /// A set of lints: bit `i` for the [`Implemented`] lint of index `i`, and bits
 /// [`BLAZE_BITS`]`..` for [`blaze::Lint`]s.
-pub(crate) type On = u64;
+pub(crate) type On = u128;
 
 /// The first bit of [`blaze::Lint`]s in an [`On`].
-pub(crate) const BLAZE_BITS: u32 = 48;
+pub(crate) const BLAZE_BITS: u32 = 96;
 
 const _: () = assert!(Implemented::ALL.len() <= BLAZE_BITS as usize);
 const _: () = assert!(BLAZE_BITS as usize + blaze::Lint::ALL.len() <= On::BITS as usize);
@@ -329,7 +378,7 @@ pub(crate) fn in_calls(cx: &Cx<'_, '_>) -> bool {
 }
 
 /// The method names some lint of a method call looks at; any other call is linted by none.
-const METHODS: [&str; 15] = [
+const METHODS: [&str; 19] = [
     "map",
     "unwrap_or",
     "unwrap_or_default",
@@ -345,6 +394,10 @@ const METHODS: [&str; 15] = [
     "to_vec",
     "into_owned",
     "collect",
+    "map_err",
+    "ok",
+    "unwrap",
+    "expect",
 ];
 
 blaze_phf::phf_table!(static METHOD = &METHODS;);
@@ -363,6 +416,9 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
             empty_enums::check(cx, it);
         }
         return;
+    }
+    if matches!(node.kind(), K::PATH | K::METHOD_CALL_EXPR) || node == cx.root() {
+        disallowed::check(cx, node);
     }
     match node.kind() {
         K::STRUCT | K::TRAIT => {
@@ -391,7 +447,30 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
             needless_return::check_fn(cx, it);
             needless_pass_by_value::check(cx, node);
             large_types_passed_by_value::check(cx, node);
+            large_stack_frames::check(cx, node);
+            significant_drop_tightening::check(cx, node);
+            await_holding_invalid::check(cx, node);
             box_collection::check(cx, node);
+            panic_in_result_fn::check(cx, it);
+        }
+        K::ATTR => {
+            let Some(it) = ast::Attr::cast(node) else { return };
+            allow_attributes::check(cx, it);
+            allow_attributes_without_reason::check(cx, it);
+        }
+        K::LET_STMT => {
+            let Some(it) = ast::LetStmt::cast(node) else { return };
+            let_underscore_future::check(cx, it);
+            let_underscore_must_use::check(cx, it);
+            mutex_atomic::check_let(cx, it);
+        }
+        K::LOOP_EXPR => {
+            let Some(ast::Expr::LoopExpr(it)) = ast::Expr::cast(node) else { return };
+            infinite_loop::check(cx, it);
+        }
+        K::FOR_EXPR => {
+            let Some(ast::Expr::ForExpr(it)) = ast::Expr::cast(node) else { return };
+            iter_over_hash_type::check(cx, it);
         }
         K::CONST => {
             let Some(it) = ast::Const::cast(node) else { return };
@@ -402,6 +481,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
             let Some(it) = ast::Static::cast(node) else { return };
             redundant_static_lifetimes::check_static(cx, it);
             box_collection::check(cx, node);
+            mutex_atomic::check_static(cx, it);
         }
         K::RECORD_FIELD | K::TUPLE_FIELD => box_collection::check(cx, node),
         K::MACRO_CALL => {
@@ -434,14 +514,22 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
             needless_bool::check_if(cx, it);
             collapsible_if::check(cx, it);
             match_like_matches_macro::check_if_let(cx, it);
+            significant_drop_in_scrutinee::check_if(cx, it);
         }
         K::MATCH_EXPR => {
             let Some(ast::Expr::MatchExpr(it)) = ast::Expr::cast(node) else { return };
             match_like_matches_macro::check_match(cx, it);
+            significant_drop_in_scrutinee::check_match(cx, it);
+        }
+        K::WHILE_EXPR => {
+            let Some(ast::Expr::WhileExpr(it)) = ast::Expr::cast(node) else { return };
+            significant_drop_in_scrutinee::check_while(cx, it);
         }
         K::CALL_EXPR => {
             let Some(it) = ast::Expr::cast(node) else { return };
             io_other_error::check(cx, it);
+            unwrap_in_result::check(cx, it);
+            arc_with_non_send_sync::check(cx, it);
         }
         K::REF_EXPR => {
             let Some(it) = ast::Expr::cast(node) else { return };
@@ -452,6 +540,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         K::ARRAY_EXPR | K::PAREN_EXPR => {
             let Some(it) = ast::Expr::cast(node) else { return };
             byte_char_slices::check(cx, it);
+            large_stack_arrays::check(cx, it);
         }
         K::CLOSURE_EXPR => {
             let Some(ast::Expr::ClosureExpr(closure)) = ast::Expr::cast(node) else { return };
@@ -501,6 +590,9 @@ fn check_method_call<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         }
         13 => unnecessary_to_owned::check(cx, node),
         14 => format_collect::check(cx, node),
+        15 => map_err_ignore::check(cx, expr),
+        16 => unused_result_ok::check(cx, expr),
+        17 | 18 => unwrap_in_result::check(cx, expr),
         _ => {}
     }
 }
@@ -522,6 +614,9 @@ pub(crate) fn check_node_by_casts<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) 
         }
         return;
     }
+    if ast::Path::cast(node).is_some() || ast::MethodCallExpr::cast(node).is_some() || node == cx.root() {
+        disallowed::check(cx, node);
+    }
     if let Some(it) = ast::Item::cast(node) {
         upper_case_acronyms::check(cx, it);
     }
@@ -531,10 +626,12 @@ pub(crate) fn check_node_by_casts<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) 
         new_without_default::check(cx, it);
     } else if let Some(it) = ast::Fn::cast(node) {
         needless_return::check_fn(cx, it);
+        panic_in_result_fn::check(cx, it);
     } else if let Some(it) = ast::Const::cast(node) {
         redundant_static_lifetimes::check_const(cx, it);
     } else if let Some(it) = ast::Static::cast(node) {
         redundant_static_lifetimes::check_static(cx, it);
+        mutex_atomic::check_static(cx, it);
     } else if let Some(it) = ast::MacroCall::cast(node) {
         nonstandard_macro_braces::check_call(cx, it);
         bool_assert_comparison::check(cx, it);
@@ -548,15 +645,27 @@ pub(crate) fn check_node_by_casts<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) 
         needless_bool::check_block(cx, it);
     } else if let Some(it) = ast::IdentPat::cast(node) {
         needless_borrow::check_ref_pat(cx, it);
+    } else if let Some(it) = ast::Attr::cast(node) {
+        allow_attributes::check(cx, it);
+        allow_attributes_without_reason::check(cx, it);
+    } else if let Some(it) = ast::LetStmt::cast(node) {
+        let_underscore_future::check(cx, it);
+        let_underscore_must_use::check(cx, it);
+        mutex_atomic::check_let(cx, it);
     }
     if let Some(it) = ast::Expr::cast(node) {
         if let ast::Expr::IfExpr(it) = it {
             needless_bool::check_if(cx, it);
             collapsible_if::check(cx, it);
             match_like_matches_macro::check_if_let(cx, it);
+            significant_drop_in_scrutinee::check_if(cx, it);
         }
         if let ast::Expr::MatchExpr(it) = it {
             match_like_matches_macro::check_match(cx, it);
+            significant_drop_in_scrutinee::check_match(cx, it);
+        }
+        if let ast::Expr::WhileExpr(it) = it {
+            significant_drop_in_scrutinee::check_while(cx, it);
         }
         io_other_error::check(cx, it);
         map_clone::check(cx, it);
@@ -565,11 +674,22 @@ pub(crate) fn check_node_by_casts<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) 
         needless_borrows_for_generic_args::check(cx, it);
         unnecessary_map_or::check(cx, it);
         byte_char_slices::check(cx, it);
+        large_stack_arrays::check(cx, it);
         clone_on_copy::check(cx, it);
         get_first::check(cx, it);
         single_char_add_str::check(cx, it);
+        map_err_ignore::check(cx, it);
+        unused_result_ok::check(cx, it);
+        unwrap_in_result::check(cx, it);
+        arc_with_non_send_sync::check(cx, it);
         if let ast::Expr::ClosureExpr(it) = it {
             needless_return::check_closure(cx, it);
+        }
+        if let ast::Expr::LoopExpr(it) = it {
+            infinite_loop::check(cx, it);
+        }
+        if let ast::Expr::ForExpr(it) = it {
+            iter_over_hash_type::check(cx, it);
         }
     }
     redundant_clone::check(cx, node);
@@ -581,6 +701,9 @@ pub(crate) fn check_node_by_casts<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) 
     str_to_string::check(cx, node);
     needless_pass_by_value::check(cx, node);
     large_types_passed_by_value::check(cx, node);
+    large_stack_frames::check(cx, node);
+    significant_drop_tightening::check(cx, node);
+    await_holding_invalid::check(cx, node);
     box_collection::check(cx, node);
     large_enum_variant::check(cx, node);
     undocumented_unsafe_blocks::check(cx, node);
@@ -597,7 +720,7 @@ mod tests {
 
     #[test]
     fn implemented_lints_are_clippys() {
-        assert_eq!(Implemented::ALL.len(), 43);
+        assert_eq!(Implemented::ALL.len(), 66);
         for (at, &lint) in Implemented::ALL.iter().enumerate() {
             assert_eq!(lint as usize, at);
             let info = registry::lint(lint.name()).expect("a lint of clippy's");
@@ -617,7 +740,7 @@ mod tests {
         for (at, name) in METHODS.iter().enumerate() {
             assert_eq!(METHOD.get(name), Some(at), "{name}");
         }
-        for name in ["", "clon", "clones", "Clone", "r#clone", "to_str", "iter", "unwrap"] {
+        for name in ["", "clon", "clones", "Clone", "r#clone", "to_str", "iter", "unwrap_err"] {
             assert_eq!(METHOD.get(name), None, "{name}");
         }
     }

@@ -2,9 +2,9 @@
 //! can name or reach. Read once from the crate's effective visibilities (`names::effective`)
 //! into a bitset over the numbering, so that each question the pass asks is a bit test.
 
+use blaze_hash::HashMap;
 use hir::{InFile, ModuleDef};
 use hir_def::{Lookup as _, ModuleId};
-use rustc_hash::FxHashMap;
 
 use super::defs::{DefIdx, DefSet, Defs, Id};
 use crate::{
@@ -21,7 +21,7 @@ impl Reach {
         let db = cx.db;
         // The `use`s of the crate's modules by their nodes; one in a body has no effective
         // visibility.
-        let mut uses = FxHashMap::default(); // alloc: setup, once per crate
+        let mut uses = HashMap::default(); // alloc: setup, once per crate
         for &module in &defs.module_ids {
             let id: ModuleId = module.into();
             for use_ in id.def_map(db).module(db, id).scope(db).use_decls() {

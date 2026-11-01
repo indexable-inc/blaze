@@ -7,7 +7,7 @@
 
 use blaze_ids::radix;
 use intern::Symbol;
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use span::{Span, TextRange, TextSize};
 
 use super::CompressedSpanPart;
@@ -80,7 +80,7 @@ const fn n_bits_mask_u64(n: u32) -> u64 {
 fn encode_span(
     w: &mut Writer,
     span: &Span,
-    span_parts_map: &FxHashMap<CompressedSpanPart, usize>,
+    span_parts_map: &HashMap<CompressedSpanPart, usize>,
     extra_two_bits: u32,
 ) {
     let span_parts_index = span_parts_map[&CompressedSpanPart::from_span(span)] as u32;
@@ -135,7 +135,7 @@ fn encode_span_no_map(
     w.u32(first_u32);
 }
 
-fn encode_symbol(w: &mut Writer, symbol: &Symbol, tag: u32, symbols_map: &FxHashMap<Symbol, usize>) {
+fn encode_symbol(w: &mut Writer, symbol: &Symbol, tag: u32, symbols_map: &HashMap<Symbol, usize>) {
     let symbol_idx = symbols_map[symbol] as u32;
     if symbol_idx <= n_bits_mask(6) {
         w.u8(((symbol_idx << 2) | tag) as u8);
@@ -152,9 +152,9 @@ fn encode_symbol(w: &mut Writer, symbol: &Symbol, tag: u32, symbols_map: &FxHash
 fn encode(
     w: &mut Writer,
     tt: TokenTree,
-    span_parts_map: &FxHashMap<CompressedSpanPart, usize>,
+    span_parts_map: &HashMap<CompressedSpanPart, usize>,
     byte_size_after: &mut [u32],
-    symbols_map: &FxHashMap<Symbol, usize>,
+    symbols_map: &HashMap<Symbol, usize>,
 ) {
     let before = w.len();
     match tt {
@@ -336,8 +336,8 @@ pub(super) struct VarintTree {
 
 impl VarintTree {
     pub(super) fn from_serialized(tts: Vec<TokenTree>) -> VarintTree {
-        let mut span_frequencies = FxHashMap::default();
-        let mut symbol_frequencies = FxHashMap::default();
+        let mut span_frequencies = HashMap::default();
+        let mut symbol_frequencies = HashMap::default();
         for tt in &tts[1..] {
             match tt {
                 TokenTree::Leaf(leaf) => {
@@ -377,8 +377,8 @@ impl VarintTree {
 
 fn encode_all(
     tts: Vec<TokenTree>,
-    mut compressed_span_frequencies: FxHashMap<CompressedSpanPart, usize>,
-    mut symbol_frequencies: FxHashMap<Symbol, usize>,
+    mut compressed_span_frequencies: HashMap<CompressedSpanPart, usize>,
+    mut symbol_frequencies: HashMap<Symbol, usize>,
 ) -> VarintTree {
     let tts_len = tts.len();
     let mut token_trees = tts.into_iter().enumerate();

@@ -42,15 +42,16 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use blaze_codegen::{Arch, CompiledFunction, InstanceKey, RelocKind, Relocs, Target};
+use blaze_hash::HashMap;
 use blaze_inproc::{CodeMemory, CodeRange};
 use blaze_lazy::runner::Placer;
 use blaze_lazy::stub::{self, Layout, Stubs};
 use blaze_lazy::{Session, hook};
 use blaze_mem::align::align_up_u64;
-use rustc_hash::FxHashMap;
+use parking_lot::Mutex;
 
 use crate::model::{Apply, Sym};
 use crate::position::{self, LOCATION_ALIGN, LOCATION_SIZE};
@@ -171,8 +172,8 @@ pub struct LazyPlacer<S: Slots> {
     slide: u64,
     /// The arena code each slot runs, by the key the slot is named for: what a replacement
     /// retires.
-    // FxHashMap: one entry per placed slot, probed once per placement.
-    placed: FxHashMap<InstanceKey, CodeRange>,
+    // HashMap: one entry per placed slot, probed once per placement.
+    placed: HashMap<InstanceKey, CodeRange>,
     scratch: Scratch,
 }
 
@@ -261,11 +262,6 @@ enum Value {
 /// where the image fixes one, and whether the address slides with the image.
 type Parts = (u64, u64, Option<i64>, bool);
 
-fn lock<'m, T>(it: &'m Mutex<T>, what: &str) -> Result<MutexGuard<'m, T>, String> {
-    // alloc: error path
-    it.lock().map_err(|_| format!("the {what}'s lock is poisoned: a thread panicked holding it"))
-}
-
 impl<S: Slots> LazyPlacer<S> {
     /// The placer of the lazy image `image`, committed into `memory` and laid out over it
     /// ([`CodeMemory::lay_out`]), whose every run process has the image at `slide` from its
@@ -274,8 +270,8 @@ impl<S: Slots> LazyPlacer<S> {
     pub fn new(image: Arc<Mutex<Image>>, memory: Arc<Mutex<CodeMemory>>, slots: S, slide: u64) -> Result<LazyPlacer<S>, LinkError> {
         let fail = |what: String| LinkError { function: None, what, refusal: None };
         {
-            let image = lock(&image, "image").map_err(fail)?;
-            let mut memory = lock(&memory, "code memory").map_err(fail)?;
+            let image = image.lock();
+            let mut memory = memory.lock();
             let Some(region) = image.lazy_stubs() else {
                 // alloc: error path
                 return Err(fail(format!("{}: not a lazy image, or not linked yet (`Image::stage_lazy`)", image.to)));
@@ -301,7 +297,7 @@ impl<S: Slots> LazyPlacer<S> {
             memory.store_word(at, hook.wrapping_add(slide)).map_err(|it| fail(it.what))?;
         }
         // alloc: once per run, the placer
-        Ok(LazyPlacer { image, memory, slots, slide, placed: FxHashMap::default(), scratch: Scratch::default() })
+        Ok(LazyPlacer { image, memory, slots, slide, placed: HashMap::default(), scratch: Scratch::default() })
     }
 
     /// The slide every run process of the memory has: one whose image is elsewhere must be
@@ -318,9 +314,9 @@ impl<S: Slots> LazyPlacer<S> {
         let LazyPlacer { image, memory, slots, slide, placed, scratch } = self;
         let slide = *slide;
         let (index, range, target) = {
-            let mut image = lock(image, "image").map_err(fail)?;
+            let mut image = image.lock();
             let image = &mut *image;
-            let mut memory = lock(memory, "code memory").map_err(fail)?;
+            let mut memory = memory.lock();
             if function.arch != image.output.arch {
                 // alloc: error path
                 return Err(fail(format!("compiled for {:?}, placed in an image for {:?}", function.arch, image.output.arch)));
@@ -351,13 +347,13 @@ impl<S: Slots> LazyPlacer<S> {
         };
         if let Err(why) = slots.publish(index, target) {
             // Some process may have stored it: the range waits behind the fence.
-            lock(memory, "code memory").map_err(fail)?.retire(range).map_err(|it| fail(it.what))?;
+            memory.lock().retire(range).map_err(|it| fail(it.what))?;
             // alloc: error path
             return Err(fail(format!("publishing it in slot {}: {why}", index.0)));
         }
         // alloc: once per slot placed, its entry
         if let Some(old) = placed.insert(slot, range) {
-            lock(memory, "code memory").map_err(fail)?.retire(old).map_err(|it| fail(it.what))?;
+            memory.lock().retire(old).map_err(|it| fail(it.what))?;
         }
         Ok(target)
     }
@@ -371,7 +367,7 @@ impl<S: Slots> Placer for LazyPlacer<S> {
 
     fn cells(&self, key: &InstanceKey) -> Option<u64> {
         // A poisoned lock still holds every pair given: a pair is set before the count moves.
-        let image = self.image.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let image = self.image.lock();
         image.counter(key)
     }
 

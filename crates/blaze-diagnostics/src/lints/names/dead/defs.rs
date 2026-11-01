@@ -12,6 +12,7 @@
 //! `compiler/rustc_builtin_macros/src/deriving/` (where a derive puts its impl)
 //! (MIT or Apache-2.0).
 
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::{bits::BitSet, radix};
 use hir::{HirFileId, InFile, ModuleSourceView, Name};
 use hir_def::{
@@ -19,7 +20,6 @@ use hir_def::{
     StaticId, TraitId, TypeAliasId, builtin_derive::BuiltinDeriveImplTrait,
 };
 use intern::sym;
-use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use syntax::{
     SyntaxKind, SyntaxNodePtr, T,
@@ -167,7 +167,7 @@ pub(super) struct ModuleItems {
 #[derive(Debug)]
 pub(super) struct Defs {
     pub(super) defs: Vec<Def>,
-    ids: FxHashMap<Id, DefIdx>,
+    ids: HashMap<Id, DefIdx>,
     /// CSR: the children of definition `d` (a trait's or an impl's associated items, an enum's
     /// variants, a struct's, a union's or a variant's fields, in order) are
     /// `child_list[child_at[d]..child_at[d + 1]]`.
@@ -196,7 +196,7 @@ impl Defs {
         let mut walk = Walk {
             cx,
             defs: Vec::new(), // alloc: setup, the crate's tables, once per crate
-            ids: FxHashMap::default(),
+            ids: HashMap::default(),
             edges: Vec::new(), // alloc: setup, once per crate
             modules: Vec::new(), // alloc: setup, once per crate
             module_of: Vec::new(), // alloc: setup, once per crate
@@ -204,8 +204,8 @@ impl Defs {
             impl_items: Vec::new(), // alloc: setup, once per crate
             free_owners: Vec::new(), // alloc: setup, once per crate
             foreign_owners: Vec::new(), // alloc: setup, once per crate
-            derives: FxHashMap::default(),
-            scopes: FxHashSet::default(),
+            derives: HashMap::default(),
+            scopes: HashSet::default(),
             unported: false,
         };
         let module_ids = crate::checks::modules(cx);
@@ -348,7 +348,7 @@ enum Container {
 struct Walk<'c, 'a, 'db> {
     cx: &'c Cx<'a, 'db>,
     defs: Vec<Def>,
-    ids: FxHashMap<Id, DefIdx>,
+    ids: HashMap<Id, DefIdx>,
     /// (owner, child), in the order the children are met.
     edges: Vec<(DefIdx, DefIdx)>,
     modules: Vec<ModuleItems>,
@@ -358,8 +358,8 @@ struct Walk<'c, 'a, 'db> {
     impl_items: Vec<DefIdx>,
     foreign_owners: Vec<DefIdx>,
     /// The builtin derives of each ADT, of the scopes read so far.
-    derives: FxHashMap<AdtId, SmallVec<[BuiltinDeriveImplId; 4]>>,
-    scopes: FxHashSet<hir_def::ModuleId>,
+    derives: HashMap<AdtId, SmallVec<[BuiltinDeriveImplId; 4]>>,
+    scopes: HashSet<hir_def::ModuleId>,
     unported: bool,
 }
 

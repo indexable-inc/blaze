@@ -14,6 +14,7 @@
 
 use std::hash::BuildHasher;
 
+use blaze_hash::{FixedState, HashMap};
 use blaze_mem::Frame;
 use hashbrown::HashTable;
 use hir::{HirFileId, InFile};
@@ -24,7 +25,6 @@ use hir_def::{
     },
 };
 use intern::{Symbol, sym};
-use rustc_hash::{FxBuildHasher, FxHashMap};
 use syntax::{
     SyntaxNodePtr, TextRange,
     view::{AstNode as _, Node},
@@ -39,7 +39,7 @@ use crate::cx::Cx;
 /// The index's table lives in the check's frame and goes with it.
 pub(super) struct Index<'a, 'b, 'db> {
     cx: &'a Cx<'b, 'db>,
-    staged: FxHashMap<hir::Crate, bool>,
+    staged: HashMap<hir::Crate, bool>,
     enabled: HashTable<(Symbol, bool), &'b Frame>,
     /// `RustcVersion::CURRENT` of this crate's graph; none when it names no toolchain.
     pub(super) current: Option<RustcVersion>,
@@ -49,7 +49,7 @@ impl<'a, 'b, 'db> Index<'a, 'b, 'db> {
     pub(super) fn new(cx: &'a Cx<'b, 'db>) -> Self {
         Index {
             cx,
-            staged: FxHashMap::default(),
+            staged: HashMap::default(),
             enabled: HashTable::new_in(cx.frame()),
             current: RustcVersion::current(cx.db, cx.krate.base()),
         }
@@ -146,13 +146,13 @@ impl<'a, 'b, 'db> Index<'a, 'b, 'db> {
 /// Whether this crate enables `feature`, kept in `enabled`. A hit clones no `Symbol` (no
 /// shared refcount written).
 fn enabled_in(cx: &Cx<'_, '_>, enabled: &mut HashTable<(Symbol, bool), &Frame>, feature: &Symbol) -> bool {
-    let hash = FxBuildHasher.hash_one(feature);
+    let hash = FixedState.hash_one(feature);
     if let Some((_, it)) = enabled.find(hash, |(it, _)| it == feature) {
         return *it;
     }
     let it = cx.krate.is_unstable_feature_enabled(cx.db, feature);
     // clone: the miss, once per distinct feature a use asks about; the table keeps its own `Symbol`
-    enabled.insert_unique(hash, (feature.clone(), it), |(it, _)| FxBuildHasher.hash_one(it));
+    enabled.insert_unique(hash, (feature.clone(), it), |(it, _)| FixedState.hash_one(it));
     it
 }
 

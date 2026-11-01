@@ -1,0 +1,12 @@
+fn run(vm: &Vm) {
+    let balloons = vm.device_manager().balloon_counter_handles();
+    let control = Control {
+        block_stop: vm.device_manager().pci_devices.iter().map(|s| s.x()).collect(),
+        balloons,
+        other: other.lock().a,
+    };
+    call(self.a.lock().x, self.b.lock().y);
+}
+fn closures() {
+    run(async { order.lock().push("a") }, || { order.lock().push("b"); 7 });
+}

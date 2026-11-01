@@ -13,8 +13,9 @@
 //!
 //! [`pool`] is the threads the plane's tasks run on, one per core, stealing work nearest first
 //! by [`topology`] (a CCD or a cluster, then a socket, then any). [`pump`] is the rule for a
-//! wait inside a task (#1301): the waiting thread runs other work, and a wait that would close
-//! a cycle is [`Cancelled`] and its task posted again. [`build`] says a build's nodes:
+//! wait inside a task (#1301): one run of a key at a time, in a table of buckets, its waiters
+//! suspended in [`sched`], and a wait that would close a cycle is [`Cancelled`] and its task
+//! posted again. [`build`] says a build's nodes:
 //! the workspace load, codegen with its store writes, links and test runs (docs/driver.md
 //! steps 4 to 7). [`par`] is the parallel loops of every crate, on the same pool: blaze has no
 //! other.
@@ -23,9 +24,9 @@
 //! a state machine with no thread, clock or sleep, in which a waiting job holds no thread.
 //!
 //! Unsafe code is in [`exec`]'s slot table, [`pool`]'s jobs and queues, [`par`]'s item
-//! sources and [`pump`]'s waiter
-//! lists (lock-free structures whose safe versions would take a lock or an `Arc` per job or
-//! waiter, each with model tests under `--cfg blaze_check`), and in `arena`'s allocator hook and
+//! sources and [`pump`]'s table of runs (structures whose safe versions would take a lock or
+//! an `Arc` per job, run or waiter, or a lock per key held across its run, each with model
+//! tests under `--cfg blaze_check`), and in `arena`'s allocator hook and
 //! the kernel calls of `arena` and [`topology`], each in a small module of its own.
 
 #![deny(unsafe_code)]
@@ -45,9 +46,11 @@ pub mod pool;
 #[allow(unsafe_code)]
 pub mod pump;
 pub mod sched;
+pub mod spin;
 mod sync;
 pub mod topology;
 pub mod trace;
+pub mod wait;
 
 pub use machine::{Config, Error, Input, Machine, NodeId, Outcome, Output, Pool, Spec};
 pub use plane::{

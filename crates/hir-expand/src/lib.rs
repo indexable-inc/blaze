@@ -70,7 +70,7 @@ use crate::{
     cfg_process::attr_macro_input_to_token_tree,
     fixup::SyntaxFixupUndoInfo,
     hygiene::{span_with_call_site_ctxt, span_with_def_site_ctxt, span_with_mixed_site_ctxt},
-    proc_macro::{CustomProcMacroExpander, ProcMacroKind, ProcMacros},
+    proc_macro::{CustomProcMacroExpander, ProcMacroKind},
     span_map::{ExpansionSpanMap, InOrder, MacroRulesArgs, SpanMap},
 };
 
@@ -177,6 +177,12 @@ impl ExpandError {
     pub fn span(&self) -> Span {
         self.inner.1
     }
+    /// This error, at `span` instead.
+    pub fn at(self, span: Span) -> Self {
+        // clone: of a shared error's kind only, on the error path
+        let (kind, _) = Arc::try_unwrap(self.inner).unwrap_or_else(|shared| (*shared).clone());
+        Self::new(span, kind)
+    }
 
     pub fn render_to_string(&self, db: &Db) -> RenderedExpandError {
         self.inner.0.render_to_string(db)
@@ -187,7 +193,9 @@ impl ExpandError {
 pub enum ExpandErrorKind {
     /// Attribute macro expansion is disabled.
     ProcMacroAttrExpansionDisabled,
-    MissingProcMacroExpander(Crate),
+    /// A macro of proc-macro crate `krate` with no expander, and why, as the proc-macro map
+    /// said when the call was expanded.
+    MissingProcMacroExpander { krate: Crate, why: Box<str> },
     /// The macro for this call is disabled.
     MacroDisabled,
     /// The macro definition has errors.
@@ -304,22 +312,11 @@ impl ExpandErrorKind {
                 error: false,
                 kind: RenderedExpandError::DISABLED,
             },
-            &ExpandErrorKind::MissingProcMacroExpander(def_crate) => {
-                match ProcMacros::get_for_crate(db, def_crate).and_then(|it| it.get_error()) {
-                    Some(e) => RenderedExpandError {
-                        message: e.to_string(), // alloc: a diagnostic's text, at the edge
-                        error: e.is_hard_error(),
-                        kind: RenderedExpandError::GENERAL_KIND,
-                    },
-                    None => RenderedExpandError {
-                        message: format!( // alloc: a diagnostic's text, at the edge
-                            "internal error: proc-macro map is missing error entry for crate {def_crate:?}"
-                        ),
-                        error: true,
-                        kind: RenderedExpandError::GENERAL_KIND,
-                    },
-                }
-            }
+            ExpandErrorKind::MissingProcMacroExpander { why, .. } => RenderedExpandError {
+                message: why.to_string(), // alloc: a diagnostic's text, at the edge
+                error: true,
+                kind: RenderedExpandError::GENERAL_KIND,
+            },
             ExpandErrorKind::MacroDefinition => RenderedExpandError {
                 message: "macro definition has parse errors".to_owned(), // alloc: a diagnostic's text, at the edge
                 error: true,
@@ -896,11 +893,18 @@ impl MacroCallId {
                         .map_err(Into::into)
                         .map(Expansion::Framed)
                         .zip_val(None),
-                    MacroDefKind::BuiltInDerive(_, it) => it
-                        .expand(db, frame, self, arg, span)
-                        .map_err(Into::into)
-                        .map(Expansion::Framed)
-                        .zip_val(None),
+                    MacroDefKind::BuiltInDerive(_, it) => {
+                        let ExpandResult { value, err } = it.expand(db, frame, self, arg, span);
+                        let at_call = |it: &ExpandError| it.span().range == span.range && it.span().anchor == span.anchor;
+                        let err = match err {
+                            Some(err) if at_call(&err) => match derive_path_span(db, loc) {
+                                Some(path) => Some(err.at(path)),
+                                None => Some(err),
+                            },
+                            err => err,
+                        };
+                        ExpandResult { value: Expansion::Framed(value), err }.zip_val(None)
+                    }
                     MacroDefKind::UnimplementedBuiltIn(_) => {
                         expand_unimplemented_builtin_macro(frame, span)
                             .map(Expansion::Framed)
@@ -1221,6 +1225,38 @@ impl MacroDefId {
     pub fn is_env_or_option_env(&self) -> bool {
         matches!(self.kind, MacroDefKind::BuiltInEager(_, expander) if expander.is_env_or_option_env())
     }
+}
+
+/// Where rustc puts a built-in derive's own errors: the path of its trait in its
+/// `#[derive(..)]` (`From` of `#[derive(From)]`, `core::From` of `#[derive(core::From)]`).
+/// `None` for a call that is no derive, or whose attribute names fewer paths than its index:
+/// its errors stay at the attribute.
+fn derive_path_span(db: &Db, loc: &MacroCallLoc) -> Option<Span> {
+    let MacroCallKind::Derive { ast_id, derive_attr_index, derive_index, .. } = &loc.kind else { return None };
+    let (_, meta) = derive_attr_index.find_attr_range_view(db, loc.krate, *ast_id);
+    let (_, tt) = meta.as_simple_call()?;
+    // The paths are counted as the collector numbers them: each run between commas that
+    // names something.
+    let (mut at, mut first, mut last) = (0, None::<TextRange>, None::<TextRange>);
+    for token in tt.syntax().children_with_tokens().filter_map(|it| it.into_token()) {
+        match token.kind() {
+            T![,] | T![')'] => {
+                if let (Some(first), Some(last)) = (first.take(), last.take()) {
+                    if at == *derive_index {
+                        let range = TextRange::new(first.start(), last.end());
+                        return Some(ast_id.file_id.span_map(db).span_for_range(range));
+                    }
+                    at += 1;
+                }
+            }
+            T!['('] | syntax::SyntaxKind::WHITESPACE | syntax::SyntaxKind::COMMENT => {}
+            _ => {
+                first.get_or_insert(token.text_range());
+                last = Some(token.text_range());
+            }
+        }
+    }
+    None
 }
 
 impl MacroCallLoc {

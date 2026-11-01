@@ -13,18 +13,19 @@
 
 use base_db::{Crate, Db, Written};
 use blaze_dbsp::{Arrangement, Pos, ReadIndex, Work};
+use blaze_hash::{HashMap, HashSet};
 use hir_def::{
     BuiltinDeriveImplId, HasModule, ImplId, ModuleDefId, ModuleId, TraitId,
     builtin_derive::BuiltinDeriveImplTrait,
     lang_item::lang_items,
     nameres::{
+        crate_def_map,
         delta::{CrateDelta, LastWrite},
-        crate_def_map, module_impls,
+        module_impls,
     },
 };
 use hir_expand::name::Name;
 use intern::Symbol;
-use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use super::{
@@ -62,20 +63,20 @@ struct DeriveRow {
 /// One crate's impls and traits, and its published inputs.
 #[derive(Default)]
 pub(crate) struct CrateState {
-    impls: FxHashMap<ImplId, ImplRow>,
-    derives: FxHashMap<BuiltinDeriveImplId, DeriveRow>,
+    impls: HashMap<ImplId, ImplRow>,
+    derives: HashMap<BuiltinDeriveImplId, DeriveRow>,
     pub(crate) traits: Arrangement<TraitId, Pos, TraitEntry>,
     pub(crate) heads: Arrangement<Head, Pos, (ModuleId, ImplId)>,
     /// Each trait declared in the crate's modules with its item names (`AssocFn`).
-    assoc: FxHashMap<TraitId, SmallVec<[Name; 8]>>,
+    assoc: HashMap<TraitId, SmallVec<[Name; 8]>>,
     /// Traits whose items a macro call writes: their names may change with no edit of theirs.
-    wild_traits: FxHashSet<TraitId>,
+    wild_traits: HashSet<TraitId>,
     pub(crate) candidates: Arrangement<Name, TraitId, TraitId>,
     /// The traits the crate's lang items give each built-in derive, by
     /// `BuiltinDeriveImplTrait::ALL` index, once a derive impl asked.
     lang: Option<SmallVec<[Option<TraitId>; 16]>>,
     /// The body part of each module whose bodies may hold an impl.
-    bodies: FxHashMap<ModuleId, BodyPart>,
+    bodies: HashMap<ModuleId, BodyPart>,
     /// The modules whose bodies hold impls of each trait, of each head, and (under `()`) any
     /// inherent impl.
     body_traits: Arrangement<TraitId, ModuleId, ModuleId>,
@@ -91,11 +92,11 @@ pub(crate) struct CrateState {
 /// the impls of its dependents that read it.
 #[derive(Default)]
 pub struct State {
-    crates: FxHashMap<Crate, CrateState>,
-    owner: FxHashMap<ImplId, Crate>,
+    crates: HashMap<Crate, CrateState>,
+    owner: HashMap<ImplId, Crate>,
     by_name: ReadIndex<Name, ImplId>,
     by_def: ReadIndex<ModuleDefId, ImplId>,
-    wild: FxHashSet<ImplId>,
+    wild: HashSet<ImplId>,
     scratch: Scratch,
 }
 
@@ -103,13 +104,13 @@ pub struct State {
 #[derive(Default)]
 struct Scratch {
     reads: Reads,
-    deltas: FxHashMap<Crate, usize>,
-    names: FxHashSet<Name>,
-    defs: FxHashSet<ModuleDefId>,
-    woken: FxHashSet<ImplId>,
-    done: FxHashSet<ImplId>,
-    kinds: FxHashMap<ImplId, bool>,
-    kinds_of: FxHashSet<ModuleId>,
+    deltas: HashMap<Crate, usize>,
+    names: HashSet<Name>,
+    defs: HashSet<ModuleDefId>,
+    woken: HashSet<ImplId>,
+    done: HashSet<ImplId>,
+    kinds: HashMap<ImplId, bool>,
+    kinds_of: HashSet<ModuleId>,
     trait_keys: Vec<TraitId>,
     head_keys: Vec<Head>,
     name_keys: Vec<Name>,
@@ -178,7 +179,7 @@ pub(crate) fn run(
 /// Drops the state of every crate no longer in the graph, with its impls' read sets.
 fn drop_gone(state: &mut State, crates: &[Crate]) {
     // alloc: a crate graph change, once
-    let live: FxHashSet<Crate> = crates.iter().copied().collect();
+    let live: HashSet<Crate> = crates.iter().copied().collect();
     let gone: Vec<Crate> =
         state.crates.keys().copied().filter(|it| !live.contains(it)).collect(); // alloc: as above
     for krate in gone {
@@ -816,7 +817,7 @@ pub(crate) fn warm_one(db: &Db, _: &Written<'_>, warm: &mut Warm) {
 }
 
 /// Each maintained crate's delta of `last`, by crate.
-fn deltas(last: &LastWrite) -> FxHashMap<Crate, &CrateDelta> {
+fn deltas(last: &LastWrite) -> HashMap<Crate, &CrateDelta> {
     last.crates.iter().map(|it| (it.krate, it)).collect() // alloc: a crate's delta each, once per write
 }
 
@@ -831,7 +832,7 @@ fn changed(last: &LastWrite) -> bool {
 pub(crate) fn warm(db: &Db, state: &State, last: &LastWrite, written: &Written<'_>) -> Vec<Warm> {
     let deltas = deltas(last);
     let changed = changed(last);
-    let mut impls: FxHashSet<ImplId> = FxHashSet::default(); // alloc: the impls the write reads, once per write
+    let mut impls: HashSet<ImplId> = HashSet::default(); // alloc: the impls the write reads, once per write
     for delta in &last.crates {
         impls.extend(delta.touched_impls.iter().copied());
         for &(_, name) in &delta.bindings {

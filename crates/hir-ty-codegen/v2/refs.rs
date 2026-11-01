@@ -15,6 +15,9 @@ use std::{borrow::Cow, hash::BuildHasher};
 
 use base_db::Db;
 use blaze_codegen::backend::FrontRef;
+use blaze_hash::{FixedState, HashMap, HashSet};
+use blaze_ids::bits::BitSet;
+use blaze_query::db::AsId;
 use cranelift_codegen::ir::{self, ArgumentPurpose};
 use hashbrown::{HashTable, hash_table::Entry};
 use hir_def::{
@@ -39,10 +42,7 @@ use hir_ty_mir::mir::{
 };
 use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike as _, Ty as _};
-use blaze_ids::bits::BitSet;
-use blaze_query::db::AsId;
 use smallvec::{SmallVec, smallvec};
 
 use super::{
@@ -319,7 +319,7 @@ struct Found<'db> {
     listed: Listed,
     /// The calls listed already, by their interned definition and arguments, and the place of
     /// each: a call made again costs a hash of two ids and no homing (`places::call_ref`).
-    called: FxHashMap<(InstanceDef, GenericArgs<'db>), u32>,
+    called: HashMap<(InstanceDef, GenericArgs<'db>), u32>,
     /// The places in `listed` of the callees whose bodies are built in ([`Walked::built_in`]),
     /// each once.
     built_in: Vec<u32>,
@@ -333,7 +333,7 @@ impl<'db> Found<'db> {
             homes: Homes::default(),
             env,
             listed: Listed::with_capacity(capacity),
-            called: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+            called: HashMap::with_capacity_and_hasher(capacity, Default::default()),
             // alloc: the memoized output, empty until a callee is built in
             built_in: Vec::new(),
         }
@@ -347,7 +347,7 @@ impl<'db> Found<'db> {
 }
 
 /// The references found so far, each once, in the order found, as rustc's collector keeps the
-/// items of an instance in an index set. Each is hashed once (FxHash) and kept once: the
+/// items of an instance in an index set. Each is hashed once and kept once: the
 /// tables hold its hash and place (16 bytes an entry, one probe a lookup), and growing them
 /// hashes nothing again. A symbol is looked up by its name, so one listed already makes no
 /// `String`, nor does a routine of Cranelift's listed already.
@@ -388,7 +388,7 @@ impl Listed {
             FrontRef::Extern(name) => return self.symbol(Cow::Owned(name)),
             it => it,
         };
-        let hash = FxBuildHasher.hash_one(&it);
+        let hash = FixedState.hash_one(&it);
         let at = self.next();
         let refs = &self.refs;
         match self.at.entry(hash, |slot| refs[slot.at as usize] == it, |slot| slot.hash) {
@@ -402,7 +402,7 @@ impl Listed {
     }
 
     fn symbol(&mut self, name: Cow<'_, str>) -> u32 {
-        let hash = FxBuildHasher.hash_one(&*name);
+        let hash = FixedState.hash_one(&*name);
         let at = self.next();
         let refs = &self.refs;
         let same =
@@ -924,7 +924,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     fn reachable(&mut self, body: &'db MirBody<'db>) -> (Blocks, Blocks) {
         let off = self.fx.checks_off(body);
         let resumes_only = match body.coroutine {
-            Some(_) => FxHashSet::default(),
+            Some(_) => HashSet::default(),
             None => hir_ty_mir::mir::noop_landing_pads(body),
         };
         let count = body.basic_blocks.len();

@@ -7,6 +7,7 @@
 use std::{fmt::Write as _, sync::LazyLock};
 
 use base_db::Db;
+use blaze_hash::HashSet;
 use hir::db::HirDatabase;
 use hir_def::{AdtId, GenericDefId, ItemContainerId, Lookup, hir::generics::GenericParams};
 use hir_expand::name::Name;
@@ -15,7 +16,6 @@ use hir_ty::next_solver::{
     Region, RegionKind, TraitClause, TraitRef, Ty, TyKind,
 };
 use intern::Symbol;
-use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     BoundRegionKind, BoundVarIndexKind, ClausePolarity, DebruijnIndex, INNERMOST,
     TypeSuperVisitable, TypeVisitable, TypeVisitor,
@@ -82,7 +82,7 @@ pub(crate) struct Printer<'p, 'a, 'db, 't> {
     no_visible: bool,
     printed_type_count: usize,
     frames: Vec<Frame>,
-    used_names: FxHashSet<Symbol>,
+    used_names: HashSet<Symbol>,
     region_index: usize,
 }
 
@@ -111,7 +111,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
             no_visible: false,
             printed_type_count: 0,
             frames: Vec::new(), // alloc: empty, allocates nothing
-            used_names: FxHashSet::default(),
+            used_names: HashSet::default(),
             region_index: 0,
         }
     }
@@ -217,7 +217,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
     {
         let value = binder.as_ref().skip_binder();
         if self.frames.is_empty() {
-            let mut used = FxHashSet::default();
+            let mut used = HashSet::default();
             if !self.mode.erase {
                 value.visit_with(&mut UsedNames {
                     db: self.db,
@@ -794,7 +794,7 @@ struct UsedNames<'t, 'x> {
     db: &'t Db,
     depth: DebruijnIndex,
     signature: bool,
-    out: &'x mut FxHashSet<Symbol>,
+    out: &'x mut HashSet<Symbol>,
 }
 
 impl<'t> TypeVisitor<DbInterner<'t>> for UsedNames<'t, '_> {

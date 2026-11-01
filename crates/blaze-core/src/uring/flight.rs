@@ -1036,7 +1036,7 @@ impl Drop for Uring {
         self.load_waiting.clear();
         drop(self.lent.clear_waiting());
         // alloc: drop, once.
-        let mut owed: FxHashMap<Id, usize> = self.ops.iter().map(|(id, hot)| (id, owed(hot))).collect();
+        let mut owed: HashMap<Id, usize> = self.ops.iter().map(|(id, hot)| (id, owed(hot))).collect();
         // Those the kernel holds nothing of: never handed to it, or every completion in.
         owed.retain(|&id, left| {
             if *left == 0 {

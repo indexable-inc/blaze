@@ -18,11 +18,10 @@
 use std::{
     cell::Cell,
     fmt, panic,
-    sync::{
-        Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::atomic::{AtomicBool, Ordering},
 };
+
+use crossbeam_queue::SegQueue;
 
 use blaze_mem::{Tag, frame};
 use blaze_query::db::Durability;
@@ -92,23 +91,24 @@ pub fn set_run_order(order: RunOrder) -> RunOrder {
 }
 
 /// The events a logged database keeps while [`Db::log`] runs, and the queries a maintainer's
-/// apply executes, which it must not. The hook reads `active` and `applying` before it takes a
-/// lock, so an event outside both costs two relaxed loads.
+/// apply executes, which it must not. The hook reads `active` and `applying` before it pushes,
+/// so an event outside both costs two relaxed loads.
 #[derive(Default)]
 struct EventLog {
     active: AtomicBool,
-    events: Mutex<Option<Vec<blaze_query::db::Event>>>,
+    events: SegQueue<blaze_query::db::Event>,
     applying: AtomicBool,
-    executed: Mutex<Vec<blaze_query::db::DatabaseKeyIndex>>,
+    executed: SegQueue<blaze_query::db::DatabaseKeyIndex>,
 }
 
 impl EventLog {
     fn record(&self, f: impl FnOnce()) -> Vec<blaze_query::db::Event> {
-        *self.events.lock().unwrap_or_else(|it| it.into_inner()) = Some(Vec::new()); // alloc: tests only
+        while self.events.pop().is_some() {}
         self.active.store(true, Ordering::Release);
         f();
         self.active.store(false, Ordering::Release);
-        self.events.lock().unwrap_or_else(|it| it.into_inner()).take().unwrap_or_default()
+        // alloc: tests only
+        std::iter::from_fn(|| self.events.pop()).collect()
     }
 }
 
@@ -160,14 +160,12 @@ impl Db {
                     && log.applying.load(Ordering::Relaxed)
                     && let blaze_query::db::EventKind::WillExecute { database_key } = event.kind
                 {
-                    log.executed.lock().unwrap_or_else(|it| it.into_inner()).push(database_key);
+                    log.executed.push(database_key);
                 }
                 if let Some(log) = &log
                     && log.active.load(Ordering::Relaxed)
-                    && let Some(events) =
-                        &mut *log.events.lock().unwrap_or_else(|it| it.into_inner())
                 {
-                    events.push(event);
+                    log.events.push(event);
                 }
             }) as blaze_query::db::Hook
         });
@@ -543,7 +541,7 @@ impl Db {
     /// starting.
     pub(crate) fn begin_apply(&self) {
         if let Some(log) = &self.log {
-            log.executed.lock().unwrap_or_else(|it| it.into_inner()).clear();
+            while log.executed.pop().is_some() {}
             log.applying.store(true, Ordering::Release);
         }
     }
@@ -553,9 +551,7 @@ impl Db {
     pub(crate) fn end_apply(&self) -> Vec<String> {
         let Some(log) = &self.log else { return Vec::new() }; // alloc: empty, allocates nothing
         log.applying.store(false, Ordering::Release);
-        let executed = std::mem::take(&mut *log.executed.lock().unwrap_or_else(|it| it.into_inner()));
-        executed
-            .into_iter()
+        std::iter::from_fn(|| log.executed.pop())
             // alloc: a logged database's check, tests only
             .map(|key| self.storage.ingredient_name(key.ingredient_index()).to_owned())
             .collect() // alloc: a logged database's check, tests only

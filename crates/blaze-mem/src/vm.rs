@@ -177,15 +177,20 @@ mod tests {
         let base = reserve_aligned(4 * PAGE, ALIGN).expect("address space");
         assert!(base.as_ptr().addr().is_multiple_of(ALIGN));
         // SAFETY: the first page of the live reservation just made, used only here.
-        unsafe {
-            commit(base, PAGE).expect("commit");
-            base.as_ptr().write(7);
-            protect_readonly(base, PAGE).expect("read-only");
-            assert_eq!(base.as_ptr().read(), 7);
-            decommit(base, PAGE).expect("decommit");
-            commit(base, PAGE).expect("commit again");
-            assert_eq!(base.as_ptr().read(), 0);
-            release(base, 4 * PAGE);
-        }
+        unsafe { commit(base, PAGE) }.expect("commit");
+        // SAFETY: the page is committed and writable.
+        unsafe { base.as_ptr().write(7) };
+        // SAFETY: as above; nothing writes it after.
+        unsafe { protect_readonly(base, PAGE) }.expect("read-only");
+        // SAFETY: the page is committed and readable.
+        assert_eq!(unsafe { base.as_ptr().read() }, 7);
+        // SAFETY: nothing holds a reference into the page.
+        unsafe { decommit(base, PAGE) }.expect("decommit");
+        // SAFETY: the first page of the reservation, as at the start.
+        unsafe { commit(base, PAGE) }.expect("commit again");
+        // SAFETY: committed again, readable.
+        assert_eq!(unsafe { base.as_ptr().read() }, 0);
+        // SAFETY: the whole reservation, which nothing uses after.
+        unsafe { release(base, 4 * PAGE) };
     }
 }

@@ -25,9 +25,9 @@
 
 use blaze_api::{ApiError, Arrived, Reply, Request, RequestRef, Response, ViewRef};
 use blaze_core::{Completion, Conn, Done, Effect, FileName, Tag, decimal::decimal};
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_vfs::{Outside, Vfs, Watched, Watcher};
-use rustc_hash::FxHashMap;
 
 /// How many tags one watcher uses ([`Watcher::new`]).
 const WATCHER_TAGS: u64 = 1 << 32;
@@ -65,7 +65,7 @@ struct Checkout {
     cookie_prefix: String,
     /// Cookies written or being written and not seen yet, by number. Walked in number order
     /// only where the walk makes effects ([`Heads::sweep`]).
-    cookies: FxHashMap<u64, Cookie>,
+    cookies: HashMap<u64, Cookie>,
 }
 
 struct Cookie {
@@ -85,9 +85,9 @@ pub struct Heads {
     /// By slot; a slot whose watch ended stays empty, its tags never used again.
     checkouts: Vec<Option<Box<Checkout>>>,
     /// The slot of each checkout watched, by its head.
-    slots: FxHashMap<String, u32>,
+    slots: HashMap<String, u32>,
     /// By cookie tag: the checkout's slot and the cookie.
-    writing: FxHashMap<Tag, (u32, u64)>,
+    writing: HashMap<Tag, (u32, u64)>,
     held: Vec<Held>,
     /// Kept for the daemon's life: dropping it leaves every directory unconfirmed.
     outside: Outside<'static>,
@@ -185,8 +185,8 @@ impl Heads {
             watcher_end: watchers_end,
             next_cookie: 0,
             checkouts: Vec::new(),
-            slots: FxHashMap::default(),
-            writing: FxHashMap::default(),
+            slots: HashMap::default(),
+            writing: HashMap::default(),
             held: Vec::new(),
             outside,
         }
@@ -314,7 +314,7 @@ impl Heads {
             below: format!("{dir}/"),
             cookie_dir,
             cookie_prefix,
-            cookies: FxHashMap::default(),
+            cookies: HashMap::default(),
         };
         self.checkouts.push(Some(Box::new(checkout)));
         self.slots.insert(head.to_owned(), slot);

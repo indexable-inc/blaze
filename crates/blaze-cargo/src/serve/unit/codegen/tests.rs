@@ -150,7 +150,7 @@ fn a_profile_read_is_named_by_its_content_and_given() {
     let read = read_profile(dir.path().to_str().unwrap(), "merged.profdata").unwrap_or_else(|what| panic!("{what}"));
     assert_eq!(read.id, hir_ty_codegen::v2::profile_id(&bytes));
     assert_eq!(read._given.id(), read.id);
-    assert_eq!(read.unstored.lock().unwrap().as_deref(), Some(&bytes[..]));
+    assert_eq!(read.unstored.lock().as_deref(), Some(&bytes[..]));
 }
 
 #[cfg(not(feature = "llvm"))]

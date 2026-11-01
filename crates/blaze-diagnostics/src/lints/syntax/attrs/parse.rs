@@ -24,8 +24,8 @@
 //! macro_attrs,crate_level,proc_macro_attrs,repr}.rs`, and the texts of `diagnostics.rs` and
 //! `session_diagnostics.rs` (MIT or Apache-2.0).
 
+use blaze_hash::HashMap;
 use hir::InFile;
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use stdx::edit_distance::find_best_match_for_name_with_substrings;
 use syntax::{
@@ -37,7 +37,6 @@ use super::{
     Args, Attr, AttrKind, Owner, Target, lint_at, parsed,
     table::{self, Allowed, Builtin, Kind, OnDuplicate, Policy, Safety, Targets},
 };
-use stdx::list::Join;
 use crate::{
     cx::{Cx, item_range_view},
     lints::{
@@ -46,6 +45,7 @@ use crate::{
     },
     model::{Applicability, Diag, SuggestionStyle},
 };
+use stdx::list::Join;
 
 const PREVIOUSLY_ACCEPTED: &str = "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!";
 
@@ -95,7 +95,7 @@ impl Krate {
 #[derive(Default)]
 struct Seen {
     /// The attribute each single parser uses, by its path.
-    single: FxHashMap<&'static [&'static str], InFile<TextRange>>,
+    single: HashMap<&'static [&'static str], InFile<TextRange>>,
     /// `#[used(compiler)]`, `#[used(linker)]` and `#[used]`.
     used: [Option<InFile<TextRange>>; 3],
     macro_use: MacroUse,

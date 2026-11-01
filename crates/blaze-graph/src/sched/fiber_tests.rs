@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Mutex, OnceLock,
+        OnceLock,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
     thread::{self, ThreadId},
@@ -9,6 +9,7 @@ use std::{
 
 use hegel::TestCase;
 use hegel::generators as gs;
+use parking_lot::Mutex;
 
 use super::fiber::{Config, Cx, Driver, Handle, NoWait, Work};
 use super::*;
@@ -36,11 +37,7 @@ fn thread_now() -> ThreadId {
 }
 
 fn until(what: &str, done: impl Fn() -> bool) {
-    let deadline = Instant::now() + LONG;
-    while !done() {
-        assert!(Instant::now() < deadline, "{what}: not within {LONG:?}");
-        std::hint::spin_loop();
-    }
+    crate::spin::SpinWait::within(what, LONG, done);
 }
 
 /// Each job waits for a child it spawns, a thousand deep, on one core: with a thread held per
@@ -188,7 +185,7 @@ impl Work for &'static CrossedDrivers {
             cx.wait(Wait::Until(cx.now() + 100_000)).expect("a timed wait closes no cycle");
         }
         if let Err(cycle) = cx.wait(Wait::Key(key(100 + (1 - mine)))) {
-            self.refused.lock().unwrap().push(cycle);
+            self.refused.lock().push(cycle);
         }
         cx.key_done(key(100 + mine));
     }
@@ -203,7 +200,7 @@ fn a_cycle_of_waits_through_two_drivers_is_refused_once() {
     let b = second.spawn(1, Spawn::root());
     first.join().unwrap();
     second.join().unwrap();
-    let refused = work.refused.lock().unwrap();
+    let refused = work.refused.lock();
     assert_eq!(refused.len(), 1, "exactly one wait gives way: {refused:?}");
     let mut jobs = refused[0].jobs.clone();
     jobs.sort_unstable();
@@ -338,7 +335,7 @@ impl Work for &'static Pair {
             *self.first.get().unwrap()
         };
         if let Err(cycle) = cx.wait_job(other) {
-            self.refused.lock().unwrap().push(cycle);
+            self.refused.lock().push(cycle);
         }
     }
 }
@@ -351,7 +348,7 @@ fn a_cycle_of_waits_on_fibers_is_refused_naming_both_jobs() {
     let first = driver.spawn(true, Spawn::root());
     pair.first.set(first).unwrap();
     driver.join().unwrap();
-    let refused = pair.refused.lock().unwrap();
+    let refused = pair.refused.lock();
     assert_eq!(refused.len(), 1, "exactly one wait refused: {refused:?}");
     let mut jobs = refused[0].jobs.clone();
     jobs.sort();
@@ -435,7 +432,10 @@ fn a_flight_of_the_drivers_wakes_its_waiter() {
     assert!(driver.claim(key(7)));
     driver.spawn((), Spawn::root());
     until("the job to wait", || work.waiting.load(Ordering::Acquire));
-    thread::sleep(Duration::from_millis(5));
+    let mut spin = crate::spin::SpinWait::new();
+    while spin.spin() {
+        assert!(!work.woke.load(Ordering::Acquire), "the job woke before its flight ended");
+    }
     assert!(!work.woke.load(Ordering::Acquire), "the job waits for the flight");
     driver.key_done(key(7));
     driver.join().unwrap();
@@ -505,7 +505,7 @@ impl Work for &'static Free {
         let at = cx.now() + 1_000_000;
         super::wait(Wait::Until(at)).expect("no cycle");
         assert_eq!(fiber::current_job(), Some(cx.job()), "the job's identity after the wait");
-        self.seen.lock().unwrap().push(cx.job());
+        self.seen.lock().push(cx.job());
     }
 }
 
@@ -518,7 +518,7 @@ fn the_free_wait_suspends_the_running_job() {
         driver.spawn((), Spawn::root());
     }
     driver.join().unwrap();
-    assert_eq!(work.seen.lock().unwrap().len(), 8);
+    assert_eq!(work.seen.lock().len(), 8);
 }
 
 /// Jobs on fibers asking one key of `pump::Flights`: one runs it, the others suspend on its
@@ -551,7 +551,7 @@ impl Work for &'static OneKey {
                     cx.wait(Wait::Until(at)).expect("a timed wait closes no cycle");
                     Ok(5)
                 });
-                self.got.lock().unwrap().push(value.expect("the run is not cancelled"));
+                self.got.lock().push(value.expect("the run is not cancelled"));
             }
         }
     }
@@ -569,7 +569,7 @@ fn a_key_asked_on_fibers_runs_once_and_its_waiters_suspend() {
     driver.spawn(OneKeyJob::Root(6), Spawn::root());
     driver.join().unwrap();
     assert_eq!(work.runs.load(Ordering::Relaxed), 1, "one run of the key");
-    assert_eq!(*work.got.lock().unwrap(), vec![5; 6], "every asker got its value");
+    assert_eq!(*work.got.lock(), vec![5; 6], "every asker got its value");
     assert_eq!(work.flights.running(), 0);
 }
 
@@ -595,7 +595,7 @@ impl Work for &'static Crossed {
             cx.wait(Wait::Until(at)).expect("a timed wait closes no cycle");
             self.flights.get_or_run(key(theirs), || Ok(0)).map(|it| it + 10)
         });
-        self.ended.lock().unwrap().push(got);
+        self.ended.lock().push(got);
     }
 }
 
@@ -606,7 +606,7 @@ fn crossed_runs_on_fibers_give_way_once() {
     let driver = start(Cores::flat(1).unwrap(), work);
     driver.spawn(0, Spawn::root());
     driver.join().unwrap();
-    let ended = work.ended.lock().unwrap();
+    let ended = work.ended.lock();
     assert_eq!(ended.len(), 2);
     assert_eq!(ended.iter().filter(|it| it.is_err()).count(), 1, "exactly one run gave way: {ended:?}");
     assert!(ended.contains(&Ok(10)), "the other ended with a value: {ended:?}");
@@ -778,7 +778,7 @@ impl ScopeWait {
         driver.spawn(root, Spawn::root());
         driver.join().unwrap();
         assert_eq!(self.flights.running(), 0, "no run of key 1 is left");
-        (self.owner.lock().unwrap().clone(), self.asked.lock().unwrap().clone())
+        (self.owner.lock().clone(), self.asked.lock().clone())
     }
 }
 
@@ -796,11 +796,11 @@ impl Work for &'static ScopeWait {
                     Ok(()) => Ok(1),
                     Err(_) => Err(crate::Cancelled),
                 });
-                self.owner.lock().unwrap().push(got);
+                self.owner.lock().push(got);
             }
             ScopeJob::Ask => {
                 let got = self.flights.get_or_run(key(1), || Ok(7));
-                self.asked.lock().unwrap().push(got);
+                self.asked.lock().push(got);
             }
         }
     }

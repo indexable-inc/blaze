@@ -15,15 +15,15 @@ use std::{
     sync::{LazyLock, OnceLock},
 };
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
+use blaze_hash::FixedState;
 use blaze_ids::{bits::Bits, radix};
 use blaze_mem::scratch;
+use blaze_query::db::{AsId, FromId};
 use either::Either;
 use hir_expand::{AstId, MacroCallId, attrs::AttrId, name::Name};
 use intern::sym;
 use la_arena::{Idx, RawIdx};
-use rustc_hash::FxBuildHasher;
-use blaze_query::db::{AsId, FromId};
 use smallvec::SmallVec;
 use span::Edition;
 use stdx::{format_to, impl_from};
@@ -42,9 +42,9 @@ use crate::{
 /// build-time table, in the collector's frame or (for the facts engine's carried state) the heap.
 #[derive(Clone)]
 pub struct PerNsGlobImports<A: Allocator + Clone = Global> {
-    types: hashbrown::HashSet<(ModuleId, Name), FxBuildHasher, A>,
-    values: hashbrown::HashSet<(ModuleId, Name), FxBuildHasher, A>,
-    macros: hashbrown::HashSet<(ModuleId, Name), FxBuildHasher, A>,
+    types: hashbrown::HashSet<(ModuleId, Name), FixedState, A>,
+    values: hashbrown::HashSet<(ModuleId, Name), FixedState, A>,
+    macros: hashbrown::HashSet<(ModuleId, Name), FixedState, A>,
 }
 
 /// By the marks alone: `Global` is not `PartialEq`, so a derive would not cover the default.
@@ -155,10 +155,10 @@ impl<A: Allocator + Clone> PerNsGlobImports<A> {
     pub(crate) fn new_in(alloc: A) -> Self {
         PerNsGlobImports {
             // clone: the allocator handle: a frame reference or the zero-sized `Global`
-            types: hashbrown::HashSet::with_hasher_in(FxBuildHasher, alloc.clone()),
+            types: hashbrown::HashSet::with_hasher_in(FixedState, alloc.clone()),
             // clone: the allocator handle: a frame reference or the zero-sized `Global`
-            values: hashbrown::HashSet::with_hasher_in(FxBuildHasher, alloc.clone()),
-            macros: hashbrown::HashSet::with_hasher_in(FxBuildHasher, alloc),
+            values: hashbrown::HashSet::with_hasher_in(FixedState, alloc.clone()),
+            macros: hashbrown::HashSet::with_hasher_in(FixedState, alloc),
         }
     }
 
@@ -173,7 +173,7 @@ impl<A: Allocator + Clone> PerNsGlobImports<A> {
             scope.macros.iter().filter(|(_, it)| matches!(it.import, Some(ImportOrExternCrate::Glob(_))))
         };
         let set = |len: usize, alloc: A| {
-            hashbrown::HashSet::with_capacity_and_hasher_in(len, FxBuildHasher, alloc)
+            hashbrown::HashSet::with_capacity_and_hasher_in(len, FixedState, alloc)
         };
         let mut marks = PerNsGlobImports {
             // clone: the allocator handle: a frame reference or the zero-sized `Global`
@@ -239,11 +239,11 @@ fn hash_tag(hash: u64) -> u32 {
     (hash >> 58) as u32
 }
 
-/// The hash a name is indexed by: its symbol's pointer, one word, through `FxHash` (a multiply
-/// and a rotate, so the low bits that pick the slot are mixed).
+/// The hash a name is indexed by: its symbol's pointer, one word, through
+/// `blaze_hash::FixedState`, which mixes it into every bit, the low ones that pick the slot too.
 #[inline]
 fn name_hash(name: &Name) -> u64 {
-    FxBuildHasher.hash_one(name)
+    FixedState.hash_one(name)
 }
 
 impl Index {
@@ -707,7 +707,7 @@ impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for Keyed<K, V> {
 impl<K: Copy + Eq + Hash, V> Keyed<K, V> {
     #[inline]
     fn hash(key: &K) -> u64 {
-        FxBuildHasher.hash_one(key)
+        FixedState.hash_one(key)
     }
 
     #[inline]
@@ -2326,11 +2326,11 @@ impl ItemInNs {
 mod tests {
     mod budgets;
 
+    use blaze_hash::{HashMap, HashSet};
     use blaze_ids::rng::SplitMix64;
     use indexmap::map::Entry as MapEntry;
     use intern::Symbol;
     use itertools::Itertools;
-    use rustc_hash::{FxHashMap, FxHashSet};
 
     use super::*;
     use crate::{
@@ -2413,11 +2413,11 @@ mod tests {
         types: FxIndexMap<Name, TypesItem>,
         values: FxIndexMap<Name, ValuesItem>,
         macros: FxIndexMap<Name, MacrosItem>,
-        unresolved: FxHashSet<Name>,
-        use_imports_types: FxHashMap<ImportOrExternCrate, ImportOrDef>,
-        use_imports_values: FxHashMap<ImportOrGlob, ImportOrDef>,
-        use_imports_macros: FxHashMap<ImportOrExternCrate, ImportOrDef>,
-        legacy_macros: FxHashMap<Name, Vec<MacroId>>,
+        unresolved: HashSet<Name>,
+        use_imports_types: HashMap<ImportOrExternCrate, ImportOrDef>,
+        use_imports_values: HashMap<ImportOrGlob, ImportOrDef>,
+        use_imports_macros: HashMap<ImportOrExternCrate, ImportOrDef>,
+        legacy_macros: HashMap<Name, Vec<MacroId>>,
     }
 
     impl Model {
@@ -2804,7 +2804,7 @@ mod tests {
     fn keyed_maps_as_a_hash_map() {
         let mut rng = SplitMix64::new(7);
         let mut keyed: Keyed<u32, u64> = Keyed::default();
-        let mut map: FxHashMap<u32, u64> = FxHashMap::default();
+        let mut map: HashMap<u32, u64> = HashMap::default();
         for step in 0..3000u64 {
             let key = rng.below(400) as u32;
             if rng.one_in(3) {

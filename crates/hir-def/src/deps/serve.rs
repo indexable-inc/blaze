@@ -14,9 +14,9 @@ use std::{
 };
 
 use base_db::{Crate, Db, Env};
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::ContentId;
 use hir_expand::{MacroCallId, MacroCallKind, MacroDefKind, builtin::include_input_to_file_id};
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     Lookup,
@@ -104,7 +104,7 @@ pub struct Served {
     /// those asked, and their dependencies.
     ///
     /// [`eligible`]: super::eligible
-    pub keys: FxHashMap<Crate, ContentId>,
+    pub keys: HashMap<Crate, ContentId>,
     /// The crates read from an image, in the order of their keys.
     pub hits: Vec<Crate>,
     /// The crates with reads kept under their key but no image for the values those reads
@@ -162,7 +162,7 @@ pub struct Stored {
     /// The key each crate of `written` has its image filed under ([`Image::key`]): what a
     /// value made from the crate as this database resolved it is filed by
     /// (`blaze_diagnostics::cache`).
-    pub filed: FxHashMap<Crate, ContentId>,
+    pub filed: HashMap<Crate, ContentId>,
 }
 
 /// The name of `krate` in an error.
@@ -264,7 +264,7 @@ pub fn serve(
 }
 
 /// The frozen bytes a database was given, to add to.
-fn copied(maps: Option<&Arc<FxHashMap<Crate, Frozen>>>) -> FxHashMap<Crate, Frozen> {
+fn copied(maps: Option<&Arc<HashMap<Crate, Frozen>>>) -> HashMap<Crate, Frozen> {
     // clone: what was served before, once per serve that fetches a crate, to add to
     maps.map(|it| (**it).clone()).unwrap_or_default()
 }
@@ -314,7 +314,7 @@ fn open(db: &Db, krate: Crate, filed: ContentId, bytes: ImageBuf) -> Fetched {
     Ok(Found::Hit { bytes, parts, filed })
 }
 
-fn set_images(db: &mut Db, images: FxHashMap<Crate, Image>) {
+fn set_images(db: &mut Db, images: HashMap<Crate, Image>) {
     use blaze_query::db::{Durability, Setter};
     // alloc: setup: the one input value, once per session
     let images = Arc::new(images);
@@ -334,7 +334,7 @@ fn set_images(db: &mut Db, images: FxHashMap<Crate, Image>) {
 // dyn: the driver's store, one call per crate per session
 pub fn store(db: &Db, served: &Served, images: &dyn ImageStore) -> Result<Stored, String> {
     // alloc: setup: once per session
-    let hits: FxHashSet<Crate> = served.hits.iter().copied().collect();
+    let hits: HashSet<Crate> = served.hits.iter().copied().collect();
     // alloc: setup: once per session
     let mut order: Vec<(Crate, ContentId)> = (served.keys.iter())
         .filter(|(krate, _)| !hits.contains(krate))

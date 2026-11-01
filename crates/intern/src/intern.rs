@@ -20,7 +20,7 @@ use std::{
     ptr,
 };
 
-use rustc_hash::FxBuildHasher;
+use blaze_hash::FixedState;
 
 use crate::{
     sync::OnceLock,
@@ -58,7 +58,7 @@ impl<T: Internable> Interned<T> {
 /// The one copy of `obj` in `T::storage()`, interning it if it is not there.
 #[inline]
 fn intern<T: Internable>(obj: T) -> &'static T {
-    let hash = FxBuildHasher.hash_one(&obj);
+    let hash = FixedState.hash_one(&obj);
     T::storage().get().intern(hash, obj)
 }
 
@@ -372,13 +372,13 @@ mod tests {
     struct Keyed(Vec<u8>);
     impl_internable!(Keyed);
 
-    /// Interning against an `FxHashMap` from value to the address of its first handle, over
+    /// Interning against an `HashMap` from value to the address of its first handle, over
     /// seeded values that collide often: a value seen before gets that handle, a new one a
     /// handle of its own, and every handle reads its value.
     #[test]
     fn interning_agrees_with_a_map_model() {
         let mut rng = blaze_ids::rng::SplitMix64::new(0x1a7e);
-        let mut model: rustc_hash::FxHashMap<Vec<u8>, *const Keyed> = rustc_hash::FxHashMap::default();
+        let mut model: blaze_hash::HashMap<Vec<u8>, *const Keyed> = blaze_hash::HashMap::default();
         for _ in 0..20_000 {
             let len = rng.index(24);
             let bytes: Vec<u8> = (0..len).map(|_| b"ab\0"[rng.index(3)]).collect();

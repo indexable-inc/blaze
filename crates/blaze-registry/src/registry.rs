@@ -4,12 +4,13 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError},
+    sync::Arc,
     task::{Poll, Waker},
 };
 
 use anyhow::{Context as _, bail};
-use rustc_hash::FxHashMap;
+use blaze_hash::SharedMap;
+use parking_lot::Mutex;
 use semver::{Version, VersionReq};
 
 use blaze_source::SourceId;
@@ -42,7 +43,7 @@ pub struct Registry {
     crate_dir: PathBuf,
     context: Arc<Context>,
     /// The index files read since the last update, or being read.
-    read: Mutex<FxHashMap<String, Arc<Read>>>,
+    read: SharedMap<String, Arc<Read>>,
 }
 
 /// One index file read once for every query that asks for it while it is read.
@@ -82,8 +83,8 @@ impl Read {
         .await
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, ReadState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> parking_lot::MutexGuard<'_, ReadState> {
+        self.state.lock()
     }
 }
 
@@ -129,7 +130,7 @@ impl Registry {
             source,
             name,
             context,
-            read: Mutex::default(),
+            read: SharedMap::default(),
         })
     }
 
@@ -144,7 +145,7 @@ impl Registry {
             source,
             name,
             context,
-            read: Mutex::default(),
+            read: SharedMap::default(),
         }
     }
 
@@ -219,7 +220,7 @@ impl Registry {
     /// Asks the server about every file from now on, once, as cargo does when it updates an
     /// index; until then what is in the cache is used as it is.
     pub fn invalidate(&self) {
-        self.read.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        self.read.pin().clear();
         match &self.files {
             Files::Sparse(sparse) => sparse.invalidate(),
             Files::Git(git) => git.invalidate(),
@@ -239,14 +240,13 @@ impl Registry {
     /// another reads the file waits for that read. An error is not kept.
     pub async fn summaries(&self, name: &str) -> anyhow::Result<Arc<Summaries>> {
         let (read, reader) = {
-            let mut open = self.read.lock().unwrap_or_else(PoisonError::into_inner);
+            let open = self.read.pin();
             match open.get(name) {
                 Some(read) => (read.clone(), false),
-                None => {
-                    let read = Arc::new(Read::default());
-                    open.insert(name.to_owned(), read.clone());
-                    (read, true)
-                }
+                None => match open.try_insert(name.to_owned(), Arc::new(Read::default())) {
+                    Ok(read) => (read.clone(), true),
+                    Err(it) => (it.current.clone(), false),
+                },
             }
         };
         if !reader {
@@ -267,10 +267,7 @@ impl Registry {
     }
 
     fn forget(&self, name: &str, read: &Arc<Read>) {
-        let mut open = self.read.lock().unwrap_or_else(PoisonError::into_inner);
-        if open.get(name).is_some_and(|it| Arc::ptr_eq(it, read)) {
-            open.remove(name);
-        }
+        _ = self.read.pin().remove_if(name, |_, it| Arc::ptr_eq(it, read));
     }
 
     /// As cargo's `Summaries::parse`: the cache when the files say it is still good, else the
@@ -293,7 +290,7 @@ impl Registry {
         // A missing git entry can update the entire tree, including entries already read.
         // Keep this read, but ask for the others again from that snapshot next time.
         if matches!(&self.files, Files::Git(_)) && !was_updated && self.is_updated() {
-            self.read.lock().unwrap_or_else(PoisonError::into_inner).retain(|it, _| it == name);
+            self.read.pin().retain(|it, _| it == name);
         }
         match response {
             LoadResponse::CacheValid => {

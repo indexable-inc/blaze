@@ -2,9 +2,9 @@
 
 use base_db::{Db, all_crates, relevant_crates};
 
+use blaze_hash::HashMap;
 use hir_def::{ModuleId, nameres::crate_def_map};
 use hir_expand::EditionedFileId;
-use rustc_hash::FxHashMap;
 use span::FileId;
 use syntax::TextRange;
 use test_utils::extract_annotations;
@@ -18,7 +18,7 @@ pub(crate) trait TestDBExt {
         self.module_for_file_opt(file_id.into()).unwrap()
     }
 
-    fn extract_annotations(&self) -> FxHashMap<EditionedFileId, Vec<(TextRange, String)>>;
+    fn extract_annotations(&self) -> HashMap<EditionedFileId, Vec<(TextRange, String)>>;
 }
 
 impl TestDBExt for Db {
@@ -35,7 +35,7 @@ impl TestDBExt for Db {
         None
     }
 
-    fn extract_annotations(&self) -> FxHashMap<EditionedFileId, Vec<(TextRange, String)>> {
+    fn extract_annotations(&self) -> HashMap<EditionedFileId, Vec<(TextRange, String)>> {
         let mut files = Vec::new();
         for &krate in all_crates(self).iter() {
             let crate_def_map = crate_def_map(self, krate);

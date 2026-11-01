@@ -2,7 +2,7 @@
 
 use std::hash::Hash;
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 use crate::borrows::unimap::{UniIndex, UniKeyMap, UniValMap};
 
@@ -53,7 +53,7 @@ fn indices_are_reused() {
 struct MapWitness<K, V> {
     key: UniKeyMap<K>,
     val: UniValMap<V>,
-    map: FxHashMap<K, V>,
+    map: HashMap<K, V>,
 }
 
 impl<K, V> MapWitness<K, V>

@@ -65,7 +65,7 @@ fn ui(style: Style) -> Style {
 fn stderr(diags: &[Diag], sources: &Sources, style: Style) -> String {
     let closing = emit::summary(diags);
     let out: String =
-        diags.iter().chain(&closing).map(|it| emit::written(it, sources, ui(style))).collect();
+        diags.iter().chain(&closing).map(|it| emit::written(it, sources, ui(style)).unwrap()).collect();
     compiletest(&out, false)
 }
 
@@ -75,7 +75,7 @@ fn json(diags: &[Diag], sources: &Sources, style: Style) -> String {
     let out: String = diags
         .iter()
         .chain(&closing)
-        .map(|it| emit::json(it, sources, ui(style)))
+        .map(|it| emit::json(it, sources, ui(style)).unwrap())
         .filter(|it| !it.is_empty())
         .map(|it| it + "\n")
         .collect();
@@ -504,19 +504,20 @@ fn a_file_whose_source_is_not_shown_is_placed_but_neither_quoted_nor_spliced() {
     let mut diag = Diag::error(None, "x", at.clone());
     diag.span_label(at, "here");
     diag.span_label(option.span("None"), "defined here");
-    let unspliced = emit::written(&diag, &sources, ui(Style::default()));
+    let unspliced = emit::written(&diag, &sources, ui(Style::default())).unwrap();
     diag.suggestion_verbose(
         option.span("None"),
         "a suggestion into a file not shown",
         "Some",
         Applicability::MachineApplicable,
     );
-    assert_eq!(emit::written(&diag, &sources, ui(Style::default())), unspliced);
+    assert_eq!(emit::written(&diag, &sources, ui(Style::default())).unwrap(), unspliced);
     assert!(unspliced.contains(" $SRC_DIR/core/src/option.rs:2:4\n"), "{unspliced}");
     assert!(!unspliced.contains("LL |     None,"), "{unspliced}");
     assert!(unspliced.ends_with("   = note: defined here\n\n"), "{unspliced}");
 
-    let json: serde_json::Value = serde_json::from_str(&emit::json(&diag, &sources, Style::default())).unwrap();
+    let line = emit::json(&diag, &sources, Style::default()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&line).unwrap();
     let defined = &json["spans"][1];
     assert_eq!((&defined["line_start"], &defined["column_start"]), (&serde_json::json!(2), &serde_json::json!(5)));
     assert_eq!(defined["text"], serde_json::json!([]));
@@ -750,7 +751,7 @@ LL + fn setup() -> PutDown { Set }
 
 "#,
     );
-    let written = emit::written(&diag, &File::sources(&[&file]), ui(Style::default()));
+    let written = emit::written(&diag, &File::sources(&[&file]), ui(Style::default())).unwrap();
     assert_eq!(compiletest(&written, false), expected);
 }
 
@@ -864,7 +865,7 @@ fn a_macro_expansion_in_json() {
     let file = File::new("issue-6596-2.rs", MACRO);
     let mut noted = in_a_macro(&file);
     noted.originates_in();
-    let line = emit::json(&noted, &File::sources(&[&file]), Style::default());
+    let line = emit::json(&noted, &File::sources(&[&file]), Style::default()).unwrap();
     let value: serde_json::Value = serde_json::from_str(&line).unwrap();
     // The note rustc's text emitter adds is not one of its children.
     assert_eq!(value["children"], serde_json::json!([]));
@@ -996,7 +997,7 @@ fn colour_codes_are_rustcs() {
     diag.span_label(at.clone(), "not found in this scope");
     diag.span_note(at, "here");
     let style = ui(Style { ansi: true, ..Style::default() });
-    let rendered = emit::written(&diag, &File::sources(&[&file]), style);
+    let rendered = emit::written(&diag, &File::sources(&[&file]), style).unwrap();
     let lines: Vec<&str> = rendered.lines().collect();
     assert_eq!(
         lines[0],
@@ -1004,10 +1005,11 @@ fn colour_codes_are_rustcs() {
     );
     assert_eq!(lines[1], "  \x1b[1m\x1b[94m--> \x1b[0m$DIR/E0412.rs:1:6");
     assert!(lines.iter().any(|it| *it == "\x1b[1m\x1b[92mnote\x1b[0m: here"), "{rendered:?}");
-    let warned = emit::written(&Diag::new(Level::Warning, None, "1 warning emitted"), &File::sources(&[]), style);
+    let warned =
+        emit::written(&Diag::new(Level::Warning, None, "1 warning emitted"), &File::sources(&[]), style).unwrap();
     assert_eq!(warned, "\x1b[1m\x1b[33mwarning\x1b[0m\x1b[1m: 1 warning emitted\x1b[0m\n\n");
     let failure = Diag::new(Level::FailureNote, None, "For more information about this error, try `rustc --explain E0425`.");
-    let written = emit::written(&failure, &File::sources(&[]), style);
+    let written = emit::written(&failure, &File::sources(&[]), style).unwrap();
     assert_eq!(written, "\x1b[1mFor more information about this error, try `rustc --explain E0425`.\x1b[0m\n");
 }
 
@@ -1048,7 +1050,7 @@ LL |     let x = 1;
 
 "}"##,
     );
-    let line = emit::json(&diag, &File::sources(&[&file]), ui(Style::default()));
+    let line = emit::json(&diag, &File::sources(&[&file]), ui(Style::default())).unwrap();
     assert_eq!(compiletest(&line, true), expected);
 }
 
@@ -1176,8 +1178,8 @@ fn json_of_children_without_spans_and_of_a_failure_note() {
     let mut diag = Diag::error(Some("E0308"), "mismatched types", file.at(3, 4));
     diag.note("a note\nof two lines");
     let sources = File::sources(&[&file]);
-    let line = emit::json(&diag, &sources, Style::default());
-    let written = emit::written(&diag, &sources, Style::default());
+    let line = emit::json(&diag, &sources, Style::default()).unwrap();
+    let written = emit::written(&diag, &sources, Style::default()).unwrap();
     let value: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(
         value["children"],
@@ -1199,16 +1201,16 @@ fn json_of_children_without_spans_and_of_a_failure_note() {
 
     let failure = &emit::summary(&[diag])[1];
     assert_eq!(
-        emit::json(failure, &File::sources(&[]), Style::default()),
+        emit::json(failure, &File::sources(&[]), Style::default()).unwrap(),
         r#"{"$message_type":"diagnostic","message":"For more information about this error, try `rustc --explain E0308`.","code":null,"level":"failure-note","spans":[],"children":[],"rendered":"For more information about this error, try `rustc --explain E0308`.\n"}"#
     );
     let short = Style { short: true, ..Style::default() };
-    assert_eq!(emit::json(failure, &File::sources(&[]), short), "");
-    assert_eq!(emit::written(failure, &File::sources(&[]), short), "");
+    assert_eq!(emit::json(failure, &File::sources(&[]), short).unwrap(), "");
+    assert_eq!(emit::written(failure, &File::sources(&[]), short).unwrap(), "");
     // Only the notes naming codes to explain are left out of short; another failure note is
     // written as one.
     let other = Diag::new(Level::FailureNote, None, "query stack during panic:");
-    assert_eq!(emit::written(&other, &File::sources(&[]), short), "query stack during panic:\n");
+    assert_eq!(emit::written(&other, &File::sources(&[]), short).unwrap(), "query stack during panic:\n");
 }
 
 /// A suggestion to remove a whole line removes its newline too, in JSON.
@@ -1223,7 +1225,7 @@ fn json_of_removing_a_line_takes_its_newline() {
         Applicability::MachineApplicable,
         SuggestionStyle::HideCodeInline,
     );
-    let out = emit::json(&diag, &File::sources(&[&file]), Style::default());
+    let out = emit::json(&diag, &File::sources(&[&file]), Style::default()).unwrap();
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
     let removed = &value["children"][0]["spans"][0];
     assert_eq!(removed["byte_start"], 0);
@@ -1316,7 +1318,7 @@ fn the_closing_lines_are_written_as_rustc_writes_them() {
     let closing = emit::summary(&diags);
     let sources = File::sources(&[]);
     let written: Vec<String> =
-        closing.iter().map(|it| emit::written(it, &sources, Style::default())).collect();
+        closing.iter().map(|it| emit::written(it, &sources, Style::default()).unwrap()).collect();
     assert_eq!(
         written,
         [
@@ -1326,7 +1328,7 @@ fn the_closing_lines_are_written_as_rustc_writes_them() {
     );
     let short = Style { short: true, ..Style::default() };
     let written: Vec<String> =
-        closing.iter().map(|it| emit::written(it, &sources, short)).collect();
+        closing.iter().map(|it| emit::written(it, &sources, short).unwrap()).collect();
     assert_eq!(written, ["error: aborting due to 1 previous error\n", ""]);
 }
 
@@ -1335,12 +1337,26 @@ fn rendered_is_written_without_its_empty_line() {
     let file = File::new("lib.rs", "fn f() {}\n");
     let diag = Diag::error(Some("E0308"), "mismatched types", file.at(3, 4));
     let sources = File::sources(&[&file]);
-    let rendered = emit::rendered(&diag, &sources, Style::default());
+    let rendered = emit::rendered(&diag, &sources, Style::default()).unwrap();
     assert_eq!(rendered, "error[E0308]: mismatched types\n --> $DIR/lib.rs:1:4\n  |\n1 | fn f() {}\n  |    ^");
-    assert_eq!(emit::written(&diag, &sources, Style::default()), format!("{rendered}\n\n"));
+    assert_eq!(emit::written(&diag, &sources, Style::default()).unwrap(), format!("{rendered}\n\n"));
 }
 
 #[test]
 fn ansi_runs_are_normalized_as_the_ui_test_says() {
     assert_eq!(ansi(r"\u001b[1m\u001b[33mw\u001b[0m: x"), "[ANSI]w[ANSI]: x");
+}
+
+#[test]
+fn a_span_of_a_file_not_read_is_an_error_of_every_writer_naming_the_file() {
+    let file = File::new("out/gen.rs", "let unused = 1;\n");
+    let diag = Diag::error(None, "unused variable: `unused`", file.span("unused"));
+    let mut sources = Sources::default();
+    sources.add(&file.name, None);
+    let unread = emit::Unplaced::Unread { file: file.name.clone(), byte: 4 };
+    assert_eq!(emit::written(&diag, &sources, Style::default()), Err(unread.clone()));
+    assert_eq!(emit::rendered(&diag, &sources, Style::default()), Err(unread.clone()));
+    assert_eq!(emit::json(&diag, &sources, Style::default()), Err(unread.clone()));
+    assert_eq!(emit::json_rendered(&diag, &sources, String::new()), Err(unread));
+    assert!(emit::written(&diag, &File::sources(&[&file]), Style::default()).is_ok());
 }

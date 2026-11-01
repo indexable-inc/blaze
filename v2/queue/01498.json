@@ -1,0 +1,23 @@
+{
+  "id": "01498",
+  "from_lane": "codegen",
+  "owner": "db",
+  "paths": [
+    "crates/hir/src/diagnostics.rs"
+  ],
+  "what": "codegen, the hir half of 01388 (const checks of anonymous constants). codegen added hir_ty_mir::mir::const_check::anon_const_check(db, AnonConstId) -> &ConstCheck (tracked; context ConstContext::Const, as rustc checks an array length, repeat count, const argument or default and a const block). In crates/hir/src/diagnostics.rs: (1) anon_const_reports (line ~2705): add `|| !hir_ty_mir::mir::const_check::anon_const_check(db, def).diagnostics.is_empty()`, so a body or signature whose only finding is one runs the collection. (2) collect_anon_const (line ~2549): after collect_anon_const_valtree, call a new collect_anon_const_const_check(source_map, def) that does for anon_const_check(self.db, def).diagnostics what collect_def_with_body does for const_check at line ~2937: node_of(span) from source_map (ExprId/ExprEnd -> expr_syntax, PatId -> pat_syntax, as collect_anon_const_borrowck node_of), a ConstCheckError { node, code, message, kind, context } when placed, else UnplacedDiagnostic { owner: unplaced_owner(self.db, def.into(), source_map), what: Unplaced::ConstCheck { code, message } }. Acceptance: blaze-diagnostics tests::check::a_non_const_call_in_a_constant_is_refused (#1440). codegen side test: hir-ty-mir tests/mir/const_check.rs a_non_const_call_in_an_array_length_is_refused.",
+  "state": "open",
+  "created": "2026-11-01T12:55:19Z",
+  "updated": "2026-11-01T12:55:19Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T12:55:19Z",
+      "by": "codegen",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

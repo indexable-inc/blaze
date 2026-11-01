@@ -19,10 +19,10 @@
 //! `DropImplOnWrongItem` and `DropImplPolarity` of `compiler/rustc_hir_analysis/src/
 //! diagnostics.rs` (MIT or Apache-2.0).
 
+use blaze_hash::HashSet;
 use blaze_items::{Fact, ItemId};
 use either::Either;
 use hir_def::lang_item::{LangItems, lang_items};
-use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 use syntax::view::{
     self as ast, AstNode as _, HasGenericArgs as _, HasGenericParams as _, HasName as _,
@@ -32,7 +32,10 @@ use syntax::view::{
 use super::Origin;
 use crate::{
     cx::{Cx, def_range_view as def_range, item_range_view as item_range},
-    lower::{Found, Phase, incoherent_impl::{ImplAt, assoc_def_span}},
+    lower::{
+        Found, Phase,
+        incoherent_impl::{ImplAt, assoc_def_span},
+    },
     model::{Applicability, Diag, Span},
 };
 
@@ -210,7 +213,7 @@ fn infringing_fields_error<'db>(
 ) -> Diag {
     let db = cx.db;
     let mut diag = Diag::error(Some("E0204"), "the trait `Copy` cannot be implemented for this type", span);
-    let mut seen = FxHashSet::default();
+    let mut seen = HashSet::default();
     // alloc: on the error path (E0204)
     let mut params = Vec::new();
     let adt_key = cx.key(ItemId::Adt(adt.into()));
@@ -381,7 +384,7 @@ fn not_unique_param<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'db>, self_ty: &hir::Type
     let mut seen_lifetimes: SmallVec<[ast::Lifetime<'db>; 4]> = SmallVec::new();
     let mut seen_unnamed = false;
     let mut seen_types: SmallVec<[hir::TypeParam; 4]> = SmallVec::new();
-    let mut seen_consts = FxHashSet::default();
+    let mut seen_consts = HashSet::default();
     let mut type_arg = |ty: hir::Type<'db>| -> Option<NotUnique> {
         match ty.as_type_param(db) {
             Some(param) if seen_types.contains(&param) => Some(NotUnique::Duplicate(cx.ty(&ty))),

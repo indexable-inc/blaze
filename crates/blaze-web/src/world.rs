@@ -27,9 +27,9 @@
 
 use std::path::{Path, PathBuf};
 
+use blaze_hash::HashMap;
 use blaze_ids::radix;
 use blaze_protocol::events::{Event, How, Record};
-use rustc_hash::FxHashMap;
 
 pub use crate::flecs::Answer;
 use crate::flecs::{Entity, Flecs, Tag};
@@ -90,31 +90,31 @@ pub struct Program {
     crates: Vec<String>,
     /// Each crate's entity, by its index in `crates`.
     crates_of: Vec<Entity>,
-    crate_of: FxHashMap<String, (u32, Entity)>,
+    crate_of: HashMap<String, (u32, Entity)>,
     /// The crate named last: a record's functions are mostly of one crate.
     last_crate: u32,
     /// Each module by its crate's index (4 bytes, little-endian) and then `ff` and a segment
     /// for each of its segments: a function's module is one lookup of its path, and each
     /// module above it is a prefix of that.
-    modules: FxHashMap<Box<[u8]>, Entity>,
+    modules: HashMap<Box<[u8]>, Entity>,
     /// Each function, in the snapshot's order.
     nodes: Vec<Node>,
-    by_key: FxHashMap<u64, u32>,
+    by_key: HashMap<u64, u32>,
     /// The nodes of each object of the build under way, by their ids in it, and the maps of
     /// the builds before, emptied, for the next build's objects.
-    ids: FxHashMap<u32, FxHashMap<u32, u32>>,
-    spare_ids: Vec<FxHashMap<u32, u32>>,
+    ids: HashMap<u32, HashMap<u32, u32>>,
+    spare_ids: Vec<HashMap<u32, u32>>,
     /// The nodes each node calls.
     out: Calls,
     edges: usize,
     /// The modules that call one another, and the crates.
-    calls: rustc_hash::FxHashSet<(Entity, Entity)>,
+    calls: blaze_hash::HashSet<(Entity, Entity)>,
     /// The modules each module calls, as its `Callees`.
-    module_calls: FxHashMap<Entity, Vec<Entity>>,
+    module_calls: HashMap<Entity, Vec<Entity>>,
     /// Calls of the build's objects to ids none of its records has named yet: the first of
     /// each `(object, id)` ([`key`]), chained through `waiting` in the order they came. One to
     /// code of another is never named.
-    unnamed: FxHashMap<u64, u32>,
+    unnamed: HashMap<u64, u32>,
     waiting: Vec<Waiting>,
     /// The records of the last build, but for its functions, each as the page is sent it: a
     /// CBOR sequence, encoded once.
@@ -241,18 +241,18 @@ impl World {
             changes: 0,
             crates,
             crates_of,
-            crate_of: FxHashMap::default(),
+            crate_of: HashMap::default(),
             last_crate: 0,
-            modules: FxHashMap::default(),
+            modules: HashMap::default(),
             nodes,
-            by_key: FxHashMap::default(),
-            ids: FxHashMap::default(),
+            by_key: HashMap::default(),
+            ids: HashMap::default(),
             spare_ids,
             out: Calls::new(),
             edges: 0,
             calls: Default::default(),
-            module_calls: FxHashMap::default(),
-            unnamed: FxHashMap::default(),
+            module_calls: HashMap::default(),
+            unnamed: HashMap::default(),
             waiting,
             told,
             told_count: 0,

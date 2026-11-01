@@ -96,7 +96,7 @@ shelves! {
     Importables, IMPORTABLES: (hir_def::item_scope::ItemInNs, hir_def::Complete);
 }
 
-type ImportablesSeen = rustc_hash::FxHashSet<(hir_def::item_scope::ItemInNs, hir_def::Complete)>;
+type ImportablesSeen = blaze_hash::HashSet<(hir_def::item_scope::ItemInNs, hir_def::Complete)>;
 
 thread_local! {
     /// The items `query_external_importables` has handed out, to skip one found again.

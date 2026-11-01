@@ -26,14 +26,15 @@
 
 use blaze_cas::Kind;
 use blaze_graph::par;
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
 use blaze_mem::{Tag, frame};
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
-    Build, Built, FnNode, FrontInstance, FrontStatic, Lookup, Node, Out, Put, Sorted, StaticId, StaticNode, callee,
-    Whence, error, placed, stopped, stored, stored_function, unfit, unkept_inline,
+    Build, Built, FnNode, FrontInstance, FrontStatic, Lookup, Node, Out, Put, Sorted, StaticId,
+    StaticNode, Whence, callee, error, placed, stopped, stored, stored_function, unfit,
+    unkept_inline,
 };
 use crate::{
     Backend, CodegenError, CompiledFunction, Instance, InstanceKey, Unit,
@@ -78,12 +79,12 @@ pub fn runs_at_start(section: &str) -> bool {
 pub struct Later<I, S> {
     pub(super) nodes: Sorted<InstanceKey, FnNode<I, S>>,
     /// The shape of each function whose IR was built for its check.
-    pub(super) shapes: FxHashMap<InstanceKey, ContentId>,
+    pub(super) shapes: HashMap<InstanceKey, ContentId>,
 }
 
 impl<I, S> Default for Later<I, S> {
     fn default() -> Self {
-        Later { nodes: Sorted::default(), shapes: FxHashMap::default() }
+        Later { nodes: Sorted::default(), shapes: HashMap::default() }
     }
 }
 
@@ -100,7 +101,7 @@ pub(super) struct Lazily {
     pub(super) walked: Vec<Walked>,
     pub(super) entry: Vec<InstanceKey>,
     /// The shape of each function whose IR was built for its check.
-    pub(super) shapes: FxHashMap<InstanceKey, ContentId>,
+    pub(super) shapes: HashMap<InstanceKey, ContentId>,
 }
 
 /// Where a compile's template came from.
@@ -257,7 +258,7 @@ fn claimed<B: Prepare>(
     let (key, at) = (unit.instance.key(), placed(stored(unit.instance.key(), &node.built_in), &node.refs));
     let flights = memo.flights();
     loop {
-        let mut claims = flights.claims();
+        let mut claims = flights.claims("a function compiled at its first call");
         let shape = match claims.claim(&[at])[0] {
             Asked::Landed(shape) => shape,
             Asked::Ours => {
@@ -508,7 +509,7 @@ impl<B: Prepare> Build<'_, B> {
             .filter(|it| it.described.section.as_deref().is_some_and(runs_at_start))
             .flat_map(|it| it.refs.iter().filter_map(callee));
         // alloc: per build, its entry and start functions
-        let ahead: FxHashSet<InstanceKey> = entry_keys.iter().copied().chain(started).collect();
+        let ahead: HashSet<InstanceKey> = entry_keys.iter().copied().chain(started).collect();
         // alloc: per build, its entry and start functions
         let mut ahead: Vec<InstanceKey> = ahead.into_iter().collect();
         ahead.sort_unstable();
@@ -541,7 +542,7 @@ impl<B: Prepare> Build<'_, B> {
                 // The IR is let go here, on the thread that built it: only its shape is kept.
                 (*key, made.map(|(shape, _)| shape.key()))
             });
-        let mut shapes = FxHashMap::with_capacity_and_hasher(checked.len(), Default::default());
+        let mut shapes = HashMap::with_capacity_and_hasher(checked.len(), Default::default());
         for (key, shape) in checked {
             match shape {
                 Ok(shape) => {

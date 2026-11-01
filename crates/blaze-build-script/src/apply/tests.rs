@@ -158,7 +158,7 @@ fn which_scripts_a_unit_is_linked_with() {
         };
         GraphUnit { deps, own_runs, for_host, linkable }
     };
-    let mut memo = FxHashMap::default();
+    let mut memo = HashMap::default();
     let scripts = to_link("app", &graph, &mut memo);
     assert_eq!(scripts.to_link, ["run-app", "run-a", "run-b", "run-c"]);
     assert_eq!(to_link("app-script", &graph, &mut memo).to_link, ["run-d"]);
@@ -173,7 +173,7 @@ fn a_unit_met_again_is_free() {
         let deps = (*unit + 1..(*unit + 3).min(8)).collect();
         GraphUnit { deps, own_runs: vec![100 + *unit], for_host: false, linkable: true }
     };
-    let mut memo = FxHashMap::default();
+    let mut memo = HashMap::default();
     let first = to_link_in(0, &graph, &mut memo).to_link.clone();
     let again = blaze_alloc_count::assert_at_most(0, "a memo hit", || {
         to_link_in(0, &graph, &mut memo).to_link.len()

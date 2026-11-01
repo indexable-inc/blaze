@@ -4,7 +4,7 @@
 
 use std::vec;
 
-use rustc_hash::FxHashSet;
+use blaze_hash::HashSet;
 use serde::de::{self, IntoDeserializer};
 
 use super::error::ConfigError;
@@ -225,7 +225,7 @@ impl<'c, F: Files> ConfigMapAccess<'c, F> {
             }
         }
 
-        let mut fields = FxHashSet::default();
+        let mut fields = HashSet::default();
         for field in given_fields {
             let mut field_key = de.key.clone();
             field_key.push(field);

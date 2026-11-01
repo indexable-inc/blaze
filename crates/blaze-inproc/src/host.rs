@@ -12,11 +12,12 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime};
 
 use blaze_core::{Command, Sandbox};
+use parking_lot::Mutex;
 
 use crate::channel::Channel;
 use crate::frame::{Reader, Writer, kinds};
@@ -104,7 +105,7 @@ struct Waiting {
     asks: sys::View,
     grant: Grant,
     encoded: Vec<u8>,
-    done: mpsc::Sender<Result<Session, Error>>,
+    done: crossbeam_channel::Sender<Result<Session, Error>>,
 }
 
 /// The launches whose start hook has not connected yet. Locked only to add, take or drop one
@@ -124,10 +125,10 @@ impl Host {
     pub fn new(dir: &Path) -> Result<Host, Error> {
         let (listener, address) = sys::Listener::bind(dir)?;
         let waiting: Table = Arc::default();
-        let table = waiting.clone();
+        let table = Arc::clone(&waiting);
         std::thread::Builder::new()
             .name("blaze-inproc host".to_owned())
-            .spawn(move || accept(listener, table))
+            .spawn(move || accept(&listener, &table))
             .map_err(|it| Error::new(format!("starting the host's thread: {it}")))?;
         Ok(Host { address, waiting, written: Mutex::default(), temporaries: AtomicU64::new(0) })
     }
@@ -140,7 +141,7 @@ impl Host {
     /// differs from what the overlay swaps in.
     pub fn write_executable(&self, memory: &CodeMemory, executable: &Executable<'_>) -> Result<Wrote, Error> {
         let path = executable.path;
-        let mut written = self.written.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut written = self.written.lock();
         if let Some((key, identity)) = written.get(path)
             && *key == executable.key
             && Identity::of(path) == Some(*identity)
@@ -216,7 +217,7 @@ impl Host {
 
         let mut token = [0u8; 16];
         sys::random(&mut token)?;
-        let (done, wait) = mpsc::channel();
+        let (done, wait) = crossbeam_channel::unbounded();
         self.table().insert(token, Waiting { objects, asks, grant, encoded, done });
 
         let mut var = OsString::from(&self.address);
@@ -244,11 +245,11 @@ impl Host {
             sandbox,
             memory: launch.memory,
         };
-        Ok((command, Pending { token, wait, waiting: self.waiting.clone() }))
+        Ok((command, Pending { token, wait, waiting: Arc::clone(&self.waiting) }))
     }
 
-    fn table(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 16], Waiting>> {
-        self.waiting.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn table(&self) -> parking_lot::MutexGuard<'_, HashMap<[u8; 16], Waiting>> {
+        self.waiting.lock()
     }
 }
 
@@ -388,7 +389,7 @@ fn grant(launch: &Launch<'_>) -> Result<(Vec<(sys::Object, Rights)>, Grant), Err
 /// A launch whose start hook has not finished its handshake.
 pub struct Pending {
     token: [u8; 16],
-    wait: mpsc::Receiver<Result<Session, Error>>,
+    wait: crossbeam_channel::Receiver<Result<Session, Error>>,
     waiting: Table,
 }
 
@@ -397,13 +398,13 @@ impl Pending {
     /// it on a thread of the run's, not a plane worker.
     pub fn wait(self, timeout: Duration) -> Result<Session, Error> {
         let got = self.wait.recv_timeout(timeout);
-        self.waiting.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&self.token);
+        self.waiting.lock().remove(&self.token);
         match got {
             Ok(session) => session,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 Err(Error::new(format!("the start hook did not attach within {timeout:?}")))
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(Error::new("the host stopped before the start hook attached")),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(Error::new("the host stopped before the start hook attached")),
         }
     }
 }
@@ -423,7 +424,7 @@ pub struct Session {
 impl Session {
     /// Where its asks are read, on one thread, and what answers them, from any.
     pub fn split(self) -> (ask::Reader, ask::Sender) {
-        (ask::Reader::new(self.channel, self.run.clone()), ask::Sender::new(self.run))
+        (ask::Reader::new(self.channel, Arc::clone(&self.run)), ask::Sender::new(self.run))
     }
 
     /// Ends the process, `why` its run's error ([`Session::killed`]): for a run whose asks
@@ -450,7 +451,7 @@ pub struct Program {
     host: Arc<Host>,
     memory: Arc<Mutex<CodeMemory>>,
     image: Image,
-    sessions: mpsc::Sender<Result<Session, Error>>,
+    sessions: crossbeam_channel::Sender<Result<Session, Error>>,
     starts: Arc<Mutex<Starts>>,
 }
 
@@ -484,7 +485,7 @@ struct Starts {
 impl Program {
     /// `memory` laid out ([`CodeMemory::lay_out`]), its image part the executable `image`
     /// names.
-    pub fn new(host: Arc<Host>, memory: Arc<Mutex<CodeMemory>>, image: Image, sessions: mpsc::Sender<Result<Session, Error>>) -> Program {
+    pub fn new(host: Arc<Host>, memory: Arc<Mutex<CodeMemory>>, image: Image, sessions: crossbeam_channel::Sender<Result<Session, Error>>) -> Program {
         Program { host, memory, image, sessions, starts: Arc::default() }
     }
 
@@ -544,8 +545,8 @@ impl Program {
             starts.starts.insert(id, Start::Waiting);
             Started(id)
         };
-        let memory = self.memory.clone();
-        let starts = self.starts.clone();
+        let memory = Arc::clone(&self.memory);
+        let starts = Arc::clone(&self.starts);
         let sessions = self.sessions.clone();
         std::thread::Builder::new()
             .name("blaze-inproc start".to_owned())
@@ -608,15 +609,15 @@ impl Program {
     }
 }
 
-fn lock_starts(starts: &Mutex<Starts>) -> std::sync::MutexGuard<'_, Starts> {
-    starts.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+fn lock_starts(starts: &Mutex<Starts>) -> parking_lot::MutexGuard<'_, Starts> {
+    starts.lock()
 }
 
-fn lock(memory: &Mutex<CodeMemory>) -> std::sync::MutexGuard<'_, CodeMemory> {
-    memory.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+fn lock(memory: &Mutex<CodeMemory>) -> parking_lot::MutexGuard<'_, CodeMemory> {
+    memory.lock()
 }
 
-fn accept(listener: sys::Listener, waiting: Table) {
+fn accept(listener: &sys::Listener, waiting: &Table) {
     loop {
         let (stream, peer) = match listener.accept() {
             Ok(it) => it,
@@ -625,7 +626,7 @@ fn accept(listener: sys::Listener, waiting: Table) {
                 continue;
             }
         };
-        let waiting = waiting.clone();
+        let waiting = Arc::clone(waiting);
         let started = std::thread::Builder::new()
             .name("blaze-inproc handshake".to_owned())
             .spawn(move || handshake(Channel::new(stream), peer, &waiting));
@@ -651,7 +652,7 @@ fn handshake(mut channel: Channel, peer: u32, waiting: &Table) {
             return;
         }
     };
-    let Some(launch) = waiting.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&hello.token) else {
+    let Some(launch) = waiting.lock().remove(&hello.token) else {
         return;
     };
     let mut seq = 0;

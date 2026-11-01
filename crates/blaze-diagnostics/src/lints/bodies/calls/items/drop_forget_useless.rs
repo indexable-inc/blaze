@@ -12,6 +12,7 @@
 //! (`Expr::can_have_side_effects`) and `compiler/rustc_span/src/lib.rs`
 //! (`Span::find_ancestor_inside_same_ctxt`) (MIT or Apache-2.0).
 
+use blaze_hash::HashSet;
 use blaze_items::{Fact, ItemId};
 use hir_def::{
     AdtId, ModuleDefId,
@@ -19,12 +20,11 @@ use hir_def::{
     resolver::ValueNs,
 };
 use hir_ty::next_solver::{Ty, TyKind};
-use rustc_hash::FxHashSet;
 use rustc_type_ir::inherent::IntoKind as _;
 
 use super::FnItems;
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprKind, Hooks, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKind, ExprKinds, Hooks, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
@@ -37,7 +37,7 @@ const IGNORE: &str = "use `let _ = ...` to ignore the expression or result";
 pub(crate) struct DropForgetUseless {
     items: FnItems,
     /// The values of the arms of the body's matches visited so far that are calls.
-    arm_values: FxHashSet<ExprId>,
+    arm_values: HashSet<ExprId>,
     /// The expression of the statement last visited, when the statement ends in `;`.
     semi_stmt: Option<ExprId>,
 }
@@ -46,7 +46,7 @@ impl Default for DropForgetUseless {
     fn default() -> DropForgetUseless {
         DropForgetUseless {
             items: FnItems::new(&[MEM_DROP, MEM_FORGET]),
-            arm_values: FxHashSet::default(),
+            arm_values: HashSet::default(),
             semi_stmt: None,
         }
     }

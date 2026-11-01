@@ -12,13 +12,15 @@ use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::ops::Range;
 
+use blaze_hash::{FixedState, HashMap};
 use blaze_resolve::resolver::{CliFeatures, CompileKind, FeaturesFor, ResolvedFeatures};
-use blaze_resolve::{DepKind, Dependency, FeatureMap, FeatureValue, InternedString, PackageId, Resolve, Summary};
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use blaze_resolve::{
+    DepKind, Dependency, FeatureMap, FeatureValue, InternedString, PackageId, Resolve, Summary,
+};
 
-use blaze_ids::bits::BitSet as Bits;
 use super::packages::{Pkg, Table};
 use super::{Kinds, Options, Target};
+use blaze_ids::bits::BitSet as Bits;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct NodeId(u32);
@@ -201,7 +203,7 @@ pub(crate) struct Graph<'a> {
     slots: Vec<NodeId>,
     stride: usize,
     /// The feature nodes by `(package node, name)`.
-    feature_index: FxHashMap<(NodeId, usize), NodeId>,
+    feature_index: HashMap<(NodeId, usize), NodeId>,
     /// After [`Graph::restrict`], the nodes still in the graph.
     live: Option<Bits>,
 }
@@ -231,7 +233,7 @@ impl<'a> Graph<'a> {
             dep_names: Vec::with_capacity(names),
             slots,
             stride,
-            feature_index: FxHashMap::with_capacity_and_hasher(if graph_features { nodes } else { 0 }, FxBuildHasher),
+            feature_index: HashMap::with_capacity_and_hasher(if graph_features { nodes } else { 0 }, FixedState),
             live: None,
         }
     }

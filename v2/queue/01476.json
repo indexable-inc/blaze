@@ -6,10 +6,10 @@
     "crates/hir-ty-codegen/v2/places.rs"
   ],
   "what": "psm build script (self-build since 23:17, 11 functions) refused with \"a call of the trait method `distance`, which no impl was found for\" (hir-ty-codegen v2/places.rs:121 bodyless). Reduced: a bin over object (0.39.1 or 0.38.1, so not the std-vendored copy) with features read_core+coff calling coff ImageSymbol::name (a provided method generic over R: ReadRef) through CoffFile. `distance` is memchr 2.8.3 private ext trait Pointer (impl<T> Pointer for *const T / *mut T), reached from object calling memchr::memchr (#[inline]). The same shape in a bin or a path lib over memchr builds, so it is something of object (edition 2018?) instantiating memchr inline code in its own crate context. Test: blaze-engine tests/repro.rs a_program_reading_coff_symbol_names_builds (expects Invalid COFF file header size or alignment). Reroute to the front end if the impl lookup is theirs.",
-  "state": "open",
+  "state": "taken",
   "created": "2026-11-01T07:56:51Z",
-  "updated": "2026-11-01T07:56:51Z",
-  "taken_by": null,
+  "updated": "2026-11-01T12:51:16Z",
+  "taken_by": "codegen",
   "why": null,
   "source": null,
   "history": [
@@ -17,6 +17,12 @@
       "at": "2026-11-01T07:56:51Z",
       "by": "repro",
       "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T12:51:16Z",
+      "by": "codegen",
+      "action": "take",
       "note": ""
     }
   ]

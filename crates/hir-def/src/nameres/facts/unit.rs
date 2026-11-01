@@ -21,13 +21,13 @@ use std::{
 };
 
 use base_db::Db;
+use blaze_hash::{FixedState, HashMap};
 use blaze_mem::Frame;
 use hashbrown::HashSet;
 use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::Name,
 };
-use rustc_hash::{FxBuildHasher, FxHashMap};
 use span::Edition;
 use triomphe::Arc;
 
@@ -55,7 +55,7 @@ use self::imports::{
     NONE, PartialResolvedImport, Phase, TYPES, WaitOn, written_ns,
 };
 use super::{
-    FrameSet, FrameVec, set_in,
+    FrameSet, FrameVec,
     env::{ChildMode, ChildRequest, CollectCx, Sink},
     graph::Partition,
     ops::{DeclOp, ImportOp, MacroOp, OpLog},
@@ -63,6 +63,7 @@ use super::{
         self, CrateEnvKey, FactKey, RoundActive, RoundKey, RoundKind, Rows, RowsKey, SccKey,
         SccState,
     },
+    set_in,
 };
 
 const GLOB_RECURSION_LIMIT: usize = 100;
@@ -80,7 +81,7 @@ pub(crate) struct UnitState<A: Allocator + Clone = Global> {
     globs: GlobEdges<A>,
     from_glob_import: PerNsGlobImports<A>,
     /// Every module of another component the state read (a path's slot, a glob's source).
-    upstream: HashSet<ModuleId, FxBuildHasher, A>,
+    upstream: HashSet<ModuleId, FixedState, A>,
     /// The modules of other components the members glob-import, in the order first read:
     /// pulled again when the component carries on into a round.
     upstream_globs: Vec<ModuleId, A>,
@@ -103,7 +104,7 @@ impl<A: Allocator + Clone> UnitState<A> {
             imports: Imports::new_in(a()),
             globs: ImporterLists::new_in(a()),
             from_glob_import: PerNsGlobImports::new_in(a()),
-            upstream: HashSet::with_hasher_in(FxBuildHasher, a()),
+            upstream: HashSet::with_hasher_in(FixedState, a()),
             upstream_globs: Vec::new_in(a()),
             prelude: None,
         }
@@ -125,7 +126,7 @@ impl<A: Allocator + Clone> UnitState<A> {
 pub(super) struct ReadCheck<'db> {
     pub(super) partition: &'db Partition,
     /// The round's module order (`RoundModules::index`).
-    pub(super) index: &'db FxHashMap<ModuleId, u32>,
+    pub(super) index: &'db HashMap<ModuleId, u32>,
     pub(super) component: u32,
 }
 
@@ -152,7 +153,7 @@ impl ReadCheck<'_> {
 fn held<A: Allocator + Clone>(
     db: &Db,
     check: &Option<ReadCheck<'_>>,
-    upstream: &mut HashSet<ModuleId, FxBuildHasher, A>,
+    upstream: &mut HashSet<ModuleId, FixedState, A>,
     module: ModuleId,
     path: &ModPath,
     importer: ModuleId,
@@ -376,8 +377,8 @@ impl<'db, 'f> Unit<'db, 'f> {
             root: queries::crate_root(db, krate),
             modules: ModulesSlot::Unit { own, rows: blaze_query::db::AsId::as_id(&rows) },
             prelude: None,
-            macro_use_prelude: FxHashMap::default(),
-            derive_helpers_in_scope: FxHashMap::default(),
+            macro_use_prelude: HashMap::default(),
+            derive_helpers_in_scope: HashMap::default(),
             session_macros: false,
             names: uses::NameRecords::default(),
             // alloc: empty, a component's view keeps no diagnostics
@@ -1491,8 +1492,8 @@ pub(crate) fn local_scope(
         root,
         modules: ModulesSlot::Building(rows),
         prelude: None,
-        macro_use_prelude: FxHashMap::default(),
-        derive_helpers_in_scope: FxHashMap::default(),
+        macro_use_prelude: HashMap::default(),
+        derive_helpers_in_scope: HashMap::default(),
         session_macros: false,
         names: uses::NameRecords::default(),
         // alloc: empty, a scope's view keeps no diagnostics

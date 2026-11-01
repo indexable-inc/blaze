@@ -8,7 +8,7 @@ macro_rules! pkg {
     ($pkgid:expr => [$($deps:expr),* $(,)? ]) => ({
         use crate::helpers::ToDep;
         let d: Vec<Dependency> = vec![$($deps.to_dep()),*];
-        crate::helpers::pkg_dep($pkgid, d)
+        crate::helpers::pkg_dep(&$pkgid, d)
     });
 
     ($pkgid:expr) => ({
@@ -360,7 +360,7 @@ fn resolving_with_constrained_sibling_backtrack_parent() {
                                           dep_req("constrained", "1.0.1")]));
         reglist.push(pkg!(("backtrack_trap1", vsn.clone())));
         reglist.push(pkg!(("backtrack_trap2", vsn.clone())));
-        reglist.push(pkg!(("constrained", vsn.clone())));
+        reglist.push(pkg!(("constrained", vsn)));
     }
     let reg = registry(reglist);
 
@@ -582,11 +582,11 @@ fn resolving_with_constrained_sibling_backtrack_activation() {
     for i in 0..NUM_TRAPS {
         let vsn = format!("1.0.{}", i);
         reglist.push(pkg!(("backtrack_trap1", vsn.clone())));
-        reglist.push(pkg!(("backtrack_trap2", vsn.clone())));
+        reglist.push(pkg!(("backtrack_trap2", vsn)));
     }
     for i in 0..NUM_CONSTRAINED {
         let vsn = format!("1.0.{}", i);
-        reglist.push(pkg!(("constrained", vsn.clone())));
+        reglist.push(pkg!(("constrained", vsn)));
     }
     let reg = registry(reglist);
 
@@ -876,13 +876,13 @@ fn resolving_slow_case_missing_feature() {
     // should be `>= 2` to reproduce slowdown
     const TRANSITIVE_CRATES_COUNT: usize = 3;
 
-    reg.push(pkg_dep_with(("last", "1.0.0"), vec![], &[("f", &[])]));
+    reg.push(pkg_dep_with(&("last", "1.0.0"), vec![], &[("f", &[])]));
     for v in 1..LAST_CRATE_VERSION_COUNT {
         reg.push(pkg(("last", format!("1.0.{v}"))));
     }
 
     reg.push(pkg_dep(
-        ("dep", "1.0.0"),
+        &("dep", "1.0.0"),
         vec![
             dep("last"), // <-- needed to reproduce slowdown
             dep_req("intermediate-1", "1.0.0"),
@@ -893,12 +893,12 @@ fn resolving_slow_case_missing_feature() {
         let version = format!("1.0.{n}");
         for c in 1..TRANSITIVE_CRATES_COUNT {
             reg.push(pkg_dep(
-                (format!("intermediate-{c}"), &version),
+                &(format!("intermediate-{c}"), &version),
                 vec![dep_req(&format!("intermediate-{}", c + 1), &version)],
             ));
         }
         reg.push(pkg_dep(
-            (format!("intermediate-{TRANSITIVE_CRATES_COUNT}"), &version),
+            &(format!("intermediate-{TRANSITIVE_CRATES_COUNT}"), &version),
             vec![dep_req("last", "1.0.0").with(&["f"])],
         ));
     }
@@ -1081,16 +1081,16 @@ mod validated {
             pkg!("a"),
             pkg!("b"),
             pkg_dep_with(
-                "image",
+                &"image",
                 vec!["a".opt(), "b".opt(), "jpg".to_dep()],
                 &[("default", &["a"]), ("b", &["dep:b"])],
             ),
             pkg!("jpg"),
             pkg!("log"),
             pkg!("man"),
-            pkg_dep_with("rgb", vec!["man".opt()], &[("man", &["dep:man"])]),
+            pkg_dep_with(&"rgb", vec!["man".opt()], &[("man", &["dep:man"])]),
             pkg_dep_with(
-                "dep",
+                &"dep",
                 vec!["image".with(&["b"]), "log".opt(), "rgb".opt()],
                 &[("default", &["log", "image/default"]), ("man", &["rgb?/man"])],
             ),
@@ -1115,7 +1115,7 @@ mod validated {
 
     #[test]
     fn missing_dep_feature() {
-        let reg = registry(vec![pkg("a"), pkg_dep_with("dep", vec![dep("a")], &[("f", &["a/a"])])]);
+        let reg = registry(vec![pkg("a"), pkg_dep_with(&"dep", vec![dep("a")], &[("f", &["a/a"])])]);
 
         let deps = vec![dep("dep").with(&["f"])];
         assert!(resolve_and_validated(deps, &reg).is_err());
@@ -1125,10 +1125,10 @@ mod validated {
     fn missing_weak_dep_feature() {
         let reg = registry(vec![
             pkg("a"),
-            pkg_dep_with("dep1", vec![dep("a")], &[("f", &["a/a"])]),
-            pkg_dep_with("dep2", vec!["a".opt()], &[("f", &["a/a"])]),
-            pkg_dep_with("dep3", vec!["a".opt()], &[("f", &["a?/a"])]),
-            pkg_dep_with("dep4", vec!["x".opt()], &[("f", &["x?/a"])]),
+            pkg_dep_with(&"dep1", vec![dep("a")], &[("f", &["a/a"])]),
+            pkg_dep_with(&"dep2", vec!["a".opt()], &[("f", &["a/a"])]),
+            pkg_dep_with(&"dep3", vec!["a".opt()], &[("f", &["a?/a"])]),
+            pkg_dep_with(&"dep4", vec!["x".opt()], &[("f", &["x?/a"])]),
         ]);
 
         let deps = vec![dep("dep1").with(&["f"])];
@@ -1160,9 +1160,9 @@ mod validated {
         let reg = registry(vec![
             pkg(("a-sys", "1.0.0")),
             pkg(("a-sys", "2.0.0")),
-            pkg_dep_with(("a", "1.0.0"), vec![dep_req("a-sys", "1.0.0")], &[("f", &[])]),
-            pkg_dep_with(("a", "2.0.0"), vec![dep_req("a-sys", "2.0.0")], &[("g", &[])]),
-            pkg_dep("dep", vec![dep_req("a", "2.0.0")]),
+            pkg_dep_with(&("a", "1.0.0"), vec![dep_req("a-sys", "1.0.0")], &[("f", &[])]),
+            pkg_dep_with(&("a", "2.0.0"), vec![dep_req("a-sys", "2.0.0")], &[("g", &[])]),
+            pkg_dep(&"dep", vec![dep_req("a", "2.0.0")]),
         ]);
 
         let deps = vec![dep_req("a", "*").with(&["f"]), dep("dep")];
@@ -1174,10 +1174,10 @@ mod validated {
         let reg = registry(vec![
             pkg(("a-sys", "1.0.0")),
             pkg(("a-sys", "2.0.0")),
-            pkg_dep("a1", vec![dep_req("a-sys", "1.0.0").opt()]),
-            pkg_dep("a2", vec![dep_req("a-sys", "2.0.0").opt()]),
+            pkg_dep(&"a1", vec![dep_req("a-sys", "1.0.0").opt()]),
+            pkg_dep(&"a2", vec![dep_req("a-sys", "2.0.0").opt()]),
             pkg_dep_with(
-                "dep",
+                &"dep",
                 vec!["a1".opt(), "a2".opt()],
                 &[("a1", &["a1?/a-sys"]), ("a2", &["a2?/a-sys"])],
             ),
@@ -1195,7 +1195,7 @@ mod validated {
             pkg(("a-sys", "1.0.0")),
             pkg(("a-sys", "2.0.0")),
             pkg_dep_with(
-                "dep1",
+                &"dep1",
                 vec![
                     dep_req_platform("a-sys", "1.0.0", "cfg(all())").opt(),
                     dep_req("a-sys", "1.0.0").opt(),
@@ -1204,7 +1204,7 @@ mod validated {
                 &[("default", &["dep:a-sys"])],
             ),
             pkg_dep_with(
-                "dep2",
+                &"dep2",
                 vec![
                     dep_req_platform("a-sys", "1.0.0", "cfg(all())").opt(),
                     dep_req("a-sys", "1.0.0").opt(),
@@ -1236,11 +1236,11 @@ mod validated {
     #[test]
     fn multiple_dep_kinds_and_targets_with_different_packages() {
         let reg = registry(vec![
-            pkg_dep_with("a", vec![], &[("f", &[])]),
-            pkg_dep_with("b", vec![], &[("f", &[])]),
-            pkg_dep_with("c", vec![], &[("g", &[])]),
+            pkg_dep_with(&"a", vec![], &[("f", &[])]),
+            pkg_dep_with(&"b", vec![], &[("f", &[])]),
+            pkg_dep_with(&"c", vec![], &[("g", &[])]),
             pkg_dep_with(
-                "dep1",
+                &"dep1",
                 vec![
                     "a".opt().rename("x").with(&["f"]),
                     dep_platform("a", "cfg(all())").opt().rename("x"),
@@ -1249,7 +1249,7 @@ mod validated {
                 &[("default", &["x"])],
             ),
             pkg_dep_with(
-                "dep2",
+                &"dep2",
                 vec![
                     "a".opt().rename("x").with(&["f"]),
                     dep_platform("a", "cfg(all())").opt().rename("x"),
@@ -1269,9 +1269,9 @@ mod validated {
     #[test]
     fn dep_feature_with_shadowing_feature() {
         let reg = registry(vec![
-            pkg_dep_with("a", vec![], &[("b", &[])]),
+            pkg_dep_with(&"a", vec![], &[("b", &[])]),
             pkg_dep_with(
-                "dep",
+                &"dep",
                 vec!["a".opt().rename("aa"), "c".opt()],
                 &[("default", &["aa/b"]), ("aa", &["c"])],
             ),
@@ -1284,9 +1284,9 @@ mod validated {
     #[test]
     fn dep_feature_not_optional_with_shadowing_feature() {
         let reg = registry(vec![
-            pkg_dep_with("a", vec![], &[("b", &[])]),
+            pkg_dep_with(&"a", vec![], &[("b", &[])]),
             pkg_dep_with(
-                "dep",
+                &"dep",
                 vec!["a".rename("aa"), "c".opt()],
                 &[("default", &["aa/b"]), ("aa", &["c"])],
             ),
@@ -1299,9 +1299,9 @@ mod validated {
     #[test]
     fn dep_feature_weak_with_shadowing_feature() {
         let reg = registry(vec![
-            pkg_dep_with("a", vec![], &[("b", &[])]),
+            pkg_dep_with(&"a", vec![], &[("b", &[])]),
             pkg_dep_with(
-                "dep",
+                &"dep",
                 vec!["a".opt().rename("aa"), "c".opt()],
                 &[("default", &["aa?/b"]), ("aa", &["c"])],
             ),
@@ -1314,9 +1314,9 @@ mod validated {
     #[test]
     fn dep_feature_duplicate_with_shadowing_feature() {
         let reg = registry(vec![
-            pkg_dep_with("a", vec![], &[("b", &[])]),
+            pkg_dep_with(&"a", vec![], &[("b", &[])]),
             pkg_dep_with(
-                "dep",
+                &"dep",
                 vec!["a".opt().rename("aa"), dep_kind("a", DepKind::Build).rename("aa"), "c".opt()],
                 &[("default", &["aa/b"]), ("aa", &["c"])],
             ),
@@ -1329,9 +1329,9 @@ mod validated {
     #[test]
     fn optional_dep_features() {
         let reg = registry(vec![
-            pkg_dep("a", vec!["bad".opt()]),
-            pkg_dep("b", vec!["a".opt().with(&["bad"])]),
-            pkg_dep("dep", vec![dep("a"), dep("b")]),
+            pkg_dep(&"a", vec!["bad".opt()]),
+            pkg_dep(&"b", vec!["a".opt().with(&["bad"])]),
+            pkg_dep(&"dep", vec![dep("a"), dep("b")]),
         ]);
 
         let deps = vec![dep("dep")];
@@ -1342,12 +1342,12 @@ mod validated {
     fn optional_dep_features_with_rename() {
         let reg = registry(vec![
             pkg("x1"),
-            pkg_dep("a", vec!["x1".opt(), "x2".opt(), "x3".opt()]),
+            pkg_dep(&"a", vec!["x1".opt(), "x2".opt(), "x3".opt()]),
             pkg_dep(
-                "dep1",
+                &"dep1",
                 vec!["a".opt().with(&["x1"]), dep_kind("a", DepKind::Build).opt().with(&["x2"])],
             ),
-            pkg_dep("dep2", vec!["a".opt().with(&["x1"]), "a".opt().rename("a2").with(&["x3"])]),
+            pkg_dep(&"dep2", vec!["a".opt().with(&["x1"]), "a".opt().rename("a2").with(&["x3"])]),
         ]);
 
         let deps = vec!["dep1".with(&["a"])];
@@ -1360,9 +1360,9 @@ mod validated {
     #[test]
     fn optional_weak_dep_features() {
         let reg = registry(vec![
-            pkg_dep("a", vec!["bad".opt()]),
-            pkg_dep("b", vec![dep("a")]),
-            pkg_dep_with("dep", vec!["a".opt(), dep("b")], &[("f", &["a?/bad"])]),
+            pkg_dep(&"a", vec!["bad".opt()]),
+            pkg_dep(&"b", vec![dep("a")]),
+            pkg_dep_with(&"dep", vec!["a".opt(), dep("b")], &[("f", &["a?/bad"])]),
         ]);
 
         let deps = vec!["dep".with(&["f"])];
@@ -1374,33 +1374,33 @@ mod validated {
     #[test]
     fn default_feature_multiple_major_versions() {
         let reg = registry(vec![
-            pkg_dep_with(("a", "0.2.0"), vec![], &[("default", &[])]),
+            pkg_dep_with(&("a", "0.2.0"), vec![], &[("default", &[])]),
             pkg(("a", "0.3.0")),
-            pkg_dep_with(("a", "0.4.0"), vec![], &[("default", &[])]),
+            pkg_dep_with(&("a", "0.4.0"), vec![], &[("default", &[])]),
             pkg_dep(
-                "dep1",
+                &"dep1",
                 vec![
                     dep_req("a", ">=0.2, <0.4").with_default(),
                     dep_req("a", "0.2").rename("a2").with(&[]),
                 ],
             ),
             pkg_dep(
-                "dep2",
+                &"dep2",
                 vec![
                     dep_req("a", ">=0.2, <0.4").with_default(),
                     dep_req("a", "0.3").rename("a2").with(&[]),
                 ],
             ),
             pkg_dep(
-                "dep3",
+                &"dep3",
                 vec![
                     dep_req("a", ">=0.2, <0.4").with_default(),
                     dep_req("a", "0.2").rename("a1").with(&[]),
                     dep_req("a", "0.3").rename("a2").with(&[]),
                 ],
             ),
-            pkg_dep("dep4", vec![dep_req("a", ">=0.2, <0.4").with_default()]),
-            pkg_dep("dep5", vec![dep_req("a", ">=0.3, <0.5").with_default()]),
+            pkg_dep(&"dep4", vec![dep_req("a", ">=0.2, <0.4").with_default()]),
+            pkg_dep(&"dep5", vec![dep_req("a", ">=0.3, <0.5").with_default()]),
         ]);
 
         let deps = vec![dep("dep1")];

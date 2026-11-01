@@ -1,0 +1,23 @@
+{
+  "id": "01501",
+  "from_lane": "no-fallback-front",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.toml"
+  ],
+  "what": "brief-lints.md Levels: blaze::error_debug is deny. It is registered in blaze-lints (blaze/error_debug.rs, no-fallback-front-lints-errors, ra clean) at Allow by default. Two steps so no lane's build stops on existing hits: (1) on the next blaze-lints run, lint the workspace once with `--warn=blaze::error_debug` and send the hit count and sites to blaze-v2:=no-fallback-front (we fix them or queue them to their owners); (2) once it is 0, add `error_debug = \"deny\"` under `[workspace.metadata.blaze.lints]` in the root Cargo.toml (next to `hot_alloc = \"warn\"`, line 35).",
+  "state": "open",
+  "created": "2026-11-01T13:20:30Z",
+  "updated": "2026-11-01T13:20:30Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T13:20:30Z",
+      "by": "no-fallback-front",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

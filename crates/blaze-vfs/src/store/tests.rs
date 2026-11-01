@@ -1,10 +1,10 @@
 //! The store against safe reference versions (docs/v2/plan/design/unsafe.md "Differential"): a
-//! `Vec` for a column, an `FxHashMap` for the index, a `Vec<String>` for the names.
+//! `Vec` for a column, an `HashMap` for the index, a `Vec<String>` for the names.
 
 use std::sync::Arc;
 
+use blaze_hash::HashMap;
 use blaze_ids::{ContentId, rng::SplitMix64 as Rng};
-use rustc_hash::FxHashMap;
 
 use super::{Base, Building, Column, DIR, FILE, FIRST, Writer, chunk_of, chunk_start, run};
 
@@ -110,7 +110,7 @@ fn a_file_shape_has_no_entries() {
 #[test]
 fn the_index_finds_what_a_map_holds() {
     let mut writer = Writer::new();
-    let mut model: FxHashMap<ContentId, u32> = FxHashMap::default();
+    let mut model: HashMap<ContentId, u32> = HashMap::default();
     for at in 0..5000u32 {
         let bytes: Arc<[u8]> = Arc::from(at.to_le_bytes().as_slice());
         let id = ContentId::of("store test", &bytes);

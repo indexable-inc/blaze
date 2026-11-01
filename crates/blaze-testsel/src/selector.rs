@@ -27,6 +27,7 @@
 use std::time::Duration;
 
 use blaze_cas::{Corrupt, Key};
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_usercode::{
     RunKey,
@@ -37,12 +38,11 @@ use blaze_usercode::{
     },
     trace::Inputs,
 };
-use rustc_hash::FxHashMap;
 
 use crate::{
     select::{
-        Basis, Cached, Choice, Kept, LOOKBACK, Ran, RecordError, Subject, Unread, Why, end, entry, find, identity,
-        keep_set, kept_set,
+        Basis, Cached, Choice, Kept, LOOKBACK, Ran, RecordError, Subject, Unread, Why, end, entry,
+        find, identity, keep_set, kept_set,
     },
     table::{Bound, FnId, Image, SetView, Version},
 };
@@ -245,7 +245,7 @@ pub struct Selector {
     versions: Versions,
     blocks: Vec<Block>,
     sets: Sets,
-    names: FxHashMap<Box<str>, u32>,
+    names: HashMap<Box<str>, u32>,
     tests: Vec<Memo>,
 }
 
@@ -259,7 +259,7 @@ impl Selector {
             // alloc: empty, allocates nothing
             blocks: Vec::new(),
             sets: Sets::default(),
-            names: FxHashMap::default(),
+            names: HashMap::default(),
             // alloc: empty, allocates nothing
             tests: Vec::new(),
         }

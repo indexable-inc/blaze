@@ -11,9 +11,10 @@
 use std::mem::offset_of;
 
 use blaze_format::{
-    ALIGN, Aligned, FormatError, Part, Persist, Placed, Record, SchemaHash, Slice, Writer,
-    open_as, schema_of,
+    ALIGN, Aligned, FormatError, Part, Persist, Placed, Record, SchemaHash, Slice, Writer, open_as,
+    schema_of,
 };
+use blaze_hash::FixedState;
 use blaze_mem::{Frame, scratch};
 use hir_def::{
     AdtId, AssocItemId, ConstId, ConstParamId, EnumVariantId, FieldId, FunctionId, GenericDefId,
@@ -31,7 +32,6 @@ use intern::Symbol;
 use la_arena::{Idx, RawIdx};
 use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
-use rustc_hash::FxBuildHasher;
 use rustc_type_ir::{ClausePolarity, ClosureKind};
 
 use crate::{
@@ -39,8 +39,8 @@ use crate::{
     consteval::CreateConstError,
     db::{AnonConstId, InternedOpaqueTyId},
     infer::{
-        Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability, CallArguments, CaptureInfo,
-        CaptureSourceStack, CapturedPlace, ClosureData, ExplicitDropMethodUseKind,
+        Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability, CallArguments,
+        CaptureInfo, CaptureSourceStack, CapturedPlace, ClosureData, ExplicitDropMethodUseKind,
         InferenceDiagnostic, InferenceResult, MinCaptures, OverloadedDeref, PatAdjust,
         PatAdjustment, PointerCast, ReturnKind, StructPathDef, StructPathFound, Unreachable,
         UnreachableAt, UpvarCapture,
@@ -50,8 +50,8 @@ use crate::{
             expr_use_visitor::{FakeReadCause, Place, PlaceBase, Projection, ProjectionKind},
         },
         columns::{
-            Csr, DenseKey, ExprOrPatColumn, ExprOrPatMap, ExprOrPatSet, FieldColumn, IdxSet, IndexColumn,
-            ModeColumn, SortedMap, TyColumn,
+            Csr, DenseKey, ExprOrPatColumn, ExprOrPatMap, ExprOrPatSet, FieldColumn, IdxSet,
+            IndexColumn, ModeColumn, SortedMap, TyColumn,
         },
         prelude_lints::{EditionLint, ReceiverAdjustment},
     },
@@ -61,18 +61,18 @@ use crate::{
     },
     method_resolution::CandidateId,
     next_solver::{
-        DbInterner, FnSig, FnSigKind, GenericArgs, Predicate, StoredFnSig, StoredGenericArgs,
-        StoredPredicate, StoredTraitRef, StoredTy, StoredTys, TraitRef, Ty, Tys,
-        AnyImplId, StoredGenericArg,
+        AnyImplId, DbInterner, FnSig, FnSigKind, GenericArgs, Predicate, StoredFnSig,
+        StoredGenericArg, StoredGenericArgs, StoredPredicate, StoredTraitRef, StoredTy, StoredTys,
+        TraitRef, Ty, Tys,
         abi::Safety,
         infer::traits::ObligationCauseCode,
         persist::{TyTableReader, TyTableWriter, table_words},
     },
-    solver_errors::{SolverDiagnostic, SolverDiagnosticKind, StoredTraitPredicate},
     solver_errors::{
         Ambiguity, AmbiguityCandidate, AmbiguityNote, NamedTerm, StoredGoal, TypeAnnotationNeeded,
         UnreportedSolverError,
     },
+    solver_errors::{SolverDiagnostic, SolverDiagnosticKind, StoredTraitPredicate},
 };
 
 const _: () = assert!(align_of::<u128>() == ALIGN, "the type table is placed as `u128`s");
@@ -3407,7 +3407,7 @@ impl Source<'_> {
         let len = self.len()?;
         // alloc: the decoded roots, once at their number
         let mut roots = Vec::with_capacity(len);
-        let mut seen = hashbrown::HashSet::with_capacity_and_hasher_in(len, FxBuildHasher, frame);
+        let mut seen = hashbrown::HashSet::with_capacity_and_hasher_in(len, FixedState, frame);
         let mut captures = Vec::new_in(frame);
         for _ in 0..len {
             let binding: BindingId = self.local()?;
@@ -3486,13 +3486,13 @@ impl Source<'_> {
 #[cfg(test)]
 mod tests {
     use blaze_format::to_bytes;
+    use blaze_query::db::FromId;
     use either::Either;
     use hir_def::{
         BuiltinDeriveImplId, ImplId, StaticId, TypeAliasId,
         hir::{BindingId, PatId},
     };
     use la_arena::ArenaMap;
-    use blaze_query::db::FromId;
 
     use super::*;
     use crate::{

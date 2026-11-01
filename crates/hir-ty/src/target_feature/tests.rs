@@ -1,16 +1,16 @@
+use blaze_hash::{HashMap, HashSet};
 use intern::Symbol;
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::*;
 
 /// rustc's `implied_target_features`' map of `arch`'s table: each name, what its (last) line
 /// says it implies.
-fn rustc_map(arch: TargetArch) -> FxHashMap<&'static str, &'static [&'static str]> {
+fn rustc_map(arch: TargetArch) -> HashMap<&'static str, &'static [&'static str]> {
     arch.rustc_table().collect()
 }
 
 /// rustc's `implied_target_features` of each feature of `enabled`, added to it.
-fn rustc_expand(map: &FxHashMap<&str, &[&str]>, enabled: &mut FxHashSet<Symbol>) {
+fn rustc_expand(map: &HashMap<&str, &[&str]>, enabled: &mut HashSet<Symbol>) {
     let mut queue = enabled.iter().cloned().collect::<Vec<_>>();
     while let Some(feature) = queue.pop() {
         if let Some(implications) = map.get(feature.as_str()) {
@@ -84,10 +84,10 @@ fn enables_gives_rustcs_results_on(arch: TargetArch) {
     ];
     let mut probes: Vec<&str> = TargetFeature::all().map(TargetFeature::name).collect();
     probes.extend(["", "x", " fma", "AVX2", "not-a-feature", "avx 2"]);
-    let olds: Vec<(FxHashSet<Symbol>, FxHashSet<Symbol>)> = combos
+    let olds: Vec<(HashSet<Symbol>, HashSet<Symbol>)> = combos
         .iter()
         .map(|names| {
-            let raw: FxHashSet<Symbol> = names.iter().map(|it| Symbol::intern(it)).collect();
+            let raw: HashSet<Symbol> = names.iter().map(|it| Symbol::intern(it)).collect();
             let mut expanded = raw.clone();
             rustc_expand(&map, &mut expanded);
             (raw, expanded)

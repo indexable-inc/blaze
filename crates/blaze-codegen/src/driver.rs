@@ -29,7 +29,7 @@ use blaze_graph::par::{self, IntoSource};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
 use blaze_mem::{Tag, frame};
-use rustc_hash::{FxHashMap, FxHashSet};
+
 
 use crate::{
     CodegenError, CompiledFunction, Instance, InstanceKey, Static, Target, Unit,
@@ -302,20 +302,20 @@ type StaticId = (ItemKey, ContentId);
 struct Sorted<K, V> {
     keys: Vec<K>,
     values: Vec<V>,
-    at: FxHashMap<K, u32>,
+    at: blaze_hash::HashMap<K, u32>,
 }
 
 impl<K, V> Default for Sorted<K, V> {
     fn default() -> Self {
         // alloc: none, the lists are empty
-        Sorted { keys: Vec::new(), values: Vec::new(), at: FxHashMap::default() }
+        Sorted { keys: Vec::new(), values: Vec::new(), at: blaze_hash::HashMap::default() }
     }
 }
 
 impl<K: Copy + Ord + Hash, V> Sorted<K, V> {
     /// The entries of `map` by key. Each value moves twice whatever its size: only the
     /// permutation is sorted.
-    fn of(map: FxHashMap<K, V>) -> Self {
+    fn of(map: blaze_hash::HashMap<K, V>) -> Self {
         // alloc: per build, sized by its units
         let mut entries: Vec<Option<(K, V)>> = map.into_iter().map(Some).collect();
         assert!(entries.len() <= u32::MAX as usize, "more than 2^32 nodes");
@@ -326,7 +326,7 @@ impl<K: Copy + Ord + Hash, V> Sorted<K, V> {
         let mut sorted = Sorted {
             keys: Vec::with_capacity(entries.len()),
             values: Vec::with_capacity(entries.len()),
-            at: FxHashMap::with_capacity_and_hasher(entries.len(), Default::default()),
+            at: blaze_hash::HashMap::with_capacity_and_hasher(entries.len(), Default::default()),
         };
         for at in order {
             let (key, value) = entries[at as usize].take().expect("each entry once");
@@ -639,7 +639,9 @@ pub struct Build<'a, B: Prepare> {
     /// The last run's functions, with the shapes its lazy checks recorded.
     last: Later<FrontInstance<B>, FrontStatic<B>>,
     /// Functions the last run's statics refer to.
-    static_callees: FxHashSet<InstanceKey>,
+    static_callees: blaze_hash::HashSet<InstanceKey>,
+    /// What other builds' waits for its compiles name it by ([`Build::owned_by`]).
+    owner: &'a str,
 }
 
 /// The function a target names, if it names one.
@@ -659,13 +661,21 @@ impl<'a, B: Prepare> Build<'a, B> {
             memo,
             masks: Masks::shared(),
             last: Later::default(),
-            static_callees: FxHashSet::default(),
+            static_callees: blaze_hash::HashSet::default(),
+            owner: "a build",
         }
     }
 
     /// Keeps masked IR in `masks` in place of the process's [`Masks::shared`].
     pub fn with_masks(mut self, masks: &'a Masks) -> Self {
         self.masks = masks;
+        self
+    }
+
+    /// Names this build `owner` (its unit) in the spans of other builds' waits for the
+    /// functions it compiles ([`crate::flight`]).
+    pub fn owned_by(mut self, owner: &'a str) -> Self {
+        self.owner = owner;
         self
     }
 
@@ -730,8 +740,9 @@ impl<'a, B: Prepare> Build<'a, B> {
         mut order: Option<&mut Vec<InstanceKey>>,
         errors: &mut Vec<CodegenError>,
     ) -> (Sorted<InstanceKey, Node<B>>, Sorted<StaticId, StaticNode<B>>, Vec<InstanceKey>) {
-        let mut nodes: FxHashMap<InstanceKey, Node<B>> = FxHashMap::default();
-        let mut statics: FxHashMap<StaticId, StaticNode<B>> = FxHashMap::default();
+        let mut nodes: blaze_hash::HashMap<InstanceKey, Node<B>> = blaze_hash::HashMap::default();
+        let mut statics: blaze_hash::HashMap<StaticId, StaticNode<B>> =
+            blaze_hash::HashMap::default();
         let mut asked: HashMap<(FrontInstance<B>, Origin), InstanceKey> = HashMap::new();
         let mut static_asked: HashMap<FrontStatic<B>, StaticId> = HashMap::new();
         let mut queued: HashSet<(FrontInstance<B>, Origin)> = HashSet::new();
@@ -867,8 +878,8 @@ impl<'a, B: Prepare> Build<'a, B> {
             node.refs = resolve(&node.described.refs, &node.described.origin).unwrap_or_default();
         }
         // What each builds in directly, then at any depth.
-        let mut direct: FxHashMap<InstanceKey, Vec<InstanceKey>> =
-            FxHashMap::with_capacity_and_hasher(nodes.len(), Default::default());
+        let mut direct: blaze_hash::HashMap<InstanceKey, Vec<InstanceKey>> =
+            blaze_hash::HashMap::with_capacity_and_hasher(nodes.len(), Default::default());
         for (key, node) in nodes.iter() {
             if node.refs.is_empty() && !node.described.refs.is_empty() {
                 continue;
@@ -896,7 +907,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             direct.insert(*key, callees);
         }
         // alloc: per build, reused across its units
-        let (mut seen, mut queue) = (FxHashSet::default(), Vec::new());
+        let (mut seen, mut queue) = (blaze_hash::HashSet::default(), Vec::new());
         for (key, node) in nodes.iter_mut() {
             seen.clear();
             queue.extend(direct.get(key).into_iter().flatten().copied());
@@ -1262,7 +1273,8 @@ impl<'a, B: Prepare> Build<'a, B> {
         }
         let groups = fold::groups(&candidates, &fold::Limits::default());
         // alloc: per build, sized by its units
-        let grouped: HashSet<InstanceKey> = groups.iter().flat_map(|it| it.members.iter().copied()).collect();
+        let grouped: HashSet<InstanceKey> =
+            groups.iter().flat_map(|it| it.members.iter().copied()).collect();
 
         // Every other dev unit: its template from the store, the memo, or a compile.
         // alloc: per build, sized by its units
@@ -1289,7 +1301,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         // ([`crate::flight`]): this one when it asks first, else the other's template, waited
         // for once this build's own compiles landed and its other claims are let go of.
         let flights = self.memo.flights();
-        let mut claims = flights.claims();
+        let mut claims = flights.claims(self.owner);
         while !missing.is_empty() {
             // alloc: per batch of store misses, sized by it
             let stored_keys: Vec<InstanceKey> = missing.iter().map(|key| nodes[key].stored()).collect();
@@ -1514,7 +1526,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         // by its key and members; its body and thunks are kept in the memo under their store
         // keys, so a build that waited for it or asks after takes them there.
         let flights = self.memo.flights();
-        let mut claims = flights.claims();
+        let mut claims = flights.claims(self.owner);
         while !merging.is_empty() {
             // alloc: per batch of store misses, sized by it
             let flight_keys: Vec<InstanceKey> = merging.iter().map(|it| group_flight(it)).collect();
@@ -1706,7 +1718,8 @@ impl<'a, B: Prepare> Build<'a, B> {
             return;
         }
         // alloc: per build, sized by its units
-        let by_name: HashMap<InstanceKey, &Job<'_, B>> = jobs.iter().map(|job| (job.name, job)).collect();
+        let by_name: HashMap<InstanceKey, &Job<'_, B>> =
+            jobs.iter().map(|job| (job.name, job)).collect();
         let prepare = |names: &[InstanceKey],
                        errors: &mut Vec<CodegenError>|
          -> Vec<(InstanceKey, Result<(Shape, B::Prepared), CodegenError>)> {
@@ -1721,8 +1734,8 @@ impl<'a, B: Prepare> Build<'a, B> {
         // another build of the memo made ([`crate::flight`]), by its store key: this build then
         // prepares the function only if it compiles or imports it. Sorted by key once, in
         // `imports::decide`.
-        let mut summaries: FxHashMap<InstanceKey, Summary> =
-            FxHashMap::with_capacity_and_hasher(jobs.len(), Default::default());
+        let mut summaries: blaze_hash::HashMap<InstanceKey, Summary> =
+            blaze_hash::HashMap::with_capacity_and_hasher(jobs.len(), Default::default());
         let mut prepared: HashMap<InstanceKey, B::Prepared> = HashMap::new();
         let mut exports: HashMap<InstanceKey, B::Export> = HashMap::new();
         // alloc: per build, sized by its units
@@ -1753,7 +1766,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         };
         let summary_flight = |name: &InstanceKey| InstanceKey(keys::summary(&by_name[name].summarized()).0);
         let flights = self.memo.flights();
-        let mut claims = flights.claims();
+        let mut claims = flights.claims(self.owner);
         while !unsummarized.is_empty() {
             // alloc: per batch of store misses, sized by it
             let flight_keys: Vec<InstanceKey> = unsummarized.iter().map(summary_flight).collect();
@@ -1818,7 +1831,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         for (name, summary) in &mut summaries {
             summary.key = *name;
         }
-        let outside: FxHashSet<InstanceKey> = jobs
+        let outside: blaze_hash::HashSet<InstanceKey> = jobs
             .iter()
             .filter(|job| job.node.external())
             .map(|job| job.name)
@@ -2017,7 +2030,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         &self,
         by_name: &HashMap<InstanceKey, &Job<'_, B>>,
         flown: Vec<(InstanceKey, InstanceKey)>,
-        summaries: &mut FxHashMap<InstanceKey, Summary>,
+        summaries: &mut blaze_hash::HashMap<InstanceKey, Summary>,
         out: &mut Out,
     ) {
         if flown.is_empty() {

@@ -10,6 +10,7 @@
 //! `compiler/rustc_lint/src/lints.rs` (`BuiltinMutablesTransmutes`, `IntegerToPtrTransmutes`,
 //! `IntegerToPtrTransmutesSuggestion`) (MIT or Apache-2.0).
 
+use blaze_hash::HashMap;
 use blaze_items::{Fact, ItemId};
 use hir_def::{
     CallableDefId, DefWithBodyId, ItemContainerId, Lookup as _,
@@ -18,14 +19,13 @@ use hir_def::{
     signatures::FunctionSignature,
 };
 use hir_ty::next_solver::{CallableIdWrapper, Ty, TyKind};
-use rustc_hash::FxHashMap;
 use rustc_type_ir::{
     IntTy, UintTy,
     inherent::{GenericArgs as _, IntoKind as _},
 };
 
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprKind, Hooks, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKind, ExprKinds, Hooks, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag, Span},
 };
@@ -83,7 +83,7 @@ enum Inner {
 /// walk of the body the first time a transmute in it is found, which most bodies never have.
 #[derive(Default)]
 pub(crate) struct CheckTransmutes {
-    inner: FxHashMap<ExprId, Inner>,
+    inner: HashMap<ExprId, Inner>,
     stack: Vec<(ExprId, Option<Inner>)>,
     /// Whether `inner` is of the body being walked.
     built: bool,

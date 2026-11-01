@@ -24,14 +24,13 @@
 use std::{
     fmt,
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Weak,
         atomic::{AtomicU64, Ordering},
     },
 };
 
 use base_db::{Crate, Db, Nonce, ProcMacroLoadingError};
-use proc_macro_api::kept::verdict::{self as verdicts, STATEFUL, STATELESS, Verdict};
-use proc_macro_api::kept::{Call, Keeping, Mode, Put, checked, given, keeping, put, read, written};
+use blaze_hash::SharedMap;
 use blaze_ids::ContentId;
 use blaze_usercode::{
     RunKey,
@@ -40,14 +39,18 @@ use blaze_usercode::{
 };
 use hir_def::{FunctionId, StaticId, nameres::crate_def_map, unstable_features::UnstableFeatures};
 use hir_expand::proc_macro::{
-    ExpansionReads, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
-    ProcMacroLoadResult, report_reads,
+    ExpansionReads, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
+    ProcMacroKind, ProcMacroLoadResult, report_reads,
 };
 use intern::Symbol;
-use rustc_hash::FxHashMap;
+use parking_lot::Mutex;
+use proc_macro_api::kept::verdict::{self as verdicts, STATEFUL, STATELESS, Verdict};
+use proc_macro_api::kept::{Call, Keeping, Mode, Put, checked, given, keeping, put, read, written};
 
 use crate::{
-    code, keep::Calling, protocol,
+    code,
+    keep::Calling,
+    protocol,
     run::{self, Bridge, Expansion, Ran},
     stream::Stream,
 };
@@ -69,8 +72,12 @@ struct Library {
     seen: verdicts::Seen,
     /// Each calling crate's session, each held while a call that has state runs: its calls
     /// run in order.
-    sessions: Mutex<FxHashMap<Crate, Arc<Mutex<Session>>>>,
+    sessions: SharedMap<Crate, Arc<Mutex<Session>>>,
 }
+
+/// A call that panicked holding a session or the sessions leaves them as they were at the panic,
+/// and the next call takes them as they are.
+impl std::panic::RefUnwindSafe for Library {}
 
 /// The run a verdict of the crate whose code is `code` is kept under, in the store expansions
 /// are kept in, with nothing read. Each verdict has its own key, so neither is ever put under a
@@ -136,7 +143,7 @@ pub fn flush() {
     if keeping().is_none() {
         return;
     }
-    let mut libraries = LIBRARIES.lock().unwrap_or_else(|it| it.into_inner());
+    let mut libraries = LIBRARIES.lock();
     libraries.retain(|it| it.strong_count() != 0);
     for library in libraries.iter().filter_map(Weak::upgrade) {
         // Another build that saw one leave state may have told the store since the load.
@@ -169,13 +176,10 @@ impl Library {
     /// another.
     fn session(&self, db: &Db, calling: Crate) -> Arc<Mutex<Session>> {
         let now = db.nonce_and_revision();
-        let session = {
-            let mut sessions = self.sessions.lock().unwrap_or_else(|it| it.into_inner());
-            // clone: the session's handle, held for one call
-            Arc::clone(sessions.entry(calling).or_default())
-        };
+        // clone: the session's handle, held for one call
+        let session = Arc::clone(self.sessions.pin().get_or_insert_with(calling, Arc::default));
         {
-            let mut held = session.lock().unwrap_or_else(|it| it.into_inner());
+            let mut held = session.lock();
             if held.at != Some(now) {
                 *held = Session { at: Some(now), ..Session::default() };
             }
@@ -255,9 +259,9 @@ pub fn load(db: &Db, krate: Crate, toolchain: ContentId) -> ProcMacroLoadResult 
         code,
         runs: AtomicU64::new(0),
         seen: verdicts::Seen::new(verdict),
-        sessions: Mutex::new(FxHashMap::default()),
+        sessions: SharedMap::default(),
     });
-    LIBRARIES.lock().unwrap_or_else(|it| it.into_inner()).push(Arc::downgrade(&library));
+    LIBRARIES.lock().push(Arc::downgrade(&library));
     let functions = run::functions(db, krate);
     if functions.is_empty() {
         return Err(refused(format!("the proc-macro crate `{}` has no proc macros", library.name))); // alloc: error path
@@ -311,7 +315,7 @@ impl Evaluated {
     fn run(&self, db: &Db, calling: Crate, call: &ProcMacroCall<'_>) -> Result<Ran, ProcMacroExpansionError> {
         let library = &*self.library;
         let session = library.session(db, calling);
-        let mut held = session.lock().unwrap_or_else(|it| it.into_inner());
+        let mut held = session.lock();
         let this = Kept {
             function: self.function,
             attr: self.kind == ProcMacroKind::Attr,
@@ -327,7 +331,7 @@ impl Evaluated {
             // Its calls run at once: the state of each is the start, which none of them change.
             drop(held);
             let ran = self.run_on(db, code, runs, call, &[], &[], &this);
-            held = session.lock().unwrap_or_else(|it| it.into_inner());
+            held = session.lock();
             ran?
         } else {
             let replayed: &[Kept] = if held.holds { &held.calls } else { &[] };
@@ -393,7 +397,7 @@ impl Evaluated {
     /// Whether the session of `calling` starts each call from nothing.
     fn stateless(&self, db: &Db, calling: Crate) -> bool {
         let session = self.library.session(db, calling);
-        let held = session.lock().unwrap_or_else(|it| it.into_inner());
+        let held = session.lock();
         held.statics.is_empty() && !held.holds
     }
 

@@ -15,6 +15,7 @@ doctest = false
 
 [dependencies]
 blaze-api.workspace = true
+blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
 blaze-mem.workspace = true
@@ -22,7 +23,6 @@ blaze-vfs.workspace = true
 
 either.workspace = true
 memchr.workspace = true
-rustc-hash.workspace = true
 
 base-db.workspace = true
 hir.workspace = true

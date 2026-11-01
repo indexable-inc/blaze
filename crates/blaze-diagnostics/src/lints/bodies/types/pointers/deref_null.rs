@@ -5,14 +5,17 @@
 //! Follows rustc's `compiler/rustc_lint/src/builtin.rs` (`DerefNullPtr`) and
 //! `compiler/rustc_lint/src/lints.rs` (`BuiltinDerefNullptr`) (MIT or Apache-2.0).
 
-use hir_def::hir::{Expr, ExprId, UnaryOp, type_ref::{Rawness, TypeRef}};
+use blaze_hash::HashSet;
+use hir_def::hir::{
+    Expr, ExprId, UnaryOp,
+    type_ref::{Rawness, TypeRef},
+};
 use hir_ty::next_solver::TyKind;
-use rustc_hash::FxHashSet;
 use rustc_type_ir::inherent::IntoKind as _;
 
 use super::{is_zero, layout, span};
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprKind, Hooks, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKind, ExprKinds, Hooks, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::Diag,
 };
@@ -21,7 +24,7 @@ use crate::{
 pub(crate) struct DerefNullPtr {
     /// The places of the body being walked that are borrowed raw (`&raw const <place>`): the
     /// parents rustc's `parent_hir_node` finds, seen before the places in them.
-    raw_borrowed: FxHashSet<ExprId>,
+    raw_borrowed: HashSet<ExprId>,
 }
 
 impl LatePass for DerefNullPtr {

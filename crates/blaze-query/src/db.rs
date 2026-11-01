@@ -243,19 +243,15 @@ pub fn par_for_each(count: usize, task: impl Fn(usize) + Sync) {
 
 /// `f(at)` for each `at` in `0..count`, in order, run as [`par_for_each`] runs its tasks.
 pub fn par_map<R: Send>(count: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
-    let made: Vec<std::sync::Mutex<Option<R>>> =
+    let made: Vec<parking_lot::Mutex<Option<R>>> =
         // alloc: a slot per result, once per loop
-        (0..count).map(|_| std::sync::Mutex::new(None)).collect();
+        (0..count).map(|_| parking_lot::Mutex::new(None)).collect();
     par_for_each(count, |at| {
         let it = f(at);
-        *made[at].lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(it);
+        *made[at].lock() = Some(it);
     });
     made.into_iter()
-        .map(|it| {
-            it.into_inner()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .expect("every task ran")
-        })
+        .map(|it| it.into_inner().expect("every task ran"))
         // alloc: the results, once per loop
         .collect()
 }

@@ -145,7 +145,7 @@ fn panic(panic: &str) -> Result<Panic, String> {
 /// generator takes them. Worked out once per job from [`Graph`](super::graph::Graph)'s bitset.
 fn build_time(job: &Job) -> std::sync::Arc<BuildTime> {
     let crates = job.build_time.get_or_init(|| {
-        let mut crates = rustc_hash::FxHashSet::default();
+        let mut crates = blaze_hash::HashSet::default();
         for at in 0..job.graph.len() as u32 {
             if job.graph.build_time(at)
                 && let Some(krate) = job.crates.krate(at as usize)
@@ -276,7 +276,7 @@ pub(crate) struct Profiles(Box<[(String, Result<Profiled, String>)]>);
 #[cfg_attr(not(feature = "llvm"), allow(dead_code))]
 pub(crate) struct Profiled {
     id: ContentId,
-    unstored: std::sync::Mutex<Option<Vec<u8>>>,
+    unstored: parking_lot::Mutex<Option<Vec<u8>>>,
     #[cfg(feature = "llvm")]
     _given: hir_ty_codegen::v2::Profile,
 }
@@ -316,7 +316,7 @@ fn profiled(path: &str, bytes: Vec<u8>) -> Result<Profiled, String> {
     let given = hir_ty_codegen::v2::give_profile(id, &bytes)
         // alloc: an error
         .map_err(|what| format!("the profile of `-C profile-use={path}`: {what}"))?;
-    Ok(Profiled { id, unstored: std::sync::Mutex::new(Some(bytes)), _given: given })
+    Ok(Profiled { id, unstored: parking_lot::Mutex::new(Some(bytes)), _given: given })
 }
 
 #[cfg(not(feature = "llvm"))]
@@ -364,7 +364,7 @@ fn profile_put(job: &Job, pgo: Pgo) -> Result<Option<blaze_codegen::driver::Put>
     if job.input.store.has(&blaze_cas::enter(), &key) {
         return Ok(None);
     }
-    let bytes = read.unstored.lock().unwrap_or_else(|it| it.into_inner()).take();
+    let bytes = read.unstored.lock().take();
     Ok(bytes.map(|bytes| blaze_codegen::driver::Put { key, kind: blaze_cas::Kind::Output, bytes }))
 }
 
@@ -372,7 +372,7 @@ fn profile_put(job: &Job, pgo: Pgo) -> Result<Option<blaze_codegen::driver::Put>
 fn unput_profile(job: &Job, put: blaze_codegen::driver::Put) {
     let read = profiles(job).0.iter().find_map(|it| it.1.as_ref().ok().filter(|read| blaze_cas::Key(read.id) == put.key));
     if let Some(read) = read {
-        *read.unstored.lock().unwrap_or_else(|it| it.into_inner()) = Some(put.bytes);
+        *read.unstored.lock() = Some(put.bytes);
     }
 }
 
@@ -559,7 +559,9 @@ pub(crate) fn generate<'db>(
     let built = {
         let guard = blaze_cas::enter();
         let store = Reading { store: &job.input.store, guard: &guard };
-        Build::new(&backends, &frontend, &policy, &job.memo).run_with_statics(&asked, &roots.statics, &store)
+        Build::new(&backends, &frontend, &policy, &job.memo)
+            .owned_by(&u.target.name)
+            .run_with_statics(&asked, &roots.statics, &store)
     };
     match built {
         Ok(mut built) => {

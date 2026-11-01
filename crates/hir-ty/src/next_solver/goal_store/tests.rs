@@ -3,28 +3,24 @@
 //! an answer is found while its facts hold and refused when one or the solver changed, a goal
 //! with a read that is no fact is never stored, and a lookup with no store allocates nothing.
 
-use std::{
-    collections::BTreeSet,
-    marker::PhantomData,
-    path::Path,
-    sync::{Arc, Mutex},
-};
+use std::{collections::BTreeSet, marker::PhantomData, path::Path, sync::Arc};
 
 use base_db::{Crate, Db, Env, all_crates};
 use blaze_alloc_count::assert_at_most;
 use blaze_format::Aligned;
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_query::QueryKind;
+use blaze_query::db::Setter;
 use hir_def::{
     FunctionId, GenericDefId, ModuleDefId,
     deps::{ImageBuf, ImageStore},
     nameres::crate_def_map,
     signatures::FunctionSignature,
 };
-use rustc_hash::FxHashMap;
-use rustc_type_ir::inherent::{IntoKind as _, Ty as _};
-use blaze_query::db::Setter;
 use hir_expand::fixture;
+use parking_lot::Mutex;
+use rustc_type_ir::inherent::{IntoKind as _, Ty as _};
 
 use super::{
     Answer, FactObject, FactRef, Flushed, GoalFacts, SOLVER_FILES, install, lookup, lookup_goal,
@@ -128,8 +124,8 @@ fn local_crate(db: &Db) -> Crate {
     *all_crates(db).iter().find(|krate| krate.data(db).origin.is_local()).expect("a local crate")
 }
 
-fn functions(db: &Db, krate: Crate) -> FxHashMap<String, FunctionId> {
-    let mut found = FxHashMap::default();
+fn functions(db: &Db, krate: Crate) -> HashMap<String, FunctionId> {
+    let mut found = HashMap::default();
     for (_, module) in crate_def_map(db, krate).modules(db) {
         for def in module.scope(db).declarations() {
             if let ModuleDefId::FunctionId(id) = def {
@@ -143,22 +139,22 @@ fn functions(db: &Db, krate: Crate) -> FxHashMap<String, FunctionId> {
 /// A store in memory, which refuses a second put of a key with other bytes as the store does.
 #[derive(Default)]
 struct Memory {
-    images: Mutex<FxHashMap<ContentId, Arc<Aligned>>>,
+    images: Mutex<HashMap<ContentId, Arc<Aligned>>>,
 }
 
 impl Memory {
     fn len(&self) -> usize {
-        self.images.lock().unwrap().len()
+        self.images.lock().len()
     }
 }
 
 impl ImageStore for Memory {
     fn get(&self, key: &ContentId) -> Result<Option<ImageBuf>, String> {
-        Ok(self.images.lock().unwrap().get(key).map(|it| it.clone() as ImageBuf))
+        Ok(self.images.lock().get(key).map(|it| it.clone() as ImageBuf))
     }
 
     fn put(&self, key: ContentId, value: Vec<u8>) -> Result<(), String> {
-        let mut images = self.images.lock().unwrap();
+        let mut images = self.images.lock();
         match images.get(&key) {
             Some(kept) if kept[..] != value[..] => Err(format!("{key:?} kept with other bytes")),
             Some(_) => Ok(()),
@@ -178,7 +174,7 @@ impl ImageStore for Memory {
 /// so [`Back`] can read a stable form back; every read but an interned one is [`KNOB`] (or none,
 /// when not `expressible`).
 struct TestFacts {
-    defs: Mutex<FxHashMap<ContentId, Vec<u32>>>,
+    defs: Mutex<HashMap<ContentId, Vec<u32>>>,
     knob: Knob,
     expressible: bool,
     names: Mutex<Vec<&'static str>>,
@@ -196,7 +192,7 @@ impl GoalFacts for TestFacts {
         persist::put_def(&mut words, def);
         let bytes: Vec<u8> = words.0.iter().flat_map(|word| word.to_le_bytes()).collect();
         let key = ContentId::of("blaze v2 goal test def", &bytes);
-        self.defs.lock().unwrap().insert(key, words.0);
+        self.defs.lock().insert(key, words.0);
         key
     }
 
@@ -205,7 +201,7 @@ impl GoalFacts for TestFacts {
     }
 
     fn fact_of(&self, _: &Db, _: blaze_query::db::DatabaseKeyIndex, name: &'static str) -> Option<FactRef> {
-        self.names.lock().unwrap().push(name);
+        self.names.lock().push(name);
         self.expressible.then_some(KNOB)
     }
 
@@ -264,7 +260,7 @@ impl<'db> Source<'db> for RawSource<'_> {
 /// A stable form, read back: children inline, definitions by the keys [`TestFacts`] made.
 struct Back<'a, 'db> {
     words: &'a [u32],
-    defs: &'a FxHashMap<ContentId, Vec<u32>>,
+    defs: &'a HashMap<ContentId, Vec<u32>>,
     db: PhantomData<&'db ()>,
 }
 
@@ -316,7 +312,7 @@ impl<'db> Source<'db> for Back<'_, 'db> {
 /// The head words, predicate and clauses of the stable form `words`.
 fn decode<'db>(
     words: &[u32],
-    defs: &FxHashMap<ContentId, Vec<u32>>,
+    defs: &HashMap<ContentId, Vec<u32>>,
 ) -> Result<([u32; 3], Predicate<'db>, Clauses<'db>), &'static str> {
     let mut back = Back { words, defs, db: PhantomData };
     let head = [back.word()?, back.word()?, back.word()?];
@@ -373,7 +369,7 @@ const KINDS: [&str; 24] = [
 
 /// Every type of the fixture's two bodies, two that no body has, and one long enough that its
 /// stable form spans many of the hash's buffers.
-fn fixture_types<'db>(db: &'db Db, interner: DbInterner<'db>, functions: &FxHashMap<String, FunctionId>) -> Vec<Ty<'db>> {
+fn fixture_types<'db>(db: &'db Db, interner: DbInterner<'db>, functions: &HashMap<String, FunctionId>) -> Vec<Ty<'db>> {
     let mut tys = Vec::new();
     for name in ["every", "generic"] {
         let result = InferenceResult::of(db, functions[name]);
@@ -437,13 +433,13 @@ fn a_goal_reads_back_from_its_stable_form_and_its_record() {
     let version = solver_version(&BUILD);
     let memory = Memory::default();
     let limit = rustc_type_ir::Interner::recursion_limit(interner) as u32;
-    let mut keys = FxHashMap::default();
+    let mut keys = HashMap::default();
     let mut longest = 0;
     for (n, &goal) in goals.iter().enumerate() {
         let mut words = Vec::new();
         assert!(stable::goal_words(interner, &facts, goal, &mut words), "goal {n} is short enough");
         longest = longest.max(words.len());
-        let defs = facts.defs.lock().unwrap().clone();
+        let defs = facts.defs.lock().clone();
         let (head, predicate, clauses) = decode(&words, &defs).unwrap_or_else(|why| panic!("goal {n}: {why}"));
         assert_eq!(head, [u32::from(goal.mode), u32::from(interner.regions()), limit], "goal {n}");
         assert_eq!((predicate, clauses), (goal.predicate, goal.clauses), "goal {n}");
@@ -552,7 +548,7 @@ fn a_goal_with_a_read_that_is_no_fact_is_never_stored() {
     let installed = install(&db, memory.clone(), facts.clone(), BUILD).unwrap();
     offered(&db, knob);
     let flushed = installed.flush().unwrap();
-    let names = facts.names.lock().unwrap().clone();
+    let names = facts.names.lock().clone();
     assert_eq!(names.len(), 1, "one read asked about: {names:?}");
     assert_eq!(flushed, Flushed { inexpressible: vec![(names[0], 1)], ..Flushed::default() });
     assert_eq!(memory.len(), 0);

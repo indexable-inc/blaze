@@ -1,11 +1,11 @@
 use std::hash::BuildHasher;
 
+use blaze_hash::FixedState;
+use blaze_ids::rng::SplitMix64;
 use blaze_protocol::events::{
     Cache, Cause, CrateState, Event, Fns, Level, NodeKind, NodeState, Record, Slow, Step, Summary,
     Took,
 };
-use blaze_ids::rng::SplitMix64;
-use rustc_hash::FxBuildHasher;
 
 use crate::{
     Build, Count, Dur, Finished, Live, Plain, Progress, Unnamed, summary_line, took, why_lines,
@@ -1009,7 +1009,7 @@ fn indexes_agree(build: &Build, now_ns: u64) {
     assert_eq!(index.rows.len(), crates.len());
     for (row, krate) in crates.iter().enumerate() {
         assert_eq!(crates.iter().position(|it| it.name == krate.name), Some(row));
-        let hash = FxBuildHasher.hash_one(krate.name.as_str());
+        let hash = FixedState.hash_one(krate.name.as_str());
         let found = index.rows.find(hash, |&it| crates[it as usize].name == krate.name);
         assert_eq!(found, Some(&(row as u32)));
     }

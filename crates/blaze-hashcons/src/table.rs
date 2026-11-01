@@ -19,7 +19,7 @@ use std::{
     ops::Deref,
     ptr,
     sync::{
-        OnceLock, PoisonError,
+        OnceLock,
         atomic::{AtomicU32, Ordering},
     },
 };
@@ -49,17 +49,17 @@ type Chunk<T> = Box<[OnceLock<Node<T>>]>;
 /// interner.
 struct ShardLock {
     #[allow(clippy::disallowed_types)]
-    inner: std::sync::Mutex<()>,
+    inner: parking_lot::Mutex<()>,
 }
 
 #[allow(clippy::disallowed_types)]
 impl ShardLock {
     fn new() -> ShardLock {
-        ShardLock { inner: std::sync::Mutex::new(()) }
+        ShardLock { inner: parking_lot::Mutex::new(()) }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.inner.lock()
     }
 }
 

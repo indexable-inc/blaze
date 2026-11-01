@@ -1,0 +1,23 @@
+{
+  "id": "01499",
+  "from_lane": "tests-misc-lints",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-cargo/src"
+  ],
+  "what": "Wire `blaze fix` into the CLI (blaze-cargo): for each workspace member, load the crate into the front end and call blaze_lints::fix::fix(&mut db, krate, &setup, name_of); write Fixed.files back through the VFS; print FixError (it names file:line and lint) and exit nonzero on Err. `blaze fix --replace A=B` is the same edit with no lint: blaze_intent::retarget::Retarget with `to` mapping the item at A to B (agree the shape with tests-misc, who build Edit::Replace). Then turn std_lock/std_mpsc/fx_hash on in [workspace.metadata.blaze.lints] once blaze_hash exists.",
+  "state": "open",
+  "created": "2026-11-01T12:59:49Z",
+  "updated": "2026-11-01T12:59:49Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T12:59:49Z",
+      "by": "tests-misc-lints",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

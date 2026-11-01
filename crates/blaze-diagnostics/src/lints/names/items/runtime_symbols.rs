@@ -8,20 +8,20 @@
 //! canonical_symbols.rs`, `compiler/rustc_symbol_mangling/src/lib.rs` (`symbol_name_from_attrs`)
 //! and `compiler/rustc_lint/src/lints.rs` (`RedefiningRuntimeSymbolsDiag`) (MIT or Apache-2.0).
 
-use hir_ty::db::HirDatabase;
+use blaze_hash::{HashMap, HashSet};
 use blaze_items::{Fact, ItemId};
 use hir::{ModuleDef, view::HasSourceView as _};
 use hir_def::{
-    AdtId, AttrDefId, CallableDefId, FunctionId, GenericDefId, ItemContainerId, Lookup as _, StaticId,
-    attrs::AttrFlags, hir::generics::GenericParams, lang_item::lang_items,
+    AdtId, AttrDefId, CallableDefId, FunctionId, GenericDefId, ItemContainerId, Lookup as _,
+    StaticId, attrs::AttrFlags, hir::generics::GenericParams, lang_item::lang_items,
     signatures::FunctionSignature, unstable_features::UnstableFeatures,
 };
+use hir_ty::db::HirDatabase;
 use hir_ty::next_solver::{
     Binder, DbInterner, FnSig, ParamEnv, Region, RegionExt as _, Ty, TyKind, TypingMode,
     infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
 };
 use intern::{Symbol, sym};
-use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     Interner as _,
     inherent::{GenericArgs as _, IntoKind as _, Ty as _},
@@ -37,22 +37,22 @@ use crate::{
 
 /// The runtime symbols this crate's items could redefine: each symbol a crate of its graph
 /// declares canonical, with the foreign function that declares it. Keyed by interned symbol:
-/// one FxHash of a pointer per lookup.
+/// one hash of a pointer per lookup.
 pub(super) struct Canonical {
-    symbols: FxHashMap<Symbol, FunctionId>,
+    symbols: HashMap<Symbol, FunctionId>,
 }
 
 impl Canonical {
     /// rustc's `all_canonical_symbols`, read only for the symbols `items` define, so that a
     /// crate defining none reads no other crate.
     pub(super) fn of<'db>(cx: &Cx<'_, 'db>, items: &[Item<'db>]) -> Canonical {
-        let mut wanted = FxHashSet::default();
+        let mut wanted = HashSet::default();
         for item in items {
             if let Some(candidate) = candidate(cx, item) {
                 wanted.insert(candidate.symbol);
             }
         }
-        let mut symbols = FxHashMap::default();
+        let mut symbols = HashMap::default();
         if wanted.is_empty() {
             return Canonical { symbols };
         }

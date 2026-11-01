@@ -51,7 +51,7 @@
 
 use std::{borrow::Cow, ffi::OsString, io::Write as _, path::PathBuf, sync::Arc, time::Duration};
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 use blaze_core::{
     Address, Command, Completion, Conn, Done, Effect, Exit, FileName, Sandbox, Tag, Traced,
@@ -1431,7 +1431,7 @@ impl Queue {
     fn first_hello(&mut self, b: usize, r: u32, fork: u64, tests: Vec<String>) -> Result<(), String> {
         let cores = self.config.jobs;
         let bin = &mut self.bins[b];
-        let jobs: FxHashMap<&str, u32> =
+        let jobs: HashMap<&str, u32> =
             bin.plan.jobs.iter().enumerate().map(|(j, it)| (it.name.as_str(), j as u32)).collect(); // alloc: setup, once per server: the hello
         let mut expected: Vec<u64> = Vec::with_capacity(bin.plan.jobs.len()); // alloc: setup, once per server: the hello
         expected.extend(bin.plan.jobs.iter().map(|it| nanos(it.expected)));

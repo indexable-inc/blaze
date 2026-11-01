@@ -322,7 +322,7 @@ fn a_value_that_is_not_text_is_refused_where_it_is() {
     assert!(error.to_string().contains(&format!("at byte {}", root.bytes)), "{error}");
 }
 
-/// The table against an `FxHashMap<Vec<u8>, u32>` over seeded values, many sharing a hash tag,
+/// The table against an `HashMap<Vec<u8>, u32>` over seeded values, many sharing a hash tag,
 /// a home group or an order key: a value new to the map takes the next ID, a known one its own,
 /// and every ID reads back its bytes and key, in the overlay and again after a write and a
 /// restore (the mapped base), where new values continue from the same next ID.
@@ -331,7 +331,7 @@ fn interning_agrees_with_a_map_model() {
     for seed in 0..3 {
         let mut rng = SplitMix64::new(0x5eed + seed);
         let table = Table::new(shape());
-        let mut model: rustc_hash::FxHashMap<Vec<u8>, u32> = rustc_hash::FxHashMap::default();
+        let mut model: blaze_hash::HashMap<Vec<u8>, u32> = blaze_hash::HashMap::default();
         let mut next = table.end();
         // Text, as the shape's restore checks: short names, numbered ones, long runs, digits.
         let value = |rng: &mut SplitMix64| -> Vec<u8> {
@@ -345,7 +345,7 @@ fn interning_agrees_with_a_map_model() {
                 }
             }
         };
-        let check = |table: &Table, model: &mut rustc_hash::FxHashMap<Vec<u8>, u32>, next: &mut u32, bytes: Vec<u8>| {
+        let check = |table: &Table, model: &mut blaze_hash::HashMap<Vec<u8>, u32>, next: &mut u32, bytes: Vec<u8>| {
             let id = table.intern(&bytes);
             let expect = match model.get(&bytes) {
                 Some(&id) => id,

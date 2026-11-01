@@ -32,20 +32,27 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, MutexGuard, OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
+use crossbeam_queue::SegQueue;
+use parking_lot::{Mutex, MutexGuard};
 use serde_derive::{Deserialize, Serialize};
 
 pub mod arrow;
 pub mod batches;
 pub mod clock;
+pub mod diff;
+pub mod errors;
+pub mod facts;
 pub mod flight;
+pub mod gate;
 pub mod history;
+pub mod identity;
 pub mod live;
 pub mod sampler;
 pub mod schema;
@@ -54,7 +61,7 @@ mod symbols;
 pub mod views;
 pub mod watchdog;
 
-pub use flight::{FiberStack, Plot, fiber_stack, moved, plot};
+pub use flight::{FiberStack, Plot, QueryCounts, fiber_stack, moved, plot, query_counts};
 pub use watchdog::{Stall, Watchdog};
 
 /// The variable that turns profiling on, naming the directory the profile is written to.
@@ -86,7 +93,7 @@ pub const ASKED: u8 = 2;
 pub const WORKER: u8 = 3;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|it| it.into_inner())
+    mutex.lock()
 }
 
 /// Microseconds since the Unix epoch of `at`: the wall clock now, less how long ago it was.
@@ -144,16 +151,23 @@ pub fn span(name: impl Into<String>, level: Option<u8>, start: Instant, end: Ins
 }
 
 /// The steps this process noted for the build it is in: the client's.
-// alloc: once a process
-static NOTED: Mutex<Vec<Span>> = Mutex::new(Vec::new());
+static NOTED: SegQueue<Span> = SegQueue::new();
 
 /// Notes a step from `start` to now.
 pub fn note(name: &str, level: u8, start: Instant) {
-    lock(&NOTED).push(span(name, Some(level), start, Instant::now()));
+    NOTED.push(span(name, Some(level), start, Instant::now()));
 }
 
 pub fn note_all(spans: impl IntoIterator<Item = Span>) {
-    lock(&NOTED).extend(spans);
+    for span in spans {
+        NOTED.push(span);
+    }
+}
+
+/// Everything in `queue`, in the order it was pushed.
+fn drain<T>(queue: &SegQueue<T>) -> Vec<T> {
+    // alloc: writing the profile, once a build
+    std::iter::from_fn(|| queue.pop()).collect()
 }
 
 /// What the answer line of a worker has after the spans it sends.
@@ -263,17 +277,32 @@ fn carry_with_fiber_jobs() {
     CARRIED.call_once(|| {
         fiber::carry(fiber::Carried { take: flight::take_open, put: flight::put_open });
         _ = fiber::observe(observed);
-        _ = pump::span_waits(pump::WaitSpans { begin: wait_began, end: wait_ended });
+        _ = fiber::observe_idle(idled);
+        _ = pump::span_waits(pump::WaitSpans { begin: wait_began, end: wait_ended, held: hold_began });
     });
 }
 
-/// Opens and enters the span `wait`, its `function` what it waits for: its id, 0 when no
-/// subscriber records it. The span outlives this call, closed by [`wait_ended`].
-fn wait_began(awaited: &str) -> u64 {
-    let span = tracing::info_span!(target: "blaze", "wait", function = awaited);
+/// Opens and enters the span `wait`, its `awaits` (and `function`) what it waits for and its
+/// `owner` the task running that: its id, 0 when no subscriber records it. The span outlives
+/// this call, closed by [`wait_ended`].
+fn wait_began(awaited: &str, owner: Option<u64>) -> u64 {
+    let span = tracing::info_span!(target: "blaze", "wait", function = awaited, awaits = awaited, owner);
     let Some(id) = span.id() else { return 0 };
     tracing::dispatcher::get_default(|it| {
         // The handle `span` drops is given back: the wait keeps the span open.
+        _ = it.clone_span(&id);
+        it.enter(&id);
+    });
+    id.into_u64()
+}
+
+/// Opens and enters the span `hold`, its `function` what is held and its `owner` the task
+/// holding it (the number a waiter's `owner` names); closed by [`wait_ended`] as a wait's is.
+fn hold_began(what: &str, holder: u64) -> u64 {
+    let span = tracing::info_span!(target: "blaze", "hold", function = what, owner = holder);
+    let Some(id) = span.id() else { return 0 };
+    tracing::dispatcher::get_default(|it| {
+        // The handle `span` drops is given back: the hold keeps the span open.
         _ = it.clone_span(&id);
         it.enter(&id);
     });
@@ -289,6 +318,23 @@ fn wait_ended(span: u64) {
         it.exit(&id);
         // clone: an id is a number; `get_default` may call this more than once
         _ = it.try_close(id.clone());
+    });
+}
+
+/// A worker of `blaze_graph`'s fiber driver going idle or waking, as a switch row of no job.
+fn idled(idle: blaze_graph::sched::Idle) {
+    use blaze_graph::sched::IdleReason;
+    use flight::{Switched, WaitedOn};
+    let waited = match idle.reason {
+        IdleReason::Nothing => (WaitedOn::Nothing, 0),
+        IdleReason::Until(at) => (WaitedOn::Until, at),
+    };
+    flight::switched(flight::Switch {
+        event: if idle.began { Switched::Idle } else { Switched::Woke },
+        job: 0,
+        fiber: 0,
+        core: idle.core.0,
+        waited: Some(waited),
     });
 }
 
@@ -354,9 +400,9 @@ struct Recorded {
     tid: u64,
     thread: String,
     events: Vec<Event>,
-    phases: FxHashMap<&'static str, Cost>,
-    subjects: FxHashMap<(&'static str, Box<str>), Cost>,
-    passes: FxHashMap<&'static str, Cost>,
+    phases: HashMap<&'static str, Cost>,
+    subjects: HashMap<(&'static str, Box<str>), Cost>,
+    passes: HashMap<&'static str, Cost>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -395,8 +441,7 @@ impl Cost {
 }
 
 /// Every thread's [`Recorded`].
-// alloc: once a process
-static THREADS: Mutex<Vec<Arc<Mutex<Recorded>>>> = Mutex::new(Vec::new());
+static THREADS: SegQueue<Arc<Mutex<Recorded>>> = SegQueue::new();
 
 /// A target `blaze` span open on this thread: its id, the thread's CPU time when it began,
 /// the CPU time of the `blaze` spans under it, and what it is of.
@@ -417,7 +462,7 @@ thread_local! {
             ..Recorded::default()
         }));
         // clone: once per thread, as it first records
-        lock(&THREADS).push(recorded.clone());
+        THREADS.push(recorded.clone());
         recorded
     };
     // alloc: once per thread, as it first records
@@ -699,8 +744,7 @@ impl Drop for Pass {
 
 /// The step of the build the process is at, from when it began, on a track of its own.
 static STEP: Mutex<Option<(String, Instant)>> = Mutex::new(None);
-// alloc: once a process
-static STEPS: Mutex<Vec<Event>> = Mutex::new(Vec::new());
+static STEPS: SegQueue<Event> = SegQueue::new();
 
 /// Says the process is at the step `name` (`None`: waiting), done with the one before.
 pub fn step(name: Option<String>) {
@@ -713,7 +757,7 @@ pub fn step(name: Option<String>) {
         let dur_us = now.saturating_duration_since(start).as_micros() as u64;
         let event =
             Event { name, subject: None, tid: 0, start_us: us_of(start), dur_us, cpu_us: None };
-        lock(&STEPS).push(event);
+        STEPS.push(event);
     }
 }
 
@@ -755,19 +799,17 @@ struct Sampled {
 
 /// Takes what every thread recorded since the last call.
 fn take() -> Part {
-    let threads = std::mem::take(&mut *lock(&THREADS));
+    let threads = drain(&THREADS);
     let mut part = Part {
         pid: std::process::id(),
         command: command(),
-        events: std::mem::take(&mut *lock(&STEPS)),
+        events: drain(&STEPS),
         ..Part::default()
     };
     if !part.events.is_empty() {
         // alloc: writing the profile, once a build
         part.threads.push((0, "steps".to_owned()));
     }
-    // alloc: writing the profile, once a build
-    let mut kept = Vec::new();
     for thread in threads {
         let mut it = lock(&thread);
         if !it.events.is_empty() || !it.phases.is_empty() || !it.passes.is_empty() {
@@ -790,10 +832,9 @@ fn take() -> Part {
         drop(it);
         // A thread that has ended holds it no more.
         if Arc::strong_count(&thread) > 1 {
-            kept.push(thread);
+            THREADS.push(thread);
         }
     }
-    lock(&THREADS).extend(kept);
     part
 }
 
@@ -894,7 +935,7 @@ pub fn finish() {
     if !stats && profile.is_none() {
         return;
     }
-    let spans = std::mem::take(&mut *lock(&NOTED));
+    let spans = drain(&NOTED);
     let (start, end) = (epoch_us(began()), epoch_us(Instant::now()));
     eprint!("{}", table(&spans, start, end));
     if let Some(dir) = profile {
@@ -954,9 +995,9 @@ fn put_together(dir: &Path, spans: &[Span], start: u64, end: u64) -> std::io::Re
     let mut out = std::io::BufWriter::new(std::fs::File::create(&trace)?);
     chrome(&mut out, spans, &parts, start, end)?;
     out.flush()?;
-    let mut phases: FxHashMap<&str, Cost> = FxHashMap::default();
-    let mut subjects: FxHashMap<(&str, &str), Cost> = FxHashMap::default();
-    let mut passes: FxHashMap<&str, Cost> = FxHashMap::default();
+    let mut phases: HashMap<&str, Cost> = HashMap::default();
+    let mut subjects: HashMap<(&str, &str), Cost> = HashMap::default();
+    let mut passes: HashMap<&str, Cost> = HashMap::default();
     for part in &parts {
         for (name, cost) in &part.phases {
             phases.entry(name.as_str()).or_default().merge(*cost);
@@ -1012,7 +1053,7 @@ fn put_together(dir: &Path, spans: &[Span], start: u64, end: u64) -> std::io::Re
     for file in files {
         _ = std::fs::remove_file(file);
     }
-    let processes = parts.iter().map(|it| it.pid).collect::<rustc_hash::FxHashSet<_>>().len();
+    let processes = parts.iter().map(|it| it.pid).collect::<blaze_hash::HashSet<_>>().len();
     // alloc: writing the profile, once a build
     let mut said = format!(
         "blaze: profile of {processes} processes in {}: trace.json (ui.perfetto.dev), \
@@ -1047,7 +1088,7 @@ fn chrome(
         write!(out, "{comma}{event}")
     };
     out.write_all(b"{\"traceEvents\":[\n")?;
-    let mut named = rustc_hash::FxHashSet::default();
+    let mut named = blaze_hash::HashSet::default();
     for part in parts {
         if named.insert((part.pid, u64::MAX)) {
             put(
@@ -1159,7 +1200,7 @@ fn chrome(
     let mut ours = json!({"start_us": start, "total_us": end - start, "breakdown": breakdown});
     // The samples folded, outermost function first and `;` between, with how often each stack
     // was seen, most first: a flame graph's input, and text an agent reads.
-    let mut folded: FxHashMap<String, u64> = FxHashMap::default();
+    let mut folded: HashMap<String, u64> = HashMap::default();
     for it in parts.iter().flat_map(|part| &part.samples) {
         // alloc: writing the profile, once a build
         let stack: Vec<&str> = it.stack.iter().rev().map(String::as_str).collect();
@@ -1236,7 +1277,7 @@ mod tests {
         start(&dir);
         {
             let _dropped = tracing::info_span!(target: "blaze", "dropped").entered();
-            std::thread::sleep(Duration::from_millis(1));
+            blaze_graph::spin::busy(Duration::from_millis(1));
         }
         discard();
         step(Some("Codegen".to_owned()));
@@ -1253,9 +1294,9 @@ mod tests {
         }
         {
             let _whole = pass("compile");
-            std::thread::sleep(Duration::from_millis(2));
+            blaze_graph::spin::busy(Duration::from_millis(2));
             let _part = pass("regalloc");
-            std::thread::sleep(Duration::from_millis(8));
+            blaze_graph::spin::busy(Duration::from_millis(8));
         }
         step(None);
         write_part();

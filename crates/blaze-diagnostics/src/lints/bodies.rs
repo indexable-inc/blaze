@@ -45,10 +45,10 @@ mod unstable_names;
 use std::cell::{Cell, OnceCell};
 
 use base_db::Db;
+use blaze_hash::HashMap;
 use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
 use hir::{DefWithBody, InFile, db::HirDatabase};
-use hir_expand::MacroCallKind;
 use hir_def::{
     AdtId, DefWithBodyId, Lookup, ModuleDefId,
     expr_store::{Body, BodySourceMap, ExpressionStore, ExpressionStoreDiagnostics},
@@ -57,11 +57,12 @@ use hir_def::{
     signatures::FunctionSignature,
     src::HasSource as _,
 };
+use hir_expand::MacroCallKind;
 use hir_ty::{
-    InferBodyId, InferenceDiagnostic, InferenceResult, PathLoweringDiagnostic, TyLoweringDiagnostic,
+    InferBodyId, InferenceDiagnostic, InferenceResult, PathLoweringDiagnostic,
+    TyLoweringDiagnostic,
     mir::{MirBody, MirSpan},
 };
-use rustc_hash::FxHashMap;
 use span::FileId;
 use syntax::{
     SyntaxNodePtr, TextRange, TextSize,
@@ -583,7 +584,7 @@ fn child_exprs(store: &ExpressionStore, expr: ExprId, out: &mut Vec<ExprId>) {
 /// hold.
 fn body_owners(cx: &Cx<'_, '_>) -> Vec<DefWithBodyId> {
     let db = cx.db;
-    let mut rank: FxHashMap<FileId, usize> = FxHashMap::default();
+    let mut rank: HashMap<FileId, usize> = HashMap::default();
     for module in crate::checks::modules(cx) {
         let file = module.definition_source_file_id(db).original_file(db).file_id(db);
         let next = rank.len();

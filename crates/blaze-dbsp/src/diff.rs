@@ -1,9 +1,9 @@
 use std::{cell::RefCell, hash::BuildHasher};
 
-use rustc_hash::FxBuildHasher;
+use blaze_hash::FixedState;
 
 /// Diff of two op sequences: equal prefix and suffix skipped, multiset diff of the middle by
-/// `hash` (FxHash of the item) then `==`. Positions are indexes into old/new, ascending. Within
+/// `hash` (the hash of the item) then `==`. Positions are indexes into old/new, ascending. Within
 /// the middle, an item present in both (same hash and equal) as many times is kept, not removed
 /// and re-added.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -34,7 +34,7 @@ thread_local! {
 }
 
 /// [`SeqDiff`] of `old` and `new` into `out` (cleared first). `O(n)` compares for the prefix and
-/// suffix, then `O(k log k)` for a middle of `k` items: one FxHash each, a sort of the
+/// suffix, then `O(k log k)` for a middle of `k` items: one hash each, a sort of the
 /// `(hash, index)` rows, and a merge. A warm call allocates nothing.
 pub fn diff_seq<T: Eq + std::hash::Hash>(old: &[T], new: &[T], out: &mut SeqDiff) {
     out.clear();
@@ -77,7 +77,7 @@ pub fn diff_seq<T: Eq + std::hash::Hash>(old: &[T], new: &[T], out: &mut SeqDiff
 
 fn rows<T: std::hash::Hash>(items: &[T], range: std::ops::Range<usize>, out: &mut Vec<(u64, u32)>) {
     out.clear();
-    out.extend(range.map(|at| (FxBuildHasher.hash_one(&items[at]), at as u32)));
+    out.extend(range.map(|at| (FixedState.hash_one(&items[at]), at as u32)));
     out.sort_unstable();
 }
 

@@ -55,9 +55,8 @@ use std::{
 };
 
 use arrayvec::ArrayVec;
-use base_db::{
-    CrateDisplayName, CrateOrigin, Db, LangCrateOrigin, TargetKind, all_crates,
-};
+use base_db::{CrateDisplayName, CrateOrigin, Db, LangCrateOrigin, TargetKind, all_crates};
+use blaze_hash::{HashMap, HashSet};
 use blaze_hashcons::Interned;
 use either::Either;
 use hir_def::{
@@ -115,7 +114,6 @@ use hir_ty_mir::{
     mir_pretty::{MirBodyPretty as _, MirEvalErrorPretty as _},
 };
 use itertools::Itertools;
-use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     AliasTyKind, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor, fast_reject,
     inherent::{AdtDef as _, GenericArgs as _, IntoKind, SliceLike, Term as _, Ty as _},
@@ -169,13 +167,13 @@ pub use crate::{
     diagnostics::*,
     match_lints::{
         BindingOrigin, BindingWithVariantName, ConstPatternError, IrrefutableLet, LetSource,
-        ManualPartialEq, MatchLint, NonContiguousRangeEndpoints, OverlappingRangeEndpoints, PatternTypo, SpecialTy,
-        UnreachablePattern,
+        ManualPartialEq, MatchLint, NonContiguousRangeEndpoints, OverlappingRangeEndpoints,
+        PatternTypo, SpecialTy, UnreachablePattern,
     },
     named::named_dependencies,
     semantics::{
-        LintAttr, PathResolution, PathResolutionPerNs, SemanticsImpl, SemanticsScope,
-        TypeInfo, VisibleTraits,
+        LintAttr, PathResolution, PathResolutionPerNs, SemanticsImpl, SemanticsScope, TypeInfo,
+        VisibleTraits,
         view::{self, FieldSourceView, LocalSourceView, ModuleSourceView},
     },
 };
@@ -197,8 +195,8 @@ pub use {
         attrs::{
             Docs, IsInnerDoc,
             stability::{
-                DeprecatedSince, Deprecation, DeprecationEntry, RustcVersion, StableSince,
-                Stability, StabilityLevel, UnstableReason,
+                DeprecatedSince, Deprecation, DeprecationEntry, RustcVersion, Stability,
+                StabilityLevel, StableSince, UnstableReason,
             },
         },
         expr_store::Body,
@@ -227,12 +225,8 @@ pub use {
         proc_macro::{ProcMacros, ProcMacrosBuilder},
         tt,
     },
-    // FIXME: Properly encapsulate mir
-    hir_ty_mir::mir,
-    hir_ty_mir::{const_macro, mir_pretty::ConstEvalErrorPretty},
     hir_ty::{
-        CastError, EditionLint, PointerCast, ReceiverAdjustment, attach_db,
-        attach_db_allow_change,
+        CastError, EditionLint, PointerCast, ReceiverAdjustment, attach_db, attach_db_allow_change,
         consteval::ConstEvalError,
         display::{ClosureStyle, DisplayTarget, HirDisplay, HirDisplayError},
         drop::DropGlue,
@@ -245,6 +239,9 @@ pub use {
     },
     // FIXME: These are needed for import assets, properly encapsulate them.
     hir_ty::{method_resolution::TraitImpls, next_solver::SimplifiedType},
+    // FIXME: Properly encapsulate mir
+    hir_ty_mir::mir,
+    hir_ty_mir::{const_macro, mir_pretty::ConstEvalErrorPretty},
     hir_ty_wfcheck::SignatureMismatchAt,
     intern::{Symbol, sym},
 };
@@ -4018,7 +4015,7 @@ impl Impl {
             }
         }
         // An impl in a block is one of its crate as well as of the block.
-        let mut seen = FxHashSet::default(); // alloc: editor edge, sized by the impls found
+        let mut seen = HashSet::default(); // alloc: editor edge, sized by the impls found
         result.retain(|it| seen.insert(*it));
         result
     }
@@ -4041,7 +4038,7 @@ impl Impl {
             handle_impls(impls);
         }
         // An impl in a block is one of its crate as well as of the block.
-        let mut seen = FxHashSet::default(); // alloc: editor edge, sized by the impls found
+        let mut seen = HashSet::default(); // alloc: editor edge, sized by the impls found
         all.retain(|it| seen.insert(*it));
         all
     }
@@ -4793,7 +4790,7 @@ impl<'db> Type<'db> {
         tys: impl IntoIterator<Item: Borrow<Type<'db>>>,
         infcx: &InferCtxt<'db>,
     ) -> impl Iterator<Item = Ty<'db>> {
-        let mut var_for_param = FxHashMap::default();
+        let mut var_for_param = HashMap::default();
         tys.into_iter().map(move |ty| {
             let ty = ty.borrow();
             let owner = match ty.owner {
@@ -5716,7 +5713,7 @@ impl<'db> Type<'db> {
         &self,
         db: &'db Db,
         scope: &SemanticsScope<'db>,
-        traits_in_scope: &FxHashSet<TraitId>,
+        traits_in_scope: &HashSet<TraitId>,
         name: Option<&Name>,
         mut callback: impl FnMut(Function) -> Option<T>,
     ) -> Option<T> {
@@ -5754,7 +5751,7 @@ impl<'db> Type<'db> {
         &self,
         db: &'db Db,
         resolver: &Resolver<'db>,
-        traits_in_scope: &FxHashSet<TraitId>,
+        traits_in_scope: &HashSet<TraitId>,
         f: impl FnOnce(&MethodResolutionContext<'_, 'db>) -> R,
     ) -> R {
         let module = resolver.module();
@@ -5798,7 +5795,7 @@ impl<'db> Type<'db> {
         &self,
         db: &'db Db,
         scope: &SemanticsScope<'db>,
-        traits_in_scope: &FxHashSet<TraitId>,
+        traits_in_scope: &HashSet<TraitId>,
         name: Option<&Name>,
         mut callback: impl MethodCandidateCallback,
     ) {
@@ -5878,7 +5875,7 @@ impl<'db> Type<'db> {
         &self,
         db: &'db Db,
         scope: &SemanticsScope<'db>,
-        traits_in_scope: &FxHashSet<TraitId>,
+        traits_in_scope: &HashSet<TraitId>,
         name: Option<&Name>,
         mut callback: impl FnMut(AssocItem) -> Option<T>,
     ) -> Option<T> {
@@ -5907,7 +5904,7 @@ impl<'db> Type<'db> {
         &self,
         db: &'db Db,
         scope: &SemanticsScope<'db>,
-        traits_in_scope: &FxHashSet<TraitId>,
+        traits_in_scope: &HashSet<TraitId>,
         name: Option<&Name>,
         mut callback: impl PathCandidateCallback,
     ) {
@@ -6107,7 +6104,7 @@ impl<'db> Type<'db> {
             interner: DbInterner<'db>,
             owner: TypeOwnerId,
             callback: F,
-            visited: FxHashSet<Ty<'db>>,
+            visited: HashSet<Ty<'db>>,
         }
         impl<'db, F> TypeVisitor<DbInterner<'db>> for Visitor<'db, F>
         where
@@ -6136,7 +6133,7 @@ impl<'db> Type<'db> {
             interner: DbInterner::new_no_crate(db),
             owner: self.owner,
             callback,
-            visited: FxHashSet::default(),
+            visited: HashSet::default(),
         };
         self.ty.skip_binder().visit_with(&mut visitor);
     }
@@ -6189,7 +6186,7 @@ impl<'db> Type<'db> {
     }
 
     /// Returns unique `GenericParam`s contained in this type.
-    pub fn generic_params(&self, db: &'db Db) -> FxHashSet<GenericParam> {
+    pub fn generic_params(&self, db: &'db Db) -> HashSet<GenericParam> {
         hir_ty::collect_params(&self.ty.skip_binder())
             .into_iter()
             .map(|id| TypeOrConstParam { id }.split(db).either_into())

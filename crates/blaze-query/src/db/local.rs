@@ -14,7 +14,7 @@
 
 use std::{cell::UnsafeCell, hash::BuildHasher, ptr};
 
-use rustc_hash::FxBuildHasher;
+use blaze_hash::FixedState;
 
 use super::{Id, Storage};
 use crate::table::ShortLock;
@@ -153,7 +153,9 @@ pub(crate) struct Local {
     bloom: [u16; BLOOM],
     serial: u64,
     /// Tracked structs made by each run: `(run serial, ingredient, identity hash)` → count.
-    pub(crate) occurrences: hashbrown::HashMap<(u64, u32, u64), u32, FxBuildHasher>,
+    pub(crate) occurrences: hashbrown::HashMap<(u64, u32, u64), u32, FixedState>,
+    /// The nodes [`Local::dedup_from`] has kept, empty between its calls.
+    seen: hashbrown::HashSet<u32, FixedState>,
     pub(crate) attached: *const Storage,
 }
 
@@ -169,7 +171,8 @@ impl Local {
             walk: Vec::new(), // alloc: none, empty
             bloom: [0; BLOOM],
             serial: 0,
-            occurrences: hashbrown::HashMap::with_hasher(FxBuildHasher),
+            occurrences: hashbrown::HashMap::with_hasher(FixedState),
+            seen: hashbrown::HashSet::with_hasher(FixedState),
             attached: ptr::null(),
         }
     }
@@ -271,6 +274,29 @@ impl Local {
         self.edges.push(node);
     }
 
+    /// Drops every edge from `start` on that repeats one before it there, the first of each
+    /// kept in order: a node read again in one run is proved by its first read, and a run
+    /// that reads a few thousand nodes in turn (a pass over a body's calls) has its edges
+    /// once each instead of once a read. Short runs, which the read's own check of the last
+    /// edge keeps small, are left as they are. The edges from `start` must be the top frame's.
+    pub(crate) fn dedup_from(&mut self, start: usize) {
+        const LONG: usize = 1 << 12;
+        if self.edges.len() - start <= LONG {
+            return;
+        }
+        let mut kept = start;
+        for at in start..self.edges.len() {
+            let node = self.edges[at];
+            // alloc: none once warm: the set grows to its high-water mark once per thread
+            if self.seen.insert(node) {
+                self.edges[kept] = node;
+                kept += 1;
+            }
+        }
+        self.edges.truncate(kept);
+        self.seen.clear();
+    }
+
     pub(crate) fn push(&mut self, mut frame: Frame) -> u32 {
         let at = self.frames.len() as u32;
         frame.edges_start = self.edges.len() as u32;
@@ -370,7 +396,7 @@ impl Local {
 
     /// The hash the occurrence table keys an identity by.
     pub(crate) fn identity_hash<T: std::hash::Hash>(identity: &T) -> u64 {
-        FxBuildHasher.hash_one(identity)
+        FixedState.hash_one(identity)
     }
 }
 

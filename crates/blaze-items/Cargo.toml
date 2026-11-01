@@ -15,12 +15,12 @@ doctest = false
 
 [dependencies]
 blaze-format.workspace = true
+blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
 blaze-query.workspace = true
 serde = { workspace = true, features = ["derive"] }
 
-rustc-hash.workspace = true
 smallvec.workspace = true
 either.workspace = true
 rustc_type_ir.workspace = true

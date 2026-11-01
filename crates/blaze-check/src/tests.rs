@@ -6,8 +6,11 @@ use std::{
     cell::Cell as StdCell,
     collections::BTreeSet,
     panic::{AssertUnwindSafe, Location, catch_unwind},
-    sync::{Arc as StdArc, Mutex as StdMutex, atomic::AtomicU64 as Id},
+    sync::{Arc as StdArc, atomic::AtomicU64 as Id},
+    time::Duration,
 };
+
+use parking_lot::Mutex as StdMutex;
 
 use crate::{
     Builder,
@@ -19,6 +22,7 @@ use crate::{
     sync::{
         Arc, Condvar, Mutex, OnceLock, RwLock,
         atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering, fence},
+        lot,
     },
     thread,
 };
@@ -31,9 +35,9 @@ fn outcomes<T: Ord + Clone + 'static>(builder: Builder, f: impl Fn() -> T + 'sta
     let into = StdArc::clone(&seen);
     builder.check(move || {
         let out = f();
-        into.lock().unwrap().insert(out);
+        into.lock().insert(out);
     });
-    let seen = seen.lock().unwrap().clone();
+    let seen = seen.lock().clone();
     seen
 }
 
@@ -420,6 +424,67 @@ fn a_lost_wakeup_is_a_deadlock() {
         };
         // Waits without a condition: the notify may come first and be lost.
         let guard = pair.1.wait(pair.0.lock().unwrap()).unwrap();
+        drop(guard);
+        notifier.join().unwrap();
+    });
+    assert!(report.contains("deadlock"), "{report}");
+}
+
+#[test]
+fn the_lot_locks_count_right_and_wake_their_waiter() {
+    let seen = outcomes(builder(), || {
+        let pair = Arc::new((lot::Mutex::new(0u32), lot::Condvar::new()));
+        let others: Vec<_> = (0..2)
+            .map(|_| {
+                let pair = pair.clone();
+                thread::spawn(move || {
+                    *pair.0.lock() += 1;
+                    pair.1.notify_all();
+                })
+            })
+            .collect();
+        let n = {
+            let mut n = pair.0.lock();
+            pair.1.wait_while(&mut n, |n| *n < 2);
+            *n
+        };
+        for other in others {
+            other.join().unwrap();
+        }
+        n
+    });
+    assert_eq!(seen, BTreeSet::from([2]));
+}
+
+#[test]
+fn a_lot_condvar_timed_out_only_while_its_condition_holds() {
+    builder().check(|| {
+        let pair = Arc::new((lot::Mutex::new(false), lot::Condvar::new()));
+        let notifier = {
+            let pair = pair.clone();
+            thread::spawn(move || {
+                *pair.0.lock() = true;
+                pair.1.notify_one();
+            })
+        };
+        let mut ready = pair.0.lock();
+        let waited = pair.1.wait_while_for(&mut ready, |ready| !*ready, Duration::from_secs(1));
+        assert_eq!(waited.timed_out(), !*ready);
+        drop(ready);
+        notifier.join().unwrap();
+    });
+}
+
+#[test]
+fn a_lost_wakeup_on_a_lot_condvar_is_a_deadlock() {
+    let report = finding(builder(), || {
+        let pair = Arc::new((lot::Mutex::new(()), lot::Condvar::new()));
+        let notifier = {
+            let pair = pair.clone();
+            thread::spawn(move || pair.1.notify_one())
+        };
+        let mut guard = pair.0.lock();
+        pair.1.wait(&mut guard);
         drop(guard);
         notifier.join().unwrap();
     });
@@ -1055,7 +1120,7 @@ fn interleavings() -> Vec<Vec<u8>> {
     let mut builder = builder();
     builder.max_preemptions = Some(2);
     builder.check(move || {
-        into_log.lock().unwrap().clear();
+        into_log.lock().clear();
         let lock = Arc::new(Mutex::new(0u32));
         let x = Arc::new(AtomicU32::new(0));
         let workers: Vec<_> = (1..3u8)
@@ -1063,25 +1128,25 @@ fn interleavings() -> Vec<Vec<u8>> {
                 let (log, lock, x) = (into_log.clone(), lock.clone(), x.clone());
                 thread::spawn(move || {
                     for _ in 0..2 {
-                        log.lock().unwrap().push(me);
+                        log.lock().push(me);
                         x.fetch_add(1, AcqRel);
-                        log.lock().unwrap().push(me);
+                        log.lock().push(me);
                         *lock.lock().unwrap() += 1;
                         thread::yield_now();
                     }
                 })
             })
             .collect();
-        into_log.lock().unwrap().push(0);
+        into_log.lock().push(0);
         x.load(Acquire);
-        into_log.lock().unwrap().push(0);
+        into_log.lock().push(0);
         for worker in workers {
             worker.join().unwrap();
         }
-        let trace = into_log.lock().unwrap().clone();
-        into_runs.lock().unwrap().push(trace);
+        let trace = into_log.lock().clone();
+        into_runs.lock().push(trace);
     });
-    let runs = runs.lock().unwrap().clone();
+    let runs = runs.lock().clone();
     runs
 }
 

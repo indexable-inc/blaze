@@ -3,16 +3,17 @@
 //! that fails or panics is answered `Failed` naming it, and the run is stopped once. On a
 //! host with stubs, threads call through real entries into a hook that asks a runner.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use blaze_codegen::{CompiledFunction, InstanceKey, plan::Mode, plan::OptLevel};
-use blaze_inproc::frame::Kind;
+use blaze_hash::{HashMap, HashSet};
 use blaze_inproc::CodeMemory;
+use blaze_inproc::frame::Kind;
 use blaze_items::ItemKey;
 use blaze_stencil::tier::{self, CALLS, Policy, Tier};
-use rustc_hash::{FxHashMap, FxHashSet};
+use parking_lot::{Condvar, Mutex};
 
 use super::{Rng, compiled, function, key, policy};
 use crate::{
@@ -27,7 +28,7 @@ use crate::{
 /// The answers a runner sent, by client and sequence number, and the stops it asked for.
 #[derive(Default)]
 pub(crate) struct Mailbox {
-    answers: Mutex<FxHashMap<(u32, u32), (Kind, Vec<u8>)>>,
+    answers: Mutex<HashMap<(u32, u32), (Kind, Vec<u8>)>>,
     arrived: Condvar,
     stops: Mutex<Vec<(Option<(InstanceKey, ItemKey)>, String)>>,
 }
@@ -36,23 +37,23 @@ impl Mailbox {
     /// The answer to `client`'s frame `seq`, once it comes.
     pub(crate) fn wait(&self, client: u32, seq: u32) -> (Kind, Vec<u8>) {
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut answers = self.answers.lock().unwrap();
+        let mut answers = self.answers.lock();
         loop {
             if let Some(answer) = answers.remove(&(client, seq)) {
                 return answer;
             }
             let left = deadline.checked_duration_since(Instant::now()).expect("an answer within a minute");
-            answers = self.arrived.wait_timeout(answers, left).unwrap().0;
+            self.arrived.wait_for(&mut answers, left);
         }
     }
 
     /// Whether `client`'s frame `seq` was answered yet, not waiting.
     pub(crate) fn has(&self, client: u32, seq: u32) -> bool {
-        self.answers.lock().unwrap().contains_key(&(client, seq))
+        self.answers.lock().contains_key(&(client, seq))
     }
 
     pub(crate) fn stops(&self) -> Vec<(Option<(InstanceKey, ItemKey)>, String)> {
-        self.stops.lock().unwrap().clone()
+        self.stops.lock().clone()
     }
 }
 
@@ -61,13 +62,13 @@ pub(crate) struct Mail(pub(crate) Arc<Mailbox>);
 
 impl Answers for Mail {
     fn send(&self, client: u32, seq: u32, kind: Kind, body: &[u8]) {
-        let old = self.0.answers.lock().unwrap().insert((client, seq), (kind, body.to_vec()));
+        let old = self.0.answers.lock().insert((client, seq), (kind, body.to_vec()));
         assert!(old.is_none(), "frame {seq} of client {client} answered twice");
         self.0.arrived.notify_all();
     }
 
     fn stop(&self, function: Option<(InstanceKey, ItemKey)>, why: &str) {
-        self.0.stops.lock().unwrap().push((function, why.to_owned()));
+        self.0.stops.lock().push((function, why.to_owned()));
     }
 }
 
@@ -84,8 +85,8 @@ pub(crate) struct Counting {
 
 impl Compiler for Counting {
     fn compile(&self, key: InstanceKey) -> Result<CompiledFunction, String> {
-        self.seen.lock().unwrap().push(key);
-        std::thread::sleep(self.delay);
+        self.seen.lock().push(key);
+        blaze_spin::busy(self.delay);
         if self.fail.contains(&key) {
             return Err("its MIR could not be built".to_owned());
         }
@@ -116,12 +117,12 @@ impl Compiler for Counting {
 
 impl Counting {
     fn times(&self, key: InstanceKey) -> usize {
-        self.seen.lock().unwrap().iter().filter(|it| **it == key).count()
+        self.seen.lock().iter().filter(|it| **it == key).count()
     }
 }
 
 /// Places each function at the address its key was given.
-pub(crate) struct Addresses(pub(crate) FxHashMap<InstanceKey, u64>);
+pub(crate) struct Addresses(pub(crate) HashMap<InstanceKey, u64>);
 
 impl Placer for Addresses {
     fn place(&mut self, function: &CompiledFunction) -> Result<u64, String> {
@@ -309,9 +310,9 @@ fn idle_workers_compile_the_rest_and_close_reports_what_failed_unasked() {
     let deadline = Instant::now() + Duration::from_secs(60);
     while (0..10).any(|n| runner.target(&key(n)).is_none() && n != 2) || compiler.times(key(2)) == 0 {
         assert!(Instant::now() < deadline, "idle compiles within a minute");
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::yield_now();
     }
-    assert_eq!(compiler.seen.lock().unwrap().first(), Some(&key(4)), "history before idle");
+    assert_eq!(compiler.seen.lock().first(), Some(&key(4)), "history before idle");
     let closed = runner.close();
     assert_eq!(closed.failures.len(), 1);
     assert_eq!(closed.failures[0].0, key(2));
@@ -338,7 +339,7 @@ impl Compiler for Tiers {
     }
 
     fn tier_up(&self, key: InstanceKey, to: Tier) -> Result<CompiledFunction, String> {
-        self.ups.lock().unwrap().push((key, to));
+        self.ups.lock().push((key, to));
         if self.fail {
             return Err("its MIR could not be built".to_owned());
         }
@@ -360,7 +361,7 @@ const CODE_MEMORY: bool = cfg!(any(
 struct Slots {
     addresses: Addresses,
     cells: u64,
-    replaced: FxHashSet<InstanceKey>,
+    replaced: HashSet<InstanceKey>,
 }
 
 impl Slots {
@@ -391,7 +392,7 @@ fn wait_for(what: &str, done: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(60);
     while !done() {
         assert!(Instant::now() < deadline, "{what} within a minute");
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::yield_now();
     }
 }
 
@@ -414,7 +415,7 @@ fn hot_cells_tier_a_function_up_and_its_late_asks_get_the_new_code() {
         session(&functions),
         &[],
         compiler.clone(),
-        Slots { addresses: addresses(3), cells, replaced: FxHashSet::default() },
+        Slots { addresses: addresses(3), cells, replaced: HashSet::default() },
         Mail(Arc::clone(&mail)),
         Config { workers: 1, idle: false },
         Some(up),
@@ -440,7 +441,7 @@ fn hot_cells_tier_a_function_up_and_its_late_asks_get_the_new_code() {
     assert_eq!((tiered.promotions, tiered.landed), (2, 2));
     assert!(tiered.failures.is_empty() && tiered.stopped.is_none(), "{tiered:?}");
     assert!(closed.unbound.is_empty() && closed.failures.is_empty());
-    let mut ups = compiler.ups.lock().unwrap().clone();
+    let mut ups = compiler.ups.lock().clone();
     ups.sort_by_key(|it| (0..3).position(|n| key(n) == it.0));
     assert_eq!(ups, [(key(0), Tier::Cranelift), (key(2), Tier::Cranelift)]);
     assert!(mail.stops().is_empty());
@@ -464,7 +465,7 @@ fn a_failed_tier_up_leaves_the_first_code_and_is_reported() {
         session(&[function(0)]),
         &[],
         compiler.clone(),
-        Slots { addresses: addresses(1), cells, replaced: FxHashSet::default() },
+        Slots { addresses: addresses(1), cells, replaced: HashSet::default() },
         Mail(Arc::clone(&mail)),
         Config { workers: 1, idle: false },
         Some(up),
@@ -473,7 +474,7 @@ fn a_failed_tier_up_leaves_the_first_code_and_is_reported() {
     runner.remembered(LazyId(0), Tier::Cranelift).unwrap();
     let (kind, _) = ask(&runner, &mail, 0, 1, 0);
     assert_eq!(kind, READY_KIND);
-    wait_for("the tier-up", || !compiler.ups.lock().unwrap().is_empty());
+    wait_for("the tier-up", || !compiler.ups.lock().is_empty());
     assert_eq!(runner.target(&key(0)), Some(target_of(0)));
     let closed = runner.close();
     let tiered = closed.tier.unwrap();

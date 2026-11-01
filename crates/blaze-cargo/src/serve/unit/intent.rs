@@ -6,9 +6,9 @@ use std::cell::OnceCell;
 
 use base_db::FileId;
 use blaze_api::{ApiError, Edit, Edited};
+use blaze_hash::HashMap;
 use blaze_intent::ahead;
 use blaze_vfs::Bytes;
-use rustc_hash::FxHashMap;
 
 use super::{Job, UnitReader, files::Mounted, graph::flag};
 use crate::serve::work::Failed;
@@ -23,7 +23,7 @@ pub(crate) fn edit(job: &Job, reader: &UnitReader, edits: &[Edit]) -> Result<Edi
     }
     let applied = applied?;
     // alloc: once per edit, one seed per file it reparsed
-    *job.seeds.lock().unwrap_or_else(|it| it.into_inner()) = applied.seeds().collect();
+    *job.seeds.lock() = applied.seeds().collect();
     Ok(applied.edited)
 }
 
@@ -59,8 +59,8 @@ pub(crate) fn ahead(job: &Job, reader: &UnitReader, filter: &[String]) -> Result
 struct ViewFiles<'a> {
     mounted: &'a Mounted,
     files: Vec<ViewFile<'a>>,
-    by_path: FxHashMap<Box<str>, u32>,
-    by_id: FxHashMap<FileId, u32>,
+    by_path: HashMap<Box<str>, u32>,
+    by_id: HashMap<FileId, u32>,
     /// The first file whose bytes failed their check, and why.
     corrupt: OnceCell<(String, String)>,
 }
@@ -75,7 +75,7 @@ struct ViewFile<'a> {
 impl<'a> ViewFiles<'a> {
     fn new(mounted: &'a Mounted, paths: &'a std::collections::HashMap<FileId, String>) -> ViewFiles<'a> {
         let mut files = Vec::new();
-        let (mut by_path, mut by_id) = (FxHashMap::default(), FxHashMap::default());
+        let (mut by_path, mut by_id) = (HashMap::default(), HashMap::default());
         for (&id, absolute) in paths {
             let Some(path) = mounted.in_view(absolute) else { continue };
             let at = u32::try_from(files.len()).expect("under 2^32 files");

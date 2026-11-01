@@ -17,6 +17,7 @@ doctest = false
 blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
+parking_lot.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

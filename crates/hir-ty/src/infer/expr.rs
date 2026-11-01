@@ -2,6 +2,7 @@
 
 use std::{iter::repeat_with, mem};
 
+use blaze_hash::FixedState;
 use blaze_mem::Frame;
 use either::Either;
 use hir_def::{
@@ -13,8 +14,8 @@ use hir_def::{
         RecordSpread, Statement, Statements, UnaryOp, UnsafeBinderCastKind,
     },
     resolver::{TypeNs, ValueNs},
-    type_ref::TypeRefId,
     signatures::VariantFields,
+    type_ref::TypeRefId,
 };
 use hir_def::{
     FunctionId,
@@ -23,7 +24,6 @@ use hir_def::{
 };
 use hir_expand::{mod_path::ModPath, name::Name};
 use rustc_ast_ir::Mutability;
-use rustc_hash::FxBuildHasher;
 use rustc_type_ir::{
     FallibleTypeFolder, InferTy, Interner, TypeFoldable, TypeFolder, TypeVisitable,
     TypeVisitableExt, TypeVisitor, VisitorResult,
@@ -34,9 +34,9 @@ use smallvec::SmallVec;
 use tracing::debug;
 
 use crate::{
-    db::HirDatabase,
     Adjust, Adjustment, CallableDefId, Rawness, Span,
     consteval::literal_ty,
+    db::HirDatabase,
     infer::{AllowTwoPhase, BreakableKind, coerce::CoerceMany, find_continuable, pat::PatOrigin},
     lower::lower_mutability,
     method_resolution::{self, CandidateId, MethodCallee, MethodError},
@@ -1199,13 +1199,13 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         let variant_field_vis = VariantFields::field_visibilities(self.db, variant);
         let mut remaining_fields = hashbrown::HashMap::with_capacity_and_hasher_in(
             variant_fields.len(),
-            FxBuildHasher,
+            FixedState,
             self.frame,
         );
         remaining_fields.extend(variant_fields.fields().iter().map(|(i, field)| (&field.name, i)));
 
         let mut seen_fields =
-            hashbrown::HashMap::with_capacity_and_hasher_in(hir_fields.len(), FxBuildHasher, self.frame);
+            hashbrown::HashMap::with_capacity_and_hasher_in(hir_fields.len(), FixedState, self.frame);
 
         // Type-check each field.
         for field in hir_fields {

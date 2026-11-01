@@ -9,13 +9,13 @@
 //! builds the def map from the final round's `fact_handle`s: no scope is copied.
 
 use base_db::{Crate, Db};
+use blaze_hash::HashMap;
 use blaze_mem::Frame;
 use hir_expand::{
     MacroCallId, MacroDefId,
     mod_path::{ModPath, PathKind},
     name::Name,
 };
-use rustc_hash::FxHashMap;
 use stdx::always;
 use syntax::ast;
 use triomphe::Arc;
@@ -40,11 +40,11 @@ use super::{
     graph::{ImportShape, ShapeImport, ShapeModule},
     macros, map_in,
     ops::{DeclOp, DeriveHelper, ImportOp, ImportSource, MacroOp, OpLog},
-    set_in,
     queries::{
         self, CrateEnvKey, FactKey, ModuleRound, ModuleRow, NO_ROUND, RoundKey, RoundKind,
         RoundModules, RoundOutcome, SccKey, SccState, Scope,
     },
+    set_in,
     unit::Unit,
 };
 
@@ -228,9 +228,9 @@ pub(crate) fn round_modules(db: &Db, frame: &Frame, round: RoundKey) -> RoundMod
 }
 
 /// The round's index of each module in `order`, sized once.
-fn module_index(order: &[ModuleId]) -> FxHashMap<ModuleId, u32> {
+fn module_index(order: &[ModuleId]) -> HashMap<ModuleId, u32> {
     // alloc: the round's index, at its size, once per round.
-    let mut index = FxHashMap::with_capacity_and_hasher(order.len(), Default::default());
+    let mut index = HashMap::with_capacity_and_hasher(order.len(), Default::default());
     index.extend((0u32..).zip(order).map(|(at, &module)| (module, at)));
     index
 }
@@ -240,7 +240,7 @@ fn has_directive(log: &OpLog, module: ModuleId) -> bool {
     log.iter().any(|op| matches!(op, DeclOp::Macro(it) if it.module == module))
 }
 
-fn index_of_in(index: &FxHashMap<ModuleId, u32>, module: ModuleId, round: u32) -> u32 {
+fn index_of_in(index: &HashMap<ModuleId, u32>, module: ModuleId, round: u32) -> u32 {
     *index.get(&module).unwrap_or_else(|| panic!("nameres facts: {module:?} is not a module of round {round}"))
 }
 
@@ -699,7 +699,7 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, frame: &Frame, krate: Crate) -> (D
         root,
         modules: ModulesSlot::Building(table),
         prelude: None,
-        macro_use_prelude: FxHashMap::default(),
+        macro_use_prelude: HashMap::default(),
         derive_helpers_in_scope: owned_helpers(&derive_helpers),
         session_macros,
         names: NameRecords::default(),
@@ -1210,8 +1210,8 @@ mod tests {
     use super::super::{
         queries::{self, RoundKey, RoundKind},
         tests::{
-            Exempt, compare, compare_fixture, fixture_db, new_block_def_map, new_crate_local_def_map,
-            old_block_def_map, old_crate_local_def_map, project,
+            Exempt, compare, compare_fixture, fixture_db, new_block_def_map,
+            new_crate_local_def_map, old_block_def_map, old_crate_local_def_map, project,
         },
     };
     use crate::{

@@ -48,8 +48,8 @@ mod tests;
 
 pub use error::{Action, DataRace, Deadlock, RaceError, RaceErrorKind, RacingOp};
 
+use blaze_hash::HashMap;
 use blaze_ids::rng::SplitMix64;
-use rustc_hash::FxHashMap;
 
 use crate::ids::{AccessKind, AllocId, AtomicOrd, SiteId, Span, ThreadId};
 
@@ -560,7 +560,7 @@ pub struct Races {
     allocs: Vec<Slot>,
     /// The clock of each synchronization object by address (Miri: the `clock` of `Mutex`,
     /// `Futex`, `Condvar` and `InitOnce` in `sync.rs` and `init_once.rs`).
-    sync: FxHashMap<u64, VClock>,
+    sync: HashMap<u64, VClock>,
     /// Set by an atomic [`Races::read`], for [`Races::load_value`].
     pending_load: Option<PendingLoad>,
     /// Set by [`Races::rmw`], for [`Races::store_value`].
@@ -577,7 +577,7 @@ impl Races {
             yield_requested: false,
             global: Global::new(),
             allocs: Vec::new(),
-            sync: FxHashMap::default(),
+            sync: HashMap::default(),
             pending_load: None,
             pending_rmw: None,
         }

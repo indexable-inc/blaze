@@ -51,7 +51,7 @@ impl std::hash::Hash for Conf {
 /// A hash of `table` that its order does not change, as its equality doesn't.
 fn table_hash(table: &toml::Table) -> u64 {
     table.iter().fold(table.len() as u64, |sum, (key, value)| {
-        let mut entry = rustc_hash::FxHasher::default();
+        let mut entry = blaze_hash::FixedHasher::default();
         std::hash::Hash::hash(key, &mut entry);
         std::hash::Hasher::write_u64(&mut entry, value_hash(value));
         sum.wrapping_add(std::hash::Hasher::finish(&entry))
@@ -60,7 +60,7 @@ fn table_hash(table: &toml::Table) -> u64 {
 
 fn value_hash(value: &toml::Value) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut state = rustc_hash::FxHasher::default();
+    let mut state = blaze_hash::FixedHasher::default();
     match value {
         toml::Value::String(it) => (0u8, it).hash(&mut state),
         toml::Value::Integer(it) => (1u8, it).hash(&mut state),
@@ -77,7 +77,9 @@ fn value_hash(value: &toml::Value) -> u64 {
 }
 
 /// The counts the lints read ([`Conf::int`]): `u64` in clippy's `Conf`, and blaze's own.
-const COUNTS: [&str; 7] = [
+const COUNTS: [&str; 9] = [
+    "array-size-threshold",
+    "stack-size-threshold",
     "enum-variant-size-threshold",
     "pass-by-value-size-limit",
     "too-large-for-stack",
@@ -129,7 +131,110 @@ fn checked(table: &toml::Table) -> Result<(), String> {
             }
         }
     }
+    for kind in Kind::ALL {
+        disallowed(table, kind)?;
+    }
     Ok(())
+}
+
+/// Which list of disallowed items an entry is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Kind {
+    Types,
+    Methods,
+    Macros,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 3] = [Kind::Types, Kind::Methods, Kind::Macros];
+
+    /// Its key in `clippy.toml`.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Kind::Types => "disallowed-types",
+            Kind::Methods => "disallowed-methods",
+            Kind::Macros => "disallowed-macros",
+        }
+    }
+}
+
+/// An entry of a `disallowed-*` list: clippy's `DisallowedPath`, written as its path alone or
+/// as a table, with blaze's `allow-in` and `lint` beside clippy's keys.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Disallowed {
+    /// The item, as a path from a crate's root: `std::sync::Mutex`, `std::time::Instant::now`.
+    pub path: String,
+    pub reason: Option<String>,
+    /// The item to use instead, as a path: the fix rewrites to it.
+    pub replacement: Option<String>,
+    /// Whether a path that resolves to nothing is no error (an item of a crate the package
+    /// may not depend on).
+    pub allow_invalid: bool,
+    /// The modules where the item is allowed, as paths from the crate's root (`crate::driver`),
+    /// each with the modules inside it.
+    pub allow_in: Vec<String>,
+    /// The lint a use of it is reported under, when not clippy's `disallowed_*` for its list:
+    /// `blaze::wall_clock`, which an `#[expect]` can name.
+    pub lint: Option<String>,
+}
+
+const ENTRY_KEYS: [&str; 6] = ["path", "reason", "replacement", "allow-invalid", "allow-in", "lint"];
+
+/// The entries of `table`'s list `kind`; an entry that does not read is the error, naming it.
+pub fn disallowed(table: &toml::Table, kind: Kind) -> Result<Vec<Disallowed>, String> {
+    let key = kind.key();
+    let Some(list) = table.get(key) else { return Ok(Vec::new()) };
+    let error = |what: String| format!("error reading Clippy's configuration file: {what} in `{key}`");
+    let list = list.as_array().ok_or_else(|| error(format!("invalid type: {}, expected a list", list.type_str())))?;
+    let mut entries = Vec::with_capacity(list.len());
+    for item in list {
+        let entry = match item {
+            toml::Value::String(path) => Disallowed { path: path.clone(), ..Disallowed::default() },
+            toml::Value::Table(fields) => {
+                if let Some(unknown) = fields.keys().find(|it| !ENTRY_KEYS.contains(&it.as_str())) {
+                    return Err(error(format!("unknown field `{unknown}`, expected one of {}", ENTRY_KEYS.join(", "))));
+                }
+                let string = |name: &str| match fields.get(name) {
+                    None => Ok(None),
+                    Some(toml::Value::String(it)) => Ok(Some(it.clone())),
+                    Some(other) => Err(error(format!("invalid type: {}, expected a string for `{name}`", other.type_str()))),
+                };
+                let path = string("path")?.ok_or_else(|| error("an entry with no `path`".to_owned()))?;
+                let allow_invalid = match fields.get("allow-invalid") {
+                    None => false,
+                    Some(toml::Value::Boolean(it)) => *it,
+                    Some(other) => {
+                        return Err(error(format!("invalid type: {}, expected a boolean for `allow-invalid` of `{path}`", other.type_str())));
+                    }
+                };
+                let allow_in = match fields.get("allow-in") {
+                    None => Vec::new(),
+                    Some(toml::Value::Array(items)) => items
+                        .iter()
+                        .map(|it| {
+                            it.as_str()
+                                .filter(|it| *it == "crate" || it.starts_with("crate::"))
+                                .map(str::to_owned)
+                                .ok_or_else(|| error(format!("`allow-in` of `{path}` has {it}, not a module path from `crate`")))
+                        })
+                        .collect::<Result<_, _>>()?,
+                    Some(other) => {
+                        return Err(error(format!("invalid type: {}, expected a list for `allow-in` of `{path}`", other.type_str())));
+                    }
+                };
+                let lint = string("lint")?;
+                if let Some(lint) = &lint
+                    && !lint.starts_with("blaze::")
+                {
+                    return Err(error(format!("`lint` of `{path}` is `{lint}`, not a lint of blaze's")));
+                }
+                Disallowed { reason: string("reason")?, replacement: string("replacement")?, allow_invalid, allow_in, lint, path }
+            }
+            other => return Err(error(format!("invalid type: {}, expected a path or a table", other.type_str()))),
+        };
+        entries.push(entry);
+    }
+    Ok(entries)
 }
 
 /// The names clippy looks for, in the order it takes them.
@@ -195,6 +300,11 @@ impl Conf {
         self.table.get(key)
     }
 
+    /// The entries of the list `kind`.
+    pub fn disallowed(&self, kind: Kind) -> Result<Vec<Disallowed>, String> {
+        disallowed(&self.table, kind)
+    }
+
     /// Whether the Rust version kept to has what came in `version`: clippy's `Msrv::meets`,
     /// which with no version set keeps to none.
     pub fn meets(&self, version: Version) -> bool {
@@ -252,12 +362,48 @@ mod tests {
     }
 
     #[test]
+    fn disallowed_entries_read_as_a_path_or_a_table_and_refuse_what_clippy_and_blaze_do_not_know() {
+        let table: toml::Table = r#"
+disallowed-types = [
+    "std::collections::LinkedList",
+    { path = "std::sync::Mutex", replacement = "parking_lot::Mutex", reason = "no poisoning" },
+    { path = "dashmap::DashMap", allow-invalid = true },
+]
+disallowed-methods = [
+    { path = "std::time::Instant::now", allow-in = ["crate::driver"], lint = "blaze::wall_clock" },
+]
+"#
+        .parse()
+        .unwrap();
+        checked(&table).unwrap();
+        let types = disallowed(&table, Kind::Types).unwrap();
+        assert_eq!(types[0], Disallowed { path: "std::collections::LinkedList".to_owned(), ..Disallowed::default() });
+        assert_eq!(types[1].replacement.as_deref(), Some("parking_lot::Mutex"));
+        assert_eq!(types[1].reason.as_deref(), Some("no poisoning"));
+        assert!(types[2].allow_invalid);
+        let methods = disallowed(&table, Kind::Methods).unwrap();
+        assert_eq!(methods[0].allow_in, ["crate::driver"]);
+        assert_eq!(methods[0].lint.as_deref(), Some("blaze::wall_clock"));
+        assert!(disallowed(&table, Kind::Macros).unwrap().is_empty());
+        for (text, says) in [
+            ("disallowed-types = [{ path = \"a::B\", replace = \"c::D\" }]\n", "unknown field `replace`"),
+            ("disallowed-types = [{ reason = \"x\" }]\n", "an entry with no `path`"),
+            ("disallowed-methods = [{ path = \"a::b\", allow-in = [\"driver\"] }]\n", "not a module path from `crate`"),
+            ("disallowed-macros = [{ path = \"a::b\", lint = \"clippy::x\" }]\n", "not a lint of blaze's"),
+            ("disallowed-types = \"a::B\"\n", "expected a list"),
+        ] {
+            let error = checked(&text.parse().unwrap()).expect_err(text);
+            assert!(error.contains(says), "{text}: {error}");
+        }
+    }
+
+    #[test]
     fn equal_confs_hash_alike_in_any_order() {
         use std::hash::BuildHasher as _;
         let of = |text: &str| Conf { table: text.parse().unwrap(), ..Conf::default() };
         let (a, b) = (of("a = 1\nb = [true, 2.5]\n"), of("b = [true, 2.5]\na = 1\n"));
         assert_eq!(a, b);
-        let hash = |it: &Conf| rustc_hash::FxBuildHasher.hash_one(it);
+        let hash = |it: &Conf| blaze_hash::FixedState.hash_one(it);
         assert_eq!(hash(&a), hash(&b));
         assert_ne!(hash(&a), hash(&of("a = 2\nb = [true, 2.5]\n")));
     }

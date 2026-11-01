@@ -56,8 +56,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use blaze_hash::HashSet;
 use blaze_usercode::trace::Seen;
-use rustc_hash::FxHashSet;
 
 use super::{Also, Recorder, Spec, tidy};
 
@@ -575,7 +575,7 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
                     blaze_core::busy::MOST_NS / 1_000_000
                 );
             };
-            std::thread::sleep(std::time::Duration::from_nanos(wait));
+            blaze_core::busy::wait(wait);
             tried += 1;
             waited += wait;
         };
@@ -674,6 +674,7 @@ fn group_ended(group: libc::pid_t) -> bool {
         {
             return true;
         }
+        #[allow(clippy::disallowed_methods, reason = "the group's timer: macOS has no event for a process group's end, only each known pid's")]
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
     false
@@ -696,7 +697,7 @@ fn still_runs(pid: libc::pid_t) -> bool {
 fn merge(raw: &str, recorder: &mut Recorder) -> Option<String> {
     // Once per run, as it ends: the programs it ran, by reference.
     let mut ran = Vec::with_capacity(64);
-    let mut loaded = FxHashSet::default();
+    let mut loaded = HashSet::default();
     let mut lost = None;
     for piece in raw.split_inclusive('\n') {
         let Some(line) = piece.strip_suffix('\n') else {

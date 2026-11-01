@@ -1,5 +1,5 @@
 use base_db::all_crates;
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use hir_expand::fixture;
 
 use super::{MacroReachable, Reached, macro_reach_module};
@@ -51,13 +51,13 @@ fn g() {
 
 /// The names of what the def maps declare, by definition, and their macros by name.
 struct Names {
-    of: FxHashMap<ModuleDefId, String>,
-    macros: FxHashMap<String, MacroId>,
+    of: HashMap<ModuleDefId, String>,
+    macros: HashMap<String, MacroId>,
 }
 
 impl Names {
     fn of(db: &TestDB, def_maps: &[&DefMap]) -> Names {
-        let mut names = Names { of: FxHashMap::default(), macros: FxHashMap::default() };
+        let mut names = Names { of: HashMap::default(), macros: HashMap::default() };
         for def_map in def_maps {
             for (_, data) in def_map.modules(db) {
                 for (name, per_ns) in data.scope(db).entries() {

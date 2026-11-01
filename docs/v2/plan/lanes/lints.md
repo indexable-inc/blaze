@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze-lints in v2: clippy's lints and blaze's own (`blaze::`), run per body as queries over `&Db` and the flat tree's views; hot_lint.py's rules as typed lints.
+summary: blaze-lints in v2: clippy's lints and blaze's own (`blaze::`), run per body as queries over `&Db` and the flat tree's views; hot_lint.py's rules as typed lints; the `clippy.toml` bans (`disallowed_*`) by resolution, with fixes `blaze fix` makes.
 date: 2026-10-29
 ---
 # Lane `lints`: blaze's clippy and blaze's own lints
@@ -70,6 +70,146 @@ their tests.
 They are the same kind of `blaze::Lint` (in `Lint::ALL`, with a bit of `On` past the hot lints',
 `allow` by default, opted in by `[workspace.metadata.blaze.lints]`), but in no group:
 `blaze::hot` stays the hot lints.
+
+## `clippy.toml` bans: `disallowed_types`, `disallowed_methods`, `disallowed_macros`
+
+v2 runs no stock clippy, so these three, ported in `crates/blaze-lints/src/lints/disallowed.rs`,
+are what enforce the `disallowed-*` lists of `.clippy.toml` and the hot crates' `clippy.toml`
+(clippy's rule: a crate's own file replaces the root's). Each entry is an item's path, or a
+table with clippy's keys `path`, `reason`, `replacement`, `allow-invalid` and two of blaze's:
+
+- `allow-in = ["crate::driver", ...]`: the modules (and those inside them) where the item is
+  allowed, by module path, never by file.
+- `lint = "blaze::wall_clock"`: report under that blaze lint instead, so an
+  `#[expect(blaze::wall_clock, reason = "..")]` reads well.
+
+Stock clippy refuses both keys, failing `cargo clippy` for the crate, so the repo's own
+`clippy.toml` files use neither. `blaze::wall_clock` is instead three entries built into the
+query, after the configured ones: `std::time::Instant::now`, `std::time::SystemTime::now` and
+`std::time::Instant::elapsed`, reported under that lint, in every crate whether or not it has a
+`clippy.toml`. A configured entry for the same item wins.
+
+An unknown key or a value of the wrong type is an error as the file loads. A crate resolves the
+entries once per configuration (the query `disallowed_defs`): an entry's path walks from a
+dependency's (or `crate`'s) root through modules, then a type's inherent impls or a trait's
+items, as clippy's `def_path_res` does; one that resolves to nothing, or to an item of another
+kind than its list's, is an error at the crate's root unless `allow-invalid`.
+
+A finding is any written path that resolves to an entry's item (in a `use`, a type, an
+expression, a pattern, a macro call), after re-exports, renames and globs, and for a method a
+method call resolved to it. The message names the item ("use of a disallowed type
+`std::sync::Mutex`"); the suggestion's message is the reason, else "use". An entry whose
+`replacement` is a path the crate can name has a machine-applicable fix:
+
+- a `use` is rewritten whole: the moved items get a line of their own, the rest stay, a renamed
+  item keeps its alias, and an item whose name changes is imported `as` the old name, so no other
+  line changes;
+- a qualified path is rewritten to the replacement;
+- a bare name follows the `use` of the file that brings it in; a glob stays, with the moved
+  names imported beside it, which shadows them;
+- std's `Mutex` and `RwLock` to `parking_lot`'s: the `.unwrap()` or `.expect(..)` after `lock`,
+  `read`, `write`, `into_inner` or `get_mut` is dropped (they never poison); `Condvar`:
+  `g = cv.wait(g).unwrap()` (or `wait_while`) becomes `cv.wait(&mut g)`.
+
+With no fix the finding says why in a note: the replacement is not a path, its crate is no
+dependency, a method call (which the fix would have to rewrite as a call), a lock's poisoning
+result used other than unwrapped, a `use` with a comment inside its tree, or code a macro made.
+
+## Clippy ports for AGENTS.md's rules
+
+Clippy lints ported in `crates/blaze-lints/src/lints/`, one file each, because each finds code
+that breaks one of AGENTS.md's rules. Each module's doc names the clippy source file it follows
+(indexable-inc's fork at c2308e38, the nearest checkout to the pinned nightly) and where it
+differs: messages name the item, the type or the function, and a fix is offered only where it
+is right. In blaze's own workspace each is at `warn`, not `deny`, until the tree is clean of it.
+
+- `allow_attributes` (rule 3): `#[allow(..)]` outside a macro's own tokens, MSRV 1.81. The fix
+  rewrites `allow` to `expect` (machine-applicable); the `reason` is still written by hand.
+- `allow_attributes_without_reason` (rule 3): `#[allow]` or `#[expect]`, inner or outer, `cfg_attr`
+  included, whose last item is not `reason = ".."`. No fix.
+- `map_err_ignore` (rules 3, 14): `.map_err(|_| ..)` on a `Result`: the new error can't say what
+  failed. Not `|_e|`, a `move` closure or a function path.
+- `unused_result_ok` (rule 3): the statement `result.ok();`, which only silences `#[must_use]`.
+  In a function returning a `Result` it suggests `?` (maybe incorrect).
+- `let_underscore_must_use` (rule 3): `let _ =` of a `#[must_use]` type (through references,
+  tuples, arrays, a `Result` with an uninhabited error) or of a `#[must_use]` function's result;
+  a lock guard is one, so clippy's `let_underscore_lock` is not separate.
+- `let_underscore_future` (rule 3): `let _ =` of a future, which never runs it.
+- `unwrap_in_result` (rules 3, 15): `unwrap` or `expect` of an `Option` or `Result`, as a method or
+  by path, in a function returning one; closures, constants and `async` blocks are their own
+  bodies. Same-kind `unwrap` is fixed to `?` (maybe incorrect).
+- `panic_in_result_fn` (rule 15): `panic!`, `assert!`, `assert_eq!` or `assert_ne!` in a function
+  returning a `Result`, including those a crate's own macro expands to; `todo!` and
+  `unreachable!` are not counted.
+- `infinite_loop` (rule 13): a `loop` nothing leaves in a function not returning `!`; the walk
+  goes into macro expansions. `-> !` is suggested where the loop is the function's tail.
+
+- `mutex_atomic`, `mutex_integer` (rule 9): a `static` or `let` of std's or `lock_api`'s `Mutex`
+  around a `bool`, an integer up to 64 bits, a `usize`/`isize` or a `*mut T` (`mutex_integer`
+  for the fixed-size integers). `Mutex::new(x)` becomes `AtomicX::new(x)`; for a local whose
+  every use is `*m.lock()` read or assigned, the uses become `load`/`store` with `SeqCst` and
+  the fix is machine-applicable, otherwise maybe incorrect with the other uses named.
+- `rc_mutex` (rule 9): the type `Rc<Mutex<_>>` (std's or `lock_api`'s lock), in `box_collection`'s
+  walk of written types.
+- `arc_with_non_send_sync` (rule 9): `Arc::new(x)` of a concrete type not `Send`, not `Sync` or
+  neither.
+- `iter_over_hash_type` (rule 20): a `for` over a hash map or set (std's, `hashbrown`'s,
+  `papaya`'s, `dashmap`'s, `blaze_hash`'s) or one of std's iterators of one. Its check,
+  `lints::iter_over_hash_type::hash_iterated`, is what `blaze::hash_order_output` narrows to
+  loops whose order reaches output.
+- `large_stack_arrays` (rule 9: work runs on fibers): an array expression of a function's or
+  closure's body, not of a `const` or `static`, whose layout passes 1/1024 of a pool fiber's
+  stack (`blaze_graph::sched::FIBER_STACK`, 16 MiB, so 16 KiB); `array-size-threshold` sets it.
+  An array whose layout the front end can't compute (a generic length or element) is left alone.
+- `large_stack_frames` (rule 9): a function, or a closure in it, whose frame passes 1/32 of a
+  pool fiber's stack (512 KiB); `stack-size-threshold` sets it. The frame is the runtime MIR's
+  locals as the front end lays them out, those that never hold storage at once sharing a slot as
+  the code generator shares them (`FrameStorage::frame_storage_conflicts`), not clippy's sum of
+  every local; the note names the largest. A body with a local of unknown layout is left alone.
+- `significant_drop_in_scrutinee` (rule 9): a lock guard (std's, by its diagnostic item, or
+  `lock_api`'s) returned by a call in a `match`, `if let` or `while let` scrutinee and used there
+  in place (a borrowing or dereferencing method, a field, an index, `&`, `*`), so it lives through
+  every arm. A guard moved on or matched on itself is not one; closures and blocks in the
+  scrutinee are not looked in. For a `match` or `if let` statement of a scalar value the fix is
+  `let value = ..;` first (maybe incorrect: the arms then run without the lock).
+- `significant_drop_tightening` (rule 9): a named lock guard, used, then held through a call
+  written in the source on a path where it is used on no path after, until its scope ends. Uses
+  are read from the runtime MIR (the guard, references into it, call results that may borrow
+  from it), with liveness across branches and loops, not clippy's statement walk; a guard never
+  used (a critical section) is left alone. No fix.
+- `await_holding_lock`, `await_holding_refcell_ref` (rule 9): a local an `async` body keeps
+  across an `.await` (`MirBody::held_locals_in`, the front end's coroutine layout) holding a
+  lock guard, or a `RefCell`'s `Ref`/`RefMut`, itself or in its arguments or fields. A guard
+  dropped or moved away before the `.await` is not held; each `.await` it is held across is
+  noted.
+
+## `blaze fix`
+
+`blaze_lints::fix::fix` makes every machine-applicable suggestion of a crate's findings, of the
+lints the command line turns on. Each pass splices the fixes into the front end's trees with
+blaze-intent's `Working::splice`, which reparses only what they touched, sets the new texts with
+those trees seeded, and lints again, which recomputes only the bodies that changed. It ends
+when no finding has a fix left (one pass for the `disallowed_*` fixes), and fails, naming the
+file, line and lint, when two fixes still rewrite the same text after the last of 4 passes,
+findings with a fix are left after it, or a fix's text does not fit the file. The crate's errors
+are checked before and after: fixes that leave an error it did not have are refused, the texts
+restored, and the error named with the lints whose fixes were made. `blaze fix --replace
+FROM=TO` is the same move of one path with no lint, through the same rewrite
+(`blaze_intent::retarget`): a command (`crates/blaze-cargo/src/cli/fix.rs`) that has the daemon
+make blaze-intent's `Edit::Replace` in its front end and writes the edits to the checkout.
+`blaze fix` with no `--replace`, making the lints' fixes, is not a command yet.
+
+## Baselines
+
+A lint at `warn` whose findings are being moved off has a baseline,
+`crates/blaze-lints/baselines/<tool>.<lint>.txt`: one `path<TAB>count` line per file with
+findings, sorted. `blaze_lints::baseline::check` takes a run's counts (`baseline::counts` of its
+findings) and names, by lint and file, each count over its baseline and each file the baseline
+does not have; `baseline::bless` lowers the baselines to a run's counts, never raising one or
+adding a file, and is only right for a run over the whole workspace. A file in the directory that
+is not of a clippy or blaze lint blaze knows is an error. A lint whose baseline is empty moves to
+`deny` and its file is deleted. Neither is called by a command yet: the check and the bless after
+`blaze fix` come with its lint mode.
 
 ## Done when
 

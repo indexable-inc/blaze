@@ -6,9 +6,9 @@
     "crates/hir-ty/src/consteval/hir_eval.rs"
   ],
   "what": "from 01286 (1): hir-ty consteval::hir_eval the_shape, the_checks, generated_programs_match: by_hir refuses constants it took, exactly the shifts (SHL, SHR, SHL_NEG, 1 << 64). Find why a shift drops out (hir_eval.rs Program::of / Compiler::binary, maybe a new adjustment or diagnostic on shifts) and print which owner falls out and why. Still failing in round 15.",
-  "state": "taken",
+  "state": "applied",
   "created": "2026-11-01T00:50:08Z",
-  "updated": "2026-11-01T00:52:42Z",
+  "updated": "2026-11-01T13:54:33Z",
   "taken_by": "no-fallback-front-ty-next1",
   "why": null,
   "source": null,
@@ -24,6 +24,12 @@
       "by": "no-fallback-front-ty-next1",
       "action": "take",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T13:54:33Z",
+      "by": "coord-1030",
+      "action": "done",
+      "note": "hir-ty-mir consteval::hir_eval the_shape, the_checks, generated_programs_match pass on blaze-v2-build."
     }
   ]
 }

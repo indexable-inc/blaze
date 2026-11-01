@@ -26,3 +26,11 @@ pub const fn next(tried: u32, waited: u64) -> Option<u64> {
     let left = MOST_NS - waited;
     Some(if wait < left { wait } else { left })
 }
+
+/// Waits out one wait of the schedule, `ns` from [`next`]: the one sleep of blaze's spawns, a
+/// driver's timer, on a thread no job runs on (a driver's, or the launcher's before its exec).
+/// A syscall alone, so the launcher may call it between its fork and its exec.
+#[allow(clippy::disallowed_methods, reason = "the schedule's timer: no event says the writer's copy is closed")]
+pub fn wait(ns: u64) {
+    std::thread::sleep(std::time::Duration::from_nanos(ns));
+}

@@ -389,6 +389,6 @@ impl<T> RcVecIter<T> {
 // Not derived to avoid `T: Clone`
 impl<T> Clone for RcVecIter<T> {
     fn clone(&self) -> RcVecIter<T> {
-        RcVecIter { vec: self.vec.clone(), offset: self.offset }
+        RcVecIter { vec: Rc::clone(&self.vec), offset: self.offset }
     }
 }

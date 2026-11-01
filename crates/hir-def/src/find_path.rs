@@ -11,15 +11,15 @@ use std::{
     iter,
 };
 
-use base_db::{Db, Crate, CrateOrigin, LangCrateOrigin};
+use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
+use blaze_hash::{FixedState, HashSet};
+use blaze_query::db::{AsId, FromId};
 use hir_expand::{
     Lookup,
     mod_path::{ModPath, PathKind},
     name::{AsName, Name},
 };
 use intern::sym;
-use rustc_hash::{FxBuildHasher, FxHashSet};
-use blaze_query::db::{AsId, FromId};
 use smallvec::SmallVec;
 
 use crate::{
@@ -119,7 +119,7 @@ pub struct FindPathScratch {
     /// `(item, module)` pairs the local searches on the current stack have looked at, the module
     /// as its `blaze_query::db::Id`. Empty between top-level searches: each local search removes what it
     /// added.
-    visited: FxHashSet<(ItemInNs, blaze_query::db::Id)>,
+    visited: HashSet<(ItemInNs, blaze_query::db::Id)>,
     /// The segments of every candidate of the call, each linked to the one before it, so a
     /// candidate extended by a name shares its prefix instead of copying it.
     segments: Vec<Segment>,
@@ -140,7 +140,7 @@ thread_local! {
 impl FindPathScratch {
     pub const fn new() -> FindPathScratch {
         FindPathScratch {
-            visited: FxHashSet::with_hasher(FxBuildHasher),
+            visited: HashSet::with_hasher(FixedState),
             // alloc: none until the thread's first call grows it, then kept
             segments: Vec::new(),
             // alloc: none until the thread's first call grows it, then kept
@@ -826,11 +826,11 @@ pub(crate) mod tests {
     use blaze_alloc_count::assert_at_most;
     use blaze_ids::rng::SplitMix64;
     use expect_test::{Expect, expect};
+    use hir_expand::fixture;
     use itertools::Itertools;
     use span::Edition;
     use stdx::format_to;
     use syntax::view::AstNode;
-    use hir_expand::fixture;
 
     use crate::test_db::{TestDB, TestDBExt};
 
@@ -2455,13 +2455,13 @@ pub mod future {
         use std::{cell::Cell, cmp::Ordering, iter};
 
         use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
+        use blaze_hash::HashSet;
         use hir_expand::{
             Lookup,
             mod_path::{ModPath, PathKind},
             name::{AsName, Name},
         };
         use intern::sym;
-        use rustc_hash::FxHashSet;
 
         use super::super::{
             FIND_PATH_FUEL, FindPathConfig, MAX_PATH_LEN, PrefixKind, Stability, Stability::*,
@@ -2530,7 +2530,7 @@ pub mod future {
             fuel: Cell<usize>,
         }
 
-        type Visited<'db> = FxHashSet<(ItemInNs, ModuleIdLt<'db>)>;
+        type Visited<'db> = HashSet<(ItemInNs, ModuleIdLt<'db>)>;
 
         fn find_path_inner(
             ctx: &FindPathCtx<'_>,
@@ -2542,7 +2542,7 @@ pub mod future {
             {
                 return find_path_for_module(
                     ctx,
-                    &mut FxHashSet::default(),
+                    &mut HashSet::default(),
                     module_id,
                     true,
                     max_len,
@@ -2581,7 +2581,7 @@ pub mod future {
                 }
             }
             let mut best_choice = None;
-            calculate_best_path(ctx, &mut FxHashSet::default(), item, max_len, &mut best_choice);
+            calculate_best_path(ctx, &mut HashSet::default(), item, max_len, &mut best_choice);
             best_choice.map(|choice| choice.path)
         }
 
@@ -2974,7 +2974,7 @@ pub mod future {
         name: String,
         is_pub: bool,
         lines: Vec<String>,
-        names: FxHashSet<String>,
+        names: HashSet<String>,
     }
 
     /// One generated crate: its modules (0 the root) and the items and modules it declares, each
@@ -3039,7 +3039,7 @@ pub mod future {
             name: String::new(),
             is_pub: true,
             lines: Vec::new(),
-            names: FxHashSet::default(),
+            names: HashSet::default(),
         };
         let mut krate = GenCrate { modules: vec![root], items: Vec::new() };
         for i in 0..1 + rng.index(7) {
@@ -3051,7 +3051,7 @@ pub mod future {
                 name,
                 is_pub: !shape.private_modules || rng.below(100) < 70,
                 lines: Vec::new(),
-                names: FxHashSet::default(),
+                names: HashSet::default(),
             });
         }
         for i in 0..2 + rng.index(8) {
@@ -3310,7 +3310,7 @@ pub mod future {
     fn brute_force_len(db: &TestDB, from: crate::ModuleId, target: ModuleDefId) -> Option<usize> {
         use std::collections::VecDeque;
 
-        use rustc_hash::FxHashMap;
+        use blaze_hash::HashMap;
 
         let def_map = from.def_map(db);
         let krate = from.krate(db);
@@ -3321,7 +3321,7 @@ pub mod future {
         };
         // The first name of each def in `module`, in scope order.
         let first_names = |module: crate::ModuleId| {
-            let mut seen = FxHashSet::default();
+            let mut seen = HashSet::default();
             def_map
                 .module(db, module)
                 .scope(db)
@@ -3332,7 +3332,7 @@ pub mod future {
         };
 
         fn reach(
-            dist: &mut FxHashMap<crate::ModuleId, usize>,
+            dist: &mut HashMap<crate::ModuleId, usize>,
             queue: &mut VecDeque<crate::ModuleId>,
             module: crate::ModuleId,
             len: usize,
@@ -3355,7 +3355,7 @@ pub mod future {
 
         // Breadth first, every edge one segment: `self` (no segment) is taken first, then the
         // one-segment starts, so each module is reached at its fewest segments.
-        let mut dist = FxHashMap::default();
+        let mut dist = HashMap::default();
         let mut queue = VecDeque::new();
         reach(&mut dist, &mut queue, from, 0);
         reach(&mut dist, &mut queue, root, 1);

@@ -1,14 +1,12 @@
 //! A query span on a body says which body: its crate and its path, so a profile can name the
 //! function a slow `infer_query` was for.
 
-use std::sync::{
-    Mutex,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use base_db::all_crates;
 use hir_def::{DefWithBodyId, FunctionId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature};
 use hir_expand::fixture;
+use parking_lot::Mutex;
 
 use crate::InferenceResult;
 
@@ -35,11 +33,11 @@ struct Values<'a>(&'a Mutex<Vec<(String, String)>>);
 
 impl tracing::field::Visit for Values<'_> {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        self.0.lock().unwrap().push((field.name().to_owned(), value.to_owned()));
+        self.0.lock().push((field.name().to_owned(), value.to_owned()));
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.0.lock().unwrap().push((field.name().to_owned(), format!("{value:?}")));
+        self.0.lock().push((field.name().to_owned(), format!("{value:?}")));
     }
 }
 
@@ -51,13 +49,13 @@ impl tracing::Subscriber for &'static Seen {
     fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
         let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         if span.metadata().name() == "infer_query" {
-            self.infer.lock().unwrap().push(id);
+            self.infer.lock().push(id);
         }
         tracing::span::Id::from_u64(id)
     }
 
     fn record(&self, id: &tracing::span::Id, values: &tracing::span::Record<'_>) {
-        if self.infer.lock().unwrap().contains(&id.into_u64()) {
+        if self.infer.lock().contains(&id.into_u64()) {
             values.record(&mut Values(&self.values));
         }
     }
@@ -102,7 +100,7 @@ fn infer_span_of(name: &str) -> Vec<(String, String)> {
     tracing::subscriber::with_default(seen, || {
         InferenceResult::of(&db, def);
     });
-    let mut values = seen.values.lock().unwrap().clone();
+    let mut values = seen.values.lock().clone();
     values.sort();
     values
 }
