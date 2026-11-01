@@ -19,11 +19,11 @@ The input is one JSON object (inline, a file's path, or `-` for stdin):
     synthetic   also make the edits of this script, not only the app's (true)
     check       what is run after each step: "edit" (the step's app edit's `check`, else the app's
                 `edit_check`, else the program with no arguments, as appsedits.py runs) or "runs"
-                (every command line of the app's `runs`, as apps.py's workload)
+                (every command line of the app's `runs`, as appruns.py's workload)
     keep_going  go on with an app after a step fails (false: its later steps would start from
                 a store the failure left)
 
-Each app is checked out, its dependencies put beside it and its setup run as apps.py does
+Each app is checked out, its dependencies put beside it and its setup run as appruns.py does
 (`checkout`, `prepare`, `localize`, `setup`). blaze builds it with `BLAZE_ITEM_STORE=verify`:
 every body step the item store holds is run fresh as well and a difference stops the build with
 an error naming the body. blaze also builds the same source from nothing, with
@@ -47,7 +47,7 @@ string, char, comment or format string on its line, no field, method, macro, mod
 the name, no app edit's text holding it); a renamed name ends in `_item_store_<step>`. Both sides
 build again. One outcome per step, `<app>: step <i>: <what>`:
 
-    pass   both builds succeed and the check prints the same from both programs (apps.App's
+    pass   both builds succeed and the check prints the same from both programs (appruns.Program's
            behaviour: status, stdout and stderr, scrubbed as the app's `scrub` says), or both
            builds fail (the edit is one Rust rejects, as a synthetic one may be)
     fail   the build with the item store fails and the one from nothing does not (an item store
@@ -554,9 +554,9 @@ def verdict(blaze_ok: bool, fresh_ok: bool, blaze_said: str, fresh_said: str,
         return "pass", "both builds fail"
     for name, want, got in seen:
         if want != got:
-            import mixed
+            import appruns
             return "fail", (f"`{name}` differs: the program built from nothing exits {want[0]!r}, the one built "
-                            f"with the item store {got[0]!r}: {mixed.symptom(want, got)}")
+                            f"with the item store {got[0]!r}: {appruns.symptom(want, got)}")
     if unlike:
         return "fail", f"after a rename or a move: {unlike}"
     return "pass", ""
@@ -568,14 +568,14 @@ class App:
     """One app's checkout, its two builds and its source as the sequence changes it."""
 
     def __init__(self, eng: engine.Engine, name: str, spec: dict[str, Any], work: Path, check: Check):
-        import apps
+        import appruns as apps
         self.apps, self.eng, self.name, self.spec, self.check = apps, eng, name, spec, check
         self.edits = edits_of(spec)
         self.ws = Path(apps.checkout(name, spec)).resolve()
         apps.prepare(str(self.ws), spec)
         apps.localize(str(self.ws))
         apps.setup(str(self.ws), spec)
-        self.fixture = apps.App(str(self.ws), spec, False)
+        self.fixture = apps.Program(str(self.ws), spec)
         main = Path(self.fixture.touch).resolve()
         self.root = str(main.relative_to(self.ws))
         self.sources = sources_of(self.ws, [main.parent, *((self.ws / e.file).parent for e in self.edits)])
@@ -731,8 +731,8 @@ def main(args: Input) -> None:
         fail(SCRIPT, f"engine.kind: v2, not {args.engine.kind!r}: v1 has no item store")
     if args.steps < 0:
         fail(SCRIPT, f"steps: at least 0, not {args.steps}")
-    import apps
-    specs = cast(dict[str, dict[str, Any]], json.loads(Path(apps.SPECS).read_text()))
+    import appruns
+    specs = cast(dict[str, dict[str, Any]], json.loads(Path(appruns.SPECS).read_text()))
     if unknown := sorted(set(args.apps) - set(specs)):
         fail(SCRIPT, f"apps: apps.json has no {', '.join(unknown)}")
     if without := sorted(n for n in args.apps if not specs[n].get("edits")):

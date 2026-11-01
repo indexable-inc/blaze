@@ -146,7 +146,8 @@ mod x86 {
             unsafe { _mm_stream_si128(to_at.cast(), v) };
             at += 16;
         }
-        _mm_sfence();
+        // SAFETY: SSE2 is baseline on x86_64; this fences the non-temporal stores above.
+        unsafe { _mm_sfence() };
         // SAFETY: `at <= from.len()`, so both offsets are inside (or one past) their buffers.
         let (from_at, to_at) = (unsafe { src.add(at) }, unsafe { to.add(at) });
         // SAFETY: the `from.len() - at` bytes from each are in `from` and `to` (the caller's

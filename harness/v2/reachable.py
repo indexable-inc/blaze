@@ -63,7 +63,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -286,6 +286,7 @@ def behaviour(s: Subject, run: object, program: Path, ws: Path, env: dict[str, s
     """One command line of `runs`: the program's, or a tool's talking to it."""
     executable: Path | None = program
     stdin_path: Path | None = None
+    shown = run_name(run)
     if isinstance(run, dict):
         given = cast(dict[str, Any], run)
         if "tool" in given:
@@ -301,12 +302,14 @@ def behaviour(s: Subject, run: object, program: Path, ws: Path, env: dict[str, s
     except subprocess.TimeoutExpired:
         return (f"no end in {RUN_SECS} s", "", "")
     except OSError as e:
-        raise engine.Failed(f"{s.label}: `{run_name(run)}` did not start: {e}") from None
-    return (str(done.returncode), *(cleaned(out, program, port, s.scrub) for out in (done.stdout, done.stderr)))
+        raise engine.Failed(f"{s.label}: `{shown}` did not start: {e}") from None
+    stdout: bytes = done.stdout
+    stderr: bytes = done.stderr
+    return (str(done.returncode), cleaned(stdout, program, port, s.scrub), cleaned(stderr, program, port, s.scrub))
 
 
 @contextlib.contextmanager
-def served(s: Subject, program: Path, ws: Path, env: dict[str, str], port: int, log: Path) -> Iterator[None]:
+def served(s: Subject, program: Path, ws: Path, env: dict[str, str], port: int, log: Path) -> Generator[None]:
     """The program served on `port` for as long as the block runs, when the entry has `serve`."""
     if s.serve is None:
         yield
@@ -488,8 +491,9 @@ def compare_symbols(a: dict[str, Symbols], b: dict[str, Symbols]) -> str | None:
             x, y = set(a[name].get(table, ())), set(b[name].get(table, ()))
             if x == y:
                 continue
+            only: list[tuple[Mode, set[str]]] = [("full", x - y), ("reached", y - x)]
             how = [f"{len(names)} only in the {MODE_NAMES[mode]} build, first {', '.join(sorted(names)[:SYMBOLS_SHOWN])}"
-                   for mode, names in (("full", x - y), ("reached", y - x)) if names]
+                   for mode, names in only if names]
             lines.append(f"{name} ({table}): {'; '.join(how)}")
     if not lines:
         return None

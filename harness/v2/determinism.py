@@ -234,10 +234,10 @@ def main(args: Input) -> None:
         subjects.append(("fixture", lambda top: fixture_subject(top, args.fixture_seed)))
 
     def each(subject: Subject, top: Path) -> None:
-        for profile in dict.fromkeys(args.profiles):
+        for profile in sorted(set(args.profiles), key=args.profiles.index):
             name = f"{subject.label} {profile}"
-            rep.guarded(name, lambda: budgets.failing(name, lambda: compare(eng, rep, subject, top, profile, cores_a,
-                                                                            cores_b)))
+            rep.guarded(name, lambda p=profile: budgets.failing(name, lambda: compare(eng, rep, subject, top, p, cores_a,
+                                                                                      cores_b)))
 
     for label, make in subjects:
         top = work / label

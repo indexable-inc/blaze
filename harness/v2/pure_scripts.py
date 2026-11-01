@@ -65,10 +65,10 @@ import shutil
 import sys
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent)]
@@ -195,7 +195,7 @@ def package_of(step: str, package_id: str) -> tuple[str, str]:
     raise engine.Failed(f"{step}: {package_id!r} is no package id cargo writes")
 
 
-def script_run(step: str, line: dict[str, object]) -> ScriptRun:
+def script_run(step: str, line: Mapping[str, object]) -> ScriptRun:
     """One `blaze-script` line, checked whole."""
     package_id, out_dir, kind = line.get("package_id"), line.get("out_dir"), line.get("purity")
     said, identity, hit = line.get("said"), line.get("identity"), line.get("hit")
@@ -213,7 +213,7 @@ def script_run(step: str, line: dict[str, object]) -> ScriptRun:
     if hit and kind != "pure":
         raise engine.Failed(f"{wrong} hit a pure key and is not pure")
     name, version = package_of(step, package_id)
-    purity = Purity(cast(Kind, kind), cast(str | None, said if kind == "impure" else None),
+    purity = Purity(kind, cast(str | None, said if kind == "impure" else None),
                     cast(str | None, identity if kind == "pure" else None), hit)
     return ScriptRun(package_id, name, version, out_dir, purity)
 
@@ -354,10 +354,12 @@ def resolved_build_deps(label: str, ws: Path, env: dict[str, str]) -> dict[tuple
     """Each package's build dependencies as cargo resolved them, by name, from `cargo metadata`
     of the lock file the builds read."""
     ran = engine.cargo(f"{label}: cargo metadata", ["metadata", "--format-version", "1", "--locked", "--offline"], ws, env)
-    meta = json.loads(ran.checked(f"{label}: cargo metadata").stdout)
+    meta: dict[str, Any] = json.loads(ran.checked(f"{label}: cargo metadata").stdout)
     names = {p["id"]: (p["name"], p["version"]) for p in meta["packages"]}
     out: dict[tuple[str, str], tuple[str, ...]] = {}
-    for node in (meta.get("resolve") or {}).get("nodes", []):
+    resolve: dict[str, Any] = meta.get("resolve") or {}
+    nodes: list[dict[str, Any]] = resolve.get("nodes", [])
+    for node in nodes:
         deps = {names[dep["pkg"]][0] for dep in node["deps"] if any(k["kind"] == "build" for k in dep["dep_kinds"])}
         out[names[node["id"]]] = tuple(sorted(deps))
     return out

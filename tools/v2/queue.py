@@ -31,12 +31,12 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from typed_input import InputError, fail, parse, read
 
@@ -216,7 +216,7 @@ def save(root: str, request: Request) -> None:
 
 
 @contextmanager
-def locked(root: str) -> Iterator[None]:
+def locked(root: str) -> Generator[None]:
     folder = queue_dir(root)
     folder.mkdir(parents=True, exist_ok=True)
     with open(folder / ".lock", "w") as lock:
@@ -645,7 +645,7 @@ def command_of(text: str) -> Command:
         value = read(text)
     except (InputError, OSError) as e:
         fail(SCRIPT, str(e))
-    name = value.get("command") if isinstance(value, dict) else None
+    name: object = cast("dict[str, object]", value).get("command") if isinstance(value, dict) else None
     if not isinstance(name, str) or name not in COMMANDS:
         fail(SCRIPT, f"`command` is one of {', '.join(COMMANDS)}, not {json.dumps(name)}")
     return parse(COMMANDS[name], json.dumps(value), SCRIPT)

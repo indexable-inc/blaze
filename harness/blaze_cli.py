@@ -43,6 +43,7 @@ Writes BLAZE-CLI.md and blaze_cli.json next to this file. A run of some projects
 and keeps the others. `--small` is the three projects of the CI job.
 """
 import collections, contextlib, glob, json, os, re, shutil, signal, stat, subprocess, sys, tempfile, time, urllib.request
+from typing import Any
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -326,7 +327,7 @@ class Scratch(Side):
             shutil.rmtree(home, ignore_errors=True)
 
 
-def how_built(stderr):
+def how_built(stderr: str) -> str:
     """How a build of blaze's ended: "daemon" when it finished, else "failed: " and its first
     error. v2 builds only through its daemon (`blaze` hands every command to `blaze_cargo::cli`,
     which runs no cargo and no rustc), and prints cargo's own lines, `Finished` and `Compiling`
@@ -354,14 +355,14 @@ def program_output(ran):
     return ran.returncode, clean(ran.stdout), clean(ran.stderr)
 
 
-def kept_passes(report):
+def kept_passes(report: str) -> list[str]:
     """The tests a `blaze test` kept the pass of and did not run, by libtest's name, from the
     `tests.ndjson` it wrote at `report` (docs/cargo.md)."""
     lines = open(report, encoding="utf-8").read().splitlines() if os.path.exists(report) else []
     return [test["name"] for test in map(json.loads, filter(None, lines)) if test.get("result") == "cached"]
 
 
-def test_results(ran):
+def test_results(ran: Any) -> tuple[int, collections.Counter[tuple[str, str]], tuple[int, int, int, int, int]]:
     """The outcome of each test, the totals of the test executables, and the exit status.
     `blaze test` does not run a test that passed as it is now, and lists it on stderr only
     (#836): a test it kept (`ran.kept`, from `Side.cargo`) is one cargo ran and passed. So the
@@ -409,7 +410,7 @@ def test_verdict(results, known=frozenset()):
     return "; ".join(wrong) or None
 
 
-def difference(ours, theirs):
+def difference(ours: object, theirs: object) -> str | None:
     """`None` when the two are the same, or the first thing that is not."""
     if ours == theirs:
         return None

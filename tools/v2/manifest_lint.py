@@ -17,7 +17,7 @@ import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from typed_input import parse
 
@@ -52,8 +52,9 @@ def lint(root: Path) -> list[str]:
     root_manifest = tomllib.loads((root / "Cargo.toml").read_text())
     workspace = root_manifest["workspace"]
     declared: dict[str, Any] = workspace.get("dependencies", {})
-    for name, spec in declared.items():
-        if isinstance(spec, dict) and "path" in spec and not (root / spec["path"] / "Cargo.toml").is_file():
+    for name, entry in declared.items():
+        spec = cast("dict[str, Any]", entry) if isinstance(entry, dict) else None
+        if spec is not None and "path" in spec and not (root / str(spec["path"]) / "Cargo.toml").is_file():
             problems.append(f"Cargo.toml: workspace dependency `{name}` points at `{spec['path']}`, which has no Cargo.toml")
     excluded = {(root / e).resolve() for e in workspace.get("exclude", [])}
     members = [c for pattern in workspace.get("members", []) for c in sorted(root.glob(pattern))]
@@ -70,13 +71,14 @@ def lint(root: Path) -> list[str]:
         if not has_target(crate, manifest):
             problems.append(f"{rel}: no target file (src/lib.rs, src/main.rs or a `path =`)")
         for table_name, table in dep_tables(manifest):
-            for name, spec in table.items():
-                if not isinstance(spec, dict) or not spec.get("workspace"):
+            for name, entry in table.items():
+                spec = cast("dict[str, Any]", entry) if isinstance(entry, dict) else None
+                if spec is None or not spec.get("workspace"):
                     problems.append(
                         f"{rel}/Cargo.toml: `{name}` in [{table_name}] is not `workspace = true`: its version, "
                         f"path or git source goes in the root's [workspace.dependencies]"
                     )
-                    if isinstance(spec, dict) and "path" in spec and not (crate / spec["path"] / "Cargo.toml").is_file():
+                    if spec is not None and "path" in spec and not (crate / str(spec["path"]) / "Cargo.toml").is_file():
                         problems.append(f"{rel}/Cargo.toml: `{name}` points at `{spec['path']}`, which has no Cargo.toml")
                     continue
                 used.add(name)

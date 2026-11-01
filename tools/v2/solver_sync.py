@@ -88,7 +88,7 @@ def read_series(crate: Path) -> Series:
         raise Failed(f"{crate.name}: PATCHES.md names a patch twice")
     if names != tuple(sorted(names)):
         raise Failed(f"{crate.name}: PATCHES.md's patches are not in the order of their numbers")
-    on_disk = {p.stem for p in (crate / "patches").glob("*.patch")} if (crate / "patches").is_dir() else set()
+    on_disk: set[str] = {p.stem for p in (crate / "patches").glob("*.patch")} if (crate / "patches").is_dir() else set()
     if unlisted := sorted(on_disk - set(names)):
         raise Failed(f"{crate.name}: patches/ has {', '.join(unlisted)}, which PATCHES.md doesn't list")
     if missing := sorted(set(names) - on_disk):

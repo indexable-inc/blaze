@@ -100,7 +100,9 @@ class Report:
         return None
 
     def failing(self) -> list[Outcome]:
-        bad: set[Verdict] = {"fail", "error"} | ({"unmeasured"} if self.engine.kind == "v2" else set())
+        bad: set[Verdict] = {"fail", "error"}
+        if self.engine.kind == "v2":
+            bad.add("unmeasured")
         return [o for o in self.outcomes if o.verdict in bad]
 
     def finish(self) -> NoReturn:

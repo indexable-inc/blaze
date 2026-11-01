@@ -32,7 +32,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "python" / "typed-input" / "src"))
 from typed_input import fail, parse, read  # noqa: E402
@@ -261,7 +261,8 @@ DEP_TABLE = re.compile(r"^\[(?:.*\.)?(?:dependencies|dev-dependencies|build-depe
 
 def dependency_lines(manifest: str) -> list[int]:
     """The line numbers of single-line entries in `manifest`'s dependency tables."""
-    found, inside = [], False
+    found: list[int] = []
+    inside = False
     for i, line in enumerate(manifest.splitlines()):
         if line.startswith("["):
             inside = DEP_TABLE.match(line) is not None
@@ -350,7 +351,7 @@ def main() -> None:
     value = read(sys.argv[1])
     if not isinstance(value, dict):
         fail(SCRIPT, "the input is a JSON object")
-    command = parse(Command, json.dumps({"command": value.get("command")}), SCRIPT).command
+    command = parse(Command, json.dumps({"command": cast("dict[str, object]", value).get("command")}), SCRIPT).command
     if command == "classify":
         c = parse(Classify, sys.argv[1], SCRIPT)
         text = Path(c.log).read_text(errors="replace")

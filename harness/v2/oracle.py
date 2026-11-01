@@ -70,7 +70,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent)]
@@ -230,9 +230,9 @@ def compare(a: Built, b: Built, names: tuple[str, str]) -> list[str]:
             continue
         if program[0] != other[0]:
             out.append(f"{profile}: the program exits {program[0]} under {la}, {other[0]} under {lb}")
-        for stream, at in (("stdout", 1), ("stderr", 2)):
-            if program[at] != other[at]:
-                out.append(f"{profile}: the program's {stream} differs: {first_line_apart(program[at], other[at])}")
+        for stream, mine, theirs in (("stdout", program[1], other[1]), ("stderr", program[2], other[2])):
+            if mine != theirs:
+                out.append(f"{profile}: the program's {stream} differs: {first_line_apart(mine, theirs)}")
     for profile, tests in a.tests.items():
         other = b.tests.get(profile)
         if other is not None and tests != other:
@@ -318,7 +318,7 @@ class Round:
         kept_file.unlink(missing_ok=True)
         ran = self.eng.build(f"{step}: test", self.ws, env, args, command="test", timeout=BUILD_SECS)
         built.not_blazes = built.not_blazes or self.eng.not_blazes(ran)
-        kept = cast(list[str], blaze_cli.kept_passes(str(kept_file)))
+        kept = blaze_cli.kept_passes(str(kept_file))
         return cast(object, blaze_cli.test_results(SimpleNamespace(returncode=ran.returncode, stdout=ran.stdout, kept=kept)))
 
     def codegen(self, env: dict[str, str]) -> dict[str, str] | None:
@@ -356,10 +356,11 @@ class Round:
         ran = engine.run("comparing the traces", [str(proof), json.dumps(given)], self.work, engine.scrubbed(), RUN_SECS)
         if ran.returncode not in (0, 1):
             raise engine.Failed(f"comparing the traces: `blaze-v2-proof` exited {ran.returncode}:\n{ran.said()}")
-        found = json.loads(ran.stdout)
+        found: dict[str, Any] = json.loads(ran.stdout)
         stale = [f"the trace: {s['what']} {s['query']}: {s['detail']}" for s in found["stale"]]
-        case = found.get("nameres")
-        for f in case["findings"] if case else []:
+        case: dict[str, Any] = found.get("nameres") or {}
+        findings: list[dict[str, Any]] = case.get("findings", [])
+        for f in findings:
             line = f"the {case['slot']} case ({case['claim']}): {f['side'].lower()}: {f['detail']}"
             if f["side"] != "Unmeasured":
                 stale.append(line)

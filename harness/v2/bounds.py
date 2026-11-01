@@ -34,6 +34,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent)]
@@ -100,7 +101,7 @@ def value_of(stdout: str, what: str) -> float:
         said = json.loads(lines[-1]) if lines else None
     except json.JSONDecodeError:
         said = None
-    value = said.get("value") if isinstance(said, dict) else None
+    value = cast("dict[str, object]", said).get("value") if isinstance(said, dict) else None
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ValueError(f"{what}: the last line is not a JSON object with a number `value`: {lines[-1:]!r:.300}")
     return float(value)

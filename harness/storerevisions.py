@@ -45,7 +45,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, get_args
+from typing import Literal, cast, get_args
 
 from typed_input import fail, parse
 
@@ -257,9 +257,18 @@ def messages(said: str, reason: str) -> list[dict[str, object]]:
                 message = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if isinstance(message, dict) and message.get("reason") == reason:
-                out.append(message)
+            if not isinstance(message, dict):
+                continue
+            found = cast("dict[str, object]", message)
+            if found.get("reason") == reason:
+                out.append(found)
     return out
+
+
+def target_name(message: dict[str, object]) -> object:
+    """The `target.name` of a compiler message."""
+    target = message.get("target")
+    return cast("dict[str, object]", target).get("name") if isinstance(target, dict) else None
 
 
 @dataclass(frozen=True)
@@ -286,7 +295,7 @@ async def build(env: Env, ws: Path, seed: Path | None, label: str, exe: str) -> 
     try:
         said = await run(f"{label}: the build", [blaze, "build", "--message-format=json"], ws, variables, BUILD_SECS)
         programs = [m["executable"] for m in messages(said, "compiler-artifact")
-                    if m.get("executable") and isinstance(m.get("target"), dict) and m["target"].get("name") == exe]
+                    if m.get("executable") and target_name(m) == exe]
         if not programs:
             raise Failed(f"{label}: the build names no executable of {exe}:\n{said[-3000:]}")
         program = str(programs[-1])

@@ -376,7 +376,7 @@ def test_lock() -> None:
 
 def test_fixture() -> None:
     """The fixture's own proc-macro crates, and the tests this runs of this repository."""
-    own = []
+    own: list[str] = []
     for manifest in sorted(FIXTURE.glob("*/Cargo.toml")):
         parsed = tomllib.loads(manifest.read_text())
         if parsed.get("lib", {}).get("proc-macro"):

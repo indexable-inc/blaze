@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
@@ -191,7 +192,7 @@ class Import(unittest.TestCase):
         lanes.mkdir()
         for name in ("v2-frontend", "v2-link", "v2-requests"):
             (lanes / f"{name}.md").write_text("")
-        self.input = {"command": "import", "root": str(self.root), "lanes_from": [str(lanes)]}
+        self.input: dict[str, Any] = {"command": "import", "root": str(self.root), "lanes_from": [str(lanes)]}
         self.patches = [
             mock.patch.object(q, "now", lambda: T0),
             mock.patch.object(q, "windows", lambda: [(3, "link-next1")]),
@@ -204,7 +205,7 @@ class Import(unittest.TestCase):
             p.stop()
         self.scratch.cleanup()
 
-    def run_import(self) -> list[object]:
+    def run_import(self) -> list[Any]:
         return q.import_requests(q.parse(q.Import, json.dumps(self.input), "test"))
 
     def test_imports_only_open_items_with_their_owner(self) -> None:

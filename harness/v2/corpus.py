@@ -269,9 +269,12 @@ def listed_cksum(index: str, name: str, version: str) -> str:
         if not line.strip():
             continue
         entry: Any = json.loads(line)
-        if not isinstance(entry, dict) or entry.get("vers") != version:
+        if not isinstance(entry, dict):
             continue
-        cksum: Any = entry.get("cksum")
+        fields = cast("dict[str, Any]", entry)
+        if fields.get("vers") != version:
+            continue
+        cksum: Any = fields.get("cksum")
         if not isinstance(cksum, str) or not re.fullmatch(r"[0-9a-f]{64}", cksum):
             raise engine.Failed(f"{name} {version}: the index lists the checksum {cksum!r}")
         return cksum
@@ -770,8 +773,8 @@ def test_dev_backend() -> None:
         assert "codegen-backend" in said and "requests-backend-axis.md" in said, said
         assert "v1" in refused(lambda: engine.Engine.of(dataclasses.replace(v2, kind="v1")))
         assert "LLVM" in refused(lambda: engine.Engine.of(dataclasses.replace(v2, backend="llvm")))
-        args = Input(engine.EngineSpec("v2", sys.executable), "", backends=("stencil", "cranelift"))
-        assert "codegen-backend" in refused(lambda: engines_of(args))
+        with_backends = Input(engine.EngineSpec("v2", sys.executable), "", backends=("stencil", "cranelift"))
+        assert "codegen-backend" in refused(lambda: engines_of(with_backends))
     assert [e.spec for _, e in engines_of(Input(engine.EngineSpec("v2", sys.executable), ""))] == [
         engine.EngineSpec("v2", sys.executable)]
     forced = engine.dev_backend_args

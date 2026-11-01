@@ -9,6 +9,7 @@ of an entry as its `runs` say, with what differs from run to run written alike; 
 as a server for as long as a block runs, when the entry is one.
 """
 import importlib, json, os, re, shlex, shutil, socket, subprocess, time
+from typing import Any
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -16,7 +17,7 @@ APPS_DIR = os.environ.get("APPS_DIR") or os.path.join(HERE, "vendor", "apps")
 SPECS = os.path.join(HERE, "apps", "apps.json")
 
 
-def own_flags(spec):
+def own_flags(spec: dict[str, Any]) -> str:
     """The flags the program's own build gives rustc (bun's `-Cforce-frame-pointers=yes`),
     which the harness's RUSTFLAGS would otherwise take the place of. Each build has them, and
     blaze reads them from RUSTFLAGS as cargo does."""
@@ -32,7 +33,7 @@ def sh(argv, cwd, env=None, check=True, timeout=None):
     return time.monotonic() - began, ran
 
 
-def checkout(name, spec):
+def checkout(name: str, spec: dict[str, Any]) -> str:
     """The application's source at the pinned commit, with its dependencies beside it."""
     ws = os.path.join(APPS_DIR, name)
     if not os.path.isdir(ws):
@@ -47,7 +48,7 @@ def checkout(name, spec):
     return os.path.join(ws, spec.get("dir", ""))
 
 
-def prepare(ws, spec):
+def prepare(ws: str, spec: dict[str, Any]) -> None:
     """What the application's own build makes before cargo can build it: `prepare` names a
     module of the harness whose `in_place(ws)` makes it, once, and returns the environment
     every build of the workspace needs (bunprep.py)."""
@@ -55,7 +56,7 @@ def prepare(ws, spec):
         os.environ.update(importlib.import_module(spec["prepare"]).in_place(ws))
 
 
-def localize(ws):
+def localize(ws: str) -> None:
     """Puts the source of every dependency in a directory beside the workspace and has cargo
     take it from there, so the versions built are the locked ones and blaze reads the files
     cargo compiles."""
@@ -80,7 +81,7 @@ def package_directory(ws, package):
     raise SystemExit(f"no package {package} in {ws}")
 
 
-def setup(ws, spec):
+def setup(ws: str, spec: dict[str, Any]) -> None:
     """What the command lines read is made once."""
     done = os.path.join(ws, ".apps-setup")
     if not os.path.exists(done):
@@ -181,7 +182,7 @@ def name_of(run):
     return shlex.join(run)
 
 
-def symptom(expected, got):
+def symptom(expected: tuple[Any, ...], got: tuple[Any, ...]) -> str:
     """How the run `got` differs from `expected`, both as `Program.behaviour` gives them: the
     exit status, else the first line of standard output that differs."""
     if got[0] != expected[0]:
