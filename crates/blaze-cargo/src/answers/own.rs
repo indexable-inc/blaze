@@ -621,11 +621,11 @@ mod tests {
         let path = std::env::var_os("PATH");
         assert_eq!(Vars::Process.get("PATH"), path);
         assert_eq!(Vars::Process.get(&unset), None);
-        let mut command = std::process::Command::new("rustc");
+        let mut command = std::process::Command::new("a-program");
         command.env(&unset, "set").env_remove("PATH");
         assert_eq!(Vars::Command(&command).get(&unset), Some("set".into()));
         assert_eq!(Vars::Command(&command).get("PATH"), None);
-        assert_eq!(Vars::Command(&std::process::Command::new("rustc")).get("PATH"), path);
+        assert_eq!(Vars::Command(&std::process::Command::new("a-program")).get("PATH"), path);
         let over = [
             (OsString::from(&unset), Some(OsString::from("first"))),
             (OsString::from(&unset), Some(OsString::from("last"))),

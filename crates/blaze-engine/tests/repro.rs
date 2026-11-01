@@ -21,6 +21,8 @@ use std::{
 /// Longer than any of these builds takes with the standard library built cold; a build still
 /// running then is a hang, and fails the test instead of holding the run.
 const DEADLINE: Duration = Duration::from_secs(900);
+/// The blaze this package builds.
+const BLAZE: &str = env!("CARGO_BIN_EXE_blaze");
 
 struct Case {
     root: PathBuf,
@@ -77,7 +79,7 @@ impl Case {
     /// `blaze args` in `sub`, a directory of the case's crate (`""` for the crate itself).
     fn blaze_in(&self, sub: &str, args: &[&str]) -> Out {
         let dir = self.dir.join(sub);
-        let mut child = Command::new(env!("CARGO_BIN_EXE_blaze"))
+        let mut child = Command::new(BLAZE)
             .args(args)
             .current_dir(&dir)
             .env("BLAZE_HOME", &self.home)
@@ -148,7 +150,7 @@ impl Case {
 
 impl Drop for Case {
     fn drop(&mut self) {
-        let stopped = Command::new(env!("CARGO_BIN_EXE_blaze"))
+        let stopped = Command::new(BLAZE)
             .arg("stop")
             .current_dir(&self.dir)
             .env("BLAZE_HOME", &self.home)
