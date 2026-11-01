@@ -1,6 +1,114 @@
 use super::busy;
 use crate::sim::Rng;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod path {
+    use std::{
+        ffi::{CStr, OsString},
+        io::{self, Read as _},
+        os::unix::{ffi::OsStringExt as _, fs::PermissionsExt as _},
+        path::{Path, PathBuf},
+    };
+
+    use crate::{Command, Sandbox};
+
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new(name: &str) -> Dir {
+            let dir = std::env::temp_dir()
+                .join(format!("blaze-spawn-path-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Dir(dir)
+        }
+
+        fn tool(&self, name: &str, says: &str) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, format!("#!/bin/sh\nprintf '%s' '{says}'\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn resolved(program: &str, env: &[(OsString, OsString)], dir: &Path) -> io::Result<PathBuf> {
+        let plan = super::super::Plan::new(&super::super::Program {
+            program: Path::new(program),
+            args: &[],
+            env,
+            dir,
+        })?;
+        // SAFETY: the plan owns the NUL-terminated program its pointer names.
+        let path = unsafe { CStr::from_ptr(plan.program) };
+        Ok(OsString::from_vec(path.to_bytes().to_vec()).into())
+    }
+
+    #[test]
+    fn relative_and_empty_path_entries_use_the_commands_directory() {
+        let dir = Dir::new("relative");
+        let nested = dir.tool("tools/blaze-path-tool", "nested");
+        let local = dir.tool("blaze-path-tool", "local");
+        for path in ["tools", "missing:tools", "tools:missing"] {
+            let env = [("PATH".into(), path.into())];
+            assert_eq!(resolved("blaze-path-tool", &env, &dir.0).unwrap(), nested, "PATH={path}");
+        }
+        for path in ["", ":missing", "missing:", "missing::other"] {
+            let env = [("PATH".into(), path.into())];
+            assert_eq!(resolved("blaze-path-tool", &env, &dir.0).unwrap(), local, "PATH={path}");
+        }
+    }
+
+    #[test]
+    fn an_unset_path_never_uses_the_daemons_environment() {
+        let error = resolved("sh", &[], Path::new("/")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            error.to_string().contains("PATH is not set in the command's environment"),
+            "{error}"
+        );
+        assert_eq!(resolved("/bin/sh", &[], Path::new("/")).unwrap(), Path::new("/bin/sh"));
+    }
+
+    #[test]
+    fn successive_requests_select_their_own_tools_and_restoring_path_restores_the_tool() {
+        let dir = Dir::new("requests");
+        dir.tool("one/blaze-path-tool", "one");
+        dir.tool("two/blaze-path-tool", "two");
+        let mut relative = PathBuf::new();
+        for _ in std::env::current_dir().unwrap().components().skip(1) {
+            relative.push("..");
+        }
+        relative.push(dir.0.strip_prefix("/").unwrap());
+        for cwd in [&dir.0, &relative] {
+            for (path, expected) in [("one:two", "one"), ("two:one", "two"), ("one:two", "one")] {
+                let command = Box::new(Command {
+                    program: "blaze-path-tool".into(),
+                    args: Vec::new(),
+                    env: vec![("PATH".into(), path.into())],
+                    dir: cwd.clone(),
+                    stdin: Vec::new(),
+                    sandbox: Sandbox::Off,
+                    memory: None,
+                });
+                let started = crate::process::start(Path::new("/"), command, None).unwrap();
+                let mut stdout = Vec::new();
+                std::fs::File::from(started.stdout).read_to_end(&mut stdout).unwrap();
+                let mut stderr = Vec::new();
+                std::fs::File::from(started.stderr).read_to_end(&mut stderr).unwrap();
+                let exit = started.finish.exited(started.pid, stdout, stderr).unwrap();
+                assert_eq!((exit.code, exit.signal), (Some(0), None), "{exit:?}");
+                assert_eq!(exit.stdout, expected.as_bytes(), "PATH={path}");
+            }
+        }
+    }
+}
+
 /// [`busy::next`] as a loop: the wait doubled once per try, held at the cap, cut at the bound.
 fn reference(tried: u32, waited: u64) -> Option<u64> {
     if waited >= busy::MOST_NS {

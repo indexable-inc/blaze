@@ -184,7 +184,7 @@ impl Plan {
             Ok(at)
         };
         let resolved = bytes.len();
-        resolve(program.program, program.env, &mut bytes)?;
+        resolve(program.program, program.env, program.dir, &mut bytes)?;
         if bytes[resolved..].contains(&0) {
             return Err(nul("its path"));
         }
@@ -235,23 +235,41 @@ impl Plan {
 }
 
 /// Writes to `into` the file `program` names: itself where it has a `/`, else the first
-/// executable file of that name on the `PATH` of its environment, or of the daemon's where it
-/// sets none, as std's spawn looks it up. Each candidate is joined in the thread's path buffer.
+/// executable file of that name on the command's `PATH`. Relative and empty entries are
+/// relative to the command's directory, where the child will run, never the daemon's.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn resolve(program: &Path, env: &[(OsString, OsString)], into: &mut Vec<u8>) -> io::Result<()> {
+fn resolve(
+    program: &Path,
+    env: &[(OsString, OsString)],
+    dir: &Path,
+    into: &mut Vec<u8>,
+) -> io::Result<()> {
     let named = program.as_os_str().as_bytes();
     if named.contains(&b'/') {
         into.extend_from_slice(named);
         return Ok(());
     }
-    let own = env.iter().rev().find(|(name, _)| name == "PATH").map(|(_, value)| value.as_os_str());
-    // alloc: once per spawn whose environment sets no PATH, the daemon's.
-    let daemon = if own.is_none() { std::env::var_os("PATH") } else { None };
-    let path = own.or(daemon.as_deref()).unwrap_or_default();
+    let path = env.iter().rev().find(|(name, _)| name == "PATH").map(|(_, value)| value.as_os_str()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            // alloc: an error path.
+            format!("{}: PATH is not set in the command's environment; set PATH or name the program by path", program.display()),
+        )
+    })?;
+    // A relative working directory is relative to the parent once; exec runs after chdir.
+    let absolute;
+    let dir = if dir.is_absolute() {
+        dir
+    } else {
+        // alloc: a spawn whose working directory is relative.
+        absolute = std::env::current_dir()?.join(dir);
+        &absolute
+    };
     let found = blaze_mem::scratch::with_path(|candidate| {
-        for dir in path.as_bytes().split(|&it| it == b':') {
+        for entry in path.as_bytes().split(|&it| it == b':') {
             candidate.as_mut_os_string().clear();
-            candidate.push(if dir.is_empty() { OsStr::new(".") } else { OsStr::from_bytes(dir) });
+            candidate.push(dir);
+            candidate.push(OsStr::from_bytes(entry));
             candidate.push(program);
             let runs = std::fs::metadata(&*candidate)
                 .is_ok_and(|it| it.is_file() && it.permissions().mode() & 0o111 != 0);
