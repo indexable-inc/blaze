@@ -134,8 +134,31 @@ pub fn config_files(place: &Place, configs: &[String], cargo_home: Option<&Path>
 /// A path as the API carries it.
 pub fn utf8(path: &Path) -> Result<String, String> {
     path.to_str()
-        .map(str::to_owned)
+        .map(api_path)
         .ok_or_else(|| format!("the path {} is not UTF-8, which a request to the daemon can't carry", path.display()))
+}
+
+/// A path as the daemon names it: with `/` between its parts, on Windows after its drive
+/// (`C:\a` is `C:/a`, which `Path` and `Url` take as absolute too).
+#[cfg(windows)]
+pub fn api_path(text: &str) -> String {
+    text.replace('\\', "/")
+}
+
+#[cfg(not(windows))]
+pub fn api_path(text: &str) -> String {
+    text.to_owned()
+}
+
+/// A path the daemon named, as this system opens it: [`api_path`]'s inverse.
+#[cfg(windows)]
+pub fn host_path(text: &str) -> PathBuf {
+    PathBuf::from(text.replace('/', "\\"))
+}
+
+#[cfg(not(windows))]
+pub fn host_path(text: &str) -> PathBuf {
+    PathBuf::from(text)
 }
 
 /// The command's environment, sorted by name. A variable that is not UTF-8 is refused by its

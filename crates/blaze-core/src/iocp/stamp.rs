@@ -10,7 +10,7 @@
 use std::{
     io,
     os::windows::io::{AsRawHandle as _, OwnedHandle},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use windows_sys::Win32::{
@@ -72,7 +72,12 @@ fn ns(ticks: i64) -> u64 {
 /// `st_mode` as a system with none is made to say it: a name-surrogate reparse point is a link,
 /// then a directory, then a file, whose owner may write unless it is read-only.
 fn mode(attributes: u32, tag: u32) -> u32 {
-    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && tag & NAME_SURROGATE != 0 {
+    /// `IO_REPARSE_TAG_AF_UNIX`: the file of an `AF_UNIX` socket, which no open reads.
+    const AF_UNIX: u32 = 0x8000_0023;
+    const S_IFSOCK: u32 = 0o140000;
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && tag == AF_UNIX {
+        S_IFSOCK | 0o600
+    } else if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && tag & NAME_SURROGATE != 0 {
         S_IFLNK | 0o777
     } else if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
         S_IFDIR | 0o755
@@ -103,6 +108,14 @@ fn open(wide: &[u16], rights: u32, flags: u32) -> io::Result<OwnedHandle> {
 /// `\` or `:` would name another file or a stream of one.
 fn unnameable(name: &str) -> bool {
     name.bytes().any(|it| it < 0x20 || matches!(it, b'\\' | b':' | b'*' | b'?' | b'"' | b'<' | b'>' | b'|'))
+}
+
+/// The drive a name starts with, and the rest: Windows has no one root, so a name `S:/wt/x` is on
+/// the drive `S:` (and `S:` alone is that drive's root), whatever the driver's root is.
+fn drive(name: &str) -> Option<(&str, &str)> {
+    let bytes = name.as_bytes();
+    let on = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    (on && (bytes.len() == 2 || bytes[2] == b'/')).then(|| (&name[..2], name.get(3..).unwrap_or("")))
 }
 
 /// The stamp of what `handle` is open on.
@@ -146,11 +159,18 @@ fn stamp_of(handle: &OwnedHandle) -> io::Result<Stamp> {
 /// The stamp of `name` under the root whose wide path is `prefix`, with `path` the buffer it is
 /// put together in.
 fn stamp_name(prefix: &[u16], name: &str, path: &mut Vec<u16>) -> Stamp {
+    let (drive, name) = match drive(name) {
+        Some((drive, rest)) => (Some(drive), rest),
+        None => (None, name),
+    };
     if unnameable(name) {
         return Stamp::GONE;
     }
     path.clear();
-    path.extend_from_slice(prefix);
+    match drive {
+        Some(drive) => path.extend(r"\\?\".encode_utf16().chain(drive.encode_utf16())),
+        None => path.extend_from_slice(prefix),
+    }
     path.push(u16::from(b'\\'));
     path.extend(name.encode_utf16().map(|it| if it == u16::from(b'/') { u16::from(b'\\') } else { it }));
     path.push(0);
@@ -238,6 +258,14 @@ pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, 
         // alloc: once per thread, the buffer every listing on it fills.
         static BUFFER: std::cell::RefCell<Box<[u64]>> = std::cell::RefCell::new(vec![0u64; LISTING / 8].into_boxed_slice());
     }
+    let root;
+    let dir = match drive(name.as_str()) {
+        Some((drive, "")) => {
+            root = PathBuf::from(format!("{drive}\\"));
+            &root
+        }
+        _ => dir,
+    };
     BUFFER.with_borrow_mut(|buffer| list(dir, name, buffer))
 }
 

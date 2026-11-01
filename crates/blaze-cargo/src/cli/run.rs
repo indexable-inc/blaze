@@ -119,7 +119,7 @@ pub fn planned(artifact: &Artifact, program_args: &[OsString], cwd: &Path) -> Re
     let Some(executable) = artifact.executable.as_deref() else {
         return Err(format!("example target `{}` is a library and cannot be executed", artifact.target.name));
     };
-    let shown = shown_exe(Path::new(executable), cwd);
+    let shown = shown_exe(&super::place::host_path(executable), cwd);
     Ok(Exec::of(artifact, shown, program_args.iter().cloned(), cwd.to_owned()))
 }
 

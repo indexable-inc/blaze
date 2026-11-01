@@ -799,6 +799,7 @@ dependencies = [
  "serde",
  "serde_json",
  "stdx",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

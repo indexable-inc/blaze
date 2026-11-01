@@ -32,6 +32,9 @@ stdx.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_SystemInformation"] }
+
 [target.'cfg(blaze_check)'.dependencies]
 blaze-check.workspace = true
 

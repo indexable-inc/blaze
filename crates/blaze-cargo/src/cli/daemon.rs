@@ -323,6 +323,9 @@ fn started() -> anyhow::Result<std::path::PathBuf> {
     // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW: out of this console's Ctrl-C and close.
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(&mut daemon, 0x0000_0008 | 0x0000_0200 | 0x0800_0000);
+    // The daemon inherits no pipe of ours: whoever reads this command's output would wait for it to end.
+    #[cfg(windows)]
+    let _withheld = crate::raw::process::withhold_inheritance();
     daemon.spawn().context("starting the daemon (`blaze serve`)")?;
     Ok(log)
 }
