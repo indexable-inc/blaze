@@ -19,8 +19,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use blaze_hash::HashMap;
 use blaze_radix as radix;
-use rustc_hash::FxHashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Cpu {
@@ -68,9 +68,9 @@ impl Topology {
     /// tree laid out as it is, for tests). The affinity mask is not applied here.
     pub fn from_sysfs(root: &Path) -> io::Result<Topology> {
         let online = list(&read(&root.join("online"))?)
-            .map_err(|why| at(&root.join("online"), why))?;
+            .map_err(|why| at(&root.join("online"), &why))?;
         let mut found = Vec::with_capacity(online.len());
-        let mut capacities: FxHashMap<u32, u64> = FxHashMap::default();
+        let mut capacities: HashMap<u32, u64> = HashMap::default();
         for &id in &online {
             // alloc: a sysfs path, once per CPU per pool
             let cpu = root.join(format!("cpu{id}"));
@@ -95,12 +95,12 @@ impl Topology {
             }
             found.push((id, share, socket.unwrap_or(0), node_of(&cpu)?));
         }
-        let node: FxHashMap<u32, u32> =
+        let node: HashMap<u32, u32> =
             // alloc: once per pool, setup
             found.iter().map(|&(id, _, _, node)| (id, node)).collect();
         let fastest = capacities.values().copied().max();
         // Groups are numbered in the order they are first met, so the map's order is never read.
-        let mut sets: FxHashMap<Vec<u32>, u32> = FxHashMap::default();
+        let mut sets: HashMap<Vec<u32>, u32> = HashMap::default();
         let mut cpus = Vec::with_capacity(found.len());
         for (id, share, socket, home) in found {
             // A cache shared across nodes is split by node: a group's memory is all local.
@@ -149,7 +149,7 @@ impl Topology {
     /// its NUMA node, then of its socket, then the rest, each nearest by id first (ties to the
     /// lower). Empty for a group the topology does not have.
     pub fn steal_order(&self, group: u32) -> Vec<u32> {
-        let mut place_of: FxHashMap<u32, (u32, u32)> = FxHashMap::default();
+        let mut place_of: HashMap<u32, (u32, u32)> = HashMap::default();
         for cpu in &self.cpus {
             place_of.entry(cpu.group).or_insert((cpu.socket, cpu.node));
         }
@@ -183,7 +183,7 @@ impl Topology {
 /// `cpus` by id, their groups numbered from 0 in the order of their first CPU.
 fn dense(mut cpus: Vec<Cpu>) -> Topology {
     radix::sort_copy_by_key(&mut cpus, |it| it.id);
-    let mut renamed: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut renamed: HashMap<u32, u32> = HashMap::default();
     for cpu in &mut cpus {
         let next = u32::try_from(renamed.len()).unwrap_or(u32::MAX);
         cpu.group = *renamed.entry(cpu.group).or_insert(next);
@@ -242,10 +242,10 @@ fn node_of(cpu: &Path) -> io::Result<u32> {
     let entries = match fs::read_dir(cpu) {
         Ok(entries) => entries,
         Err(why) if why.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(why) => return Err(at(cpu, why)),
+        Err(why) => return Err(at(cpu, &why)),
     };
     for entry in entries {
-        let entry = entry.map_err(|why| at(cpu, why))?;
+        let entry = entry.map_err(|why| at(cpu, &why))?;
         let name = entry.file_name();
         if let Some(number) = name.to_str().and_then(|it| it.strip_prefix("node"))
             && let Ok(node) = number.parse::<u32>()
@@ -264,12 +264,12 @@ fn last_level(cpu: &Path) -> io::Result<Option<BTreeSet<u32>>> {
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(why) if why.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(why) => return Err(at(&dir, why)),
+        Err(why) => return Err(at(&dir, &why)),
     };
     // alloc: once per CPU per pool, setup
     let mut indexes: Vec<PathBuf> = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|why| at(&dir, why))?;
+        let entry = entry.map_err(|why| at(&dir, &why))?;
         if entry.file_name().to_string_lossy().starts_with("index") {
             indexes.push(entry.path());
         }
@@ -280,7 +280,7 @@ fn last_level(cpu: &Path) -> io::Result<Option<BTreeSet<u32>>> {
             && let Some(text) = read_opt(&index.join("shared_cpu_list"))?
         {
             let path = index.join("shared_cpu_list");
-            return list(&text).map(Some).map_err(|why| at(&path, why));
+            return list(&text).map(Some).map_err(|why| at(&path, &why));
         }
     }
     Ok(None)
@@ -290,12 +290,12 @@ fn last_level(cpu: &Path) -> io::Result<Option<BTreeSet<u32>>> {
 fn cluster(cpu: &Path, id: u32, online: &BTreeSet<u32>) -> io::Result<Option<BTreeSet<u32>>> {
     let path = cpu.join("topology/cluster_cpus_list");
     let Some(text) = read_opt(&path)? else { return Ok(None) };
-    let cluster = &list(&text).map_err(|why| at(&path, why))? & online;
+    let cluster = &list(&text).map_err(|why| at(&path, &why))? & online;
     let mut core = BTreeSet::from([id]);
     for name in ["topology/core_cpus_list", "topology/thread_siblings_list"] {
         let path = cpu.join(name);
         if let Some(text) = read_opt(&path)? {
-            core.extend(&list(&text).map_err(|why| at(&path, why))? & online);
+            core.extend(&list(&text).map_err(|why| at(&path, &why))? & online);
             break;
         }
     }
@@ -329,18 +329,18 @@ fn list(text: &str) -> io::Result<BTreeSet<u32>> {
 }
 
 fn read(path: &Path) -> io::Result<String> {
-    fs::read_to_string(path).map_err(|why| at(path, why))
+    fs::read_to_string(path).map_err(|why| at(path, &why))
 }
 
 fn read_opt(path: &Path) -> io::Result<Option<String>> {
     match fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
         Err(why) if why.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(why) => Err(at(path, why)),
+        Err(why) => Err(at(path, &why)),
     }
 }
 
-fn at(path: &Path, why: io::Error) -> io::Error {
+fn at(path: &Path, why: &io::Error) -> io::Error {
     // alloc: the error's message
     io::Error::new(why.kind(), format!("{}: {why}", path.display()))
 }

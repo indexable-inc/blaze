@@ -10,14 +10,14 @@
 
 use base_db::{Db, FileId};
 use blaze_api::{ApiError, How, Target};
+use blaze_hash::HashSet;
 use blaze_ids::radix;
 use blaze_vfs::Op;
 use either::Either;
 use hir::{
     AsAssocItem, Crate, Field, HasVisibility, ModuleDef, PathResolution, Trait, Visibility,
-    db::HirDatabase, view::Semantics,
+    view::Semantics,
 };
-use rustc_hash::FxHashSet;
 use syntax::{
     LexedStr, NodeOrToken, SyntaxKind, TextRange, TextSize,
     view::{self as ast, AstNode as _, HasAttrs as _},
@@ -223,8 +223,8 @@ fn files_of(db: &Db, def: Def) -> Vec<FileId> {
     if public {
         crates.extend(krate.transitive_reverse_dependencies(db));
     }
-    let mut seen_crates = FxHashSet::default();
-    let mut seen = FxHashSet::default();
+    let mut seen_crates = HashSet::default();
+    let mut seen = HashSet::default();
     let mut files = Vec::new();
     for krate in crates {
         if !seen_crates.insert(krate) {
@@ -417,7 +417,7 @@ fn record_expr_field<'db>(cx: &Edits<'db, impl Files>, field: ast::RecordExprFie
 /// The item a rewritten occurrence touches, and how: the renamed item's own name renames it; one
 /// in a body changes that body; in a use or a module's macro call, the scope; anywhere else, the
 /// item's signature, or its fields.
-fn touch_of(file: u32, token: ast::Token<'_>) -> Touch {
+pub(crate) fn touch_of(file: u32, token: ast::Token<'_>) -> Touch {
     let parent = token.parent().expect("a token has a parent");
     let Some(top) = path::top_of(parent) else {
         return Touch { file, at: At::File, how: How::Scope };

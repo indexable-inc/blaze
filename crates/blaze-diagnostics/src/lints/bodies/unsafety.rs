@@ -10,6 +10,7 @@
 //! functions that are unsafe only from edition 2024 (`std::env::set_var`): rustc requires
 //! `unsafe` of them in every edition, and only lints a call outside a block before 2024.
 
+use blaze_hash::HashSet;
 use hir::{DefWithBody, InFile};
 use hir_def::{
     CallableDefId, DefWithBodyId,
@@ -17,7 +18,6 @@ use hir_def::{
     hir::{AsmOperand, Expr, ExprId, ExprKind, Pat, PatId, Statement, Unsafe},
 };
 use hir_ty::next_solver::{CallableIdWrapper, TyKind};
-use rustc_hash::FxHashSet;
 use rustc_type_ir::inherent::IntoKind as _;
 use span::Edition;
 use syntax::{
@@ -88,7 +88,7 @@ enum Context {
 
 struct Visitor<'s, 'a, 'db> {
     b: &'s BodyCx<'s, 'a, 'db>,
-    ops: FxHashSet<ExprOrPatSource>,
+    ops: HashSet<ExprOrPatSource>,
     context: Context,
     /// Each block found unused, with the used block it is nested in when that is why.
     warnings: Vec<(ExprId, Option<ExprId>)>,
@@ -216,7 +216,7 @@ impl Visitor<'_, '_, '_> {
 }
 
 /// The unsafe operations of the body, by where they are written.
-fn operations(b: &BodyCx<'_, '_, '_>) -> FxHashSet<ExprOrPatSource> {
+fn operations(b: &BodyCx<'_, '_, '_>) -> HashSet<ExprOrPatSource> {
     let def = DefWithBody::from(b.owner);
     b.cx.vsema.get_unsafe_ops(def.into())
 }

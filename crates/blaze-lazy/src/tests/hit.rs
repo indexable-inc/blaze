@@ -2,11 +2,12 @@
 //! read it, never compiled; its callees are still prefetched; a probe that panics fails the
 //! function naming it; and asks for hits from many threads at once start each function once.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use blaze_codegen::{CompiledFunction, InstanceKey};
 use blaze_stencil::tier::Tier;
+use parking_lot::Mutex;
 
 use super::flight::{Addresses, Counting, Mail, Mailbox, session};
 use super::{compiled, function, key};
@@ -38,7 +39,7 @@ pub(super) fn start<C: Compiler>(count: u32, compiler: C, workers: u32) -> (Runn
 
 /// Past [`crate::runner`]'s `ALONE`, so the next ask is a lone one.
 pub(super) fn pause() {
-    std::thread::sleep(Duration::from_millis(1));
+    blaze_spin::busy(Duration::from_millis(1));
 }
 
 #[test]
@@ -57,7 +58,7 @@ fn a_lone_hit_is_answered_before_the_frame_returns_and_never_compiled() {
     }
     let closed = runner.close();
     assert_eq!(closed.compiles, 4);
-    assert!(compiler.seen.lock().unwrap().is_empty(), "nothing compiled");
+    assert!(compiler.seen.lock().is_empty(), "nothing compiled");
 }
 
 #[test]
@@ -67,7 +68,7 @@ fn a_miss_after_a_probe_is_compiled_by_a_worker() {
     pause();
     runner.frame(0, ASK_KIND, 1, &wire::ask(1, 1)).unwrap();
     assert_eq!(mail.wait(0, 1).0, READY_KIND);
-    assert_eq!(*compiler.seen.lock().unwrap(), vec![key(1)]);
+    assert_eq!(*compiler.seen.lock(), vec![key(1)]);
     assert_eq!(runner.close().compiles, 1);
 }
 
@@ -79,7 +80,7 @@ fn a_hits_callees_are_prefetched_by_the_workers() {
     impl Compiler for Memo {
         fn compile(&self, at: InstanceKey) -> Result<CompiledFunction, String> {
             let n = (1..8).find(|n| key(*n) == at).ok_or("compiled, not a miss")?;
-            self.0.lock().unwrap().push(at);
+            self.0.lock().push(at);
             Ok(compiled(n, &[], &[]))
         }
         fn hit(&self, at: InstanceKey) -> Option<Result<CompiledFunction, String>> {
@@ -97,9 +98,9 @@ fn a_hits_callees_are_prefetched_by_the_workers() {
     let deadline = Instant::now() + Duration::from_secs(60);
     while (1..8).any(|n| runner.target(&key(n)).is_none()) {
         assert!(Instant::now() < deadline, "the callees prefetched within a minute");
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::yield_now();
     }
-    let seen = memo.0.lock().unwrap().clone();
+    let seen = memo.0.lock().clone();
     let distinct: std::collections::HashSet<_> = seen.iter().copied().collect();
     assert_eq!(seen.len(), 7, "each callee compiled once");
     assert_eq!(distinct, (1..8).map(key).collect());
@@ -118,7 +119,7 @@ fn a_probe_that_panics_fails_the_function_naming_it_and_stops_the_run() {
     assert_eq!(lazy, 1);
     assert!(why.contains("the compiler panicked: boom") && why.contains("on its first call"), "{why}");
     assert_eq!(mail.stops().len(), 1);
-    assert!(compiler.seen.lock().unwrap().is_empty());
+    assert!(compiler.seen.lock().is_empty());
     assert_eq!(runner.close().failures.len(), 1);
 }
 

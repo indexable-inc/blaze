@@ -3,11 +3,11 @@
 //! where its region stops holding, or the reference to it is overwritten, or the place it
 //! borrows goes away.
 
+use blaze_hash::{HashMap, HashSet};
 use hir_def::{
     DefWithBodyId,
     hir::{Array, Expr},
 };
-use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::IntoKind;
 use smallvec::SmallVec;
 
@@ -76,7 +76,7 @@ pub(crate) struct Loans {
     /// walk, which replay it.
     kills: Relation,
     /// The borrows of a promoted copy, which make no loan and read nothing.
-    pub(crate) promoted: FxHashSet<Location>,
+    pub(crate) promoted: HashSet<Location>,
 }
 
 /// How much of a place an access touches, as rustc's `AccessDepth`.
@@ -105,7 +105,7 @@ fn ignored<'db>(
     body: &MirBody<'db>,
     local: LocalId,
     projection: &[PlaceElem],
-    statics: &FxHashSet<LocalId>,
+    statics: &HashSet<LocalId>,
 ) -> bool {
     if statics.contains(&local) {
         return true;
@@ -166,8 +166,8 @@ fn plain_value<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, expr: hir_def::hir:
 }
 
 /// The locals a `static` is read through.
-pub(crate) fn static_locals(body: &MirBody<'_>) -> FxHashSet<LocalId> {
-    let mut found = FxHashSet::default();
+pub(crate) fn static_locals(body: &MirBody<'_>) -> HashSet<LocalId> {
+    let mut found = HashSet::default();
     for (_, block) in body.basic_blocks.iter() {
         for statement in &block.statements {
             if let StatementKind::Assign(place, Rvalue::Use(operand)) = &statement.kind
@@ -185,8 +185,8 @@ pub(crate) fn static_locals(body: &MirBody<'_>) -> FxHashSet<LocalId> {
 /// lifetime, into the value itself: the operand of a `&` the value is, or that is an element,
 /// a field, a tuple struct's or variant's constructor argument, a block's value or a cast
 /// operand of such. Likewise a `const { .. }` block's value.
-fn extended_temporaries(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<LocalId> {
-    let mut refs = FxHashSet::default();
+fn extended_temporaries(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> HashSet<LocalId> {
+    let mut refs = HashSet::default();
     let root = match body.owner {
         InferBodyId::AnonConstId(konst) if ctx.inline_const => Some(konst.loc(ctx.db).expr),
         _ => ctx.store.expr_roots().next_back(),
@@ -218,7 +218,7 @@ fn extended_temporaries(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Loca
             _ => (),
         }
     }
-    let mut found = FxHashSet::default();
+    let mut found = HashSet::default();
     for (_, block) in body.basic_blocks.iter() {
         for statement in &block.statements {
             if let StatementKind::Assign(_, Rvalue::Ref(_, place)) = &statement.kind
@@ -240,7 +240,7 @@ fn extended_temporaries(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Loca
 /// mutability (`Ms::new(&[M::new("a")])`). A borrow is promoted only if it is shared, or of
 /// an empty array, and a call only where the item's value certainly runs it, not in a branch
 /// that may be dead code.
-fn const_promoted(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<LocalId> {
+fn const_promoted(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> HashSet<LocalId> {
     let certain = certain_blocks(body);
     let calls = |expr: hir_def::hir::ExprId| {
         let mut stack = vec![expr];
@@ -252,7 +252,7 @@ fn const_promoted(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<LocalId> {
         }
         false
     };
-    let mut found = FxHashSet::default();
+    let mut found = HashSet::default();
     for (id, block) in body.basic_blocks.iter() {
         for statement in &block.statements {
             if let StatementKind::Assign(_, Rvalue::Ref(_, place)) = &statement.kind
@@ -278,8 +278,8 @@ fn const_promoted(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<LocalId> {
 
 /// The blocks a body certainly runs if it returns, rustc's `promotion_safe_blocks`: from the
 /// start on through gotos, calls, drops and asserts.
-fn certain_blocks(body: &MirBody<'_>) -> FxHashSet<hir_ty_mir::mir::BasicBlockId> {
-    let mut found = FxHashSet::default();
+fn certain_blocks(body: &MirBody<'_>) -> HashSet<hir_ty_mir::mir::BasicBlockId> {
+    let mut found = HashSet::default();
     let mut block = body.start_block;
     while found.insert(block) {
         block = match body.basic_blocks[block].terminator.as_ref().map(|it| &it.kind) {
@@ -300,15 +300,15 @@ fn certain_blocks(body: &MirBody<'_>) -> FxHashSet<hir_ty_mir::mir::BasicBlockId
 /// aggregates of them, of a type with no drop glue or interior mutability. The borrow
 /// neither reads the temporary nor holds it, so the `ref a` of `let ref a @ b = U;` does
 /// not borrow what `b` moves out.
-fn promoted_borrows(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Location> {
+fn promoted_borrows(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> HashSet<Location> {
     fn define<'b>(
-        defs: &mut FxHashMap<LocalId, Option<&'b Rvalue>>,
+        defs: &mut HashMap<LocalId, Option<&'b Rvalue>>,
         local: LocalId,
         rvalue: Option<&'b Rvalue>,
     ) {
         defs.entry(local).and_modify(|it| *it = None).or_insert(rvalue);
     }
-    let mut defs = FxHashMap::default();
+    let mut defs = HashMap::default();
     for (_, block) in body.basic_blocks.iter() {
         for statement in &block.statements {
             match &statement.kind {
@@ -339,7 +339,7 @@ fn promoted_borrows(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Location
             && !ctx.bindings.contains_key(&local)
     };
     fn promotable(
-        defs: &FxHashMap<LocalId, Option<&Rvalue>>,
+        defs: &HashMap<LocalId, Option<&Rvalue>>,
         temp: &impl Fn(LocalId) -> bool,
         local: LocalId,
         depth: usize,
@@ -363,7 +363,7 @@ fn promoted_borrows(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Location
                 _ => false,
             }
     }
-    let mut found = FxHashSet::default();
+    let mut found = HashSet::default();
     for (block, data) in body.basic_blocks.iter() {
         for (statement, it) in data.statements.iter().enumerate() {
             if let StatementKind::Assign(_, Rvalue::Ref(BorrowKind::Shared, place)) = &it.kind
@@ -489,7 +489,7 @@ impl Loans {
                         || plain_value(ctx, body, expr)))
             });
         // Nor what borrows one it does not promote, `&&TEST_DROP`.
-        let rejected: FxHashSet<hir_def::hir::ExprId> =
+        let rejected: HashSet<hir_def::hir::ExprId> =
             rejected.into_iter().map(|&(_, expr)| expr).collect();
         let borrows_rejected = |expr: hir_def::hir::ExprId| {
             let mut stack = vec![expr];
@@ -538,7 +538,7 @@ impl Loans {
             promoted: promoted_borrows(ctx, body),
         };
         let mut facts = Facts::default();
-        let mut two_phase: FxHashMap<LocalId, usize> = FxHashMap::default();
+        let mut two_phase: HashMap<LocalId, usize> = HashMap::default();
         for &block in &cfg.order {
             for (statement, it) in body.basic_blocks[block].statements.iter().enumerate() {
                 let StatementKind::Assign(place, Rvalue::Ref(kind, borrowed)) = &it.kind else {

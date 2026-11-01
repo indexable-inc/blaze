@@ -3,15 +3,13 @@
 use std::{borrow::Cow, iter, mem};
 
 use arrayvec::ArrayVec;
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
+use blaze_hash::HashMap;
 use blaze_mem::{Frame, Tag, frame};
 use hir_def::{
     AdtId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, HasModule, ItemContainerId,
     LocalFieldId, Lookup,
-    expr_store::{
-        Body, ExpressionStore, HygieneId,
-        body::Param,
-    },
+    expr_store::{Body, ExpressionStore, HygieneId, body::Param},
     hir::{
         ArithOp, Array, AsmOperand, BinaryOp, BindingAnnotation, BindingId, ClosureKind,
         CoroutineKind, CoroutineSource, ExprId, ExprOrPatId, LabelId, Literal, LoopSource,
@@ -26,7 +24,6 @@ use hir_expand::name::Name;
 use itertools::{Either, EitherOrBoth, Itertools};
 use la_arena::{ArenaMap, RawIdx};
 use rustc_apfloat::Float;
-use rustc_hash::FxHashMap;
 use rustc_type_ir::{
     CoroutineArgs, CoroutineArgsParts, TypeVisitableExt,
     inherent::{GenericArgs as _, IntoKind, Ty as _},
@@ -249,7 +246,7 @@ struct MirLowerCtx<'a, 'f, 'db> {
     inline_consts: u32,
     /// The `line!()` literals read where the code runs ([`location::slots_lines`]); `None`
     /// where each is its value.
-    line_slots: Option<&'db rustc_hash::FxHashSet<ExprId>>,
+    line_slots: Option<&'db blaze_hash::HashSet<ExprId>>,
     /// How many shared borrows rustc may promote the expression being lowered is inside of: a
     /// promoted constant is a value, so a `line!()` in one stays a literal.
     promotable_borrows: u32,
@@ -318,7 +315,7 @@ struct MirLowerCtx<'a, 'f, 'db> {
     /// Whether each type asked about is `Copy`. Every statement that may panic asks of every
     /// local in scope, which in a long body is the most of lowering it.
     // alloc: mark_moves (hir-ty) takes this map by type; frame once D2 lands
-    copy: FxHashMap<Ty<'db>, bool>,
+    copy: HashMap<Ty<'db>, bool>,
     env: ParamEnv<'db>,
     infcx: InferCtxt<'db>,
     /// Buffers reused across statements, each taken out while it is in use and put back.
@@ -422,7 +419,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             locals: Arena::new(),
             start_block,
             binding_locals: ArenaMap::new(),
-            upvar_locals: FxHashMap::default(),
+            upvar_locals: HashMap::default(),
             param_locals: Vec::with_capacity(0),
             promoted_locals: Vec::with_capacity(0),
             owner,
@@ -497,7 +494,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             deref_temps: framed::map_in(frame),
             assigned: Vec::new_in(frame),
             assigned_from: MirSpan::Unknown,
-            copy: FxHashMap::default(),
+            copy: HashMap::default(),
             env,
             infcx,
             order_buf: Vec::new_in(frame),
@@ -561,7 +558,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
 
     /// The body lowering built, each list of it allocated once at its length, with what
     /// `mark_moves` asks for.
-    fn finish(mut self) -> (MirBody<'db>, InferCtxt<'db>, ParamEnv<'db>, FxHashMap<Ty<'db>, bool>) {
+    fn finish(mut self) -> (MirBody<'db>, InferCtxt<'db>, ParamEnv<'db>, HashMap<Ty<'db>, bool>) {
         let Building {
             blocks,
             locals,

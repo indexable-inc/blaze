@@ -1,0 +1,29 @@
+astlog: ix's Datalog over tree-sitter syntax trees, its linter and rewriter.
+
+Repository: indexable-inc/ix
+Commit: 4c33e5a810f76f87ddbaa3c615e1a156b72de4eb (origin/main, 2026-11-01)
+
+What came from where (ix path -> blaze path):
+
+  packages/astlog/core                              -> tools/astlog/core (crate astlog-core)
+  packages/astlog/cli                               -> tools/astlog/cli (crate astlog, bin astlog)
+  packages/astlog/README.md                         -> tools/astlog/README.md
+  packages/edit-applier                             -> tools/astlog/edit-applier
+  packages/error-chain                              -> tools/astlog/error-chain
+  packages/ast-merge/langs                          -> tools/astlog/langs (crate ast-merge-langs)
+  build/lint/astlog-rules/rust-locks.astlog         -> tools/astlog/rules/rust-locks.astlog
+  build/lint/astlog-rules/tests/rust-relock/*       -> tools/astlog/rules/tests/rust-locks/*
+
+Changed on the way in, so a sync is the diff of ix between two commits applied over these:
+
+- langs: Rust, TOML and Python only. The other 26 grammars, their profiles and their tests are
+  gone, so their crates stay out of Cargo.lock; Python no longer claims Starlark's file names.
+- Manifests in blaze's form (`publish = false`, every dependency `workspace = true`). snafu is
+  crates.io's 0.8 without `unstable-provider-api`, so `#![feature(error_generic_member_access)]`
+  is gone from the three crates that had it.
+- core: maps and sets are `blaze_hash`'s (std's are disallowed in blaze, `.clippy.toml`); items
+  no other crate can name are `pub(crate)` (blaze warns on `unreachable_pub`); the Nix and
+  Elixir cases of its tests are the same cases in TOML and Rust.
+- edit-applier: no `#[expect]` of clippy's `suspicious_operation_groupings`, a nursery lint
+  blaze does not turn on. cli: `load` takes a `&Path`.
+- core/tests/rules.rs, rules/tests/rust-locks/bad.expected and scan.py are blaze's own.

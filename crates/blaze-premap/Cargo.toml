@@ -19,12 +19,12 @@ blaze-cas.workspace = true
 blaze-codegen.workspace = true
 blaze-format.workspace = true
 blaze-graph.workspace = true
+blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-inproc.workspace = true
 blaze-items.workspace = true
 blaze-link.workspace = true
 blaze-mem.workspace = true
-rustc-hash.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

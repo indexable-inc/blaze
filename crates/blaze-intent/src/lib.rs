@@ -4,7 +4,8 @@
 //! [`apply`] makes a request's [`Edit`]s in the files of a view the front end has lowered:
 //! each finds its target by path ([`path`]), replaces only that text and reparses only what it
 //! touched ([`file::Working::splice`]), and says which items it changed and how. A rename finds
-//! every reference through the front end's name resolution, never by text search ([`rename`]).
+//! every reference through the front end's name resolution, never by text search ([`rename`]),
+//! and so does a replace, which retargets every reference to one item to another ([`replace`]).
 //! What comes out is the VFS's text edits ([`blaze_vfs::Op::Edit`], and the moves of a renamed
 //! module's files): committing them gives exactly the bytes, and so the root, a text edit
 //! would. The trees reparsed in place come out too ([`Seed`]), for the front end to take in
@@ -21,6 +22,8 @@ pub mod edit;
 pub mod file;
 pub mod path;
 pub mod rename;
+pub mod replace;
+pub mod retarget;
 
 #[cfg(test)]
 mod tests;
@@ -31,10 +34,10 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use base_db::{Db, FileId, FileText};
 use blaze_api::{ApiError, Edit, Edited, EditedItem};
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_vfs::Op;
 use hir::view::Semantics;
-use rustc_hash::FxHashMap;
 use syntax::{
     Edition, Parse, SourceFile, SyntaxKind,
     view::{self as ast, AstNode as _},
@@ -108,16 +111,16 @@ pub(crate) struct Edits<'a, F: Files> {
     /// Each working copy's tree before any splice, as the front end has it: the views `sema`
     /// answers for.
     pub roots: Vec<ast::Node<'a>>,
-    pub by_path: FxHashMap<Box<str>, u32>,
-    pub by_id: FxHashMap<FileId, u32>,
+    pub by_path: HashMap<Box<str>, u32>,
+    pub by_id: HashMap<FileId, u32>,
     pub touches: Vec<Touch>,
     /// The moves of renamed modules' files, after every text edit.
     pub moves: Vec<Op>,
 }
 
 /// Makes `edits`, in order, in the view whose front end is `db` and whose files are `files`.
-/// A rename resolves in the view as it is, so every rename comes before the request's other
-/// edits.
+/// A rename or a replace resolves in the view as it is, so each comes before the request's
+/// other edits. The request's replaces are made together, in one pass at the first of them.
 pub fn apply<F: Files>(db: &Db, files: &F, edits: &[Edit]) -> Result<Applied, ApiError> {
     let mut cx = Edits {
         db,
@@ -126,12 +129,13 @@ pub fn apply<F: Files>(db: &Db, files: &F, edits: &[Edit]) -> Result<Applied, Ap
         working: Vec::new(),
         ids: Vec::new(),
         roots: Vec::new(), // alloc: one view per file the request opens, beside `ids`
-        by_path: FxHashMap::default(),
-        by_id: FxHashMap::default(),
+        by_path: HashMap::default(),
+        by_id: HashMap::default(),
         touches: Vec::new(),
         moves: Vec::new(),
     };
     let mut others_made = false;
+    let mut replaced = false;
     for edit in edits {
         match edit {
             Edit::Rename { to, item } => {
@@ -147,9 +151,38 @@ pub fn apply<F: Files>(db: &Db, files: &F, edits: &[Edit]) -> Result<Applied, Ap
                 }
                 rename::rename(&mut cx, item, to)?;
             }
+            Edit::Replace { .. } if replaced => {}
+            Edit::Replace { .. } => {
+                let late = edits
+                    .iter()
+                    .skip_while(|it| matches!(it, Edit::Rename { .. } | Edit::Replace { .. }))
+                    .find_map(|it| match it {
+                        Edit::Replace { from, .. } => Some(from),
+                        _ => None,
+                    });
+                if let Some(from) = late {
+                    return Err(ApiError::new(
+                        format!(
+                            "the replace of `{from}` comes after another kind of edit: a replace \
+                             resolves in the view as it is, so replaces and renames come first"
+                        ),
+                        None,
+                    ));
+                }
+                // alloc: the request's replaces, made together in one pass
+                let asked: Vec<(&str, &str)> = edits
+                    .iter()
+                    .filter_map(|it| match it {
+                        Edit::Replace { to, from } => Some((from.as_str(), to.as_str())),
+                        _ => None,
+                    })
+                    .collect();
+                replace::replace(&mut cx, &asked)?;
+                replaced = true;
+            }
             _ => {
                 others_made = true;
-                let path = edit::file_of(edit);
+                let path = edit::file_of(edit).expect("an edit other than a replace names its file");
                 let at = cx.open(path).map_err(|what| ApiError::new(what, Some(path.to_owned())))?;
                 edit::apply(&mut cx.working[at as usize], at, edit, &mut cx.touches)
                     .map_err(|what| ApiError::new(what, Some(path.to_owned())))?;
@@ -266,7 +299,9 @@ pub(crate) fn key_of<'db>(
     node: ast::Node<'db>,
 ) -> Option<ContentId> {
     use blaze_items::ItemId;
-    use hir_def::{AdtId, ConstId, FunctionId, ImplId, MacroId, ModuleId, StaticId, TraitId, TypeAliasId};
+    use hir_def::{
+        AdtId, ConstId, FunctionId, ImplId, MacroId, ModuleId, StaticId, TraitId, TypeAliasId,
+    };
 
     let id = match node.kind() {
         SyntaxKind::FN => ItemId::Function(FunctionId::try_from(sema.to_fn_def(ast::Fn::cast(node)?)?).ok()?),

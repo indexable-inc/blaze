@@ -2,7 +2,7 @@
 //! items where rustdoc puts them, each signature as code pieces whose names link, the docs
 //! with their intra-doc links resolved, and the impls of every type and trait.
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 /// Every crate documented in one run.
 #[derive(Debug, Default)]
@@ -426,9 +426,9 @@ pub struct Doc {
     pub markdown: String,
     /// Keyed by the link's destination as the docs write it (`Foo::bar`, `crate::Baz`), or its
     /// text for a shortcut link (`[Foo]`).
-    pub links: FxHashMap<String, Target>,
+    pub links: HashMap<String, Target>,
     /// What a link whose text is the link itself shows instead: `[struct@Foo]` shows `Foo`.
-    pub texts: FxHashMap<String, String>,
+    pub texts: HashMap<String, String>,
 }
 
 impl Doc {

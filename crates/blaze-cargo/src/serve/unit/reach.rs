@@ -12,9 +12,9 @@
 #![forbid(unsafe_code)]
 
 use blaze_api::{FactRead, Reach, ReachedItem};
+use blaze_hash::HashSet;
 use blaze_items::{CodeHash, Fact, HashColumns, ItemHashes, ItemKey, ItemKind, Resolved};
 use blaze_lower::Db;
-use rustc_hash::FxHashSet;
 
 use super::Job;
 use crate::serve::work::Failed;
@@ -60,8 +60,8 @@ pub(crate) fn reach(
 ) -> Result<Reach, Failed> {
     let mut items = Vec::new();
     let mut compiled = Vec::new();
-    let mut changed_code: FxHashSet<CodeHash> = FxHashSet::default();
-    let mut seen: FxHashSet<ItemKey> = FxHashSet::default();
+    let mut changed_code: HashSet<CodeHash> = HashSet::default();
+    let mut seen: HashSet<ItemKey> = HashSet::default();
     for (at, unit) in to.units().graph.units.iter().enumerate() {
         let package = to.package(unit)?;
         if !package.is_member || unit.is_std {

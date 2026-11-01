@@ -21,7 +21,7 @@ use blaze_mem::swiss::Index;
 use crate::{
     b3::ContextKey,
     sync::{
-        Mutex, OnceLock, PoisonError,
+        Mutex, OnceLock,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
 };
@@ -33,14 +33,13 @@ pub mod crc32c;
 pub mod fuse;
 mod many;
 pub mod names;
-pub mod prehashed;
 pub use blaze_radix as radix;
 pub use blaze_rng as rng;
 mod std_hash;
 mod sync;
 mod wire;
 
-pub use crate::std_hash::StdHash;
+pub use crate::std_hash::fixed_width_writes;
 
 /// Counts allocations so the read paths' tests hold them to a budget.
 #[cfg(all(test, not(blaze_check)))]
@@ -441,7 +440,7 @@ impl<T: Send + Sync> Interner<T> for Sharded<T> {
         }
         let value = value();
         let shard = self.shard(&id);
-        let mut claimed = shard.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut claimed = shard.lock.lock();
         if let Some(found) = self.probe(shard, &id) {
             return found;
         }
@@ -845,7 +844,7 @@ mod model {
     struct Model {
         interner: Sharded<Counted>,
         ids: Vec<ContentId>,
-        made: std::sync::Mutex<Vec<Arc<AtomicBool>>>,
+        made: parking_lot::Mutex<Vec<Arc<AtomicBool>>>,
         history: History<Set>,
     }
 
@@ -856,7 +855,7 @@ mod model {
             Arc::new(Model {
                 interner: Sharded::new(),
                 ids,
-                made: std::sync::Mutex::new(Vec::new()),
+                made: parking_lot::Mutex::new(Vec::new()),
                 history: History::new(),
             })
         }
@@ -876,7 +875,7 @@ mod model {
                     at = Some(idx);
                     let Some(made) = made else { return false };
                     let kept = !made.load(Relaxed);
-                    self.made.lock().unwrap_or_else(PoisonError::into_inner).push(made);
+                    self.made.lock().push(made);
                     kept
                 }
                 Op::Find(key) => {
@@ -900,7 +899,7 @@ mod model {
         fn finish(model: Arc<Model>) {
             model.history.check(Set::default());
             let Ok(model) = Arc::try_unwrap(model) else { panic!("a model thread outlived its join") };
-            let made = model.made.into_inner().unwrap_or_else(PoisonError::into_inner);
+            let made = model.made.into_inner();
             drop(model.interner);
             assert!(made.iter().all(|it| it.load(Relaxed)), "every value made is dropped once");
         }

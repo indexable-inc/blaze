@@ -73,7 +73,7 @@ use std::{
 };
 
 use blaze_core::{Untraceable, utf8::push_lossy};
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 use super::{Also, Bind, MARK, Recorder, Scope, Spec, View, tidy, tidy_into};
 
@@ -651,7 +651,7 @@ fn run_in(
         (None, true) => Around::Confined(first),
         (None, false) => Around::Namespaces,
     };
-    let mut watch = Watch { around, network: also.network, processes: FxHashMap::default() };
+    let mut watch = Watch { around, network: also.network, processes: HashMap::default() };
     let supervised = listener.is_some();
     if let Some(listener) = listener {
         supervise(listener.as_raw_fd(), first, &mut recorder, &mut watch);
@@ -1682,7 +1682,7 @@ fn exec(made: &Made<'_>) -> String {
                 blaze_core::busy::MOST_NS / 1_000_000
             );
         };
-        std::thread::sleep(std::time::Duration::from_nanos(wait));
+        blaze_core::busy::wait(wait);
         tried += 1;
         waited += wait;
     }
@@ -1867,7 +1867,7 @@ struct Watch {
     /// Whether the program may reach the network ([`Also::network`]).
     network: bool,
     /// The process of each thread seen, by the thread's id.
-    processes: FxHashMap<u64, u64>,
+    processes: HashMap<u64, u64>,
 }
 
 /// The supervisor's buffers, kept from one notification to the next: a path a call names is
@@ -3085,7 +3085,7 @@ sleep 5 & kill -0 "$!" || fail "it could not signal its own child"
             std::fs::copy("/bin/sh", &sh).unwrap();
             let writer = std::fs::OpenOptions::new().write(true).open(&sh).unwrap();
             let held = std::thread::spawn(move || {
-                std::thread::sleep(hold);
+                blaze_graph::spin::busy(hold);
                 drop(writer);
             });
             let program: Vec<OsString> = vec![sh.clone().into(), "-c".into(), "exit 3".into()];

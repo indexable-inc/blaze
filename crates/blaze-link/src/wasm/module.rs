@@ -7,7 +7,7 @@
 //! function, element, code, data, custom and name sections' runs are written there in
 //! parallel. A code piece's header is read in place ([`Header`], 48 bytes, nothing copied). The
 //! functions are handled in pieces of 4096 on every thread: each piece interns its types by
-//! their encoded bytes (one FxHash of a few bytes each) and sizes its entries, and the pieces'
+//! their encoded bytes (one hash of a few bytes each) and sizes its entries, and the pieces'
 //! types are then interned in order, a few per piece, so the indices are those of one pass.
 //! Per function the writer keeps only `u32` columns (its type, the CSR range of its fixups'
 //! types); the checks of the functions' placing are parallel too, the first error in order the
@@ -18,7 +18,7 @@ use std::collections::hash_map::Entry;
 
 use blaze_graph::par;
 use blaze_ids::radix;
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 use super::code::{Header, NOTHING, Sig};
 use super::leb::{self, PADDED, padded_uleb};
@@ -324,18 +324,18 @@ fn check(placed: &Placed<'_>) -> Result<(), String> {
     Ok(())
 }
 
-/// The module's types, each interned once by its encoding: an FxHash of a few bytes per
+/// The module's types, each interned once by its encoding: a hash of a few bytes per
 /// lookup, through the entry API.
 struct Types<'a> {
     list: Vec<Sig<'a>>,
-    index: FxHashMap<Sig<'a>, u32>,
+    index: HashMap<Sig<'a>, u32>,
 }
 
 impl<'a> Types<'a> {
     fn with_capacity(capacity: usize) -> Types<'a> {
         Types {
             list: Vec::with_capacity(capacity),
-            index: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+            index: HashMap::with_capacity_and_hasher(capacity, Default::default()),
         }
     }
 
@@ -501,7 +501,7 @@ fn segment_name(class: &Class) -> &str {
 
 /// Adds an export, or checks that one of that name exports the same thing when `again` may.
 fn export<'n>(
-    named: &mut FxHashMap<&'n str, (u8, u32)>,
+    named: &mut HashMap<&'n str, (u8, u32)>,
     list: &mut Vec<(&'n str, u8, u32)>,
     name: &'n str,
     kind: u8,
@@ -810,8 +810,8 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     // The core keeps one import per name: a function that says another must not call it.
     if par::any(&units, |it| it.header.is_some_and(|it| it.imports().next().is_some())) {
         let names = placed.imports.iter().map(|it| it.name.as_str());
-        let mut by_name: FxHashMap<&str, Imported<'_>> =
-            FxHashMap::with_capacity_and_hasher(imports.len(), Default::default());
+        let mut by_name: HashMap<&str, Imported<'_>> =
+            HashMap::with_capacity_and_hasher(imports.len(), Default::default());
         by_name.extend(names.zip(imports.iter().copied()));
         let conflict = par::find_map_first(&units, |unit| {
             unit.header?.imports().find_map(|(name, module, field, ty)| {
@@ -905,7 +905,7 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     let mut globals: Vec<(&str, bool, u32)> = Vec::with_capacity(1 + placed.exports.len());
     globals.push(("__stack_pointer", true, wasm.stack as u32));
     let mut exports: Vec<(&str, u8, u32)> = Vec::with_capacity(2 + placed.exports.len());
-    let mut named = FxHashMap::with_capacity_and_hasher(2 + placed.exports.len(), Default::default());
+    let mut named = HashMap::with_capacity_and_hasher(2 + placed.exports.len(), Default::default());
     export(&mut named, &mut exports, "memory", EXPORT_MEMORY, 0, false)?;
     if let OutputKind::Executable { entry } = &wasm.kind {
         // alloc: error path
@@ -952,8 +952,8 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     by_addr.extend(regions.filter(|(_, it)| is_custom(it)).map(|(index, it)| (it.addr, index)));
     radix::sort_copy_by_key(&mut by_addr, |&(addr, index)| radix::pack_64(addr, index as u64));
     let mut groups: Vec<(&str, bool)> = Vec::with_capacity(customs);
-    let mut group_of: FxHashMap<&str, u32> =
-        FxHashMap::with_capacity_and_hasher(customs, Default::default());
+    let mut group_of: HashMap<&str, u32> =
+        HashMap::with_capacity_and_hasher(customs, Default::default());
     let mut parts: Vec<(u32, usize)> = Vec::with_capacity(customs);
     for &(_, index) in &by_addr {
         let Class::Named { name, .. } = &placed.regions[index].class else { continue };

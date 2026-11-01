@@ -35,14 +35,16 @@ use std::{
     os::windows::ffi::OsStrExt as _,
     path::Path,
     ptr::{null, null_mut},
-    sync::{Mutex, OnceLock, PoisonError},
+    sync::OnceLock,
 };
+
+use parking_lot::Mutex;
 
 // The table's atomics are the model checker's in a model build (`--cfg blaze_check`), so its
 // model tests explore the same lines a launcher runs.
 #[cfg(blaze_check)]
 use blaze_check::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-use rustc_hash::FxBuildHasher;
+use blaze_hash::FixedState;
 #[cfg(not(blaze_check))]
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use windows_sys::Win32::{
@@ -193,7 +195,7 @@ impl Reads {
         if key.last() != Some(&BACKSLASH) {
             key.push(BACKSLASH);
         }
-        let mut roots = self.roots.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut roots = self.roots.lock();
         if let Some(root) = roots.iter().find(|it| *it.key == *key) {
             return (!root.dead.load(Ordering::SeqCst)).then_some(*root);
         }
@@ -299,7 +301,7 @@ fn fold(unit: u16) -> u16 {
 }
 
 fn hash(key: &[u16]) -> u64 {
-    FxBuildHasher.hash_one(key)
+    FixedState.hash_one(key)
 }
 
 fn shown(key: &[u16]) -> String {
@@ -726,7 +728,7 @@ mod tests {
         let seen = loop {
             let seen = reads.covered(&plain, &readers, &mut buffer).unwrap();
             assert_eq!(seen, Some(Seen { dir: true, covered: true }));
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::thread::yield_now();
             if is_kept(reads, plain.to_str().unwrap()) {
                 break seen;
             }
@@ -737,7 +739,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while is_kept(reads, plain.to_str().unwrap()) && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::yield_now();
         }
         assert!(!is_kept(reads, plain.to_str().unwrap()), "a removal is told");
         assert_eq!(reads.covered(&plain, &readers, &mut buffer).unwrap(), None);

@@ -21,11 +21,12 @@
 //! tests run over any bytes.
 
 use std::ffi::{CStr, CString, c_char, c_int};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use blaze_bytes::le::{get_u32 as get, get_u64 as get64};
+use crossbeam_channel::RecvTimeoutError;
+use parking_lot::Mutex;
 
 use super::{
     KERN_SUCCESS, Kern, MACH_PORT_NULL, Object, Port, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, kern,
@@ -100,7 +101,9 @@ unsafe extern "C" {
 
 fn bootstrap_error(what: &str, code: Kern) -> Error {
     // SAFETY: bootstrap_strerror returns a static NUL-terminated string for any code.
-    let reason = unsafe { CStr::from_ptr(bootstrap_strerror(code)) };
+    let reason = unsafe { bootstrap_strerror(code) };
+    // SAFETY: bootstrap_strerror returns a static NUL-terminated string for any code.
+    let reason = unsafe { CStr::from_ptr(reason) };
     Error::new(format!("{what}: {code} ({})", reason.to_string_lossy()))
 }
 
@@ -295,14 +298,14 @@ struct Pending {
     token: Token,
     ports: Ports,
     lens: Vec<u64>,
-    done: mpsc::Sender<Result<(), Error>>,
+    done: crossbeam_channel::Sender<Result<(), Error>>,
 }
 
 /// What is filed for each run process being started. Locked only to file or take an entry.
 static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
 
 fn take(token: &Token) -> Option<Pending> {
-    let mut pending = PENDING.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut pending = PENDING.lock();
     let index = pending.iter().position(|it| it.token == *token)?;
     Some(pending.swap_remove(index))
 }
@@ -452,9 +455,9 @@ pub(crate) fn send_objects(channel: &mut Channel, pid: u32, grant: &[u8], object
         ports.0.push(object.entry(protection(rights))?);
         lens.push(object.len());
     }
-    let (done, finished) = mpsc::channel();
+    let (done, finished) = crossbeam_channel::unbounded();
     {
-        let mut pending = PENDING.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut pending = PENDING.lock();
         pending.retain(|it| it.token != token);
         pending.push(Pending { token, ports, lens, done });
     }

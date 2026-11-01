@@ -5,11 +5,11 @@
 //! The code block attributes and hidden lines follow `html/markdown.rs` in librustdoc at rust
 //! 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0 (`LangString::parse`, `map_line`).
 
+use blaze_hash::HashMap;
 use pulldown_cmark::{
     BrokenLink, BrokenLinkCallback, CodeBlockKind, CowStr, Event, HeadingLevel, LinkType, Parser,
     Tag, TagEnd,
 };
-use rustc_hash::FxHashMap;
 
 use crate::{
     html::{Writer, escape},
@@ -20,7 +20,7 @@ use crate::{
 /// The ids a page has used, so a heading in docs gets one of its own.
 #[derive(Default)]
 pub(crate) struct Ids {
-    used: FxHashMap<String, usize>,
+    used: HashMap<String, usize>,
 }
 
 impl Ids {

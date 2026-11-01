@@ -12,7 +12,7 @@
 //! - [`SliceHasher`]: a published slice's content hash.
 //! - [`Work`]: the counters the cost tests assert.
 //!
-//! Every structure is flat: FxHash maps to `u32` rows, buffers kept and reused, and no
+//! Every structure is flat: Hash maps to `u32` rows, buffers kept and reused, and no
 //! allocation on a lookup.
 
 #![forbid(unsafe_code)]

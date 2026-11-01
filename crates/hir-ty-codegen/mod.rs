@@ -14,11 +14,13 @@ extern crate rustc_type_ir;
 
 use std::{borrow::Cow, fmt, sync::LazyLock};
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_mem::Frame;
 use frame_map::{FrameHashMap, FrameHashSet, FrameMap};
 use std::cell::Cell;
 
+use blaze_hash::{HashMap, HashSet};
+use blaze_query::db::{AsId, FromId};
 use cranelift_codegen::{
     ir::{
         self, AbiParam, ArgumentPurpose, AtomicRmwOp, InstBuilder, MemFlagsData, Signature,
@@ -53,13 +55,11 @@ use hir_def::{
 use hir_expand::{FileRange, HirFileId, InFile, MacroDefKind, builtin::BuiltinFnLikeExpander};
 use rustc_abi::{ExternAbi, Integer, ReprFlags, Size};
 use rustc_ast_ir::Mutability;
-use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::Idx;
 use rustc_type_ir::UintTy;
 use rustc_type_ir::inherent::{
     AdtDef as _, BoundExistentialPredicates as _, GenericArgs as _, IntoKind, SliceLike, Ty as _,
 };
-use blaze_query::db::{AsId, FromId};
 use syntax::{TextRange, TextSize};
 use triomphe::Arc;
 
@@ -94,12 +94,12 @@ use self::vtable::{Slot, Upcast, VtableLayout};
 pub use hir_ty_mir::mir::location::name_sources;
 use hir_ty_mir::mir::{
     AggregateKind, AssertKind, BasicBlockId, BinOp, CallerLocation, CastKind, FrameStorage,
-    LocalId, MirBody, MirEvalError, MirOptLevel, MirOptions, MirOwner, MirPhase, MirSpan,
-    MirStage, Operand, OperandKind, PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace,
+    LocalId, MirBody, MirEvalError, MirOptLevel, MirOptions, MirOwner, MirPhase, MirSpan, MirStage,
+    Operand, OperandKind, PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace,
     TerminatorKind, UnOp, caller_location, interpret_mir,
     location::{
-        ConcatPart, concat_parts, line_and_column, located_concats, location_macros,
-        location_of, macro_location_of, reported_range, source_location_in_file, source_range, track_caller,
+        ConcatPart, concat_parts, line_and_column, located_concats, location_macros, location_of,
+        macro_location_of, reported_range, source_location_in_file, source_range, track_caller,
         written_call, written_range,
     },
     monomorphized, monomorphized_promoted_mir_body_query,
@@ -716,6 +716,29 @@ enum InstanceDef {
     },
 }
 
+impl blaze_query::db::NamesIds for InstanceDef {
+    fn names_ids(&self, out: &mut Vec<blaze_query::db::Id>) {
+        match *self {
+            InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => out.push(func.as_id()),
+            InstanceDef::Closure(id) | InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
+                out.push(id)
+            }
+            InstanceDef::DropGlue
+            | InstanceDef::CallOnceShim
+            | InstanceDef::FnPointerShim
+            | InstanceDef::ReifyShim { .. } => {}
+        }
+    }
+}
+
+impl blaze_query::db::NamesIds for Instance {
+    fn names_ids(&self, out: &mut Vec<blaze_query::db::Id>) {
+        use blaze_query::db::NamesIds;
+        self.def.names_ids(out);
+        self.args.names_ids(out);
+    }
+}
+
 impl InstanceDef {
     /// Whose MIR the instance runs: `None` for a shim, which has none.
     fn mir_owner<'db>(self) -> Option<MirOwner<'db>> {
@@ -979,8 +1002,8 @@ fn root_code(db: &Db, func: FunctionId, tier: bool) -> Result<Produced> {
 fn linked_crates(
     db: &Db,
     crates: impl IntoIterator<Item = Crate>,
-) -> FxHashSet<Crate> {
-    let mut linked = FxHashSet::default();
+) -> HashSet<Crate> {
+    let mut linked = HashSet::default();
     // alloc: once per program linked, setup
     let mut stack: Vec<Crate> = crates.into_iter().collect();
     while let Some(krate) = stack.pop() {
@@ -2723,7 +2746,7 @@ enum Lowered {
 struct Relocations<'a, 'db> {
     map: &'a MemoryMap<'db>,
     in_static: bool,
-    defined: FxHashMap<usize, DataId>,
+    defined: HashMap<usize, DataId>,
     /// The allocations [`FunctionCx::relocate_data_pointer`] is in the middle of, by start.
     walking: Vec<usize>,
 }
@@ -2957,7 +2980,7 @@ struct FunctionCx<'cx, 'db> {
 /// The layouts a function's build asked for, each asked of the database once and then lent
 /// out as `&Layout` for the whole build. A layout is hash-consed for the life of the process
 /// (`hir_ty::layout::InternedLayout`), so what is lent is the interned one itself, with no
-/// reference count to write. A lookup is one `FxHash` probe of an interned `Ty` (a pointer)
+/// reference count to write. A lookup is one hash probe of an interned `Ty` (a pointer)
 /// and no write outside the thread.
 struct Layouts<'cx, 'db> {
     kept: &'cx KeptLayouts,
@@ -3025,7 +3048,7 @@ pub(crate) fn erase_regions<'db>(
     /// How many are kept before they are let go, as each keeps its types interned.
     const KEPT: usize = 1 << 16;
     thread_local! {
-        static ERASED: std::cell::RefCell<FxHashMap<StoredGenericArgs, StoredGenericArgs>> =
+        static ERASED: std::cell::RefCell<HashMap<StoredGenericArgs, StoredGenericArgs>> =
             std::cell::RefCell::default();
     }
     if !args.has_free_regions() {
@@ -4965,7 +4988,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         // In an `async` body a temporary may be kept in the future where its binding is not.
         let mut forwarded =
-            if frame.is_none() { forwarded_temps(body) } else { FxHashMap::default() };
+            if frame.is_none() { forwarded_temps(body) } else { HashMap::default() };
         let in_place = match self.ret_mode {
             PassMode::Indirect if frame.is_none() => {
                 returned_in_place(body, &forwarded).filter(|it| !forwarded.contains_key(it))
@@ -5100,15 +5123,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
         // Only blocks that can run are compiled: `if cfg!(miri) { .. }` calls functions that do
         // not exist.
-        let mut reachable = rustc_hash::FxHashSet::default();
+        let mut reachable = blaze_hash::HashSet::default();
         let off = self.checks_off(body);
         // rustc's RemoveNoopLandingPads: such a pad costs a call LLVM doesn't know resumes.
         let resumes_only = match frame {
-            Some(_) => FxHashSet::default(),
+            Some(_) => HashSet::default(),
             None => hir_ty_mir::mir::noop_landing_pads(body),
         };
         // Switches on a value known now, and the one way they go.
-        let mut decided = FxHashMap::default();
+        let mut decided = HashMap::default();
         let mut worklist = Vec::with_capacity(body.basic_blocks.len());
         worklist.push(body.start_block);
         while let Some(id) = worklist.pop() {
@@ -5239,7 +5262,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         &mut self,
         block: &hir_ty_mir::mir::BasicBlock,
         discr: &Operand,
-        off: &FxHashSet<LocalId>,
+        off: &HashSet<LocalId>,
     ) -> Option<u128> {
         if let Some(bits) = self.const_bits(discr) {
             return Some(bits);
@@ -5275,11 +5298,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// false, and what they guard is not compiled, nor asks
     /// for the bodies of what it calls (`precondition_check`, the panics), which would else
     /// use up what a compile may build in before the code that runs is reached.
-    fn checks_off(&mut self, body: &MirBody<'db>) -> FxHashSet<LocalId> {
+    fn checks_off(&mut self, body: &MirBody<'db>) -> HashSet<LocalId> {
         let db = self.cg.db;
-        let mut assigned: FxHashMap<LocalId, usize> = FxHashMap::default();
-        let mut borrowed = FxHashSet::default();
-        let mut off = FxHashSet::default();
+        let mut assigned: HashMap<LocalId, usize> = HashMap::default();
+        let mut borrowed = HashSet::default();
+        let mut off = HashSet::default();
         for (_, block) in body.basic_blocks.iter() {
             for statement in &block.statements {
                 if let StatementKind::Assign(place, rvalue) = &statement.kind {
@@ -6020,7 +6043,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let mut map = Relocations {
             map: memory_map,
             in_static,
-            defined: FxHashMap::default(),
+            defined: HashMap::default(),
             walking: Vec::new(), // alloc: empty until a pointer is followed
         };
         self.relocate(&mut blob, 0, *ty, &mut map)?;
@@ -7843,7 +7866,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         &mut self,
         body: &MirBody<'_>,
         shareable: &[(LocalId, ir::StackSlot)],
-        forwarded: &FxHashMap<LocalId, LocalId>,
+        forwarded: &HashMap<LocalId, LocalId>,
     ) {
         let frame = self.frame;
         // A local kept in a register gets its slot later, if ever: see `local_slot`. In index
@@ -7862,8 +7885,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             Vec::with_capacity_in(count + forwarded.len(), frame);
         members.extend(shareable.iter().enumerate().map(|(at, &(local, _))| (local, at)));
         // alloc: kept in the recorder's frame locals (`overlap::FrameLocals`) past the build
-        let mut lazy: FxHashMap<LocalId, usize> =
-            FxHashMap::with_capacity_and_hasher(registers.len(), Default::default());
+        let mut lazy: HashMap<LocalId, usize> =
+            HashMap::with_capacity_and_hasher(registers.len(), Default::default());
         lazy.extend(registers.iter().enumerate().map(|(at, &local)| (local, shareable.len() + at)));
         members.extend(registers.iter().map(|local| (*local, lazy[local])));
         for (&temp, to) in forwarded {
@@ -14285,10 +14308,10 @@ fn dump_mir(body: &MirBody<'_>) {
 
 /// The locals that can be kept in a register as far as the body goes: temporaries written
 /// whole by assignments only, that nothing takes the address of.
-fn register_locals(body: &MirBody<'_>, forwarded: &FxHashMap<LocalId, LocalId>) -> Vec<LocalId> {
+fn register_locals(body: &MirBody<'_>, forwarded: &HashMap<LocalId, LocalId>) -> Vec<LocalId> {
     let whole = |place: &StoredPlace| place.projection.as_slice().is_empty().then_some(place.local);
     // Every mention of the whole local, and the ones that are a value read or an assignment.
-    let mut mentions: FxHashMap<LocalId, (usize, usize)> = FxHashMap::default();
+    let mut mentions: HashMap<LocalId, (usize, usize)> = HashMap::default();
     body.visit_places(|place| {
         if let Some(local) = whole(place) {
             mentions.entry(local).or_default().0 += 1;
@@ -14324,7 +14347,7 @@ fn register_locals(body: &MirBody<'_>, forwarded: &FxHashMap<LocalId, LocalId>) 
             _ => (),
         }
     }
-    let bound: rustc_hash::FxHashSet<LocalId> = body
+    let bound: blaze_hash::HashSet<LocalId> = body
         .binding_locals
         .values()
         .chain(&body.param_locals)
@@ -14346,8 +14369,8 @@ fn register_locals(body: &MirBody<'_>, forwarded: &FxHashMap<LocalId, LocalId>) 
 /// storage markers are all there is of them. The parameters, the return slot and the promoted
 /// locals are not among them, whatever mentions them: they are written from outside the body,
 /// or read by it.
-fn unmentioned_locals(body: &MirBody<'_>) -> FxHashSet<LocalId> {
-    let mut mentioned = FxHashSet::default();
+fn unmentioned_locals(body: &MirBody<'_>) -> HashSet<LocalId> {
+    let mut mentioned = HashSet::default();
     body.visit_places(|place| {
         mentioned.insert(place.local);
     });
@@ -14370,7 +14393,7 @@ fn unmentioned_locals(body: &MirBody<'_>) -> FxHashSet<LocalId> {
 /// or a fresh binding, so the callee reaches that memory through nothing else.
 fn returned_in_place(
     body: &MirBody<'_>,
-    forwarded: &FxHashMap<LocalId, LocalId>,
+    forwarded: &HashMap<LocalId, LocalId>,
 ) -> Option<LocalId> {
     if body.coroutine.is_some() {
         return None;
@@ -14444,8 +14467,8 @@ fn returned_in_place(
 
 /// How many times each local is dropped by a terminator or read by a `FakeRead`, counted in one
 /// pass: a body of many blocks has many temporaries, and neither is a use of what one holds.
-fn drops_and_fake_reads(body: &MirBody<'_>) -> FxHashMap<LocalId, usize> {
-    let mut counted: FxHashMap<LocalId, usize> = FxHashMap::default();
+fn drops_and_fake_reads(body: &MirBody<'_>) -> HashMap<LocalId, usize> {
+    let mut counted: HashMap<LocalId, usize> = HashMap::default();
     for (_, block) in body.basic_blocks.iter() {
         for statement in &block.statements {
             if let StatementKind::FakeRead(place) = &statement.kind {
@@ -14467,7 +14490,7 @@ fn drops_and_fake_reads(body: &MirBody<'_>) -> FxHashMap<LocalId, usize> {
 /// `value`'s memory, as rustc passes a moved local.
 fn moved_arguments(
     body: &MirBody<'_>,
-    forwarded: &FxHashMap<LocalId, LocalId>,
+    forwarded: &HashMap<LocalId, LocalId>,
 ) -> Vec<(LocalId, LocalId)> {
     let whole = |place: &StoredPlace| place.projection.as_slice().is_empty().then_some(place.local);
     let slot = return_slot();
@@ -14527,11 +14550,11 @@ fn moved_arguments(
     if found.is_empty() {
         return found;
     }
-    let mut mentions: FxHashMap<LocalId, usize> = FxHashMap::default();
+    let mut mentions: HashMap<LocalId, usize> = HashMap::default();
     body.visit_places(|place| *mentions.entry(place.local).or_default() += 1);
     let not_uses = drops_and_fake_reads(body);
     let dropped_or_read = |local: LocalId| not_uses.get(&local).copied().unwrap_or(0);
-    let bound: rustc_hash::FxHashSet<LocalId> = body
+    let bound: blaze_hash::HashSet<LocalId> = body
         .binding_locals
         .values()
         .chain(&body.param_locals)
@@ -14551,7 +14574,7 @@ fn moved_arguments(
             && body.locals[temp].ty == body.locals[from].ty
     });
     // alloc: once per body with a moved argument, which this has no frame for
-    let temps: rustc_hash::FxHashSet<LocalId> = found.iter().map(|it| it.0).collect();
+    let temps: blaze_hash::HashSet<LocalId> = found.iter().map(|it| it.0).collect();
     found.retain(|(_, from)| !temps.contains(from));
     blaze_ids::radix::sort_copy_by_key(&mut found, |&(temp, from)| {
         blaze_ids::radix::pack_32(temp.into_raw().into_u32(), from.into_raw().into_u32())
@@ -14564,9 +14587,9 @@ fn moved_arguments(
 /// after it is written: `let buffer = [0u8; N]` builds the array in a temporary and copies it.
 /// The two can be one slot, the binding holding nothing yet when the temporary is written, and
 /// a frame is not twice the size of what it declares.
-fn forwarded_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, LocalId> {
+fn forwarded_temps(body: &MirBody<'_>) -> HashMap<LocalId, LocalId> {
     let whole = |place: &StoredPlace| place.projection.as_slice().is_empty().then_some(place.local);
-    let mut forwarded = FxHashMap::default();
+    let mut forwarded = HashMap::default();
     if body.coroutine.is_some() {
         return forwarded;
     }
@@ -14617,13 +14640,13 @@ fn forwarded_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, LocalId> {
         return forwarded;
     }
     // Written once and read once, and by nothing else: the binding is not what it is made of.
-    let mut mentions: FxHashMap<LocalId, usize> = FxHashMap::default();
+    let mut mentions: HashMap<LocalId, usize> = HashMap::default();
     body.visit_places(|place| *mentions.entry(place.local).or_default() += 1);
     // A drop of the temporary is not a use: it holds a value only between the two statements,
     // which unwind to nowhere, and a drop of it then finds the slot holding its value.
     let not_uses = drops_and_fake_reads(body);
     let dropped_or_read = |local: LocalId| not_uses.get(&local).copied().unwrap_or(0);
-    let bound: rustc_hash::FxHashSet<LocalId> = body
+    let bound: blaze_hash::HashSet<LocalId> = body
         .binding_locals
         .values()
         .chain(&body.param_locals)
@@ -14719,7 +14742,7 @@ mod tests {
             "panic_const_div_by_zero",
             "panic_const_rem_by_zero",
         ];
-        let distinct: rustc_hash::FxHashSet<_> = names.iter().collect();
+        let distinct: blaze_hash::HashSet<_> = names.iter().collect();
         assert_eq!(distinct.len(), names.len());
     }
 

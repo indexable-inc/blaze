@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use arrayvec::ArrayVec;
+use blaze_hash::HashMap;
 use intern::{Symbol, sym};
-use rustc_hash::FxHashMap;
 use span::{Edition, Span, SyntaxContext};
 use tt::{
     MAX_GLUED_PUNCT_LEN,
@@ -544,12 +544,12 @@ fn try_eat_dollar(src: &mut TtIter<'_>) -> bool {
 /// one `lhs` declares no binding for). Returns how many numbers there are. Runs once per rule,
 /// when the macro is defined.
 pub(crate) fn resolve_binders(lhs: &mut MetaTemplate, rhs: &mut MetaTemplate) -> u32 {
-    let mut binders = FxHashMap::default();
+    let mut binders = HashMap::default();
     declare(lhs, &mut binders);
     resolve(rhs, &binders);
     return binders.len() as u32;
 
-    fn declare(template: &mut MetaTemplate, binders: &mut FxHashMap<MetaVar, Binder>) {
+    fn declare(template: &mut MetaTemplate, binders: &mut HashMap<MetaVar, Binder>) {
         for op in template.0.iter_mut() {
             match op {
                 Op::Var { name, binder, .. } => {
@@ -562,7 +562,7 @@ pub(crate) fn resolve_binders(lhs: &mut MetaTemplate, rhs: &mut MetaTemplate) ->
         }
     }
 
-    fn resolve(template: &mut MetaTemplate, binders: &FxHashMap<MetaVar, Binder>) {
+    fn resolve(template: &mut MetaTemplate, binders: &HashMap<MetaVar, Binder>) {
         let lookup = |name: &MetaVar| binders.get(name).copied().unwrap_or(NO_BINDER);
         for op in template.0.iter_mut() {
             match op {

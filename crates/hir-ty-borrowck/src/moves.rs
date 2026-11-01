@@ -102,7 +102,7 @@ const INIT_AT: u8 = 1;
 const MOVE_OF: u8 = 2;
 
 /// The move paths as columns by preorder id: 4 bytes of local, 4 of parent and 4 of subtree
-/// end per path, the projections one CSR. Finding a path's child is one FxHash probe.
+/// end per path, the projections one CSR. Finding a path's child is one hash probe.
 pub(super) struct MoveData<'f> {
     local: FVec<'f, LocalId>,
     parent: FVec<'f, u32>,

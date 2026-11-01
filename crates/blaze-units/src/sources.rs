@@ -5,8 +5,8 @@
 //! adds them here.
 
 use anyhow::bail;
+use blaze_hash::HashMap;
 use blaze_resolve::{CRATES_IO_REGISTRY, SourceId, SourceKind};
-use rustc_hash::FxHashMap;
 
 #[derive(Clone)]
 struct Replacement {
@@ -17,12 +17,12 @@ struct Replacement {
 
 /// The sources cargo knows by name, and which of them replaces which.
 pub struct SourceMap {
-    by_name: FxHashMap<String, Replacement>,
-    names: FxHashMap<SourceId, String>,
+    by_name: HashMap<String, Replacement>,
+    names: HashMap<SourceId, String>,
     /// The `[registries]` a `replace-with` names, as cargo's `SourceId::alt_registry` reads
     /// them: one whose index is not configured, or is not a registry's URL, is not here, as
     /// cargo's `load` passes over a name `alt_registry` refuses.
-    registries: FxHashMap<String, SourceId>,
+    registries: HashMap<String, SourceId>,
     crates_io: SourceId,
 }
 
@@ -30,9 +30,9 @@ impl SourceMap {
     /// crates.io alone, its packages read from `crates_io` (its git or its sparse index).
     pub fn new(crates_io: SourceId) -> SourceMap {
         let mut map = SourceMap {
-            by_name: FxHashMap::default(),
-            names: FxHashMap::default(),
-            registries: FxHashMap::default(),
+            by_name: HashMap::default(),
+            names: HashMap::default(),
+            registries: HashMap::default(),
             crates_io,
         };
         for id in [SourceId::crates_io(), crates_io] {

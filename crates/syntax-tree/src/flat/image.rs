@@ -486,6 +486,7 @@ mod tests {
                 let read = read(&tree, &bytes, at).unwrap_or_else(|it| panic!("seed {seed}: {it}"));
                 check_same(&read, &tree, seed);
                 assert_eq!(read.subtree_hash(0), tree.subtree_hash(0), "seed {seed}");
+                #[allow(clippy::redundant_clone, reason = "the copy is the point: a clone packs a tree read in place into a block of its own")]
                 let copy = read.clone();
                 assert!(!copy.is_read_in_place(), "a copy is packed into a block of its own");
                 flat::same_arrays(&copy, &tree, seed);

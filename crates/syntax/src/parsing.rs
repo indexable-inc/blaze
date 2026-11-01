@@ -16,12 +16,12 @@ pub(crate) use crate::parsing::reparsing::{
 
 /// A source file's tree: in full, or as an outline whose `fn` bodies are lazy nodes.
 pub(crate) fn parse_text(
-    text: Text,
+    text: &Text,
     edition: Edition,
     outline: bool,
 ) -> (Tree, Vec<SyntaxError>) {
     let _p = tracing::info_span!("parse_text", outline).entered();
-    let lexed = parser::LexedStr::new(edition, &text);
+    let lexed = parser::LexedStr::new(edition, text);
     let parser_input = lexed.to_input(edition);
     let parser_output = match outline {
         true => parser::TopEntryPoint::SourceFile.parse_outline(&parser_input),
@@ -32,12 +32,12 @@ pub(crate) fn parse_text(
 }
 
 pub(crate) fn parse_text_at(
-    text: Text,
+    text: &Text,
     entry: parser::TopEntryPoint,
     edition: Edition,
 ) -> (Tree, Vec<SyntaxError>) {
     let _p = tracing::info_span!("parse_text_at").entered();
-    let lexed = parser::LexedStr::new(edition, &text);
+    let lexed = parser::LexedStr::new(edition, text);
     let parser_input = lexed.to_input(edition);
     let parser_output = entry.parse(&parser_input);
     let (tree, errors, _eof) = build_tree(text.clone(), &lexed, &parser_output, edition);

@@ -17,7 +17,7 @@ use arrow_ipc::{
     writer::{IpcWriteOptions, StreamWriter},
 };
 use arrow_schema::ArrowError;
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 use crate::{
     batches::{self, Process},
@@ -153,6 +153,18 @@ fn strings<'a>(
     Ok((0..keys.len()).map(move |row| keys.is_valid(row).then(|| values.value(keys.value(row) as usize))))
 }
 
+/// The strings of a string column, one a row (`None` where null).
+fn utf8s<'a>(
+    batch: &'a RecordBatch,
+    table: &'static Table,
+    name: &'static str,
+) -> Result<impl Iterator<Item = Option<&'a str>> + 'a, TopError> {
+    let array = column(batch, table, name)?
+        .as_string_opt::<i32>()
+        .ok_or(TopError::Column { table: table.name, column: name })?;
+    Ok(array.iter())
+}
+
 fn primitive<'a, T: arrow_array::ArrowPrimitiveType>(
     batch: &'a RecordBatch,
     table: &'static Table,
@@ -167,6 +179,8 @@ fn primitive<'a, T: arrow_array::ArrowPrimitiveType>(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Running {
     name: String,
+    /// What it is of: ` `function` of crate`, each part only when it has it.
+    of: String,
     start_ns: i64,
 }
 
@@ -181,7 +195,7 @@ struct Thread {
 /// The client's view of the feed, folded from each frame.
 #[derive(Default, Debug)]
 pub struct Top {
-    threads: FxHashMap<u32, Thread>,
+    threads: HashMap<u32, Thread>,
     at_ns: i64,
     /// Spans closed a second, over the last frame.
     rate: f64,
@@ -241,8 +255,16 @@ impl Top {
             let thread_names = strings(batch, &schema::OPEN, "thread_name")?;
             let names = strings(batch, &schema::OPEN, "name")?;
             let starts = primitive::<arrow_array::types::Int64Type>(batch, &schema::OPEN, "start_ns")?;
-            for (((tid, thread_name), name), start_ns) in
-                tids.values().iter().zip(thread_names).zip(names).zip(starts.values().iter())
+            let functions = utf8s(batch, &schema::OPEN, "function")?;
+            let crates = strings(batch, &schema::OPEN, "crate")?;
+            for (((((tid, thread_name), name), start_ns), function), krate) in tids
+                .values()
+                .iter()
+                .zip(thread_names)
+                .zip(names)
+                .zip(starts.values().iter())
+                .zip(functions)
+                .zip(crates)
             {
                 let thread = self.threads.entry(*tid).or_default();
                 if thread.name.is_empty() {
@@ -250,7 +272,15 @@ impl Top {
                     thread.name = thread_name.unwrap_or("?").to_owned();
                 }
                 // alloc: the view's copy of a running span, once a frame
-                thread.open.push(Running { name: name.unwrap_or("?").to_owned(), start_ns: *start_ns });
+                let mut of = String::new();
+                if let Some(function) = function {
+                    _ = write!(of, " `{function}`");
+                }
+                if let Some(krate) = krate {
+                    _ = write!(of, " of {krate}");
+                }
+                // alloc: the view's copy of a running span, once a frame
+                thread.open.push(Running { name: name.unwrap_or("?").to_owned(), of, start_ns: *start_ns });
                 inside = true;
             }
         }
@@ -316,6 +346,7 @@ impl Top {
             for (i, span) in thread.open.iter().enumerate() {
                 out.push_str(if i == 0 { "" } else { " > " });
                 out.push_str(&span.name);
+                out.push_str(&span.of);
             }
             if thread.open.is_empty() {
                 _ = write!(out, "(idle, tid {tid})");
@@ -335,7 +366,7 @@ impl Top {
         }
         for (span, thread) in longest.iter().take(10) {
             let line_start = out.len();
-            _ = write!(out, "{:>8.1}s  {}  ({thread})", secs(self.at_ns - span.start_ns), span.name);
+            _ = write!(out, "{:>8.1}s  {}{}  ({thread})", secs(self.at_ns - span.start_ns), span.name, span.of);
             cut(out, line_start, width);
             out.push('\n');
         }
@@ -373,8 +404,15 @@ mod tests {
             tid: 41,
             name: "worker 3".to_owned(),
             open: vec![
-                OpenSpan { name: "build", target: "blaze", for_ns },
-                OpenSpan { name: "typeck_query", target: "hir_ty", for_ns: for_ns / 2 },
+                OpenSpan { name: "build", target: "blaze", for_ns, ..OpenSpan::default() },
+                OpenSpan {
+                    name: "typeck_query",
+                    target: "hir_ty",
+                    for_ns: for_ns / 2,
+                    krate: Some("app".into()),
+                    function: Some("app::main".into()),
+                    ..OpenSpan::default()
+                },
             ],
             deeper: 0,
         }
@@ -395,8 +433,8 @@ mod tests {
         let s = 1_000_000_000i64;
         let counters = batches::counters(
             &[
-                CounterRow { build: 1, plot: Plot::MemoHits, t_ns: s, value: 90, fiber: None },
-                CounterRow { build: 1, plot: Plot::MemoMisses, t_ns: s, value: 10, fiber: None },
+                CounterRow { build: 1, plot: Plot::MemoHits, t_ns: s, value: 90, fiber: None, query_kind: 0 },
+                CounterRow { build: 1, plot: Plot::MemoMisses, t_ns: s, value: 10, fiber: None, query_kind: 0 },
             ],
             process,
         )
@@ -408,7 +446,7 @@ mod tests {
         let mut text = String::new();
         top.render(200, &mut text);
         assert!(text.contains("memo hit rate 90.0%"), "{text}");
-        assert!(text.contains("worker 3") && text.contains("build > typeck_query"), "{text}");
+        assert!(text.contains("worker 3") && text.contains("build > typeck_query `app::main` of app"), "{text}");
         assert!(text.contains("longest running"), "{text}");
         assert!(!text.contains("warning"), "{text}");
     }

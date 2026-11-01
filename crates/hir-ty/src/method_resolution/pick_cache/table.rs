@@ -17,15 +17,14 @@ use std::ptr;
 
 #[cfg(blaze_check)]
 use blaze_check::sync::{
-    Mutex,
     atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
+    lot::Mutex,
 };
 use blaze_reclaim::{Guard, Limbo};
 #[cfg(not(blaze_check))]
-use std::sync::{
-    Mutex,
-    atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
-};
+use parking_lot::Mutex;
+#[cfg(not(blaze_check))]
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 #[cfg(all(test, blaze_check))]
 mod model;
@@ -214,7 +213,7 @@ where
     }
 
     fn retire(&self, entry: Box<Entry<K, S, V>>) {
-        let mut limbo = self.limbo.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut limbo = self.limbo.lock();
         limbo.retire(entry);
         // alloc: `Limbo::collect` frees; it is not an iterator's.
         limbo.collect();

@@ -20,10 +20,10 @@ use blaze_codegen::InstanceKey;
 use blaze_format::SpanRef;
 use blaze_format::cursor::Put;
 use blaze_graph::par;
+use blaze_hash::FixedHasher;
 use blaze_ids::{ContentId, radix};
 use blaze_items::ItemKey;
 use blaze_mem::MemError;
-use rustc_hash::FxHasher;
 use smallvec::SmallVec;
 
 use crate::intern::{IdShard, KeyShard, NameShard, Shard, shards};
@@ -200,7 +200,7 @@ pub(crate) fn hash_key(key: SymKey) -> u64 {
 
 #[inline]
 pub(crate) fn hash_name(name: &str) -> u64 {
-    let mut hasher = FxHasher::default();
+    let mut hasher = FixedHasher::default();
     hasher.write(name.as_bytes());
     fold(hasher.finish() ^ name.len() as u64, K0)
 }

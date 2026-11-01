@@ -25,17 +25,17 @@ use std::{
     cmp::Ordering,
     hash::{Hash, Hasher},
     mem,
-    sync::{Arc, Mutex, PoisonError},
+    sync::Arc,
 };
 
 use base_db::{Crate, Db, EditionedFileId, Nonce};
 use blaze_ids::Domain;
 use cfg::CfgOptions;
 use hir_expand::{HirFileId, span_map::SpanMap};
+use parking_lot::Mutex;
 use span::{AstIdMap, ErasedFileAstId, ROOT_ERASED_FILE_AST_ID, RealSpanMap};
 use syntax::{
-    NodeOrToken, SyntaxKind, Text, TextRange, TextSize,
-    ast as tag,
+    NodeOrToken, SyntaxKind, Text, TextRange, TextSize, ast as tag,
     view::{self as ast, AstNode, HasModuleItem},
 };
 
@@ -54,7 +54,7 @@ mod tests;
 pub(super) fn file_item_tree(db: &Db, file: EditionedFileId, krate: Crate) -> Arc<ItemTree> {
     let db_nonce = db.nonce_and_revision().0;
     let kept =
-        with_slot(db_nonce, file, krate, |it| it.lock().unwrap_or_else(PoisonError::into_inner).take());
+        with_slot(db_nonce, file, krate, |it| it.lock().take());
     let kept = kept.filter(|it| (it.db, it.file, it.krate) == (db_nonce, file, krate));
     // Read on every path, so the query depends on it even where nothing lowered reads it.
     let cfg = krate.cfg_options(db);
@@ -74,7 +74,7 @@ pub(super) fn file_item_tree(db: &Db, file: EditionedFileId, krate: Crate) -> Ar
         }
     };
     let replaced = with_slot(db_nonce, file, krate, |it| {
-        (it.lock().unwrap_or_else(PoisonError::into_inner))
+        (it.lock())
             .replace(Kept { db: db_nonce, file, krate, keyed })
     });
     // Dropped after the lock: a tree let go of may be a whole file's columns.
@@ -100,7 +100,7 @@ thread_local! {
 }
 
 fn with_slot<R>(db: Nonce, file: EditionedFileId, krate: Crate, f: impl FnOnce(&Slot) -> R) -> R {
-    let mut hasher = rustc_hash::FxHasher::default();
+    let mut hasher = blaze_hash::FixedHasher::default();
     (db, file, krate).hash(&mut hasher);
     // The multiply leaves its best bits at the top.
     let at = (hasher.finish() >> (64 - SLOTS.trailing_zeros())) as usize;

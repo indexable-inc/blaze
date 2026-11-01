@@ -5,9 +5,13 @@
 #[cfg(test)]
 mod tests;
 
+use super::{HashSource, Hashes, Kind, frontend::HirFrontend};
 use base_db::{Crate, Db};
-use blaze_codegen::{CodegenError, Init, InstanceKey, NativeLib, NativeLibKind, Target, driver::Built};
+use blaze_codegen::{
+    CodegenError, Init, InstanceKey, NativeLib, NativeLibKind, Target, driver::Built,
+};
 use blaze_format::cursor::Put;
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::ContentId;
 use blaze_items::{ItemId, ItemKey, key::Resolved};
 use hir_def::{
@@ -20,8 +24,6 @@ use hir_def::{
 };
 use hir_ty_mir::mir::MirSpan;
 use hir_ty_share::code::{self, TABLES};
-use rustc_hash::{FxHashMap, FxHashSet};
-use super::{HashSource, Hashes, Kind, frontend::HirFrontend};
 
 /// What [`HirFrontend::link_inputs`] gives the link.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -186,14 +188,14 @@ fn tables(
     db: &Db,
     hashes: &HashSource,
     items: &[ItemKey],
-    mut named: FxHashMap<ContentId, NamedBy>,
+    mut named: HashMap<ContentId, NamedBy>,
     debug_names: &[(InstanceKey, String)],
 ) -> Result<Vec<(ContentId, Vec<u8>)>, String> {
-    let mut names: FxHashMap<base_db::FileId, String> = FxHashMap::default();
+    let mut names: HashMap<base_db::FileId, String> = HashMap::default();
     // alloc: per link, a table the code names each
     let mut spans = Vec::with_capacity(named.len());
-    let mut owners: FxHashSet<DefWithBodyId> = FxHashSet::default();
-    let mut declared: FxHashSet<FunctionId> = FxHashSet::default();
+    let mut owners: HashSet<DefWithBodyId> = HashSet::default();
+    let mut declared: HashSet<FunctionId> = HashSet::default();
     // An `asm!` function's and the allocator shim's items are of no crate of the database.
     let mut unresolved: Option<(usize, ItemKey)> = None;
     for &item in items {
@@ -269,14 +271,14 @@ fn tables(
 
 /// Every anchor the code of `built` names, in a position, a line or a static's bytes, with
 /// what names it first, for an error.
-fn named_anchors(built: &Built) -> FxHashMap<ContentId, NamedBy> {
+fn named_anchors(built: &Built) -> HashMap<ContentId, NamedBy> {
     fn named_in(targets: &[Target]) -> impl Iterator<Item = ContentId> + '_ {
         targets.iter().filter_map(|it| match it {
             Target::Position(span) => Some(span.anchor),
             _ => None,
         })
     }
-    let mut named: FxHashMap<ContentId, NamedBy> = FxHashMap::default();
+    let mut named: HashMap<ContentId, NamedBy> = HashMap::default();
     for function in &built.functions {
         let by = |what: &'static str| move |anchor: ContentId| (anchor, NamedBy::Function { key: function.key, what });
         let code = named_in(function.relocs.targets()).map(by("a position in"));
@@ -387,7 +389,7 @@ fn owner_location(db: &Db, owner: DefWithBodyId) -> Option<Row> {
 fn encode(
     db: &Db,
     hashes: &HashSource,
-    names: &mut FxHashMap<base_db::FileId, String>,
+    names: &mut HashMap<base_db::FileId, String>,
     rows: &[Row],
 ) -> Result<Vec<u8>, String> {
     // alloc: per table, the files it names, a few

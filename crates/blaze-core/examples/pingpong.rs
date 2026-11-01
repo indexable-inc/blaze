@@ -5,7 +5,6 @@
 #![deny(unsafe_code)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::affinity::pin;
@@ -36,6 +35,7 @@ mod affinity {
 #[repr(align(128))]
 struct Line(AtomicU64);
 
+#[allow(clippy::disallowed_methods, reason = "measures the bare handoff of a cache line, which any bounded spin adds rounds to")]
 fn spun(a: usize, b: usize, rounds: u64) -> Duration {
     let line = Line(AtomicU64::new(0));
     std::thread::scope(|scope| {
@@ -61,8 +61,8 @@ fn spun(a: usize, b: usize, rounds: u64) -> Duration {
 }
 
 fn slept(a: usize, b: usize, rounds: u64) -> Duration {
-    let (there, from_here) = mpsc::channel::<u64>();
-    let (back, from_there) = mpsc::channel::<u64>();
+    let (there, from_here) = crossbeam_channel::unbounded::<u64>();
+    let (back, from_there) = crossbeam_channel::unbounded::<u64>();
     std::thread::scope(|scope| {
         scope.spawn(move || {
             pin(b);

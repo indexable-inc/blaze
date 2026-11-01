@@ -12,13 +12,12 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc,
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use blaze_graph::{Cancelled, Key, pool::Pool, pump::Flights, topology::Topology};
+use blaze_graph::{Cancelled, Key, pool::Pool, pump::Flights, spin::SpinWait, topology::Topology};
 
 /// Far longer than either run takes; a run not done by then is the deadlock.
 const LONG: Duration = Duration::from_secs(20);
@@ -44,12 +43,8 @@ fn run_key_waiting_on_a_scope_job_that_asks_for_it(pool: &Pool, flights: &Flight
                 },
                 |it| asked = Some(it),
             );
-            // Busy here, so neither this thread nor its pump runs the job: another worker does.
-            let until = Instant::now() + LONG;
-            while !started.load(Ordering::SeqCst) {
-                assert!(Instant::now() < until, "no worker started the scope's job");
-                std::hint::spin_loop();
-            }
+            // Busy here, so this thread doesn't run the job: another worker does.
+            SpinWait::within("a worker to start the scope's job", LONG, || started.load(Ordering::SeqCst));
         });
         match asked.expect("a scope runs its job before it returns") {
             Ok(Err(Cancelled)) => Ok(1),
@@ -59,7 +54,7 @@ fn run_key_waiting_on_a_scope_job_that_asks_for_it(pool: &Pool, flights: &Flight
     })
 }
 
-fn done_in_time(rx: &mpsc::Receiver<Result<u32, Cancelled>>, owner: &str) -> Result<u32, Cancelled> {
+fn done_in_time(rx: &crossbeam_channel::Receiver<Result<u32, Cancelled>>, owner: &str) -> Result<u32, Cancelled> {
     rx.recv_timeout(LONG).unwrap_or_else(|_| {
         panic!(
             "no answer in {} s: the scope's job waits for key 1, whose runner ({owner}) waits for the \
@@ -74,7 +69,7 @@ fn done_in_time(rx: &mpsc::Receiver<Result<u32, Cancelled>>, owner: &str) -> Res
 fn no_wait_chain_through_a_scope_leaves_every_worker_parked() {
     let pool = Arc::new(Pool::new(&Topology::flat(2), false).unwrap());
     let flights = Arc::new(Flights::<u32>::new());
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     {
         let (inner, flights) = (pool.clone(), flights.clone());
         pool.submit(
@@ -92,7 +87,7 @@ fn no_wait_chain_through_a_scope_leaves_every_worker_parked() {
 fn no_wait_chain_through_a_clients_scope_leaves_every_worker_parked() {
     let pool = Arc::new(Pool::new(&Topology::flat(2), false).unwrap());
     let flights = Arc::new(Flights::<u32>::new());
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     {
         let (pool, flights) = (pool.clone(), flights.clone());
         // Detached: on the deadlock it never returns, and the test fails on the timeout instead.

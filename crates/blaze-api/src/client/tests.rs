@@ -9,7 +9,7 @@ use super::*;
 use crate::{Status, http::RequestParser};
 
 fn status() -> Status {
-    Status { pid: 4, requests: vec![7], views: 1, history: None, memory_bytes: 2, budget_bytes: 3 }
+    Status { pid: 4, requests: vec![7], views: 1, history: None, memory_bytes: 2, budget_bytes: 3, build: crate::Build::default() }
 }
 
 /// A client over one end of a socket pair, and a thread on the other that reads one request

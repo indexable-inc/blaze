@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use blaze_ids::{ContentId, rng::SplitMix64 as Rng};
 use blaze_mem::{Frame, Tag, frame};
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use crate::{FileId, VfsPath};
 
 use super::{MAX_DEPTH, NO_NODE, RootContent, digit};
@@ -36,7 +36,7 @@ fn built(is_library: bool, model: &Model, old: Option<&RootContent>, frame: &Fra
 }
 
 fn refreshed(content: RootContent, frame: &Frame) -> RootContent {
-    let mut contents = FxHashMap::default();
+    let mut contents = HashMap::default();
     contents.insert(ROOT, content);
     RootContent::refresh(&mut contents, &[ROOT], frame);
     contents.remove(&ROOT).expect("the root put in")
@@ -208,7 +208,7 @@ fn an_edit_of_a_large_root_hashes_its_path_and_allocates_nothing() {
     const FILES: u32 = 4096;
     let model: Model = (0..FILES).map(|file| (file, (file, 0))).collect();
     frame::task(Tag::Parse, |frame| {
-        let mut contents = FxHashMap::default();
+        let mut contents = HashMap::default();
         contents.insert(ROOT, refreshed(built(false, &model, None, frame), frame));
         let file = FileId::from_raw(17);
         let (key17, path17) = key(17);
@@ -218,7 +218,7 @@ fn an_edit_of_a_large_root_hashes_its_path_and_allocates_nothing() {
         assert!(dirty_nodes(index) <= levels, "a text edit: {} nodes", dirty_nodes(index));
         RootContent::refresh(&mut contents, &[ROOT], frame);
 
-        let cycle = |contents: &mut FxHashMap<SourceRootId, RootContent>, key: Box<[u8]>, at: u8| {
+        let cycle = |contents: &mut HashMap<SourceRootId, RootContent>, key: Box<[u8]>, at: u8| {
             let index = contents.get_mut(&ROOT).expect("the root");
             index.set(file, text(at));
             index.remove(file);

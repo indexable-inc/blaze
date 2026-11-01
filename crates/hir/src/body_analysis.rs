@@ -8,6 +8,7 @@ mod tests;
 use std::{cell::OnceCell, iter::once, mem, sync::Arc};
 
 use base_db::Db;
+use blaze_hash::HashMap;
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, BuiltinDeriveImplId, CallableDefId, DefWithBodyId, EnumVariantId,
@@ -38,7 +39,6 @@ use hir_ty::{
     infer::closure::analysis::expr_use_visitor::moved_locals,
     next_solver::{DbInterner, EarlyBinder, GenericArgs, Ty, TyKind},
 };
-use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::IntoKind as _;
 use span::{AstIdMap, ErasedFileAstId, RealSpanMap, SyntaxContext};
 use syntax::{
@@ -69,7 +69,7 @@ pub struct BodyAnalysis<'db> {
     infer: OnceCell<&'db InferenceResult<'db>>,
     anchor: OnceCell<Arc<FlatTree>>,
     /// Where each macro call of the body's store is, by its call.
-    calls: OnceCell<FxHashMap<MacroCallId, InFile<SyntaxNodePtr>>>,
+    calls: OnceCell<HashMap<MacroCallId, InFile<SyntaxNodePtr>>>,
     nested: OnceCell<Nested>,
     moved: OnceCell<Option<Box<[BindingId]>>>,
 }
@@ -78,8 +78,8 @@ pub struct BodyAnalysis<'db> {
 /// where the macro calls among them are.
 #[derive(Default)]
 struct Nested {
-    items: FxHashMap<InFile<SyntaxNodePtr>, Either<GenericDefId, EnumVariantId>>,
-    calls: FxHashMap<MacroCallId, InFile<SyntaxNodePtr>>,
+    items: HashMap<InFile<SyntaxNodePtr>, Either<GenericDefId, EnumVariantId>>,
+    calls: HashMap<MacroCallId, InFile<SyntaxNodePtr>>,
 }
 
 /// The store a node is lowered in.

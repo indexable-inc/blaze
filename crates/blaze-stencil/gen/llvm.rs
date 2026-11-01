@@ -83,21 +83,27 @@ impl Machine {
 /// Registers the two targets with LLVM, once per process.
 pub fn init() {
     static INIT: Once = Once::new();
-    // SAFETY: LLVM's target registration functions take no arguments and only fill LLVM's
-    // global target registry; `Once` makes them run once, before any other call here.
-    INIT.call_once(|| unsafe {
-        LLVMInitializeX86TargetInfo();
-        LLVMInitializeX86Target();
-        LLVMInitializeX86TargetMC();
-        LLVMInitializeX86AsmPrinter();
-        LLVMInitializeX86AsmParser();
-        LLVMInitializeX86Disassembler();
-        LLVMInitializeAArch64TargetInfo();
-        LLVMInitializeAArch64Target();
-        LLVMInitializeAArch64TargetMC();
-        LLVMInitializeAArch64AsmPrinter();
-        LLVMInitializeAArch64AsmParser();
-        LLVMInitializeAArch64Disassembler();
+    // LLVM's target registration functions take no arguments and only fill LLVM's global
+    // target registry; `Once` makes them run once, before any other call here.
+    INIT.call_once(|| {
+        let all: [unsafe extern "C" fn(); 12] = [
+            LLVMInitializeX86TargetInfo,
+            LLVMInitializeX86Target,
+            LLVMInitializeX86TargetMC,
+            LLVMInitializeX86AsmPrinter,
+            LLVMInitializeX86AsmParser,
+            LLVMInitializeX86Disassembler,
+            LLVMInitializeAArch64TargetInfo,
+            LLVMInitializeAArch64Target,
+            LLVMInitializeAArch64TargetMC,
+            LLVMInitializeAArch64AsmPrinter,
+            LLVMInitializeAArch64AsmParser,
+            LLVMInitializeAArch64Disassembler,
+        ];
+        for register in all {
+            // SAFETY: as above: no arguments, once, before any other call into LLVM.
+            unsafe { register() };
+        }
     });
 }
 
@@ -113,12 +119,11 @@ unsafe fn message(message: *mut c_char) -> String {
     if message.is_null() {
         return String::from("(no message)");
     }
-    // SAFETY: the caller's contract: a NUL-terminated string from LLVM, freed once here.
-    unsafe {
-        let text = CStr::from_ptr(message).to_string_lossy().into_owned();
-        LLVMDisposeMessage(message);
-        text
-    }
+    // SAFETY: the caller's contract: a NUL-terminated string from LLVM, live until freed below.
+    let text = unsafe { CStr::from_ptr(message) }.to_string_lossy().into_owned();
+    // SAFETY: the caller's contract: LLVM allocated it for the caller to free, once, here.
+    unsafe { LLVMDisposeMessage(message) };
+    text
 }
 
 /// Compiles one module of LLVM IR text for `machine` at `-O2`; the ELF object's bytes.
@@ -128,29 +133,39 @@ pub fn compile(machine: Machine, name: &str, ir: &str) -> Result<Vec<u8>, String
     let cpu = cstring(machine.cpu);
     let features = cstring(machine.features);
     let buffer_name = cstring(name);
-    // SAFETY: every pointer handed to LLVM is a live `CString` or the text's own bytes with
-    // its length; every object LLVM returns is disposed exactly once below, on every path,
-    // and none is used after its disposal. The context is used by this thread alone.
-    unsafe {
-        let context = LLVMContextCreate();
-        let buffer = LLVMCreateMemoryBufferWithMemoryRangeCopy(
+    // Every pointer handed to LLVM is a live `CString` or the text's own bytes with its length;
+    // every object LLVM returns is disposed exactly once below, on every path, and none is used
+    // after its disposal. The context is used by this thread alone.
+    // SAFETY: takes nothing; the context is disposed on every path below.
+    let context = unsafe { LLVMContextCreate() };
+    // SAFETY: the text's bytes with their length and a live `CString`; LLVM copies them.
+    let buffer = unsafe {
+        LLVMCreateMemoryBufferWithMemoryRangeCopy(
             ir.as_ptr().cast(),
             ir.len(),
             buffer_name.as_ptr(),
-        );
-        let mut module: LLVMModuleRef = ptr::null_mut();
-        let mut error: *mut c_char = ptr::null_mut();
-        let parsed = LLVMParseIRInContext2(context, buffer, &mut module, &mut error);
-        LLVMDisposeMemoryBuffer(buffer);
-        if parsed != 0 {
-            LLVMContextDispose(context);
-            return Err(format!("LLVM refused the stencils' IR of {name}: {}", message(error)));
-        }
-        let result = emit(machine, &triple, &cpu, &features, module, name);
-        LLVMDisposeModule(module);
-        LLVMContextDispose(context);
-        result
+        )
+    };
+    let mut module: LLVMModuleRef = ptr::null_mut();
+    let mut error: *mut c_char = ptr::null_mut();
+    // SAFETY: a live context and buffer, and two places for LLVM to write its answers.
+    let parsed = unsafe { LLVMParseIRInContext2(context, buffer, &mut module, &mut error) };
+    // SAFETY: the buffer made above, parsed and used no more.
+    unsafe { LLVMDisposeMemoryBuffer(buffer) };
+    if parsed != 0 {
+        // SAFETY: the context made above, with no module of it left.
+        unsafe { LLVMContextDispose(context) };
+        // SAFETY: what the parse left in `error`, null or LLVM's to free.
+        let why = unsafe { message(error) };
+        return Err(format!("LLVM refused the stencils' IR of {name}: {why}"));
     }
+    // SAFETY: the module just parsed is live, and the strings are.
+    let result = unsafe { emit(machine, &triple, &cpu, &features, module, name) };
+    // SAFETY: the module parsed above, used no more.
+    unsafe { LLVMDisposeModule(module) };
+    // SAFETY: the context made above, its module disposed.
+    unsafe { LLVMContextDispose(context) };
+    result
 }
 
 /// # Safety
@@ -163,14 +178,17 @@ unsafe fn emit(
     module: LLVMModuleRef,
     name: &str,
 ) -> Result<Vec<u8>, String> {
-    // SAFETY: as `compile` says; the target machine and data layout are disposed here.
-    unsafe {
-        let mut target: LLVMTargetRef = ptr::null_mut();
-        let mut error: *mut c_char = ptr::null_mut();
-        if LLVMGetTargetFromTriple(triple.as_ptr(), &mut target, &mut error) != 0 {
-            return Err(format!("LLVM has no target {}: {}", machine.triple, message(error)));
-        }
-        let tm = LLVMCreateTargetMachine(
+    // As `compile` says; the target machine and data layout are disposed here.
+    let mut target: LLVMTargetRef = ptr::null_mut();
+    let mut error: *mut c_char = ptr::null_mut();
+    // SAFETY: a live `CString` and two places for LLVM to write its answers.
+    if unsafe { LLVMGetTargetFromTriple(triple.as_ptr(), &mut target, &mut error) } != 0 {
+        // SAFETY: what the lookup left in `error`, null or LLVM's to free.
+        return Err(format!("LLVM has no target {}: {}", machine.triple, unsafe { message(error) }));
+    }
+    // SAFETY: the target LLVM just gave and live `CString`s; the machine is disposed below.
+    let tm = unsafe {
+        LLVMCreateTargetMachine(
             target,
             triple.as_ptr(),
             cpu.as_ptr(),
@@ -178,44 +196,67 @@ unsafe fn emit(
             LLVMCodeGenOptLevel::LLVMCodeGenLevelDefault,
             machine.reloc,
             machine.model,
-        );
-        if tm.is_null() {
-            return Err(format!("LLVM made no target machine for {}", machine.triple));
-        }
-        LLVMSetTarget(module, triple.as_ptr());
-        let layout = LLVMCreateTargetDataLayout(tm);
-        let layout_text = LLVMCopyStringRepOfTargetData(layout);
-        LLVMSetDataLayout(module, layout_text);
-        LLVMDisposeMessage(layout_text);
-        LLVMDisposeTargetData(layout);
-        let mut error: *mut c_char = ptr::null_mut();
-        if LLVMVerifyModule(module, LLVMVerifierFailureAction::LLVMReturnStatusAction, &mut error)
-            != 0
-        {
-            LLVMDisposeTargetMachine(tm);
-            return Err(format!("the stencils' IR of {name} is not valid: {}", message(error)));
-        }
-        if !error.is_null() {
-            LLVMDisposeMessage(error);
-        }
-        let mut out: LLVMMemoryBufferRef = ptr::null_mut();
-        let mut error: *mut c_char = ptr::null_mut();
-        let failed = LLVMTargetMachineEmitToMemoryBuffer(
+        )
+    };
+    if tm.is_null() {
+        return Err(format!("LLVM made no target machine for {}", machine.triple));
+    }
+    // SAFETY: the caller's live module and a live `CString`, which LLVM copies.
+    unsafe { LLVMSetTarget(module, triple.as_ptr()) };
+    // SAFETY: the live target machine; the layout is disposed below.
+    let layout = unsafe { LLVMCreateTargetDataLayout(tm) };
+    // SAFETY: the live layout; the text is LLVM's, freed below.
+    let layout_text = unsafe { LLVMCopyStringRepOfTargetData(layout) };
+    // SAFETY: the live module and the layout's text, which LLVM copies.
+    unsafe { LLVMSetDataLayout(module, layout_text) };
+    // SAFETY: the text LLVM made above, used no more.
+    unsafe { LLVMDisposeMessage(layout_text) };
+    // SAFETY: the layout made above, used no more.
+    unsafe { LLVMDisposeTargetData(layout) };
+    let mut error: *mut c_char = ptr::null_mut();
+    // SAFETY: the live module and a place for LLVM to write its message.
+    let refused = unsafe {
+        LLVMVerifyModule(module, LLVMVerifierFailureAction::LLVMReturnStatusAction, &mut error)
+    };
+    if refused != 0 {
+        // SAFETY: the machine made above, used no more.
+        unsafe { LLVMDisposeTargetMachine(tm) };
+        // SAFETY: what the check left in `error`, null or LLVM's to free.
+        let why = unsafe { message(error) };
+        return Err(format!("the stencils' IR of {name} is not valid: {why}"));
+    }
+    if !error.is_null() {
+        // SAFETY: a message the check made, LLVM's to free, once.
+        unsafe { LLVMDisposeMessage(error) };
+    }
+    let mut out: LLVMMemoryBufferRef = ptr::null_mut();
+    let mut error: *mut c_char = ptr::null_mut();
+    // SAFETY: the live machine and module, and two places for LLVM to write its answers.
+    let failed = unsafe {
+        LLVMTargetMachineEmitToMemoryBuffer(
             tm,
             module,
             LLVMCodeGenFileType::LLVMObjectFile,
             &mut error,
             &mut out,
-        );
-        LLVMDisposeTargetMachine(tm);
-        if failed != 0 {
-            return Err(format!("LLVM did not compile the stencils of {name}: {}", message(error)));
-        }
-        let start = LLVMGetBufferStart(out).cast::<u8>();
-        let bytes = std::slice::from_raw_parts(start, LLVMGetBufferSize(out)).to_vec();
-        LLVMDisposeMemoryBuffer(out);
-        Ok(bytes)
+        )
+    };
+    // SAFETY: the machine made above, used no more.
+    unsafe { LLVMDisposeTargetMachine(tm) };
+    if failed != 0 {
+        // SAFETY: what the emit left in `error`, null or LLVM's to free.
+        let why = unsafe { message(error) };
+        return Err(format!("LLVM did not compile the stencils of {name}: {why}"));
     }
+    // SAFETY: the live buffer LLVM just filled.
+    let start = unsafe { LLVMGetBufferStart(out) }.cast::<u8>();
+    // SAFETY: the live buffer LLVM just filled.
+    let len = unsafe { LLVMGetBufferSize(out) };
+    // SAFETY: `start..start + len` is the buffer's bytes, live until it is disposed below.
+    let bytes = unsafe { std::slice::from_raw_parts(start, len) }.to_vec();
+    // SAFETY: the buffer the emit made, its bytes copied out.
+    unsafe { LLVMDisposeMemoryBuffer(out) };
+    Ok(bytes)
 }
 
 /// LLVM's disassembler for one variant, for the checks: each instruction's length and text.

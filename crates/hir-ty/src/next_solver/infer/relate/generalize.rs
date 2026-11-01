@@ -4,7 +4,7 @@ use std::hash::Hash;
 use std::mem;
 
 use arrayvec::ArrayVec;
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use rustc_type_ir::error::TypeError;
 use rustc_type_ir::inherent::{IntoKind, Term as _, Ty as _};
 use rustc_type_ir::relate::VarianceDiagInfo;
@@ -347,12 +347,12 @@ const CACHE_INLINE: usize = 8;
 /// first `CACHE_INLINE` entries live in place and nothing is allocated unless it spills.
 pub(in crate::next_solver::infer) struct GeneralizeCache<K, V> {
     inline: ArrayVec<(K, V), CACHE_INLINE>,
-    spill: FxHashMap<K, V>,
+    spill: HashMap<K, V>,
 }
 
 impl<K, V> Default for GeneralizeCache<K, V> {
     fn default() -> Self {
-        GeneralizeCache { inline: ArrayVec::new(), spill: FxHashMap::default() }
+        GeneralizeCache { inline: ArrayVec::new(), spill: HashMap::default() }
     }
 }
 

@@ -17,11 +17,12 @@ doctest = false
 blaze-bytes.workspace = true
 blaze-core.workspace = true
 blaze-format.workspace = true
+blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
 blaze-reclaim.workspace = true
 lz4_flex.workspace = true
-rustc-hash.workspace = true
+parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 zstd.workspace = true
 

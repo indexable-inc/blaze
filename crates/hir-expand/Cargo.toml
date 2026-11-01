@@ -13,10 +13,10 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
+blaze-hash.workspace = true
 cov-mark.workspace = true
 tracing.workspace = true
 either.workspace = true
-rustc-hash.workspace = true
 itertools.workspace = true
 smallvec.workspace = true
 triomphe.workspace = true

@@ -22,13 +22,14 @@ base64.workspace = true
 blaze-api.workspace = true
 blaze-core.workspace = true
 blaze-format.workspace = true
+blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-protocol.workspace = true
 blaze-vfs.workspace = true
 crossbeam-channel.workspace = true
 hashbrown.workspace = true
+parking_lot.workspace = true
 ring.workspace = true
-rustc-hash.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -38,6 +39,7 @@ sonic-rs.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-query.workspace = true
+blaze-spin.workspace = true
 
 [lints]
 workspace = true

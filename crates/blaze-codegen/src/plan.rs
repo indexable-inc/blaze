@@ -558,8 +558,8 @@ mod tests {
     }
 
     fn std_hash(value: &impl std::hash::Hash) -> u64 {
-        use std::hash::{BuildHasher, BuildHasherDefault};
-        BuildHasherDefault::<rustc_hash::FxHasher>::default().hash_one(value)
+        use std::hash::BuildHasher;
+        blaze_hash::FixedState.hash_one(value)
     }
 
     #[test]

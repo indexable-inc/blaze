@@ -61,18 +61,18 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering, fence},
-        mpsc,
     },
     time::{Duration, Instant},
 };
 
+use blaze_hash::HashMap;
 use blaze_mem::{Handle, Slab, Tag as MemTag, scratch};
 use blaze_radix as radix;
-use rustc_hash::FxHashMap;
 
 use self::ops::{Cold, Hot, Id, Kind};
 use crate::{
-    Command, Completion, Confine, Conn, Done, Driver, Effect, FileName, IoError, Names, RECV_MOST, Stamp, Tag,
+    Command, Completion, Confine, Conn, Done, Driver, Effect, FileName, IoError, Names, RECV_MOST,
+    Stamp, Tag,
     handoff::Claims,
     wheel::{self, Wheel},
 };
@@ -1187,8 +1187,8 @@ const NOBODYS: Tag = Tag(u64::MAX);
 /// Work done on threads of its own rather than through the ring (a listing, which may take
 /// long): their completions, and the eventfd that wakes the ring when one is sent.
 struct Offload {
-    sender: mpsc::Sender<Completion>,
-    receiver: mpsc::Receiver<Completion>,
+    sender: crossbeam_channel::Sender<Completion>,
+    receiver: crossbeam_channel::Receiver<Completion>,
     /// Shared with the threads, so a write of one that ends after the driver is dropped
     /// still reaches an open descriptor.
     wake: Arc<OwnedFd>,
@@ -1209,7 +1209,7 @@ impl Offload {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = crossbeam_channel::unbounded();
         // SAFETY: the call returned a descriptor of its own.
         let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }); // alloc: setup, once per driver.
         // alloc: setup, once per driver.
@@ -1313,7 +1313,7 @@ struct Job {
     /// One stamp per name, written through `base`.
     out: UnsafeCell<Vec<Stamp>>,
     base: *mut Stamp,
-    sender: mpsc::Sender<Completion>,
+    sender: crossbeam_channel::Sender<Completion>,
     wake: Arc<OwnedFd>,
 }
 
@@ -1409,7 +1409,7 @@ struct List {
     tag: Tag,
     root: Arc<Path>,
     dir: FileName,
-    sender: mpsc::Sender<Completion>,
+    sender: crossbeam_channel::Sender<Completion>,
     wake: Arc<OwnedFd>,
 }
 
@@ -1587,7 +1587,7 @@ pub struct Uring {
     lent: ops::Lent,
     /// Each file opened, for reading and appending, and the name each is kept under.
     kept: Slab<Kept>,
-    names: FxHashMap<FileName, Handle<Kept>>,
+    names: HashMap<FileName, Handle<Kept>>,
     /// Every request in flight or waiting, by the handle its `user_data` carries ([`data`]).
     /// Not freed while the kernel may still read or write what a request holds (see `Drop`).
     ops: ManuallyDrop<ops::Ops>,
@@ -1615,12 +1615,12 @@ pub struct Uring {
     /// Completions to hand out at the next poll, in order.
     ready: Vec<Completion>,
     /// The request reading each watch's events, by the watch's tag.
-    watches: FxHashMap<Tag, Id>,
+    watches: HashMap<Tag, Id>,
     /// What each watch's read reads for. Not freed while the kernel may still write into a
     /// buffer of one (see `Drop`).
     watchings: ManuallyDrop<Slab<Watching>>,
     /// The request accepting each listen's connections, by the listen's tag.
-    listens: FxHashMap<Tag, Id>,
+    listens: HashMap<Tag, Id>,
     /// What each listen accepts on, by the handle in its accept's [`ops::Hot::of`].
     listeners: Slab<crate::net::Listener>,
     /// Each connect in flight, by the handle in its request's [`ops::Hot::of`]. Not freed while
@@ -1628,7 +1628,7 @@ pub struct Uring {
     connectings: ManuallyDrop<Slab<Connecting>>,
     spawns: Slab<Spawning>,
     /// Each spawn in flight by its tag, for a kill.
-    spawning: FxHashMap<Tag, Handle<Spawning>>,
+    spawning: HashMap<Tag, Handle<Spawning>>,
     conns: Slab<Connection>,
     /// By ticks since `start`; a wait of the ring ends at the next one due.
     timers: Wheel<Tag>,
@@ -1673,7 +1673,7 @@ impl Uring {
             provided,
             lent: ops::Lent::new(DIRECT_BUFFERS),
             kept: slab(KEPT)?,
-            names: FxHashMap::default(),
+            names: HashMap::default(),
             ops: ManuallyDrop::new(ops::Ops::new(PENDING).map_err(io::Error::other)?),
             paths: ManuallyDrop::new(ops::Paths::new().map_err(io::Error::other)?),
             // alloc: setup, once per driver: room for as many as the ring holds.
@@ -1689,13 +1689,13 @@ impl Uring {
             direct_writes: 0,
             zero_copy_sends: 0,
             ready: Vec::new(), // alloc: empty, nothing allocated; reused after.
-            watches: FxHashMap::default(),
+            watches: HashMap::default(),
             watchings: ManuallyDrop::new(slab(WATCHES)?),
-            listens: FxHashMap::default(),
+            listens: HashMap::default(),
             listeners: slab(LISTENS)?,
             connectings: ManuallyDrop::new(slab(CONNS)?),
             spawns: slab(SPAWNS)?,
-            spawning: FxHashMap::default(),
+            spawning: HashMap::default(),
             conns: slab(CONNS)?,
             timers: Wheel::new(),
             confine: None,
@@ -1999,7 +1999,7 @@ fn unflushed(ready: &mut Vec<Completion>, flushes: &mut Vec<Tag>) {
 
 /// Forgets the descriptor kept for `name`: the name now is another file. It is closed once no
 /// request in flight holds it.
-fn forget(names: &mut FxHashMap<FileName, Handle<Kept>>, kept: &mut Slab<Kept>, name: &FileName) {
+fn forget(names: &mut HashMap<FileName, Handle<Kept>>, kept: &mut Slab<Kept>, name: &FileName) {
     let Some(file) = names.remove(name) else { return };
     let it = kept.get_mut(file).expect("named files are kept");
     it.named = false;
@@ -2850,8 +2850,7 @@ mod tests {
         // The slot is emptied through the ring, a close no effect waits for.
         let deadline = Instant::now() + Duration::from_secs(5);
         while driver.table.free.borrow().len() < free + 1 && Instant::now() < deadline {
-            driver.poll(&mut Vec::new(), Duration::ZERO);
-            std::thread::sleep(Duration::from_millis(1));
+            driver.poll(&mut Vec::new(), Duration::from_millis(1));
         }
         assert_eq!((driver.table.free.borrow().len(), driver.closes), (free + 1, 0));
         drop(driver);
@@ -2866,8 +2865,11 @@ mod tests {
         let mut driver = Uring::new(&root).unwrap();
         let file = FileName::new("log").unwrap();
         for n in 0..3u8 {
-            std::thread::sleep(Duration::from_millis(u64::from(SQ_THREAD_IDLE_MS) * 4));
-            assert_ne!(driver.ring.flags() & SQ_NEED_WAKEUP, 0, "asleep after {SQ_THREAD_IDLE_MS} ms idle");
+            blaze_spin::SpinWait::within(
+                "the submission thread to sleep, past its idle time",
+                Duration::from_millis(u64::from(SQ_THREAD_IDLE_MS) * 100),
+                || driver.ring.flags() & SQ_NEED_WAKEUP != 0,
+            );
             let began = Instant::now();
             let mut effects = vec![Effect::Append { file: file.clone(), bytes: vec![n], tag: Tag(n.into()) }];
             let mut seen = Vec::new();
@@ -3320,7 +3322,7 @@ mod tests {
         for seed in 0..64 {
             let mut rng = crate::sim::Rng::new(seed);
             let mut ours = ops::Ops::new(PENDING).unwrap();
-            let mut theirs: FxHashMap<u64, Model> = FxHashMap::default();
+            let mut theirs: HashMap<u64, Model> = HashMap::default();
             let (mut live, mut ended): (Vec<(u64, Id)>, Vec<Id>) = (Vec::new(), Vec::new());
             for next in 0..2_000u64 {
                 match rng.below(4) {
@@ -3830,8 +3832,7 @@ mod tests {
         opened(4, root.join("plain/under"));
         let deadline = Instant::now() + Duration::from_secs(5);
         while (driver.table.free.borrow().len() < free || driver.closes > 0) && Instant::now() < deadline {
-            driver.poll(&mut Vec::new(), Duration::ZERO);
-            std::thread::sleep(Duration::from_millis(1));
+            driver.poll(&mut Vec::new(), Duration::from_millis(1));
         }
         assert_eq!((driver.table.free.borrow().len(), driver.closes, driver.slots_held), (free, 0, 0));
         assert_eq!(driver.paths.held(), [0, 0]);

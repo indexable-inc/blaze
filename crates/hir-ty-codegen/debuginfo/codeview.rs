@@ -6,6 +6,7 @@
 //! There is no `.debug$T`: a procedure has no type, and no variable is told of.
 
 use blaze_format::cursor::Put;
+use blaze_hash::HashMap;
 use cranelift_module::FuncId;
 use cranelift_object::{
     ObjectProduct,
@@ -15,7 +16,6 @@ use cranelift_object::{
         write::{Relocation, RelocationFlags},
     },
 };
-use rustc_hash::FxHashMap;
 use std::fmt::Write;
 
 use super::FunctionDebug;
@@ -68,7 +68,7 @@ struct Function {
 pub(super) struct CodeView {
     directory: String,
     files: Vec<String>,
-    file_ids: FxHashMap<String, u32>,
+    file_ids: HashMap<String, u32>,
     functions: Vec<Function>,
     /// The names of the functions, one after another.
     names: String,

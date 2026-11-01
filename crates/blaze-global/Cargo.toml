@@ -19,6 +19,7 @@ blaze-codegen.workspace = true
 blaze-core.workspace = true
 blaze-diagnostics.workspace = true
 blaze-format.workspace = true
+blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
 blaze-usercode.workspace = true

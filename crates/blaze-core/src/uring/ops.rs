@@ -438,7 +438,7 @@ impl Lent {
 
 #[cfg(test)]
 mod tests {
-    use rustc_hash::FxHashMap;
+    use blaze_hash::HashMap;
 
     use super::*;
 
@@ -449,7 +449,7 @@ mod tests {
         for seed in 0..32 {
             let mut rng = crate::sim::Rng::new(seed);
             let mut ops = Ops::new(1 << 12).unwrap();
-            let mut model: FxHashMap<u64, (Id, u64, Vec<u8>, u64)> = FxHashMap::default();
+            let mut model: HashMap<u64, (Id, u64, Vec<u8>, u64)> = HashMap::default();
             for next in 0..2_000u64 {
                 if model.is_empty() || (model.len() < 128 && rng.below(3) != 0) {
                     let bytes = next.to_le_bytes().to_vec();

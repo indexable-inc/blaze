@@ -52,7 +52,7 @@ use blaze_reclaim::{Guard, Limbo};
 use crate::{
     Mode,
     sync::{
-        Mutex, PoisonError,
+        Mutex,
         atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering},
     },
 };
@@ -1126,7 +1126,7 @@ impl Writer {
         // SAFETY: `old` was the published `Box`, now unlinked; the limbo becomes its only
         // owner and frees it once every task that could have loaded it has ended.
         let old = unsafe { Box::from_raw(old) };
-        let mut retired = self.shared.retired.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut retired = self.shared.retired.lock();
         retired.retire(old);
         retired.collect(); // alloc: none, the limbo's sweep, not an iterator's collect
         retired.len()
@@ -1134,7 +1134,7 @@ impl Writer {
 
     /// Frees each retired table no reader's task can be in; returns how many are left.
     pub(crate) fn reclaim(&mut self) -> usize {
-        let mut retired = self.shared.retired.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut retired = self.shared.retired.lock();
         retired.collect(); // alloc: none, the limbo's sweep, not an iterator's collect
         retired.len()
     }

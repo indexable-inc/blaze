@@ -22,6 +22,7 @@ use std::{
 };
 
 use base_db::Db;
+use blaze_hash::HashMap;
 use blaze_ids::bits::AtomicBits;
 use blaze_mem::Tag;
 use hir_def::{
@@ -31,10 +32,11 @@ use hir_def::{
         assoc::{ImplItems, TraitItems},
     },
 };
-use rustc_hash::FxHashMap;
 
 use super::file_modules;
-use crate::{AnyDiagnostic, Crate, DefWithBody, Module, TypeOwnerId, diagnostics::DiagnosticsCollector};
+use crate::{
+    AnyDiagnostic, Crate, DefWithBody, Module, TypeOwnerId, diagnostics::DiagnosticsCollector,
+};
 
 #[cfg(test)]
 mod tests;
@@ -98,11 +100,11 @@ pub struct Plan<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> {
     /// Each task's work, in the order the batch gives them: a module, then its bodies.
     tasks: Vec<u32>,
     /// Each listed body's index in `bodies`, made on the first [`Plan::reached`].
-    index: OnceLock<FxHashMap<DefWithBodyId, u32>>,
+    index: OnceLock<HashMap<DefWithBodyId, u32>>,
     queue: Queue,
     started: AtomicBool,
     #[cfg(test)]
-    ran: std::sync::Mutex<Vec<Ran>>,
+    ran: parking_lot::Mutex<Vec<Ran>>,
 }
 
 impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
@@ -148,7 +150,7 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
             queue,
             started: AtomicBool::new(false),
             #[cfg(test)]
-            ran: std::sync::Mutex::new(Vec::new()),
+            ran: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -158,7 +160,7 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
     /// thread, before or while the plan runs.
     pub fn reached(&self, defs: &[DefWithBodyId]) {
         let index = self.index.get_or_init(|| {
-            let mut index = FxHashMap::default();
+            let mut index = HashMap::default();
             index.reserve(self.bodies.len());
             index.extend(self.bodies.iter().enumerate().map(|(at, it)| (it.def, at as u32)));
             index
@@ -223,7 +225,7 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
         self.queue.running[task].store(body, Ordering::Relaxed);
         let planned = self.bodies[body as usize];
         #[cfg(test)]
-        self.ran.lock().unwrap_or_else(|it| it.into_inner()).push(Ran::Body(planned.def));
+        self.ran.lock().push(Ran::Body(planned.def));
         let mut found = Vec::new();
         DiagnosticsCollector::collect_body(db, planned.def, planned.owner, &mut found, style_lints, self.asked);
         assert!(slots.bodies[body as usize].set(found).is_ok(), "a body of a check was checked twice");
@@ -233,7 +235,7 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
     /// The item checks of file module `module`, its listed bodies left to their tasks.
     fn module<'db>(&self, db: &'db Db, module: u32, style_lints: bool, slots: Slots<'_, 'db>) {
         #[cfg(test)]
-        self.ran.lock().unwrap_or_else(|it| it.into_inner()).push(Ran::Module(module));
+        self.ran.lock().push(Ran::Module(module));
         let at = module as usize;
         let expected = &self.bodies[self.starts[at] as usize..self.starts[at + 1] as usize];
         let mut found = Vec::new();
@@ -285,7 +287,7 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
     /// What the plan's run did, in order.
     #[cfg(test)]
     pub(crate) fn ran(&self) -> Vec<Ran> {
-        self.ran.lock().unwrap_or_else(|it| it.into_inner()).clone()
+        self.ran.lock().clone()
     }
 
     /// The bodies the plan lists, in its order.

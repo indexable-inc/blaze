@@ -10,12 +10,13 @@ use std::{
     ops::ControlFlow,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Barrier, Mutex,
+        Arc, Barrier,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
 use hegel::{TestCase, generators as gs};
+use parking_lot::Mutex;
 
 use super::{
     AsId, Cancelled, Cause, Cycle, Database, DatabaseKeyIndex, Durability, Event, FromIdIn, Hook,
@@ -73,11 +74,11 @@ impl TestDb {
 
     fn ran(&self, query: &'static str, key: Id) {
         let view = self.storage.view_bits();
-        self.log.lock().unwrap().push((query, key.as_u32(), view));
+        self.log.lock().push((query, key.as_u32(), view));
     }
 
     fn runs(&self, query: &str) -> usize {
-        self.log.lock().unwrap().iter().filter(|it| it.0 == query).count()
+        self.log.lock().iter().filter(|it| it.0 == query).count()
     }
 }
 
@@ -338,6 +339,29 @@ fn each_field_has_its_own_edge() {
     assert_eq!(db.runs("ReadB"), 2);
 }
 
+query!(Alternating, u64, |db, key| {
+    let mut sum = 0u64;
+    for _ in 0..(1u64 << 23) + 1 {
+        sum = sum.wrapping_add(key.a(db)).wrapping_add(key.b(db));
+    }
+    sum
+});
+
+/// A run that reads the same nodes in turn, more times than a row's edge span holds
+/// (2^24), keeps each edge once: it is stored, and a write of either field reruns it.
+#[test]
+fn a_run_reading_the_same_nodes_in_turn_keeps_each_edge_once() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 1, 2);
+    let reads = (1u64 << 23) + 1;
+    assert_eq!(*get::<Alternating>(&db, cell), 3 * reads);
+    cell.set_a(&mut db, 2);
+    assert_eq!(*get::<Alternating>(&db, cell), 4 * reads);
+    cell.set_b(&mut db, 3);
+    assert_eq!(*get::<Alternating>(&db, cell), 5 * reads);
+    assert_eq!(db.runs("Alternating"), 3);
+}
+
 #[test]
 fn a_write_of_a_lower_durability_skips_higher_rows() {
     let mut db = TestDb::new();
@@ -400,7 +424,7 @@ fn recorded() -> (Arc<Mutex<Vec<String>>>, Hook) {
     let events = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&events);
     let hook: Hook = Box::new(move |_: &Storage, event: Event| {
-        seen.lock().unwrap().push(format!("{:?}", event.kind));
+        seen.lock().push(format!("{:?}", event.kind));
     });
     (events, hook)
 }
@@ -412,10 +436,10 @@ fn a_memo_green_by_its_summary_walks_nothing() {
     let cell = Cell::new(&db, 3, 0);
     let other = apart(&db, cell);
     assert_eq!(*get::<Label>(&db, cell), 11);
-    events.lock().unwrap().clear();
+    events.lock().clear();
     other.set_a(&mut db, 1);
     assert_eq!(*get::<Label>(&db, cell), 11);
-    let events = events.lock().unwrap();
+    let events = events.lock();
     assert!(
         events.iter().any(|it| it.starts_with("DidValidateMemoizedValue") && it.contains("Label("))
     );
@@ -426,9 +450,7 @@ fn a_memo_green_by_its_summary_walks_nothing() {
     assert_eq!((db.runs("Label"), db.runs("Parity")), (1, 1));
 }
 
-query!(Grows, u64, |db, key| {
-    if key.a(db) == 0 { 0 } else { Cell(db.cells.lock().unwrap()[0]).b(db) }
-});
+query!(Grows, u64, |db, key| { if key.a(db) == 0 { 0 } else { Cell(db.cells.lock()[0]).b(db) } });
 query!(GrowsReader, u64, |db, key| get::<Grows>(db, key) + 1);
 
 #[test]
@@ -436,7 +458,7 @@ fn a_walk_refreshes_the_summary_with_a_dependencys_new_reads() {
     let mut db = TestDb::new();
     let cell = Cell::new(&db, 0, 0);
     let late = apart(&db, cell);
-    db.cells.lock().unwrap().push(late.0);
+    db.cells.lock().push(late.0);
     assert_eq!(*get::<GrowsReader>(&db, cell), 1);
     cell.set_a(&mut db, 1);
     assert_eq!(*get::<GrowsReader>(&db, cell), 1, "Grows reran, read `late.b` (0): backdated");
@@ -714,7 +736,7 @@ fn a_job_that_gave_way_runs_again_on_its_caller_and_never_reaches_it() {
 }
 
 query!(Slow, u64, |db, key| {
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    blaze_graph::spin::busy(std::time::Duration::from_millis(20));
     key.a(db)
 });
 
@@ -969,14 +991,11 @@ fn a_tracked_struct_keeps_its_id_and_its_field_has_an_edge() {
 
 query!(Capture, u64, |db, key| {
     let (value, reads) = capture_reads(db, || key.a(db));
-    db.shared
-        .lock()
-        .unwrap()
-        .insert(key.0.as_u32(), (value, reads.expect("a plain read is shareable")));
+    db.shared.lock().insert(key.0.as_u32(), (value, reads.expect("a plain read is shareable")));
     value
 });
 query!(Replay, u64, |db, key| {
-    let (value, reads) = db.shared.lock().unwrap()[&key.0.as_u32()];
+    let (value, reads) = db.shared.lock()[&key.0.as_u32()];
     replay_reads(db, reads);
     value + 1
 });
@@ -994,7 +1013,7 @@ fn captured_reads_replay_into_another_query() {
     let cell = Cell::new(&db, 3, 0);
     assert_eq!(*get::<Capture>(&db, cell), 3);
     assert_eq!(*get::<Replay>(&db, cell), 4);
-    let (_, reads) = db.shared.lock().unwrap()[&cell.0.as_u32()];
+    let (_, reads) = db.shared.lock()[&cell.0.as_u32()];
     assert_eq!(reads.len(), 1);
     let first =
         reads.for_each_read(db.storage(), |read| ControlFlow::Break(read)).expect("one read");
@@ -1342,16 +1361,15 @@ fn dropping_the_storage_frees_every_value() {
 fn events_reach_the_hook() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&events);
-    let hook: Hook = Box::new(move |_: &Storage, event: Event| {
-        seen.lock().unwrap().push(format!("{:?}", event.kind))
-    });
+    let hook: Hook =
+        Box::new(move |_: &Storage, event: Event| seen.lock().push(format!("{:?}", event.kind)));
     let mut db = TestDb::made(Some(hook), Vec::new());
     let cell = Cell::new(&db, 1, 0);
     let other = Cell::new(&db, 0, 0);
     get::<Double>(&db, cell);
     other.set_a(&mut db, 1);
     get::<Double>(&db, cell);
-    let events = events.lock().unwrap();
+    let events = events.lock();
     assert_eq!(
         events.iter().filter(|it| it.starts_with("WillExecute") && it.contains("Double(")).count(),
         1
@@ -1373,7 +1391,7 @@ fn attach_lends_the_storage_to_its_closure() {
 }
 
 query!(Wide, u64, |db, _key| {
-    let cells = db.cells.lock().unwrap().clone();
+    let cells = db.cells.lock().clone();
     cells.iter().map(|&it| Cell(it).a(db)).sum()
 });
 
@@ -1381,7 +1399,7 @@ query!(Wide, u64, |db, _key| {
 fn compaction_keeps_every_live_span() {
     let mut db = TestDb::new();
     let cells: Vec<Cell> = (0..128).map(|i| Cell::new(&db, i, 0)).collect();
-    db.cells.lock().unwrap().extend(cells.iter().map(|it| it.0));
+    db.cells.lock().extend(cells.iter().map(|it| it.0));
     let key = cells[0];
     let mut expected: u64 = (0..128).sum();
     assert_eq!(*get::<Wide>(&db, key), expected);
@@ -1416,7 +1434,7 @@ impl Interned for Numbers {
 }
 
 query!(Probe, u64, |db, key| {
-    let target = Cell(db.cells.lock().unwrap()[0]);
+    let target = Cell(db.cells.lock()[0]);
     let (value, used) = blaze_alloc_count::measure(|| *get::<Double>(db, target));
     db.probe.store(used.allocations, Ordering::SeqCst);
     value + key.a(db)
@@ -1427,7 +1445,7 @@ fn warm_paths_allocate_nothing() {
     let mut db = TestDb::new();
     let cell = Cell::new(&db, 3, 0);
     let other = Cell::new(&db, 0, 0);
-    db.cells.lock().unwrap().push(cell.0);
+    db.cells.lock().push(cell.0);
     get::<Double>(&db, cell);
     let (_, used) = blaze_alloc_count::measure(|| *get::<Double>(&db, cell));
     assert_eq!(used.allocations, 0, "a warm hit");
@@ -1533,13 +1551,13 @@ impl Spec for Graph {
             .iter()
             .map(|&dep| match dep {
                 Dep::Input(input) => {
-                    let cell = Cell(db.cells.lock().unwrap()[input]);
+                    let cell = Cell(db.cells.lock()[input]);
                     cell.a(db)
                 }
                 Dep::Query(query) => *fetch::<Graph>(db, node(db, query)),
             })
             .collect();
-        if let Some(last) = db.snapshots.lock().unwrap().insert(at, values.clone()) {
+        if let Some(last) = db.snapshots.lock().insert(at, values.clone()) {
             assert_ne!(last, values, "node {at} ran again though nothing it read changed");
         }
         combine(spec.op, &values)
@@ -1593,7 +1611,7 @@ fn random_graphs_agree_with_a_run_from_scratch(tc: TestCase) {
     let mut values: Vec<u64> = (0..inputs).map(|i| i as u64).collect();
     let mut db = TestDb::made(None, graph);
     let cells: Vec<Cell> = values.iter().map(|&value| Cell::new(&db, value, 0)).collect();
-    db.cells.lock().unwrap().extend(cells.iter().map(|it| it.0));
+    db.cells.lock().extend(cells.iter().map(|it| it.0));
     let writes: usize = tc.draw(gs::integers::<usize>().max_value(12));
     for step in 0..=writes {
         if step > 0 {
@@ -1612,7 +1630,7 @@ fn random_graphs_agree_with_a_run_from_scratch(tc: TestCase) {
             );
         }
     }
-    let log = db.log.lock().unwrap();
+    let log = db.log.lock();
     let mut seen = HashMap::new();
     for &(query, key, view) in log.iter() {
         *seen.entry((query, key, view)).or_insert(0) += 1;
@@ -1630,7 +1648,7 @@ fn after_editing_one_input_every_rerun_memos_cause_chain_leads_back_to_it(tc: Te
     let mut values: Vec<u64> = (0..inputs).map(|i| i as u64).collect();
     let mut db = TestDb::made(None, graph);
     let cells: Vec<Cell> = values.iter().map(|&value| Cell::new(&db, value, 0)).collect();
-    db.cells.lock().unwrap().extend(cells.iter().map(|it| it.0));
+    db.cells.lock().extend(cells.iter().map(|it| it.0));
     let ask = |db: &TestDb| {
         for at in 0..queries {
             fetch::<Graph>(db, node(db, at));

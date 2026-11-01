@@ -40,36 +40,40 @@ mod tests;
 
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
 use blaze_api::{
-    ApiError, Artifact, Diagnostic, Edit, FetchVerb, Level, LinkKind, Mismatch, Response, Targets, TestOutcome,
-    ServedCrate, ServedPart, TestResult, Traced, Ub, UnitStarted, Verb, Worked,
+    ApiError, Artifact, Diagnostic, Edit, FetchVerb, Level, LinkKind, Mismatch, Response,
+    ServedCrate, ServedPart, Targets, TestOutcome, TestResult, Traced, Ub, UnitStarted, Verb,
+    Worked,
     build::{Builder, JobId, Opened, Work},
 };
 use blaze_cas::{Placed, Store};
 use blaze_core::{Completion, Done, Effect, FileName, Meta, Tag};
 use blaze_graph::{
-    Key, Outcome, Pool, RequestId, RequestStats,
-    admission::TaskKind,
-    machine::NodeId,
+    Key, Outcome, Pool, RequestId, RequestStats, admission::TaskKind, machine::NodeId,
     plane::NodeRef,
 };
+use blaze_hash::{HashMap, HashSet};
+use blaze_history::History;
 use blaze_ids::{ContentId, Hasher, bits::BitSet};
+use blaze_profile::history::{self as profile_history, BuildRow};
 use blaze_protocol::events::NodeKind;
 use blaze_query::{Database, QueryKey};
 use blaze_units::{
-    query::{BuildConfig, Command, Fetch, FetchKind, Invocation, LockWrite, Mount, Origin, Planned, Units},
+    query::{
+        BuildConfig, Command, Fetch, FetchKind, Invocation, LockWrite, Mount, Origin, Planned,
+        Units,
+    },
     schema::Mode as UnitMode,
 };
-use blaze_history::History;
-use blaze_profile::history::{self as profile_history, BuildRow};
-use blaze_vfs::{Change, Ticket, ViewId, Vfs};
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_vfs::{Change, Ticket, Vfs, ViewId};
+use crossbeam_queue::SegQueue;
+use parking_lot::Mutex;
 
 use blaze_mem::{Handle, MemError, Tag as MemTag};
 
@@ -80,8 +84,8 @@ use super::{
     mounts::Mounts,
     plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds, loops},
     work::{
-        Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, Library, Linking, Phase,
-        Readers, Runs, Selection, Source, Steps, Writer,
+        Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, Library,
+        Linking, Phase, Readers, Runs, Selection, Source, Steps, Writer,
     },
 };
 use crate::cli::print::Format;
@@ -205,7 +209,7 @@ pub(super) enum Does<S: Steps> {
     Lower { steps: Arc<S>, input: JobInput, kept: Mutex<Option<S::KeptFront>> },
     /// Task `at` compiles unit `at`. A compile that gives way puts the images it was given in
     /// `back` ([`Paths::back`]), so its next try still relinks them.
-    Compile { front: Arc<S::Front>, back: Arc<Mutex<Vec<Image<S>>>> },
+    Compile { front: Arc<S::Front>, back: Arc<SegQueue<Image<S>>> },
     Select { front: Arc<S::Front>, filter: Vec<String>, args: Vec<String>, all: bool, ub: Ub },
     /// Task `at` evaluates `tests[at]`.
     Evaluate { front: Arc<S::Front>, tests: Arc<[String]>, ub: Ub },
@@ -281,16 +285,42 @@ impl<S: Steps> plane::Work for Step<S> {
                 self.settle(fetched, |it| Value::Fetched(fetches.clone(), arg, it))
             }
             Does::Lower { steps, input, kept } => {
-                let kept = kept.lock().unwrap_or_else(|it| it.into_inner()).take();
+                let kept = kept.lock().take();
                 self.settle(steps.lower(input, kept), Value::Lowered)
             }
             Does::Compile { front, back } => {
                 let (unit, phase) = Phase::of(arg);
                 let Readers { this, mut images, .. } = readers;
                 let reader = this.expect("a task that reads is posted with its reader");
-                let compiled = front.compile(reader, unit, phase, &mut images);
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| front.compile(reader, unit, phase, &mut images)));
+                let mut panicked = None;
+                let compiled = match caught {
+                    Ok(it) => it,
+                    Err(payload) if payload.is::<blaze_query::db::Cancelled>() || payload.is::<blaze_graph::Cancelled>() => {
+                        Err(Failed::Again)
+                    }
+                    Err(payload) => {
+                        let panic = plane::panicked(&*payload);
+                        // The images it was relinking may be half written.
+                        images.clear();
+                        let refused = front.refused(unit, format!("blaze {panic}, making this unit")); // alloc: a panic, once
+                        panicked = Some(panic.to_string()); // alloc: a panic, once
+                        Ok(Some(Compiled {
+                            diagnostics: vec![refused], // alloc: a panic, once
+                            ok: false,
+                            puts: Vec::new(),
+                            share: Vec::new(),
+                            outputs: Vec::new(),
+                            artifact: None,
+                            macros: None,
+                            links: Vec::new(),
+                        }))
+                    }
+                };
                 if matches!(compiled, Err(Failed::Again)) && !self.cancelled.load(Ordering::Acquire) {
-                    back.lock().unwrap_or_else(|it| it.into_inner()).append(&mut images);
+                    for image in images {
+                        back.push(image);
+                    }
                     return None;
                 }
                 let compiled = match compiled {
@@ -301,7 +331,8 @@ impl<S: Steps> plane::Work for Step<S> {
                 let ok = matches!(&compiled, Ok(it) if it.ok);
                 let mut did = self.settle(compiled, |it| Value::Compiled(unit, it, images))?;
                 if !ok && matches!(did.outcome, Outcome::Built) {
-                    did.outcome = Outcome::Failed { why: "it did not compile".to_owned() }; // alloc: a unit that failed, once
+                    let why = panicked.unwrap_or_else(|| "it did not compile".to_owned()); // alloc: a unit that failed, once
+                    did.outcome = Outcome::Failed { why };
                 }
                 Some(did)
             }
@@ -576,7 +607,7 @@ struct Prep {
     key: ContentId,
     queries: ViewId,
     /// Every fetch's `at` this view's load asked for: asked again once mounted is a loop.
-    asked: FxHashSet<String>,
+    asked: HashSet<String>,
     /// The units of the head's last plan when it was of this key, asked nothing again.
     last: Option<(Arc<Units>, Option<LockWrite>)>,
 }
@@ -619,7 +650,7 @@ impl Outputs {
 /// Every path an output is placed at or an image kept at, interned to a `u32` once, the first
 /// time it comes in, for the daemon's life; the rest indexed by it, a column each.
 struct Paths<S: Steps> {
-    ids: FxHashMap<Box<str>, u32>,
+    ids: HashMap<Box<str>, u32>,
     /// As it came in: `/`-rooted.
     names: Vec<Box<str>>,
     /// The driver's name of it; none for a path that names no file under the driver's root.
@@ -634,19 +665,19 @@ struct Paths<S: Steps> {
     kept: u32,
     /// The images of compiles that gave way, put back into `images` before any is taken: a
     /// compile posted again relinks the image it was given, never a new one.
-    back: Arc<Mutex<Vec<Image<S>>>>,
+    back: Arc<SegQueue<Image<S>>>,
 }
 
 impl<S: Steps> Paths<S> {
     fn new() -> Paths<S> {
         Paths {
-            ids: FxHashMap::default(),
+            ids: HashMap::default(),
             names: Vec::new(),  // alloc: none until the first path
             files: Vec::new(),  // alloc: none until the first path
             placed: Vec::new(), // alloc: none until the first path
             images: Vec::new(), // alloc: none until the first path
             kept: 0,
-            back: Arc::new(Mutex::new(Vec::new())), // alloc: once for the daemon's life
+            back: Arc::new(SegQueue::new()), // alloc: once for the daemon's life
         }
     }
 
@@ -685,9 +716,8 @@ impl<S: Steps> Paths<S> {
 
     /// The images kept at `ids`, moved out for a compile.
     fn take_images(&mut self, ids: &[u32]) -> Vec<Image<S>> {
-        let back = std::mem::take(&mut *self.back.lock().unwrap_or_else(|it| it.into_inner()));
-        if !back.is_empty() {
-            self.keep(&[], back);
+        while let Some(image) = self.back.pop() {
+            self.keep_one(&[], image);
         }
         let mut images = Vec::new(); // alloc: none unless an image is kept at an output
         if self.kept == 0 {
@@ -705,17 +735,21 @@ impl<S: Steps> Paths<S> {
     /// Images a compile gave back, kept at their paths, `ids` the unit's outputs.
     fn keep(&mut self, ids: &[u32], images: Vec<Image<S>>) {
         for image in images {
-            let id = self.find(ids, &image.path) as usize;
-            if self.images[id].replace(image).is_none() {
-                self.kept += 1;
-            }
+            self.keep_one(ids, image);
+        }
+    }
+
+    fn keep_one(&mut self, ids: &[u32], image: Image<S>) {
+        let id = self.find(ids, &image.path) as usize;
+        if self.images[id].replace(image).is_none() {
+            self.kept += 1;
         }
     }
 }
 
 /// The checkouts later builds are of again ([`lasting`]), interned once by root directory.
 struct Roots<S: Steps> {
-    ids: FxHashMap<Box<str>, u32>,
+    ids: HashMap<Box<str>, u32>,
     /// The last plan of each.
     plans: Vec<Option<LastPlan>>,
     /// The front end of each one's last build, for its next job to lower into
@@ -728,7 +762,7 @@ struct Roots<S: Steps> {
 impl<S: Steps> Roots<S> {
     fn new() -> Roots<S> {
         Roots {
-            ids: FxHashMap::default(),
+            ids: HashMap::default(),
             plans: Vec::new(),   // alloc: none until the first checkout
             fronts: Vec::new(),  // alloc: none until the first checkout
             outputs: Vec::new(), // alloc: none until the first checkout
@@ -880,7 +914,7 @@ struct Job<S: Steps> {
     /// The value of the node its stage waits on, given before the node settles.
     value: Option<(NodeId, Value<S>)>,
     /// Index files and git repositories reported as `Updating`, once each.
-    updating: FxHashSet<String>,
+    updating: HashSet<String>,
     /// Opened by the job and closed as it finishes, but `built`.
     queries: Vec<ViewId>,
     /// The one of `queries` its last view was made ready in: handed to the session as it
@@ -891,7 +925,7 @@ struct Job<S: Steps> {
     placing: usize,
     /// Of `placing`, how many are in flight at each path ([`Paths`] id): a file with one is
     /// not yet all there.
-    busy: FxHashMap<u32, u32>,
+    busy: HashMap<u32, u32>,
     /// Build scripts' runs the plane started whose programs are not yet all placed: each
     /// starts once its compile's outputs have nothing in flight ([`Jobs::run_script`]).
     held: Vec<NodeId>,
@@ -955,6 +989,8 @@ impl<S: Steps> Job<S> {
             hits: stats.map(|it| it.cached),
             misses: stats.map(|it| it.ran),
             joined: stats.map(|it| it.joined),
+            tree: None,
+            blaze: None,
         }
     }
 
@@ -1065,10 +1101,10 @@ pub struct Jobs<S: Steps> {
     library_failed: Option<ApiError>,
     /// The errors of fetches that failed, by where they mount: a fetch is one task for every
     /// job asking it, so the jobs that joined it read its error here. Once per source.
-    fetch_failed: FxHashMap<String, ApiError>,
+    fetch_failed: HashMap<String, ApiError>,
     /// The store's placements by the store's tag: its tags are its own, made among its other
     /// effects, so there is no slot of ours in them to index by.
-    placing: FxHashMap<Tag, Placing>,
+    placing: HashMap<Tag, Placing>,
     paths: Paths<S>,
     /// The lock writes, modes and looks at files in flight, by the slot their tag carries.
     own: Tagged<Own>,
@@ -1130,8 +1166,8 @@ impl<S: Steps> Jobs<S> {
             batches: Batches::new(),
             library: None,
             library_failed: None,
-            fetch_failed: FxHashMap::default(),
-            placing: FxHashMap::default(),
+            fetch_failed: HashMap::default(),
+            placing: HashMap::default(),
             paths: Paths::new(),
             own,
             runs,
@@ -1219,12 +1255,12 @@ impl<S: Steps> Jobs<S> {
             cancelled: Arc::new(AtomicBool::new(false)), // alloc: once per job, shared with its tasks
             stage: Stage::Over,
             value: None,
-            updating: FxHashSet::default(),
+            updating: HashSet::default(),
             queries: Vec::new(),  // alloc: once per job
             built: None,
             borrowed: Vec::new(), // alloc: once per job
             placing: 0,
-            busy: FxHashMap::default(),
+            busy: HashMap::default(),
             held: Vec::new(), // alloc: none until a run waits for its program
             look: 0,
             awaiting: None,
@@ -1292,12 +1328,12 @@ impl<S: Steps> Jobs<S> {
             self.end(w, id, false, Some(ApiError::new("the job has no view to build", None)));
             return;
         };
-        self.open(w, id, opened, FxHashSet::default());
+        self.open(w, id, opened, HashSet::default());
     }
 
     /// The view opened in the database with its build configuration as the mounts are now, or
     /// the head's last plan when it was of this view and configuration; then its plan.
-    fn open(&mut self, w: &mut World<'_, S>, id: JobId, opened: Opened, asked: FxHashSet<String>) {
+    fn open(&mut self, w: &mut World<'_, S>, id: JobId, opened: Opened, asked: HashSet<String>) {
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         // clone: the config owns the library's place, once per view
         let Some(library) = self.library.clone() else {
@@ -2028,7 +2064,7 @@ impl<S: Steps> Jobs<S> {
         let work = Step::of(&cancelled, Does::Compile { front: front.clone(), back: self.paths.back.clone() });
         let units = &input.units;
         let package_of = {
-            let packages: FxHashMap<&str, u32> =
+            let packages: HashMap<&str, u32> =
                 // alloc: once per build
                 (0u32..).zip(&units.packages).map(|(at, package)| (package.id.as_str(), at)).collect();
             // alloc: once per build
@@ -2824,7 +2860,10 @@ impl<S: Steps> Jobs<S> {
         }
         refuse_held(w, &mut job.stage);
         if let (Some(request), false) = (job.request, job.finished) {
-            w.plane.cancel(w.now, request);
+            // Finished at the plane, its word not yet read here: nothing is left to cancel.
+            if w.plane.is_open(request) {
+                w.plane.cancel(w.now, request);
+            }
             // A cancelled request takes no more nodes, and no `Close` either.
             job.closed = true;
         }
@@ -2874,15 +2913,14 @@ impl<S: Steps> Jobs<S> {
             job.stage = Stage::Over;
         }
         if let (Some(request), false) = (job.request, job.finished) {
-            if !ok {
+            let (cancel, close) = at_its_end(w.plane.is_open(request), ok, job.closed);
+            if cancel {
                 w.plane.cancel(w.now, request);
-                // A cancelled request takes no more nodes, and no `Close` either.
-                job.closed = true;
             }
-            if !job.closed {
-                job.closed = true;
+            if close {
                 w.plane.close(w.now, request);
             }
+            job.closed = true;
         }
         if scripts {
             self.kill_runs(w, id);
@@ -3023,6 +3061,21 @@ fn answer<S: Steps>(job: &Job<S>, paths: &Paths<S>, steps: &Arc<S>) -> Result<St
     Ok(Step::of(&job.cancelled, does))
 }
 
+/// What a job's end does to its unfinished request at the plane, as `(cancel, close)`: cancel
+/// it when not `ok`, else close it unless it was closed. One the plane finished already (not
+/// `open`), its word not yet read here, has nothing left to cancel or close, and the plane
+/// refuses both.
+fn at_its_end(open: bool, ok: bool, closed: bool) -> (bool, bool) {
+    if !open {
+        return (false, false);
+    }
+    // A cancelled request takes no more nodes, and no `Close` either.
+    if !ok {
+        return (true, false);
+    }
+    (false, !closed)
+}
+
 /// The reading tasks a job held for a write ended unposted: the job is over or cancelled.
 fn refuse_held<S: Steps>(w: &mut World<'_, S>, stage: &mut Stage<S>) {
     if let Stage::Units(build) = stage {
@@ -3106,7 +3159,7 @@ fn noted(served: &ServedCrate) -> Option<Diagnostic> {
 
 /// Every memo reachable from `from` in `db`, each once, in the order it is reached.
 fn walk(db: &Database, from: QueryKey) -> Vec<blaze_query::Memo> {
-    let mut seen = FxHashSet::default();
+    let mut seen = HashSet::default();
     let mut queue = vec![from]; // alloc: a trace or a verify, once
     let mut memos = Vec::new(); // alloc: a trace or a verify, once
     while let Some(key) = queue.pop() {

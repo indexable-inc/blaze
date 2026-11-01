@@ -8,7 +8,7 @@ use std::{
     fmt,
     io::{self, Read, Write},
     net::{TcpStream, ToSocketAddrs},
-    sync::{Arc, Mutex, PoisonError},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -17,6 +17,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 use blaze_api::http::{self, HttpResponse};
+use parking_lot::Mutex;
 use ring::{
     rand::SystemRandom,
     signature::{RSA_PKCS1_SHA256, RsaKeyPair},
@@ -338,7 +339,7 @@ impl GitHub {
         if !valid(&self.token) {
             self.token = None;
             let minted = Arc::clone(&self.minted);
-            let mut shared = minted.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut shared = minted.lock();
             if !valid(&*shared) {
                 *shared = None;
                 let jwt = self.app.key.jwt(self.app.id, now)?;

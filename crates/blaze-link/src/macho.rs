@@ -42,7 +42,6 @@ pub(crate) use dylib::trie_differential;
 pub(crate) use tbd::differential as tbd_differential;
 
 use std::cmp::Ordering;
-use std::sync::Mutex;
 
 use blaze_codegen::Arch;
 use blaze_format::cursor::Put;
@@ -50,6 +49,7 @@ use blaze_graph::par;
 use blaze_ids::radix;
 use blaze_sha256 as sha256;
 use object::macho;
+use parking_lot::Mutex;
 
 use crate::cow::CowBytes;
 use crate::model::{
@@ -58,6 +58,7 @@ use crate::model::{
 };
 use smallvec::SmallVec;
 use crate::output::Platform;
+use crate::reset::{self, Reset};
 use crate::{Format, LinkError, NativeKind, Output, OutputKind};
 
 /// Where an executable's image starts: after `__PAGEZERO`, which catches 32-bit pointers.
@@ -1606,7 +1607,7 @@ impl MachO {
         let base = placed.plan.base;
         let section_at = |addr: u64, what: &str| -> Result<u8, LinkError> { section_in(ranges, addr, what) };
 
-        let exported: rustc_hash::FxHashSet<&str> =
+        let exported: blaze_hash::HashSet<&str> =
             // alloc: one set per link, sized once by the exports
             placed.exports.iter().map(|it| it.name.as_str()).collect();
         let mut locals: Vec<(u64, &str)> = Vec::with_capacity(placed.functions.len());
@@ -2191,12 +2192,8 @@ fn written_since(placed: &Placed<'_>, kept: &Kept, debug_at: &[(u64, usize)]) ->
 
 /// The kept state, started over after a panic while it was held: a page may be without its
 /// hash, a table half patched.
-fn lock(cache: &Mutex<Kept>) -> std::sync::MutexGuard<'_, Kept> {
-    cache.lock().unwrap_or_else(|poisoned| {
-        let mut kept = poisoned.into_inner();
-        *kept = Kept::default();
-        kept
-    })
+fn lock(cache: &Mutex<Kept>) -> Reset<'_, Kept> {
+    reset::lock(cache)
 }
 
 /// A load command of a path at `at`, after `fields`: `LC_LOAD_DYLINKER`, `LC_*_DYLIB`.

@@ -36,7 +36,7 @@ use std::{
     ops::ControlFlow,
     ptr::{self, NonNull},
     sync::{
-        Arc, LazyLock, Mutex, OnceLock,
+        Arc, LazyLock, OnceLock,
         atomic::{AtomicPtr, AtomicUsize, Ordering},
     },
 };
@@ -46,6 +46,7 @@ use blaze_format::{Part, SchemaHash, schema_of};
 use blaze_ids::ContentId;
 use blaze_reclaim::Limbo;
 use hir_def::{DefWithBodyId, deps::ImageStore};
+use parking_lot::Mutex;
 
 pub use facts::{BodyFacts, Classified, Step};
 pub use value::step_value;
@@ -296,7 +297,7 @@ impl Store {
     #[cold]
     #[inline(never)]
     fn fail(&self, why: fmt::Arguments<'_>) {
-        let mut error = self.error.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut error = self.error.lock();
         if error.is_none() {
             // alloc: error text, once per store until the flush that reports it
             *error = Some(format!("the item store: {why}"));
@@ -619,7 +620,7 @@ impl Installed {
     /// running the step), taken: the driver calls it once a build has ended, so the build it
     /// happened in stops with it.
     pub fn errors(&self) -> Result<(), String> {
-        match self.store().error.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+        match self.store().error.lock().take() {
             Some(why) => Err(why),
             None => Ok(()),
         }
@@ -633,7 +634,7 @@ impl Installed {
     pub fn flush(&self) -> Result<Flushed, String> {
         let store = self.store();
         let (taken, tallies) = store.pending.take();
-        if let Some(why) = store.error.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+        if let Some(why) = store.error.lock().take() {
             return Err(why);
         }
         // alloc: flush, once per build: one entry per step offered
@@ -669,7 +670,7 @@ impl Drop for Installed {
         // SAFETY: made by `Box::into_raw` in `install`, and unlinked by the swap above, which only
         // this guard makes; readers that loaded it are covered by the limbo's grace.
         let store = unsafe { Box::from_raw(held) };
-        let mut limbo = LIMBO.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut limbo = LIMBO.lock();
         limbo.retire(store);
         // alloc: `Limbo::collect` frees; it is not an iterator's.
         limbo.collect();

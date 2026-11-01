@@ -2,9 +2,9 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
+use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Hasher};
 use blaze_vfs::{Bytes, Corrupt, Mode};
-use rustc_hash::FxHashMap;
 
 use crate::table::{FxMap, ShortLock};
 
@@ -69,13 +69,13 @@ type Files = BTreeMap<String, (ContentId, Mode, Bytes)>;
 /// lent as the VFS lends one, nothing made per read.
 struct MemRoot {
     files: Files,
-    dirs: FxHashMap<String, Vec<(String, bool)>>,
+    dirs: HashMap<String, Vec<(String, bool)>>,
 }
 
 impl MemRoot {
     fn new(files: Files) -> MemRoot {
         // alloc: `MemTree` is the tree of tests and what-ifs, off every hot path
-        let mut dirs: FxHashMap<String, Vec<(String, bool)>> = FxHashMap::default();
+        let mut dirs: HashMap<String, Vec<(String, bool)>> = HashMap::default();
         dirs.insert(String::new(), Vec::new()); // alloc: see above
         for path in files.keys() {
             let (mut parent, mut from) = (0, 0);

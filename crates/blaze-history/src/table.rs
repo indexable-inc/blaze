@@ -23,7 +23,6 @@
 
 use std::{
     cell::Cell,
-    hint,
     marker::PhantomData,
     sync::{
         Arc,
@@ -158,17 +157,21 @@ impl Slot {
 
     /// Its record as any thread reads it: a whole one, never one torn by a write under way.
     fn read(&self) -> Option<Record> {
-        loop {
+        let mut read = None;
+        // The one writer's write is a few stores.
+        blaze_graph::spin::SpinWait::until("a history record's write under way", || {
             let before = self.seq.load(Acquire);
             if before & 1 == 0 {
                 let words = self.load();
                 fence(Acquire);
                 if self.seq.load(Relaxed) == before {
-                    return unpack(words);
+                    read = Some(unpack(words));
+                    return true;
                 }
             }
-            hint::spin_loop();
-        }
+            false
+        });
+        read.expect("a read that ended read a record")
     }
 
     /// Puts `record` in it. Only the table's one writer calls it.

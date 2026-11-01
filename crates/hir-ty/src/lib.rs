@@ -69,6 +69,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 use std::{hash::Hash, ops::ControlFlow};
 
 use base_db::Db;
+use blaze_hash::{FixedState, HashMap, HashSet};
 use blaze_mem::Frame;
 use hir_def::{
     CallableDefId, ConstId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, FunctionId,
@@ -83,7 +84,6 @@ use hir_expand::name::Name;
 use macros::GenericTypeVisitable;
 use mir::{MirEvalError, VTableMap};
 use rustc_abi::ExternAbi;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use rustc_type_ir::{
     BoundVarIndexKind, TypeSuperVisitable, TypeVisitableExt,
     inherent::{IntoKind, Ty as _},
@@ -112,12 +112,14 @@ pub use autoderef::autoderef;
 pub use infer::{
     Adjust, Adjustment, AutoBorrow, BindingMode, ByRef, CallArguments, ExplicitDropMethodUseKind,
     InferenceDiagnostic, InferenceResult, OverloadedDeref, PointerCast, ReturnKind, StructPathDef,
-    StructPathFound, Unreachable, UnreachableAt, cast::{CastError, CastPointerKind, CastPointers},
-    prelude_lints::{EditionLint, ReceiverAdjustment}, could_coerce, could_unify, could_unify_deeply, infer_query_with_inspect,
+    StructPathFound, Unreachable, UnreachableAt,
+    cast::{CastError, CastPointerKind, CastPointers},
+    could_coerce, could_unify, could_unify_deeply, infer_query_with_inspect,
+    prelude_lints::{EditionLint, ReceiverAdjustment},
 };
 pub use lower::{
     ElidedLifetimes, ElidedOutput, FieldType, FieldTypes, GenericDefaults, GenericDefaultsRef,
-    GenericPredicates, LifetimeElisionKind, LifetimeLoweringMode, LoweringMode, Lowered,
+    GenericPredicates, LifetimeElisionKind, LifetimeLoweringMode, Lowered, LoweringMode,
     PredicateSource, SelfAndAssocBounds, TyDefId, TyLoweringContext, TyLoweringResult,
     ValueTyDefId,
     batch::{
@@ -131,16 +133,14 @@ pub use lower::{
 pub use next_solver::interner::{attach_db, attach_db_allow_change, with_attached_db};
 pub use opaques::{rpit_hidden_types, tait_hidden_types};
 pub use specialization::impl_unconstrained_params;
-pub use target_feature::{
-    TargetFeature, TargetFeatureSet, TargetFeatures, crate_target_features,
-};
+pub use target_feature::{TargetFeature, TargetFeatureSet, TargetFeatures, crate_target_features};
 pub use traits::{ParamEnvAndCrate, check_orphan_rules};
+pub use used_imports::used_imports_with_traits;
 pub use utils::{
     TargetFeatureIsSafeInTarget, Unsafety, all_super_traits, direct_super_traits,
     is_fn_unsafe_to_call, target_feature_is_safe_in_target,
 };
 pub use variance::{adt_unused_params, ctor_variances};
-pub use used_imports::used_imports_with_traits;
 
 pub mod closure_analysis {
     pub use crate::infer::{
@@ -154,16 +154,16 @@ pub mod closure_analysis {
 }
 
 /// A map of a query run's temporaries, in its frame (docs/v2/plan/lanes/mem/db-infer.md, R3).
-pub type FrameMap<'f, K, V> = hashbrown::HashMap<K, V, FxBuildHasher, &'f Frame>;
+pub type FrameMap<'f, K, V> = hashbrown::HashMap<K, V, FixedState, &'f Frame>;
 /// A set of a query run's temporaries, in its frame.
-pub type FrameSet<'f, T> = hashbrown::HashSet<T, FxBuildHasher, &'f Frame>;
+pub type FrameSet<'f, T> = hashbrown::HashSet<T, FixedState, &'f Frame>;
 
 pub fn frame_map<K, V>(frame: &Frame) -> FrameMap<'_, K, V> {
-    hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame)
+    hashbrown::HashMap::with_hasher_in(FixedState, frame)
 }
 
 pub fn frame_set<T>(frame: &Frame) -> FrameSet<'_, T> {
-    hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame)
+    hashbrown::HashSet::with_hasher_in(FixedState, frame)
 }
 
 /// A constant can have reference to other things. Memory map job is holding
@@ -507,7 +507,7 @@ impl<'db> MemoryMap<'db> {
     pub fn transform_addresses(
         &self,
         mut f: impl FnMut(&[u8], usize) -> Result<usize, MirEvalError<'db>>,
-    ) -> Result<FxHashMap<usize, usize>, MirEvalError<'db>> {
+    ) -> Result<HashMap<usize, usize>, MirEvalError<'db>> {
         let mut transform = |(addr, val): (&usize, &[u8])| {
             let addr = *addr;
             let align = match self.align_at(addr) {
@@ -520,13 +520,13 @@ impl<'db> MemoryMap<'db> {
         match self {
             MemoryMap::Empty => Ok(Default::default()),
             MemoryMap::Simple(m) => transform((&0, m)).map(|(addr, val)| {
-                let mut map = FxHashMap::with_capacity_and_hasher(1, rustc_hash::FxBuildHasher);
+                let mut map = HashMap::with_capacity_and_hasher(1, blaze_hash::FixedState);
                 map.insert(addr, val);
                 map
             }),
             MemoryMap::Complex(cm) => {
                 let mut map =
-                    FxHashMap::with_capacity_and_hasher(cm.memory.len(), rustc_hash::FxBuildHasher);
+                    HashMap::with_capacity_and_hasher(cm.memory.len(), blaze_hash::FixedState);
                 for (addr, val) in cm.memory.iter() {
                     let (addr, new) = transform((addr, val))?;
                     map.insert(addr, new);
@@ -645,7 +645,7 @@ mod memory_map_tests {
         assert_eq!(map.align_at(16), None);
         assert_eq!(map, other);
         assert_eq!(hash(&map), hash(&other));
-        let addresses: FxHashMap<usize, usize> = map
+        let addresses: HashMap<usize, usize> = map
             .transform_addresses(|bytes, align| Ok(bytes.len() * 1000 + align))
             .unwrap();
         assert_eq!(addresses.get(&64), Some(&8008));
@@ -870,7 +870,7 @@ pub fn associated_type_shorthand_candidates(
         _ => return None,
     };
 
-    let mut dedup_map = FxHashSet::default();
+    let mut dedup_map = HashSet::default();
     let param_ty = Ty::new_param(interner, param, type_or_const_param_idx(db, param.into()));
     // We use the ParamEnv and not the predicates because the ParamEnv elaborates bounds.
     let param_env = db.trait_environment(def);
@@ -961,7 +961,7 @@ pub fn callable_sig_from_fn_trait<'db>(
 }
 
 struct ParamCollector {
-    params: FxHashSet<TypeOrConstParamId>,
+    params: HashSet<TypeOrConstParamId>,
 }
 
 impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for ParamCollector {
@@ -989,7 +989,7 @@ pub fn collect_params<'db, T>(value: &T) -> Vec<TypeOrConstParamId>
 where
     T: ?Sized + rustc_type_ir::TypeVisitable<DbInterner<'db>>,
 {
-    let mut collector = ParamCollector { params: FxHashSet::default() };
+    let mut collector = ParamCollector { params: HashSet::default() };
     value.visit_with(&mut collector);
     Vec::from_iter(collector.params)
 }

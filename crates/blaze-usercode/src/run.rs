@@ -416,7 +416,7 @@ pub fn restore(dir: &Path, files: &[OutFile]) -> Result<(), String> {
     }
     empty(dir)?;
     // alloc: once per OUT_DIR restored, the directories made in it, lent from `files`
-    let mut made = rustc_hash::FxHashSet::<&str>::default();
+    let mut made = blaze_hash::HashSet::<&str>::default();
     for file in files {
         let path = dir.join(&file.path);
         match &file.bytes {

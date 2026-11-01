@@ -72,7 +72,7 @@ fn build(config: &Corpus, dir: &str, records: &Records, loaded: &mut Loaded) -> 
 }
 
 fn taken(records: &Records) -> Vec<Record> {
-    std::mem::take(&mut *records.lock().unwrap_or_else(|it| it.into_inner()))
+    std::mem::take(&mut *records.lock())
 }
 
 /// The puts of macro `name`.

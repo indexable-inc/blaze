@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze v2 lane fastcompile, ideas 9 and 10 (semantic edits, declared intent): crates/blaze-intent's edits by meaning applied to the flat tree in place, the byte-equality argument against the text edit, rename through the front end's resolution, what each edit reports changed, the agent API's Edit, WillTest and WillSave, the session's take-over and cancel rules, the plane's idle class requested from core, the hooks requested from ci, core, db and cargo, the tests, and the state of the art.
+summary: blaze v2 lane fastcompile, ideas 9 and 10 (semantic edits, declared intent): crates/blaze-intent's edits by meaning applied to the flat tree in place, the byte-equality argument against the text edit, rename and path replacement (`blaze fix --replace`) through the front end's resolution, what each edit reports changed, the agent API's Edit, WillTest and WillSave, the session's take-over and cancel rules, the plane's idle class requested from core, the hooks requested from ci, core, db and cargo, the tests, and the state of the art.
 date: 2026-10-29
 ---
 # fastcompile: semantic edits and declared intent (`crates/blaze-intent`)
@@ -22,7 +22,8 @@ edit kinds are:
 - `AddField` and `RemoveField`;
 - `AddItem` and `RemoveItem` (an item, a field or a variant);
 - `AddUse`;
-- `Rename`.
+- `Rename`;
+- `Replace { from, to }`, which names no file: two def paths from a crate's name.
 
 The daemon's job (`Work::Edit`) calls `blaze_intent::apply` on the view's lowered front end.
 
@@ -70,6 +71,51 @@ from a text diff.
   token tree, an unresolved path, a token a macro uses both for the item and for something
   else, and renaming an item that implements a trait method ("rename it in the trait").
   Renaming the trait method renames every impl of it and every call.
+
+**Replace retargets by resolution, never by text** (`blaze_intent::replace`, `blaze fix
+--replace std::sync::Mutex=parking_lot::Mutex`). It is the tool for moving a type or path
+(the locks and hasher ports); astlog stays the syntax tool.
+
+- `from` and `to` are def paths: a crate's name, then the item's path in it, resolved from the
+  crate's root (re-exports followed). Of several crates by one name, the one the view's crates
+  depend on. A module, a macro, a builtin type, a path that names nothing, or a `to` missing a
+  namespace `from` has, is an error.
+- The files are those of the view's crates that can name `from` (its crate and those depending
+  on it), prefiltered by a `memchr` finder for every name `from` goes by: its own, the path's
+  last segment, and each a dependency outside the view exports it under
+  (`hir_def::import_map`, so `use std::alias::Lock` is found). A file of such a crate outside
+  the view that holds a name is an error.
+- Each file is rewritten by `blaze_intent::retarget`, the rewrite the lints' fixes share: a
+  `use` of `from` becomes an import of `to` of its own (its attributes and visibility kept, and
+  under the old name when the new one differs: `use parking_lot::Mutex as Lock;`), the other
+  leaves of its list staying; a glob of a module outside the view gets an import of `to` beside
+  it when its scope names `from`; a path that qualifies `from` is rewritten up to its name,
+  generic arguments kept.
+- A request's replaces are made together in one pass over the same base: each file's retarget
+  moves the items of all of them, so `use std::sync::{Mutex, RwLock};` under two replaces is
+  one rewrite. An item given twice (by any of its paths), or a chain (one's `to` another's
+  `from`), is an error.
+- `to` is written as the crate naming it sees it: `crate::…` in its own crate, else under the
+  name the crate's manifest gives the dependency, checked to resolve to `to` at the crate's
+  root. A crate that has no such dependency is an error ("add it to the crate's manifest").
+- A path through one of the view's own imports (`crate::locks::Mutex` where `locks` has
+  `pub use std::sync::Mutex;`, `use lib::locks::Mutex;` in a dependent) stays: the import
+  moves. So does a path of one segment bound by an import of the view.
+- What one file's tree can't show is done here, after every name's token is classified
+  through `Semantics` (macros descended): a path a macro expands from its input is rewritten
+  at the input's range; a path of one segment reaching `from` through the prelude gets an
+  import of `to` in its module; one reaching it through a chain of the view's globs gets the
+  import beside the last glob of the chain, whose module is outside the view, with the glob's
+  visibility, so every glob of it sees `to`.
+- **No-fallback**, as rename: a name in a `macro_rules!` body or tokens no macro expanded, an
+  unresolved or cfg'd-out occurrence, a `use` a macro expands, a path a macro builds from
+  pieces of its input, a token a macro uses both for `from` and for something else, and a glob
+  cycle each stop it with `path:line`. Nothing is written.
+- `blaze fix` (`crates/blaze-cargo/src/cli/fix.rs`) opens the checkout's head, sends
+  `Request::Edit` with one `Replace` a `--replace`, and writes the committed ops to the
+  checkout's files (each read once, edited in memory, written whole through a file renamed
+  over it); a path leaving the checkout or an edit past a file's end is refused before
+  anything is written.
 
 ## Declared intent
 
@@ -129,6 +175,19 @@ task could hold a thread for up to one task's length.
   an associated function followed by a body edit, a trait method reaching its impls and
   calls, and the refusals (a macro body, an impl of a trait method). Keys are checked
   through `blaze_items::resolve`.
+- `blaze-intent/src/tests/replace.rs`: std's `Mutex` to parking_lot's over two crates of the
+  view (`lib` and `app`) beside std and parking_lot outside it, with each import form: a
+  `use`, a list, a rename, a glob, a block's glob, a qualified path, a path through a module, a
+  re-export of the view and a glob of it, the prelude, an alias of the dependency's, a macro's
+  input, and a struct of the same name that stays. The bytes equal hand-written text edits
+  (and the VFS root theirs), seeds equal fresh parses, and in a front end of the new text every
+  name that named std's lock names parking_lot's, the other stays, no `Unresolved*` or
+  `TypeMismatch` diagnostic appears, and a second replace has nothing to move. Refusals: a
+  crate without the dependency, a `macro_rules!` body (`lib.rs:4`), and bad def paths. Two
+  replaces (`Mutex` and `RwLock`) sharing one `use` list make one rewrite of it; an item
+  replaced twice and a chain are refused.
+- `blaze-cargo/src/cli/fix.rs`: the `--replace` words, and ops written to files in order with
+  a path outside and an edit past the end refused before writing.
 - `path.rs`, `file.rs` and `ahead.rs` have their own unit tests.
 - `blaze-api/src/session/tests.rs`:
   - an edit commits its reported ops once durable, and a failed, cancelled, silent or gone
@@ -380,6 +439,13 @@ reuses it.
   instead of editing text in macros, and by scanning only the crates that can see the item. A
   trigram index of the workspace (zoekt, Sourcegraph) would make the scan proportional to the
   files that hold the name. That index is not built here; the scan runs at memory bandwidth.
+- **Moving a path.** rust-analyzer has no "replace this path everywhere" assist; its
+  structural search and replace (`ide-ssr`) matches a path pattern by resolution but edits
+  only the matched paths, leaving `use` items, globs and the prelude to the user, and IntelliJ's
+  "migrate" (Java's package and class migration maps) rewrites imports and qualified names
+  together but by fully qualified name text. `blaze fix --replace` resolves both ends, moves
+  imports instead of paths through them, adds the import a glob or the prelude needed, and
+  refuses what it can't place.
 - **Speculation.** Watch modes and flycheck (rust-analyzer, dune, cargo-watch) build after a
   save, and merge queues build ahead of a merge. Here the build starts before the save, in an
   idle class, and is promoted, not restarted, when the save lands. With requests 3 and 4,

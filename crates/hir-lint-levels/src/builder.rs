@@ -5,7 +5,7 @@
 //! names in them, a builder that speaks hands to its [`Sink`] as [`Event`]s, and the HIR one
 //! keeps the `#[expect]`s it finds.
 //!
-//! Cost: a node with no attribute costs the walk a check of its kind. A level costs one FxHash
+//! Cost: a node with no attribute costs the walk a check of its kind. A level costs one hash
 //! of its node (or of each node out to the nearest one seen), and one bit test for a lint no
 //! attribute nor flag names; else one bit test of each set of levels from there out and a scan
 //! of the 2-byte lint ids of the one that has it. A level is a 12-byte [`Spec`].
@@ -17,13 +17,13 @@
 use std::{hash::BuildHasher, num::NonZeroU32, ops::Range};
 
 use base_db::{Crate, Db};
+use blaze_hash::{FixedState, HashMap};
 use blaze_lint_defs::{Checked, Feature, Level, Lint, LintId, LintOptions, LintSet, Store};
 use cfg::CfgOptions;
 use hashbrown::HashTable;
 use hir_def::unstable_features::UnstableFeatures;
 use hir_expand::{HirFileId, InFile};
 use intern::Symbol;
-use rustc_hash::{FxBuildHasher, FxHashMap};
 use span::Edition;
 use syntax::{
     SyntaxKind, SyntaxNodePtr, TextRange,
@@ -97,7 +97,7 @@ pub struct LevelCx<'a, 'db> {
     /// command line, not one per lint or per node.
     sources: Vec<Source>,
     /// Each `#[expect]`'s name by where it is, hashed once as both builders come to it.
-    expects: FxHashMap<(HirFileId, TextRange), ExpectId>,
+    expects: HashMap<(HirFileId, TextRange), ExpectId>,
 }
 
 impl<'a, 'db> LevelCx<'a, 'db> {
@@ -126,7 +126,7 @@ impl<'a, 'db> LevelCx<'a, 'db> {
             features: UnstableFeatures::query(db, krate),
             cmd_warnings: opts.opts.iter().find(|(it, _)| &**it == "warnings").map(|&(_, it)| it),
             sources: vec![Source::Default], // alloc: once per crate's levels
-            expects: FxHashMap::default(),
+            expects: HashMap::default(),
         }
     }
 
@@ -263,7 +263,7 @@ pub struct Levels<'db> {
     /// The command line's lints at each level, by `Level as usize`: each lint it names is in
     /// the one of its level.
     cmd_at: [LintSet; LEVELS],
-    /// The set in force at each node seen, by one FxHash of the node: 28 bytes a node.
+    /// The set in force at each node seen, by one hash of the node: 28 bytes a node.
     at: HashTable<(InFile<SyntaxNodePtr>, SetId)>,
     /// [`Levels::at`] as [`Levels::set_of_in_file`] has it, out to the root of each file.
     in_file: HashTable<(InFile<SyntaxNodePtr>, SetId)>,
@@ -366,7 +366,7 @@ impl<'db> Levels<'db> {
     /// [`Levels::set_at`] of the node `at` points to, with no tree walked when a node at it was
     /// seen.
     pub fn set_of(&mut self, cx: &mut LevelCx<'_, 'db>, sink: &mut impl Sink<'db>, at: InFile<SyntaxNodePtr>) -> SetId {
-        let hash = FxBuildHasher.hash_one(at);
+        let hash = FixedState.hash_one(at);
         if let Some(&(_, set)) = self.at.find(hash, |(it, _)| *it == at) {
             return set;
         }
@@ -386,7 +386,7 @@ impl<'db> Levels<'db> {
     /// set: a module file has neither its `mod` item's levels nor the crate's
     /// (rust-lang/rust#132218). A macro's expansion is walked out of to the file of its call.
     pub fn set_of_in_file(&mut self, cx: &mut LevelCx<'_, 'db>, sink: &mut impl Sink<'db>, at: InFile<SyntaxNodePtr>) -> SetId {
-        let hash = FxBuildHasher.hash_one(at);
+        let hash = FixedState.hash_one(at);
         if let Some(&(_, set)) = self.in_file.find(hash, |(it, _)| *it == at) {
             return set;
         }
@@ -402,7 +402,7 @@ impl<'db> Levels<'db> {
         let mut set = COMMAND_LINE;
         while let Some(node) = next {
             let key = attrs::key(node);
-            let hash = FxBuildHasher.hash_one(key);
+            let hash = FixedState.hash_one(key);
             let seen = if in_file { &self.in_file } else { &self.at };
             if let Some(&(_, known)) = seen.find(hash, |(it, _)| *it == key) {
                 set = known;
@@ -415,7 +415,7 @@ impl<'db> Levels<'db> {
         for (hash, key, node) in chain.drain(..).rev() {
             set = self.push_node(cx, sink, set, node);
             let seen = if in_file { &mut self.in_file } else { &mut self.at };
-            seen.insert_unique(hash, (key, set), |(it, _)| FxBuildHasher.hash_one(it));
+            seen.insert_unique(hash, (key, set), |(it, _)| FixedState.hash_one(it));
         }
         self.chain = chain;
         set

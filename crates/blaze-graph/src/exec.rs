@@ -25,10 +25,10 @@ use std::{
     time::Instant,
 };
 
+use blaze_hash::HashMap;
 use blaze_mem::{Cache, MemError, Pooled, Slab, Tag as MemTag, frame};
 use blaze_protocol::events::{Event, Record};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-use rustc_hash::FxHashMap;
 
 use crate::{
     Cancelled, Key,
@@ -124,7 +124,7 @@ where
     // dyn: as above, once per node that panicked
     let failed = |panic: Box<dyn Any + Send>| {
         let did = Did::failed(panicked(&*panic));
-        first_panic.lock().get_or_insert(panic);
+        first_panic.lock_said("a build's first panic").get_or_insert(panic);
         did
     };
     let over = workers.pool().scope(|jobs| {
@@ -195,7 +195,7 @@ where
     }
     while over.is_none() {
         // Every node the machine runs is on a thread that sends what came of it.
-        let Ok((id, did, at_ns)) = done_rx.recv() else {
+        let Ok((id, did, at_ns)) = recv_said(&done_rx, "the build's nodes done") else {
             unreachable!("`drive` keeps a sender until the build is over");
         };
         over = feed(Input::Done { at_ns, id, outcome: did.outcome, added: did.added })?;
@@ -215,7 +215,7 @@ struct Lent(Option<Workers>);
 impl Lent {
     fn take(workers: usize, what: &str) -> Lent {
         let spare = {
-            let mut spare = SPARE.lock();
+            let mut spare = SPARE.lock_said("the spare pools");
             spare.iter().position(|it| it.workers() == workers).map(|at| spare.swap_remove(at))
         };
         Lent(Some(spare.unwrap_or_else(|| {
@@ -232,7 +232,7 @@ impl Lent {
 impl Drop for Lent {
     fn drop(&mut self) {
         if let Some(pool) = self.0.take() {
-            SPARE.lock().push(pool);
+            SPARE.lock_said("the spare pools").push(pool);
         }
     }
 }
@@ -691,7 +691,7 @@ impl<W> Handle<W> {
     pub fn estimates(&self) -> Vec<u8> {
         let (reply, estimates) = crossbeam_channel::bounded(1);
         _ = self.tx.send(Msg::Estimates { reply });
-        estimates.recv().unwrap_or_else(|_| panic!("the scheduler is gone"))
+        recv_said(&estimates, "the scheduler's estimates").unwrap_or_else(|_| panic!("the scheduler is gone"))
     }
 
     #[cfg(test)]
@@ -800,7 +800,7 @@ impl<W: Send + 'static> Scheduler<W> {
                     .name(format!("blaze-io-{at}"))
                     .spawn(move || {
                         // Ends when the owner, its runs over, says so.
-                        while let Ok(Some(run)) = io_rx.recv() {
+                        while let Ok(Some(run)) = recv_said(&io_rx, "the scheduler's IO runs") {
                             run_io(run);
                         }
                     })
@@ -827,8 +827,8 @@ impl<W: Send + 'static> Scheduler<W> {
         let owner = Owner {
             plane,
             predict,
-            heard: FxHashMap::default(),
-            works: FxHashMap::default(),
+            heard: HashMap::default(),
+            works: HashMap::default(),
             ctx,
             table,
             throttle,
@@ -901,9 +901,9 @@ struct Entry<W> {
 struct Owner<R: Runner, P, M> {
     plane: Plane<M>,
     predict: P,
-    heard: FxHashMap<RequestId, Sender<Heard>>,
+    heard: HashMap<RequestId, Sender<Heard>>,
     /// The work of each node added and not settled.
-    works: FxHashMap<NodeId, Entry<R::Work>>,
+    works: HashMap<NodeId, Entry<R::Work>>,
     ctx: &'static Ctx<R>,
     table: Table<R>,
     throttle: Throttle,
@@ -937,7 +937,7 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
         let _stop_io = StopIo(self.ctx, self.io_threads);
         // The owner's one wait. What is already in the mailbox is taken before the plane hears
         // what blaze holds, up to `HELD_EVERY` messages, and it hears before the next wait.
-        'serve: while let Ok(msg) = rx.recv() {
+        'serve: while let Ok(msg) = recv_said(&rx, "the scheduler's mailbox") {
             let mut next = Some(msg);
             let mut taken = 0;
             while let Some(msg) = next {
@@ -962,7 +962,7 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
         // Each run under way reads a slot of the table: it ends before the table goes, and
         // nothing more comes of it.
         while self.table.running() > 0 {
-            match rx.recv() {
+            match recv_said(&rx, "the scheduler's runs ending") {
                 Ok(Msg::Done { slot: Some(slot), .. }) => {
                     let tag = self.table.free(slot);
                     self.throttle.ended(tag);
@@ -1203,6 +1203,7 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
 }
 
 /// Runs `run` on the scheduler's pool near `near` (on a fast group when it is critical).
+#[allow(clippy::needless_pass_by_value, reason = "posting transfers the run's sole ownership to the pool job")]
 fn post<R: Runner>(ctx: &Ctx<R>, near: Option<u32>, critical: bool, run: Ran<R>) {
     // SAFETY: the slot's header is its first field (`Run` is `repr(C)`) and runs `run_pooled`;
     // the slot stays in the scheduler's pool, unmoved, until its `Done` is taken, and `run`,
@@ -1253,22 +1254,35 @@ fn run_io<R: Runner>(run: Ran<R>) {
     }
 }
 
+/// `rx.recv()`, said as a wait on the channel `name` ([`crate::wait`]) only when nothing is
+/// there yet: a receive that finds a message costs a `try_recv`.
+fn recv_said<T>(rx: &Receiver<T>, name: &'static str) -> Result<T, crossbeam_channel::RecvError> {
+    match rx.try_recv() {
+        Ok(it) => Ok(it),
+        Err(crossbeam_channel::TryRecvError::Disconnected) => Err(crossbeam_channel::RecvError),
+        Err(crossbeam_channel::TryRecvError::Empty) => {
+            crate::wait::wait(crate::wait::WaitOn::Channel(name), None, || rx.recv())
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 mod tests {
     use std::{
         sync::{
-            Arc, Mutex,
+            Arc,
             atomic::{AtomicBool, AtomicU32, Ordering},
         },
         thread::ThreadId,
         time::Duration,
     };
 
+    use blaze_hash::{HashMap, HashSet};
     use blaze_ids::rng::SplitMix64;
     use blaze_protocol::events::{Event, NodeKind, NodeState, Record};
     use crossbeam_channel::bounded;
-    use rustc_hash::{FxHashMap, FxHashSet};
+    use parking_lot::Mutex;
 
     use blaze_mem::{Tag as MemTag, frame};
 
@@ -1321,7 +1335,7 @@ mod tests {
 
     /// The database a test's work puts each key's value in before its `Done`, as real work
     /// does; the scheduler's memo reads it.
-    type Db = Arc<Mutex<FxHashMap<Key, Outcome>>>;
+    type Db = Arc<Mutex<HashMap<Key, Outcome>>>;
 
     fn scheduler(workers: usize) -> (Scheduler<Work>, Db) {
         scheduler_on(&Topology::flat(workers)).0
@@ -1341,8 +1355,8 @@ mod tests {
         let config = PlaneConfig { io: 1, work: workers, budget: None, starve_after: 4 };
         let db = Db::default();
         let memo = {
-            let db = db.clone();
-            move |key: Key| db.lock().expect("the test's database").get(&key).cloned()
+            let db = Arc::clone(&db);
+            move |key: Key| db.lock().get(&key).cloned()
         };
         ((Scheduler::with_pool(config, Closures, predict, memo, pool).unwrap(), db), pool)
     }
@@ -1362,16 +1376,16 @@ mod tests {
 
     impl Predict for Recorder {
         fn predict(&self, kind: TaskKind, key: Option<Key>) -> Prediction {
-            self.asked.lock().unwrap().push(Asked::Predict(kind, key));
+            self.asked.lock().push(Asked::Predict(kind, key));
             self.prediction
         }
 
         fn observe(&mut self, kind: TaskKind, key: Option<Key>, ran_ns: u64, _peak: u64) {
-            self.asked.lock().unwrap().push(Asked::Observe { kind, key, ran_ns });
+            self.asked.lock().push(Asked::Observe { kind, key, ran_ns });
         }
 
         fn encode(&self) -> Vec<u8> {
-            self.asked.lock().unwrap().len().to_le_bytes().to_vec()
+            self.asked.lock().len().to_le_bytes().to_vec()
         }
     }
 
@@ -1383,20 +1397,20 @@ mod tests {
     fn the_scheduler_asks_its_predictor_and_teaches_it_each_run() {
         let asked: Arc<Mutex<Vec<Asked>>> = Arc::default();
         let recorder = Recorder {
-            asked: asked.clone(),
+            asked: Arc::clone(&asked),
             prediction: Prediction { cost: Some(5), peak: 1 << 10 },
         };
         let ((scheduler, _), _) = scheduler_with(&Topology::flat(2), recorder);
         let opened = scheduler.open(1, false);
         let (request, handle) = (opened.request, scheduler.handle());
         let tries = Arc::new(AtomicU32::new(0));
-        let counted = tries.clone();
+        let counted = Arc::clone(&tries);
         let slow: Work = Arc::new(move || {
             if counted.fetch_add(1, Ordering::SeqCst) < 2 {
-                std::thread::sleep(Duration::from_millis(200));
+                crate::spin::busy(Duration::from_millis(200));
                 return Err(Cancelled);
             }
-            std::thread::sleep(Duration::from_millis(5));
+            crate::spin::busy(Duration::from_millis(5));
             Ok(Did::built())
         });
         let finder: Work = Arc::new(move || {
@@ -1415,7 +1429,7 @@ mod tests {
         assert!(finish(&opened).0);
         assert_eq!(tries.load(Ordering::SeqCst), 3);
 
-        let asked = asked.lock().unwrap().clone();
+        let asked = asked.lock().clone();
         let key = |it: u8| Some(Key([it; 32]));
         let predicted: Vec<_> =
             asked.iter().filter(|it| matches!(it, Asked::Predict(..))).cloned().collect();
@@ -1451,7 +1465,7 @@ mod tests {
         let chain = (0..5u32)
             .map(|id| {
                 let deps: Vec<u32> = (id > 0).then_some(59 + id).into_iter().collect();
-                task(60 + id, &deps, None, built.clone())
+                task(60 + id, &deps, None, Arc::clone(&built))
             })
             .collect();
         scheduler.add(opened.request, chain);
@@ -1474,7 +1488,7 @@ mod tests {
         let work: Work =
             Arc::new(move || Ok(if in_frame() { Did::built() } else { Did::failed("no frame") }));
         let opened = scheduler.open(1, false);
-        let io = Task { spec: spec(71, &[], Pool::Io, None), kind: TaskKind(1), work: work.clone() };
+        let io = Task { spec: spec(71, &[], Pool::Io, None), kind: TaskKind(1), work: Arc::clone(&work) };
         scheduler.add(opened.request, vec![io, task(72, &[71], None, work)]);
         scheduler.close(opened.request);
         assert!(finish(&opened).0);
@@ -1489,7 +1503,7 @@ mod tests {
             type Work = u32;
 
             fn run(&self, work: &u32) -> Result<Did, Cancelled> {
-                self.0.lock().unwrap().push(*work);
+                self.0.lock().push(*work);
                 Ok(Did::built())
             }
         }
@@ -1497,7 +1511,7 @@ mod tests {
         let pool = Workers::new(&Topology::flat(2), false).unwrap();
         let pool: &'static Workers = Box::leak(Box::new(pool));
         let config = PlaneConfig { io: 1, work: 2, budget: None, starve_after: 4 };
-        let runner = Squares(seen.clone());
+        let runner = Squares(Arc::clone(&seen));
         let memo = crate::plane::NoMemo;
         let scheduler =
             Scheduler::with_pool(config, runner, Estimates::default(), memo, pool).unwrap();
@@ -1511,7 +1525,7 @@ mod tests {
         scheduler.add(opened.request, tasks);
         scheduler.close(opened.request);
         assert!(finish(&opened).0);
-        let mut seen = seen.lock().unwrap().clone();
+        let mut seen = seen.lock().clone();
         seen.sort_unstable();
         assert_eq!(seen, (0..20u32).map(|id| id * id).collect::<Vec<_>>());
     }
@@ -1544,12 +1558,12 @@ mod tests {
             ];
             let work = |id: NodeId| {
                 assert_eq!(group(), Some(0), "node {id} runs on a pool");
-                ran.lock().unwrap().push((id.0, std::thread::current().id()));
+                ran.lock().push((id.0, std::thread::current().id()));
                 Did::built()
             };
             assert!(drive(&mut machine, nodes, &work, &mut |_| {}, None).unwrap());
-            let ran = ran.into_inner().unwrap();
-            let on = |nodes: &[u32]| -> FxHashSet<ThreadId> {
+            let ran = ran.into_inner();
+            let on = |nodes: &[u32]| -> HashSet<ThreadId> {
                 ran.iter().filter(|(id, _)| nodes.contains(id)).map(|&(_, at)| at).collect()
             };
             assert_eq!(ran.len(), 4);
@@ -1569,13 +1583,13 @@ mod tests {
     #[test]
     fn shared_keys_run_once_for_two_requests() {
         let (scheduler, db) = scheduler(4);
-        let runs: Arc<Mutex<FxHashMap<u8, u32>>> = Arc::default();
+        let runs: Arc<Mutex<HashMap<u8, u32>>> = Arc::default();
         let keyed = |id: u32, key: u8| {
-            let (runs, db) = (runs.clone(), db.clone());
+            let (runs, db) = (Arc::clone(&runs), Arc::clone(&db));
             let work: Work = Arc::new(move || {
-                *runs.lock().unwrap().entry(key).or_default() += 1;
-                std::thread::sleep(Duration::from_millis(1));
-                db.lock().unwrap().insert(Key([key; 32]), Outcome::Built);
+                *runs.lock().entry(key).or_default() += 1;
+                crate::spin::busy(Duration::from_millis(1));
+                db.lock().insert(Key([key; 32]), Outcome::Built);
                 Ok(Did::built())
             });
             task(id, &[], Some(key), work)
@@ -1589,7 +1603,7 @@ mod tests {
         assert!(finish(&light).0);
         assert!(finish(&heavy).0);
         {
-            let runs = runs.lock().unwrap();
+            let runs = runs.lock();
             assert_eq!(runs.len(), 10);
             assert!(runs.values().all(|&it| it == 1), "{runs:?}");
         }
@@ -1604,7 +1618,7 @@ mod tests {
             .filter(|it| matches!(it.event, Event::Moved { state: NodeState::Cached { .. }, .. }))
             .count();
         assert_eq!(cached, 10);
-        assert!(runs.lock().unwrap().values().all(|&it| it == 1), "the database settled it");
+        assert!(runs.lock().values().all(|&it| it == 1), "the database settled it");
     }
 
     /// A request cancelled while its first task runs: what waits for it never runs, the task
@@ -1622,7 +1636,7 @@ mod tests {
             _ = ended_tx.send(());
             Ok(Did::built())
         });
-        let ran = second_ran.clone();
+        let ran = Arc::clone(&second_ran);
         let second: Work = Arc::new(move || {
             ran.store(true, Ordering::SeqCst);
             Ok(Did::built())
@@ -1650,9 +1664,9 @@ mod tests {
             let opened = scheduler.open(1, false);
             let first = 2000 + round * 101;
             let mut tasks: Vec<Task<Work>> =
-                (0..100).map(|at| task(first + at, &[], None, built.clone())).collect();
+                (0..100).map(|at| task(first + at, &[], None, Arc::clone(&built))).collect();
             let io = spec(first + 100, &[], Pool::Io, None);
-            tasks.push(Task { spec: io, kind: TaskKind(1), work: built.clone() });
+            tasks.push(Task { spec: io, kind: TaskKind(1), work: Arc::clone(&built) });
             scheduler.add(opened.request, tasks);
             scheduler.close(opened.request);
             assert!(finish(&opened).0);
@@ -1669,7 +1683,7 @@ mod tests {
         let (gate_tx, gate_rx) = bounded::<()>(0);
         let ended = Arc::new(AtomicBool::new(false));
         let work: Work = {
-            let ended = ended.clone();
+            let ended = Arc::clone(&ended);
             Arc::new(move || {
                 _ = started_tx.send(());
                 gate_rx.recv_timeout(LONG).expect("the gate opens");
@@ -1687,7 +1701,7 @@ mod tests {
                 drop(scheduler);
                 dropped.store(true, Ordering::SeqCst);
             });
-            std::thread::sleep(Duration::from_millis(50));
+            crate::spin::busy(Duration::from_millis(50));
             assert!(!dropped.load(Ordering::SeqCst), "the drop waits for the run under way");
             gate_tx.send_timeout((), LONG).unwrap();
             dropper.join().unwrap();
@@ -1699,7 +1713,7 @@ mod tests {
     fn work_that_gives_way_twice_is_posted_again_and_done() {
         let (scheduler, _) = scheduler(2);
         let tries = Arc::new(AtomicU32::new(0));
-        let counted = tries.clone();
+        let counted = Arc::clone(&tries);
         let work: Work = Arc::new(move || {
             if counted.fetch_add(1, Ordering::SeqCst) < 2 { Err(Cancelled) } else { Ok(Did::built()) }
         });
@@ -1726,9 +1740,9 @@ mod tests {
         let opened = scheduler.open(2, false);
         let (request, handle) = (opened.request, scheduler.handle());
         let found_ran = Arc::new(AtomicBool::new(false));
-        let ran = found_ran.clone();
+        let ran = Arc::clone(&found_ran);
         let finder: Work = Arc::new(move || {
-            let ran = ran.clone();
+            let ran = Arc::clone(&ran);
             let found: Work = Arc::new(move || {
                 ran.store(true, Ordering::SeqCst);
                 Ok(Did::built())
@@ -1784,7 +1798,7 @@ mod tests {
             kind: TaskKind(1),
             key: None,
             critical: false,
-            work: work.clone(),
+            work: Arc::clone(work),
         }
     }
 

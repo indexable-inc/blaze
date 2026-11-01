@@ -7,12 +7,10 @@
 //! durable by the daemon's next [`Store::flush`], which drains every writer's segment. There is
 //! one handle a process, made by the daemon once its store is open ([`Handle::install`]).
 
-use std::{
-    path::PathBuf,
-    sync::{Mutex, OnceLock, PoisonError},
-};
+use std::{path::PathBuf, sync::OnceLock};
 
 use blaze_core::FileName;
+use parking_lot::Mutex;
 
 use crate::{Corrupt, Entry, Key, Kind, Mismatch, Pinned, Reader, Store, Ticket, Writer, enter};
 
@@ -75,7 +73,7 @@ impl Handle {
     pub fn put(&self, key: Key, kind: Kind, bytes: Vec<u8>) -> Result<Ticket, Mismatch> {
         let guard = enter();
         // A put that panicked left its segment whole: a writer publishes only whole records.
-        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut writer = self.writer.lock();
         writer.put(&guard, key, kind, bytes)
     }
 

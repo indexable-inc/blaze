@@ -1080,7 +1080,7 @@ enum Mark {
 /// A collection's marks, a bit a memo, in its frame.
 type Marks<'f> = Bits<Vec<u64, &'f blaze_mem::frame::Frame>, MemoId>;
 /// The input keys a collection keeps, in its frame.
-type KeptInputs<'f> = hashbrown::HashSet<QueryKey, rustc_hash::FxBuildHasher, &'f blaze_mem::frame::Frame>;
+type KeptInputs<'f> = hashbrown::HashSet<QueryKey, blaze_hash::FixedState, &'f blaze_mem::frame::Frame>;
 
 /// What the workers of a parallel mark share.
 struct Marking<'a> {
@@ -1741,7 +1741,7 @@ impl Database {
                 marks
             };
             let (mut reached, mut hot) = (marks(), marks());
-            let mut inputs_kept = hashbrown::HashSet::with_hasher_in(rustc_hash::FxBuildHasher, frame);
+            let mut inputs_kept = hashbrown::HashSet::with_hasher_in(blaze_hash::FixedState, frame);
             let mut work: Vec<MemoId, _> = Vec::new_in(frame);
             let mut views: Vec<&ViewState, _> = Vec::new_in(frame);
             self.views.for_each(&task, |state| {
@@ -1954,24 +1954,21 @@ impl Database {
             let mut stack: Vec<MemoId, _> = Vec::new_in(frame);
             let mut late: Vec<MemoId, _> = Vec::new_in(frame);
             let mut late_hot: Vec<MemoId, _> = Vec::new_in(frame);
-            let mut inputs: KeptInputs<'_> = hashbrown::HashSet::with_hasher_in(rustc_hash::FxBuildHasher, frame);
+            let mut inputs: KeptInputs<'_> = hashbrown::HashSet::with_hasher_in(blaze_hash::FixedState, frame);
             let reached = marking.reached;
-            let mut idle = 0u32;
+            let mut idle = blaze_graph::spin::SpinWait::new();
             loop {
                 if !marking.has_work() {
                     if marking.done() {
                         break;
                     }
                     marking.hungry.store(true, Relaxed);
-                    idle += 1;
-                    if idle < 64 {
-                        std::hint::spin_loop();
-                    } else {
+                    if !idle.spin() {
                         std::thread::yield_now();
                     }
                     continue;
                 }
-                idle = 0;
+                idle = blaze_graph::spin::SpinWait::new();
                 let busy = Busy::enter(&marking.busy);
                 marking.take(&task, &mut stack, &mut late_hot);
                 while let Some(memo) = stack.pop() {

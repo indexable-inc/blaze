@@ -175,7 +175,7 @@ impl<T> Slab<T> {
     pub fn insert_with(&mut self, make: impl FnOnce(Handle<T>) -> T) -> Handle<T> {
         match self.try_insert_with(make) {
             Ok(handle) => handle,
-            Err(error) => fail(error),
+            Err(error) => fail(&error),
         }
     }
 

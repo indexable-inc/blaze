@@ -10,16 +10,16 @@
 use std::collections::BTreeMap;
 
 use blaze_codegen::{CompiledFunction, Init, InstanceKey, RelocKind, Static, Target};
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 use blaze_link::NativeKind;
-use rustc_hash::FxHashMap;
 
 use crate::PremapError;
 use crate::image::View;
 use crate::prelink::{
-    Bind, BindKind, InitEntry, Library, PlacedName, PlacedStatic, Prelink, Prelinked, Prot, Request, Segment,
-    StaticAt, Tls,
+    Bind, BindKind, InitEntry, Library, PlacedName, PlacedStatic, Prelink, Prelinked, Prot,
+    Request, Segment, StaticAt, Tls,
 };
 use crate::split::WorkspacePart;
 use crate::start::{self, Start};
@@ -49,7 +49,7 @@ struct Site {
 pub(crate) struct Layout {
     pub functions: Vec<(InstanceKey, u64, u64)>,
     pub statics: Vec<PlacedStatic>,
-    data: FxHashMap<ContentId, u64>,
+    data: HashMap<ContentId, u64>,
     /// The open cells: name, address, referred to weakly only.
     pub cells: Vec<(String, u64, bool)>,
     sites: Vec<Site>,
@@ -87,7 +87,7 @@ pub(crate) fn place(from: u64, tls_from: u64, functions: &[&CompiledFunction], s
 
     let ro_at = (from + code.len() as u64).next_multiple_of(PAGE);
     let mut ro = Vec::new();
-    let mut data = FxHashMap::default();
+    let mut data = HashMap::default();
     let blobs = functions.iter().flat_map(|it| &it.data).chain(statics.iter().flat_map(|it| &it.data));
     for blob in blobs {
         if data.contains_key(&blob.id) {

@@ -1860,7 +1860,35 @@ pub mod result {
                 Err(e) => op(e),
             }
         }
+
+        pub fn map_err<F, O: FnOnce(E) -> F>(self, op: O) -> Result<T, F> {
+            match self {
+                Ok(t) => Ok(t),
+                Err(e) => Err(op(e)),
+            }
+        }
         // endregion:fn
+
+        // region:option
+        pub fn ok(self) -> crate::option::Option<T> {
+            match self {
+                Ok(t) => crate::option::Option::Some(t),
+                Err(_) => crate::option::Option::None,
+            }
+        }
+        // endregion:option
+
+        // region:default
+        pub fn unwrap_or_default(self) -> T
+        where
+            T: crate::default::Default,
+        {
+            match self {
+                Ok(t) => t,
+                Err(_) => T::default(),
+            }
+        }
+        // endregion:default
     }
 }
 // endregion:result

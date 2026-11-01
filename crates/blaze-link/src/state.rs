@@ -18,8 +18,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use blaze_codegen::{InstanceKey, Line};
+use blaze_hash::HashMap;
 use blaze_ids::{ContentId, radix};
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::cow::{CowBytes, CowList, CowVec, ListRef};
@@ -445,7 +445,7 @@ pub(crate) struct State {
     /// wasm: what codegen's live functions and statics say each name is imported as, the one
     /// import every live piece declaring it agrees on ([`State::declare_wasm`]); a name no
     /// live piece declares has none.
-    pub wasm_imports: Arc<FxHashMap<NameId, blaze_codegen::wasm::Import>>,
+    pub wasm_imports: Arc<HashMap<NameId, blaze_codegen::wasm::Import>>,
     pub inputs: Arc<Vec<Input>>,
     pub resolved: Arc<Resolved>,
     /// The jump table: slots given out, and how many there are room for.

@@ -3,14 +3,12 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{
-        Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
+use parking_lot::Mutex;
 
 use super::*;
 use crate::{
@@ -136,7 +134,7 @@ impl Frontend for Program {
     }
 
     fn reached(&self, functions: &[(u32, Origin)], _: &[u32]) {
-        self.reached.lock().unwrap().push(functions.iter().map(|it| it.0).collect());
+        self.reached.lock().push(functions.iter().map(|it| it.0).collect());
     }
 
     fn stopped(&self) -> bool {
@@ -403,7 +401,7 @@ fn the_front_end_hears_each_level_before_it_and_a_stop_ends_the_build() {
     let (program, policy) = (program(), policy(OptLevel::O0, Mode::Output));
     let (machine, memo, store) = (Machine::default(), Memo::new(), Store::default());
     build(&program, &machine, &policy, &memo, &store).unwrap();
-    assert_eq!(*program.reached.lock().unwrap(), [vec![1], vec![2, 3], vec![4, 5]]);
+    assert_eq!(*program.reached.lock(), [vec![1], vec![2, 3], vec![4, 5]]);
 
     program.stop.store(true, Ordering::Relaxed);
     let stopped = Machine::default();

@@ -25,7 +25,7 @@ use syntax::{
 #[cfg(test)]
 thread_local! {
     /// This is used to test `hir_segment_to_ast_segment_view()`. It's a hack, but it makes testing much easier.
-    pub(super) static SEGMENT_LOWERING_MAP: std::cell::RefCell<rustc_hash::FxHashMap<AstPtr<tag::PathSegment>, usize>> = std::cell::RefCell::default();
+    pub(super) static SEGMENT_LOWERING_MAP: std::cell::RefCell<blaze_hash::HashMap<AstPtr<tag::PathSegment>, usize>> = std::cell::RefCell::default();
     /// Whether lowering fills `SEGMENT_LOWERING_MAP`: only for its tests, so that a budget
     /// test's lowering allocates what a build's does.
     pub(super) static RECORD_SEGMENTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

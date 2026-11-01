@@ -45,7 +45,7 @@ values! {
     std::num::NonZeroI8, std::num::NonZeroI16, std::num::NonZeroI32, std::num::NonZeroI64,
     std::num::NonZeroI128, std::num::NonZeroIsize, std::num::NonZeroU8, std::num::NonZeroU16,
     std::num::NonZeroU32, std::num::NonZeroU64, std::num::NonZeroU128, std::num::NonZeroUsize,
-    rustc_hash::FxBuildHasher, Id,
+    blaze_hash::FixedState, Id,
 }
 
 // SAFETY: a `str` is bytes.

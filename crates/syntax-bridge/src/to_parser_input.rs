@@ -10,8 +10,8 @@
 
 use std::sync::LazyLock;
 
+use blaze_hash::HashMap;
 use intern::{Symbol, sym};
-use rustc_hash::FxHashMap;
 use span::{Edition, SyntaxContext};
 use syntax::{SyntaxKind, SyntaxKind::*, T};
 use tt::FlatToken;
@@ -321,13 +321,13 @@ struct Editions<'f, F: FnMut(SyntaxContext) -> Edition + ?Sized> {
     last: (SyntaxContext, Edition),
     near: [(SyntaxContext, Edition); NEAR],
     len: usize,
-    far: FxHashMap<SyntaxContext, Edition>,
+    far: HashMap<SyntaxContext, Edition>,
 }
 
 impl<'f, F: FnMut(SyntaxContext) -> Edition + ?Sized> Editions<'f, F> {
     fn new(span_to_edition: &'f mut F) -> Self {
         let unused = (SyntaxContext::root(Edition::Edition2015), Edition::Edition2015);
-        let far = FxHashMap::default();
+        let far = HashMap::default();
         Editions { span_to_edition, last: unused, near: [unused; NEAR], len: 0, far }
     }
 
@@ -391,7 +391,7 @@ struct Keywords {
     /// By declared index: the keyword's place in `kinds` plus one, 0 for none.
     declared: Box<[u8]>,
     /// The keywords whose symbols are not declared ones, and their places plus one.
-    other: FxHashMap<Symbol, u8>,
+    other: HashMap<Symbol, u8>,
     /// Bit `n` set when some keyword in `other` is `n` bytes long: most identifiers are no
     /// keyword's length and skip the map.
     other_lengths: u64,
@@ -408,7 +408,7 @@ impl Keywords {
         texts.dedup();
         // alloc: built once, for the process.
         let mut declared = Vec::new();
-        let mut other = FxHashMap::default();
+        let mut other = HashMap::default();
         let mut other_lengths = 0u64;
         let mut kinds = Vec::with_capacity(texts.len());
         for text in texts {

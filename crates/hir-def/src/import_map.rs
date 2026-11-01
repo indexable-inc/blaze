@@ -2,12 +2,12 @@
 
 use std::{cmp::Ordering, fmt};
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
+use blaze_hash::{FixedState, HashSet};
 use blaze_ids::bits::BitSet;
 use blaze_mem::Frame;
 use hir_expand::name::Name;
 use indexmap::IndexSet;
-use rustc_hash::{FxBuildHasher, FxHashSet};
 use span::Edition;
 use stdx::format_to;
 
@@ -19,7 +19,7 @@ use crate::{
     visibility::Visibility,
 };
 
-type FxIndexSet<T> = IndexSet<T, FxBuildHasher>;
+type FxIndexSet<T> = IndexSet<T, FixedState>;
 
 /// Item import details stored in the `ImportMap`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -158,7 +158,7 @@ impl ImportMap {
         run_start.push(importables.len() as u32);
 
         // alloc: the memo's set, exact
-        let mut items = FxIndexSet::with_capacity_and_hasher(rows, FxBuildHasher);
+        let mut items = FxIndexSet::with_capacity_and_hasher(rows, FixedState);
         items.extend(found.rows.iter().copied());
         ImportMap {
             items,
@@ -273,7 +273,7 @@ fn is_subsequence(needle: &[u8], hay: &[u8]) -> bool {
 /// What the walk over the public modules finds, before it is laid out as columns: the run's.
 struct Collector<'f> {
     /// The row of each item found, in the order first met.
-    rows_of: hashbrown::HashMap<ItemInNs, u32, FxBuildHasher, &'f Frame>,
+    rows_of: hashbrown::HashMap<ItemInNs, u32, FixedState, &'f Frame>,
     rows: Vec<ItemInNs, &'f Frame>,
     /// Per row, whether the item is an associated item of a trait (as the first info found
     /// for it says).
@@ -298,7 +298,7 @@ impl<'f> Collector<'f> {
 
         let def_map = crate_def_map(db, krate);
         let mut found = Collector {
-            rows_of: hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame),
+            rows_of: hashbrown::HashMap::with_hasher_in(FixedState, frame),
             rows: Vec::new_in(frame),
             trait_assoc_items: Vec::new_in(frame),
             infos: Vec::new_in(frame),
@@ -308,7 +308,7 @@ impl<'f> Collector<'f> {
         let root = def_map.root_module_id();
         let mut worklist = Vec::new_in(frame);
         worklist.push(root);
-        let mut visited = hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame);
+        let mut visited = hashbrown::HashSet::with_hasher_in(FixedState, frame);
 
         while let Some(module) = worklist.pop() {
             if !visited.insert(module) {
@@ -655,9 +655,9 @@ pub fn search_dependencies(
     db: &Db,
     krate: Crate,
     query: &Query,
-) -> FxHashSet<(ItemInNs, Complete)> {
+) -> HashSet<(ItemInNs, Complete)> {
     // alloc: the caller's result, at the edge
-    let mut found = FxHashSet::default();
+    let mut found = HashSet::default();
     search_dependencies_into(db, krate, query, &mut found);
     found
 }
@@ -668,7 +668,7 @@ pub fn search_dependencies_into(
     db: &Db,
     krate: Crate,
     query: &Query,
-    found: &mut FxHashSet<(ItemInNs, Complete)>,
+    found: &mut HashSet<(ItemInNs, Complete)>,
 ) {
     search_dependencies_each(db, krate, query, |item, complete| {
         found.insert((item, complete));
@@ -708,14 +708,10 @@ pub fn search_dependencies_each(
 mod tests {
     use base_db::all_crates;
     use expect_test::{Expect, expect};
-    use itertools::Itertools;
     use hir_expand::fixture;
+    use itertools::Itertools;
 
-    use crate::{
-        ItemContainerId, Lookup,
-        nameres::assoc::TraitItems,
-        test_db::TestDBExt,
-    };
+    use crate::{ItemContainerId, Lookup, nameres::assoc::TraitItems, test_db::TestDBExt};
 
     use super::*;
 
@@ -1311,9 +1307,9 @@ pub mod fmt {
     /// `String` each. The model the differential test compares with.
     mod reference {
         use base_db::{Crate, Db};
+        use blaze_hash::HashSet;
         use fst::{Automaton, IntoStreamer, Streamer, raw::IndexedValue};
         use itertools::Itertools;
-        use rustc_hash::FxHashSet;
         use smallvec::SmallVec;
 
         use super::super::{ImportInfo, IsTraitAssocItem, Query, SearchMode};
@@ -1379,7 +1375,7 @@ pub mod fmt {
             let mut map = FxIndexMap::default();
             let root = def_map.root_module_id();
             let mut worklist = vec![root];
-            let mut visited = FxHashSet::default();
+            let mut visited = HashSet::default();
             while let Some(module) = worklist.pop() {
                 if !visited.insert(module) {
                     continue;
@@ -1572,7 +1568,7 @@ pub mod fmt {
             db: &Db,
             krate: Crate,
             query: &Query,
-        ) -> FxHashSet<(ItemInNs, Complete)> {
+        ) -> HashSet<(ItemInNs, Complete)> {
             let maps: Vec<_> =
                 krate.data(db).dependencies.iter().map(|dep| build(db, dep.crate_id)).collect();
             let mut op = fst::map::OpBuilder::new();
@@ -1661,8 +1657,8 @@ pub mod fmt {
             maps: &[OldImportMap],
             mut stream: fst::map::Union<'_>,
             query: &Query,
-        ) -> FxHashSet<(ItemInNs, Complete)> {
-            let mut res = FxHashSet::default();
+        ) -> HashSet<(ItemInNs, Complete)> {
+            let mut res = HashSet::default();
             while let Some((_, indexed_values)) = stream.next() {
                 for &IndexedValue { index, value } in indexed_values {
                     let end = (value & 0xFFFF_FFFF) as usize;
@@ -1901,7 +1897,7 @@ pub mod fmt {
             Query::new("fmt".to_owned()).fuzzy(),
             Query::new("FMT".to_owned()).fuzzy().case_sensitive(),
         ];
-        let mut found = FxHashSet::default();
+        let mut found = HashSet::default();
         for query in &queries {
             search_dependencies_into(&db, main, query, &mut found);
         }
@@ -1954,7 +1950,7 @@ pub fn fmt() {}
             })
         });
         assert_eq!(first, again);
-        let visited: FxHashSet<_> = first.iter().copied().collect();
+        let visited: HashSet<_> = first.iter().copied().collect();
         assert_eq!(visited, search_dependencies(&db, main, &query));
     }
 

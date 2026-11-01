@@ -24,7 +24,7 @@ mod tests;
 use std::collections::VecDeque;
 
 use blaze_core::Conn;
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use blaze_ids::{ContentId, radix};
 use blaze_mem::{
     Handle, Slab, Tag,
@@ -48,6 +48,7 @@ pub struct Daemon<'a> {
     pub builder: &'a mut dyn Builder,
     /// For [`Response::Status`].
     pub pid: u32,
+    pub build: &'a crate::Build,
     pub memory_bytes: u64,
     pub budget_bytes: u64,
     /// blaze-mem's counters as they are now, for [`Response::Memory`]:
@@ -68,18 +69,18 @@ pub struct Session {
     next_serial: u64,
     /// Every request not yet over, by the session's own number for it; a gone connection's
     /// stay until their jobs finish.
-    pending: FxHashMap<u64, Pending>,
+    pending: HashMap<u64, Pending>,
     /// The number of each request of a live connection not yet over. A gone connection's are
     /// found by a walk and put in order of id; a request's begin and end touch one slot and
     /// allocate nothing.
-    live: FxHashMap<RequestRef, u64>,
+    live: HashMap<RequestRef, u64>,
     /// Every job not finished, by its slot ([`JobId`]): what it is for.
     jobs: Slab<Job>,
     /// Commits waiting to be durable.
-    tickets: FxHashMap<Ticket, u64>,
+    tickets: HashMap<Ticket, u64>,
     /// The views each connection opened with [`Request::Open`], by root, one per open; sorted
     /// by root where a gone connection's are closed.
-    held: FxHashMap<Conn, FxHashMap<ContentId, Vec<ViewId>>>,
+    held: HashMap<Conn, HashMap<ContentId, Vec<ViewId>>>,
     /// The database's view of the last job that ended on each of the latest [`KEPT`] roots,
     /// oldest first: what [`Request::Why`] reads, since a view's reruns are its own.
     kept: VecDeque<(ContentId, ViewId)>,
@@ -207,15 +208,15 @@ impl Session {
     pub fn new() -> Session {
         Session {
             next_serial: 0,
-            pending: FxHashMap::default(),
-            live: FxHashMap::default(),
+            pending: HashMap::default(),
+            live: HashMap::default(),
             // alloc: none, address space reserved.
             jobs: match Slab::new(JOBS, Tag::Api) {
                 Ok(it) => it,
                 Err(error) => panic!("the session's table of jobs: {error}"),
             },
-            tickets: FxHashMap::default(),
-            held: FxHashMap::default(),
+            tickets: HashMap::default(),
+            held: HashMap::default(),
             kept: VecDeque::new(),
             intents: Intents::default(),
             now_ns: 0,
@@ -716,6 +717,8 @@ impl Session {
                 radix::sort_copy_by_key_in(&mut requests, |it| *it, &mut self.buffers.ids_scratch);
                 let status = Status {
                     pid: cx.pid,
+                    // clone: the reply's own copy, once per Status.
+                    build: cx.build.clone(),
                     requests,
                     views: self.views(),
                     // alloc: the reply's own copy of an error, once per Status.
@@ -911,7 +914,7 @@ impl Session {
 
     /// The views the session holds open: the connections' and the jobs'.
     fn views(&self) -> u32 {
-        let held: usize = self.held.values().flat_map(FxHashMap::values).map(Vec::len).sum();
+        let held: usize = self.held.values().flat_map(HashMap::values).map(Vec::len).sum();
         let jobs: usize = self.pending.values().map(|it| it.what.views()).sum();
         u32::try_from(held + jobs + self.intents.views()).expect("fewer than 2^32 open views")
     }

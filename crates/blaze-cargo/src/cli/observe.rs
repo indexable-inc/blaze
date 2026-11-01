@@ -121,7 +121,7 @@ fn texts(words: Vec<OsString>) -> Result<Vec<String>, Refusal> {
 
 /// `request` asked of the daemon, each response but its errors handed to `on`; the daemon's
 /// errors, and a Done not ok, are the error. With [`Start::Never`], no daemon running is one.
-fn ask(request: Request, start: Start, mut on: impl FnMut(ResponseRef<'_>) -> Result<(), String>) -> Result<(), String> {
+pub(super) fn ask(request: Request, start: Start, mut on: impl FnMut(ResponseRef<'_>) -> Result<(), String>) -> Result<(), String> {
     let mut client = match daemon::connect(start) {
         Ok(Some(client)) => client,
         Ok(None) => return Err("no daemon is running: a build, or `blaze serve`, starts one".to_owned()),

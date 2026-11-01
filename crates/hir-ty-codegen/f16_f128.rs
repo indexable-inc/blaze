@@ -515,7 +515,7 @@ impl<'db> FunctionCx<'_, 'db> {
         let bfloat = |scalar: &rustc_abi::Scalar| {
             matches!(scalar.primitive(), Primitive::Float(rustc_abi::Float::F16B))
         };
-        let mut held = FxHashSet::default();
+        let mut held = HashSet::default();
         for (local, data) in body.locals.iter() {
             // A local without a layout is refused where it is compiled, for that.
             let Ok(layout) = self.layout(data.ty.as_ref()) else {
@@ -541,7 +541,7 @@ impl<'db> FunctionCx<'_, 'db> {
         if held.is_empty() {
             return Ok(());
         }
-        let mut predecessors: FxHashMap<BasicBlockId, usize> = FxHashMap::default();
+        let mut predecessors: HashMap<BasicBlockId, usize> = HashMap::default();
         for (_, block) in body.basic_blocks.iter() {
             if let Some(terminator) = &block.terminator {
                 for to in terminator.kind.successors().into_iter().chain(terminator.kind.unwind()) {
@@ -549,7 +549,7 @@ impl<'db> FunctionCx<'_, 'db> {
                 }
             }
         }
-        let mut follows: FxHashMap<BasicBlockId, BasicBlockId> = FxHashMap::default();
+        let mut follows: HashMap<BasicBlockId, BasicBlockId> = HashMap::default();
         for (id, block) in body.basic_blocks.iter() {
             let next = match block.terminator.as_ref().map(|it| &it.kind) {
                 Some(TerminatorKind::Goto { target })
@@ -569,7 +569,7 @@ impl<'db> FunctionCx<'_, 'db> {
             }
             id
         };
-        let mut made_in: FxHashMap<LocalId, BasicBlockId> = FxHashMap::default();
+        let mut made_in: HashMap<LocalId, BasicBlockId> = HashMap::default();
         // alloc: only an x86-64 body with an `f16b` local; one list reused across its blocks
         let mut mentioned = Vec::new();
         for (id, block) in body.basic_blocks.iter() {

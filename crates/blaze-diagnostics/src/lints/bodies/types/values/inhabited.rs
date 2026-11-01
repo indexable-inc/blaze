@@ -7,6 +7,7 @@
 //! `compiler/rustc_middle/src/ty/inhabitedness/inhabited_predicate.rs` (MIT or Apache-2.0).
 
 use base_db::Db;
+use blaze_hash::HashMap;
 use hir::db::HirDatabase;
 use hir_def::{
     AdtId, AttrDefId, HasModule as _, ModuleId, VariantId,
@@ -23,7 +24,6 @@ use hir_ty::{
         infer::traits::ObligationCause,
     },
 };
-use rustc_hash::FxHashMap;
 use rustc_type_ir::{AliasTyKind, inherent::IntoKind as _};
 use smallvec::SmallVec;
 
@@ -51,7 +51,7 @@ pub(super) struct Preds<'s, 'db> {
     db: &'db Db,
     krate: base_db::Crate,
     pairs: Vec<[Pred<'db>; 2]>,
-    adts: FxHashMap<AdtId, Pred<'db>>,
+    adts: HashMap<AdtId, Pred<'db>>,
 }
 
 impl<'s, 'db> Preds<'s, 'db> {
@@ -60,7 +60,7 @@ impl<'s, 'db> Preds<'s, 'db> {
     pub(super) fn new(solver: &'s Solver<'db>, krate: base_db::Crate) -> Preds<'s, 'db> {
         let db = solver.interner().db;
         // alloc: empty, pushed to only for an `And` or `Or` of a type asked about
-        Preds { solver, db, krate, pairs: Vec::new(), adts: FxHashMap::default() }
+        Preds { solver, db, krate, pairs: Vec::new(), adts: HashMap::default() }
     }
 
     fn interner(&self) -> DbInterner<'db> {

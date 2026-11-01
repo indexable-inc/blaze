@@ -5,9 +5,10 @@ use std::{
     cell::Cell,
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
+use blaze_hash::HashMap;
 use blaze_registry::{
     Context, Locked, Package, Registry, SourceConfig, SourceDef, Sources,
     download::{From, checksum, crate_key, crate_url, parse_checksum, unpack_package_in},
@@ -15,7 +16,7 @@ use blaze_registry::{
     index::Status,
 };
 use blaze_source::SourceId;
-use rustc_hash::FxHashMap as HashMap;
+use parking_lot::Mutex;
 use semver::{Version, VersionReq};
 
 const BASE: &str = "https://index.example.com/";
@@ -29,11 +30,11 @@ struct Server {
 
 impl Server {
     fn put(&self, url: &str, body: &[u8], etag: &str) {
-        self.files.lock().unwrap().insert(url.to_owned(), (body.to_vec(), etag.to_owned()));
+        self.files.lock().insert(url.to_owned(), (body.to_vec(), etag.to_owned()));
     }
 
     fn take_asked(&self) -> Vec<String> {
-        self.asked.lock().unwrap().drain(..).map(|(url, _)| url).collect()
+        self.asked.lock().drain(..).map(|(url, _)| url).collect()
     }
 }
 
@@ -41,8 +42,8 @@ impl Http for Server {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<Response> {
         let headers: Vec<(String, String)> =
             headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        self.asked.lock().unwrap().push((url.to_owned(), headers.clone()));
-        let files = self.files.lock().unwrap();
+        self.asked.lock().push((url.to_owned(), headers.clone()));
+        let files = self.files.lock();
         let Some((body, etag)) = files.get(url) else {
             return Ok(Response { status: 404, ..Response::default() });
         };
@@ -175,7 +176,7 @@ fn reads_and_caches_the_index_as_cargo() {
 
     registry.invalidate();
     assert_eq!(registry.query("serde", &any).unwrap().len(), 3);
-    let asked = fixture.server.asked.lock().unwrap().clone();
+    let asked = fixture.server.asked.lock().clone();
     let (url, headers) = asked.last().unwrap();
     assert_eq!(url, &format!("{BASE}se/rd/serde"));
     assert!(headers.contains(&("if-none-match".to_owned(), "\"v1\"".to_owned())));
@@ -192,7 +193,7 @@ fn reads_and_caches_the_index_as_cargo() {
     assert!(cache[5..].starts_with(b"etag: \"v2\"\0"));
 
     // Gone from the server: no versions, and no cache.
-    fixture.server.files.lock().unwrap().remove(&format!("{BASE}se/rd/serde"));
+    fixture.server.files.lock().remove(&format!("{BASE}se/rd/serde"));
     let registry = fixture.registry(false);
     registry.invalidate();
     assert!(registry.query("serde", &any).unwrap().is_empty());

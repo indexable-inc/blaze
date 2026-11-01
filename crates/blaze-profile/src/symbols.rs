@@ -3,12 +3,12 @@
 //! of MB is not read whole), its load slide from the dynamic loader, and `dladdr` for code in
 //! shared libraries.
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 /// A name for each of `pcs`: the function demangled with its offset, or the library and offset,
 /// or the bare address.
-pub(crate) fn names(pcs: &[u64]) -> FxHashMap<u64, String> {
-    let mut names = FxHashMap::default();
+pub(crate) fn names(pcs: &[u64]) -> HashMap<u64, String> {
+    let mut names = HashMap::default();
     let mut left: Vec<u64> = pcs.to_vec(); // alloc: a dump's addresses, on demand
     left.sort_unstable();
     left.dedup();
@@ -35,7 +35,7 @@ fn demangled(name: &str) -> String {
 
 /// Names `pcs` (sorted) that fall in the executable's text symbols, loaded `slide` bytes from
 /// the addresses the file gives.
-fn executable(pcs: &[u64], slide: u64, names: &mut FxHashMap<u64, String>) {
+fn executable(pcs: &[u64], slide: u64, names: &mut HashMap<u64, String>) {
     use object::{Object, ObjectSymbol, SymbolKind};
     let Ok(path) = std::env::current_exe() else { return };
     let Ok(file) = std::fs::File::open(&path) else { return };

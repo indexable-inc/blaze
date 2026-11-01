@@ -3,8 +3,8 @@
 use std::ops;
 
 use base_db::{Db, EditionedFileId};
+use blaze_hash::HashMap;
 use hir_expand::{HirFileId, InFile, Lookup, span_map::SpanMap};
-use rustc_hash::FxHashMap;
 use span::{AstIdMap, Edition, ErasedFileAstId, ROOT_ERASED_FILE_AST_ID, RealSpanMap};
 use syntax::{
     FlatTree, NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
@@ -619,14 +619,14 @@ struct ItemBodySyntax<'db> {
 /// The [`ItemBodySyntax`] of each fn, const, static and variant of `file` outside fn bodies, by
 /// its ast id: changed only when such an item comes or goes, not by where an item is.
 #[blaze_query::tracked(returns(ref))]
-fn file_body_syntax(db: &Db, file: EditionedFileId) -> FxHashMap<ErasedFileAstId, blaze_query::db::Id> {
+fn file_body_syntax(db: &Db, file: EditionedFileId) -> HashMap<ErasedFileAstId, blaze_query::db::Id> {
     let file_id = HirFileId::from(file);
     let SpanMap::RealSpanMap(span_map) = file_id.span_map(db) else {
         unreachable!("{file:?} is a real file")
     };
     let ast_id_map = file_id.ast_id_map(db);
     let root = file_id.root(db);
-    let mut items = FxHashMap::default();
+    let mut items = HashMap::default();
     for &[start, end, kind, id] in ast_id_map.entries() {
         let kind = SyntaxKind::from(kind as u16);
         if !matches!(kind, SyntaxKind::FN | SyntaxKind::CONST | SyntaxKind::STATIC | SyntaxKind::VARIANT) {

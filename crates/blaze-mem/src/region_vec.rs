@@ -142,7 +142,7 @@ impl<T> RegionVec<T> {
     pub fn push(&mut self, value: T) -> usize {
         match self.try_push(value) {
             Ok(index) => index,
-            Err(error) => fail(error),
+            Err(error) => fail(&error),
         }
     }
 
@@ -154,7 +154,7 @@ impl<T> RegionVec<T> {
         let index = self.push(value);
         match u32::try_from(index) {
             Ok(id) => id,
-            Err(_) => fail(MemError::TooLarge { tag: self.tag(), what: "a u32 ID", wanted: index }),
+            Err(_) => fail(&MemError::TooLarge { tag: self.tag(), what: "a u32 ID", wanted: index }),
         }
     }
 
@@ -255,7 +255,7 @@ impl<T: Copy> RegionVec<T> {
     #[track_caller]
     pub fn extend_from_slice(&mut self, values: &[T]) {
         if let Err(error) = self.try_extend_from_slice(values) {
-            fail(error)
+            fail(&error)
         }
     }
 }

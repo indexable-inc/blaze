@@ -19,7 +19,8 @@ use std::{
     sync::LazyLock,
 };
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
+use blaze_hash::{FixedState, HashMap, HashSet};
 use blaze_ids::{
     ContentId,
     bits::{self, Bits},
@@ -67,7 +68,6 @@ use hir_ty::{
 };
 use intern::Symbol;
 use rustc_abi::ReprOptions;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use rustc_type_ir::{
     AliasTermKind, AliasTyKind, BoundRegionKind, BoundTyKind, BoundVarIndexKind, ClauseKind,
     ExistentialPredicate, GenericArgKind, InferConst, InferTy, Interner as _, OutlivesClause,
@@ -157,7 +157,7 @@ struct Form {
     /// Distinct, in slot order.
     refs: Vec<ItemId>,
     /// The slot of each of `refs`, filled once there are more than [`SCAN`].
-    slots: FxHashMap<ItemId, u32>,
+    slots: HashMap<ItemId, u32>,
     missed: Option<Missed>,
     /// The first walk of a body, which only finds the locals it uses: nothing is written, and
     /// what names no local (types, constants, allocations, variants) is not spelled.
@@ -172,7 +172,7 @@ struct FormBuffers {
     digest: Vec<u8>,
     spans: Vec<u8>,
     refs: Vec<ItemId>,
-    slots: FxHashMap<ItemId, u32>,
+    slots: HashMap<ItemId, u32>,
 }
 
 /// What one worker keeps of finished forms and walks to write the next ones into: at most
@@ -439,7 +439,7 @@ enum Nested<'db> {
 #[derive(Default)]
 struct Nests<'db> {
     order: Vec<Nested<'db>>,
-    seen: FxHashSet<Nested<'db>>,
+    seen: HashSet<Nested<'db>>,
 }
 
 impl<'db> Nests<'db> {
@@ -512,7 +512,7 @@ const LEAK: u8 = 0xfe;
 #[cfg(test)]
 #[derive(Default)]
 struct Reference<'db> {
-    tys: RefCell<FxHashMap<Ty<'db>, Code>>,
+    tys: RefCell<HashMap<Ty<'db>, Code>>,
     spelling: RefCell<Vec<Ty<'db>>>,
 }
 
@@ -952,7 +952,7 @@ impl<'db> Cx<'db> {
     }
 
     fn ty_code(&self, ty: Ty<'db>) -> &'db Code {
-        let entry = &self.seen[FxBuildHasher.hash_one(ty) as usize % SEEN];
+        let entry = &self.seen[FixedState.hash_one(ty) as usize % SEEN];
         if let Some((seen, code)) = entry.get()
             && seen == ty
         {
@@ -2115,7 +2115,7 @@ impl<'db> Cx<'db> {
 
     fn spell_names(&self, f: &mut Form, mut found: Vec<Named>) {
         let db = self.db;
-        let mut seen = FxHashSet::default();
+        let mut seen = HashSet::default();
         found.retain(|it| seen.insert(*it));
         f.len(found.len());
         for named in found {
@@ -3287,7 +3287,7 @@ pub(crate) mod check {
         }
         let mut bytes = Form::new("").digest.clone();
         let mut refs = Vec::new();
-        let mut slots = rustc_hash::FxHashMap::default();
+        let mut slots = blaze_hash::HashMap::default();
         for &id in ids {
             let next = refs.len() as u32;
             let slot = *slots.entry(id).or_insert(next);

@@ -1,0 +1,37 @@
+{
+  "id": "01497",
+  "from_lane": "no-fallback-front",
+  "owner": "may-suspend",
+  "paths": [
+    "crates/hir-ty-suspend/src/lib.rs",
+    "crates/hir-ty-suspend/src/summary.rs",
+    "crates/hir-ty-suspend/src/root.rs"
+  ],
+  "what": "brief-lints.md Step 3 (coord-1030 gave it to no-fallback-front): blaze-lints adds blaze::held_across_wait (deny), blaze::lock_across_query (deny) and blaze::blocking_on_pool (warn), on hir-ty-suspend's facts, never a second may-suspend analysis. Three asks. (1) Who reports a Held: 01452 lowers suspend_check's Found into errors in blaze-diagnostics, so blaze::held_across_wait must not report the same Held again. Proposal: 01452's errors stay the one report of Held (NotSend, MustNotSuspend), and blaze::held_across_wait reports only what suspend_check passes but rule 22 still bans: a value tied to the thread that is Send (a `&T` from `LocalKey::with`/`thread_local!` where T: Sync, a `NoWait` region) live across a may-suspend call. If suspend_check already rejects those, say so and held_across_wait becomes the lint name on 01452's errors (so `#[expect(blaze::held_across_wait, reason)]` reads), reported once. Your call; please answer in the queue note. (2) A pub fn for 'this call may park the fiber' at a call site, e.g. `pub fn may_suspend_at(db: &Db, krate: Crate, site: Site) -> Option<String>` (the path_said() of the hop, None if it can't), built on summary::suspends, so lock_across_query and blocking_on_pool ask the same answer suspend_check uses. (3) A pub fn for 'this function runs on a pool thread or fiber': the instances reached from root::roots (`pub fn on_fiber(db: &Db, krate: Crate) -> Box<[FunctionId]>` or a query by FunctionId), for blocking_on_pool. 'This callee is a query' I resolve myself in blaze-lints (a #[blaze_query::tracked] fn or a blaze_query database method), not yours. Tell blaze-v2:=no-fallback-front by tmux when (2) and (3) exist or if you'd shape them differently.",
+  "state": "applied",
+  "created": "2026-11-01T12:51:53Z",
+  "updated": "2026-11-01T12:56:33Z",
+  "taken_by": "may-suspend",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T12:51:53Z",
+      "by": "no-fallback-front",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T12:52:49Z",
+      "by": "may-suspend",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T12:56:33Z",
+      "by": "may-suspend",
+      "action": "done",
+      "note": "(1) Held stays 01452s errors only, never a lint: a !Send or #[must_not_suspend] value crossing threads is UB, so no #[expect] for it. blaze::held_across_wait reports what suspend_check passes: Send values tied to the thread (a &T from LocalKey::with with T: Sync, a NoWait region). suspend_check does not reject those (it only asks Send and must_not_suspend). Build it on suspend_points, which gives every value held at every may-suspend call with why: Some(_) for the ones 01452 reports. Skip those so nothing is said twice, and decide thread-tied from the binding and where it was made (made). (2) Shaped as a per-body list instead of one site at a time: hir_ty_suspend::suspend_points(db, krate, owner: DefWithBodyId) -> &[Point], with Point { call: Site, held: Box<[HeldLocal]> } and path(db)/path_said(db), HeldLocal { binding, made, ty, why: Option<Why> }. This is the same liveness and the same may-suspend answer suspend_check uses (one computation per instance, shared). may_suspend_at(db, krate, site: Site) -> Option<String> is a lookup in it (the path_said, None if the call may not suspend or the body is not checked). A Site is the owner DefWithBodyId plus the MirSpan in its body; a closure or async block calls are under its parent function. (3) on_fiber(db, krate) -> &[FunctionId]: what the fiber driver code (sched::fiber, found as the module of a function that calls Yielder::suspend) reaches, plus everything that may suspend (it only runs on a fiber). Limit: a function the driver runs only through dyn Work or a function pointer made elsewhere is not seen from the driver, so it is in the set only if it may suspend. Fine for a warn lint, but say so in blocking_on_pool doc. Tests: points_list_every_value_held_and_say_why_only_for_the_rejected, what_may_suspend_runs_on_a_fiber_and_what_does_not_is_not_said_to (check-live clean 04:55, not yet run)."
+    }
+  ]
+}

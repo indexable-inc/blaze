@@ -19,13 +19,15 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::{
-        Mutex, OnceLock, PoisonError,
+        LazyLock, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use blaze_mem::scratch;
+use crossbeam_queue::ArrayQueue;
+use parking_lot::Mutex;
 
 static MADE: AtomicU64 = AtomicU64::new(0);
 
@@ -40,8 +42,8 @@ static READYING: Mutex<()> = Mutex::new(());
 
 /// The paths of cgroups that ended, each taken by one made after: a spawn's cgroup allocates
 /// nothing once as many have ended as run at once.
-// alloc: none: a const empty list, grown to `SPARES` once.
-static SPARE: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+// alloc: the queue's `SPARES` slots, once a process
+static SPARE: LazyLock<ArrayQueue<Vec<u8>>> = LazyLock::new(|| ArrayQueue::new(SPARES));
 
 /// The most paths kept in [`SPARE`].
 const SPARES: usize = 64;
@@ -68,7 +70,7 @@ impl Cgroup {
     pub(crate) fn new(limit: u64) -> io::Result<Cgroup> {
         let parent = parent()?;
         let n = MADE.fetch_add(1, Ordering::Relaxed);
-        let spare = SPARE.lock().unwrap_or_else(PoisonError::into_inner).pop();
+        let spare = SPARE.pop();
         // alloc: once per cgroup run at once; each one's path is kept for the next after.
         let mut path = spare.unwrap_or_default();
         path.clear();
@@ -226,17 +228,17 @@ impl Drop for Cgroup {
                 Ok(()) => break,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => break,
                 // Empty, but the kernel has not let go of it yet.
-                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
+                Err(_) if Instant::now() < deadline => {
+                    #[allow(clippy::disallowed_methods, reason = "the rmdir's timer: `cgroup.events` says empty, and nothing says when the kernel lets go")]
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 Err(_) => break,
             }
         }
         let mut path = std::mem::take(&mut self.path);
         path.clear();
-        let mut spare = SPARE.lock().unwrap_or_else(PoisonError::into_inner);
-        if spare.len() < SPARES {
-            // alloc: the list grows to `SPARES` once.
-            spare.push(path);
-        }
+        // A full queue gives the path back, dropped here: `SPARES` are kept already.
+        _ = SPARE.push(path);
     }
 }
 
@@ -271,7 +273,7 @@ fn parent() -> io::Result<&'static Path> {
     if let Some(it) = PARENT.get() {
         return Ok(it.as_path());
     }
-    let _readying = READYING.lock().unwrap_or_else(PoisonError::into_inner);
+    let _readying = READYING.lock();
     if let Some(it) = PARENT.get() {
         return Ok(it.as_path());
     }

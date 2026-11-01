@@ -270,3 +270,12 @@ fn each_path_at<'t>(
         }
     }
 }
+
+/// clippy's `indentation`: the whitespace starting the line `range` starts on.
+pub(crate) fn indentation(text: &str, range: TextRange) -> &str {
+    let start = usize::from(range.start());
+    let line_start = text[..start].rfind('\n').map_or(0, |it| it + 1);
+    let line = &text[line_start..];
+    let end = line.find(|it: char| !it.is_whitespace() || it == '\n').unwrap_or(line.len());
+    &line[..end]
+}

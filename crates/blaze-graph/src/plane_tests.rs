@@ -8,11 +8,12 @@
 mod memory;
 mod reference;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::rng::SplitMix64;
 use blaze_protocol::events::{Event, NodeKind, NodeState, Order, Record};
-use rustc_hash::{FxHashMap, FxHashSet};
+use parking_lot::Mutex;
 
 use crate::{
     machine::{Config, Error, Input, Machine, NodeId, Outcome, Output, Pool, Spec},
@@ -264,20 +265,20 @@ fn one_request_without_keys_or_budget_says_what_the_machine_says() {
 
 /// What the query database has, as the plane's [`crate::plane::Memo`] sees it: the test puts a
 /// task's value in it before its `Done`, as the work does.
-type Db = Arc<Mutex<FxHashMap<Key, Outcome>>>;
+type Db = Arc<Mutex<HashMap<Key, Outcome>>>;
 
 /// A test's [`Db`] as the plane's memo.
 struct DbMemo(Db);
 
 impl Memo for DbMemo {
     fn settled(&self, key: Key) -> Option<Outcome> {
-        self.0.lock().expect("the test's database").get(&key).cloned()
+        self.0.lock().get(&key).cloned()
     }
 }
 
 fn with_db(config: PlaneConfig) -> (Plane<DbMemo>, Db) {
     let db = Db::default();
-    (Plane::with_memo(config, DbMemo(db.clone())).unwrap(), db)
+    (Plane::with_memo(config, DbMemo(Arc::clone(&db))).unwrap(), db)
 }
 
 #[test]
@@ -286,7 +287,7 @@ fn a_key_the_database_has_runs_nothing() {
     open(&mut plane, 1, 1, false);
     assert_eq!(runs(&add(&mut plane, 1, vec![keyed(1, &[], 1, 7)])), [1]);
     close(&mut plane, 1);
-    db.lock().unwrap().insert(key(7), Outcome::Built);
+    db.lock().insert(key(7), Outcome::Built);
     assert_eq!(finished(&built(&mut plane, 1)), [(1, true)]);
     open(&mut plane, 2, 1, false);
     let out = add(&mut plane, 2, vec![keyed(2, &[], 1, 7), work(3, &[2], 1)]);
@@ -294,7 +295,7 @@ fn a_key_the_database_has_runs_nothing() {
     assert_eq!(plane.state(NodeId(2)), Some(&NodeState::Cached { remote: false }));
     assert_eq!(plane.counts().remembered, 1);
     // A failure the database keeps fails the node, and what waits for it is skipped.
-    db.lock().unwrap().insert(key(8), Outcome::Failed { why: "it failed before".to_owned() });
+    db.lock().insert(key(8), Outcome::Failed { why: "it failed before".to_owned() });
     open(&mut plane, 3, 1, true);
     let out = add(&mut plane, 3, vec![keyed(4, &[], 1, 8), work(5, &[4], 1)]);
     assert!(runs(&out).is_empty());
@@ -307,7 +308,7 @@ fn a_key_the_database_has_runs_nothing() {
         ]
     );
     // Gone from the database, the key runs again.
-    db.lock().unwrap().remove(&key(7));
+    db.lock().remove(&key(7));
     open(&mut plane, 4, 1, false);
     assert_eq!(runs(&add(&mut plane, 4, vec![keyed(6, &[], 1, 7)])), [6]);
 }
@@ -356,7 +357,7 @@ fn a_request_says_what_it_ran_and_its_measured_critical_path() {
     assert!(runs(&out).is_empty());
     close(&mut plane, 2);
     close(&mut plane, 3);
-    db.lock().unwrap().insert(key(7), Outcome::Built);
+    db.lock().insert(key(7), Outcome::Built);
     // Request 3 has started nothing yet, so its turn comes first.
     assert_eq!(runs(&at(&mut plane, done_at(4, 30))), [7, 5]);
     assert_eq!(finished(&at(&mut plane, done_at(7, 33))), [(3, true)]);
@@ -963,26 +964,26 @@ struct Planned {
 struct Model {
     seed: u64,
     budget: Option<u64>,
-    specs: FxHashMap<u32, Spec>,
-    request_of: FxHashMap<u32, u32>,
-    nodes_of: FxHashMap<u32, Vec<u32>>,
-    dependents: FxHashMap<u32, Vec<u32>>,
-    states: FxHashMap<u32, NodeState>,
+    specs: HashMap<u32, Spec>,
+    request_of: HashMap<u32, u32>,
+    nodes_of: HashMap<u32, Vec<u32>>,
+    dependents: HashMap<u32, Vec<u32>>,
+    states: HashMap<u32, NodeState>,
     /// The tasks running, by the node they run as.
     running: Vec<u32>,
-    running_keys: FxHashSet<Key>,
+    running_keys: HashSet<Key>,
     granted: u64,
     /// What the database has: keys whose task ended well, some that failed, less those
     /// dropped since.
     db: Db,
-    finished: FxHashMap<u32, bool>,
-    cancelled: FxHashSet<u32>,
+    finished: HashMap<u32, bool>,
+    cancelled: HashSet<u32>,
     /// The requests idle now.
-    idle: FxHashSet<u32>,
+    idle: HashSet<u32>,
     /// The running tasks asked to give way, by the node they run as.
-    yielding: FxHashSet<u32>,
+    yielding: HashSet<u32>,
     /// How many `Run`s each request was said, less those that gave way.
-    ran: FxHashMap<u32, u64>,
+    ran: HashMap<u32, u64>,
     outputs: Vec<PlaneOutput>,
 }
 
@@ -999,7 +1000,7 @@ impl Model {
     }
 
     /// The longest path of expected cost from `id` to the end of its request.
-    fn priority(&self, id: u32, memo: &mut FxHashMap<u32, u64>) -> u64 {
+    fn priority(&self, id: u32, memo: &mut HashMap<u32, u64>) -> u64 {
         if let Some(&it) = memo.get(&id) {
             return it;
         }
@@ -1093,7 +1094,7 @@ impl Model {
                     assert_eq!(self.states[&id.0], NodeState::Running, "seed {seed}: #{id}");
                     // Critical exactly when nothing ready or running of its request has a
                     // longer path to go, counted from the whole graph.
-                    let mut memo = FxHashMap::default();
+                    let mut memo = HashMap::default();
                     let mine = self.priority(id.0, &mut memo);
                     let most = self.nodes_of[&self.request_of[&id.0]]
                         .iter()
@@ -1110,7 +1111,7 @@ impl Model {
                     if let Some(key) = spec.key {
                         assert!(self.running_keys.insert(key), "seed {seed}: {key:?} runs twice");
                         assert!(
-                            !self.db.lock().unwrap().contains_key(&key),
+                            !self.db.lock().contains_key(&key),
                             "seed {seed}: #{id} runs a key the database has"
                         );
                     }
@@ -1130,7 +1131,7 @@ impl Model {
                         }
                     }
                     if plane.config().budget.is_none() {
-                        let mut memo = FxHashMap::default();
+                        let mut memo = HashMap::default();
                         let request = self.request_of[&id.0];
                         let mine = self.priority(id.0, &mut memo);
                         for other in &self.nodes_of[&request] {
@@ -1292,10 +1293,10 @@ impl Driver {
                 self.plane.cancel_into(*at_ns, *request, &mut self.buffer).unwrap()
             }
             Act::Release(request) => self.plane.release(*request).unwrap(),
-            Act::Put(key, outcome) => _ = self.db.lock().unwrap().insert(*key, outcome.clone()),
-            Act::Drop(key) => _ = self.db.lock().unwrap().remove(key),
+            Act::Put(key, outcome) => _ = self.db.lock().insert(*key, outcome.clone()),
+            Act::Drop(key) => _ = self.db.lock().remove(key),
         }
-        let outputs: Vec<PlaneOutput> = self.buffer.drain(..).collect();
+        let outputs: Vec<PlaneOutput> = std::mem::take(&mut self.buffer);
         let seen = Seen::of(&self.plane, self.requests, nodes);
         self.acts.push((act, outputs.clone(), seen));
         outputs
@@ -1343,7 +1344,7 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
     let by_key: Vec<(u64, Pool)> = (0..keys)
         .map(|_| (memory(&mut random), if random.one_in(3) { Pool::Io } else { Pool::Work }))
         .collect();
-    let mut model = Model { seed, budget, db: db.clone(), ..Model::default() };
+    let mut model = Model { seed, budget, db: Arc::clone(&db), ..Model::default() };
     let mut planned: Vec<Planned> = (0..1 + random.below(5))
         .map(|_| Planned {
             weight: 1 + random.below(4) as u32,
@@ -1413,9 +1414,9 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
             let budget = budget.unwrap_or(0);
             let bytes = if random.one_in(10) { random.below(budget * 2) } else { random.below(budget / 3) };
             driver.act(Act::Step(PlaneInput::Held { at_ns: at, bytes }), next_id)
-        } else if roll < 10 && !model.db.lock().unwrap().is_empty() {
+        } else if roll < 10 && !model.db.lock().is_empty() {
             let dropped = {
-                let db = model.db.lock().unwrap();
+                let db = model.db.lock();
                 let mut kept: Vec<Key> = db.keys().copied().collect();
                 kept.sort_unstable();
                 kept[random.below(kept.len() as u64) as usize]
@@ -1590,7 +1591,7 @@ fn releasing_requests_changes_no_output() {
 /// same to each act and of itself after it.
 fn replay(seed: u64, simulated: &Simulated) {
     let db = Db::default();
-    let mut model = reference::Plane::with_memo(simulated.config.clone(), DbMemo(db.clone())).unwrap();
+    let mut model = reference::Plane::with_memo(simulated.config.clone(), DbMemo(Arc::clone(&db))).unwrap();
     assert_eq!(model.config(), &simulated.config);
     let requests = simulated.acts.first().map_or(0, |(_, _, seen)| seen.stats.len() as u32);
     for (at, (act, said, seen)) in simulated.acts.iter().enumerate() {
@@ -1602,11 +1603,11 @@ fn replay(seed: u64, simulated: &Simulated) {
                 Vec::new()
             }
             Act::Put(key, outcome) => {
-                db.lock().unwrap().insert(*key, outcome.clone());
+                db.lock().insert(*key, outcome.clone());
                 Vec::new()
             }
             Act::Drop(key) => {
-                db.lock().unwrap().remove(key);
+                db.lock().remove(key);
                 Vec::new()
             }
         };
@@ -1774,7 +1775,7 @@ fn a_long_lived_plane_says_to_each_request_what_a_fresh_one_says() {
         let mut both = |input: PlaneInput, fresh: &mut Plane| {
             let want = fresh.step(input.clone()).unwrap();
             long.step_into(input, &mut buffer).unwrap();
-            let got: Vec<PlaneOutput> = buffer.drain(..).collect();
+            let got: Vec<PlaneOutput> = std::mem::take(&mut buffer);
             // A request's id and its nodes' ids are the same each round; only the plane's
             // order of adding and its clock move on, and the clock never goes back, so the
             // fresh plane is given the same times.

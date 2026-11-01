@@ -17,17 +17,17 @@
 use std::sync::Arc;
 
 use blaze_graph::par;
+use blaze_hash::HashSet;
 use blaze_ids::radix;
 use blaze_mem::align::align_up_u64;
-use rustc_hash::FxHashSet;
 
 use crate::arena::{FrameVec, collect_in};
-use crate::{DevRun, Format, LinkError, Refusal};
 use crate::cow::{CowBytes, IdSet};
 use crate::model::{Apply, Class, Counts, Prot, Region, Reserve, Sym, Writer, reserved};
 use crate::stage::{Stage, error, function_of, refused};
 use crate::state::{ClassId, PieceId, PieceRef, Sort, Space, State, What, zeroed};
 use crate::symbols::{SymKey, Symbols};
+use crate::{DevRun, Format, LinkError, Refusal};
 
 /// The patch regions' least room: what an edit session's new code and data may take.
 const PATCH: u64 = 64 << 20;
@@ -351,7 +351,7 @@ impl<'a> Stage<'a> {
     /// What the image exports: the name, the symbol it is, and whether it is data whatever
     /// it is defined in (`/EXPORT:name=symbol,DATA`).
     pub fn exports(&self) -> FrameVec<'a, (&str, &str, bool)> {
-        let mut seen: FxHashSet<&str> = FxHashSet::default();
+        let mut seen: HashSet<&str> = HashSet::default();
         let mut out: FrameVec<'a, (&str, &str, bool)> = Vec::new_in(self.arena);
         if let crate::OutputKind::Shared { exports, .. } = &self.output.kind {
             out.reserve(exports.len());

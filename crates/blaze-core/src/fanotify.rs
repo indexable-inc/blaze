@@ -31,8 +31,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use blaze_hash::HashMap;
 use blaze_mem::{RegionVec, Tag as MemTag};
-use rustc_hash::FxHashMap;
 
 use crate::{
     Done, FileName,
@@ -122,7 +122,7 @@ const SEEN: usize = 1 << 16;
 /// each lookup hashes the key once and compares the bytes of the entries of its hash.
 struct Dirs<V> {
     /// The first entry of each hash.
-    heads: FxHashMap<u64, u32>,
+    heads: HashMap<u64, u32>,
     entries: RegionVec<Entry<V>>,
     /// The first entry let go, the rest through their `next`.
     free: u32,
@@ -141,7 +141,7 @@ struct Entry<V> {
 const NONE: u32 = u32::MAX;
 
 fn hash(key: &[u8]) -> u64 {
-    let mut hasher = rustc_hash::FxHasher::default();
+    let mut hasher = blaze_hash::FixedHasher::default();
     hasher.write(key);
     hasher.finish()
 }
@@ -152,7 +152,7 @@ impl<V: Copy> Dirs<V> {
     fn new(heads: usize) -> io::Result<Dirs<V>> {
         Ok(Dirs {
             // alloc: setup, once per room, reused by every watch after.
-            heads: FxHashMap::with_capacity_and_hasher(heads, Default::default()),
+            heads: HashMap::with_capacity_and_hasher(heads, Default::default()),
             entries: RegionVec::new(DIRS, MemTag::Io).map_err(io::Error::other)?,
             free: NONE,
             len: 0,
@@ -889,7 +889,7 @@ mod tests {
         for seed in 0..32 {
             let mut rng = crate::sim::Rng::new(seed);
             let mut ours: Dirs<u64> = Dirs::new(64).unwrap();
-            let mut theirs: FxHashMap<Vec<u8>, (u64, String)> = FxHashMap::default();
+            let mut theirs: HashMap<Vec<u8>, (u64, String)> = HashMap::default();
             for step in 0..4_000u64 {
                 let handle = [rng.below(8) as u8, rng.below(8) as u8];
                 let key = Key::of(&[seed as u8; 8], 1, &handle[..1 + rng.below(2) as usize]);

@@ -17,13 +17,13 @@ use std::{
     },
 };
 
+use blaze_hash::{FixedState, HashMap};
 use cranelift_codegen::binemit::Reloc;
 use hir_def::hir::{AsmOptions, AsmPiece, InlineAsmRegOrRegClass};
 use object::{
     Architecture, BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationFlags,
     RelocationTarget, elf, macho, pe,
 };
-use rustc_hash::{FxBuildHasher, FxHashMap};
 use smallvec::SmallVec;
 
 use super::{
@@ -1136,7 +1136,7 @@ struct Kept {
 
 /// Keeps `inline` as the block the wrapper of `text` is.
 pub(super) fn keep_inline(text: &str, inline: Option<Inline>) {
-    let hash = FxBuildHasher.hash_one(text);
+    let hash = FixedState.hash_one(text);
     let inline = inline.map(Arc::new);
     let (_, found) = match INLINE.get(hash, text) {
         Some(found) => found,
@@ -1155,7 +1155,7 @@ pub(super) fn keep_inline(text: &str, inline: Option<Inline>) {
 /// The block the wrapper of `text` is, as LLVM's inline assembly, read with no write another
 /// core sees.
 pub(super) fn inline_block(text: &str) -> Option<&'static Inline> {
-    let (_, kept) = INLINE.get(FxBuildHasher.hash_one(text), text)?;
+    let (_, kept) = INLINE.get(FixedState.hash_one(text), text)?;
     match kept.other.load(Ordering::Acquire) {
         true => None,
         false => kept.inline.as_deref(),
@@ -1493,12 +1493,12 @@ impl Named {
 
 /// The machine code of the function that `text` defines. Each text is assembled once: the
 /// process keeps the code for as long as it runs. A thread that asked for a text before has it from its own table, with no
-/// write another core sees and no hash of the text but `FxHash`; one that has not looks in
+/// write another core sees and no hash of the text but `blaze_hash`'s; one that has not looks in
 /// the shared [`Table`] by its BLAKE3 hash, with loads alone.
 pub(super) fn assemble(triple: &str, text: &str) -> Result<&'static Assembled, String> {
     thread_local! {
         /// What this thread had assembled for the triple it names, by text.
-        static SEEN: RefCell<(String, FxHashMap<Box<str>, &'static Assembled>)> =
+        static SEEN: RefCell<(String, HashMap<Box<str>, &'static Assembled>)> =
             RefCell::default();
     }
     let seen = SEEN.with_borrow(|(of, seen)| match of == triple {
@@ -1832,7 +1832,7 @@ mod tests {
     /// first entry of each key says: the safe model of it.
     #[test]
     fn a_table_keeps_one_entry_a_key_whoever_adds_it() {
-        use super::{BuildHasher, FIRST, FxBuildHasher, FxHashMap, Table};
+        use super::{BuildHasher, FIRST, FixedState, HashMap, Table};
         let table: Table<u64, u64> = Table::new();
         let keys = 4 * FIRST as u64;
         let given = std::thread::scope(|scope| {
@@ -1842,7 +1842,7 @@ mod tests {
                     (0..keys)
                         .map(|key| {
                             let key = (key * 7 + thread * 13) % keys;
-                            let hash = FxBuildHasher.hash_one(key);
+                            let hash = FixedState.hash_one(key);
                             (key, table.insert(hash, key, thread).expect("room").1)
                         })
                         .collect::<Vec<_>>()
@@ -1851,13 +1851,13 @@ mod tests {
             let threads = threads.collect::<Vec<_>>();
             threads.into_iter().map(|it| it.join().unwrap()).collect::<Vec<_>>()
         });
-        let mut model = FxHashMap::default();
+        let mut model = HashMap::default();
         for (key, value) in given.into_iter().flatten() {
             assert_eq!(*model.entry(key).or_insert(value), value, "key {key}");
         }
         assert_eq!(model.len() as u64, keys);
         for key in 0..2 * keys {
-            let found = table.get(FxBuildHasher.hash_one(key), &key).map(|it| it.1);
+            let found = table.get(FixedState.hash_one(key), &key).map(|it| it.1);
             assert_eq!(found, model.get(&key).copied(), "key {key}");
         }
     }

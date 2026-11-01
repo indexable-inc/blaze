@@ -3,8 +3,8 @@
 //! such blocks, is not unwound to. The call, drop or assert just goes on unwinding, and the
 //! storage states of its scopes are never seen by the coroutine transform there.
 
+use blaze_hash::HashSet;
 use blaze_mem::{Frame, Tag, frame};
-use rustc_hash::FxHashSet;
 
 use crate::mir::{
     BasicBlockId, MirBody, StatementKind, TerminatorKind,
@@ -13,11 +13,11 @@ use crate::mir::{
 
 /// The cleanup blocks of `body` that do nothing but go on unwinding: only storage markers,
 /// fake reads and nops, ending in resuming the unwind or going to such a block.
-pub fn noop_landing_pads(body: &MirBody<'_>) -> FxHashSet<BasicBlockId> {
+pub fn noop_landing_pads(body: &MirBody<'_>) -> HashSet<BasicBlockId> {
     frame::task(Tag::Mir, |frame| {
         let noop = noop_in(body, frame);
         // alloc: codegen's set, kept for the function it builds
-        let mut set = FxHashSet::with_capacity_and_hasher(noop.count(), Default::default());
+        let mut set = HashSet::with_capacity_and_hasher(noop.count(), Default::default());
         set.extend(noop.iter().map(block_id));
         set
     })

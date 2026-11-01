@@ -22,6 +22,7 @@ mod tests;
 use std::ops::Range;
 
 use base_db::{Crate, Db};
+use blaze_hash::{HashMap, HashSet};
 use either::Either;
 use hir_def::{
     CallableDefId, FunctionId, HasModule, ItemContainerId, Lookup, attrs::AttrFlags,
@@ -29,10 +30,8 @@ use hir_def::{
 };
 use intern::Symbol;
 use rustc_abi::ExternAbi;
-use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
-    ClosureKind, FloatTy, TypeFlags, TypeFoldable, TypeFolder, TypeSuperFoldable,
-    TypeVisitableExt,
+    ClosureKind, FloatTy, TypeFlags, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt,
     inherent::{GenericArgs as _, IntoKind, Ty as _},
 };
 use smallvec::SmallVec;
@@ -135,14 +134,14 @@ impl Attrs {
 fn target_features<'db>(
     db: &'db Db,
     body: InlinedBody<'db>,
-) -> &'db FxHashSet<Symbol> {
+) -> &'db HashSet<Symbol> {
     let func = match body {
         InlinedBody::Fn(func) => Some(func),
         InlinedBody::Closure(_) => owner_of(db, body).as_function(),
     };
     match func {
         Some(func) => AttrFlags::target_features(db, func),
-        None => const { &FxHashSet::with_hasher(rustc_hash::FxBuildHasher) },
+        None => const { &HashSet::with_hasher(blaze_hash::FixedState) },
     }
 }
 
@@ -197,7 +196,7 @@ pub(super) fn inline<'db>(
         changed: false,
         caller_is_inline_forwarder: caller_attrs.hinted() && body_is_forwarder(body),
         callgraph: None,
-        listed: FxHashMap::default(),
+        listed: HashMap::default(),
     };
     inliner.run(body);
     inliner.changed
@@ -209,7 +208,7 @@ struct Inliner<'a, 'f, 'db> {
     db: &'db Db,
     caller: InlinedBody<'db>,
     caller_attrs: Attrs,
-    caller_features: &'db FxHashSet<Symbol>,
+    caller_features: &'db HashSet<Symbol>,
     options: MirOptions,
     session: cost::Session,
     env: ParamEnvAndCrate<'db>,
@@ -224,7 +223,7 @@ struct Inliner<'a, 'f, 'db> {
     /// [`cycle::callgraph_cyclic`] of the caller, once a callee of its crate asks.
     callgraph: Option<Option<&'db cycle::Callgraph<'db>>>,
     /// Where each instance is in the caller's [`Inlined::callees`](crate::mir::Inlined::callees).
-    listed: FxHashMap<(InlinedBody<'db>, GenericArgs<'db>), u32>,
+    listed: HashMap<(InlinedBody<'db>, GenericArgs<'db>), u32>,
 }
 
 /// A call that resolves to a body.

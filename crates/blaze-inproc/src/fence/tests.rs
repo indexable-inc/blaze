@@ -1,11 +1,12 @@
 //! The fence's real code: its rules one by one over plain words, and a stress test of threads
 //! calling through a slot the daemon keeps moving while it poisons what the fence frees.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use blaze_ids::rng::SplitMix64;
+use parking_lot::Mutex;
 
 use super::*;
 
@@ -187,9 +188,9 @@ fn a_waiter_for_an_announcement_wakes_at_it_or_at_its_timeout() {
     let started = Instant::now();
     assert_eq!(Thread::wait_announced(fences.words(), 2, Duration::from_secs(60)), 3, "not what was seen: at once");
     assert_eq!(Thread::wait_announced(fences.words(), 3, Duration::from_millis(20)), 3, "nothing announced");
-    let announcer = fences.clone();
+    let announcer = Arc::clone(&fences);
     let announcing = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(50));
+        blaze_spin::busy(Duration::from_millis(50));
         announcer.announce(4);
     });
     let mut now = 3;
@@ -213,7 +214,7 @@ fn processes_are_counted_apart() {
 
 /// The control words, shared by the stress test's threads.
 #[derive(Clone)]
-struct Shared(Arc<Vec<AtomicU64>>);
+struct Shared(Arc<[AtomicU64]>);
 
 impl Words for Shared {
     fn words(&self) -> usize {
@@ -315,7 +316,7 @@ fn threads_never_run_freed_code() {
     /// Calls that must land while ranges move: fewer than the lanes make in all.
     const OVERLAP: u64 = 1000;
     let world = Arc::new(World {
-        control: Shared(Arc::new(words())),
+        control: Shared(Arc::from(words())),
         code: (0..RANGES).map(|_| AtomicU64::new(POISON)).collect(),
         slot: AtomicU64::new(0),
         listed: Mutex::new(Vec::new()),
@@ -327,7 +328,7 @@ fn threads_never_run_freed_code() {
 
     let lanes: Vec<_> = (0..LANES)
         .map(|lane| {
-            let world = world.clone();
+            let world = Arc::clone(&world);
             std::thread::spawn(move || {
                 let tid = lane + 1;
                 for generation in 0..GENERATIONS {
@@ -335,12 +336,12 @@ fn threads_never_run_freed_code() {
                         break;
                     }
                     // The OS lists a thread from before it runs to after it ended.
-                    world.listed.lock().unwrap().push(tid);
-                    let inner = world.clone();
+                    world.listed.lock().push(tid);
+                    let inner = Arc::clone(&world);
                     let abrupt = generation % 3 == 2;
                     let seed = lane * 31 + generation + 1;
                     std::thread::spawn(move || worker(&inner, tid, seed, abrupt)).join().unwrap();
-                    world.listed.lock().unwrap().retain(|it| *it != tid);
+                    world.listed.lock().retain(|it| *it != tid);
                 }
             })
         })
@@ -356,7 +357,7 @@ fn threads_never_run_freed_code() {
     let collect = |fences: &mut Fences<Shared>, limbo: &mut Vec<(Grace, u32, usize)>, free: &mut Vec<usize>, listed: &mut Vec<u64>| {
         let births = fences.births();
         listed.clear();
-        listed.extend_from_slice(&world.listed.lock().unwrap());
+        listed.extend_from_slice(&world.listed.lock());
         let Some(oldest) = fences.oldest(births, &[(PID, listed.as_slice())]) else { return 0 };
         let mut count = 0;
         limbo.retain(|&(grace, entry, range)| {

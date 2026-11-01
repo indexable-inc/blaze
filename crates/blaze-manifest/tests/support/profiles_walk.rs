@@ -7,17 +7,17 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, anyhow, bail};
+use blaze_hash::HashMap;
 use blaze_manifest::config::CompileKind;
 use blaze_manifest::diagnostic::report;
-use blaze_manifest::metadata::root_manifest;
+use blaze_manifest::files::Disk;
 use blaze_manifest::manifest::PackageId as Pkg;
+use blaze_manifest::metadata::root_manifest;
 use blaze_manifest::profiles::{Profile, Profiles, UnitFor, requested_profile};
 use blaze_manifest::source::{self, SourceId};
-use blaze_manifest::files::Disk;
 use blaze_manifest::{Config, Context, Workspace};
 use cargo_util_schemas::core::PackageIdSpec;
 use cargo_util_schemas::lockfile::TomlLockfile;
-use rustc_hash::FxHashMap;
 use serde_json::Value;
 
 /// What the profiles of `cargo <args> --unit-graph` were made from.
@@ -287,7 +287,7 @@ fn profiles_of(
     if let Some(locked) = &locked {
         packages.extend(locked.iter());
     } else {
-        let mut seen = rustc_hash::FxHashSet::default();
+        let mut seen = blaze_hash::HashSet::default();
         for (unit, value) in parsed.iter().zip(units) {
             if seen.insert(value["pkg_id"].as_str()) {
                 packages.push(&unit.pkg);
@@ -300,7 +300,7 @@ fn profiles_of(
         let _ = writeln!(stderr, "warning: {warning}");
     }
     let mut walk =
-        Walk { units: &parsed, profiles, interned: Vec::new(), by_unit: FxHashMap::default() };
+        Walk { units: &parsed, profiles, interned: Vec::new(), by_unit: HashMap::default() };
     let roots = graph["roots"].as_array().ok_or_else(|| anyhow!("no `roots` in the unit graph"))?;
     let is_test_command = matches!(command.name.as_str(), "test" | "bench");
     let requested = match &command.target {
@@ -366,7 +366,7 @@ struct Walk<'a> {
     units: &'a [Unit],
     profiles: &'a Profiles,
     interned: Vec<Interned>,
-    by_unit: FxHashMap<usize, Vec<usize>>,
+    by_unit: HashMap<usize, Vec<usize>>,
 }
 
 impl Walk<'_> {

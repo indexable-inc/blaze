@@ -7,8 +7,8 @@
 
 use base_db::Crate;
 use blaze_dbsp::{Closure, Pos, ReadIndex};
+use blaze_hash::{HashMap, HashSet};
 use hir_expand::name::Name;
-use rustc_hash::{FxHashMap, FxHashSet};
 use span::FileId;
 use syntax::ast;
 use triomphe::Arc;
@@ -36,7 +36,7 @@ pub(super) type Key = (ModuleId, Option<Name>);
 /// Every crate's state, by crate. A crate served by the frozen image has none.
 #[derive(Default)]
 pub(in crate::nameres) struct State {
-    pub(super) crates: FxHashMap<Crate, CrateState>,
+    pub(super) crates: HashMap<Crate, CrateState>,
     pub(super) pass: Pass,
 }
 
@@ -66,22 +66,22 @@ pub(super) struct CrateState {
     /// The groups by round-0 module, in round-0 DFS order (the old map's insertion order).
     pub(super) groups: FxIndexMap<ModuleId, Group>,
     /// Every module of the crate and the group it is in.
-    pub(super) group_of: FxHashMap<ModuleId, ModuleId>,
+    pub(super) group_of: HashMap<ModuleId, ModuleId>,
     /// Every module as the next run reads it: a published scope (`ScopeSlot::Input`), or for a
     /// proc-macro crate's root the scope before the censor (`ScopeSlot::Building`), which the
     /// crate's own paths read. In no order: a run takes out and puts back its region's rows
     /// alone, and the published map is in group order ([`CrateState::ordered_rows`]).
     pub(super) rows: ModulesMap,
-    pub(super) inputs: FxHashMap<ModuleId, ScopeInput>,
+    pub(super) inputs: HashMap<ModuleId, ScopeInput>,
     /// Who read what: `(module, name)` (or the module whole) to the groups whose run read it,
     /// negative reads included; and each module to the groups that read anything of it.
     pub(super) reads: ReadIndex<Key, ModuleId>,
     pub(super) module_readers: ReadIndex<ModuleId, ModuleId>,
     /// The groups each file defines a round-0 module of.
-    pub(super) files: FxHashMap<FileId, Vec<ModuleId>>,
+    pub(super) files: HashMap<FileId, Vec<ModuleId>>,
     /// The groups whose round-0 log reads each file that defines none of their modules
     /// (`Group::other_files`).
-    pub(super) other_files: FxHashMap<FileId, Vec<ModuleId>>,
+    pub(super) other_files: HashMap<FileId, Vec<ModuleId>>,
     /// The crate env after the root's last run, which a run without the root starts from.
     pub(super) env: CrateEnv,
     /// The std prelude every path reads: the env's, or a `#[prelude_import]`'s, with the group
@@ -91,11 +91,11 @@ pub(super) struct CrateState {
     pub(super) resolution: Option<CrateResolution>,
     /// The position of each impl and builtin derive impl as `LastWrite` last handed it over:
     /// what a delete names.
-    pub(super) impl_pos: FxHashMap<ImplId, Pos>,
-    pub(super) derive_pos: FxHashMap<BuiltinDeriveImplId, Pos>,
+    pub(super) impl_pos: HashMap<ImplId, Pos>,
+    pub(super) derive_pos: HashMap<BuiltinDeriveImplId, Pos>,
     /// The position of each group (`diff::update_positions`), as of the last change of the
     /// round-0 tree.
-    pub(super) group_pos: FxHashMap<ModuleId, Pos>,
+    pub(super) group_pos: HashMap<ModuleId, Pos>,
     /// The crate data with every group's exported derives and proc macro functions, and whether
     /// a group asked for session macros: made again only when a group's crate-level ops change,
     /// or the root's crate attributes, [`Self::data_of`].
@@ -106,7 +106,7 @@ pub(super) struct CrateState {
     /// A fingerprint of each globbed enum's variants (names, ids and shapes) as its glob
     /// readers last woke on: a write touching the enum wakes them only when it differs. An enum
     /// with no reader has none, and the first touch after a reader comes wakes it.
-    pub(super) variants_seen: FxHashMap<EnumId, u64>,
+    pub(super) variants_seen: HashMap<EnumId, u64>,
 }
 
 impl CrateState {
@@ -125,21 +125,21 @@ impl CrateState {
         CrateState {
             root,
             groups: FxIndexMap::default(),
-            group_of: FxHashMap::default(),
+            group_of: HashMap::default(),
             rows: ModulesMap::new(),
-            inputs: FxHashMap::default(),
+            inputs: HashMap::default(),
             reads: ReadIndex::new(),
             module_readers: ReadIndex::new(),
-            files: FxHashMap::default(),
-            other_files: FxHashMap::default(),
+            files: HashMap::default(),
+            other_files: HashMap::default(),
             env: CrateEnv::default(),
             prelude: None,
             prelude_holder: None,
             resolution: None,
-            impl_pos: FxHashMap::default(),
-            derive_pos: FxHashMap::default(),
-            group_pos: FxHashMap::default(),
-            variants_seen: FxHashMap::default(),
+            impl_pos: HashMap::default(),
+            derive_pos: HashMap::default(),
+            group_pos: HashMap::default(),
+            variants_seen: HashMap::default(),
             data: None,
             data_of: None,
         }
@@ -212,7 +212,7 @@ pub(super) struct GroupOut {
     /// facts driver orders them.
     pub(super) diagnostics: Vec<DefDiagnostic>,
     pub(super) diagnostic_ends: [u32; 2],
-    pub(super) derive_helpers: FxHashMap<AstId<ast::Item>, Vec<DeriveHelper>>,
+    pub(super) derive_helpers: HashMap<AstId<ast::Item>, Vec<DeriveHelper>>,
     pub(super) unresolved_extern_crates: Vec<Name>,
     /// The crate-level ops it made (`ExternPrelude`, `MacroUsePrelude`, `Prelude`,
     /// `ExportedDerive`, `ProcMacroFn`, `SessionMacros`), its log's then its run's.
@@ -326,7 +326,7 @@ pub(super) fn over_delete(
     state: &CrateState,
     scratch: &mut Scratch,
     seeds: &[ModuleId],
-    into: &mut FxHashSet<ModuleId>,
+    into: &mut HashSet<ModuleId>,
 ) {
     if seeds.is_empty() {
         return;

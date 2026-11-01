@@ -39,7 +39,7 @@ use hir_expand::{
 use intern::Symbol;
 use la_arena::{Arena, Idx, RawIdx};
 use rustc_abi::ExternAbi;
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use blaze_query::db::{AsId, FromId};
 use smallvec::SmallVec;
 use span::Edition;
@@ -732,7 +732,7 @@ impl TypeSide {
 struct FieldNames {
     text: String,
     /// Each name's start in `text` and its length.
-    by_symbol: FxHashMap<Symbol, (u32, u32)>,
+    by_symbol: HashMap<Symbol, (u32, u32)>,
 }
 
 impl FieldNames {
@@ -2478,7 +2478,7 @@ pub(crate) fn assert_store_round_trip(
 #[cfg(test)]
 mod tests {
     use blaze_format::Aligned;
-    use rustc_hash::FxHashSet;
+    use blaze_hash::HashSet;
     use hir_expand::fixture;
 
     use super::*;
@@ -2724,7 +2724,7 @@ fn every_kind(x: u32, (y, _): (u32, u32)) -> u32 {
         let buffer = Aligned::copy_from(&blaze_format::to_bytes(&*body));
         let read = Body::read(&buffer).expect("a body just written");
         let store = read.store();
-        let kinds: FxHashSet<ExprKind> =
+        let kinds: HashSet<ExprKind> =
             (0..store.exprs_len() as u32).filter_map(|id| store.expr_kind(idx(id))).collect();
         for kind in [
             ExprKind::Path,
@@ -2757,7 +2757,7 @@ fn every_kind(x: u32, (y, _): (u32, u32)) -> u32 {
         ] {
             assert!(kinds.contains(&kind), "no {kind:?} in the body");
         }
-        let pats: FxHashSet<PatKind> =
+        let pats: HashSet<PatKind> =
             (0..store.pats_len() as u32).filter_map(|id| store.pat_kind(idx(id))).collect();
         for kind in [
             PatKind::Wild,

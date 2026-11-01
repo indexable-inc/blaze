@@ -113,3 +113,21 @@ fn a_read_of_any_most_reserves_at_most_recv_most() {
     assert_eq!(into, b"x");
     assert!(into.capacity() <= 1 + crate::RECV_MOST, "{}", into.capacity());
 }
+
+/// A listener dropped after the next one took its name (a daemon slow to end after it hung up,
+/// as the next one started) leaves the next one's socket: only the file it made is removed.
+#[test]
+fn a_listener_dropped_after_another_took_its_name_leaves_that_ones_socket() {
+    let root = root("taken");
+    let at = Address::Unix(FileName::new("blaze.sock").unwrap());
+    let socket = root.join("blaze.sock");
+    let old = listen(&root, &at).unwrap();
+    // The next daemon's start unlinks the name it finds no one answering on, then binds.
+    std::fs::remove_file(&socket).unwrap();
+    let new = listen(&root, &at).unwrap();
+    drop(old);
+    assert!(socket.exists(), "the old listener removed the new one's socket");
+    UnixStream::connect(&socket).expect("the new listener is reached at the name");
+    drop(new);
+    assert!(!socket.exists(), "a listener removes the socket it made");
+}

@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use annotate_snippets::{Level, Renderer};
 use anyhow::{Context as _, anyhow, bail};
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::radix;
-use rustc_hash::{FxHashMap, FxHashSet};
 use url::Url;
 
 use crate::files::{Disk, Files};
@@ -65,7 +65,7 @@ pub enum ConfigValue {
     Integer(i64, Definition),
     String(String, Definition),
     List(Vec<ConfigValue>, Definition),
-    Table(FxHashMap<String, ConfigValue>, Definition),
+    Table(HashMap<String, ConfigValue>, Definition),
     Boolean(bool, Definition),
 }
 
@@ -199,7 +199,7 @@ impl ConfigValue {
                             let new_def = value.definition().clone();
                             // cargo 1.99 pushes and never pops, so the path a list is checked
                             // against `NON_MERGEABLE_LISTS` with holds every key merged before
-                            // it, in the iteration order of `FxHashMap`.
+                            // it, in the iteration order of `HashMap`.
                             parts.push(key.clone());
                             let result = entry.merge_helper(value, force, parts);
                             result.with_context(|| {
@@ -259,10 +259,10 @@ pub struct Config<F: Files> {
     cli: Vec<String>,
     /// The files are read at the first value asked for, and again at the next while they fail:
     /// a broken config file is an error only to what reads configuration, as in cargo.
-    values: OnceCell<FxHashMap<String, ConfigValue>>,
+    values: OnceCell<HashMap<String, ConfigValue>>,
     /// `$CARGO_HOME/credentials.toml`, once [`Config::load_credentials`] read it: kept apart
     /// from the files' values, as cargo keeps it, for [`Config::credentials_token`] only.
-    credentials: OnceCell<FxHashMap<String, ConfigValue>>,
+    credentials: OnceCell<HashMap<String, ConfigValue>>,
     build_config: OnceCell<CargoBuildConfig>,
     target_cfgs: OnceCell<Vec<(String, target::TargetCfgConfig)>>,
     unstable: CliUnstable,
@@ -430,7 +430,7 @@ impl<F: Files> Config<F> {
         }
     }
 
-    fn values(&self) -> anyhow::Result<&FxHashMap<String, ConfigValue>> {
+    fn values(&self) -> anyhow::Result<&HashMap<String, ConfigValue>> {
         if let Some(values) = self.values.get() {
             return Ok(values);
         }
@@ -465,10 +465,10 @@ impl<F: Files> Config<F> {
         self.env.get(key).map(String::as_str)
     }
 
-    fn load_values(&self) -> anyhow::Result<FxHashMap<String, ConfigValue>> {
-        let mut cfg = CV::Table(FxHashMap::default(), Definition::BuiltIn);
+    fn load_values(&self) -> anyhow::Result<HashMap<String, ConfigValue>> {
+        let mut cfg = CV::Table(HashMap::default(), Definition::BuiltIn);
         self.walk_tree(&self.cwd, &self.home, |path| {
-            let value = self.load_file(path, &mut FxHashSet::default(), true, false)?;
+            let value = self.load_file(path, &mut HashSet::default(), true, false)?;
             cfg.merge(value, false)
                 .with_context(|| format!("failed to merge configuration at `{}`", path.display()))
         })
@@ -487,7 +487,7 @@ impl<F: Files> Config<F> {
         home: &Path,
         mut walk: impl FnMut(&Path) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
-        let mut seen_dir = FxHashSet::default();
+        let mut seen_dir = HashSet::default();
         let stop = self.env("__CARGO_TEST_ROOT").map(PathBuf::from);
         for current in paths::ancestors(pwd, stop.as_deref()) {
             let config_root = current.join(".cargo");
@@ -510,7 +510,7 @@ impl<F: Files> Config<F> {
     fn load_file(
         &self,
         path: &Path,
-        seen: &mut FxHashSet<PathBuf>,
+        seen: &mut HashSet<PathBuf>,
         includes: bool,
         cli: bool,
     ) -> anyhow::Result<ConfigValue> {
@@ -535,11 +535,11 @@ impl<F: Files> Config<F> {
     fn load_includes(
         &self,
         mut value: ConfigValue,
-        seen: &mut FxHashSet<PathBuf>,
+        seen: &mut HashSet<PathBuf>,
         cli: bool,
     ) -> anyhow::Result<ConfigValue> {
         let includes = include_paths(&mut value, true)?;
-        let mut root = CV::Table(FxHashMap::default(), value.definition().clone());
+        let mut root = CV::Table(HashMap::default(), value.definition().clone());
         for include in includes {
             let Some(abs_path) = self.include_path(&include) else { continue };
             self.load_file(&abs_path, seen, true, cli)
@@ -570,7 +570,7 @@ impl<F: Files> Config<F> {
     /// `load_values_unmerged`.
     pub fn load_values_unmerged(&self) -> anyhow::Result<Vec<ConfigValue>> {
         let mut result = Vec::new();
-        let mut seen = FxHashSet::default();
+        let mut seen = HashSet::default();
         self.walk_tree(&self.cwd, &self.home, |path| {
             let mut cv = self.load_file(path, &mut seen, false, false)?;
             self.load_unmerged_include(&mut cv, &mut seen, &mut result)?;
@@ -584,7 +584,7 @@ impl<F: Files> Config<F> {
     fn load_unmerged_include(
         &self,
         cv: &mut ConfigValue,
-        seen: &mut FxHashSet<PathBuf>,
+        seen: &mut HashSet<PathBuf>,
         output: &mut Vec<ConfigValue>,
     ) -> anyhow::Result<()> {
         for include in include_paths(cv, false)? {
@@ -621,11 +621,11 @@ impl<F: Files> Config<F> {
 
     /// The `--config` arguments merged into one table.
     pub fn cli_args_as_table(&self) -> anyhow::Result<ConfigValue> {
-        let mut loaded = CV::Table(FxHashMap::default(), Definition::Cli(None));
+        let mut loaded = CV::Table(HashMap::default(), Definition::Cli(None));
         for arg in &self.cli {
             let arg_as_path = self.cwd.join(arg);
             let table = if !arg.is_empty() && self.files.exists(&arg_as_path) {
-                self.load_file(&arg_as_path, &mut FxHashSet::default(), true, true).with_context(
+                self.load_file(&arg_as_path, &mut HashSet::default(), true, true).with_context(
                     || format!("failed to load config from `{}`", arg_as_path.display()),
                 )?
             } else {
@@ -644,7 +644,7 @@ impl<F: Files> Config<F> {
                 }
                 let value = CV::from_toml(Definition::Cli(None), toml::Value::Table(doc))
                     .with_context(|| format!("failed to convert --config argument `{arg}`"))?;
-                self.load_includes(value, &mut FxHashSet::default(), true)
+                self.load_includes(value, &mut HashSet::default(), true)
                     .context("failed to load --config include")?
             };
             loaded
@@ -689,7 +689,7 @@ impl<F: Files> Config<F> {
 
     fn get_cv_in(
         key: &ConfigKey,
-        vals: &FxHashMap<String, ConfigValue>,
+        vals: &HashMap<String, ConfigValue>,
     ) -> anyhow::Result<Option<ConfigValue>> {
         if key.is_root() {
             return Ok(Some(CV::Table(vals.clone(), Definition::Path(PathBuf::new()))));
@@ -796,7 +796,7 @@ impl<F: Files> Config<F> {
     pub(crate) fn get_table(
         &self,
         key: &ConfigKey,
-    ) -> anyhow::Result<OptValue<FxHashMap<String, ConfigValue>>> {
+    ) -> anyhow::Result<OptValue<HashMap<String, ConfigValue>>> {
         match self.get_cv(key)? {
             Some(CV::Table(val, definition)) => Ok(Some(Value { val, definition })),
             Some(val) => Err(self.expected("table", key, &val)),
@@ -990,17 +990,17 @@ impl<F: Files> Config<F> {
         self.credentials().map(|_| ())
     }
 
-    fn credentials(&self) -> anyhow::Result<&FxHashMap<String, ConfigValue>> {
+    fn credentials(&self) -> anyhow::Result<&HashMap<String, ConfigValue>> {
         if let Some(credentials) = self.credentials.get() {
             return Ok(credentials);
         }
-        let mut credentials = FxHashMap::default();
+        let mut credentials = HashMap::default();
         if let Some(path) = self.get_file_path(&self.home, "credentials") {
-            let value = self.load_file(&path, &mut FxHashSet::default(), true, false)?;
+            let value = self.load_file(&path, &mut HashSet::default(), true, false)?;
             let CV::Table(mut map, def) = value else { unreachable!() };
             if let Some(token) = map.remove("token") {
                 map.entry("registry".to_owned()).or_insert_with(|| {
-                    CV::Table(FxHashMap::from_iter([("token".to_owned(), token)]), def)
+                    CV::Table(HashMap::from_iter([("token".to_owned(), token)]), def)
                 });
             }
             credentials = map;
@@ -1069,7 +1069,7 @@ impl Config<Disk> {
             Some(token) => {
                 let def = Definition::Path(path.clone());
                 let table = CV::Table(
-                    FxHashMap::from_iter([(
+                    HashMap::from_iter([(
                         "token".to_owned(),
                         CV::String(token.to_owned(), def.clone()),
                     )]),
@@ -1078,10 +1078,7 @@ impl Config<Disk> {
                 let (key, mut value) = match registry {
                     Some(registry) => (
                         "registries",
-                        CV::Table(
-                            FxHashMap::from_iter([(registry.to_owned(), table)]),
-                            def.clone(),
-                        ),
+                        CV::Table(HashMap::from_iter([(registry.to_owned(), table)]), def.clone()),
                     ),
                     None => ("registry", table),
                 };

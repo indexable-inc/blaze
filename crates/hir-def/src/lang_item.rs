@@ -1038,17 +1038,29 @@ pub struct Global;
     }
 
     /// A miss of `crate_notable_traits`, its inputs warm, allocates its box and nothing else.
+    /// The query's table, made once a database on its first call, is warmed by a call for
+    /// another crate.
     #[test]
     fn notable_traits_miss_is_its_result() {
         let db = fixture::db(
             r#"
+//- /other.rs crate:other
+pub trait Elsewhere {}
+//- /main.rs crate:main deps:other
 #[doc(notable_trait)]
 pub trait Read {}
 pub trait Other {}
 "#,
         )
         .into_db();
-        let krate = db.fetch_test_crate();
+        let named = |name: &str| {
+            *base_db::all_crates(&db)
+                .iter()
+                .find(|it| it.extra_data(&db).display_name.as_ref().is_some_and(|it| it.to_string() == name))
+                .unwrap_or_else(|| panic!("no crate {name}"))
+        };
+        let (krate, other) = (named("main"), named("other"));
+        assert_eq!(super::crate_notable_traits(&db, other), None);
         let def_map = crate::nameres::crate_def_map(&db, krate);
         for (_, module) in def_map.modules(&db) {
             for def in module.scope(&db).declarations() {

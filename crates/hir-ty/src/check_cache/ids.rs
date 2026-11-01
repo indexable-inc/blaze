@@ -12,6 +12,8 @@ use std::cell::RefCell;
 
 use base_db::{Crate, Db};
 use blaze_format::cursor::{Put, Reader};
+use blaze_hash::HashMap;
+use blaze_query::db::{AsId, FromId};
 use hir_def::{
     AdtId, BuiltinDeriveImplId, BuiltinDeriveImplLoc, ConstId, DefWithBodyId, EnumId,
     EnumVariantId, ExpressionStoreOwnerId, FunctionId, GenericDefId, ImplId, LoweringMode,
@@ -23,8 +25,6 @@ use hir_def::{
 };
 use hir_expand::attrs::AttrId;
 use la_arena::{Idx, RawIdx};
-use rustc_hash::FxHashMap;
-use blaze_query::db::{AsId, FromId};
 
 use crate::{
     ImplTraitId, InferBodyId,
@@ -156,7 +156,7 @@ relocate_db! {
 #[derive(Default, Debug)]
 pub(crate) struct Table {
     entries: Vec<(IdKind, u64)>,
-    indexes: FxHashMap<(IdKind, u64), u32>,
+    indexes: HashMap<(IdKind, u64), u32>,
     /// Set while the `locs` type table is written: an id of a late kind refuses the body.
     locs: bool,
     refused: Option<&'static str>,

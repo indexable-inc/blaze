@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_hash::{HashMap, HashSet};
 
 use super::{DEPTH, Sample, Unsampled, keep};
 
@@ -202,7 +202,7 @@ fn parse(body: &[u8], clock: &Clock) -> Option<Sample> {
     let time = word(body, 8)?;
     let nr = word(body, 16)? as usize;
     let mut sample =
-        Sample { at: clock.instant(time), tid: u64::from(tid), depth: 0, pcs: [0; DEPTH] };
+        Sample { at: clock.instant(time), tid: u64::from(tid), depth: 0, pcs: [0; DEPTH], span: 0, build: 0, on_cpu: true };
     for i in 0..nr {
         let pc = word(body, 24 + 8 * i)?;
         if pc >= PERF_CONTEXT_MAX {
@@ -276,8 +276,8 @@ fn threads(own: libc::pid_t, into: &mut Vec<libc::pid_t>) {
 pub(super) fn run(hz: u32) {
     // SAFETY: `gettid` has no precondition.
     let own = unsafe { libc::gettid() };
-    let mut events: FxHashMap<libc::pid_t, Event> = FxHashMap::default();
-    let mut refused: FxHashSet<libc::pid_t> = FxHashSet::default();
+    let mut events: HashMap<libc::pid_t, Event> = HashMap::default();
+    let mut refused: HashSet<libc::pid_t> = HashSet::default();
     // alloc: the sampler's thread, at the edge, every 100 ms
     let mut now: Vec<libc::pid_t> = Vec::new();
     let mut batch: Vec<Sample> = Vec::with_capacity(4096);
@@ -303,6 +303,7 @@ pub(super) fn run(hz: u32) {
         now.sort_unstable();
         events.retain(|tid, _| now.binary_search(tid).is_ok());
         refused.retain(|tid| now.binary_search(tid).is_ok());
+        #[allow(clippy::disallowed_methods, reason = "the sampler thread's own timer, a driver's: no pool thread or job waits here")]
         std::thread::sleep(EVERY.saturating_sub(started.elapsed()));
     }
 }

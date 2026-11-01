@@ -69,8 +69,8 @@ use serde::{Deserialize, Serialize};
 /// [`Response::Packed`]. 16: [`Worked::links`]. 17: [`Worked::steps_us`]. 18: [`Request::Doc`],
 /// [`Response::DocPage`] and [`Response::Documented`]. 19: [`Cargo::refused`]. 20:
 /// [`Request::Explore`], [`Request::Profile`], [`Request::Live`], [`Request::Sql`], their
-/// answers, and [`Status::history`].
-pub const SCHEMA: u32 = 20;
+/// answers, and [`Status::history`]. 21: [`Edit::Replace`]. 22: [`Status::build`].
+pub const SCHEMA: u32 = 22;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -973,6 +973,8 @@ pub enum TestOutcome {
 pub struct Status {
     /// The daemon's process: what `kill` and the restart budgets name.
     pub pid: u32,
+    /// Which blaze the daemon is: a client of another build never sends it a request of one.
+    pub build: Build,
     pub views: u32,
     /// The profile history's last error (`blaze_profile::history`): a flush that failed,
     /// naming the file; `None` while every flush has been written.
@@ -980,6 +982,27 @@ pub struct Status {
     pub requests: Vec<u64>,
     pub budget_bytes: u64,
     pub memory_bytes: u64,
+}
+
+/// Which blaze a daemon is ([`Status::build`]).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+pub struct Build {
+    /// The hash of its executable's bytes as it started: two builds of one commit, a dirty
+    /// tree's, are two.
+    pub id: ContentId,
+    /// Its executable as it was when the daemon started: a client whose own is this file,
+    /// unchanged (the same length, modification time and inode), is the same build without
+    /// hashing itself.
+    pub exe: Executable,
+}
+
+/// A file's path and what changes when its bytes do: its length, modification time and inode.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+pub struct Executable {
+    pub len: u64,
+    pub path: String,
+    pub inode: u64,
+    pub modified_ns: u64,
 }
 
 /// The daemon's memory by subsystem ([`Request::Memory`]): blaze-mem's counters

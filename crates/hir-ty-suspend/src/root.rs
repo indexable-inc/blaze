@@ -3,6 +3,7 @@
 //! `blaze::fiber_boundary` holds it; everything that reaches it is may-suspend.
 
 use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
+use blaze_hash::HashSet;
 use hir_def::{
     AssocItemId, FunctionId, ModuleDefId, ModuleId, TraitId,
     nameres::{ModuleData, crate_def_map},
@@ -13,7 +14,6 @@ use hir_ty::{
     next_solver::{SimplifiedType, SolverDefId},
 };
 use intern::Symbol;
-use rustc_hash::FxHashSet;
 
 /// The crate whose function parks a fiber, by its crate name.
 const FIBERS: &str = "corosensei";
@@ -23,7 +23,7 @@ const FIBERS: &str = "corosensei";
 #[blaze_query::tracked(returns(deref))]
 pub(crate) fn roots(db: &Db, krate: Crate) -> Box<[FunctionId]> {
     let mut found = Vec::new(); // alloc: the roots, once per crate graph, one per corosensei
-    let mut seen = FxHashSet::default();
+    let mut seen = HashSet::default();
     let mut stack = vec![krate]; // alloc: the walk of the crate graph, once per crate
     while let Some(at) = stack.pop() {
         if !seen.insert(at) {

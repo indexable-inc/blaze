@@ -25,9 +25,9 @@ mod qualifications;
 mod unused;
 mod used;
 
+use blaze_hash::HashMap;
 use hir::{HirFileId, InFile};
 use hir_expand::MacroCallKind;
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use syntax::{SyntaxNodePtr, TextRange};
 
@@ -78,7 +78,7 @@ pub(super) fn lints(cx: &Cx<'_, '_>) -> Vec<Found> {
 /// it is reached through, outermost first, then its own; as the syntax lints' walk places them.
 pub(super) struct Places {
     /// Each module file's place: where its `mod` item is, itself placed.
-    files: FxHashMap<HirFileId, Place>,
+    files: HashMap<HirFileId, Place>,
 }
 
 /// A place, compared as rustc's walk order: inline up to four deep, which covers a node in a
@@ -87,7 +87,7 @@ pub(super) type Place = SmallVec<[(u32, u32); 4]>;
 
 impl Places {
     fn of(cx: &Cx<'_, '_>) -> Places {
-        let mut files: FxHashMap<HirFileId, Place> = FxHashMap::default();
+        let mut files: HashMap<HirFileId, Place> = HashMap::default();
         for module in crate::checks::modules(cx) {
             let Some(file) = module.as_source_file_id(cx.db) else { continue };
             let file = HirFileId::from(file);

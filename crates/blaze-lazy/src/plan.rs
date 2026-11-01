@@ -33,9 +33,9 @@
 //! the run starts, so a program rustc rejects is rejected here too.
 
 use blaze_codegen::{CompiledFunction, Init, InstanceKey, RelocKind, Static, Target};
+use blaze_hash::HashMap;
 use blaze_ids::names;
 use blaze_items::{CodeHash, ItemKey};
-use rustc_hash::FxHashMap;
 
 use crate::{LazyId, MOST_LAZY};
 
@@ -81,7 +81,7 @@ pub struct Plan {
     ahead: Vec<(InstanceKey, Ahead)>,
     keys: Vec<InstanceKey>,
     items: Vec<ItemKey>,
-    index: FxHashMap<InstanceKey, LazyId>,
+    index: HashMap<InstanceKey, LazyId>,
     /// Every lazy function's code hash, sorted, with its id.
     by_code: Vec<(CodeHash, LazyId)>,
 }
@@ -90,7 +90,7 @@ impl Plan {
     /// The plan of a build whose walk described `functions` (in the walk's order, which is
     /// deterministic), whose entry is `entry` and whose statics are `statics`.
     pub fn new(functions: &[Function], entry: &[InstanceKey], statics: &[Static]) -> Result<Plan, PlanError> {
-        let mut ahead: FxHashMap<InstanceKey, Ahead> = FxHashMap::default();
+        let mut ahead: HashMap<InstanceKey, Ahead> = HashMap::default();
         for key in entry {
             if !functions.iter().any(|it| it.key == *key) {
                 return Err(PlanError::Unknown(*key));
@@ -106,7 +106,7 @@ impl Plan {
             ahead: Vec::with_capacity(ahead.len()),
             keys: Vec::with_capacity(functions.len().saturating_sub(ahead.len())),
             items: Vec::with_capacity(functions.len().saturating_sub(ahead.len())),
-            index: FxHashMap::default(),
+            index: HashMap::default(),
             by_code: Vec::with_capacity(functions.len().saturating_sub(ahead.len())),
         };
         plan.index.reserve(functions.len());

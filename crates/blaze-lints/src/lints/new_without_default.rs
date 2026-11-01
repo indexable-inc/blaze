@@ -19,6 +19,7 @@ use syntax::{
     },
 };
 
+use super::utils::indentation;
 use crate::{check::Cx, diag::Applicability};
 
 const LINT: super::Implemented = super::Implemented::NewWithoutDefault;
@@ -151,13 +152,4 @@ fn derives_default(cx: &Cx<'_, '_>, adt: hir::Adt) -> bool {
                 .filter_map(|it| it.into_token())
                 .any(|it| it.text() == "Default")
     })
-}
-
-/// clippy's `indentation`: the whitespace starting the line `range` starts on.
-fn indentation(text: &str, range: TextRange) -> &str {
-    let start = usize::from(range.start());
-    let line_start = text[..start].rfind('\n').map_or(0, |it| it + 1);
-    let line = &text[line_start..];
-    let end = line.find(|it: char| !it.is_whitespace() || it == '\n').unwrap_or(line.len());
-    &line[..end]
 }

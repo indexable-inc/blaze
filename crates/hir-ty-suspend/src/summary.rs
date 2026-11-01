@@ -2,14 +2,14 @@
 //! instance summarized once, however many callers reach it.
 
 use base_db::Db;
+use blaze_hash::HashSet;
+use blaze_query::db::FromId;
 use hir_def::{DefWithBodyId, FunctionId, signatures::FunctionSignature};
 use hir_ty::{
     InferBodyId,
     db::{InternedClosureId, InternedCoroutineId},
     traits::StoredParamEnvAndCrate,
 };
-use blaze_query::db::FromId;
-use rustc_hash::FxHashSet;
 
 use crate::dispatch::{Cx, Def, Instance, LONGEST, Marked, Target, Unseen, body_of, sites};
 
@@ -52,7 +52,7 @@ pub(crate) fn summary(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) 
     let sites = sites(&cx, body);
     let mut best: Option<Hop> = None;
     let mut driver = false;
-    let mut seen = FxHashSet::default();
+    let mut seen = HashSet::default();
     let mut callees = Vec::new(); // alloc: the summary's edges, once per instance
     let mut edge = |instance: &Instance, callees: &mut Vec<Instance>| {
         if seen.insert(*instance) {

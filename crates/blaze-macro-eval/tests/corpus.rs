@@ -64,7 +64,7 @@ fn expand() -> Result<Expanded, String> {
         .map(|it| format!("{:?}", it.kind))
         .collect();
     crate_def_map(db, panics);
-    let records = std::mem::take(&mut *records.lock().unwrap_or_else(|it| it.into_inner()));
+    let records = std::mem::take(&mut *records.lock());
     Ok(Expanded { records, calls, panics, diagnostics })
 }
 

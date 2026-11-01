@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_hash::{HashMap, HashSet};
 
 use crate::PremapError;
 use crate::image::View;
@@ -59,11 +59,11 @@ pub enum Pick {
 
 #[derive(Default)]
 pub struct Images {
-    open: FxHashMap<ImageKey, Arc<Ready>>,
-    newest: FxHashMap<GraphKey, ImageKey>,
-    making: FxHashSet<ImageKey>,
-    failed: FxHashMap<ImageKey, PremapError>,
-    used: FxHashMap<GraphKey, u64>,
+    open: HashMap<ImageKey, Arc<Ready>>,
+    newest: HashMap<GraphKey, ImageKey>,
+    making: HashSet<ImageKey>,
+    failed: HashMap<ImageKey, PremapError>,
+    used: HashMap<GraphKey, u64>,
     clock: u64,
 }
 

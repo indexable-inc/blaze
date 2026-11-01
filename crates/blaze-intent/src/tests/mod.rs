@@ -1,11 +1,13 @@
 //! Every edit against the text edit an agent would make instead: the same bytes and VFS root,
 //! a tree equal to a fresh parse of them, and the same changed items as a whole-file diff of
-//! the two finds. Rename over a module graph, against the front end.
+//! the two finds. Rename and replace over a module graph, against the front end.
 
 mod budget;
 mod db;
 mod edits;
 mod rename;
+mod replace;
+mod retarget;
 
 use std::collections::BTreeMap;
 

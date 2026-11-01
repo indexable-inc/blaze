@@ -15,13 +15,13 @@ doctest = false
 
 [dependencies]
 blaze-api.workspace = true
+blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-protocol.workspace = true
 blaze-query.workspace = true
 blaze-v2-proof.workspace = true
 blaze-vfs.workspace = true
 hashbrown.workspace = true
-rustc-hash.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

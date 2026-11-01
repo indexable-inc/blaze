@@ -16,15 +16,18 @@ doctest = false
 [dependencies]
 blaze-core.workspace = true
 blaze-format.workspace = true
+blaze-hash.workspace = true
 blaze-image.workspace = true
 blaze-mem.workspace = true
 blaze-radix.workspace = true
 blaze-protocol.workspace = true
 blaze-reclaim.workspace = true
+blaze-spin.workspace = true
 corosensei.workspace = true
 crossbeam-channel.workspace = true
 crossbeam-deque.workspace = true
-rustc-hash.workspace = true
+crossbeam-queue.workspace = true
+parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 stdx.workspace = true
@@ -40,6 +43,12 @@ blaze-alloc-count.workspace = true
 blaze-ids.workspace = true
 expect-test.workspace = true
 hegeltest.workspace = true
+
+# `Flights` under contention: N threads' keys spread over 128 shards, in one shard, and on one
+# key, in ns per operation.
+[[bench]]
+name = "flights"
+harness = false
 
 [lints]
 workspace = true

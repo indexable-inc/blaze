@@ -11,8 +11,8 @@
 
 use std::collections::BTreeMap;
 
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
-use rustc_hash::FxHashMap;
 
 use crate::{CompiledFunction, Data, InstanceKey, Relocs, Target, Unwind, content::code_id};
 
@@ -24,14 +24,14 @@ pub struct Deduped {
     pub merged: BTreeMap<InstanceKey, InstanceKey>,
 }
 
-fn renamed(key: &InstanceKey, kept: &FxHashMap<InstanceKey, InstanceKey>) -> InstanceKey {
+fn renamed(key: &InstanceKey, kept: &HashMap<InstanceKey, InstanceKey>) -> InstanceKey {
     kept.get(key).copied().unwrap_or(*key)
 }
 
 fn rename_target(
     target: &Target,
-    kept: &FxHashMap<InstanceKey, InstanceKey>,
-    data: &FxHashMap<ContentId, ContentId>,
+    kept: &HashMap<InstanceKey, InstanceKey>,
+    data: &HashMap<ContentId, ContentId>,
 ) -> Target {
     match target {
         Target::Function(key) => Target::Function(renamed(key, kept)),
@@ -45,16 +45,16 @@ fn rename_target(
 
 fn rename_relocs(
     relocs: &Relocs,
-    kept: &FxHashMap<InstanceKey, InstanceKey>,
-    data: &FxHashMap<ContentId, ContentId>,
+    kept: &HashMap<InstanceKey, InstanceKey>,
+    data: &HashMap<ContentId, ContentId>,
 ) -> Relocs {
     relocs.map(|target| rename_target(target, kept, data))
 }
 
 fn rename_unwind(
     unwind: Unwind,
-    kept: &FxHashMap<InstanceKey, InstanceKey>,
-    data: &FxHashMap<ContentId, ContentId>,
+    kept: &HashMap<InstanceKey, InstanceKey>,
+    data: &HashMap<ContentId, ContentId>,
 ) -> Unwind {
     let routine = |it: &Option<Target>| it.as_ref().map(|it| rename_target(it, kept, data));
     let area = |it: Option<ContentId>| it.map(|id| data.get(&id).copied().unwrap_or(id));
@@ -76,7 +76,7 @@ fn rename_unwind(
 
 /// Renames what `function` calls by `kept`, in place, and makes its data's IDs again; leaves
 /// it as it is when it names nothing of `kept`.
-fn rename(function: &mut CompiledFunction, kept: &FxHashMap<InstanceKey, InstanceKey>) {
+fn rename(function: &mut CompiledFunction, kept: &HashMap<InstanceKey, InstanceKey>) {
     let names = |target: &Target| match target {
         Target::Function(key) | Target::Direct(key) => kept.contains_key(key),
         _ => false,
@@ -89,7 +89,7 @@ fn rename(function: &mut CompiledFunction, kept: &FxHashMap<InstanceKey, Instanc
     if !names_one(&function.relocs) && !function.data.iter().any(|it| names_one(&it.relocs)) && !routine_named {
         return;
     }
-    let mut ids = FxHashMap::default();
+    let mut ids = HashMap::default();
     for it in &mut function.data {
         let relocs = rename_relocs(&it.relocs, kept, &ids);
         let made = Data::new(it.align, std::mem::take(&mut it.bytes), relocs);
@@ -108,10 +108,10 @@ pub fn dedupe(
     mergeable: impl Fn(&InstanceKey) -> bool,
 ) -> Deduped {
     // Unordered: `merged` is sorted as it is made.
-    let mut kept: FxHashMap<InstanceKey, InstanceKey> = FxHashMap::default();
+    let mut kept: HashMap<InstanceKey, InstanceKey> = HashMap::default();
     loop {
         // Unordered: each group is sorted on its own, and only fills `more`, a map by key.
-        let mut groups: FxHashMap<ContentId, Vec<InstanceKey>> = FxHashMap::default();
+        let mut groups: HashMap<ContentId, Vec<InstanceKey>> = HashMap::default();
         // A covered function counts its own blocks, a counting one its own calls and an
         // instrumented one its own PGO record: merged, two would share counters.
         let counts = |it: &CompiledFunction| {
@@ -121,7 +121,7 @@ pub fn dedupe(
         for function in functions.iter().filter(|it| mergeable(&it.key) && it.coverage.is_none() && !counts(it)) {
             groups.entry(code_id(function)).or_default().push(function.key);
         }
-        let mut more: FxHashMap<InstanceKey, InstanceKey> = FxHashMap::default();
+        let mut more: HashMap<InstanceKey, InstanceKey> = HashMap::default();
         for mut keys in groups.into_values().filter(|it| it.len() > 1) {
             keys.sort();
             let first = keys[0];

@@ -26,7 +26,7 @@ use std::{
 };
 
 use blaze_api::{Applicability, Artifact, DiagnosticRef, FetchVerb, Level, ResponseRef, TargetKind, UnitOfRef, Verb};
-use rustc_hash::FxBuildHasher;
+use blaze_hash::FixedState;
 
 use super::{json, say};
 
@@ -132,8 +132,8 @@ const _: () = assert!(size_of::<Unit>() == 20);
 #[derive(Clone, Copy)]
 struct Name(u32, u32);
 
-pub(super) type ByHash<V> = blaze_ids::prehashed::ByHash<u64, V>;
-type HashedSet = blaze_ids::prehashed::ByHashSet<u64>;
+pub(super) type ByHash<V> = blaze_hash::ByHash<u64, V>;
+type HashedSet = blaze_hash::ByHashSet<u64>;
 
 /// What the build placed, once it said ([`ResponseRef::Built`]).
 struct Built {
@@ -417,7 +417,7 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
         // cargo takes one newline off the end, then writes the text and a newline.
         let rendered = diagnostic.rendered.strip_suffix('\n').unwrap_or(diagnostic.rendered);
         let printed = match renders {
-            true => self.printed.insert(FxBuildHasher.hash_one(rendered)),
+            true => self.printed.insert(FixedState.hash_one(rendered)),
             false => true,
         };
         if renders && printed {

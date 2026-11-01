@@ -14,9 +14,10 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-hash.workspace = true
 cranelift-codegen.workspace = true
+parking_lot.workspace = true
 rustc_lexer.workspace = true
-rustc-hash.workspace = true
 unicode-normalization.workspace = true
 
 base-db.workspace = true

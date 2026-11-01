@@ -3,12 +3,9 @@
 //! missing or refused token said as cargo says it; credential processes and
 //! `cargo:token-from-stdout` asked as cargo asks them.
 
-use std::{
-    io::Write,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::{io::Write, path::PathBuf, sync::Arc};
 
+use blaze_hash::HashMap;
 use blaze_registry::{
     Context, Locked, Package, SourceConfig, Sources,
     auth::{Auth, Shell},
@@ -16,7 +13,7 @@ use blaze_registry::{
     http::{Http, Response},
 };
 use blaze_source::SourceId;
-use rustc_hash::FxHashMap as HashMap;
+use parking_lot::Mutex;
 use semver::Version;
 
 const BASE: &str = "https://private.example.com/";
@@ -33,7 +30,7 @@ struct Server {
 impl Http for Server {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<Response> {
         let sent = headers.iter().find(|(k, _)| *k == "authorization").map(|(_, v)| v.to_string());
-        self.asked.lock().unwrap().push((url.to_owned(), sent.clone()));
+        self.asked.lock().push((url.to_owned(), sent.clone()));
         if sent.as_deref() != Some(self.token.as_str()) {
             return Ok(Response {
                 status: 401,
@@ -44,7 +41,7 @@ impl Http for Server {
                 body: b"who are you".to_vec(),
             });
         }
-        match self.files.lock().unwrap().get(url) {
+        match self.files.lock().get(url) {
             Some(body) => Ok(Response { status: 200, headers: vec![], body: body.clone() }),
             None => Ok(Response { status: 404, ..Response::default() }),
         }
@@ -56,13 +53,13 @@ struct Said(Arc<Mutex<Vec<String>>>);
 
 impl Shell for Said {
     fn warn(&self, text: &str) {
-        self.0.lock().unwrap().push(format!("warning: {text}"));
+        self.0.lock().push(format!("warning: {text}"));
     }
     fn note(&self, text: &str) {
-        self.0.lock().unwrap().push(format!("note: {text}"));
+        self.0.lock().push(format!("note: {text}"));
     }
     fn status(&self, word: &str, text: &str) {
-        self.0.lock().unwrap().push(format!("{word} {text}"));
+        self.0.lock().push(format!("{word} {text}"));
     }
     fn verbose(&self) -> bool {
         false
@@ -146,7 +143,7 @@ impl Fixture {
     }
 
     fn asked(&self) -> Vec<(String, Option<String>)> {
-        std::mem::take(&mut *self.server.asked.lock().unwrap())
+        std::mem::take(&mut *self.server.asked.lock())
     }
 }
 
@@ -179,7 +176,7 @@ fn sends_the_token_cargo_sends() {
     registry.invalidate();
     registry.config().unwrap();
     assert_eq!(fixture.asked(), [(format!("{BASE}config.json"), token)]);
-    assert!(fixture.said.0.lock().unwrap().is_empty());
+    assert!(fixture.said.0.lock().is_empty());
 }
 
 #[test]
@@ -242,7 +239,7 @@ fn a_token_the_registry_ignores_is_warned_of() {
     let credentials = "[registries.private]\ntoken = \"s3cret\"\n";
     let fixture = Fixture::new("ignored", "s3cret", config, credentials);
     let err = fixture.fetch(&[]).unwrap_err();
-    let said = fixture.said.0.lock().unwrap().clone();
+    let said = fixture.said.0.lock().clone();
     assert_eq!(
         said,
         [format!(

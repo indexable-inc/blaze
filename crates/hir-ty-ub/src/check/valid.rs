@@ -12,6 +12,7 @@
 use std::{fmt, ops::Range};
 
 use base_db::Db;
+use blaze_hash::HashMap;
 use blaze_ids::radix;
 use hir_def::{
     AdtId, EnumId, EnumVariantId, HasModule, Lookup, VariantId,
@@ -31,7 +32,6 @@ use hir_ty::{
 };
 use hir_ty_mir::mir::{RetagMode, TypedCx};
 use rustc_abi::{BackendRepr, FieldsShape, Primitive, Scalar, TagEncoding, Variants};
-use rustc_hash::FxHashMap;
 use rustc_type_ir::{
     Mutability,
     inherent::{AdtDef as _, GenericArgs as _, IntoKind as _, SliceLike as _, Ty as _},
@@ -255,16 +255,16 @@ fn range(r: (u32, u32)) -> Range<usize> {
 pub(crate) struct Plans<'db> {
     plans: Vec<Plan>,
     ops: Vec<Op<'db>>,
-    by_ty: FxHashMap<Ty<'db>, u32>,
+    by_ty: HashMap<Ty<'db>, u32>,
     enums: Vec<EnumPlan>,
     variants: Vec<VariantPlan>,
     paths: Vec<PathNode>,
     pointees: Vec<Pointee<'db>>,
-    pointee_by_ty: FxHashMap<Ty<'db>, u32>,
+    pointee_by_ty: HashMap<Ty<'db>, u32>,
     cells: Vec<Span>,
     levels: Vec<(u64, u64)>,
     unions: Vec<(u64, u64)>,
-    layouts: FxHashMap<Ty<'db>, &'static Layout>,
+    layouts: HashMap<Ty<'db>, &'static Layout>,
     infcx: Option<(base_db::Crate, InferCtxt<'db>)>,
     // Scratch, reused by every copy.
     data: Vec<(u64, u64)>,
@@ -280,7 +280,7 @@ impl<'db> Default for Plans<'db> {
             plans: Vec::new(),
             // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             ops: Vec::new(),
-            by_ty: FxHashMap::default(),
+            by_ty: HashMap::default(),
             // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             enums: Vec::new(),
             // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
@@ -289,14 +289,14 @@ impl<'db> Default for Plans<'db> {
             paths: vec![PathNode { parent: 0, elem: Elem::Root }],
             // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             pointees: Vec::new(),
-            pointee_by_ty: FxHashMap::default(),
+            pointee_by_ty: HashMap::default(),
             // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             cells: Vec::new(),
             // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             levels: Vec::new(),
             // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             unions: Vec::new(),
-            layouts: FxHashMap::default(),
+            layouts: HashMap::default(),
             infcx: None,
             // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             data: Vec::new(),

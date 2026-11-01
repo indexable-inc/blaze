@@ -34,9 +34,9 @@ use std::{
 };
 
 use blaze_api::{Diagnostic, Level, Mismatch, Request, Response, TestOutcome, TestResult, ViewRef};
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::ContentId;
 use blaze_vfs::View;
-use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -249,17 +249,17 @@ pub struct Service {
     default_ref: String,
     state: State,
     now: u64,
-    jobs: FxHashMap<JobId, Job>,
-    runs: FxHashMap<RunId, Run>,
+    jobs: HashMap<JobId, Job>,
+    runs: HashMap<RunId, Run>,
     /// Each branch's and pull request's newest job.
-    latest: FxHashMap<String, JobId>,
+    latest: HashMap<String, JobId>,
     /// The job whose checkout of a ref is in flight.
-    checking_out: FxHashMap<String, JobId>,
+    checking_out: HashMap<String, JobId>,
     train: Train,
     release_running: Option<JobId>,
     release_waiting: Option<JobId>,
     snapshotting: bool,
-    removing: FxHashSet<String>,
+    removing: HashSet<String>,
     next_job: u64,
     next_run: u64,
 }
@@ -275,15 +275,15 @@ impl Service {
             settings,
             state,
             now: 0,
-            jobs: FxHashMap::default(),
-            runs: FxHashMap::default(),
-            latest: FxHashMap::default(),
-            checking_out: FxHashMap::default(),
+            jobs: HashMap::default(),
+            runs: HashMap::default(),
+            latest: HashMap::default(),
+            checking_out: HashMap::default(),
             train: Train::default(),
             release_running: None,
             release_waiting: None,
             snapshotting: false,
-            removing: FxHashSet::default(),
+            removing: HashSet::default(),
             next_job: 0,
             next_run: 0,
         }

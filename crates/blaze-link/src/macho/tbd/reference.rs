@@ -4,7 +4,7 @@
 #![forbid(unsafe_code)]
 
 use blaze_codegen::Arch;
-use rustc_hash::FxHashSet;
+use blaze_hash::HashSet;
 
 use super::{PLATFORMS, arch_name, arch_rank, platform_name, v3_platforms};
 use crate::model::{Shared, SymbolKind};
@@ -60,7 +60,7 @@ fn read_documents(text: &str, arch: Arch, platform: u32) -> Result<Library, Stri
         docs.push(Doc::new(tag.as_deref(), lines)?);
     }
     let mut out = Exports::default();
-    let mut seen = FxHashSet::default();
+    let mut seen = HashSet::default();
     seen.insert(docs[0].install_name.clone());
     fold(&docs, 0, arch, platform, &mut seen, &mut out)?;
     Ok(Library { name: docs[0].install_name.clone(), symbols: out.symbols, inputs: out.inputs })
@@ -71,7 +71,7 @@ fn fold(
     at: usize,
     arch: Arch,
     platform: u32,
-    seen: &mut FxHashSet<String>,
+    seen: &mut HashSet<String>,
     out: &mut Exports,
 ) -> Result<(), String> {
     let doc = &docs[at];
@@ -92,7 +92,7 @@ fn fold(
 #[derive(Default)]
 struct Exports {
     symbols: Vec<Owned>,
-    names: FxHashSet<String>,
+    names: HashSet<String>,
     inputs: Vec<String>,
 }
 

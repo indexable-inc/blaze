@@ -18,10 +18,14 @@ arrow-array.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
 blaze-graph.workspace = true
+blaze-hash.workspace = true
+blaze-v2-proof.workspace = true
+crossbeam-channel.workspace = true
+crossbeam-queue.workspace = true
 object.workspace = true
+parking_lot.workspace = true
 parquet.workspace = true
 rustc-demangle.workspace = true
-rustc-hash.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
 serde_json.workspace = true
@@ -29,6 +33,9 @@ tracing.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [lints]
 workspace = true

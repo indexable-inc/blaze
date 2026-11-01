@@ -1,4 +1,7 @@
 //! Wrappers over [`make`] constructors
+
+#![allow(clippy::needless_pass_by_value, reason = "rust-analyzer's builder API takes owned nodes; it goes with the handles")]
+
 use either::Either;
 
 use crate::{
@@ -341,13 +344,13 @@ impl SyntaxFactory {
             attrs,
             is_unsafe,
             trait_gen_params.clone(),
-            trait_gen_args.clone(),
-            type_gen_params.clone(),
-            type_gen_args.clone(),
+            trait_gen_args,
+            type_gen_params,
+            type_gen_args,
             is_negative,
             path_type.clone(),
             ty.clone(),
-            trait_where_clause.clone(),
+            trait_where_clause,
             ty_where_clause.clone(),
             body.clone(),
         );
@@ -939,7 +942,7 @@ impl SyntaxFactory {
     }
 
     pub fn deref_pat(&self, pat: ast::Pat) -> ast::Pat {
-        make::deref_pat(pat.clone())
+        make::deref_pat(pat)
     }
 
     pub fn paren_pat(&self, pat: ast::Pat) -> ast::ParenPat {
@@ -2150,7 +2153,7 @@ impl SyntaxFactory {
         let ast = make::impl_(
             attrs,
             generic_params.clone(),
-            generic_args.clone(),
+            generic_args,
             path_type.clone(),
             where_clause.clone(),
             body.clone(),

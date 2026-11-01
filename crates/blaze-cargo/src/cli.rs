@@ -13,12 +13,14 @@
 //! - [`inspect`]: blaze's own looks at the last build (`codegen-inputs`, `trace`, `tables`),
 //!   and `pack`, the in-browser compiler's pack of a program.
 //! - [`observe`]: blaze's looks at itself: `explore`, `debug profile|live|sql`, `explain`.
+//! - [`fix`]: `fix --replace`, a path moved through the front end's name resolution.
 
 #![forbid(unsafe_code)]
 
 pub mod args;
 pub mod daemon;
 pub mod doc;
+pub mod fix;
 pub mod inspect;
 pub mod json;
 pub mod observe;
@@ -77,6 +79,7 @@ Commands:
     debug live                     The daemon's threads as they run
     debug sql [--live] QUERY       SQL over the profile history (with `--live`, the flight recorder too)
     explain VIEW [NAME=VALUE ...]  One of the history's named views
+    fix --replace FROM=TO          Every reference to the item FROM retargeted to TO, by name resolution
 
 Options:
     -V, --version  Print version info and exit
@@ -152,8 +155,8 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Unknown(name) => {
             let what = format!(
                 "no such command: `{name}`\n\nhelp: blaze's commands are build, check, run, test, bench, \
-                 doc, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, pack, explore, debug \
-                 and explain"
+                 doc, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, pack, explore, debug, \
+                 explain and fix"
             );
             eprint!("{}", say::error(&what, auto_color()));
             FAILED
@@ -175,6 +178,7 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Explore(words) => observe::explore(words, auto_color()),
         Asked::Debug(words) => observe::debug(words, auto_color()),
         Asked::Explain(words) => observe::explain(words, auto_color()),
+        Asked::Fix(words) => fix::main(words, auto_color()),
         Asked::Cargo(asked) => cargo(&asked),
     }
 }

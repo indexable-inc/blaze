@@ -2,11 +2,11 @@
 //! `nameres::frozen`): read back, they equal what finding them gives, impls in bodies and in
 //! the blocks of macro expansions too.
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use base_db::{Crate, all_crates};
 use hir_def::nameres::frozen::{self as frozen_def, Frozen, Mode};
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use hir_expand::fixture;
 
 use crate::{method_resolution::frozen as frozen_impls, test_db::TestDB};
@@ -103,7 +103,7 @@ fn frozen() -> Bytes {
     })
 }
 
-fn by_crate(db: &TestDB, mode: Mode, bytes: &[(String, Vec<u8>)]) -> FxHashMap<Crate, Frozen> {
+fn by_crate(db: &TestDB, mode: Mode, bytes: &[(String, Vec<u8>)]) -> HashMap<Crate, Frozen> {
     let crates = crates(db);
     bytes
         .iter()
@@ -183,7 +183,7 @@ fn the_fixture_has_impls_in_blocks() {
 
 #[test]
 fn read_back_writes_the_same_bytes() {
-    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    let _turn = TURN.lock();
     let bytes = frozen();
     for def_maps in [false, true] {
         let db = with(Mode::Verify, &bytes, def_maps);
@@ -226,7 +226,7 @@ pub use proc_macros::DeriveIdentity;
 
 #[test]
 fn def_maps_with_procedural_macros_read_back_as_resolved() {
-    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    let _turn = TURN.lock();
     let db = fixture::db(PROC_MACROS).into_db();
     let bytes: Vec<(String, Vec<u8>)> = crate::attach_db(&db, || {
         let encoded =
@@ -253,7 +253,7 @@ fn def_maps_with_procedural_macros_read_back_as_resolved() {
 
 #[test]
 fn checking_finds_a_difference() {
-    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    let _turn = TURN.lock();
     let mut bytes = frozen();
     let check = |bytes: &Bytes| {
         let db = with(Mode::Check, bytes, false);

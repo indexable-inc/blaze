@@ -68,10 +68,10 @@ mod reference {
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), code.at, bytes.len()) };
             #[cfg(target_os = "macos")]
             // SAFETY: executable again on this thread; then the instruction cache sees the bytes.
-            unsafe {
-                libc::pthread_jit_write_protect_np(1);
-                sys_icache_invalidate(code.at.cast(), bytes.len());
-            }
+            unsafe { libc::pthread_jit_write_protect_np(1) };
+            #[cfg(target_os = "macos")]
+            // SAFETY: the instruction cache sees the bytes in the fresh mapping.
+            unsafe { sys_icache_invalidate(code.at.cast(), bytes.len()) };
             #[cfg(not(target_os = "macos"))]
             {
                 // SAFETY: the whole mapping made above.

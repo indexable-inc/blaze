@@ -14,7 +14,7 @@
 use std::{
     io,
     ptr::NonNull,
-    sync::{Mutex, PoisonError, atomic::AtomicUsize, atomic::Ordering},
+    sync::{PoisonError, atomic::AtomicUsize, atomic::Ordering},
 };
 
 use crate::{MemError, Tag, huge::Pages, os, tag};
@@ -26,7 +26,11 @@ const MAX_STEP: usize = 64 << 20;
 /// what is there, so unlike `mprotect` two growers must never map the same range. Growth of
 /// such a region is rare (once per quarter of its size, at least 2 MB), so one lock for the
 /// process costs nothing measurable.
-static RESERVED_GROWTH: Mutex<()> = Mutex::new(());
+#[expect(
+    clippy::disallowed_types,
+    reason = "a cold lock inside the allocator (brief-locks.md's exception): parking_lot's parking table would allocate from within an allocation; taken only as a region of the reserved pool grows, which a grower that waits needs done anyway"
+)]
+static RESERVED_GROWTH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The huge page a region of huge pages commits whole past its first.
 #[inline]

@@ -12,6 +12,7 @@
 //! of an `async` block or a coroutine, whose code is not gone through, makes it none.
 
 use base_db::Db;
+use blaze_hash::HashSet;
 use hir_def::{
     AdtId, AssocItemId, DefWithBodyId, HasModule, ItemContainerId, Lookup, ModuleDefId, StaticId,
     expr_store::Body,
@@ -28,7 +29,6 @@ use hir_ty::{
     },
     next_solver::TyKind,
 };
-use rustc_hash::FxHashSet;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
 
 /// Whether `id` is a static that chooses a function, as the module says.
@@ -71,7 +71,7 @@ fn why_not(db: &Db, id: StaticId) -> Option<&'static str> {
     let Ok(init) = db.mir_body(InferBodyId::DefWithBodyId(id.into())) else {
         return Some("its initializer has no MIR");
     };
-    if !made_of_fn(db, init, return_slot(), &mut FxHashSet::default()) {
+    if !made_of_fn(db, init, return_slot(), &mut HashSet::default()) {
         if *super::TRACE {
             eprintln!("fn-cache: {:#?}", init.basic_blocks);
         }
@@ -79,7 +79,7 @@ fn why_not(db: &Db, id: StaticId) -> Option<&'static str> {
     }
     bodies.clear();
     bodies.push(owner);
-    let mut seen = FxHashSet::from_iter([owner]);
+    let mut seen = HashSet::from_iter([owner]);
     // alloc: reused for every module of a block, a static
     let mut found = Vec::new();
     // alloc: reused for every body, a static
@@ -130,7 +130,7 @@ pub(super) fn loaded_from(
     is_cache: &impl Fn(StaticId) -> bool,
 ) -> bool {
     let Some(local) = whole_local(operand) else { return false };
-    let mut seen = FxHashSet::default();
+    let mut seen = HashSet::default();
     loaded(db, body, local, is_cache, &mut seen)
 }
 
@@ -139,7 +139,7 @@ fn loaded(
     body: &MirBody<'_>,
     local: LocalId,
     is_cache: &impl Fn(StaticId) -> bool,
-    seen: &mut FxHashSet<LocalId>,
+    seen: &mut HashSet<LocalId>,
 ) -> bool {
     if !seen.insert(local) {
         return true;
@@ -223,7 +223,7 @@ fn owners<'db>(db: &'db Db, module: hir_def::ModuleIdLt<'db>, bodies: &mut Vec<D
 /// locals, `load` of it, and `store` in it of a function's address.
 fn only_dispatches(db: &Db, body: &MirBody<'_>, id: StaticId) -> bool {
     // The locals that hold where the static is.
-    let mut at: FxHashSet<LocalId> = FxHashSet::default();
+    let mut at: HashSet<LocalId> = HashSet::default();
     loop {
         let before = at.len();
         for (_, block) in body.basic_blocks.iter() {
@@ -297,7 +297,7 @@ fn only_dispatches(db: &Db, body: &MirBody<'_>, id: StaticId) -> bool {
                 return false;
             }
             if method == "store"
-                && !args.get(1).is_some_and(|it| fn_address(body, it, &mut FxHashSet::default()))
+                && !args.get(1).is_some_and(|it| fn_address(body, it, &mut HashSet::default()))
             {
                 return false;
             }
@@ -318,7 +318,7 @@ fn only_dispatches(db: &Db, body: &MirBody<'_>, id: StaticId) -> bool {
 }
 
 /// Whether `rvalue` is where the static `id` is, or a copy of what a local of `at` holds.
-fn copies(rvalue: &Rvalue, id: StaticId, at: &FxHashSet<LocalId>) -> bool {
+fn copies(rvalue: &Rvalue, id: StaticId, at: &HashSet<LocalId>) -> bool {
     match rvalue {
         Rvalue::Use(Operand { kind: OperandKind::Static(it), .. }) => *it == id,
         Rvalue::Use(it) => whole_local(it).is_some_and(|it| at.contains(&it)),
@@ -339,7 +339,7 @@ fn static_of(body: &MirBody<'_>, operand: &Operand) -> Option<StaticId> {
         return Some(*id);
     }
     let mut local = whole_local(operand)?;
-    let mut seen = FxHashSet::default();
+    let mut seen = HashSet::default();
     loop {
         if !seen.insert(local) || body.param_locals.contains(&local) {
             return None;
@@ -369,7 +369,7 @@ fn static_of(body: &MirBody<'_>, operand: &Operand) -> Option<StaticId> {
 
 /// Whether `operand` is a function's address, as a function pointer or made into a pointer,
 /// by the locals it is copied through: never one a body is handed, nor one a call returns.
-fn fn_address(body: &MirBody<'_>, operand: &Operand, seen: &mut FxHashSet<LocalId>) -> bool {
+fn fn_address(body: &MirBody<'_>, operand: &Operand, seen: &mut HashSet<LocalId>) -> bool {
     if operand.fn_item().is_some() {
         return true;
     }
@@ -424,7 +424,7 @@ fn made_of_fn(
     db: &Db,
     body: &MirBody<'_>,
     local: LocalId,
-    seen: &mut FxHashSet<LocalId>,
+    seen: &mut HashSet<LocalId>,
 ) -> bool {
     if !seen.insert(local) || borrowed(body, local) {
         return false;
@@ -455,7 +455,7 @@ fn made_of_fn(
         any = true;
         let made = destination.projection.as_slice().is_empty()
             && atomic_ptr_method(db, func) == Some("new")
-            && args.first().is_some_and(|it| fn_address(body, it, &mut FxHashSet::default()));
+            && args.first().is_some_and(|it| fn_address(body, it, &mut HashSet::default()));
         if !made {
             return false;
         }

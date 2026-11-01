@@ -46,7 +46,7 @@ use crate::{
 };
 
 /// A pool fiber's stack above its guard page; `stdx::ensure_sufficient_stack` grows past it.
-const STACK: usize = 16 << 20;
+pub const FIBER_STACK: usize = 16 << 20;
 /// The idle fibers a worker keeps for its next jobs; one that ends past it is freed.
 const IDLE: usize = 32;
 /// The parked records a worker keeps for the next job to park.
@@ -168,6 +168,7 @@ fn core() -> u32 {
 pub(crate) struct Host<'a> {
     member: u32,
     idle: Vec<Fiber>,
+    #[allow(clippy::vec_box, reason = "each record is given to the scheduler as a token by `Box::into_raw`")]
     spare: Vec<Box<Parked>>,
     /// The pool's jobs parked now, which it waits for before it stops.
     parked: &'a crate::sync::atomic::AtomicUsize,
@@ -289,9 +290,9 @@ fn exit(mut fiber: Fiber) {
 }
 
 fn new_fiber(member: u32) -> Fiber {
-    let stack = DefaultStack::new(STACK).unwrap_or_else(|why| panic!("a pool fiber's stack of {STACK} bytes: {why}"));
-    // The stack has at least `STACK` bytes above its guard page, which `Stack::limit` counts in.
-    let limit = stack.base().get() - STACK;
+    let stack = DefaultStack::new(FIBER_STACK).unwrap_or_else(|why| panic!("a pool fiber's stack of {FIBER_STACK} bytes: {why}"));
+    // The stack has at least `FIBER_STACK` bytes above its guard page, which `Stack::limit` counts in.
+    let limit = stack.base().get() - FIBER_STACK;
     let number = super::fiber::next_fiber();
     Fiber(Stackful::new(Coroutine::with_stack(stack, move |yielder, first| body(member, number, limit, yielder, first))), number)
 }
@@ -574,6 +575,59 @@ pub fn claim(key: Key) -> bool {
 /// ([`innermost_scope`]): `false` when the key has a flight already.
 pub fn claim_for(key: Key, job: JobId, scope: Option<CounterId>) -> bool {
     global().world.claim_for(key, job, scope)
+}
+
+/// A one-shot event in the wait graph: a key claimed by no job, which jobs wait on (a job on a
+/// fiber switches out; a thread on no fiber parks) and any thread fires, a driver's, an IO
+/// thread or one of no pool. A wait after the fire ends at once. Dropped unfired, it fires: a
+/// wake says only that the event is over, so a waiter looks again at what it waits for. A wait
+/// on it is never a stall: no job holds it, so the graph cannot tell it will not come.
+pub struct Event(Key);
+
+/// What waits on an [`Event`]: as many as want one, from any thread.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EventWait(Key);
+
+static EVENTS: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::new(0);
+
+impl Event {
+    #[expect(clippy::new_without_default, reason = "each one claims a key in the graph")]
+    pub fn new() -> Event {
+        let mut key = [0u8; 32];
+        key[..8].copy_from_slice(&EVENTS.fetch_add(1, crate::sync::atomic::Ordering::Relaxed).to_le_bytes());
+        key[8..].copy_from_slice(b"an event, of sched::host");
+        let key = Key(key);
+        assert!(global().world.claim(key, None), "event key {key:?} is new");
+        Event(key)
+    }
+
+    pub fn waiter(&self) -> EventWait {
+        EventWait(self.0)
+    }
+
+    /// Ends every wait on it, now and after.
+    pub fn fire(self) {
+        drop(self);
+    }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        let mut g = global();
+        g.world.key_done(self.0);
+        dispatch_global(&mut g, None);
+    }
+}
+
+impl EventWait {
+    /// Waits until the event is over.
+    ///
+    /// # Errors
+    ///
+    /// The cycle the wait would close; nothing waited.
+    pub fn wait(self) -> Result<(), Cycle> {
+        wait(Wait::Key(self.0))
+    }
 }
 
 /// This thread's job ended its flight of `key`: its waiters wake.

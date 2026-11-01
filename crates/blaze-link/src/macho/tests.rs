@@ -1412,7 +1412,7 @@ fn a_relink_patches_the_symbol_table_as_a_full_build_writes_it() {
     let first = Placed { synthesis: 1, ..parts.placed(&slices) };
     written(&cached, &first);
     let nlist = |writer: &super::MachO| {
-        let kept = writer.cache.as_ref().unwrap().lock().unwrap();
+        let kept = writer.cache.as_ref().unwrap().lock();
         kept.symbols.as_ref().map(|it| it.nlist.as_ptr() as usize)
     };
     let before = nlist(&cached);

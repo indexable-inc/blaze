@@ -21,13 +21,13 @@ pub(super) struct ResolverContext {
     pub age: ContextAge,
     pub activations: Activations,
     /// list the features that are activated for each package
-    pub resolve_features: persistent::HashMap<PackageId, FeaturesSet, rustc_hash::FxBuildHasher>,
+    pub resolve_features: persistent::HashMap<PackageId, FeaturesSet, blaze_hash::FixedState>,
     /// get the package that will be linking to a native library by its links attribute
-    pub links: persistent::HashMap<InternedString, PackageId, rustc_hash::FxBuildHasher>,
+    pub links: persistent::HashMap<InternedString, PackageId, blaze_hash::FixedState>,
 
     /// a way to look up for a package in activations what packages required it
     /// and all of the exact deps that it fulfilled.
-    pub parents: Graph<PackageId, persistent::HashSet<Dependency, rustc_hash::FxBuildHasher>>,
+    pub parents: Graph<PackageId, persistent::HashSet<Dependency, blaze_hash::FixedState>>,
 }
 
 /// When backtracking it can be useful to know how far back to go.
@@ -42,7 +42,7 @@ pub(super) type ContextAge = usize;
 /// semver compatible version of each crate.
 /// This all so stores the `ContextAge`.
 pub(super) type Activations =
-    persistent::HashMap<ActivationsKey, (Summary, ContextAge), rustc_hash::FxBuildHasher>;
+    persistent::HashMap<ActivationsKey, (Summary, ContextAge), blaze_hash::FixedState>;
 
 impl ResolverContext {
     pub(super) fn new() -> ResolverContext {

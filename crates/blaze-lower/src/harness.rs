@@ -5,8 +5,8 @@
 //! every crate whose root is appended to), so no other crate of that file reads it.
 
 use base_db::{Crate, FileText};
+use blaze_hash::HashSet;
 use hir_expand::proc_macro::ProcMacros;
-use rustc_hash::FxHashSet;
 
 use super::{ContentId, Db, LowerError, Lowered};
 
@@ -41,7 +41,7 @@ impl Lowered {
     ) -> Result<usize, LowerError> {
         // alloc: once a call, the units given and the roots made in it
         let units: Vec<u32> = units.into_iter().collect();
-        let mut made: FxHashSet<base_db::FileId> = FxHashSet::default();
+        let mut made: HashSet<base_db::FileId> = HashSet::default();
         let mut written = 0;
         for &unit in &units {
             let unit = unit as usize;
@@ -96,7 +96,7 @@ impl Lowered {
 pub fn macros_loaded(db: &Db, krate: Crate) -> bool {
     let by_crate = ProcMacros::get(db).by_crate(db);
     // alloc: once a test crate a write, its closure walked
-    let mut seen: FxHashSet<Crate> = FxHashSet::default();
+    let mut seen: HashSet<Crate> = HashSet::default();
     let mut stack = vec![krate]; // alloc: as `seen`
     while let Some(at) = stack.pop() {
         for dep in &at.data(db).dependencies {

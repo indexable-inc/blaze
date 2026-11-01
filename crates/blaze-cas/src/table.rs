@@ -538,7 +538,7 @@ impl<T: Keyed> Drop for Table<T> {
 #[cfg(test)]
 #[cfg(not(blaze_check))]
 mod tests {
-    use rustc_hash::FxHashMap as HashMap;
+    use blaze_hash::HashMap;
 
     use super::*;
 

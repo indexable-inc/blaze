@@ -6,8 +6,8 @@
 
 use std::mem;
 
+use blaze_hash::HashMap;
 use hir_def::StaticId;
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use super::{
@@ -124,7 +124,7 @@ pub(super) struct Thread<'db> {
     stack: Vec<u8>,
     stack_allocations: Vec<Allocated>,
     tls: TlsData,
-    statics: FxHashMap<StaticId, Address>,
+    statics: HashMap<StaticId, Address>,
     unwinding: Option<Unwinding<'db>>,
     running: Option<Running<'db>>,
     woken: Woken,
@@ -149,7 +149,7 @@ impl<'db> Thread<'db> {
             stack: Vec::new(), // alloc: empty, allocates nothing; one per spawned thread
             stack_allocations: Vec::new(), // alloc: empty, allocates nothing; one per spawned thread
             tls: TlsData::default(),
-            statics: FxHashMap::default(),
+            statics: HashMap::default(),
             unwinding: None,
             running: None,
             woken: Woken::default(),

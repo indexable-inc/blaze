@@ -18,7 +18,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Arc, Mutex, PoisonError},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -32,6 +32,7 @@ use blaze_graph::{
 use blaze_ids::rng::SplitMix64 as Rng;
 use blaze_protocol::events::{Event, NodeState};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use parking_lot::Mutex;
 
 /// The kinds of the daemon's own tasks, for their estimates and their subsystems' budgets.
 pub use blaze_graph::admission::kinds;
@@ -323,7 +324,7 @@ pub fn record_panics() {
             let thread = std::thread::current();
             let at = format!("{location} on thread {}", thread.name().unwrap_or("<unnamed>")); // alloc: a panic, once
             let message = info.payload_as_str().map(str::to_owned); // alloc: a panic, once
-            let mut raised = RAISED.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut raised = RAISED.lock();
             if raised.len() == RAISED_KEPT {
                 raised.pop_front();
             }
@@ -337,7 +338,7 @@ pub fn record_panics() {
 // dyn: a panic payload, read once per panicked task
 pub(crate) fn panicked(payload: &(dyn std::any::Any + Send)) -> Panic {
     let message = stdx::panic_text(payload).map(str::to_owned); // alloc: a panic, once
-    let mut raised = RAISED.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut raised = RAISED.lock();
     let at = raised.iter().rposition(|(it, _)| *it == message).and_then(|place| raised.remove(place)).map(|(_, at)| at);
     Panic { message, at }
 }
@@ -1031,18 +1032,18 @@ mod tests {
     type Observed = Vec<(TaskKind, Option<Key>, u64, u64)>;
 
     struct Recording {
-        asked: Arc<std::sync::Mutex<Asked>>,
-        observed: Arc<std::sync::Mutex<Observed>>,
+        asked: Arc<parking_lot::Mutex<Asked>>,
+        observed: Arc<parking_lot::Mutex<Observed>>,
     }
 
     impl Predict for Recording {
         fn predict(&self, kind: TaskKind, key: Option<Key>) -> Prediction {
-            self.asked.lock().unwrap().push((kind, key));
+            self.asked.lock().push((kind, key));
             Prediction { cost: Some(1000), peak: 0 }
         }
 
         fn observe(&mut self, kind: TaskKind, key: Option<Key>, ran_ns: u64, peak: u64) {
-            self.observed.lock().unwrap().push((kind, key, ran_ns, peak));
+            self.observed.lock().push((kind, key, ran_ns, peak));
         }
 
         fn encode(&self) -> Vec<u8> {
@@ -1063,19 +1064,19 @@ mod tests {
         plane.push(&mut fresh, node(NodeKind::Std, "thread", Some(key)), Task::Thread { kind: kinds::COMPILE, arg: 0 });
         let looped = plane.push(&mut fresh, node(NodeKind::ScriptRun, "loop", None), Task::Loop { kind: loops::SCRIPT_RUN });
         plane.add(Duration::ZERO, request, fresh, Some(Each(built)), false).unwrap();
-        assert_eq!(*asked.lock().unwrap(), [(kinds::COMPILE, Some(key)), (loops::SCRIPT_RUN, None)]);
+        assert_eq!(*asked.lock(), [(kinds::COMPILE, Some(key)), (loops::SCRIPT_RUN, None)]);
 
         let (mut happened, mut ran_loop) = (Vec::new(), false);
-        while !ran_loop || observed.lock().unwrap().is_empty() {
+        while !ran_loop || observed.lock().is_empty() {
             plane.poll(Duration::ZERO);
             plane.happened(&mut happened);
             ran_loop |= happened.iter().any(|it| matches!(it, Happened::Run { id } if *id == looped));
             happened.clear();
         }
-        let seen: Vec<_> = observed.lock().unwrap().iter().map(|&(kind, key, ran_ns, _)| (kind, key, ran_ns)).collect();
+        let seen: Vec<_> = observed.lock().iter().map(|&(kind, key, ran_ns, _)| (kind, key, ran_ns)).collect();
         assert_eq!(seen, [(kinds::COMPILE, Some(key), 0)], "the simulation's tasks take no time");
         plane.ended(Duration::from_millis(5), looped, Outcome::Built);
-        let last = observed.lock().unwrap().last().copied();
+        let last = observed.lock().last().copied();
         assert_eq!(last, Some((loops::SCRIPT_RUN, None, 5_000_000, 0)));
     }
 

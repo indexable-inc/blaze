@@ -7,24 +7,29 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
+use blaze_hash::{HashMap, HashSet};
 use blaze_manifest::manifest::Manifest;
 use blaze_manifest::profiles::{Profiles, requested_profile};
 use blaze_manifest::targets::TargetKind;
 use blaze_manifest::{Context, Workspace};
 use blaze_query::Cancelled;
-use blaze_resolve::resolver::{CompileKind, FeatureOpts, FeatureResolver, ForceAllTargets, HasDevUnits, PackageTargets};
+use blaze_resolve::resolver::{
+    CompileKind, FeatureOpts, FeatureResolver, ForceAllTargets, HasDevUnits, PackageTargets,
+};
 use blaze_resolve::{Cfg, InternedString, PackageId, Platform};
 use cargo_util_schemas::core::PartialVersion;
 use cargo_util_schemas::manifest::{ProfileName, RustVersion, TomlProfile, TomlProfiles};
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::files::Snap;
 use super::manifest::WorkspaceRead;
 use super::resolve::Resolved;
-use crate::Read;
-use super::{ForeignAsk, Spec, Staged, load_error};
 use super::sandbox::PackageOptOut;
-use crate::query::{LoadError, LockWrite, PackagePlan, StdGraph, StdKey, StdPlanned, StdUnits, TestSandbox, UnitPlan};
+use super::{ForeignAsk, Spec, Staged, load_error};
+use crate::Read;
+use crate::query::{
+    LoadError, LockWrite, PackagePlan, StdGraph, StdKey, StdPlanned, StdUnits, TestSandbox,
+    UnitPlan,
+};
 use crate::schema::{self, Mode, Unit, UnitDep};
 use crate::stdlib::target::{self as platform, CfgArgs};
 use crate::stdlib::{STD_OUT, default_crates, default_features};
@@ -123,9 +128,9 @@ pub(crate) fn units(
         Ok(it) => it,
         Err(error) => return Ok(fail(error)),
     };
-    let members: FxHashSet<PackageId> = resolved.member_ids.iter().copied().collect();
-    let mut by_id: FxHashMap<PackageId, Package<'_>> = FxHashMap::with_capacity_and_hasher(all_ids.len(), Default::default());
-    let mut packages_by_spec: BySpec<'_> = FxHashMap::with_capacity_and_hasher(all_ids.len(), Default::default());
+    let members: HashSet<PackageId> = resolved.member_ids.iter().copied().collect();
+    let mut by_id: HashMap<PackageId, Package<'_>> = HashMap::with_capacity_and_hasher(all_ids.len(), Default::default());
+    let mut packages_by_spec: BySpec<'_> = HashMap::with_capacity_and_hasher(all_ids.len(), Default::default());
     for id in &all_ids {
         let Some((_, manifest)) = resolved.manifests.get(id) else { continue };
         let package = Package { manifest, is_member: members.contains(id) };
@@ -137,9 +142,9 @@ pub(crate) fn units(
         Ok(it) => it,
         Err(error) => return Ok(Staged::Failed(error)),
     };
-    let mut unsandboxed: FxHashSet<&str> = FxHashSet::default();
+    let mut unsandboxed: HashSet<&str> = HashSet::default();
     // A member's tests keys, by id: a dependency's own table is not read (it can't opt out).
-    let mut test_sandbox: FxHashMap<PackageId, TestSandbox> = FxHashMap::default();
+    let mut test_sandbox: HashMap<PackageId, TestSandbox> = HashMap::default();
     for (spec, (id, package)) in &packages_by_spec {
         let own = match package.is_member {
             true => match super::sandbox::package(package.manifest.custom_metadata.as_ref(), resolved.manifests[id].0) {
@@ -466,7 +471,7 @@ fn platforms(config: &blaze_manifest::Config<Snap>, spec: &Spec) -> Result<Platf
 
 /// What the feature resolver reads of the packages.
 struct Targets<'a> {
-    reads: &'a FxHashMap<PackageId, Read>,
+    reads: &'a HashMap<PackageId, Read>,
     host: &'a Platformed,
     target: Option<&'a Platformed>,
 }
@@ -541,7 +546,7 @@ fn run_one(graph: &schema::UnitGraph, filter: &Filter) -> anyhow::Result<()> {
 }
 
 /// The packages by the spec a unit's `pkg_id` names them by.
-type BySpec<'a> = FxHashMap<String, (PackageId, Package<'a>)>;
+type BySpec<'a> = HashMap<String, (PackageId, Package<'a>)>;
 
 /// The first unit that depends on an artifact dependency (`-Z bindeps`, #601), which blaze
 /// does not build: refused, naming both. Units that depend on none build.

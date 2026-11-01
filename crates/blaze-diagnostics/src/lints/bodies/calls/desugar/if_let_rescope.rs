@@ -11,6 +11,7 @@
 //! `compiler/rustc_hir/src/intravisit.rs` (`walk_expr`, as `FindSignificantDropper` visits:
 //! a block's value only, no nested body) (MIT or Apache-2.0).
 
+use blaze_hash::{HashMap, HashSet};
 use blaze_items::{Fact, ItemId};
 use hir_def::{
     ModuleDefId,
@@ -21,13 +22,14 @@ use hir_ty::{
     Adjust,
     next_solver::{Ty, TyKind},
 };
-use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::IntoKind as _;
 use smallvec::SmallVec;
 
-use super::{between, can_be_used_for_suggestions, edition, end_point, significant_drop::SignificantDrops};
+use super::{
+    between, can_be_used_for_suggestions, edition, end_point, significant_drop::SignificantDrops,
+};
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprKind, Hooks, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKind, ExprKinds, Hooks, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag, Level, Span, SuggestionStyle},
 };
@@ -47,9 +49,9 @@ enum Parent {
 #[derive(Default)]
 pub(crate) struct IfLetRescope {
     /// The `if`s of a chain already probed, and the `if` of each `while`.
-    skip: FxHashSet<ExprId>,
+    skip: HashSet<ExprId>,
     /// Where the body's `if`s are, those that are statements, values or `else`s.
-    parents: FxHashMap<ExprId, Parent>,
+    parents: HashMap<ExprId, Parent>,
 }
 
 impl LatePass for IfLetRescope {

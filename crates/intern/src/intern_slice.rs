@@ -15,7 +15,7 @@ use std::{
     ops::Deref,
 };
 
-use rustc_hash::FxBuildHasher;
+use blaze_hash::FixedState;
 
 use crate::{
     sync::OnceLock,
@@ -56,7 +56,7 @@ impl<T: SliceInternable> InternedSlice<T> {
         header: T::Header,
         slice: &[T::SliceType],
     ) -> InternedSliceRef<'a, T> {
-        let hash = FxBuildHasher.hash_one((&header, slice));
+        let hash = FixedState.hash_one((&header, slice));
         let ptr = T::storage().get().intern(hash, header, slice);
         InternedSliceRef { ptr, _marker: PhantomData }
     }

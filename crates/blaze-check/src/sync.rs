@@ -9,6 +9,6 @@ mod once;
 pub use std::sync::{Arc, LockResult, PoisonError, TryLockError, TryLockResult, Weak};
 
 pub use lock::{
-    Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, WaitTimeoutResult,
+    Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, WaitTimeoutResult, lot,
 };
 pub use once::OnceLock;

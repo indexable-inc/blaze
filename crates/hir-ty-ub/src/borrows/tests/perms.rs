@@ -1,7 +1,7 @@
 //! Miri: `tree_borrows/perms.rs`, `mod propagation_optimization_checks`, and
 //! `foreign_access_skipping.rs`, `test_order`.
 
-use rustc_hash::FxHashSet;
+use blaze_hash::HashSet;
 
 use crate::{
     borrows::{
@@ -145,7 +145,7 @@ fn permission_sifa_is_correct() {
 /// The order on `PermissionPriv` is reachability by transitions.
 #[test]
 fn permissionpriv_partialord_is_reachability() {
-    let mut reach = FxHashSet::default();
+    let mut reach = HashSet::default();
     for start in PermissionPriv::exhaustive() {
         reach.insert((start, start));
         for (access, rel) in <(AccessKind, AccessRelatedness)>::exhaustive() {

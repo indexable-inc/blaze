@@ -15,6 +15,7 @@ use std::{
     fmt::{self, Write as _},
 };
 
+use blaze_hash::HashSet;
 use cranelift_codegen::ir::{self, types};
 use hir_def::{
     AdtId, FunctionId, HasModule, VariantId,
@@ -28,9 +29,10 @@ use hir_ty::{
     layout::Layout,
     next_solver::{ConstKind, GenericArgs, Ty, TyKind},
 };
-use hir_ty_mir::mir::{AggregateKind, BinOp, CastKind, MirBody, Operand, OperandKind, Rvalue, UnOp};
+use hir_ty_mir::mir::{
+    AggregateKind, BinOp, CastKind, MirBody, Operand, OperandKind, Rvalue, UnOp,
+};
 use rustc_abi::Size;
-use rustc_hash::FxHashSet;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike as _};
 use smallvec::SmallVec;
 
@@ -318,7 +320,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     | TyKind::Str
             )
         {
-            return self.equal_parts(ty, &mut FxHashSet::default());
+            return self.equal_parts(ty, &mut HashSet::default());
         }
         if matches!(ty.kind(), TyKind::RawPtr(..))
             && matches!(self.ty_layout(ty)?.backend_repr, BackendRepr::ScalarPair { .. })
@@ -1796,7 +1798,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
 
     /// `branch_unless_equal` of two values of `ty`: `memcmp` of bytes, a soft float's `==`.
     /// `seen` are the types already looked at, which ask for the same wherever they are.
-    fn equal_parts(&mut self, ty: Ty<'db>, seen: &mut FxHashSet<Ty<'db>>) -> Result<(), String> {
+    fn equal_parts(&mut self, ty: Ty<'db>, seen: &mut HashSet<Ty<'db>>) -> Result<(), String> {
         let db = self.db();
         let ty = self.fx.normalize(ty);
         if !seen.insert(ty) {

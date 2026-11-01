@@ -29,9 +29,9 @@
 use std::{fmt, net::SocketAddr};
 
 use blaze_core::{Address, Completion, Conn, Done, Effect, FileName, Tag};
+use blaze_hash::HashMap;
 use blaze_ids::radix;
 use blaze_protocol::cbor;
-use rustc_hash::FxHashMap;
 
 use crate::{
     ApiError, Arrived, Envelope, LONGEST_REQUEST, Reply, Request, RequestRef, Response,
@@ -93,8 +93,8 @@ pub struct Server {
     token: Option<String>,
     most_connections: usize,
     listeners: Vec<Listener>,
-    pending: FxHashMap<Tag, Pending>,
-    conns: FxHashMap<Conn, Connection>,
+    pending: HashMap<Tag, Pending>,
+    conns: HashMap<Conn, Connection>,
     failed: Option<String>,
     stopped: bool,
     /// What arrived, handed over at the end of the next [`Server::complete`].
@@ -183,8 +183,8 @@ impl Server {
             token: None,
             most_connections: config.most_connections,
             listeners,
-            pending: FxHashMap::default(),
-            conns: FxHashMap::default(),
+            pending: HashMap::default(),
+            conns: HashMap::default(),
             failed: None,
             stopped: false,
             told,
@@ -280,15 +280,22 @@ impl Server {
         self.flush(conn, effects);
     }
 
-    /// Unlistens and hangs up every connection.
-    pub fn stop(&mut self, effects: &mut Vec<Effect>) {
-        self.stopped = true;
+    /// Stops listening, its connections kept: a stopping daemon's first step, so its socket's
+    /// name is free (and its file gone) before it writes its image, which a client that comes
+    /// meanwhile need not wait on.
+    pub fn unlisten(&mut self, effects: &mut Vec<Effect>) {
         for listener in &mut self.listeners {
             if listener.listening == Listening::Yes {
                 listener.listening = Listening::Ending;
                 effects.push(Effect::Unlisten { tag: listener.tag });
             }
         }
+    }
+
+    /// Unlistens, if it still listens, and hangs up every connection.
+    pub fn stop(&mut self, effects: &mut Vec<Effect>) {
+        self.stopped = true;
+        self.unlisten(effects);
         // alloc: once, as the server stops.
         let mut conns: Vec<Conn> = self.conns.keys().copied().collect();
         radix::sort_copy_by_key(&mut conns, |it| it.0);

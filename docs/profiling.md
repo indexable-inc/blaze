@@ -66,6 +66,8 @@ outermost first. `?` marks a nullable column.
 | unit | utf8? | the codegen unit it was of, from its field `unit` |
 | frame_grow_copies | u64? | blocks its thread's task frames moved to grow them while it was open; null when not counted or closed on another thread |
 | frame_copied_bytes | u64? | bytes those moves copied |
+| awaits | utf8? | what a wait span waits for, from its field `awaits`: a query's key, a lock, a channel; every `wait` span has it |
+| owner | u64? | who runs what it waits for, from its field `owner`: the job (or thread) running the awaited key; null when not known. A `hold` span (a key held across a suspension, such as a codegen round) names its holder here, so its waiters' `owner` matches it |
 
 A query span on a body names it: `infer_query`, `infer_anon_const_query`, `mir_body_query`,
 `body_query`, `body_relative_query` and `body_with_source_map_query` carry the body's crate in
@@ -80,14 +82,14 @@ A file's query spans carry its path in `function`: `parse_query` (one parse per 
 `{macro <id>}`). The same path under several crates is one file lowered again for each;
 `crate_def_map_query` carries its crate.
 
-A wait for a query another task is running is a span `wait`, its `function` naming the query
+A wait for a query another task is running is a span `wait`, its `awaits` (and `function`) naming the query
 it waits for, such as `infer_body_query(Id(1234))`, or a `QueryKey` for the build's own queries.
 Its parent is the asking span, whose self time therefore leaves the wait out, so a convoy behind
 one slow query reads as many waits naming it. `blaze_graph::pump::Flights::get_or_run_named`
 opens it through the hook `pump::span_waits`, which `blaze_profile::install` registers. Jobs it
 pumps while it waits are its children. On a fiber, the span moves with the job and closes where
-the job resumes. The awaited row's path is not in the span yet. Find the awaited run by its
-`infer_query` or `mir_body_query` span on another thread that ends as the waits end.
+the job resumes. Its `owner` is the task running the awaited key (the runner's job), so a convoy
+names both what it waits on and who runs it.
 
 A `Vec` in a frame grows in place while it is the frame's last block. Once something is
 allocated after it, it moves when it grows, copied whole. blaze-mem counts those moves per
@@ -107,11 +109,17 @@ noted only when the span closes on the thread it began on.
 |---|---|---|
 | build_id | u64? | the build, or null |
 | process | u32 | the process id |
-| name | dict | what is counted: `memo hits`, `memo misses`, `joined`, `pool queued`, `pool running`, `frame bytes`, `live bytes`, and per job on a fiber `fiber stack reserved`, `fiber stack deepest`, `fiber stack touched`, `fiber stack grown` (bytes) |
+| name | dict | what is counted: `memo hits`, `memo misses`, `joined`, `pool queued`, `pool running`, `frame bytes`, `live bytes`, `footprint bytes` (the process's physical footprint, all the OS counts against it; `footprint_per_build` gives each build's peak), and per job on a fiber `fiber stack reserved`, `fiber stack deepest`, `fiber stack touched`, `fiber stack grown` (bytes), and per query kind at a build's end `query executed`, `query verified`, `query reran` |
 | t_ns | i64 | when |
 | value | f64 | the value then |
 | fiber | u32? | the fiber a `fiber stack` counter is of, or null |
 | job | u64? | the job that ran on that fiber, or null |
+| query_kind | dict? | the query kind a `query` counter is of, as `spans.query_kind` names it, or null |
+
+At a build's end the daemon notes, per query kind, what the query engine counted
+(`blaze_profile::query_counts`): its runs, the rows it verified without running, and the runs of
+a key that kind had run already in the build. `blaze explain reexecution_per_query_kind` puts them
+beside the spans' own runs, distinct keys and repeats, so repeated work shows directly.
 
 The fiber driver notes the four `fiber stack` counters when a job ends, as one row in the
 recorder (`blaze_profile::fiber_stack`):
@@ -140,17 +148,24 @@ rests on these numbers.
 | hits | u64? | nodes the memo settled without running them |
 | misses | u64? | nodes that ran their task |
 | joined | u64? | nodes that took a task another node ran |
+| tree | utf8? | the digest of the workspace's source tree when the build ended, as `blaze-v2-proof tree <dir>` prints it with `target` and `.git` skipped; null for a build of no directory. Compare it with the same digest of a checkout to tell which tree a build tested: `commit` is null for a snapshot that is not a git checkout |
+| blaze | utf8? | the BLAKE3 hash of the blaze executable that ran the build |
 
 ### `samples`: one row a CPU sample of a running thread
 
 | column | type | |
 |---|---|---|
-| build_id | u64? | the build, or null |
+| build_id | u64? | the build of the span its thread was inside, or null |
 | process | u32 | the process id |
 | thread | u32 | the thread |
 | t_ns | i64 | when it was taken |
 | stack | stack | the call stack, outermost first, each frame demangled |
 | span_id | u64? | the innermost span its thread was inside |
+| cpu | dict? | `on` when its thread was on a CPU; `off` when blocked (sampled on macOS), so what it blocked in shows |
+
+On macOS a blocked thread is sampled too, marked `cpu = off`: `raw_blocks` lists the samples of
+pool workers blocked in a mutex, condition, `kevent` or `read` with no `wait` span open above
+them, each a block that bypasses `blaze_graph::wait`.
 
 ### `provenance`: one row a query of a build that was verified or rerun, with the cause
 
@@ -222,6 +237,21 @@ next job inside no span. Three views read it:
 - `job_spans`: `spans` plus the `job` running on the span's thread when it began.
 - `job_tiles`, below, is built from `job_spans`.
 
+### `errors`: one row an error a build said: a diagnostic of level error, or each function a refused-functions error names
+
+| column | type | |
+|---|---|---|
+| build_id | u64? | the build it was part of; null outside any build |
+| t_ns | i64? | when the daemon said it |
+| crate | dict? | the package of the unit it is of |
+| unit | utf8? | the unit as cargo names it: `serde (build script)` |
+| kind | dict | a stable code: rustc's (E0277) or a deny lint's name, else blaze's: derive-panic, attr-panic, macro-panic, expand-failed, link-native-missing, link-failed, template-refs, refused, daemon-panic, uncoded |
+| function | utf8? | the function or instance it is of: a refused instance, a panicking proc macro |
+| message | utf8 | its first line |
+| detail | utf8? | why: its first help or note, or a refused function's reason |
+| file | utf8? | the file of its primary span |
+| line | u32? | its primary span's line, from 1 |
+
 ### `tiles`: a result, not stored
 
 The explorer's zoomed-out view: the spans of a time range per (process, thread, depth,
@@ -234,11 +264,34 @@ The per-job lane beside the per-thread one: `tiles` with `job u64` in place of `
 `job_spans` (the `tiles` op with `"lane": "job"`). A job that moved between threads is one
 lane. Its waits are gaps, drawn from `job_waits`.
 
+### `links`: one row an image a build linked
+
+| column | type | meaning |
+|---|---|---|
+| build_id | u64 | the build |
+| image | utf8 | the image: the target as cargo names it, `blaze (bin)` |
+| crate | dict? | the package it is of |
+| outcome | dict | `patched` (the kept image patched in place) or `placed` (laid out whole) |
+| dur_ns | i64? | how long linking it took |
+
+### `crate_deps`: one row an edge of a build's crate graph
+
+| column | type | meaning |
+|---|---|---|
+| build_id | u64 | the build |
+| crate | dict | the crate that depends |
+| dep | dict | the crate it depends on |
+| kind | dict | `normal`, `build` or `dev`: the dependency table it is from |
+
+The daemon gives both to `History::linked` and `History::crate_graph` (`crates/blaze-profile/src/facts.rs`) and the next flush writes them.
+
 ### `open`: a result, not stored
 
 The spans each live thread is inside now, which are not `spans` rows until they close: what the
 live feed sends beside the rows that closed. Its columns are `process u32, thread u32,
-thread_name dict, depth u16 (0 outermost), name dict, target dict, start_ns i64`.
+thread_name dict, depth u16 (0 outermost), name dict, target dict, start_ns i64`, then what each
+span is of, as in `spans`: `crate dict?, function utf8?, unit utf8?, awaits utf8?, owner u64?`.
+So a stuck worker names the query key it is inside, not only the query's kind.
 
 ## Utilization: where a build's wall time goes
 
@@ -281,6 +334,25 @@ thread was inside any span, so the time the profile can't account for; it should
 On 2026-10-31, rel2's release build of blaze-engine (74 s) had 66.9% uncovered; build 8 of
 `b2-home-rel`, with the phase spans below, had 0.1% (0.18 s of 134 s).
 
+The gate `blaze_profile::gate::check` holds a profiled build to that bar for each worker and each
+wait. It fails when a worker spends 1% or more of the wall time outside every span
+(`uncovered_per_worker`). It also fails on every perf sample blocked in a mutex, condition
+variable, `kevent` or `read` while no wait span is open on its thread (`raw_blocks`, which names
+the stack), and on every `wait` span without `awaits`. Its verdict names the build's `tree` and `blaze`, the exact tree and
+binary measured, and a history with no such build is an error naming it. Its test runs on a
+profiled self-build named by `BLAZE_PROFILE_FIXTURE` and also fails when that build recorded no
+tree or binary.
+
+`critical_path` walks a build's wait graph backwards from the span that ended last. On a lane (a
+job, or a thread outside jobs) it steps back to the most recent wait that ended before the
+current point. A wait with an `owner` (pump flights, and the `hold` spans of a held key such as a
+codegen round) jumps to the job that ran what it waited on; a wait without one stays on its lane.
+Each row is one stretch of the path: `ran` time on a lane (named by the span that overlaps it
+most) or a `waited` gap. `path_s` is the path's length, `path_pct` its share of the build, and
+`parallelism` the threads' busy time divided by the path. The walk is bounded at 100,000 steps;
+`complete` is false when it stopped there, so a cut-short path says so. A wait that names no owner hides its
+waiter's dependency, so the path is only as complete as the owners are.
+
 Each view whose arguments all have defaults is also a DuckDB view of the same name in every
 `blaze debug sql` query, over the last build to end: `SELECT * FROM uncovered_time`. For another
 build, `blaze explain uncovered_time build=7`.
@@ -308,7 +380,11 @@ Running a build script has no span yet.
 
 Every blaze process keeps a fixed ring per thread, holding that thread's recent spans and
 counter values as `spans` and `counters` rows. Recording allocates nothing and does no I/O. A
-span's fields (`crate`, `function`, `unit`) are interned the first time each value is seen.
+span's fields (`crate`, `function`, `unit`, `awaits`) are interned the first time each value
+is seen, in generations of 16,384 names a shard: a full one becomes the previous and the one
+before it is let go, so a daemon's thousandth build names its keys as its first did. (Until
+2026-11-01 the names were capped at 262,144 a process and dropped past it: build 24 of the
+round 31 daemon had no `function` on its wait spans and most query spans.)
 Next to it, on Linux, a sampler records every running thread's stack 49 times a second
 through `perf_event_open`. Frames are named only when they are written out.
 

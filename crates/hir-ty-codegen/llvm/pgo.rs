@@ -29,7 +29,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 
 use blaze_codegen::settings::Pgo;
 use blaze_ids::{ContentId, Hasher};
@@ -40,6 +40,7 @@ use inkwell::{
     types::AnyTypeEnum,
     values::{BasicValueEnum, FunctionValue},
 };
+use parking_lot::Mutex;
 
 use super::{OWN, Unhandled};
 use crate::backend::{Optimization, Passes};
@@ -140,7 +141,7 @@ pub fn give(id: ContentId, bytes: &[u8]) -> Result<Profile, String> {
             "the profile read for {id:x} has the content ID {found:x}: the store gave other bytes"
         ));
     }
-    let mut given = GIVEN.lock().unwrap_or_else(|it| it.into_inner());
+    let mut given = GIVEN.lock();
     given.retain(|it| it.1.strong_count() > 0);
     if let Some(kept) = given.iter().find(|it| it.0 == id).and_then(|it| it.1.upgrade()) {
         return Ok(Profile { id, _bytes: kept });
@@ -157,7 +158,7 @@ pub fn give(id: ContentId, bytes: &[u8]) -> Result<Profile, String> {
 /// The bytes of the profile given under `id`, with a NUL after them; an error naming it when
 /// nothing holds it.
 pub(super) fn profile(id: ContentId) -> Result<Arc<[u8]>, Unhandled> {
-    let given = GIVEN.lock().unwrap_or_else(|it| it.into_inner());
+    let given = GIVEN.lock();
     given.iter().find(|it| it.0 == id).and_then(|it| it.1.upgrade()).ok_or_else(|| {
         // alloc: an error
         Unhandled::Llvm(format!(

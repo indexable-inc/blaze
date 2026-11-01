@@ -32,6 +32,7 @@ use base_db::Db;
 use blaze_format::{
     FormatError, Part, Placed, Record, Rel, SchemaHash, Slice, Writer, open_as, schema_of,
 };
+use blaze_hash::HashMap;
 use hir_def::{
     DefWithBodyId, FieldId, LocalFieldId, VariantId,
     expr_store::ExpressionStore,
@@ -41,7 +42,6 @@ use hir_def::{
     },
 };
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
-use rustc_hash::FxHashMap;
 use rustc_type_ir::{IntTy, UintTy, inherent::IntoKind as _};
 use smallvec::SmallVec;
 
@@ -54,8 +54,7 @@ use super::{
     UnreachableAfterCall,
 };
 use crate::{
-    InferBodyId,
-    MemoryMap,
+    InferBodyId, MemoryMap,
     check_cache::{Relocate, id_bits, id_of},
     closure_analysis,
     consteval::{AllocationRec, read_allocation, write_allocation},
@@ -191,7 +190,7 @@ pub(crate) fn write<'db>(
         text: Vec::new(),
         // alloc: as above
         allocs: Vec::new(),
-        alloc_places: FxHashMap::default(),
+        alloc_places: HashMap::default(),
         refused: None,
         locations,
     };
@@ -271,7 +270,7 @@ struct Encode<'w, 'db> {
     text: Vec<u8>,
     /// Where each allocation's record is, by the index the words name it with.
     allocs: Vec<u64>,
-    alloc_places: FxHashMap<Allocation<'db>, u32>,
+    alloc_places: HashMap<Allocation<'db>, u32>,
     /// Why the body has no stored form, found where a word could not say so.
     refused: Option<&'static str>,
     locations: Option<Locations<'w>>,
@@ -496,7 +495,7 @@ impl<'db> Encode<'_, 'db> {
     /// Sorted by binding, so equal maps write equal words whatever order they iterate in.
     fn upvar_locals(
         &mut self,
-        upvars: &FxHashMap<BindingId, Vec<(LocalId, closure_analysis::Place)>>,
+        upvars: &HashMap<BindingId, Vec<(LocalId, closure_analysis::Place)>>,
     ) {
         self.count(upvars.len());
         blaze_mem::scratch::with_u32s(|keys| {
@@ -1372,10 +1371,10 @@ impl<'a, 'db> Decode<'a, 'db> {
 
     fn upvar_locals(
         &mut self,
-    ) -> R<FxHashMap<BindingId, Vec<(LocalId, closure_analysis::Place)>>> {
+    ) -> R<HashMap<BindingId, Vec<(LocalId, closure_analysis::Place)>>> {
         let len = self.count()?;
         // alloc: the body's own map, at its length
-        let mut upvars = FxHashMap::with_capacity_and_hasher(len, Default::default());
+        let mut upvars = HashMap::with_capacity_and_hasher(len, Default::default());
         let mut last = None;
         for _ in 0..len {
             let binding = self.word()?;

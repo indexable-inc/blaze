@@ -42,7 +42,7 @@ use std::{
     sync::Arc,
 };
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 use crate::{
     flat::FlatTree, Direction, FlatTreeBuilder, NodeOrToken, SyntaxKind, SyntaxText, TextRange,
@@ -56,7 +56,7 @@ struct FlatRoot {
     /// For a part's root: the file's root, which owns it, and the lazy node it is the part of.
     file: Option<(ptr::NonNull<FlatRoot>, u32)>,
     /// For a file's root: the roots of the parts cursors entered, by their lazy node.
-    parts: RefCell<FxHashMap<u32, ptr::NonNull<FlatRoot>>>,
+    parts: RefCell<HashMap<u32, ptr::NonNull<FlatRoot>>>,
 }
 
 impl Drop for FlatRoot {
@@ -123,7 +123,7 @@ impl FlatRoot {
             return part;
         }
         // clone: once per part, the first time a cursor enters it
-        let tree = self.tree.part(at).clone();
+        let tree = Arc::clone(self.tree.part(at));
         let part = FlatRoot {
             rc: Cell::new(0),
             tree,

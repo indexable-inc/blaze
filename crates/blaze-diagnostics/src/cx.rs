@@ -17,7 +17,7 @@ use blaze_items::{Fact, ItemId, ItemKey, NameHash, SimplifiedType};
 use blaze_mem::Frame;
 use hir::{DisplayTarget, HirFileId, InFile, MacroCallId};
 use hir_expand::{MacroCallKind, MacroDefKind};
-use rustc_hash::FxHashMap;
+
 use smallvec::SmallVec;
 use span::{Edition, FileId};
 use syntax::{
@@ -92,7 +92,7 @@ pub struct Cx<'a, 'db> {
     /// lint's level; none is rustc's defaults.
     lints: Option<&'a crate::lints::CommandLine>,
     /// The file each name shown stands for, as spans were made.
-    named: RefCell<FxHashMap<String, FileId>>,
+    named: RefCell<blaze_hash::HashMap<String, FileId>>,
     /// The paths types are printed by, made the first time one is printed.
     paths: OnceCell<crate::print::Paths<'a>>,
     /// The crate as rustc's early lint pass walks it, made the first time a pass asks.
@@ -123,7 +123,7 @@ impl<'a, 'db> Cx<'a, 'db> {
             files,
             frame,
             lints: None,
-            named: RefCell::new(FxHashMap::default()),
+            named: RefCell::new(blaze_hash::HashMap::default()),
             paths: OnceCell::new(),
             walk: OnceCell::new(),
             items: OnceCell::new(),

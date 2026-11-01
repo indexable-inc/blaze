@@ -95,6 +95,8 @@ const IMAGE: u64 = OWN + 10;
 const LAST_EFFECTS: Duration = Duration::from_secs(2);
 /// How often the plane's and the memory's plots are written to the flight recorder, at most.
 const PLOT_EVERY: Duration = Duration::from_millis(10);
+/// How often the memory by tag goes to the log while the daemon works, at most.
+const MEMORY_LOG_EVERY: Duration = Duration::from_secs(30);
 /// How long a build may have nothing that can move it before it fails with [`Still`]: past
 /// the loop's longest turn and a worker's wake, short of anyone waiting on it.
 const STILL_FOR: Duration = Duration::from_secs(2);
@@ -174,6 +176,7 @@ macro_rules! cx {
             db: &$daemon.db,
             builder: &mut $daemon.jobs,
             pid: $daemon.pid,
+            build: &$daemon.build,
             memory_bytes: arena::own(),
             budget_bytes: $daemon.plane.budget().map_or(0, |it| it.bytes),
             memory: blaze_mem::tag::snapshot,
@@ -226,6 +229,9 @@ pub struct Options {
     pub env: Vec<(String, String)>,
     pub host: String,
     pub color: bool,
+    /// Which blaze the daemon is: its executable's hash and that file as it started
+    /// ([`super::build_of`]), which a client compares with its own before it sends a request.
+    pub build: blaze_api::Build,
     /// The table of directories outside views that user code's checks read
     /// ([`blaze_vfs::outside::dirs`]); the daemon drives its watches for its whole life.
     pub outside: &'static blaze_vfs::outside::Dirs,
@@ -281,6 +287,8 @@ pub struct Daemon<D: Driver, S: Steps> {
     settling: bool,
     failed: Option<Failed>,
     pid: u32,
+    /// Which blaze it is ([`Options::build`]), for [`blaze_api::Status::build`].
+    build: blaze_api::Build,
     started: Started,
     /// Its state directory, in whose `stalls/` a stall's trace is written.
     state: FileName,
@@ -290,21 +298,28 @@ pub struct Daemon<D: Driver, S: Steps> {
     watchdog: Watchdog,
     query_watch: Watchdog,
     step_watch: Watchdog,
+    /// Of unit's steps ended, at half [`Watchdog::STEP_BOUND`]: what every thread is inside is
+    /// written to the log once a quiet stretch, and nothing fails.
+    dump_watch: Watchdog,
     /// Since when nothing could move a build ([`Daemon::still`]), on the driver's clock.
     still_since: Option<u64>,
     /// The effects in flight that end on their own, by tag ([`ends_alone`]): what can still
     /// move a build, where the driver's count holds every watch, listen and receive too.
-    ending: rustc_hash::FxHashMap<Tag, u32>,
+    ending: blaze_hash::HashMap<Tag, u32>,
     /// The plane's nodes that settled: with the spans closed, the progress the watchdog reads.
     settled: u64,
     /// When the plots were last written, on the driver's clock.
     plotted: Duration,
+    /// When the memory by tag was last logged, on the driver's clock.
+    memory_logged: Duration,
 }
 
 /// What of its image a start did not use, each by a rule: the image was written by another
 /// blaze, or a stop cut the journal. An image that is damaged is a [`StartError`] instead.
 #[derive(Default, Debug)]
 pub struct Started {
+    /// The image the database opened; `None` when it started empty ([`Started::cold`]).
+    pub restored: Option<Restored>,
     /// Why the database started empty; `None` when it opened the image's.
     pub cold: Option<Cold>,
     /// The image's VFS tree is of another layout: the journal was loaded alone and every
@@ -373,6 +388,56 @@ impl fmt::Display for Started {
         }
         if let Some(why) = &self.trees {
             write!(f, "{sep}the stored library trees were not read ({why}): library files are parsed")?;
+        }
+        Ok(())
+    }
+}
+
+/// The image a start's database opened, as its log names it.
+#[derive(Clone, Debug)]
+pub struct Restored {
+    pub hash: ContentId,
+    pub len: u64,
+    /// Its [`Shape`](super::image::Shape): hash, bytes and sections.
+    pub shape: String,
+    /// From the start to the image mapped, on the driver's clock.
+    pub mapped_in: Duration,
+}
+
+impl fmt::Display for Restored {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}, mapped in {}", self.shape, super::image::ms(self.mapped_in))
+    }
+}
+
+/// The daemon's memory by tag, for the log: what blaze-mem has committed, then each tag
+/// holding at least [`MemoryLine::SHOWN`], largest first, with its high-water mark. Committed
+/// bytes past the tags' sum are held by no tag.
+pub struct MemoryLine<'a>(pub &'a blaze_mem::tag::Snapshot);
+
+impl MemoryLine<'_> {
+    const SHOWN: u64 = 64 << 20;
+}
+
+impl fmt::Display for MemoryLine<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let gib = |bytes: u64| bytes as f64 / f64::from(1u32 << 30);
+        let memory = self.0;
+        write!(
+            f,
+            "memory: committed {:.2} GiB (most {:.2}), {:.2} GiB in tags",
+            gib(memory.committed),
+            gib(memory.committed_high_water),
+            gib(memory.live()),
+        )?;
+        let mut tags = blaze_mem::Tag::ALL;
+        tags.sort_by_key(|&tag| std::cmp::Reverse(memory.get(tag).live));
+        for tag in tags {
+            let counters = memory.get(tag);
+            if counters.live < Self::SHOWN {
+                break;
+            }
+            write!(f, "; {tag} {:.2} (most {:.2})", gib(counters.live), gib(counters.high_water))?;
         }
         Ok(())
     }
@@ -598,6 +663,8 @@ struct Read {
     journal: Option<Vec<u8>>,
     image: Option<Option<Mapping>>,
     socket_free: bool,
+    /// When the image was mapped, from the start.
+    mapped_in: Duration,
 }
 
 impl<D: Driver, S: Steps> Daemon<D, S> {
@@ -629,6 +696,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let shared = blaze_cas::SharedConfig { root: under(&options.std, "store"), writer: options.writer, tags: STD_STORE };
         let mut std = Store::open_shared(shared, &mut effects);
         let mut read = Read { socket_free: activated, ..Read::default() };
+        let began = driver.now();
         let mut done = Vec::new();
         let socket = format!("/{}", options.socket);
         loop {
@@ -655,7 +723,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                     (READ_JOURNAL, Done::Read(bytes)) => read.journal = Some(bytes),
                     (STAT_IMAGE, Done::Stat(None)) => read.image = Some(None),
                     (STAT_IMAGE, Done::Stat(Some(_))) => effects.push(Effect::Map { file: image.clone(), tag: MAP_IMAGE }),
-                    (MAP_IMAGE, Done::Mapped(mapping)) => read.image = Some(Some(mapping)),
+                    (MAP_IMAGE, Done::Mapped(mapping)) => {
+                        read.image = Some(Some(mapping));
+                        read.mapped_in = driver.now().saturating_sub(began);
+                    }
                     (DIAL, Done::Connected { conn }) => {
                         effects.push(Effect::Hangup { conn, tag: HANG_UP });
                         driver.submit(&mut effects);
@@ -709,13 +780,24 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 started.cold = Some(unrestored(error).map_err(|fault| StartError::image(&image, fault))?);
                 Database::new(config)
             }
-            Some((opened, Ok(()))) => match Database::from_image_with(config.clone(), opened) {
-                Ok(db) => db,
-                Err(error) => {
-                    started.cold = Some(unopened(error).map_err(|fault| StartError::image(&image, fault))?);
-                    Database::new(config)
+            Some((opened, Ok(()))) => {
+                let restored = Restored {
+                    hash: opened.hash(),
+                    len: opened.len(),
+                    shape: super::image::Shape(&*opened).to_string(),
+                    mapped_in: read.mapped_in,
+                };
+                match Database::from_image_with(config.clone(), opened) {
+                    Ok(db) => {
+                        started.restored = Some(restored);
+                        db
+                    }
+                    Err(error) => {
+                        started.cold = Some(unopened(error).map_err(|fault| StartError::image(&image, fault))?);
+                        Database::new(config)
+                    }
                 }
-            },
+            }
         };
         steps.register(&mut db);
         let history = match opened.as_deref() {
@@ -761,6 +843,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             most_connections: 1024,
         };
         let server = Server::new(server_config, &mut effects);
+        // Bound here, not on the first turn: once `start` returns, `blaze serve` says it listens
+        // and writes the ready byte the CLI that started it waits for, and that CLI connects at
+        // once. Every driver binds as the listen is submitted.
+        driver.submit(&mut effects);
         let jobs = Jobs::new(Setup {
             views: format!("/{state}/views"),
             std: format!("/{}", options.std),
@@ -796,16 +882,19 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             settling: false,
             failed: None,
             pid: std::process::id(),
+            build: options.build,
             started,
             state,
             observe,
             watchdog: Watchdog::new(Watchdog::BOUND),
             query_watch: Watchdog::new(Watchdog::QUERY_BOUND),
             step_watch: Watchdog::new(Watchdog::STEP_BOUND),
+            dump_watch: Watchdog::new(Watchdog::STEP_BOUND / 2),
             still_since: None,
-            ending: rustc_hash::FxHashMap::default(),
+            ending: blaze_hash::HashMap::default(),
             settled: 0,
             plotted: Duration::ZERO,
+            memory_logged: Duration::ZERO,
         })
     }
 
@@ -888,6 +977,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             return;
         }
         self.stopping = Some(Stopping::Image);
+        // The socket's name first: the next daemon may bind it while this one writes its
+        // image, and a client that comes meanwhile finds no one rather than waits.
+        self.server.unlisten(&mut self.effects);
         let mut replies = std::mem::take(&mut self.replies);
         self.observe.stop(&mut replies);
         self.send(replies);
@@ -991,7 +1083,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// The stall watchdogs' turn: once the plane's tasks run and what one counts has not moved
     /// for its bound (spans closed, queries completed, unit's steps ended), every job with a
     /// plane request under way fails with the stall, its trace is written to the state
-    /// directory, and the daemon stops.
+    /// directory, and the daemon stops. At half the steps' bound, what every thread is inside
+    /// is written to the log first, so a client's own watchdog that stops the daemon sooner
+    /// still finds it.
     fn watch(&mut self) {
         self.still();
         if self.failed.is_some() {
@@ -1002,6 +1096,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let now = ns(self.driver.now());
         let spans = blaze_profile::flight::progress() + self.settled;
         let queries = blaze_query::db::completed() + self.settled;
+        if let Some(quiet) = self.dump_watch.tick(now, self.settled, busy) {
+            let secs = quiet.for_ns / 1_000_000_000;
+            tracing::warn!("no unit's step ended for {secs} s: {}", blaze_profile::watchdog::running());
+        }
         let found = [
             (self.watchdog.tick(now, spans, busy), still::SPANS),
             (self.query_watch.tick(now, queries, busy), still::QUERIES),
@@ -1100,6 +1198,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let memory = blaze_mem::tag::snapshot();
         blaze_profile::plot(Plot::FrameBytes, memory.get(blaze_mem::Tag::Frames).live);
         blaze_profile::plot(Plot::LiveBytes, memory.live());
+        if now.saturating_sub(self.memory_logged) >= MEMORY_LOG_EVERY {
+            self.memory_logged = now;
+            let said = MemoryLine(&memory).to_string(); // alloc: one line each MEMORY_LOG_EVERY
+            eprintln!("blaze serve: {said}");
+            tracing::info!("{said}");
+        }
     }
 
     /// The session told the time before anything else it is told this turn; intent whose
@@ -1469,5 +1573,21 @@ mod tests {
         let said = error.to_string();
         assert!(said.starts_with("the daemon image /state/db/image: "), "{said}");
         assert!(said.contains("starts from no image"), "{said}");
+    }
+
+    #[test]
+    fn the_memory_line_names_the_tags_holding_the_most_largest_first() {
+        use blaze_mem::{Tag as MemTag, tag::Counters, tag::Snapshot};
+        let mut tags = [Counters::default(); MemTag::COUNT];
+        tags[MemTag::Infer.index()] = Counters { live: 1 << 30, high_water: 2 << 30, ..Counters::default() };
+        tags[MemTag::Query.index()] = Counters { live: 3 << 30, high_water: 3 << 30, ..Counters::default() };
+        tags[MemTag::Parse.index()] = Counters { live: 1 << 20, high_water: 1 << 20, ..Counters::default() };
+        let memory = Snapshot { tags, committed: 5 << 30, committed_high_water: 6 << 30 };
+        let said = MemoryLine(&memory).to_string();
+        let query = said.find(&format!("; {} 3.00 (most 3.00)", MemTag::Query)).expect(&said);
+        let infer = said.find(&format!("; {} 1.00 (most 2.00)", MemTag::Infer)).expect(&said);
+        assert!(query < infer, "{said}");
+        assert!(said.starts_with("memory: committed 5.00 GiB (most 6.00), 4.00 GiB in tags"), "{said}");
+        assert!(!said.contains(&format!("; {} ", MemTag::Parse)), "{said}");
     }
 }

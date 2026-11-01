@@ -28,6 +28,7 @@ use std::{
     num::{IntErrorKind, NonZeroU32},
 };
 
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::radix;
 use cfg::CfgAtom;
 use either::Either;
@@ -35,7 +36,6 @@ use hir::{HirFileId, InFile, ModuleDef};
 use hir_def::{Lookup as _, UseId};
 use hir_expand::MacroCallKind;
 use intern::sym;
-use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
     view::{self as ast, AstNode as _},
@@ -44,11 +44,13 @@ use syntax::{
 use super::{Accepted, Finalize, GroupId, no_args, parse_version};
 use crate::{
     checks::attrs::{
-        Lowered, is,
+        Lowered,
         accept::{Accept, Session},
         args::{ArgParser, Ident, Lit, MetaItem},
+        is,
         parsed::{
-            DeprecatedSince, Parsed, ParsedAttr, Repr, RustcVersion, Stability, StabilityLevel, StableSince,
+            DeprecatedSince, Parsed, ParsedAttr, Repr, RustcVersion, Stability, StabilityLevel,
+            StableSince,
         },
     },
     cx::{Cx, def_range_view as def_range, signature_range_view as signature_range},
@@ -886,17 +888,17 @@ fn is_def_kind(kind: SyntaxKind) -> bool {
 struct Missing<'a> {
     test: bool,
     effective: &'a Effective,
-    uses: FxHashMap<(HirFileId, TextSize), UseId>,
+    uses: HashMap<(HirFileId, TextSize), UseId>,
     /// The node of each of the crate's reachable definitions but its `use`s and its root, made
     /// the first time [`Missing::reachable`] asks: one probe per question, where mapping each
     /// node to its definition costs a `to_def`.
-    nodes: OnceCell<FxHashSet<InFile<SyntaxNodePtr>>>,
+    nodes: OnceCell<HashSet<InFile<SyntaxNodePtr>>>,
 }
 
 impl<'a> Missing<'a> {
     fn new(cx: &'a Cx<'_, '_>) -> Missing<'a> {
         let db = cx.db;
-        let mut uses = FxHashMap::default();
+        let mut uses = HashMap::default();
         for module in crate::checks::modules(cx) {
             let id = hir_def::ModuleId::from(module);
             for use_ in id.def_map(db).module(db, id).scope(db).use_decls() {
@@ -1026,13 +1028,13 @@ impl<'a> Missing<'a> {
 /// `mod` item, a macro's `macro_rules!` or `macro` (a procedural macro's `fn` is its
 /// function's), a field's declaration. A `use` and the crate's root are asked of [`Effective`]
 /// directly; a derive's impl has no node.
-fn reachable_nodes(cx: &Cx<'_, '_>, effective: &Effective) -> FxHashSet<InFile<SyntaxNodePtr>> {
+fn reachable_nodes(cx: &Cx<'_, '_>, effective: &Effective) -> HashSet<InFile<SyntaxNodePtr>> {
     fn ptr<'db, N: ast::AstNode<'db>>(it: Option<InFile<N>>) -> Option<InFile<SyntaxNodePtr>> {
         it.map(|it| it.map(|it| ast::ptr(it.syntax())))
     }
     let db = cx.db;
     // alloc: once per `staged_api` crate (the standard library), the reachable definitions
-    let mut nodes = FxHashSet::default();
+    let mut nodes = HashSet::default();
     for def in effective.reachable_local() {
         let node = match def {
             EffectiveDef::Item(item) => match item {
@@ -1194,36 +1196,36 @@ struct Defs<'a, 'c, 'db> {
     parsed: &'a Lowered<'a>,
     crate_root: HirFileId,
     /// Each owner by its node.
-    index: FxHashMap<InFile<SyntaxNodePtr>, usize>,
+    index: HashMap<InFile<SyntaxNodePtr>, usize>,
     /// The owner of a module file's root, when it has its own (its declaration has none).
-    file_roots: FxHashMap<HirFileId, usize>,
+    file_roots: HashMap<HirFileId, usize>,
     /// The declaration of each module file, in a tree `cx.vsema` handed out.
-    declared: FxHashMap<HirFileId, InFile<ast::Node<'db>>>,
+    declared: HashMap<HirFileId, InFile<ast::Node<'db>>>,
     /// The file each declaration of a module file declares.
-    declares: FxHashMap<InFile<SyntaxNodePtr>, HirFileId>,
+    declares: HashMap<InFile<SyntaxNodePtr>, HirFileId>,
     /// `lookup_stability`: the owner whose `Stability` it is.
-    stability: FxHashMap<InFile<SyntaxNodePtr>, Option<usize>>,
+    stability: HashMap<InFile<SyntaxNodePtr>, Option<usize>>,
     /// `lookup_deprecation_entry`: the owner whose `Deprecated` it is.
-    deprecation: FxHashMap<InFile<SyntaxNodePtr>, Option<usize>>,
+    deprecation: HashMap<InFile<SyntaxNodePtr>, Option<usize>>,
     /// Each module, in the order its first definition comes.
-    modules: FxHashMap<InFile<SyntaxNodePtr>, usize>,
+    modules: HashMap<InFile<SyntaxNodePtr>, usize>,
     /// [`Defs::parent`] of each definition asked about: `order_key`, the lookups and the
     /// annotation kind each ask it, so each definition's ancestors are walked once.
-    parents: RefCell<FxHashMap<InFile<SyntaxNodePtr>, Option<Def<'db>>>>,
+    parents: RefCell<HashMap<InFile<SyntaxNodePtr>, Option<Def<'db>>>>,
 }
 
 impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
     fn new(cx: &'a Cx<'c, 'db>, owners: &'a [Owner<'db>], parsed: &'a Lowered<'a>, crate_root: HirFileId) -> Self {
-        let mut index = FxHashMap::default();
-        let mut file_roots = FxHashMap::default();
+        let mut index = HashMap::default();
+        let mut file_roots = HashMap::default();
         for (at, owner) in owners.iter().enumerate() {
             index.insert(owner.at(), at);
             if owner.node.value.kind() == SyntaxKind::SOURCE_FILE {
                 file_roots.insert(owner.node.file_id, at);
             }
         }
-        let mut declared = FxHashMap::default();
-        let mut declares = FxHashMap::default();
+        let mut declared = HashMap::default();
+        let mut declares = HashMap::default();
         for module in crate::checks::modules(cx) {
             if let Some(file) = module.as_source_file_id(cx.db)
                 && let Some(declaration) = module.declaration_source_view(cx.db)
@@ -1236,7 +1238,7 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
                 declared.insert(HirFileId::from(file), node);
             }
         }
-        let mut modules = FxHashMap::default();
+        let mut modules = HashMap::default();
         if let Some(krate) = owners.iter().find(|it| it.target == Target::Crate) {
             modules.insert(krate.at(), 0);
         }
@@ -1249,10 +1251,10 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
             file_roots,
             declared,
             declares,
-            stability: FxHashMap::default(),
-            deprecation: FxHashMap::default(),
+            stability: HashMap::default(),
+            deprecation: HashMap::default(),
             modules,
-            parents: RefCell::new(FxHashMap::default()),
+            parents: RefCell::new(HashMap::default()),
         }
     }
 

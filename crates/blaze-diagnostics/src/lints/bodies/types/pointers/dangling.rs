@@ -10,7 +10,7 @@
 //! Follows rustc's `compiler/rustc_lint/src/dangling.rs` and `compiler/rustc_lint/src/lints.rs`
 //! (`DanglingPointersFromTemporaries`, `DanglingPointersFromLocals`) (MIT or Apache-2.0).
 
-use hir_ty::db::HirDatabase;
+use blaze_hash::HashMap;
 use hir::InFile;
 use hir_def::{
     AdtId, AttrDefId, CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup,
@@ -19,15 +19,15 @@ use hir_def::{
     signatures::{FnFlags, FunctionSignature},
     src::HasSource,
 };
+use hir_ty::db::HirDatabase;
 use hir_ty::next_solver::{DbInterner, Ty, TyKind};
-use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _};
 use syntax::view::{self as ast, AstNode};
 
 use super::{Inits, has_attr, layout, peel_casts, span, ty_text};
 use crate::{
     lints::{
-        bodies::{BodyCx, ExprKinds, ExprKind, Hooks, LatePass, LintSet, lint_set, types::util},
+        bodies::{BodyCx, ExprKind, ExprKinds, Hooks, LatePass, LintSet, lint_set, types::util},
         registry::LintId,
     },
     lower::{Found, Phase},
@@ -310,7 +310,7 @@ fn pointee_not_1zst<'db>(b: &BodyCx<'_, '_, 'db>, ty: Ty<'db>) -> Option<()> {
 /// value, then the tail of its body's innermost block.
 struct Locals<'s, 'a, 'db> {
     b: &'s BodyCx<'s, 'a, 'db>,
-    inits: &'s FxHashMap<BindingId, ExprId>,
+    inits: &'s HashMap<BindingId, ExprId>,
     fn_ret: &'s FnRet,
     /// The closure whose body it is, or `None` for the function's.
     owner: Option<ExprId>,

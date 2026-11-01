@@ -105,20 +105,6 @@ fn keeps(text: u32, size: u32) -> bool {
 /// stored under it.
 static SUBTREE: Domain = Domain::new("blaze v2 hir-def body tree 1");
 
-/// [`FlatTree::hash_subtree`]'s writes into BLAKE3. Its large writes (the text, the words) are
-/// whole slices, which BLAKE3 hashes many chunks at a time.
-struct Blake3(blaze_ids::Hasher);
-
-impl Hasher for Blake3 {
-    fn write(&mut self, bytes: &[u8]) {
-        self.0.update(bytes);
-    }
-
-    fn finish(&self) -> u64 {
-        self.0.finish().fingerprint().0 as u64
-    }
-}
-
 /// A kept hash, its high half 0 while not made. Whichever thread makes it writes it, and every
 /// one writes the same value; a hash whose high half is 0 is made again each time.
 struct Slot([AtomicU64; 2]);
@@ -1021,9 +1007,9 @@ impl FlatTree {
         if let Some(hash) = slot.and_then(Slot::get) {
             return hash;
         }
-        let mut state = Blake3(blaze_ids::Hasher::of(&SUBTREE));
-        self.hash_subtree(at, &mut state);
-        let hash = state.0.finish().fingerprint().0;
+        let mut hasher = blaze_ids::Hasher::of(&SUBTREE);
+        self.hash_subtree(at, &mut blaze_hash::Blake3Hasher(&mut hasher));
+        let hash = hasher.finish().fingerprint().0;
         if let Some(slot) = slot {
             slot.set(hash);
         }
@@ -1318,7 +1304,7 @@ impl FlatTree {
         // alloc: the copy's text
         let source = Text::from(text.as_str());
 
-        fn close(top: Open, open: &mut [Open], packer: &mut Packer, kept: &mut Vec<(u32, u128)>, offset: u32) {
+        fn close(top: &Open, open: &mut [Open], packer: &mut Packer, kept: &mut Vec<(u32, u128)>, offset: u32) {
             let size = packer.words.len() as u32 - top.new;
             packer.set_size(top.new, size);
             if let Some(parent) = open.last_mut() {
@@ -1343,7 +1329,7 @@ impl FlatTree {
         while it < hi {
             while open.last().is_some_and(|top: &Open| top.end <= it) {
                 let top = open.pop().expect("a node open");
-                close(top, open, packer, kept, offset);
+                close(&top, open, packer, kept, offset);
             }
             let parent = open.last().map_or(NO_PARENT, |top| top.new);
             let kind = self.kind(it);
@@ -1377,7 +1363,7 @@ impl FlatTree {
             it += 1;
         }
         while let Some(top) = open.pop() {
-            close(top, open, packer, kept, offset);
+            close(&top, open, packer, kept, offset);
         }
         radix::sort_copy_by_key_in(kept, |it| it.0, &mut spare.hashes);
         let lazy = self.lazy.as_deref().filter(|_| !lazy_nodes.is_empty()).map(|lazy| {
@@ -2179,16 +2165,17 @@ impl FlatTreeBuilder {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{hash_map::DefaultHasher, BTreeMap},
+        collections::{BTreeMap, hash_map::DefaultHasher},
         hash::{Hash, Hasher},
         ops::Range,
         sync::{
+            Arc, Barrier,
             atomic::{AtomicU32, AtomicUsize, Ordering},
-            Arc, Barrier, Mutex,
         },
     };
 
     use blaze_ids::rng::SplitMix64;
+    use parking_lot::Mutex;
 
     use super::{keeps, Expand, FlatTree, Splice, HUGE, LONG};
     use crate::{
@@ -2299,7 +2286,7 @@ mod tests {
         let text = &source[range];
         let end = text.find('>').expect("a part's number");
         let n: usize = text[1..end].parse().unwrap();
-        let part = PARTS.lock().unwrap()[&n].clone();
+        let part = PARTS.lock()[&n].clone();
         assert_eq!(part.kind(0), kind);
         let mut builder = FlatTreeBuilder::sourced_range(source.clone(), range);
         let part = SyntaxNode::new_flat_root(Arc::new(part));
@@ -2537,7 +2524,7 @@ mod tests {
                 builder.lazy(*kind, text.len() as u32);
                 let mut part = FlatTreeBuilder::new();
                 node(*kind, children, &mut part, false);
-                PARTS.lock().unwrap().insert(*n, part.finish());
+                PARTS.lock().insert(*n, part.finish());
             }
             Shape::Node(kind, children, _) => node(*kind, children, builder, outline),
             Shape::Token(kind, text) => builder.token(*kind, text),
@@ -2838,7 +2825,7 @@ mod tests {
             make_lazy(&mut shape, &mut SplitMix64::new(seed ^ 0x1a2b));
             let tree = build_outline(&shape, expand);
             let lazies: Vec<u32> = tree.lazies().collect();
-            let outline = SyntaxNode::new_flat_root(tree.clone());
+            let outline = SyntaxNode::new_flat_root(Arc::clone(&tree));
             for &at in &lazies {
                 let node = outline.flat_element(at).into_node().unwrap();
                 assert!(tree.is_lazy(at) && node.is_lazy() && !tree.is_parsed(at));
@@ -2890,7 +2877,7 @@ mod tests {
             data: u32,
         ) -> (FlatTree, Vec<(TextRange, Box<str>)>) {
             CALLS.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            blaze_spin::busy(std::time::Duration::from_millis(20));
             expand(kind, source, range, data)
         }
         let body = vec![
@@ -2907,7 +2894,7 @@ mod tests {
                 .map(|_| {
                     scope.spawn(|| {
                         barrier.wait();
-                        tree.part(at).clone()
+                        Arc::clone(tree.part(at))
                     })
                 })
                 .collect();
@@ -2953,15 +2940,15 @@ mod tests {
         assert!(full.source().ptr_eq(&source));
         assert_eq!(full, build_flat(&shape, false));
         assert!(full.heap_size() <= full.len() as usize * 9 + 8, "arrays only, no text");
-        let root = SyntaxNode::new_flat_root(tree.clone());
+        let root = SyntaxNode::new_flat_root(Arc::clone(&tree));
         let body = root.last_child().unwrap();
         assert!(body.is_lazy());
         let token = body.last_token().unwrap();
         assert!(!body.is_lazy());
         assert_eq!(token.text(), " }");
         assert_eq!(token.text_range().end(), TextSize::of(&*source));
-        assert_eq!(token.parent(), Some(body.clone()));
-        let (of, n) = token.parent().unwrap().flat().map(|(it, n)| (it.clone(), n)).unwrap();
+        assert_eq!(token.parent(), Some(body));
+        let (of, n) = token.parent().unwrap().flat().map(|(it, n)| (Arc::clone(it), n)).unwrap();
         assert!(Arc::ptr_eq(&of, &tree) && n == at);
         assert!(tree.part(at).source().ptr_eq(&source));
     }
@@ -3324,7 +3311,7 @@ mod tests {
     fn equal_cursors_are_the_same_element() {
         let flat = SyntaxNode::new_flat_root(Arc::new(build_flat(&random_shape(7), false)));
         let all = elements(&flat);
-        let again = elements(&SyntaxNode::new_flat_root(flat.flat_tree().unwrap().clone()));
+        let again = elements(&SyntaxNode::new_flat_root(Arc::clone(flat.flat_tree().unwrap())));
         for (i, a) in all.iter().enumerate() {
             for (j, b) in again.iter().enumerate() {
                 assert_eq!(a == b, i == j);
@@ -3381,7 +3368,7 @@ mod tests {
             // What goes in: elements of this tree (even `node` or the root) and of another.
             let other_shape = random_shape(seed + 20_000);
             let other = SyntaxNode::new_flat_root(Arc::new(build_flat(&other_shape, false)));
-            let (mut pool, mut shapes) = (all.clone(), Vec::new());
+            let (mut pool, mut shapes) = (all, Vec::new());
             pool.extend(elements(&other));
             preorder(&shape, &mut shapes);
             preorder(&other_shape, &mut shapes);
@@ -3420,19 +3407,10 @@ mod tests {
     /// One BLAKE3 pass over [`FlatTree::hash_subtree`]'s writes from `at`, made apart from
     /// [`FlatTree::subtree_hash`] and its kept slots, to hold them to.
     fn fresh_hash(tree: &FlatTree, at: u32) -> u128 {
-        struct Feed(blaze_ids::Hasher);
-        impl Hasher for Feed {
-            fn write(&mut self, bytes: &[u8]) {
-                self.0.update(bytes);
-            }
-            fn finish(&self) -> u64 {
-                unreachable!("hash_subtree only writes")
-            }
-        }
         static TREE: blaze_ids::Domain = blaze_ids::Domain::new("blaze v2 hir-def body tree 1");
-        let mut feed = Feed(blaze_ids::Hasher::of(&TREE));
-        tree.hash_subtree(at, &mut feed);
-        let id = feed.0.finish();
+        let mut hasher = blaze_ids::Hasher::of(&TREE);
+        tree.hash_subtree(at, &mut blaze_hash::Blake3Hasher(&mut hasher));
+        let id = hasher.finish();
         u128::from_le_bytes(id.0[..16].try_into().unwrap())
     }
 
@@ -3656,7 +3634,7 @@ mod tests {
                 true => std::iter::once(0)
                     .chain((0..6).map(|_| nodes[rng.below(nodes.len() as u64) as usize]))
                     .collect(),
-                false => nodes.clone(),
+                false => nodes,
             };
             for at in ats {
                 let under: Vec<u32> =

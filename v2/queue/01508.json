@@ -1,0 +1,24 @@
+{
+  "id": "01508",
+  "from_lane": "no-fallback-front-lints-drops",
+  "owner": "sched",
+  "paths": [
+    "crates/blaze-graph/src/sched/host.rs",
+    "crates/blaze-graph/src/sched/mod.rs"
+  ],
+  "what": "Make the pool fiber stack size public: host.rs:49 `const STACK: usize = 16 << 20;` becomes `pub const STACK` and is re-exported from sched/mod.rs as `pub use host::STACK as FIBER_STACK;`, keeping usize. blaze-lints large_stack_arrays.rs hand-copies it as FIBER_STACK = 16 << 20 and will pin the copy with a test (FIBER_STACK == blaze_graph::sched::FIBER_STACK as u64) through a blaze-graph dev-dependency, so a change to the scheduler stack cannot leave the lint limits stale.",
+  "state": "open",
+  "created": "2026-11-01T14:05:57Z",
+  "updated": "2026-11-01T14:05:57Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T14:05:57Z",
+      "by": "no-fallback-front-lints-drops",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

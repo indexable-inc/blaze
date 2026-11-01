@@ -10,7 +10,8 @@
 
 use std::{any::Any, sync::Arc};
 
-use base_db::{Db, Crate, all_crates};
+use base_db::{Crate, Db, all_crates};
+use blaze_hash::HashMap;
 use hir_def::{AdtId, FunctionId, MacroId, ModuleDefId, StructId, nameres::crate_def_map};
 use hir_expand::{
     name::Name,
@@ -22,7 +23,6 @@ use hir_expand::{
 };
 use hir_ty::db::HirDatabase;
 use intern::Symbol;
-use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::IntoKind;
 use span::{FileId, Span};
 use syntax::{
@@ -195,7 +195,7 @@ fn flat_input(
     }
     let root = parse.syntax_node().to_flat();
     let (tree, _) = root.flat().ok_or("the input has no flat tree")?;
-    let mut table: FxHashMap<Span, u32> = FxHashMap::default();
+    let mut table: HashMap<Span, u32> = HashMap::default();
     for (index, site) in (0..).zip(sites) {
         table.entry(site).or_insert(index);
     }

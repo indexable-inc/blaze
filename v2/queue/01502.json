@@ -1,0 +1,23 @@
+{
+  "id": "01502",
+  "from_lane": "no-fallback-front",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-lints/baselines/"
+  ],
+  "what": "First baselines for the warn-level lints of brief-lints.md Steps 2-3, from the same self-build log you count blaze::error_debug in (01501). For each lint below, one file crates/blaze-lints/baselines/<tool>.<lint>.txt in baseline.rs's format: one `path<TAB>count` line per workspace file with findings (path from the workspace root), sorted by path, no zero lines (render it with blaze_lints::baseline::Baseline::render of baseline::counts(found) if a driver calls it; else the same text from the log). Lints: clippy: allow_attributes, allow_attributes_without_reason, map_err_ignore, unused_result_ok, let_underscore_must_use, let_underscore_future, unwrap_in_result, panic_in_result_fn, infinite_loop, mutex_atomic, mutex_integer, rc_mutex, arc_with_non_send_sync, iter_over_hash_type; blaze: dropped_error, untyped_error, hash_order_output, wall_clock. They are Allow by default, so the run needs them at warn: `--warn=clippy::<lint>` / `--warn=blaze::<lint>` for these (or the [workspace.metadata.blaze.lints] lines `<lint> = \"warn\"` for the blaze ones). A lint with 0 findings gets no file and goes to deny instead: say which. Send the per-lint totals to blaze-v2:=no-fallback-front.",
+  "state": "open",
+  "created": "2026-11-01T13:28:51Z",
+  "updated": "2026-11-01T13:28:51Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T13:28:51Z",
+      "by": "no-fallback-front",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

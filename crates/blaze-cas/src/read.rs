@@ -442,7 +442,7 @@ impl<'a> Look<'a> {
         let it = &view.tiers[tier];
         // alloc: the listing is the output, for collection and checks
         let mut out = Vec::new();
-        let mut shadow = rustc_hash::FxHashSet::default();
+        let mut shadow = blaze_hash::HashSet::default();
         for table in std::iter::once(&it.delta).chain(&it.prev) {
             for (row, spot) in table.iter(self.held) {
                 if shadow.insert(spot.key) {

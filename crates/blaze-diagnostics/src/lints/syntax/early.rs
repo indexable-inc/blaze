@@ -26,8 +26,8 @@ mod lexer;
 mod macros;
 pub(crate) mod validation;
 
+use blaze_hash::HashMap;
 use hir::{HirFileId, InFile};
-use rustc_hash::FxHashMap;
 use span::SyntaxContext;
 use syntax::{SyntaxKind, SyntaxNodePtr, TextRange, view as ast};
 
@@ -92,15 +92,15 @@ pub(crate) fn allows_unsafe(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange) 
 }
 
 /// The trees of the walk by the macro call (or the item or attribute of an attribute macro or
-/// derive) they are the expansion of: one FxHash probe per lookup, built once per crate with
+/// derive) they are the expansion of: one hash probe per lookup, built once per crate with
 /// its size known.
 pub(crate) struct Expansions<'w, 'db> {
-    by_call: FxHashMap<InFile<SyntaxNodePtr>, &'w Tree<'db>>,
+    by_call: HashMap<InFile<SyntaxNodePtr>, &'w Tree<'db>>,
 }
 
 impl<'w, 'db> Expansions<'w, 'db> {
     pub(crate) fn of(cx: &Cx<'_, '_>, walk: &'w Walk<'db>) -> Expansions<'w, 'db> {
-        let mut by_call = FxHashMap::with_capacity_and_hasher(walk.trees.len(), Default::default());
+        let mut by_call = HashMap::with_capacity_and_hasher(walk.trees.len(), Default::default());
         for tree in &walk.trees {
             let Some(call) = tree.call else { continue };
             let node = call.loc(cx.db).to_node_view(cx.db);

@@ -35,9 +35,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use blaze_hash::HashMap;
 use blaze_mem::{MemError, Slab, Tag as MemTag};
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender};
-use rustc_hash::FxHashMap;
 
 use crate::{
     Address, Command, Completion, Confine, Conn, Cursor, Done, Driver, Effect, FileName, IoError,
@@ -305,15 +305,15 @@ pub struct Kqueue {
     /// By ticks since `start`; the wait ends at the next one due.
     timers: Wheel<Tag>,
     watches: Slab<fsevents::Watch<Watched>>,
-    watch_tags: FxHashMap<Tag, WatchId>,
+    watch_tags: HashMap<Tag, WatchId>,
     /// Stopped, for the next watch.
     spare: Vec<fsevents::Watch<Watched>>,
     /// The flushes a stopping watch had not told.
     untold: Vec<Tag>,
     spawns: Slab<Spawned>,
-    spawn_tags: FxHashMap<Tag, SpawnId>,
+    spawn_tags: HashMap<Tag, SpawnId>,
     listens: Slab<Listening>,
-    listen_tags: FxHashMap<Tag, ListenId>,
+    listen_tags: HashMap<Tag, ListenId>,
     connecting: Slab<Connecting>,
     conns: Slab<Connection>,
     in_flight: usize,
@@ -359,7 +359,7 @@ impl Kqueue {
         let workers = (0..threads.max(1))
             .map(|n| {
                 // clone: setup, one count of each per worker thread.
-                let (root, queue, notify) = (root.clone(), queue.clone(), notify.clone());
+                let (root, queue, notify) = (Arc::clone(&root), queue.clone(), Arc::clone(&notify));
                 std::thread::Builder::new()
                     // alloc: setup, once per thread.
                     .name(format!("blaze-kqueue-{n}"))
@@ -367,8 +367,8 @@ impl Kqueue {
             })
             // alloc: setup, once per driver.
             .collect::<io::Result<Vec<_>>>()?;
-        fn tags<V>() -> FxHashMap<Tag, V> {
-            FxHashMap::with_capacity_and_hasher(TAGS, Default::default())
+        fn tags<V>() -> HashMap<Tag, V> {
+            HashMap::with_capacity_and_hasher(TAGS, Default::default())
         }
         let spawn_dirs = root.join(".blaze-spawn"); // alloc: setup, once per driver.
         Ok(Kqueue {
@@ -534,7 +534,7 @@ impl Kqueue {
         let watch = match self.spare.pop() {
             Some(watch) => watch,
             // clone: one count per watch made, only when no spare one is left; never per event.
-            None => fsevents::Watch::new(Watched(self.notify.clone()))?,
+            None => fsevents::Watch::new(Watched(Arc::clone(&self.notify)))?,
         };
         let id = self.watches.insert(watch);
         let watch = self.watches.get_mut(id).expect("inserted above");
@@ -1735,7 +1735,7 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(10);
             while driver.files.len() < N {
                 assert!(Instant::now() < deadline, "the threads handed back {} of {N}", driver.files.len());
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::yield_now();
             }
             let triggers = driver.notify.triggers.load(Ordering::Relaxed);
             assert_eq!(triggers, batch, "batch {batch}: {triggers} triggers in all for {N} hand-backs each");
@@ -1935,7 +1935,7 @@ mod tests {
         let cursor = batches.last().unwrap().cursor;
         unwatch(&mut driver, Tag(7));
         std::fs::write(root.join("src/while-down.rs"), b"fn f() {}").unwrap();
-        std::thread::sleep(Duration::from_secs(1));
+        fsevents::fseventsd_keeps(Duration::from_secs(1));
         driver.submit(&mut vec![Effect::Journal { dir: name("src"), since: cursor, tag: Tag(8) }]);
         let batches = journal_until(&mut driver, Tag(8), |it| it.caught_up);
         let told: Vec<_> = batches.iter().flat_map(|it| &it.files).collect();
@@ -1989,7 +1989,7 @@ mod tests {
     /// trigger's, never reused.
     struct OldOwners {
         next: u64,
-        owners: FxHashMap<u64, Owner>,
+        owners: HashMap<u64, Owner>,
     }
 
     impl OldOwners {
@@ -2031,7 +2031,7 @@ mod tests {
         for seed in 0..300 {
             let mut rng = Rng::new(seed);
             let mut owners = Owners::new().unwrap();
-            let mut old = OldOwners { next: TRIGGER + 1, owners: FxHashMap::default() };
+            let mut old = OldOwners { next: TRIGGER + 1, owners: HashMap::default() };
             // Each registration made: its id in each, and whether it is live.
             let mut made: Vec<(u64, u64, bool)> = Vec::new();
             for _ in 0..500 {

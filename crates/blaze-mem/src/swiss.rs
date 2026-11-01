@@ -539,7 +539,7 @@ mod tests {
         }
     }
 
-    /// The index against a `HashMap` numbering keys in first-seen order, over seeded keys:
+    /// The index against a `BTreeMap` numbering keys in first-seen order, over seeded keys:
     /// the same values found, every one kept across growths and `release_outgrown`.
     #[cfg(not(blaze_check))]
     #[test]
@@ -548,7 +548,7 @@ mod tests {
             let mut index = Index::new();
             assert_eq!(index.capacity(), 0);
             let mut keys: Vec<u64> = Vec::new();
-            let mut model: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+            let mut model: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
             let mut next = seed;
             for step in 0..40_000 {
                 next = next.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -577,8 +577,14 @@ mod tests {
     /// the key's, and every key inserted before a reader starts is found.
     #[cfg(not(blaze_check))]
     #[test]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the test's one writer at a time, which `Index` asks of its caller: a test thread, not the allocator"
+    )]
     fn readers_race_a_growing_index() {
-        use std::sync::{Mutex, atomic::AtomicU64 as Key};
+        use std::sync::atomic::AtomicU64 as Key;
+
+        use parking_lot::Mutex;
 
         const KEYS: usize = 20_000;
         let index = Index::new();
@@ -589,7 +595,7 @@ mod tests {
             if let Some(value) = index.find(hash_of(key), is) {
                 return value;
             }
-            let mut len = len.lock().unwrap();
+            let mut len = len.lock();
             if let Some(value) = index.find(hash_of(key), is) {
                 return value;
             }
@@ -615,7 +621,7 @@ mod tests {
                 });
             }
         });
-        assert_eq!(*len.lock().unwrap(), KEYS / 2);
+        assert_eq!(*len.lock(), KEYS / 2);
     }
 
     /// A probe reads one line: every group of every level starts on a 32-byte boundary, so its

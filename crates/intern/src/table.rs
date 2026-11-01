@@ -223,16 +223,16 @@ fn in_chunks<E: Send>(
         return check(0..total);
     }
     #[allow(clippy::disallowed_types, reason = "taken only by a chunk that failed, an error path")]
-    let failed = std::sync::Mutex::new(None::<(usize, E)>);
+    let failed = parking_lot::Mutex::new(None::<(usize, E)>);
     jobs(n, &|job| {
         if let Err(error) = check(job * chunk..((job + 1) * chunk).min(total)) {
-            let mut failed = failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut failed = failed.lock();
             if failed.as_ref().is_none_or(|(at, _)| job < *at) {
                 *failed = Some((job, error));
             }
         }
     });
-    match failed.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
+    match failed.into_inner() {
         Some((_, error)) => Err(error),
         None => Ok(()),
     }

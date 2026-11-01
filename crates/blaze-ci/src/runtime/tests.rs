@@ -1,7 +1,7 @@
 use std::{
     io::Write,
     net::{TcpListener, TcpStream},
-    sync::{Arc, Mutex, mpsc},
+    sync::Arc,
     thread,
     time::Duration,
 };
@@ -9,9 +9,10 @@ use std::{
 use blaze_api::http;
 use blaze_ids::ContentId;
 use blaze_vfs::{Mode, Op};
+use parking_lot::Mutex;
 
 use super::{
-    Post, Posts, batches, listen, load, post, save,
+    GITHUB_RETRIES, Post, Posts, batches, listen, load, post, save, waited,
     listen::{Listener, Seen},
 };
 use crate::{
@@ -195,7 +196,7 @@ fn a_warm_webhook_delivery_allocates_only_the_event_it_hands_on() {
     std::fs::write(&path, "It's a Secret to Everybody\n").unwrap();
     let secret = Arc::new(Secret::read(&path).unwrap());
     std::fs::remove_file(&path).unwrap();
-    let (service, inputs) = mpsc::channel();
+    let (service, inputs) = crossbeam_channel::unbounded();
     let shared = Listener::remembering(secret.clone(), "o/r".to_owned(), service, 4);
     let mut parser = http::RequestParser::new(crate::webhook::MOST_PAYLOAD);
     let mut answer = listen::Answer::default();
@@ -343,8 +344,8 @@ fn run_check() -> CheckRun {
 fn github_errors_are_retried_five_times() {
     for (failing, created) in [(0, true), (5, true), (6, false)] {
         let github = Arc::new(Mutex::new(Flaky { failing, calls: 0 }));
-        let (posts, receive) = mpsc::channel();
-        let (service, inputs) = mpsc::channel();
+        let (posts, receive) = crossbeam_channel::unbounded();
+        let (service, inputs) = crossbeam_channel::unbounded();
         posts.send(Post::Create { run: RunId(3), check: run_check() }).unwrap();
         drop(posts);
         post(github.clone(), receive, service, Duration::ZERO);
@@ -354,7 +355,7 @@ fn github_errors_are_retried_five_times() {
         if let Err(what) = result {
             assert!(what.contains("blaze/check") && what.contains("6 times"), "{what}");
         }
-        assert_eq!(github.lock().unwrap().calls, (failing + 1).min(6));
+        assert_eq!(github.lock().calls, (failing + 1).min(6));
     }
 }
 
@@ -384,8 +385,8 @@ fn update(run: u64, id: u64, status: CheckStatus) -> Post {
 #[test]
 fn an_update_with_a_later_one_of_its_run_waiting_is_never_sent() {
     let github = Arc::new(Mutex::new(Recorded::default()));
-    let (posts, receive) = mpsc::channel();
-    let (service, inputs) = mpsc::channel();
+    let (posts, receive) = crossbeam_channel::unbounded();
+    let (service, inputs) = crossbeam_channel::unbounded();
     posts.send(update(1, 11, CheckStatus::Queued)).unwrap();
     posts.send(update(1, 11, CheckStatus::InProgress)).unwrap();
     posts.send(Post::Create { run: RunId(2), check: run_check() }).unwrap();
@@ -393,7 +394,7 @@ fn an_update_with_a_later_one_of_its_run_waiting_is_never_sent() {
     posts.send(update(1, 11, CheckStatus::Success)).unwrap();
     drop(posts);
     post(github.clone(), receive, service, Duration::ZERO);
-    let recorded = github.lock().unwrap();
+    let recorded = github.lock();
     assert_eq!(recorded.created, ["blaze/check"]);
     assert_eq!(recorded.updated, [(33, CheckStatus::InProgress), (11, CheckStatus::Success)]);
     assert!(matches!(inputs.recv(), Ok(Input::Created { run: RunId(2), result: Ok(101) })));
@@ -402,15 +403,15 @@ fn an_update_with_a_later_one_of_its_run_waiting_is_never_sent() {
 #[test]
 fn updates_of_different_runs_are_all_sent_in_order() {
     let github = Arc::new(Mutex::new(Recorded::default()));
-    let (posts, receive) = mpsc::channel();
-    let (service, _inputs) = mpsc::channel();
+    let (posts, receive) = crossbeam_channel::unbounded();
+    let (service, _inputs) = crossbeam_channel::unbounded();
     for id in [5, 4, 6] {
         posts.send(update(id, id, CheckStatus::Failure)).unwrap();
     }
     drop(posts);
     post(github.clone(), receive, service, Duration::ZERO);
     let statuses = [(5, CheckStatus::Failure), (4, CheckStatus::Failure), (6, CheckStatus::Failure)];
-    assert_eq!(github.lock().unwrap().updated, statuses);
+    assert_eq!(github.lock().updated, statuses);
 }
 
 /// Takes `wait` per call, counting how many calls are in flight at once across every lane.
@@ -426,10 +427,10 @@ impl Checks for Slow {
         use std::sync::atomic::Ordering;
         let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.most.fetch_max(now, Ordering::SeqCst);
-        thread::sleep(self.wait);
+        blaze_spin::busy(self.wait);
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         let id: u64 = run.name.parse().unwrap();
-        self.calls.lock().unwrap().push((id, run.status));
+        self.calls.lock().push((id, run.status));
         Ok(id)
     }
 
@@ -439,14 +440,14 @@ impl Checks for Slow {
 }
 
 /// Lanes as `serve` makes them, over fakes that share their counters.
-fn slow_lanes(wait: Duration) -> (Posts, Arc<std::sync::atomic::AtomicUsize>, Arc<Mutex<Vec<(u64, CheckStatus)>>>, mpsc::Receiver<Input>) {
+fn slow_lanes(wait: Duration) -> (Posts, Arc<std::sync::atomic::AtomicUsize>, Arc<Mutex<Vec<(u64, CheckStatus)>>>, crossbeam_channel::Receiver<Input>) {
     let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let most = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let (service, inputs) = mpsc::channel();
+    let (service, inputs) = crossbeam_channel::unbounded();
     let mut lanes = Vec::new();
     for _ in 0..super::POST_LANES {
-        let (to_lane, posts) = mpsc::channel();
+        let (to_lane, posts) = crossbeam_channel::unbounded();
         let fake = Slow { wait, in_flight: in_flight.clone(), most: most.clone(), calls: calls.clone() };
         let service = service.clone();
         thread::spawn(move || post(Arc::new(Mutex::new(fake)), posts, service, Duration::ZERO));
@@ -469,7 +470,7 @@ fn the_runs_of_a_job_post_at_once_each_on_its_lane() {
     }
     assert!(most.load(std::sync::atomic::Ordering::SeqCst) > 1, "every creation was sent alone");
     assert!(started.elapsed() < Duration::from_millis(50) * runs as u32, "{:?}", started.elapsed());
-    assert_eq!(calls.lock().unwrap().len(), runs as usize);
+    assert_eq!(calls.lock().len(), runs as usize);
 }
 
 #[test]
@@ -480,11 +481,11 @@ fn a_runs_posts_stay_in_order_on_its_lane() {
         for run in 0..3 * super::POST_LANES as u64 {
             posts.send(update(run, run, status));
         }
-        thread::sleep(Duration::from_millis(20));
+        let sent = (statuses.iter().position(|it| *it == status).unwrap() + 1) * 3 * super::POST_LANES;
+        blaze_spin::SpinWait::within("the batch's posts", Duration::from_secs(60), || calls.lock().len() >= sent);
     }
     drop(posts);
-    thread::sleep(Duration::from_millis(200));
-    let calls = calls.lock().unwrap();
+    let calls = calls.lock();
     for run in 0..3 * super::POST_LANES as u64 {
         let seen: Vec<CheckStatus> = calls.iter().filter(|(id, _)| *id == run).map(|(_, status)| *status).collect();
         assert!(seen.windows(2).all(|pair| statuses.iter().position(|it| *it == pair[0]) < statuses.iter().position(|it| *it == pair[1])), "{run}: {seen:?}");
@@ -529,7 +530,7 @@ fn needs_loopback_a_delivery_is_checked_answered_and_handed_on_once() {
     std::fs::remove_file(&path).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let at = listener.local_addr().unwrap();
-    let (service, inputs) = mpsc::channel();
+    let (service, inputs) = crossbeam_channel::unbounded();
     let shared = Arc::new(Listener::new(secret.clone(), "o/r".to_owned(), service));
     thread::spawn(move || listen::serve(listener, shared));
 
@@ -557,17 +558,18 @@ fn needs_loopback_a_delivery_is_checked_answered_and_handed_on_once() {
     assert!(inputs.recv_timeout(Duration::from_millis(200)).is_err(), "only the first was handed on");
 }
 
-fn loopback_listener() -> (std::net::SocketAddr, Arc<Secret>, mpsc::Receiver<Input>) {
+fn loopback_listener() -> (std::net::SocketAddr, Arc<Secret>, crossbeam_channel::Receiver<Input>, Arc<Listener>) {
     let path = temp(&format!("webhook-secret-{:?}", thread::current().id()));
     std::fs::write(&path, "It's a Secret to Everybody\n").unwrap();
     let secret = Arc::new(Secret::read(&path).unwrap());
     std::fs::remove_file(&path).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let at = listener.local_addr().unwrap();
-    let (service, inputs) = mpsc::channel();
+    let (service, inputs) = crossbeam_channel::unbounded();
     let shared = Arc::new(Listener::new(secret.clone(), "o/r".to_owned(), service));
-    thread::spawn(move || listen::serve(listener, shared));
-    (at, secret, inputs)
+    let serving = Arc::clone(&shared);
+    thread::spawn(move || listen::serve(listener, serving));
+    (at, secret, inputs, shared)
 }
 
 fn push_body(n: usize) -> String {
@@ -576,7 +578,7 @@ fn push_body(n: usize) -> String {
 
 #[test]
 fn needs_loopback_deliveries_at_once_are_each_answered_by_a_kept_handler() {
-    let (at, secret, inputs) = loopback_listener();
+    let (at, secret, inputs, _) = loopback_listener();
     for round in 0..3 {
         let answered: Vec<u16> = thread::scope(|scope| {
             let sent: Vec<_> = (0..16)
@@ -605,14 +607,27 @@ fn needs_loopback_deliveries_at_once_are_each_answered_by_a_kept_handler() {
 
 #[test]
 fn needs_loopback_a_connection_over_the_most_open_is_answered_503() {
-    let (at, secret, inputs) = loopback_listener();
+    let (at, secret, inputs, shared) = loopback_listener();
     let held: Vec<TcpStream> = (0..listen::MOST_CONNECTIONS).map(|_| TcpStream::connect(at).unwrap()).collect();
-    thread::sleep(Duration::from_millis(200));
+    let open = |count: usize, what: &str| {
+        blaze_spin::SpinWait::within(what, Duration::from_secs(60), || shared.open() == count);
+    };
+    open(listen::MOST_CONNECTIONS, "the listener to take every held connection");
     let body = push_body(0);
     let (status, said) = deliver(at, "over", &sign(secret.expose(), body.as_bytes()), body.as_bytes());
     assert_eq!(status, 503, "{said}");
     drop(held);
-    thread::sleep(Duration::from_millis(200));
+    open(0, "the listener to let go of the held connections");
     assert_eq!(deliver(at, "after", &sign(secret.expose(), body.as_bytes()), body.as_bytes()).0, 202);
     assert!(matches!(inputs.recv_timeout(Duration::from_secs(5)), Ok(Input::Event(_))));
+}
+
+/// A post's retries wait the backoff, doubled after each failure, and the last wait is the
+/// backoff times 2 to the retries less one.
+#[test]
+fn a_posts_waits_double_from_its_backoff() {
+    let backoff = Duration::from_millis(250);
+    let waits: Vec<_> = (0..GITHUB_RETRIES).map(|tried| waited(backoff, tried)).collect();
+    assert_eq!(waits, [250, 500, 1000, 2000, 4000].map(Duration::from_millis));
+    assert_eq!(waited(Duration::MAX, 1), Duration::MAX);
 }

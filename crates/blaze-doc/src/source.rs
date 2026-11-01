@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use hir::{HirFileId, InFile};
 use base_db::Db;
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use syntax::{TextRange, TextSize, view as ast};
 
 use crate::{
@@ -14,18 +14,18 @@ use crate::{
 
 pub(crate) struct Files {
     /// For each file: its crate's index, its index there and where its lines start.
-    by_file: FxHashMap<base_db::FileId, (usize, usize, Arc<[u32]>)>,
+    by_file: HashMap<base_db::FileId, (usize, usize, Arc<[u32]>)>,
     /// Each crate's files, in the order of their indices.
     pub(crate) per_crate: Vec<Vec<SourceFile>>,
     /// The absolute path of every file, for warnings.
-    paths: FxHashMap<base_db::FileId, String>,
+    paths: HashMap<base_db::FileId, String>,
 }
 
 impl Files {
     pub(crate) fn new(db: &Db, places: &Places) -> Files {
-        let mut by_file = FxHashMap::default();
+        let mut by_file = HashMap::default();
         let mut per_crate = vec![];
-        let mut paths = FxHashMap::default();
+        let mut paths = HashMap::default();
         for (krate, documented) in places.crates.iter().enumerate() {
             let root_file = documented.krate.root_file(db);
             let base = path_of(db, root_file)

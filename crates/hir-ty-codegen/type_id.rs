@@ -31,7 +31,6 @@ use rustc_type_ir::{
 };
 use syntax::view::HasVisibility;
 
-use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 
 use super::SymbolResolver;

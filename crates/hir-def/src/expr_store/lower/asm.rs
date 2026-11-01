@@ -1,7 +1,7 @@
 //! Lowering of inline assembly.
+use blaze_hash::{HashMap, HashSet};
 use hir_expand::name::Name;
 use intern::Symbol;
-use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     T,
     view::{self as ast, AstNode, AstToken, HasName, IsString},
@@ -14,8 +14,7 @@ use crate::{
         lower::{ExprCollector, FxIndexSet, ImplTraitLowering},
     },
     hir::{
-        AsmOperand, AsmOptions, AsmPiece, ExprId, InlineAsm, InlineAsmKind,
-        InlineAsmRegOrRegClass,
+        AsmOperand, AsmOptions, AsmPiece, ExprId, InlineAsm, InlineAsmKind, InlineAsmRegOrRegClass,
     },
 };
 
@@ -30,9 +29,9 @@ impl ExprCollector<'_> {
         let mut operands = vec![];
         let mut options = AsmOptions::empty();
 
-        let mut named_pos: FxHashMap<usize, Symbol> = Default::default();
-        let mut named_args: FxHashMap<Symbol, usize> = Default::default();
-        let mut reg_args: FxHashSet<usize> = Default::default();
+        let mut named_pos: HashMap<usize, Symbol> = Default::default();
+        let mut named_args: HashMap<Symbol, usize> = Default::default();
+        let mut reg_args: HashSet<usize> = Default::default();
         for piece in asm.asm_pieces() {
             if !self.check_cfg(piece) {
                 continue;

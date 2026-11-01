@@ -1,6 +1,6 @@
 use std::hash::Hash;
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_hash::{HashMap, HashSet};
 
 use crate::Weight;
 
@@ -18,11 +18,11 @@ use crate::Weight;
 /// all cancel goes on a free list with its buffer, which the next new key takes.
 #[derive(Debug)]
 pub struct Arrangement<K, S, V> {
-    slot: FxHashMap<K, u32>,
+    slot: HashMap<K, u32>,
     rows: Vec<KeyRows<K, S, V>>,
     free: Vec<u32>,
     changed: Vec<K>,
-    changed_set: FxHashSet<K>,
+    changed_set: HashSet<K>,
 }
 
 #[derive(Debug)]
@@ -50,11 +50,11 @@ impl<K: Copy + Eq + Hash, S: Ord + Clone, V: Copy + Eq + Hash> Default for Arran
 impl<K: Copy + Eq + Hash, S: Ord + Clone, V: Copy + Eq + Hash> Arrangement<K, S, V> {
     pub fn new() -> Self {
         Arrangement {
-            slot: FxHashMap::default(),
+            slot: HashMap::default(),
             rows: Vec::new(), // alloc: setup: an empty buffer, grown once and kept
             free: Vec::new(), // alloc: setup: an empty buffer, grown once and kept
             changed: Vec::new(), // alloc: setup: an empty buffer, grown once and kept
-            changed_set: FxHashSet::default(),
+            changed_set: HashSet::default(),
         }
     }
 

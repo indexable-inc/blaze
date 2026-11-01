@@ -137,6 +137,7 @@ def write_nodes(model: Model) -> str:
     out = [HEADER.format(name="nodes")]
     out.append(
         "\n#![allow(non_snake_case)]\n"
+        '#![allow(clippy::needless_pass_by_value, reason = "an `AnyHas*` wrapper takes any node of its trait by value")]\n'
         "use crate::{\n"
         "    SyntaxKind::{self, *},\n"
         "    T,\n"

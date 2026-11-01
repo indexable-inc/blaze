@@ -8,7 +8,7 @@
 //! `check_ops_is_prefix`, `ops_is_prefix`) and its diagnostics in
 //! `compiler/rustc_expand/src/diagnostics.rs` (MIT or Apache-2.0).
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use smallvec::SmallVec;
 use syntax::TextRange;
 
@@ -38,7 +38,7 @@ struct BinderInfo {
     ops: SmallVec<[Kleene; 1]>,
 }
 
-type Binders<'t> = FxHashMap<&'t str, BinderInfo>;
+type Binders<'t> = HashMap<&'t str, BinderInfo>;
 
 /// Where a transcriber defines a macro: the binders of the rule it is in and the operators
 /// of the repetitions it is in (rustc's `MacroState`).

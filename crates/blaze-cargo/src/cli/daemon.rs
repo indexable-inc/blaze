@@ -4,7 +4,7 @@
 use std::{
     io,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use blaze_api::{
@@ -15,11 +15,14 @@ use blaze_api::{
 use blaze_api::units::Installed;
 
 use super::args::DaemonVerb;
+use crate::{raw::process::Reaped, serve::Phase};
 
-/// How long a daemon that was started is waited for, and one that was told to stop.
+/// How long a daemon that was told to stop is waited for.
 pub const PATIENCE: Duration = Duration::from_secs(10);
-/// A socket that comes up within a millisecond is used within one.
-const POLL: Duration = Duration::from_millis(1);
+
+/// How long a daemon this command started is given for each phase of its start
+/// ([`crate::serve::Phase`]): reading a large image is one.
+pub const STARTING: Duration = Duration::from_secs(60);
 
 /// What the commands ask of the daemon, which the tests fake.
 pub trait Api {
@@ -67,9 +70,14 @@ pub enum DaemonError {
     /// A connect to the socket failed for another reason than that nothing listens there:
     /// no daemon is started over it.
     Connect { socket: PathBuf, error: ClientError },
-    /// The daemon was started and nothing listened at its socket within [`PATIENCE`], after
-    /// `tries` connects.
-    NotListening { socket: PathBuf, log: PathBuf, tries: u32, error: ClientError },
+    /// The daemon was started and did not say it listens at its socket within [`STARTING`] of
+    /// the last phase of its start it said.
+    NotListening { socket: PathBuf, log: PathBuf, pid: u32, phase: Phase },
+    /// The daemon was started and ended in `phase`, before it listened, as `ended` says.
+    Exited { socket: PathBuf, log: PathBuf, pid: u32, phase: Phase, ended: Reaped },
+    /// The daemon was started and closed its ready pipe in `phase`, before it listened, and
+    /// had not ended a moment ([`ENDING`]) after.
+    Closed { socket: PathBuf, log: PathBuf, pid: u32, phase: Phase },
 }
 
 impl std::fmt::Display for DaemonError {
@@ -78,10 +86,31 @@ impl std::fmt::Display for DaemonError {
             DaemonError::Connect { socket, error } => {
                 write!(f, "connecting to blaze's daemon at {}: {error}", socket.display())
             }
-            DaemonError::NotListening { socket, log, tries, error } => {
-                // alloc: error path, said once.
-                write!(f, "{} ({tries} connects tried)", not_listening(socket, log, &error.to_string()))
+            DaemonError::NotListening { socket, log, pid, phase } => {
+                f.write_str(&not_listening(socket, log, *pid, *phase))
             }
+            DaemonError::Exited { socket, log, pid, phase, ended } => {
+                let how = match ended {
+                    Reaped::Code(code) => format!("with exit code {code}"), // alloc: an error's text
+                    Reaped::Signal(signal) => format!("by signal {signal}"), // alloc: as above
+                };
+                write!(
+                    f,
+                    "the daemon (`blaze serve`, pid {pid}) was started and ended {how} while {}, before it \
+                     listened at {}; its log {} says why",
+                    phase.doing(),
+                    socket.display(),
+                    log.display()
+                )
+            }
+            DaemonError::Closed { socket, log, pid, phase } => write!(
+                f,
+                "the daemon (`blaze serve`, pid {pid}) was started and closed its ready pipe while {}, before it \
+                 listened at {}, and runs on; its log is {}",
+                phase.doing(),
+                socket.display(),
+                log.display()
+            ),
         }
     }
 }
@@ -99,16 +128,188 @@ pub fn nothing_listens(error: &ClientError) -> bool {
 /// Where systemd or launchd is socket-activating the daemon, the connect itself starts it
 /// (the manager listens and the request waits in its backlog); the CLI starts `blaze serve`
 /// only where no unit serves the socket, and says so.
+///
+/// A command that may start one ([`Start::IfMissing`]) first asks the daemon that answers which
+/// blaze it is ([`builds`]): one of another build is stopped, saying so, and this one started,
+/// so no request of this blaze runs on another's.
 #[cfg(unix)]
 pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
     let socket = crate::serve::socket()?;
     let refused = match Client::unix(&socket) {
-        Ok(client) => return Ok(Some(client)),
+        Ok(client) if start == Start::Never => return Ok(Some(client)),
+        Ok(client) => match this_build(client, &socket)? {
+            Some(client) => return Ok(Some(client)),
+            None => None,
+        },
         Err(error) if !nothing_listens(&error) => return Err(DaemonError::Connect { socket, error }.into()),
         Err(_) if start == Start::Never => return Ok(None),
-        Err(error) => error,
+        Err(error) => Some(error),
     };
-    match activation(&socket)? {
+    if let Some(refused) = refused {
+        say_start(&socket, &refused)?;
+    }
+    use anyhow::Context as _;
+    let (log, ready, mut child) = started()?;
+    let pid = child.id();
+    let heard = heard(&ready, STARTING).context("waiting for the daemon it started to say it listens")?;
+    match heard {
+        Heard::Listening => match Client::unix(&socket) {
+            Ok(client) => Ok(Some(client)),
+            Err(error) => Err(DaemonError::Connect { socket, error }.into()),
+        },
+        Heard::Ended { phase } => {
+            crate::raw::process::ended_within(pid, ENDING)
+                .context("waiting for the daemon that closed its pipe to end")?;
+            let status = child.try_wait().context("asking how the daemon it started ended")?;
+            Err(match status.and_then(reaped) {
+                Some(ended) => DaemonError::Exited { socket, log, pid, phase, ended },
+                None => DaemonError::Closed { socket, log, pid, phase },
+            }
+            .into())
+        }
+        Heard::Nothing { phase } => Err(DaemonError::NotListening { socket, log, pid, phase }.into()),
+    }
+}
+
+/// How a process ended, as its status says.
+#[cfg(unix)]
+fn reaped(status: std::process::ExitStatus) -> Option<Reaped> {
+    use std::os::unix::process::ExitStatusExt as _;
+    status.code().map(Reaped::Code).or_else(|| status.signal().map(Reaped::Signal))
+}
+
+/// How long a daemon of another build that was told to stop is waited for: its image is
+/// written first.
+pub const REPLACING: Duration = Duration::from_secs(120);
+
+/// Whether the daemon a client reached is this blaze ([`builds`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Builds {
+    Same,
+    /// Another build: the daemon's pid and build, and this blaze's.
+    Other { pid: u32, theirs: blaze_api::Build, ours: blaze_api::Build },
+}
+
+/// Asks the daemon on `api` for its [`Status`], and for nothing else, and says whether it is
+/// this blaze: its executable is `ours`, unchanged, or else this blaze's build (`hash`, called
+/// only then, as it reads this blaze's bytes) has its build's hash. A daemon of another schema
+/// can't be told to stop by this one: that is the error, naming both.
+pub fn builds<A: Api>(
+    api: &mut A,
+    socket: &Path,
+    ours: &blaze_api::Executable,
+    hash: impl FnOnce() -> anyhow::Result<blaze_api::Build>,
+) -> anyhow::Result<Builds> {
+    let mut status = None;
+    let mut said = Vec::new();
+    let ok = match api.call(Request::Status, |response, _| match response {
+        ResponseRef::Status(it) => status = Some(it),
+        // alloc: error path, the daemon's errors.
+        ResponseRef::Error(error) => said.push(error.what.to_owned()),
+        _ => {}
+    }) {
+        Ok(ok) => ok,
+        Err(ClientError::Schema { theirs }) => anyhow::bail!(
+            "the daemon at {} speaks API schema {theirs}, this blaze {}: it is another build of blaze, which \
+             this one can't tell to stop; `blaze stop` of that build, or ending its process (its log names its \
+             pid), stops it",
+            socket.display(),
+            blaze_api::SCHEMA
+        ),
+        Err(error) => return Err(error.into()),
+    };
+    let Some(status) = status.filter(|_| ok) else {
+        anyhow::bail!("the daemon at {} answered its Status with no status: {}", socket.display(), said.join("; "));
+    };
+    if status.build.exe == *ours {
+        return Ok(Builds::Same);
+    }
+    let ours = hash()?;
+    if ours.id == status.build.id {
+        return Ok(Builds::Same);
+    }
+    Ok(Builds::Other { pid: status.pid, theirs: status.build, ours })
+}
+
+/// `build`'s path and the start of its hash, as a line names it.
+#[cfg(unix)]
+fn named(build: &blaze_api::Build) -> String {
+    let id = format!("{:x}", build.id); // alloc: a line, once a replaced daemon
+    format!("{} {}", build.exe.path, &id[..id.len().min(12)])
+}
+
+/// The connection `client` was, made again for the command's own request, when its daemon is
+/// this blaze; `None` once one of another build was stopped, for this one to start.
+#[cfg(unix)]
+fn this_build(mut client: Client, socket: &Path) -> anyhow::Result<Option<Client>> {
+    use anyhow::Context as _;
+    let exe = std::env::current_exe().context("finding blaze's own executable")?;
+    let file = std::fs::File::open(&exe).with_context(|| format!("reading blaze itself, {}", exe.display()))?;
+    let ours = crate::serve::executable(&exe, &file)?;
+    let (pid, theirs, ours) = match builds(&mut client, socket, &ours, || crate::serve::build_of(&exe))? {
+        Builds::Same => {
+            return match Client::unix(socket) {
+                Ok(client) => Ok(Some(client)),
+                Err(error) => Err(DaemonError::Connect { socket: socket.to_owned(), error }.into()),
+            };
+        }
+        Builds::Other { pid, theirs, ours } => (pid, theirs, ours),
+    };
+    if activation(socket)? == Installed::Yes {
+        anyhow::bail!(
+            "the daemon socket-activated at {} (pid {pid}) is another build of blaze ({}) than this one ({}): \
+             `blaze daemon install` with this blaze serves this one",
+            socket.display(),
+            named(&theirs),
+            named(&ours)
+        );
+    }
+    eprintln!(
+        "blaze: the daemon at {} (pid {pid}) is another build of blaze ({}), not this one ({}): stopping it and \
+         starting this one",
+        socket.display(),
+        named(&theirs),
+        named(&ours)
+    );
+    let mut client = Client::unix(socket).map_err(|error| DaemonError::Connect { socket: socket.to_owned(), error })?;
+    let ok = Api::call(&mut client, Request::Stop, |_, _| {})
+        .with_context(|| format!("telling the daemon of another build at {} (pid {pid}) to stop", socket.display()))?;
+    if !ok {
+        anyhow::bail!("the daemon of another build at {} (pid {pid}) refused to stop", socket.display());
+    }
+    client.until_hung_up(REPLACING).with_context(|| {
+        format!(
+            "the daemon of another build at {} (pid {pid}) was told to stop and did not end within {}s",
+            socket.display(),
+            REPLACING.as_secs()
+        )
+    })?;
+    if answers(socket)? {
+        anyhow::bail!(
+            "the daemon of another build at {} (pid {pid}) was told to stop and still answers",
+            socket.display()
+        );
+    }
+    // Its end too, not only its hang-up: a daemon as it ends lets go of its socket's name, and
+    // one of an older build removes the file there, whoever's it is by then.
+    let ended = crate::raw::process::ended_within(pid, REPLACING)
+        .with_context(|| format!("waiting for the daemon of another build (pid {pid}) that hung up to end"))?;
+    if !ended {
+        anyhow::bail!(
+            "the daemon of another build (pid {pid}) hung up at {} and did not end within {}s: this one starts \
+             only once it has",
+            socket.display(),
+            REPLACING.as_secs()
+        );
+    }
+    Ok(None)
+}
+
+/// The line a command that starts the daemon says first, or why it starts none: a socket
+/// unit serves `socket` and nothing listens there (`refused`).
+#[cfg(unix)]
+fn say_start(socket: &Path, refused: &ClientError) -> anyhow::Result<()> {
+    match activation(socket)? {
         Installed::Yes => {
             let place = blaze_api::units::place_here()?;
             anyhow::bail!(
@@ -129,18 +330,59 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
              start it on demand)"
         ),
     }
-    let log = started()?;
-    let asked = Instant::now();
-    let mut tries = 0u32;
+    Ok(())
+}
+
+/// What the daemon this command started said on its pipe ([`started`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Heard {
+    /// It listens: it said [`Phase::Listening`].
+    Listening,
+    /// The pipe closed first, `phase` the last it said.
+    Ended { phase: Phase },
+    /// Neither, within the wait of `phase`, the last it said.
+    Nothing { phase: Phase },
+}
+
+/// How long a start may stay in `phase`, `long` for each but [`Phase::Waiting`]: the daemon
+/// itself waits at most [`crate::serve::BEFORE_ENDS`] there, for the one before it.
+fn within(phase: Phase, long: Duration) -> Duration {
+    match phase {
+        Phase::Waiting => crate::serve::BEFORE_ENDS + long,
+        Phase::Launched | Phase::State | Phase::Setup | Phase::Listening => long,
+    }
+}
+
+/// Waits for the daemon to say on `ready` that it listens, or to end: at most [`within`] its
+/// phase for each.
+#[cfg(unix)]
+fn heard(ready: &std::io::PipeReader, long: Duration) -> io::Result<Heard> {
+    use std::{io::Read as _, os::fd::AsFd as _};
+    let mut phase = Phase::Launched;
+    // Bounded: each byte read moves to a later phase, of which there are five, or is refused.
     loop {
-        tries += 1;
-        match Client::unix(&socket) {
-            Ok(client) => return Ok(Some(client)),
-            Err(error) if !nothing_listens(&error) => return Err(DaemonError::Connect { socket, error }.into()),
-            Err(error) if asked.elapsed() > PATIENCE => {
-                return Err(DaemonError::NotListening { socket, log, tries, error }.into());
+        if !crate::raw::process::readable_within(ready.as_fd(), within(phase, long))? {
+            return Ok(Heard::Nothing { phase });
+        }
+        let mut byte = [0u8; 1];
+        if (&mut &*ready).read(&mut byte)? == 0 {
+            return Ok(Heard::Ended { phase });
+        }
+        match Phase::of(byte[0]) {
+            Some(Phase::Listening) => return Ok(Heard::Listening),
+            Some(next) if next > phase => phase = next,
+            said => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    // alloc: an error's text
+                    format!(
+                        "the daemon said {:?} on its ready pipe while {}: no later phase of a start",
+                        char::from(byte[0]),
+                        said.unwrap_or(phase).doing()
+                    ),
+                ));
             }
-            Err(_) => std::thread::sleep(POLL),
         }
     }
 }
@@ -165,12 +407,13 @@ pub fn connect(_: Start) -> anyhow::Result<Option<Client>> {
 }
 
 /// What a start that never listened says.
-pub fn not_listening(socket: &Path, log: &Path, error: &str) -> String {
+pub fn not_listening(socket: &Path, log: &Path, pid: u32, phase: Phase) -> String {
     format!(
-        "the daemon (`blaze serve`) was started and nothing listens at {} after {}s ({error}); \
-         its log is {}",
+        "the daemon (`blaze serve`, pid {pid}) was started and did not listen at {}: it was {} for \
+         {}s; its log is {}",
         socket.display(),
-        PATIENCE.as_secs(),
+        phase.doing(),
+        within(phase, STARTING).as_secs(),
         log.display()
     )
 }
@@ -291,19 +534,12 @@ pub fn died() -> anyhow::Result<Died> {
         return Ok(Died { log, ended: None, said: Vec::new() }); // alloc: none, empty
     };
     let said = said.into_iter().map(str::to_owned).collect(); // alloc: as above
-    let asked = Instant::now();
-    let ended = loop {
-        if let Some(reaped) = crate::raw::process::reap(pid) {
-            break Ended::Reaped(reaped);
-        }
-        // A process that is gone but not yet waited for by its parent is still `alive`.
-        if !crate::raw::process::alive(pid) {
-            break Ended::Gone;
-        }
-        if asked.elapsed() > ENDING {
-            break Ended::Running;
-        }
-        std::thread::sleep(POLL);
+    let ended = crate::raw::process::ended_within(pid, ENDING)
+        .with_context(|| format!("waiting for the daemon (pid {pid}) that hung up to end"))?;
+    let ended = match (ended, crate::raw::process::reap(pid)) {
+        (_, Some(reaped)) => Ended::Reaped(reaped),
+        (true, None) => Ended::Gone,
+        (false, None) => Ended::Running,
     };
     Ok(Died { log, ended: Some((pid, ended)), said })
 }
@@ -314,9 +550,12 @@ pub fn died() -> anyhow::Result<Died> {
 }
 
 /// Starts `blaze serve` in a process group of its own, so that what ends this command or its
-/// terminal's foreground does not end it, with its output appended to its log; the log.
+/// terminal's foreground does not end it, with its output appended to its log; the log, and
+/// the pipe it writes one byte to once it listens, which closes with nothing written if it
+/// ends first.
 #[cfg(unix)]
-fn started() -> anyhow::Result<std::path::PathBuf> {
+fn started() -> anyhow::Result<(std::path::PathBuf, std::io::PipeReader, std::process::Child)> {
+    use std::os::{fd::AsRawFd as _, unix::process::CommandExt as _};
     use anyhow::Context as _;
     let state = crate::serve::state()?;
     crate::socket::private_dir(&state).with_context(|| format!("the daemon's directory {}", state.display()))?;
@@ -325,11 +564,16 @@ fn started() -> anyhow::Result<std::path::PathBuf> {
     let file = crate::socket::private_file(options.create(true).append(true), &log)
         .with_context(|| format!("the daemon's log {}", log.display()))?;
     let mut daemon = std::process::Command::new(std::env::current_exe().context("finding blaze's own executable")?);
-    daemon.arg("serve");
+    let (ready, said) = std::io::pipe().context("making the pipe the daemon says it listens on")?;
+    let fd = said.as_raw_fd();
+    daemon.arg("serve").arg("--ready-fd").arg(fd.to_string());
     daemon.stdin(std::process::Stdio::null()).stdout(file.try_clone()?).stderr(file);
-    std::os::unix::process::CommandExt::process_group(&mut daemon, 0);
-    daemon.spawn().context("starting the daemon (`blaze serve`)")?;
-    Ok(log)
+    daemon.process_group(0);
+    crate::raw::process::inherit_in_child(&mut daemon, fd);
+    let child = daemon.spawn().context("starting the daemon (`blaze serve`)")?;
+    // The daemon's copy alone is left, so its end closes the pipe.
+    drop(said);
+    Ok((log, ready, child))
 }
 
 /// `blaze stop`: the daemon made durable and ended, waited for until its socket is gone.
@@ -356,24 +600,19 @@ pub fn stop(err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
     // With a unit installed the socket answers on (the manager listens, and a connect would
     // start the daemon again): the daemon hangs up its connection last, once its image is
     // written.
-    #[cfg(unix)]
-    if activation(&socket)? == Installed::Yes {
-        if let Err(error) = client.until_hung_up(PATIENCE) {
-            let what = format!("the daemon at {} was told to stop: {error}", socket.display());
-            err.write_all(super::say::error(&what, color).as_bytes())?;
-            return Ok(super::FAILED);
-        }
-        return Ok(0);
+    // The daemon stops listening, then hangs up its connection last, once its image is
+    // written. With a unit installed the socket answers on (the manager listens, and a connect
+    // would start the daemon again).
+    if let Err(error) = client.until_hung_up(PATIENCE) {
+        let what = format!("the daemon at {} was told to stop: {error}", socket.display());
+        err.write_all(super::say::error(&what, color).as_bytes())?;
+        return Ok(super::FAILED);
     }
-    drop(client);
-    let asked = Instant::now();
-    while answers(&socket)? {
-        if asked.elapsed() > PATIENCE {
-            let what = format!("the daemon at {} was told to stop and still answers after {}s", socket.display(), PATIENCE.as_secs());
-            err.write_all(super::say::error(&what, color).as_bytes())?;
-            return Ok(super::FAILED);
-        }
-        std::thread::sleep(POLL);
+    #[cfg(unix)]
+    if activation(&socket)? != Installed::Yes && answers(&socket)? {
+        let what = format!("the daemon at {} was told to stop, hung up, and still answers", socket.display());
+        err.write_all(super::say::error(&what, color).as_bytes())?;
+        return Ok(super::FAILED);
     }
     Ok(0)
 }
@@ -389,10 +628,6 @@ fn answers(socket: &Path) -> Result<bool, DaemonError> {
     }
 }
 
-#[cfg(not(unix))]
-fn answers(_: &Path) -> Result<bool, DaemonError> {
-    Ok(false)
-}
 
 /// `blaze status`: what the daemon is doing, on stdout.
 // dyn: the CLI's output writer, written a few times per command.
@@ -527,14 +762,86 @@ mod refusals {
     }
 
     #[test]
-    fn a_refused_connect_names_the_socket_and_a_start_the_tries() {
+    fn a_refused_connect_names_the_socket_and_a_failed_start_its_log() {
         let socket = PathBuf::from("/run/blaze/v2.sock");
         let said = DaemonError::Connect { socket: socket.clone(), error: failed(io::ErrorKind::PermissionDenied) }.to_string();
         assert!(said.starts_with("connecting to blaze's daemon at /run/blaze/v2.sock: "), "{said}");
         let log = PathBuf::from("/c/blaze/v2/serve.log");
-        let said = DaemonError::NotListening { socket, log, tries: 9001, error: failed(io::ErrorKind::ConnectionRefused) }.to_string();
-        assert!(said.contains("nothing listens at /run/blaze/v2.sock after 10s"), "{said}");
-        assert!(said.ends_with("(9001 connects tried)"), "{said}");
+        let said = DaemonError::NotListening { socket: socket.clone(), log: log.clone(), pid: 9, phase: Phase::State }
+            .to_string();
+        assert!(said.contains("(`blaze serve`, pid 9) was started and did not listen at /run/blaze/v2.sock"), "{said}");
+        let reading = "it was reading its state (the VFS journal, the daemon image and the store) for 60s";
+        assert!(said.contains(reading), "{said}");
+        assert!(said.ends_with("its log is /c/blaze/v2/serve.log"), "{said}");
+        let ended = Reaped::Code(101);
+        let said = DaemonError::Exited { socket: socket.clone(), log: log.clone(), pid: 9, phase: Phase::Setup, ended }
+            .to_string();
+        assert!(
+            said.contains(
+                "ended with exit code 101 while installing its store and the toolchain's proc macros, before it \
+                 listened at /run/blaze/v2.sock"
+            ),
+            "{said}"
+        );
+        let ended = Reaped::Signal(11);
+        let said = DaemonError::Exited { socket: socket.clone(), log: log.clone(), pid: 9, phase: Phase::Launched, ended }
+            .to_string();
+        assert!(said.contains("ended by signal 11 while finding its build and its state"), "{said}");
+        let said = DaemonError::Closed { socket, log, pid: 9, phase: Phase::State }.to_string();
+        assert!(said.contains("closed its ready pipe while reading its state"), "{said}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_started_daemon_is_heard_at_its_byte_or_its_end_not_at_the_limit() {
+        use std::io::Write as _;
+        let (ready, mut said) = std::io::pipe().unwrap();
+        let started = std::time::Instant::now();
+        said.write_all(b"\n").unwrap();
+        assert_eq!(heard(&ready, STARTING).unwrap(), Heard::Listening);
+        let (ready, said) = std::io::pipe().unwrap();
+        drop(said);
+        assert_eq!(heard(&ready, STARTING).unwrap(), Heard::Ended { phase: Phase::Launched });
+        assert!(started.elapsed() < PATIENCE / 10, "heard after {:?}", started.elapsed());
+        let (ready, _said) = std::io::pipe().unwrap();
+        assert_eq!(heard(&ready, Duration::from_millis(20)).unwrap(), Heard::Nothing { phase: Phase::Launched });
+    }
+
+    /// A start is connected to only once it says it listens: the phases before are read and
+    /// named, never taken for it, as the daemon of the 06:26 self-build was (connected to while
+    /// it restored its image, before it had bound its socket).
+    /// A start waiting for the daemon before it to end is given as long as that daemon is, and
+    /// the start's own wait on top; every other phase, the start's.
+    #[test]
+    fn a_start_waiting_for_the_daemon_before_it_is_given_that_ones_wait() {
+        assert_eq!(within(Phase::Waiting, STARTING), crate::serve::BEFORE_ENDS + STARTING);
+        for phase in [Phase::Launched, Phase::State, Phase::Setup, Phase::Listening] {
+            assert_eq!(within(phase, STARTING), STARTING);
+        }
+        assert!(Phase::Launched < Phase::Waiting && Phase::Waiting < Phase::State);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_start_is_listening_only_at_its_last_word_and_stops_naming_the_phase_it_reached() {
+        use std::io::Write as _;
+        let (ready, mut said) = std::io::pipe().unwrap();
+        said.write_all(&[Phase::State.byte(), Phase::Setup.byte(), Phase::Listening.byte()]).unwrap();
+        assert_eq!(heard(&ready, STARTING).unwrap(), Heard::Listening);
+        let (ready, mut said) = std::io::pipe().unwrap();
+        said.write_all(&[Phase::State.byte()]).unwrap();
+        assert_eq!(heard(&ready, Duration::from_millis(20)).unwrap(), Heard::Nothing { phase: Phase::State });
+        said.write_all(&[Phase::Setup.byte()]).unwrap();
+        drop(said);
+        assert_eq!(heard(&ready, STARTING).unwrap(), Heard::Ended { phase: Phase::Setup });
+        // Bounded: a phase said again, or one that is no phase, is refused.
+        let (ready, mut said) = std::io::pipe().unwrap();
+        said.write_all(&[Phase::Setup.byte(), Phase::State.byte()]).unwrap();
+        let why = heard(&ready, STARTING).unwrap_err().to_string();
+        assert!(why.contains("no later phase of a start"), "{why}");
+        let (ready, mut said) = std::io::pipe().unwrap();
+        said.write_all(b"x").unwrap();
+        assert!(heard(&ready, STARTING).is_err());
     }
 
     #[test]

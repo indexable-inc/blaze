@@ -2,6 +2,7 @@
 //! `used_trait_imports` on top of the uses of its paths.
 
 use base_db::{Crate, Db};
+use blaze_hash::HashMap;
 use hir_def::{
     expr_store::{ExpressionStore, StoreVisitor, scope::ExprScopes},
     hir::{ExprId, ExprOrPatId, PatId},
@@ -11,7 +12,6 @@ use hir_def::{
     },
     resolver::resolver_for_scope,
 };
-use rustc_hash::FxHashMap;
 
 use crate::{InferBodyId, InferenceResult};
 
@@ -51,11 +51,11 @@ pub fn used_imports_with_traits(db: &Db, krate: Crate) -> UsedImports {
 /// The expression each pattern of `store` is written in (a `let`'s block, a `match`, a closure,
 /// a `let` expression), whose scope holds the items the pattern sees. A parameter's pattern has
 /// none: it sees the body's own scope. Built only for a body with a pattern that picked a trait.
-fn owners_of_patterns(store: &ExpressionStore) -> FxHashMap<PatId, ExprId> {
+fn owners_of_patterns(store: &ExpressionStore) -> HashMap<PatId, ExprId> {
     struct Patterns<'a> {
         store: &'a ExpressionStore,
         owner: ExprId,
-        owners: &'a mut FxHashMap<PatId, ExprId>,
+        owners: &'a mut HashMap<PatId, ExprId>,
     }
 
     impl StoreVisitor for Patterns<'_> {
@@ -68,7 +68,7 @@ fn owners_of_patterns(store: &ExpressionStore) -> FxHashMap<PatId, ExprId> {
     }
 
     // alloc: once per body with a pattern path resolved through a trait in scope, which is rare.
-    let mut owners = FxHashMap::default();
+    let mut owners = HashMap::default();
     for (expr, _) in store.exprs() {
         store.visit_expr_children(expr, Patterns { store, owner: expr, owners: &mut owners });
     }

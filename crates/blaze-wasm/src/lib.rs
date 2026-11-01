@@ -17,11 +17,7 @@ pub mod link;
 pub mod macros;
 pub use blaze_wasm_pack as pack;
 
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use base_db::{
     AbsPathBuf, CrateGraphBuilder, CrateOrigin, CrateWorkspaceData, Db, DependencyBuilder, Env, FileId,
@@ -34,13 +30,14 @@ use blaze_codegen::{
     plan::{Mode, OptLevel, Origin, Override, Package, Policy, Profile},
     settings::{DebugInfo, Panic, Pgo, Sanitize, Toolchain},
 };
+use blaze_hash::HashMap;
 use cfg::{CfgAtom, CfgOptions};
 use hir::{Crate, Module};
 use hir_def::{AssocItemId, FunctionId, ItemContainerId, Lookup as _, ModuleDefId};
 use hir_expand::change::ChangeWithProcMacros;
 use hir_ty_codegen::v2::{Backends, BuildTime, Databases, HashSource, HirFrontend, ItemHashes, RootKind, Runs};
 use intern::Symbol;
-use rustc_hash::FxHashMap;
+use parking_lot::Mutex;
 use span::Edition;
 use triomphe::Arc as TArc;
 
@@ -58,7 +55,7 @@ const DATA_LAYOUT: &str = "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-
 
 pub struct Compiler {
     db: Db,
-    files: FxHashMap<String, FileId>,
+    files: HashMap<String, FileId>,
     /// Files added since the crate graph was last set.
     new_files: bool,
     linker: Linker,
@@ -72,7 +69,7 @@ pub struct Compiler {
 
 /// The store of a compiler with no disk: every put of its builds, by key.
 #[derive(Default)]
-struct Stored(FxHashMap<blaze_cas::Key, Vec<u8>>);
+struct Stored(HashMap<blaze_cas::Key, Vec<u8>>);
 
 impl Lookup for Stored {
     fn read(&self, key: &blaze_cas::Key) -> Result<Option<&[u8]>, String> {
@@ -135,7 +132,7 @@ impl Default for Compiler {
         hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
         Compiler {
             db: Db::new(),
-            files: FxHashMap::default(),
+            files: HashMap::default(),
             new_files: false,
             linker: Linker::default(),
             memo: Memo::new(),
@@ -252,7 +249,7 @@ impl Compiler {
 
     /// Proc macro calls that had no recorded expansion, as `crate::name(input)`.
     pub fn missed(&self) -> Vec<String> {
-        let missed = self.missed.lock().unwrap_or_else(|it| it.into_inner());
+        let missed = self.missed.lock();
         missed.iter().map(|it| format!("{}::{}({})", it.krate, it.name, it.input)).collect()
     }
 
@@ -335,7 +332,7 @@ impl Compiler {
             .find(|it| it.data(db).root_file_id == main)
             .ok_or_else(|| format!("no crate starts at {MAIN}"))?;
         let package = app.extra_data(db).display_name.as_ref().map_or_else(|| "app".to_owned(), |it| it.to_string());
-        let paths: FxHashMap<FileId, String> = self.files.iter().map(|(path, &id)| (id, path.clone())).collect();
+        let paths: HashMap<FileId, String> = self.files.iter().map(|(path, &id)| (id, path.clone())).collect();
         let names = move |file: FileId| paths.get(&file).cloned();
         let frontend = HirFrontend::new(
             Databases::new(db),

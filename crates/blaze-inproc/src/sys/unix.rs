@@ -141,7 +141,11 @@ impl Stream {
         while !header.is_null() {
             // SAFETY: `header` is a control message header within the buffer (CMSG_FIRSTHDR,
             // CMSG_NXTHDR never return one outside it).
-            let (level, kind, len) = unsafe { ((*header).cmsg_level, (*header).cmsg_type, (*header).cmsg_len as usize) };
+            let level = unsafe { (*header).cmsg_level };
+            // SAFETY: `header` is a control message header within the buffer.
+            let kind = unsafe { (*header).cmsg_type };
+            // SAFETY: `header` is a control message header within the buffer.
+            let len = unsafe { (*header).cmsg_len as usize };
             if level == libc::SOL_SOCKET && kind == libc::SCM_RIGHTS {
                 // SAFETY: `CMSG_LEN(0)` is the header's own length, a constant.
                 let data_len = len.saturating_sub(unsafe { libc::CMSG_LEN(0) } as usize);
@@ -151,7 +155,9 @@ impl Stream {
                 for index in 0..count {
                     // SAFETY: `index < count`, in the message's data; unaligned reads, since
                     // the data is only as aligned as the header puts it.
-                    let fd = unsafe { data.add(index).read_unaligned() };
+                    let at = unsafe { data.add(index) };
+                    // SAFETY: `at` is in the message data; read unaligned as above.
+                    let fd = unsafe { at.read_unaligned() };
                     // SAFETY: the kernel installed `fd` in this process for this message:
                     // nothing else owns it.
                     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
@@ -197,12 +203,17 @@ impl Stream {
                 let header = unsafe { libc::CMSG_FIRSTHDR(&raw const message) };
                 // SAFETY: `header` is the first header of the buffer, writable; its data is
                 // `data_len` bytes inside `space`.
-                unsafe {
-                    (*header).cmsg_level = libc::SOL_SOCKET;
-                    (*header).cmsg_type = libc::SCM_RIGHTS;
-                    (*header).cmsg_len = libc::CMSG_LEN(data_len) as _;
-                    std::ptr::copy_nonoverlapping(fds.as_ptr().cast::<u8>(), libc::CMSG_DATA(header), data_len as usize);
-                }
+                unsafe { (*header).cmsg_level = libc::SOL_SOCKET };
+                // SAFETY: `header` is the first writable header of the buffer.
+                unsafe { (*header).cmsg_type = libc::SCM_RIGHTS };
+                // SAFETY: CMSG_LEN computes a length from a length.
+                let len = unsafe { libc::CMSG_LEN(data_len) };
+                // SAFETY: `header` is the first writable header of the buffer.
+                unsafe { (*header).cmsg_len = len as _ };
+                // SAFETY: `header` is the first header; its data is `data_len` bytes inside `space`.
+                let data = unsafe { libc::CMSG_DATA(header) };
+                // SAFETY: the header data is `data_len` bytes inside the writable buffer.
+                unsafe { std::ptr::copy_nonoverlapping(fds.as_ptr().cast::<u8>(), data, data_len as usize) };
             }
             #[cfg(target_os = "linux")]
             let flags = libc::MSG_NOSIGNAL;
@@ -306,9 +317,11 @@ impl Drop for Errno {
             *libc::__errno_location() = self.0;
         }
         #[cfg(target_os = "macos")]
-        // SAFETY: as above.
-        unsafe {
-            *libc::__error() = self.0;
+        {
+            // SAFETY: the calling thread's `errno`, a live thread-local `int`.
+            let errno = unsafe { libc::__error() };
+            // SAFETY: `errno` points to the calling thread's live thread-local `int`.
+            unsafe { *errno = self.0 };
         }
     }
 }

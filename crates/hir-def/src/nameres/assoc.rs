@@ -225,7 +225,7 @@ impl<'db> AssocItemCollector<'db> {
                         // crate failed), skip expansion like we would if it was
                         // disabled. This is analogous to the handling in
                         // `DefCollector::collect_macros`.
-                        if let Some(err) = exp.as_expand_error(self.module_id.krate(self.db)) {
+                        if let Some(err) = exp.as_expand_error(self.db, loc.def.krate) {
                             self.diagnostics.push(DefDiagnostic::macro_error(
                                 self.module_id,
                                 ast_id,

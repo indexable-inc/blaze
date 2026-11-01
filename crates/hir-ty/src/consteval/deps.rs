@@ -15,16 +15,17 @@ mod codec;
 #[cfg(test)]
 mod tests;
 
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, OnceLock};
 
 use base_db::{Crate, Db};
+use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Domain, Hasher};
+use crossbeam_queue::SegQueue;
 use hir_def::{
     ConstId, HasModule,
     deps::{Held as _, ImageStore, Mode, crate_name},
     nameres::frozen,
 };
-use rustc_hash::FxHashMap;
 
 pub use self::codec::VERSION;
 use crate::{
@@ -42,10 +43,6 @@ static DOMAIN: Domain = Domain::new(KEY_DOMAIN);
 /// What [`frozen::record_difference`] names the differences [`Mode::Check`] and
 /// [`Mode::Verify`] find.
 const KIND: &str = "constant values";
-
-/// How many lists [`record`] pushes onto, by the first byte of the item's key: workers that
-/// evaluate constants at once rarely meet on one.
-const SHARDS: usize = 16;
 
 /// The key the value of the constant whose stable key is `item` (`hir_def::deps::const_key`)
 /// is kept under, in the crate whose check results are filed under `base`: what it is made from,
@@ -76,8 +73,8 @@ struct Shared {
     /// Each crate whose constants are kept, with the key its check results are filed under
     /// when that is known now: `None` for a crate checked in this session, whose key is known
     /// only once its bodies are, at [`drain`].
-    crates: FxHashMap<Crate, Option<ContentId>>,
-    pending: [Mutex<Vec<Pending>>; SHARDS],
+    crates: HashMap<Crate, Option<ContentId>>,
+    pending: SegQueue<Pending>,
 }
 
 /// A value [`record`] noted, for [`drain`] to file and write.
@@ -125,7 +122,7 @@ pub fn set(
     db: &mut Db,
     // dyn: the driver's store, as `Shared::store`
     store: Arc<dyn ImageStore + Send + Sync>,
-    crates: FxHashMap<Crate, Option<ContentId>>,
+    crates: HashMap<Crate, Option<ContentId>>,
     mode: Mode,
 ) {
     use blaze_query::db::{Durability, Setter};
@@ -136,8 +133,7 @@ pub fn set(
             return;
         }
     }
-    // alloc: none until a value is noted; an empty `Vec` holds no allocation
-    let pending = std::array::from_fn(|_| Mutex::new(Vec::new()));
+    let pending = SegQueue::new();
     // alloc: setup: the one input value, once per session
     let kept = Kept(Arc::new(Shared { store, mode, crates, pending }));
     match current {
@@ -239,9 +235,7 @@ pub(crate) fn record<'db>(
             }
         }
     }
-    let shard = &site.shared.pending[usize::from(site.item.0[0]) % SHARDS];
-    let pending = Pending { krate: site.krate, def, item: site.item, body };
-    shard.lock().unwrap_or_else(PoisonError::into_inner).push(pending);
+    site.shared.pending.push(Pending { krate: site.krate, def, item: site.item, body });
 }
 
 /// Records a difference between `written`, what `what` wrote of `def` (`None` when it wrote
@@ -300,19 +294,16 @@ pub struct Drained {
 ///
 /// A value the store will not keep, and two values of one key (an evaluation that is not a
 /// function of what its key covers), are errors naming the constant.
-pub fn drain(db: &Db, bases: &FxHashMap<Crate, ContentId>) -> Result<Drained, String> {
+pub fn drain(db: &Db, bases: &HashMap<Crate, ContentId>) -> Result<Drained, String> {
     let Some(kept) = KeptConsts::try_get(db) else { return Ok(Drained::default()) };
     let shared = &*kept.kept(db).0;
     let mut drained = Drained::default();
     // alloc: setup: the values of one session, once
     let mut filed: Vec<(ContentId, Pending)> = Vec::new();
-    for shard in &shared.pending {
-        let taken = std::mem::take(&mut *shard.lock().unwrap_or_else(PoisonError::into_inner));
-        for pending in taken {
-            match bases.get(&pending.krate) {
-                Some(&base) => filed.push((key(base, pending.item), pending)),
-                None => drained.unkeyed += 1,
-            }
+    while let Some(pending) = shared.pending.pop() {
+        match bases.get(&pending.krate) {
+            Some(&base) => filed.push((key(base, pending.item), pending)),
+            None => drained.unkeyed += 1,
         }
     }
     filed.sort_unstable_by(|a, b| a.0.cmp(&b.0));

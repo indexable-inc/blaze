@@ -7,10 +7,10 @@
 
 use std::ops::Range;
 
+use blaze_hash::HashMap;
 use blaze_ids::rng::SplitMix64;
 use blaze_mem::{Tag, frame};
 use hir_ty_mir::mir::BasicBlockId;
-use rustc_hash::FxHashMap;
 
 use crate::{
     bitset::{Transfer, iter_words, words_for},
@@ -41,7 +41,7 @@ pub(super) struct Case<'f> {
     blocks: Vec<Vec<Op>>,
     /// Each edge that is not [`Edge::Same`], once.
     kinds: Vec<((usize, usize), Kind)>,
-    by_edge: FxHashMap<(usize, usize), usize>,
+    by_edge: HashMap<(usize, usize), usize>,
     /// What the start block begins with, a row's length of words.
     boundary: Vec<u64>,
 }
@@ -60,8 +60,8 @@ impl<'f> Case<'f> {
         let lens = vec![1; blocks.len()];
         let cfg = Cfg::from_edges(frame, &lens, edges);
         let mut kinds = Vec::new();
-        let mut by_edge = FxHashMap::default();
-        let mut seen = FxHashMap::default();
+        let mut by_edge = HashMap::default();
+        let mut seen = HashMap::default();
         for &edge in edges {
             if seen.insert(edge, ()).is_some() {
                 continue;

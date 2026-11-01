@@ -56,7 +56,7 @@ pub use fiber::{
 };
 pub(crate) use host::{Host, check_stall, join_pool, leave_pool};
 pub use host::{
-    claim, claim_for, close_scope, count_towards, innermost_scope, job_here, key_done, open_scope, release, wait,
+    Event, EventWait, FIBER_STACK, claim, claim_for, close_scope, count_towards, innermost_scope, job_here, key_done, open_scope, release, wait,
 };
 
 use crate::Key;
@@ -373,11 +373,7 @@ impl Place {
         let words = cores.words();
         let mut parked = Vec::with_capacity(words);
         parked.extend_from_slice(cores.all());
-        let zeros = |words: usize| {
-            let mut bits = Vec::with_capacity(words);
-            bits.resize(words, 0u64);
-            bits
-        };
+        let zeros = |words: usize| vec![0u64; words];
         let mut inbox = Vec::with_capacity(n);
         let mut queue = Vec::with_capacity(n);
         let mut urgent = Vec::with_capacity(n);

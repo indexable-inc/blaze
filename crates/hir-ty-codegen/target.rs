@@ -6,7 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::OnceLock;
 
 use blaze_stencil::TlsModel;
 use cranelift_codegen::{
@@ -14,6 +14,7 @@ use cranelift_codegen::{
     isa::{self, CallConv, OwnedTargetIsa},
     settings::{self, Configurable, OptLevel},
 };
+use parking_lot::Mutex;
 
 static SELECTED: OnceLock<Target> = OnceLock::new();
 
@@ -85,7 +86,7 @@ impl Features {
             Ok(found) => return Ok(found),
             Err(unset) => unset,
         };
-        let _adding = ADDING.lock().unwrap_or_else(PoisonError::into_inner);
+        let _adding = ADDING.lock();
         let free = match find(unset) {
             Ok(found) => return Ok(found),
             Err(free) => free,

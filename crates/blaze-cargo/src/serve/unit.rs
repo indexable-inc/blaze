@@ -52,7 +52,7 @@ mod tests;
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock, atomic::Ordering},
+    sync::{Arc, OnceLock, atomic::Ordering},
     time::Instant,
 };
 
@@ -66,6 +66,7 @@ use blaze_units::{
     schema::{Mode, Unit},
 };
 use blaze_lower::{Crates, Db, Lower, Lowered, ProcMacroLoadResult, Ran};
+use parking_lot::Mutex;
 
 use crate::serve::{
     Paths,
@@ -496,9 +497,10 @@ impl Writer<Real> for UnitWriter {
             let what = "the front end is kept for the head's next build, and another holder of it is still alive";
             return Err(ApiError::new(what, None));
         };
-        let later = std::mem::take(&mut *job.later.lock().unwrap_or_else(|it| it.into_inner()));
-        let seeds = std::mem::take(&mut *job.seeds.lock().unwrap_or_else(|it| it.into_inner()));
-        let used = std::mem::take(&mut *job.memo_used.lock().unwrap_or_else(|it| it.into_inner()));
+        let later = std::mem::take(&mut *job.later.lock());
+        let seeds = std::mem::take(&mut *job.seeds.lock());
+        // alloc: once per front end kept, every entry its units' builds used
+        let used: Vec<ContentId> = job.memo_used.iter().filter_map(OnceLock::get).flatten().copied().collect();
         let memo = Some(job.shared.memos.hold(used));
         Ok(KeptLowered {
             session,
@@ -660,9 +662,9 @@ pub(crate) struct Job {
     /// The code generator's memo, taken once at the job's start: every build of the job reads
     /// and puts in it, and no collection runs while the job holds it.
     pub(crate) memo: Arc<blaze_codegen::memo::Memo>,
-    /// Every memo entry the job's builds took or put ([`blaze_codegen::driver::Built::memo_used`]),
-    /// held with its front end once it is kept.
-    pub(crate) memo_used: Mutex<Vec<ContentId>>,
+    /// Every memo entry each unit's build took or put ([`blaze_codegen::driver::Built::memo_used`]),
+    /// by unit, set once at its link; held with its front end once it is kept.
+    pub(crate) memo_used: Box<[OnceLock<Vec<ContentId>>]>,
     /// What the head's last build used of the memo, kept there until this job's front end is.
     _held: Option<memo::Held>,
 }
@@ -697,7 +699,7 @@ impl Job {
             seeds: Mutex::new(Vec::new()),
             _seeded: Vec::new(),
             memo,
-            memo_used: Mutex::new(Vec::new()),
+            memo_used: (0..slots).map(|_| OnceLock::new()).collect(),
             _held: held,
         })
     }
@@ -713,7 +715,7 @@ impl Job {
         diags: Vec<blaze_diagnostics::Diag>,
         refused: Option<String>,
     ) {
-        self.later.lock().unwrap_or_else(|it| it.into_inner()).push(deps::Later { krate, flags, diags, refused });
+        self.later.lock().push(deps::Later { krate, flags, diags, refused });
     }
 
     pub(crate) fn units(&self) -> &Units {
@@ -866,6 +868,10 @@ impl Front<Real> for JobFront {
             return Err(Failed::Again);
         }
         cancellable(|| compile::compile(&self.0, &reader, unit, phase, images))?
+    }
+
+    fn refused(&self, unit: usize, what: String) -> blaze_api::Diagnostic {
+        say::refused(what, self.0.unit_of(unit).ok(), self.0.input.color)
     }
 
     fn script(&self, unit: usize, tags: u64) -> Result<UnitRuns, ApiError> {

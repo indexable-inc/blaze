@@ -4,9 +4,9 @@ use std::{
     sync::Arc,
 };
 
+use blaze_hash::HashMap;
 use blaze_ids::rng::SplitMix64;
 use expect_test::expect;
-use rustc_hash::FxHashMap;
 use smallvec::smallvec;
 use span::{Edition, Span};
 use syntax::{NodeOrToken, ast, view};
@@ -25,7 +25,7 @@ fn check_punct_spacing(fixture: &str) {
     let parse = ast::SourceFile::parse(fixture, span::Edition::CURRENT);
     assert!(parse.errors().is_empty(), "the fixture parses");
     let subtree = call_input(parse.root(), DummyTestSpanMap, DUMMY, DocCommentDesugarMode::Mbe);
-    let mut annotations: FxHashMap<_, _> = extract_annotations(fixture)
+    let mut annotations: HashMap<_, _> = extract_annotations(fixture)
         .into_iter()
         .map(|(range, annotation)| {
             let spacing = match annotation.as_str() {
@@ -231,7 +231,7 @@ fn an_outline_has_the_token_trees_of_a_full_parse() {
         let full_parse = ast::SourceFile::parse_shared(text.clone(), Edition::CURRENT);
         let outline_parse = ast::SourceFile::parse_outline(text, Edition::CURRENT);
         let (full, outline) = (full_parse.root(), outline_parse.root());
-        let mut in_full = FxHashMap::default();
+        let mut in_full = HashMap::default();
         for node in full.descendants() {
             in_full.entry((node.kind(), node.text_range())).or_insert(node);
         }
@@ -306,8 +306,8 @@ fn a_flat_tree_converts_as_the_cursor_does() {
 /// a walk finding the first node of a kind at a range finds, made once for every view.
 fn nodes_by_kind_and_range(
     root: &syntax::SyntaxNode,
-) -> FxHashMap<(syntax::SyntaxKind, syntax::TextRange), syntax::SyntaxNode> {
-    let mut nodes = FxHashMap::default();
+) -> HashMap<(syntax::SyntaxKind, syntax::TextRange), syntax::SyntaxNode> {
+    let mut nodes = HashMap::default();
     for node in root.descendants() {
         nodes.entry((node.kind(), node.text_range())).or_insert(node);
     }

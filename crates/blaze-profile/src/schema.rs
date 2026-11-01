@@ -118,6 +118,16 @@ pub const SPANS: Table = Table {
             "blocks its thread's task frames moved to grow them while it was open (a block grown while not its frame's last is copied whole); null when not counted or when it closed on another thread",
         ),
         opt("frame_copied_bytes", Type::U64, "bytes those moves copied"),
+        opt(
+            "awaits",
+            Type::Utf8,
+            "what a wait span waits for, from its field `awaits`: a query's key, a lock, a channel; every `wait` span has it",
+        ),
+        opt(
+            "owner",
+            Type::U64,
+            "who runs what it waits for, from its field `owner`: the job (or thread) running the awaited key; null when not known",
+        ),
     ],
 };
 
@@ -133,6 +143,11 @@ pub const COUNTERS: Table = Table {
         col("value", Type::F64, "the value then"),
         opt("fiber", Type::U32, "the fiber a fiber stack counter is of; null for any other counter"),
         opt("job", Type::U64, "the job that ran on that fiber; null for any other counter"),
+        opt(
+            "query_kind",
+            Type::Dict,
+            "the query kind a `query executed`, `query verified` or `query reran` counter is of, as `spans.query_kind` names it; null for any other counter",
+        ),
     ],
 };
 
@@ -185,6 +200,12 @@ pub const BUILDS: Table = Table {
         opt("hits", Type::U64, "nodes the memo settled without running them"),
         opt("misses", Type::U64, "nodes that ran their task"),
         opt("joined", Type::U64, "nodes that took a task another node ran"),
+        opt(
+            "tree",
+            Type::Utf8,
+            "the digest of the workspace's source tree when the build ended, as `blaze-v2-proof tree` makes it (target/ and .git/ left out); null for a build of no directory",
+        ),
+        opt("blaze", Type::Utf8, "the BLAKE3 hash of the blaze executable that ran it"),
     ],
 };
 
@@ -199,6 +220,11 @@ pub const SAMPLES: Table = Table {
         col("t_ns", Type::I64, "when it was taken"),
         col("stack", Type::Stack, "the call stack, outermost first, each frame demangled"),
         opt("span_id", Type::U64, "the innermost span its thread was inside"),
+        opt(
+            "cpu",
+            Type::Dict,
+            "`on` when its thread was on a CPU; `off` when blocked (sampled on macOS), so what it blocked in shows",
+        ),
     ],
 };
 
@@ -305,12 +331,77 @@ pub const OPEN: Table = Table {
         col("name", Type::Dict, "the span's name"),
         col("target", Type::Dict, "its tracing target, as in `spans`"),
         col("start_ns", Type::I64, "when it began"),
+        opt("crate", Type::Dict, "the crate it is of, as in `spans`"),
+        opt("function", Type::Utf8, "the function or query key it is of, as in `spans`"),
+        opt("unit", Type::Utf8, "the codegen unit it is of, as in `spans`"),
+        opt("awaits", Type::Utf8, "what a wait waits for, as in `spans`"),
+        opt("owner", Type::U64, "who runs what it waits for, as in `spans`"),
+    ],
+};
+
+/// One row an error a build said, so "derive panics per build" is a query, not a search of a
+/// log. Rows are written by `History::errored` (observe-history's `errors.rs`).
+pub const ERRORS: Table = Table {
+    name: "errors",
+    doc: "one row an error a build said: a diagnostic of level error, or each function a refused-functions error names",
+    columns: &[
+        BUILD_ID,
+        opt("t_ns", Type::I64, "when the daemon said it"),
+        opt("crate", Type::Dict, "the package of the unit it is of"),
+        opt("unit", Type::Utf8, "the unit as cargo names it: `serde (build script)`"),
+        col(
+            "kind",
+            Type::Dict,
+            "a stable code: rustc's (E0277) or a deny lint's name, else blaze's: derive-panic, attr-panic, macro-panic, expand-failed, link-native-missing, link-failed, template-refs, refused, daemon-panic, uncoded",
+        ),
+        opt("function", Type::Utf8, "the function or instance it is of: a refused instance, a panicking proc macro"),
+        col("message", Type::Utf8, "its first line"),
+        opt("detail", Type::Utf8, "why: its first help or note, or a refused function's reason"),
+        opt("file", Type::Utf8, "the file of its primary span"),
+        opt("line", Type::U32, "its primary span's line, from 1"),
+    ],
+};
+
+/// One row an image a build linked: patched in place or laid out whole (`crate::facts`).
+pub const LINKS: Table = Table {
+    name: "links",
+    doc: "one row an image a build linked, and how",
+    columns: &[
+        BUILD_ID,
+        col("image", Type::Utf8, "the image: the target as cargo names it, `blaze (bin)`"),
+        opt("crate", Type::Dict, "the package it is of"),
+        col("outcome", Type::Dict, "patched (the kept image patched in place) or placed (laid out whole)"),
+        opt("dur_ns", Type::I64, "how long linking it took"),
+    ],
+};
+
+/// One row an edge of the crate graph a build built (`crate::facts`).
+pub const CRATE_DEPS: Table = Table {
+    name: "crate_deps",
+    doc: "one row a dependency of a crate a build built",
+    columns: &[
+        BUILD_ID,
+        col("crate", Type::Dict, "the crate that depends"),
+        col("dep", Type::Dict, "the crate it depends on"),
+        col("kind", Type::Dict, "normal, build or dev: the dependency table it is from"),
     ],
 };
 
 /// Every table the history and the live feed hold.
-pub const TABLES: [&Table; 9] =
-    [&SPANS, &COUNTERS, &BUILDS, &SAMPLES, &PROVENANCE, &INPUTS, &ALLOC_SAMPLES, &HEAP_BY_OWNER, &SWITCHES];
+pub const TABLES: [&Table; 12] = [
+    &SPANS,
+    &COUNTERS,
+    &BUILDS,
+    &SAMPLES,
+    &PROVENANCE,
+    &INPUTS,
+    &ALLOC_SAMPLES,
+    &HEAP_BY_OWNER,
+    &SWITCHES,
+    &ERRORS,
+    &LINKS,
+    &CRATE_DEPS,
+];
 
 /// The tables that are results, made on request and not kept.
 pub const RESULTS: [&Table; 3] = [&TILES, &JOB_TILES, &OPEN];

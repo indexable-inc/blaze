@@ -2,7 +2,7 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     sync::{
-        Arc, Barrier, Mutex, OnceLock,
+        Arc, Barrier, OnceLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
@@ -16,6 +16,7 @@ use blaze_ids::{
 use blaze_image::{Builder, Cause, Corrupt, Image, Refused, SectionId};
 use blaze_vfs::{Bytes, Mode, View, ViewId};
 use intern::Live;
+use parking_lot::Mutex;
 
 use crate::{
     Cancelled, Changed, Config, Cx, Database, DbError, Edge, Input, Mark, MemTree, Names as Lent,
@@ -789,9 +790,9 @@ impl Query for Hold {
     }
     fn execute(_: &mut Cx<'_>, _: &()) -> Result<Num, Cancelled> {
         HELD.store(1, Ordering::SeqCst);
-        while RELEASED.load(Ordering::SeqCst) == 0 {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        blaze_graph::spin::SpinWait::within("the test to release the held query", std::time::Duration::from_secs(60), || {
+            RELEASED.load(Ordering::SeqCst) != 0
+        });
         Ok(Num(5))
     }
 }
@@ -820,7 +821,7 @@ impl Query for AsksHold {
 #[test]
 fn a_query_waiting_on_the_one_worker_frees_it_for_other_jobs() {
     use blaze_graph::{pool::Pool, topology::Topology};
-    use std::{sync::mpsc, time::Duration};
+    use std::time::Duration;
 
     let tree = Arc::new(MemTree::default());
     let mut db = Database::new(config(&tree));
@@ -831,24 +832,22 @@ fn a_query_waiting_on_the_one_worker_frees_it_for_other_jobs() {
     let one = view(&db, &tree, &[("a", "abc")]);
     let pool = Pool::new(&Topology::flat(1), false).expect("a pool");
     let wait = |flag: &AtomicUsize| {
-        let until = std::time::Instant::now() + Duration::from_secs(60);
-        while flag.load(Ordering::SeqCst) == 0 {
-            assert!(std::time::Instant::now() < until, "timed out");
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        blaze_graph::spin::SpinWait::within("a query to set its flag", Duration::from_secs(60), || flag.load(Ordering::SeqCst) != 0);
     };
 
     std::thread::scope(|scope| {
         let holder = scope.spawn(|| db.pin().get::<Hold>(one, &()));
         wait(&HELD);
 
-        let (asked, heard) = mpsc::channel();
+        let (asked, heard) = crossbeam_channel::unbounded();
         {
             let (db, asked) = (db.clone(), asked.clone());
             pool.submit(None, move || db.pin().get::<AsksHold>(one, &()), move |it| _ = asked.send(("asks", it)));
         }
         wait(&ASKING);
-        std::thread::sleep(Duration::from_millis(50));
+        blaze_graph::spin::SpinWait::within("the asking job to park on the held query", Duration::from_secs(60), || {
+            pool.parked() == 1
+        });
 
         {
             let (db, asked) = (db.clone(), asked.clone());
@@ -866,7 +865,9 @@ fn a_query_waiting_on_the_one_worker_frees_it_for_other_jobs() {
             let (db, asked) = (db.clone(), asked.clone());
             pool.submit(None, move || db.pin().get::<AsksHold>(one, &()), move |it| _ = asked.send(("again", it)));
         }
-        std::thread::sleep(Duration::from_millis(50));
+        blaze_graph::spin::SpinWait::within("the second asking job to park on the held query", Duration::from_secs(60), || {
+            pool.parked() == 2
+        });
 
         RELEASED.store(1, Ordering::SeqCst);
         assert_eq!(holder.join().expect("the holder"), Ok(5));
@@ -987,7 +988,7 @@ fn a_value_held_by_a_task_outlives_its_eviction() {
     let until = Instant::now() + Duration::from_secs(60);
     while db.held() > 0 {
         assert!(Instant::now() < until, "the evicted buffer was never freed");
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::yield_now();
     }
 }
 
@@ -1323,7 +1324,7 @@ fn marked(db: &Database, views: bool, roots: &[MemoId], capacity: usize, how: Ma
             (Bits::<_, MemoId>::from_words(Vec::new_in(frame)), Bits::<_, MemoId>::from_words(Vec::new_in(frame)));
         reached.grow(capacity);
         hot.grow(capacity);
-        let mut inputs = hashbrown::HashSet::with_hasher_in(rustc_hash::FxBuildHasher, frame);
+        let mut inputs = hashbrown::HashSet::with_hasher_in(blaze_hash::FixedState, frame);
         db.mark(&task, frame, &states, &mut work, &mut reached, &mut hot, &mut inputs, how);
         assert!(work.is_empty(), "a mark leaves no work");
         let mut inputs: Vec<QueryKey> = inputs.iter().copied().collect();
@@ -1386,7 +1387,7 @@ fn a_parallel_mark_allocates_nothing_on_its_caller() {
             (Bits::<_, MemoId>::from_words(Vec::new_in(frame)), Bits::<_, MemoId>::from_words(Vec::new_in(frame)));
         reached.grow(end);
         hot.grow(end);
-        let mut inputs = hashbrown::HashSet::with_hasher_in(rustc_hash::FxBuildHasher, frame);
+        let mut inputs = hashbrown::HashSet::with_hasher_in(blaze_hash::FixedState, frame);
         blaze_alloc_count::assert_at_most(0, "a parallel mark, on its caller", || {
             db.mark(&task, frame, &states, &mut work, &mut reached, &mut hot, &mut inputs, Mark::Parallel { batch: 64 });
         });
@@ -1493,7 +1494,7 @@ struct Breaking {
 
 impl Tree for Breaking {
     fn file(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
-        if *self.broken.lock().unwrap() == Some(path) {
+        if *self.broken.lock() == Some(path) {
             return Err(BROKEN);
         }
         self.files.file(root, path)
@@ -1512,7 +1513,7 @@ fn a_file_that_fails_its_check_fails_the_request_and_is_read_again() {
     let view = db.open(View { root: tree.files.root(&[("a", b"four".as_slice()), ("b", b"xy".as_slice())]) });
     assert_eq!(db.pin().get::<Double>(view, &"a".to_owned()).err(), Some(DbError::Corrupt(BROKEN)));
     assert_eq!(double(&db, view, "b"), 4, "another file of the view still reads");
-    *tree.broken.lock().unwrap() = None;
+    *tree.broken.lock() = None;
     assert_eq!(double(&db, view, "a"), 8, "the failed read was not kept");
     assert_eq!(runs("len"), 3);
 }
@@ -1675,7 +1676,7 @@ fn a_tree_that_lists_out_of_order_stops_the_read_naming_the_directory() {
 static SPREAD: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
 
 fn spread_runs(name: &str) -> usize {
-    SPREAD.lock().unwrap().as_ref().and_then(|runs| runs.get(name).copied()).unwrap_or(0)
+    SPREAD.lock().as_ref().and_then(|runs| runs.get(name).copied()).unwrap_or(0)
 }
 
 /// The length of a file, `u64::MAX` for none, its runs counted by name across threads: the
@@ -1697,7 +1698,7 @@ impl Query for Spread {
             "gone" => panic!("spread was asked of {key}, which is gone"),
             _ => {}
         }
-        *SPREAD.lock().unwrap().get_or_insert_with(HashMap::new).entry(key.clone()).or_default() += 1;
+        *SPREAD.lock().get_or_insert_with(HashMap::new).entry(key.clone()).or_default() += 1;
         Ok(Num(cx.file(key)?.map_or(u64::MAX, |file| file.bytes.len() as u64)))
     }
 }
@@ -1919,7 +1920,7 @@ fn collect_until_freed(db: &Database) {
             return;
         }
         assert!(std::time::Instant::now() < deadline, "what the collections let go of was never freed");
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        std::thread::yield_now();
     }
 }
 

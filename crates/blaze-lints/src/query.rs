@@ -10,12 +10,12 @@
 mod tests;
 
 use base_db::{Db, EditionedFileId};
+use blaze_hash::HashSet;
 use hir::HasVisibility as _;
 use hir_def::{
     AdtId, AssocItemId, DefWithBodyId, ImplId, ItemContainerId, Lookup as _, ModuleDefId,
     nameres::crate_def_map, visibility::Visibility,
 };
-use rustc_hash::FxHashSet;
 use syntax::{TextRange, TextSize};
 
 use crate::{
@@ -178,7 +178,7 @@ pub(crate) struct Exported {
     /// The definitions named by a public path from the crate's root, through public modules,
     /// enums and traits and `pub use`s; impls and their items are read off their self type and
     /// trait ([`Exported::has_impl`]).
-    defs: FxHashSet<ModuleDefId>,
+    defs: HashSet<ModuleDefId>,
 }
 
 impl Exported {

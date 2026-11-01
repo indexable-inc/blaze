@@ -23,8 +23,8 @@ use paths::Utf8PathBuf;
 use stdx::is_ci;
 use text_size::{TextRange, TextSize};
 
+pub use blaze_hash::HashMap;
 pub use dissimilar::diff as __diff;
-pub use rustc_hash::FxHashMap;
 
 pub use crate::{
     assert_linear::AssertLinear,

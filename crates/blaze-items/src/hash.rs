@@ -30,6 +30,7 @@
 use std::{alloc::Allocator, fmt, fmt::Write as _};
 
 use base_db::Db;
+use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Hasher};
 use blaze_mem::{Frame, Tag, frame};
 use hir_def::AdtId;
@@ -37,7 +38,6 @@ use hir_ty::{
     InferBodyId,
     db::{HirDatabase, InternedClosure, InternedClosureId, InternedCoroutineId},
 };
-use rustc_hash::FxHashMap;
 
 use crate::{
     CodeHash, DeepHash, InterfaceHash, ItemHashes, ItemId, LayoutHash, SignatureHash, form, key,
@@ -604,7 +604,7 @@ pub(crate) fn searched(
 #[derive(PartialEq, Eq, Debug, Default)]
 pub(crate) struct Components {
     /// Each item searched and its component, [`ALONE`] for an item by itself.
-    of: FxHashMap<ItemId, u32>,
+    of: HashMap<ItemId, u32>,
     /// Component `c`'s members are `members[starts[c]..starts[c + 1]]`.
     members: Box<[ItemId]>,
     starts: Box<[u32]>,
@@ -675,7 +675,7 @@ pub(crate) fn find_components(db: &Db, graph: Graph, krate: base_db::Crate) -> C
             }
         }
         cycles.sort_unstable_by_key(|&(start, _)| found[start]);
-        let mut of = FxHashMap::default();
+        let mut of = HashMap::default();
         // alloc: the memo's map, one entry per item searched.
         of.reserve(tarjan.index.len());
         for &id in tarjan.index.keys() {
@@ -716,7 +716,7 @@ struct Tarjan<'a, 'f> {
     krate: base_db::Crate,
     known: Option<&'a Components>,
     // alloc: std's map takes no allocator; one per search.
-    index: FxHashMap<ItemId, usize>,
+    index: HashMap<ItemId, usize>,
     low: Vec<usize, &'f Frame>,
     on_stack: Vec<bool, &'f Frame>,
     stack: Vec<ItemId, &'f Frame>,
@@ -737,7 +737,7 @@ impl<'a, 'f> Tarjan<'a, 'f> {
             graph,
             krate,
             known,
-            index: FxHashMap::default(),
+            index: HashMap::default(),
             low: Vec::new_in(frame),
             on_stack: Vec::new_in(frame),
             stack: Vec::new_in(frame),

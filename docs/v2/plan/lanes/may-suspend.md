@@ -113,7 +113,7 @@ undefined behavior, like a data race. It costs nothing for a crate whose graph h
 
 | Path | What |
 |---|---|
-| `crates/hir-ty-suspend/` (new, this lane) | a front-end crate (semantics-in-front-end): `root`, the root's `FunctionId`; `dispatch`, a call's targets as codegen dispatches them; `summary`, the may-suspend query per instance; `check`, the held-across check per body and the promise checks; `suspend_check(db, krate) -> Found` (its `Held` and `Broken`), what blaze-diagnostics lowers |
+| `crates/hir-ty-suspend/` (new, this lane) | a front-end crate (semantics-in-front-end): `root`, the root's `FunctionId`; `dispatch`, a call's targets as codegen dispatches them; `summary`, the may-suspend query per instance; `check`, the held-across check per body and the promise checks; `suspend_check(db, krate) -> Found` (its `Held` and `Broken`), what blaze-diagnostics lowers; for blaze-lints (01497), `suspend_points` (every value held at every may-suspend call of a body, with why it is rejected or `None`), `may_suspend_at` and `on_fiber` |
 | `crates/hir-ty/src/mir/held.rs` (codegen) | one added entry: `MirBody::held_across_calls_in(frame, points)`, the same analyses with given suspend points |
 | `crates/hir-def/src/attrs.rs` (db) | two flags: `#[blaze::may_suspend]` (functions and fields) and `#[must_not_suspend]` (ADTs, word or `= "reason"`) |
 | `crates/blaze-diagnostics/` (diagnostics) | lowering of `hir_ty_suspend::Held` and `Broken` into errors, and the call from a crate's check |

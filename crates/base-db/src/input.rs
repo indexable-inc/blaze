@@ -8,20 +8,21 @@
 use std::collections::hash_map::Entry;
 use std::error::Error;
 use std::str::FromStr;
-use std::sync::{Mutex, PoisonError};
 use std::{fmt, mem, ops};
 
+use parking_lot::Mutex;
+
+use crate::{AbsPathBuf, AnchoredPath, FileId, FileSet, VfsPath};
+use blaze_hash::{FixedState, HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher, radix};
 use blaze_lint_defs::LintOptions;
 use blaze_mem::Frame;
+use blaze_query::db::{Durability, Setter};
 use cfg::{CfgOptions, HashableCfgOptions};
 use intern::Symbol;
 use la_arena::{Arena, Idx, RawIdx};
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
-use blaze_query::db::{Durability, Setter};
 use span::Edition;
 use triomphe::Arc;
-use crate::{AbsPathBuf, AnchoredPath, FileId, FileSet, VfsPath};
 
 use crate::{
     CrateWorkspaceData, Db, EditionedFileId, FxIndexSet, all_crates,
@@ -31,7 +32,7 @@ use crate::{
 };
 
 pub type ProcMacroPaths =
-    FxHashMap<CrateBuilderId, Result<(String, AbsPathBuf), ProcMacroLoadingError>>;
+    HashMap<CrateBuilderId, Result<(String, AbsPathBuf), ProcMacroLoadingError>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: an error, cold
 pub enum ProcMacroLoadingError {
@@ -600,7 +601,7 @@ pub struct ExtraCrateData {
 
 #[derive(Default, Clone, PartialEq, Eq)] // clone: setup: the crate graph, once per load
 pub struct Env {
-    entries: FxHashMap<String, String>,
+    entries: HashMap<String, String>,
 }
 
 impl fmt::Debug for Env {
@@ -687,7 +688,7 @@ impl<Id> Dependency<Id> {
     }
 }
 
-pub type CratesIdMap = FxHashMap<CrateBuilderId, Crate>;
+pub type CratesIdMap = HashMap<CrateBuilderId, Crate>;
 
 /// A crate. Its fields are set only through base-db ([`Crate::create`], [`Crate::set_env`] and
 /// the other setters, [`CrateGraphBuilder::set_in_db`]), which keep [`Crate::content`] the
@@ -923,7 +924,7 @@ fn refresh_contents(db: &mut Db, krate: Crate) {
     if !refresh_content(db, krate) {
         return;
     }
-    let mut changed = FxHashSet::default();
+    let mut changed = HashSet::default();
     changed.insert(krate);
     // In topological order: a crate's dependencies are refreshed before it.
     for dependent in all_crates(&*db).iter().copied() {
@@ -999,8 +1000,8 @@ fn transitive_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
     blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
         let mut worklist = Vec::new_in(frame);
         worklist.push(krate);
-        let mut seen: hashbrown::HashSet<Crate, FxBuildHasher, &Frame> =
-            hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame);
+        let mut seen: hashbrown::HashSet<Crate, FixedState, &Frame> =
+            hashbrown::HashSet::with_hasher_in(FixedState, frame);
         let mut deps = Vec::new_in(frame);
         while let Some(krate) = worklist.pop() {
             if !seen.insert(krate) {
@@ -1019,8 +1020,8 @@ fn transitive_rev_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
         let all = all_crates(db);
         // The reverse edges as CSR: for each crate (by its place in `all`), the crates that
         // depend on it.
-        let mut place: hashbrown::HashMap<Crate, u32, FxBuildHasher, &Frame> =
-            hashbrown::HashMap::with_capacity_and_hasher_in(all.len(), FxBuildHasher, frame);
+        let mut place: hashbrown::HashMap<Crate, u32, FixedState, &Frame> =
+            hashbrown::HashMap::with_capacity_and_hasher_in(all.len(), FixedState, frame);
         place.extend(all.iter().enumerate().map(|(at, &krate)| (krate, at as u32)));
         let starts = frame.alloc_slice_fill_with(all.len() + 1, |_| 0u32);
         for &from in all.iter() {
@@ -1067,18 +1068,18 @@ fn transitive_rev_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
 pub struct CratesMap(Mutex<Crates>);
 
 impl CratesMap {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Crates> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> parking_lot::MutexGuard<'_, Crates> {
+        self.0.lock()
     }
 }
 
 #[derive(Debug, Default)]
 struct Crates {
-    by_data: FxHashMap<UniqueCrateData, Crate>,
+    by_data: HashMap<UniqueCrateData, Crate>,
     /// For each crate whose content ID base-db made, when and from which root path: what lets
     /// [`CrateGraphBuilder::set_in_db`] keep the ID of a crate whose fields are what they were
     /// without hashing it.
-    stamps: FxHashMap<Crate, Stamp>,
+    stamps: HashMap<Crate, Stamp>,
     /// Ticks once per content ID made.
     clock: u64,
 }
@@ -1136,7 +1137,7 @@ struct Walk<'a, 'f> {
     crates: &'a mut Crates,
     all: FxIndexSet<Crate>,
     visited: CratesIdMap,
-    root_files: FxHashSet<FileId>,
+    root_files: HashSet<FileId>,
     /// Each builder crate walked, by its index: its crate, and when that crate's content ID
     /// last changed ([`Stamp::changed`]).
     done: &'f mut [Option<(Crate, u64)>],
@@ -1393,7 +1394,7 @@ impl CrateGraphBuilder {
         // Check if adding a dep from `from` to `to` creates a cycle. To figure
         // that out, look for a  path in the *opposite* direction, from `to` to
         // `from`.
-        if let Some(path) = self.find_path(&mut FxHashSet::default(), dep.crate_id, from) {
+        if let Some(path) = self.find_path(&mut HashSet::default(), dep.crate_id, from) {
             let path =
                 // clone: the cycle's error (an error path).
                 path.into_iter().map(|it| (it, self[it].extra.display_name.clone())).collect();
@@ -1424,9 +1425,9 @@ impl CrateGraphBuilder {
                 crates: &mut *crates,
                 // For some reason in some repositories we have duplicate crates, so we use a set and not `Vec`.
                 // We use an `IndexSet` because the list needs to be topologically sorted.
-                all: FxIndexSet::with_capacity_and_hasher(len, FxBuildHasher),
-                visited: FxHashMap::with_capacity_and_hasher(len, FxBuildHasher),
-                root_files: FxHashSet::with_capacity_and_hasher(len, FxBuildHasher),
+                all: FxIndexSet::with_capacity_and_hasher(len, FixedState),
+                visited: HashMap::with_capacity_and_hasher(len, FixedState),
+                root_files: HashSet::with_capacity_and_hasher(len, FixedState),
                 done: frame.alloc_slice_fill_with(len, |_| None),
                 frame,
             };
@@ -1460,7 +1461,7 @@ impl CrateGraphBuilder {
     pub fn transitive_deps(&self, of: CrateBuilderId) -> impl Iterator<Item = CrateBuilderId> {
         // alloc: a walk of the builder's graph (setup).
         let mut worklist = vec![of];
-        let mut deps = FxHashSet::default();
+        let mut deps = HashSet::default();
 
         while let Some(krate) = worklist.pop() {
             if !deps.insert(krate) {
@@ -1478,7 +1479,7 @@ impl CrateGraphBuilder {
     fn crates_in_topological_order(&self) -> Vec<CrateBuilderId> {
         // alloc: a walk of the builder's graph (setup).
         let mut res = Vec::new();
-        let mut visited = FxHashSet::default();
+        let mut visited = HashSet::default();
 
         for krate in self.iter() {
             go(self, &mut visited, &mut res, krate);
@@ -1488,7 +1489,7 @@ impl CrateGraphBuilder {
 
         fn go(
             graph: &CrateGraphBuilder,
-            visited: &mut FxHashSet<CrateBuilderId>,
+            visited: &mut HashSet<CrateBuilderId>,
             res: &mut Vec<CrateBuilderId>,
             source: CrateBuilderId,
         ) {
@@ -1513,7 +1514,7 @@ impl CrateGraphBuilder {
         &mut self,
         mut other: CrateGraphBuilder,
         proc_macros: &mut ProcMacroPaths,
-    ) -> FxHashMap<CrateBuilderId, CrateBuilderId> {
+    ) -> HashMap<CrateBuilderId, CrateBuilderId> {
         // Sorting here is a bit pointless because the input is likely already sorted.
         // However, the overhead is small and it makes the `extend` method harder to misuse.
         self.arena
@@ -1524,7 +1525,7 @@ impl CrateGraphBuilder {
 
         let m = self.arena.len();
         let topo = other.crates_in_topological_order();
-        let mut id_map: FxHashMap<CrateBuilderId, CrateBuilderId> = FxHashMap::default();
+        let mut id_map: HashMap<CrateBuilderId, CrateBuilderId> = HashMap::default();
         for topo in topo {
             let crate_data = &mut other.arena[topo];
 
@@ -1549,7 +1550,7 @@ impl CrateGraphBuilder {
 
     fn find_path(
         &self,
-        visited: &mut FxHashSet<CrateBuilderId>,
+        visited: &mut HashSet<CrateBuilderId>,
         from: CrateBuilderId,
         to: CrateBuilderId,
     ) -> Option<Vec<CrateBuilderId>> {
@@ -1765,8 +1766,8 @@ impl fmt::Display for CyclicDependenciesError {
 
 #[cfg(test)]
 mod tests {
-    use triomphe::Arc;
     use crate::AbsPathBuf;
+    use triomphe::Arc;
 
     use crate::{CrateWorkspaceData, DependencyBuilder, TargetKind};
 

@@ -50,7 +50,7 @@ fn an_image_is_put_once_for_the_loop_and_other_bytes_under_its_key_are_an_error(
     assert_eq!(found.bytes(), b"image one");
     images.put(key(2), b"image two".to_vec()).unwrap();
     assert!(images.put(key(2), b"changed".to_vec()).unwrap_err().contains("other bytes"));
-    assert!(images.puts.into_inner().unwrap().is_empty());
+    assert!(images.puts.into_inner().is_empty());
 }
 
 #[test]

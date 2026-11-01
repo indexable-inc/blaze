@@ -72,10 +72,10 @@ fn down_and_is_aligned_match_division(tc: TestCase) {
     let down = align_down_u64(value, align);
     assert_eq!(down, reference::down(value, align));
     assert!(down <= value && value - down < align);
-    assert_eq!(is_aligned_u64(value, align), value % align == 0);
+    assert_eq!(is_aligned_u64(value, align), value.is_multiple_of(align));
     assert!(is_aligned_u64(down, align));
     assert_eq!(align_down(value as usize, align as usize), down as usize);
-    assert_eq!(is_aligned(value as usize, align as usize), value as usize % align as usize == 0);
+    assert_eq!(is_aligned(value as usize, align as usize), (value as usize).is_multiple_of(align as usize));
     if align <= 1 << 31 {
         let (small, small_align) = (value as u32, align as u32);
         assert_eq!(align_down_u32(small, small_align), small - small % small_align);
@@ -108,7 +108,7 @@ fn range_covers_the_blocks_touched(tc: TestCase) {
     let align = tc.draw(power_of_two(32));
     let range = start..start + len;
     let covered = align_range_u64(range.clone(), align);
-    assert_eq!(covered.clone(), range.start & !(align - 1)..range.end.next_multiple_of(align));
+    assert_eq!(covered, range.start & !(align - 1)..range.end.next_multiple_of(align));
     assert!(covered.start <= range.start && covered.end >= range.end);
     assert!(is_aligned_u64(covered.start, align) && is_aligned_u64(covered.end, align));
     assert_eq!(align_range(start as usize..(start + len) as usize, align as usize), covered.start as usize..covered.end as usize);

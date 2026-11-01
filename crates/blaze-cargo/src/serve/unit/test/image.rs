@@ -3,14 +3,14 @@
 //! [`Image`] a selector reads it as ([`image`]), what a test executed as a [`Record`]
 //! ([`record`]), and the daemon's one [`Selector`] per suite ([`Selectors`]).
 
-use std::sync::{Mutex, PoisonError};
 
 use blaze_codegen::{ExecTable, InstanceKey, driver::Built};
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_testsel::{Bound, FnId, Image, Record, Selector, Version};
 use blaze_usercode::test::Executed;
 use hir_ty_codegen::v2::RootTest;
-use rustc_hash::FxHashMap;
+use parking_lot::Mutex;
 
 /// The execution table of the test binary `binary`, linked from `built` with the span tables
 /// `spans` (`LinkInputs::spans`): `slots` is how many
@@ -58,7 +58,7 @@ pub(crate) fn record(executed: Executed) -> Record {
 /// the store, so a selector is always the only writer of its suite's history. The lock is
 /// taken twice per suite per run, never per test.
 #[derive(Default)]
-pub(crate) struct Selectors(Mutex<FxHashMap<ContentId, Held>>);
+pub(crate) struct Selectors(Mutex<HashMap<ContentId, Held>>);
 
 /// A selector, with the binary its image is of.
 struct Held {
@@ -76,7 +76,7 @@ impl Selectors {
         image: impl FnOnce() -> Result<Image, String>,
     ) -> Result<Selector, String> {
         // An insert or a remove that panicked left the map as it was: its value stands.
-        let held = self.0.lock().unwrap_or_else(PoisonError::into_inner).remove(&given);
+        let held = self.0.lock().remove(&given);
         match held {
             Some(held) if held.binary == binary => Ok(held.selector),
             Some(mut held) => {
@@ -90,11 +90,11 @@ impl Selectors {
     /// Keeps `selector`, whose image is of `binary`, for the next run of its suite.
     pub(crate) fn give(&self, binary: ContentId, selector: Selector) {
         let given = selector.given();
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).insert(given, Held { binary, selector });
+        self.0.lock().insert(given, Held { binary, selector });
     }
 
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).len()
+        self.0.lock().len()
     }
 }

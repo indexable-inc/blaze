@@ -132,6 +132,20 @@ impl<'db> Semantics<'db> {
         T::to_def(self, src)
     }
 
+    /// The modules of `file`: those of the crate def maps, else the one only a block's def map
+    /// has ([`ViewCtx::block_declared_module`]).
+    pub(super) fn file_modules(&self, file: FileId) -> impl Iterator<Item = crate::Module> + use<> {
+        let found = self.with_ctx(|ctx| {
+            // alloc: copy out of the cache borrow, inline for the common single module
+            let found = ctx.s2d.file_to_def(file).to_owned();
+            match found.is_empty() {
+                true => ctx.block_declared_module(None, file).into_iter().collect(), // alloc: one module, inline
+                false => found,
+            }
+        });
+        found.into_iter().map(crate::Module::from)
+    }
+
     pub fn to_adt_def(&self, a: ast::Adt<'db>) -> Option<crate::Adt> {
         self.to_def(a)
     }
@@ -541,10 +555,53 @@ impl<'db> ViewCtx<'db, '_> {
         // call's crate: the other's module maps none of them to a def. So is a module of the
         // file the walk out of the expansion comes to (an inline `mod` around the call).
         let krate = file_id.macro_file().map(|it| it.loc(db).krate).or(self.call_crate);
-        match krate {
+        let found = match krate {
             Some(krate) => self.s2d.file_to_def_in(krate, file),
             None => self.s2d.file_to_def(file).first().copied(),
+        };
+        found.or_else(|| self.block_declared_module(krate, file))
+    }
+
+    /// The module of `file` when only a block's def map has it: the file of a `mod name;`
+    /// declared in a block (`fn main() { #[path = "m.rs"] mod m; }`), which no crate def map
+    /// lists. Searched from the crate's own module files down through the out-of-line modules
+    /// their blocks declare, each found module recorded as its file's, so resolving a `mod` in a
+    /// file found so reads that record and the search runs once per file.
+    #[cold]
+    fn block_declared_module(&mut self, krate: Option<base_db::Crate>, file: FileId) -> Option<ModuleId> {
+        let db = self.db();
+        let relevant = base_db::relevant_crates(db, file);
+        let crates = krate.into_iter().chain(relevant.iter().copied().filter(|_| krate.is_none()));
+        for krate in crates {
+            let def_map = hir_def::nameres::crate_def_map(db, krate);
+            let files = def_map.modules(db).filter_map(|(_, data)| data.origin.file_id());
+            let mut pending: Vec<hir_expand::EditionedFileId> = files.collect(); // alloc: the files searched, once per file no crate def map has
+            // alloc: as above
+            let mut seen: blaze_hash::HashSet<hir_expand::EditionedFileId> = pending.iter().copied().collect();
+            while let Some(searched) = pending.pop() {
+                let root = self.sema.parse(searched).syntax();
+                for node in root.descendants() {
+                    let Some(module) = ast::Module::cast(node) else { continue };
+                    let in_block = node.ancestors().any(|it| it.kind() == syntax::SyntaxKind::BLOCK_EXPR);
+                    if module.item_list().is_some() || !in_block {
+                        continue;
+                    }
+                    let Some(child) = self.module_to_def(InFile::new(searched.into(), module)) else { continue };
+                    let Some(child_file) = child.def_map(db).module(db, child).origin.file_id() else { continue };
+                    let recorded = self.s2d.cache.file_to_def_cache.entry(child_file.file_id(db)).or_default();
+                    if !recorded.contains(&child) {
+                        recorded.push(child);
+                    }
+                    if child_file.file_id(db) == file {
+                        return Some(child);
+                    }
+                    if seen.insert(child_file) {
+                        pending.push(child_file);
+                    }
+                }
+            }
         }
+        None
     }
 
     pub(super) fn module_to_def(&mut self, src: InFile<ast::Module<'db>>) -> Option<ModuleId> {

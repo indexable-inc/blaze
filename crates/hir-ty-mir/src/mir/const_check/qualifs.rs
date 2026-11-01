@@ -55,18 +55,19 @@ use super::{ConstCheckKind, ConstContext, reachable as reachable_blocks, stabili
 /// each a kind and the span rustc points at, in the order rustc visits them.
 pub(super) fn check_qualifs<'db>(
     db: &'db Db,
-    def: DefWithBodyId,
+    owner: InferBodyId<'db>,
     body: &MirBody<'db>,
     context: ConstContext,
     reachable: &[BasicBlockId],
     frame: &Frame,
     report: &mut impl FnMut(ConstCheckKind, MirSpan),
 ) {
-    let precise = precise_live_drops(db, def, context);
+    let precise = precise_live_drops(db, owner, context);
     // rustc's `ConstContext::Static(Mutability::Mut)`, where any mutable borrow is allowed.
     let mutable_static = matches!(
-        def,
-        DefWithBodyId::StaticId(it) if StaticSignature::of(db, it).flags.contains(StaticFlags::MUTABLE)
+        owner,
+        InferBodyId::DefWithBodyId(DefWithBodyId::StaticId(it))
+            if StaticSignature::of(db, it).flags.contains(StaticFlags::MUTABLE)
     );
     let live = blocks_in(body, reachable, frame);
     let mut checker = Checker::new(db, body, context, frame);
@@ -95,7 +96,7 @@ pub(super) fn check_qualifs<'db>(
             continue;
         }
         let index = data.statements.len();
-        checker.check_drop(def, block, index, place, terminator.span, report);
+        checker.check_drop(owner, block, index, place, terminator.span, report);
     }
     // rustc's `check_live_drops`, over the body after drop elaboration: a drop elaboration
     // finds dead is gone, and one of a value moved out of in part drops the rest. Elaboration
@@ -106,7 +107,7 @@ pub(super) fn check_qualifs<'db>(
     }
     // A body that builds but does not get to runtime MIR has that error reported by what asks
     // for its runtime MIR, evaluation and code generation.
-    let Ok(runtime) = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)) else { return };
+    let Ok(runtime) = db.runtime_mir_body(owner) else { return };
     let live = blocks_in(runtime, &reachable_blocks(runtime, frame), frame);
     let mut checker = Checker::new(db, runtime, context, frame);
     for (block, data) in runtime.basic_blocks.iter() {
@@ -115,7 +116,7 @@ pub(super) fn check_qualifs<'db>(
         }
         if let Some(Terminator { kind: TerminatorKind::Drop { place, .. }, span }) = &data.terminator
         {
-            checker.check_drop(def, block, data.statements.len(), place, *span, report);
+            checker.check_drop(owner, block, data.statements.len(), place, *span, report);
         }
     }
 }
@@ -133,12 +134,12 @@ fn blocks_in<'f>(body: &MirBody<'_>, blocks: &[BasicBlockId], frame: &'f Frame) 
 /// drop elaboration (`const_precise_live_drops`). A `const fn` of a `staged_api` crate that is
 /// safe to expose on stable is checked before it, unless it allows the feature with
 /// `#[rustc_allow_const_fn_unstable(const_precise_live_drops)]`.
-fn precise_live_drops(db: &Db, def: DefWithBodyId, context: ConstContext) -> bool {
-    let krate = def.module(db).krate(db);
+fn precise_live_drops(db: &Db, owner: InferBodyId<'_>, context: ConstContext) -> bool {
+    let krate = owner.module(db).krate(db);
     let features = UnstableFeatures::query(db, krate);
     let gate = Symbol::intern("const_precise_live_drops");
     // rustc's `enforce_recursive_const_stability`.
-    if let DefWithBodyId::FunctionId(func) = def
+    if let Some(func) = owner.as_function()
         && context == ConstContext::ConstFn
         && features.staged_api
         && stability::safe_to_expose(db, stability::Item::Fn(func), krate)
@@ -890,7 +891,7 @@ impl<'a, 'f, 'db> Checker<'a, 'f, 'db> {
     /// needs it.
     fn check_drop(
         &mut self,
-        def: DefWithBodyId,
+        owner: InferBodyId<'_>,
         block: BasicBlockId,
         index: usize,
         place: &StoredPlace,
@@ -908,7 +909,7 @@ impl<'a, 'f, 'db> Checker<'a, 'f, 'db> {
         }
         let (span, needs_non_const_drop) = match local {
             Some(local) => (
-                local_span(self.cx.db, def, self.cx.body, local, dropped_at),
+                local_span(self.cx.db, owner, self.cx.body, local, dropped_at),
                 self.in_local(Qualif::NeedsNonConstDrop, local, block, index),
             ),
             None => (dropped_at, self.cx.in_any_value_of_ty(Qualif::NeedsNonConstDrop, ty)),
@@ -942,12 +943,15 @@ fn local_qualif<'f>(
 /// binding, `self`, or the expression a temporary holds; `otherwise` for one with none.
 fn local_span(
     db: &Db,
-    def: DefWithBodyId,
+    owner: InferBodyId<'_>,
     body: &MirBody<'_>,
     local: LocalId,
     otherwise: MirSpan,
 ) -> MirSpan {
-    if let Some(at) = body.param_locals.iter().position(|&it| it == local) {
+    // An anonymous constant has no parameters.
+    if let InferBodyId::DefWithBodyId(def) = owner
+        && let Some(at) = body.param_locals.iter().position(|&it| it == local)
+    {
         let store = Body::of(db, def);
         // The `self` parameter's local comes first.
         let has_self = store.self_param.is_some();
@@ -959,7 +963,7 @@ fn local_span(
         }
     }
     if let Some((binding, _)) = body.binding_locals.iter().find(|&(_, &it)| it == local) {
-        let (_, map) = Body::with_source_map(db, def);
+        let (_, map) = ExpressionStore::with_source_map(db, owner.expression_store_owner(db));
         return match map.patterns_for_binding(binding).first() {
             Some(&pat) => MirSpan::PatId(pat),
             None => MirSpan::BindingId(binding),

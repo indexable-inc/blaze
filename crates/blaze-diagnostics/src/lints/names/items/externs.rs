@@ -21,27 +21,27 @@ use hir_ty::db::HirDatabase;
 use std::{cell::OnceCell, str::FromStr};
 
 use base_db::Db;
+use blaze_hash::{HashMap, HashSet};
 use blaze_items::{Fact, ItemId};
 use blaze_mem::Frame;
 use either::Either;
 use hir::{InFile, ModuleDef};
-use intern::{Symbol, sym};
 use hir_def::{
-    AdtId, AttrDefId, CallableDefId, EnumId, FunctionId, GenericDefId, HasModule as _, Lookup, VariantId,
-    attrs::AttrFlags, item_tree::FieldsShape, nameres::crate_def_map, signatures::FunctionSignature,
-    src::HasSource as _,
+    AdtId, AttrDefId, CallableDefId, EnumId, FunctionId, GenericDefId, HasModule as _, Lookup,
+    VariantId, attrs::AttrFlags, item_tree::FieldsShape, nameres::crate_def_map,
+    signatures::FunctionSignature, src::HasSource as _,
 };
 use hir_ty::{
     ParamEnvAndCrate, TyDefId, ValueTyDefId,
     consteval::try_const_usize,
     next_solver::{
-        AdtDef, AliasTy, CallableIdWrapper, DbInterner, FnSig, GenericArgs, ParamEnv, Pattern, Region, RegionExt as _, Ty,
-        TyKind, TypingMode, ensure_sufficient_stack,
+        AdtDef, AliasTy, CallableIdWrapper, DbInterner, FnSig, GenericArgs, ParamEnv, Pattern,
+        Region, RegionExt as _, Ty, TyKind, TypingMode, ensure_sufficient_stack,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
     },
 };
+use intern::{Symbol, sym};
 use rustc_abi::{BackendRepr, ExternAbi, ReprOptions};
-use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     AliasTyKind, PatternKind,
     inherent::{AdtDef as _, GenericArgs as _, IntoKind as _, Ty as _},
@@ -360,7 +360,7 @@ impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
 /// rustc's `ImproperCTypesVisitor`: whether a type is FFI-safe.
 struct Visitor<'t, 'c, 'a, 'db> {
     types: &'t mut Types<'c, 'a, 'db>,
-    cache: FxHashSet<Ty<'db>>,
+    cache: HashSet<Ty<'db>>,
     base_ty: Ty<'db>,
     base_mode: CItemKind,
 }
@@ -368,7 +368,7 @@ struct Visitor<'t, 'c, 'a, 'db> {
 impl<'t, 'c, 'a, 'db> Visitor<'t, 'c, 'a, 'db> {
     fn new(types: &'t mut Types<'c, 'a, 'db>, base_ty: Ty<'db>, base_mode: CItemKind) -> Self {
         let base_ty = if opaque(base_ty).is_some() { base_ty } else { types.normalize(base_ty) };
-        Visitor { types, cache: FxHashSet::default(), base_ty, base_mode }
+        Visitor { types, cache: HashSet::default(), base_ty, base_mode }
     }
 
     fn check_type(&mut self, state: State, ty: Ty<'db>) -> FfiResult<'db> {
@@ -895,7 +895,7 @@ impl<'db> Pass<'_, '_, 'db> {
         if let Some((id, name)) = super::item_id(cx, site.item) {
             diag.fact(Fact::Signature(cx.key(id)), format!("the signature of `{name}`")); // alloc: the firing lint's fact
         }
-        let mut seen = FxHashSet::default();
+        let mut seen = HashSet::default();
         for &adt in &types.adts {
             if seen.insert(adt) {
                 let name = cx.def_path(ModuleDef::Adt(adt.into()));
@@ -1028,7 +1028,7 @@ fn link_name(cx: &Cx<'_, '_>, id: FunctionId, f: ast::Fn<'_>) -> Option<TextRang
 /// rustc's `structurally_same_type`.
 struct Same<'t, 'c, 'a, 'db> {
     types: &'t Types<'c, 'a, 'db>,
-    seen: FxHashSet<(Ty<'db>, Ty<'db>)>,
+    seen: HashSet<(Ty<'db>, Ty<'db>)>,
 }
 
 impl<'db> Same<'_, '_, '_, 'db> {
@@ -1137,7 +1137,7 @@ pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, items: &[Item<'db>]) -> Vec<Found> {
     }
     decls.sort_by(|a, b| a.0.cmp(&b.0));
     let mut found = Vec::new(); // alloc: empty until a lint fires; holds only what fires
-    let mut seen: FxHashMap<Symbol, usize> = FxHashMap::with_capacity_and_hasher(decls.len(), Default::default());
+    let mut seen: HashMap<Symbol, usize> = HashMap::with_capacity_and_hasher(decls.len(), Default::default());
     for index in 0..decls.len() {
         let (_, item, f, def, id) = &decls[index];
         let first = match seen.entry(symbol(cx, *id)) {
@@ -1152,7 +1152,7 @@ pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, items: &[Item<'db>]) -> Vec<Found> {
         let interner = types.interner;
         let sig_of = |id: FunctionId| db.callable_item_signature(CallableDefId::FunctionId(id)).skip_binder();
         let (expected, this_sig) = (sig_of(*first_id), sig_of(*id));
-        let mut same = Same { types: &types, seen: FxHashSet::default() };
+        let mut same = Same { types: &types, seen: HashSet::default() };
         let erased = (
             interner.instantiate_bound_regions_with_erased(expected),
             interner.instantiate_bound_regions_with_erased(this_sig),

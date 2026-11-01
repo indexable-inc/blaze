@@ -15,9 +15,9 @@ use blaze_codegen::{
     wasm::{Code, Import, Signature, ValType},
 };
 use blaze_format::{SpanRef, leb};
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::ItemKey;
-use rustc_hash::{FxHashMap, FxHashSet};
 use wasm_encoder::{
     CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType, FunctionSection,
     GlobalType, ImportSection, MemoryType, Module, NameMap, NameSection, RefType, TableType,
@@ -48,15 +48,15 @@ const STATIC_DOMAIN: &str = "blaze-wasm static content 1";
 /// Where everything linked so far is.
 pub struct Linker {
     /// The slot of each function by what it is across versions, with what was last put there.
-    slots: FxHashMap<ContentId, Slot>,
+    slots: HashMap<ContentId, Slot>,
     /// The slot of each imported function something points to, by its module and field.
-    imported: FxHashMap<(String, String), u32>,
-    statics: FxHashMap<(ItemKey, ContentId), Placed>,
+    imported: HashMap<(String, String), u32>,
+    statics: HashMap<(ItemKey, ContentId), Placed>,
     /// Read-only data, by content: placed once, never moved.
-    data: FxHashMap<ContentId, u64>,
+    data: HashMap<ContentId, u64>,
     /// The `Location` of each position code named, and each file name they point at.
-    positions: FxHashMap<SpanRef, u64>,
-    files: FxHashMap<String, u64>,
+    positions: HashMap<SpanRef, u64>,
+    files: HashMap<String, u64>,
     table_len: u32,
     memory_len: u64,
 }
@@ -92,12 +92,12 @@ pub struct Patch {
 impl Default for Linker {
     fn default() -> Self {
         Linker {
-            slots: FxHashMap::default(),
-            imported: FxHashMap::default(),
-            statics: FxHashMap::default(),
-            data: FxHashMap::default(),
-            positions: FxHashMap::default(),
-            files: FxHashMap::default(),
+            slots: HashMap::default(),
+            imported: HashMap::default(),
+            statics: HashMap::default(),
+            data: HashMap::default(),
+            positions: HashMap::default(),
+            files: HashMap::default(),
             // Slot 0 stays empty: a null function pointer traps.
             table_len: 1,
             memory_len: STACK_START + STACK_SIZE,
@@ -117,8 +117,8 @@ struct Function<'a> {
 
 /// The build's span tables, decoded as positions ask for them.
 struct Spans<'a> {
-    encoded: FxHashMap<ContentId, &'a [u8]>,
-    decoded: FxHashMap<ContentId, SpanTable>,
+    encoded: HashMap<ContentId, &'a [u8]>,
+    decoded: HashMap<ContentId, SpanTable>,
 }
 
 /// One span table, as `blaze_link::SpanTable` encodes it.
@@ -132,10 +132,10 @@ struct SpanTable {
 #[derive(Default)]
 struct Output {
     types: Vec<Signature>,
-    type_of: FxHashMap<Signature, u32>,
+    type_of: HashMap<Signature, u32>,
     /// Module, field and type of each function imported, in index order.
     imports: Vec<(String, String, u32)>,
-    import_of: FxHashMap<(String, String), u32>,
+    import_of: HashMap<(String, String), u32>,
     /// Type, body and name of each function defined, in index order after the imports.
     defined: Vec<(u32, Vec<u8>, String)>,
     /// What the element segments put in the table: slot and function index.
@@ -176,7 +176,7 @@ impl Linker {
     /// Links what `built` compiled against everything linked before: a module of what is new.
     /// `spans` are the build's span tables by anchor, which its positions are read from.
     pub fn link(&mut self, built: &Built, spans: &[(ContentId, Vec<u8>)]) -> Result<Patch, String> {
-        let ids: FxHashMap<InstanceKey, ContentId> = built
+        let ids: HashMap<InstanceKey, ContentId> = built
             .inputs
             .iter()
             .zip(&built.versions)
@@ -184,7 +184,7 @@ impl Linker {
             .collect();
         let kept = |key: &InstanceKey| built.deduped.merged.get(key).copied().unwrap_or(*key);
         let mut functions = Vec::with_capacity(built.functions.len());
-        let mut by_key = FxHashMap::default();
+        let mut by_key = HashMap::default();
         for compiled in &built.functions {
             if compiled.arch != Arch::Wasm32 {
                 return Err(format!(
@@ -202,7 +202,7 @@ impl Linker {
         for function in &functions {
             self.slot(function.id);
         }
-        let mut externs: FxHashMap<&str, &Import> = FxHashMap::default();
+        let mut externs: HashMap<&str, &Import> = HashMap::default();
         for function in &functions {
             externs
                 .extend(function.code.imports.iter().map(|(name, import)| (name.as_str(), import)));
@@ -212,7 +212,7 @@ impl Linker {
         }
         let mut spans = Spans {
             encoded: spans.iter().map(|(id, bytes)| (*id, bytes.as_slice())).collect(),
-            decoded: FxHashMap::default(),
+            decoded: HashMap::default(),
         };
         let mut out = Output::default();
 
@@ -230,7 +230,7 @@ impl Linker {
             }
         }
         let mut written_statics = Vec::new();
-        let mut moved = FxHashSet::default();
+        let mut moved = HashSet::default();
         for s in &built.statics {
             if let Some(section) = &s.section {
                 return Err(format!(
@@ -272,7 +272,7 @@ impl Linker {
             relocs.iter().any(|it| matches!(it.target, Target::Static { item, instance } if moved.contains(&(*item, *instance))))
         };
         if !moved.is_empty() {
-            let mut seen: FxHashSet<ContentId> = new_data.iter().map(|it| it.id).collect();
+            let mut seen: HashSet<ContentId> = new_data.iter().map(|it| it.id).collect();
             let all_data = functions
                 .iter()
                 .flat_map(|it| &it.compiled.data)
@@ -326,7 +326,7 @@ impl Linker {
             .map(|(it, linked)| self.slots[&it.id].linked != Some(*linked))
             .collect();
         // A direct call binds the function an import gave when its caller's module was made.
-        let mut callers: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+        let mut callers: HashMap<usize, Vec<usize>> = HashMap::default();
         for (at, function) in functions.iter().enumerate() {
             for reloc in function.compiled.relocs.iter() {
                 if reloc.kind == RelocKind::WasmFunction
@@ -399,7 +399,7 @@ impl Linker {
         }
         let names = names(built);
         let first_defined = out.imports.len() as u32;
-        let index_of: FxHashMap<usize, u32> = order
+        let index_of: HashMap<usize, u32> = order
             .iter()
             .enumerate()
             .map(|(place, &at)| (at, first_defined + place as u32))
@@ -429,7 +429,7 @@ impl Linker {
 
         let mut exports: Vec<(String, u32)> = Vec::new();
         for (key, name) in &built.symbols {
-            if let Some(&at) = by_key.get(&kept(*key)) {
+            if let Some(&at) = by_key.get(&kept(key)) {
                 exports.push((name.clone(), self.slots[&functions[at].id].index));
             }
         }
@@ -489,7 +489,7 @@ impl Linker {
     fn static_content(
         &self,
         s: &Static,
-        ids: &FxHashMap<InstanceKey, ContentId>,
+        ids: &HashMap<InstanceKey, ContentId>,
         kept: &impl Fn(&InstanceKey) -> InstanceKey,
     ) -> Result<ContentId, String> {
         let mut hasher = Hasher::new(STATIC_DOMAIN);
@@ -551,9 +551,9 @@ impl Linker {
         &mut self,
         target: &Target,
         kind: RelocKind,
-        ids: &FxHashMap<InstanceKey, ContentId>,
+        ids: &HashMap<InstanceKey, ContentId>,
         kept: &impl Fn(&InstanceKey) -> InstanceKey,
-        externs: &FxHashMap<&str, &Import>,
+        externs: &HashMap<&str, &Import>,
         spans: &mut Spans<'_>,
         out: &mut Output,
     ) -> Result<u64, String> {
@@ -638,9 +638,9 @@ impl Linker {
         &mut self,
         bytes: &[u8],
         relocs: &Relocs,
-        ids: &FxHashMap<InstanceKey, ContentId>,
+        ids: &HashMap<InstanceKey, ContentId>,
         kept: &impl Fn(&InstanceKey) -> InstanceKey,
-        externs: &FxHashMap<&str, &Import>,
+        externs: &HashMap<&str, &Import>,
         spans: &mut Spans<'_>,
         out: &mut Output,
     ) -> Result<Vec<u8>, String> {
@@ -665,9 +665,9 @@ impl Linker {
     fn linked(
         &mut self,
         function: &Function<'_>,
-        ids: &FxHashMap<InstanceKey, ContentId>,
+        ids: &HashMap<InstanceKey, ContentId>,
         kept: &impl Fn(&InstanceKey) -> InstanceKey,
-        externs: &FxHashMap<&str, &Import>,
+        externs: &HashMap<&str, &Import>,
         spans: &mut Spans<'_>,
         out: &mut Output,
     ) -> Result<ContentId, String> {
@@ -704,9 +704,9 @@ impl Linker {
     fn body(
         &mut self,
         function: &Function<'_>,
-        ids: &FxHashMap<InstanceKey, ContentId>,
+        ids: &HashMap<InstanceKey, ContentId>,
         kept: &impl Fn(&InstanceKey) -> InstanceKey,
-        externs: &FxHashMap<&str, &Import>,
+        externs: &HashMap<&str, &Import>,
         spans: &mut Spans<'_>,
         out: &mut Output,
     ) -> Result<Vec<u8>, String> {
@@ -757,8 +757,8 @@ fn put_index(body: &mut [u8], at: usize, value: u64) -> Result<(), String> {
 
 /// What each function is called in the report and a trap: its symbol, or its name for a
 /// debugger.
-fn names(built: &Built) -> FxHashMap<InstanceKey, &str> {
-    let mut names: FxHashMap<InstanceKey, &str> =
+fn names(built: &Built) -> HashMap<InstanceKey, &str> {
+    let mut names: HashMap<InstanceKey, &str> =
         built.debug_names.iter().map(|(key, name)| (*key, name.as_str())).collect();
     names.extend(built.symbols.iter().map(|(key, name)| (*key, name.as_str())));
     names

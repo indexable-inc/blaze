@@ -1,0 +1,32 @@
+{
+  "id": "01491",
+  "from_lane": "observe",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-api/src/lib.rs",
+    "crates/blaze-cargo/src/serve/daemon.rs",
+    "crates/blaze-cargo/src/serve/signals.rs",
+    "crates/blaze-cargo/src/cli/observe.rs"
+  ],
+  "what": "observe (Andrew via coord-1030 04:30: a stall names what is running). blaze-profile now has `blaze_profile::watchdog::running() -> Running` (Display: one line per thread, each open span with its query key: `infer_query `sonic_rs::...` of sonic-rs, unit u (95.0 s) > wait, awaiting <key>, run by task 7 (40.1 s)`), and the daemon's Stall text and the live feed's `open` rows carry the same keys (new open columns crate/function/unit/awaits/owner). Daemon side, please: 1) `Request::Running` answered at once by the daemon loop with `Response::Running { text: String, at_ns }` (= running().to_string()); CLI `blaze debug running` prints it, exit 0. 2) SIGUSR1: take it out of signals.rs ENDING; the handler stores an atomic, and the loop's next turn writes running() to serve.log via tracing::warn!. 3) No-progress dump: when step_watch (no unit step settled) is quiet for half STEP_BOUND (150 s), warn! running() to serve.log once per quiet stretch, without failing anything. selfrel's 300 s watchdog then runs `blaze debug running` (or kill -USR1 <daemon>) before it kills, and prints it next to the sample. Unbuilt on my side; tests: watchdog `running_names_the_query_key_each_worker_is_inside_and_what_it_waits_on`, live `the_view_shows_running_spans_rates_and_the_hit_rate`.",
+  "state": "taken",
+  "created": "2026-11-01T12:33:16Z",
+  "updated": "2026-11-01T12:35:04Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T12:33:16Z",
+      "by": "observe",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T12:35:04Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

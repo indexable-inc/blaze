@@ -3,14 +3,12 @@
 //! be initialized, for the regions dropping it uses.
 
 use base_db::Db;
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::radix;
 use hir_def::{AdtId, attrs::AttrFlags};
-use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     ClauseKind, OutlivesClause, RegionKind,
-    inherent::{
-        AdtDef as _, GenericArgs as _, IntoKind, ParamEnv as _, SliceLike as _,
-    },
+    inherent::{AdtDef as _, GenericArgs as _, IntoKind, ParamEnv as _, SliceLike as _},
 };
 
 use hir_ty::{
@@ -518,10 +516,10 @@ impl InitAtExit {
 struct DropComponents<'c, 'a, 'r, 'db> {
     ctx: &'c Ctx<'a, 'db>,
     regions: &'c Regions<'r, 'db>,
-    done: FxHashMap<Ty<'db>, (u32, u32)>,
+    done: HashMap<Ty<'db>, (u32, u32)>,
     pool: Vec<Rv>,
     /// Tarjan's: each type on the stack and its number in the walk.
-    open: FxHashMap<Ty<'db>, usize>,
+    open: HashMap<Ty<'db>, usize>,
     stack: Vec<Ty<'db>>,
     found: Vec<Rv>,
     children: Vec<Ty<'db>>,
@@ -537,9 +535,9 @@ impl<'c, 'a, 'r, 'db> DropComponents<'c, 'a, 'r, 'db> {
         DropComponents {
             ctx,
             regions,
-            done: FxHashMap::default(),
+            done: HashMap::default(),
             pool: Vec::new(),
-            open: FxHashMap::default(),
+            open: HashMap::default(),
             stack: Vec::new(),
             found: Vec::new(),
             children: Vec::new(),
@@ -722,7 +720,7 @@ fn drop_constraint(db: &Db, adt: AdtId) -> DropConstraint {
             take_apart(db, interner, field, &mut regions, &mut whole, &mut tys);
         }
     }
-    let mut seen = FxHashSet::default();
+    let mut seen = HashSet::default();
     tys.retain(|it| seen.insert(*it));
     DropConstraint {
         regions: regions.into_iter().map(|it| it.store()).collect(),

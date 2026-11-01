@@ -1,5 +1,5 @@
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -11,6 +11,7 @@ use cranelift_codegen::{
     isa::CallConv,
     settings,
 };
+use parking_lot::Mutex;
 
 use super::*;
 
@@ -546,12 +547,12 @@ struct Threaded {
 
 impl Recompile for Arc<Threaded> {
     fn recompile(&self, function: u32, to: Tier) -> Result<Option<u64>, String> {
-        self.recompiles.lock().unwrap().push(Promote { function, to });
+        self.recompiles.lock().push(Promote { function, to });
         if function == 3 {
             panic!("function 3's backend fell over");
         }
         let cells = to.counts().then(|| self.next.fetch_add(1, Ordering::Relaxed) * u64::from(CELLS));
-        self.slots.lock().unwrap()[function as usize] = (to, cells);
+        self.slots.lock()[function as usize] = (to, cells);
         Ok(cells)
     }
 }
@@ -573,7 +574,7 @@ fn the_runner_tiers_a_running_program() {
     let deadline = Instant::now() + Duration::from_secs(30);
     while runner.tier(0) != Tier::Llvm && Instant::now() < deadline {
         for function in [0, 3] {
-            let slot = daemon.slots.lock().unwrap()[function as usize];
+            let slot = daemon.slots.lock()[function as usize];
             if let (_, Some(cells)) = slot {
                 bump(&daemon.memory, cells, CALLS, 1);
                 bump(&daemon.memory, cells, BACK_EDGES, 3);
@@ -594,7 +595,7 @@ fn the_runner_tiers_a_running_program() {
     assert!(!closed.failures.is_empty());
     // Function 0 to Cranelift then LLVM, or straight to LLVM if one period ran it past hot.
     assert!((1..=2).contains(&closed.landed), "{closed:?}");
-    let recompiles = daemon.recompiles.lock().unwrap().clone();
+    let recompiles = daemon.recompiles.lock().clone();
     let zero: Vec<Tier> = recompiles.iter().filter(|it| it.function == 0).map(|it| it.to).collect();
     assert!(zero.is_sorted() && zero.last() == Some(&Tier::Llvm), "{zero:?}");
     let mut unique = recompiles.clone();
@@ -618,7 +619,7 @@ fn cells_that_cannot_be_read_stop_the_tiering_and_say_so() {
     runner.bind(0, Some(4096)).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     while runner.stopped().is_none() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::yield_now();
     }
     assert_eq!(runner.tier(0), Tier::Stencil);
     let closed = runner.close();
@@ -648,7 +649,7 @@ fn a_panic_reading_the_cells_stops_the_tiering_and_says_so() {
     runner.bind(0, Some(0)).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     while runner.stopped().is_none() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::yield_now();
     }
     let closed = runner.close();
     let stopped = closed.stopped.expect("the panic is reported");

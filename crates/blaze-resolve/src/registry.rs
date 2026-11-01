@@ -3,7 +3,7 @@
 //! (`src/sources/registry/index/mod.rs`).
 
 use anyhow::Result;
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 use crate::dependency::Dependency;
 use crate::interning::InternedString;
@@ -116,7 +116,7 @@ pub trait Registry {
 /// A registry held in memory: the resolver's tests, and sources already read.
 #[derive(Default, Debug, Clone)]
 pub struct MemRegistry {
-    packages: FxHashMap<InternedString, Vec<IndexSummary>>,
+    packages: HashMap<InternedString, Vec<IndexSummary>>,
 }
 
 impl MemRegistry {

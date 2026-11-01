@@ -33,8 +33,10 @@
 use std::hash::Hash as _;
 
 use base_db::Db;
+use blaze_hash::HashSet;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, closure_code, code_hash, coroutine_code, interface_hash, item_key, key};
+use blaze_query::db::{AsId, FromId};
 use either::Either;
 use hir_def::{
     CallableDefId, FunctionId, HasModule, ItemContainerId, Lookup, hir::ExprId,
@@ -47,9 +49,8 @@ use hir_ty::{
     method_resolution::{is_dyn_method, lookup_impl_const},
     mir::{MirOptions, MirOwner, MirStage},
     next_solver::{
-        AliasConst, AliasConstKind, AllocationData, Const, ConstKind, FreeConstAliasId,
-        GenericArg, GenericArgs, InherentAssocConstId, StoredGenericArgs, TraitAssocConstId, Ty,
-        TyKind,
+        AliasConst, AliasConstKind, AllocationData, Const, ConstKind, FreeConstAliasId, GenericArg,
+        GenericArgs, InherentAssocConstId, StoredGenericArgs, TraitAssocConstId, Ty, TyKind,
     },
     traits::StoredParamEnvAndCrate,
 };
@@ -59,17 +60,15 @@ use hir_ty_mir::mir::{
     TerminatorKind, monomorphized_args, monomorphized_promoted_mir_body_query,
     runtime_promoted_mir_body_query,
 };
-use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     GenericArgKind, TypeFlags, TypeVisitableExt,
     inherent::{GenericArgs as _, IntoKind},
 };
-use blaze_query::db::{AsId, FromId};
 use smallvec::SmallVec;
 
 use crate::{
-    BodyOptions, CALLEE_DOMAIN, Class, OptionsSet, SHARE_DOMAIN, ShareDef, ShareInstance, ShareKey, Unshared,
-    VALUE_DOMAIN, WALK_DOMAIN, classify, drop, fact::Cx, identity,
+    BodyOptions, CALLEE_DOMAIN, Class, OptionsSet, SHARE_DOMAIN, ShareDef, ShareInstance, ShareKey,
+    Unshared, VALUE_DOMAIN, WALK_DOMAIN, classify, drop, fact::Cx, identity,
 };
 
 /// A generic parameter, of a type or a constant. A lifetime is erased before codegen.
@@ -208,6 +207,7 @@ pub(crate) fn share(
     env: StoredParamEnvAndCrate,
     options: BodyOptions,
 ) -> Result<ShareKey, Unshared> {
+    let _on = OnChain::enter(db, &instance, env.krate)?;
     let cx = Cx::new(db, env);
     let mut key = Hasher::new(SHARE_DOMAIN);
     let bodies = bodies(db, instance.def, options, &mut key)?;
@@ -231,6 +231,155 @@ pub(crate) fn share(
         key.update(&[OptionsSet::index(asked) as u8]).id(&records);
     }
     Ok(ShareKey(key.finish()))
+}
+
+/// The instances whose share a job is walking, outermost first, each with the crate its chain
+/// started in.
+type Chain = Vec<(ShareInstance, base_db::Crate)>;
+
+thread_local! {
+    /// The running job's [`Chain`]: a share walks its callees' shares inline, so this is the
+    /// chain of calls rustc's collector counts a body's recursion depth along. A callee's share
+    /// may wait and resume the job on another thread, so the chain moves with the job
+    /// ([`carry_chain`]), and it is read only in `#[inline(never)]` functions that end before
+    /// any wait.
+    static CHAIN: std::cell::RefCell<Chain> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The chains of jobs switched out with one, by the slot [`take_chain`] gave (its index + 1;
+/// 0 is an empty chain, which moves without a slot). Held only to move one chain in or out.
+static PARKED: parking_lot::Mutex<Vec<Option<Chain>>> = parking_lot::Mutex::new(Vec::new());
+
+/// Has [`CHAIN`] moved with each job across its waits. Once a process, before the first chain
+/// is made.
+fn carry_chain() {
+    static CARRIED: std::sync::Once = std::sync::Once::new();
+    CARRIED.call_once(|| blaze_query::carry(blaze_query::Carried { take: take_chain, put: put_chain }));
+}
+
+/// Moves the switching job's chain off this thread, leaving an empty one.
+#[inline(never)]
+fn take_chain() -> usize {
+    let chain = CHAIN.with_borrow_mut(std::mem::take);
+    if chain.is_empty() {
+        return 0;
+    }
+    let mut parked = PARKED.lock();
+    let at = match parked.iter().position(Option::is_none) {
+        Some(at) => at,
+        None => {
+            parked.push(None);
+            parked.len() - 1
+        }
+    };
+    parked[at] = Some(chain);
+    at + 1
+}
+
+/// Puts the chain [`take_chain`] moved off back, on the thread the job resumes on.
+///
+/// # Panics
+///
+/// If the thread's own chain is not empty, or `taken` names no parked chain.
+#[inline(never)]
+fn put_chain(taken: usize) {
+    let chain = match taken {
+        0 => Vec::new(),
+        at => PARKED.lock()[at - 1].take().expect("a parked chain is put back once"),
+    };
+    CHAIN.with_borrow_mut(|it| {
+        assert!(it.is_empty(), "a job resumed on a thread whose share chain holds {} instances", it.len());
+        *it = chain;
+    });
+}
+
+/// An instance on [`CHAIN`] while its share is walked.
+struct OnChain;
+
+impl OnChain {
+    /// `instance` onto the chain, or [`Unshared::RecursionLimit`] when its body is on it as
+    /// many times as the `#![recursion_limit]` of the crate the chain started in (`krate`
+    /// for an outermost one) allows. The limit is a query, which may wait, so each read of
+    /// the chain is a function of its own.
+    fn enter(db: &Db, instance: &ShareInstance, krate: base_db::Crate) -> Result<OnChain, Unshared> {
+        carry_chain();
+        let (root, depth) = chain_depth(instance.def, krate);
+        let limit = hir_def::nameres::crate_def_map(db, root).recursion_limit();
+        if depth > limit {
+            return Err(recursion_limit(db, &chain_now(), instance, root, depth, limit));
+        }
+        chain_push(instance, root);
+        Ok(OnChain)
+    }
+}
+
+/// The crate the running job's chain started in (`krate` when it is empty), and how many
+/// times `def` would be on it with one more.
+#[inline(never)]
+fn chain_depth(def: ShareDef, krate: base_db::Crate) -> (base_db::Crate, u32) {
+    CHAIN.with_borrow(|chain| {
+        let depth = 1 + chain.iter().filter(|it| it.0.def == def).count() as u32;
+        (chain.first().map_or(krate, |it| it.1), depth)
+    })
+}
+
+/// The running job's chain, for an error.
+#[inline(never)]
+fn chain_now() -> Chain {
+    CHAIN.with_borrow(Clone::clone) // clone: an error's chain, once
+}
+
+#[inline(never)]
+fn chain_push(instance: &ShareInstance, root: base_db::Crate) {
+    // clone: the query's key, a reference count
+    CHAIN.with_borrow_mut(|chain| chain.push((instance.clone(), root)));
+}
+
+impl Drop for OnChain {
+    #[inline(never)]
+    fn drop(&mut self) {
+        CHAIN.with_borrow_mut(|chain| chain.pop());
+    }
+}
+
+/// How many instances of a chain past the recursion limit its error names from its start,
+/// where the arguments begin to grow, and from its end.
+const CHAIN_HEAD: usize = 10;
+const CHAIN_TAIL: usize = 3;
+
+/// The error of `instance`, `depth` times its body on `chain`, past `root`'s `limit`.
+fn recursion_limit(
+    db: &Db,
+    chain: &[(ShareInstance, base_db::Crate)],
+    instance: &ShareInstance,
+    root: base_db::Crate,
+    depth: u32,
+    limit: u32,
+) -> Unshared {
+    let named = |it: &ShareInstance| -> String {
+        let spelled = match it.def {
+            ShareDef::Fn(func) => {
+                hir_ty_mir::mir::type_name::rustc_function_name(db, func, it.args.as_ref().as_slice())
+            }
+            _ => None,
+        };
+        spelled.unwrap_or_else(|| format!("{it:?}")) // alloc: the error's message
+    };
+    let body = match instance.def {
+        ShareDef::Fn(func) => FunctionSignature::of(db, func).name.as_str().to_owned(), // alloc: the error's message
+        def => format!("{def:?}"), // alloc: the error's message
+    };
+    let krate = (root.extra_data(db).display_name.as_ref())
+        .map_or_else(|| format!("{root:?}"), |it| it.to_string()); // alloc: the error's message
+    let ends: Vec<String> = if chain.len() <= CHAIN_HEAD + CHAIN_TAIL {
+        chain.iter().map(|it| named(&it.0)).collect() // alloc: the error's message
+    } else {
+        let (head, tail) = (&chain[..CHAIN_HEAD], &chain[chain.len() - CHAIN_TAIL..]);
+        let between = format!("({} more)", chain.len() - CHAIN_HEAD - CHAIN_TAIL); // alloc: the error's message
+        // alloc: the error's message, its two ends
+        head.iter().map(|it| named(&it.0)).chain([between]).chain(tail.iter().map(|it| named(&it.0))).collect()
+    };
+    Unshared::RecursionLimit { krate, body, depth, limit, instance: named(instance), chain: ends }
 }
 
 fn share_cycle(
@@ -381,7 +530,7 @@ pub(crate) fn sites(db: &Db, def: ShareDef, options: MirOptions) -> Result<Sites
         filled: Vec::with_capacity(body.locals.len() + 16),
         kept: Vec::new(), // alloc: once per generic body and options, this query's miss
         ops: Vec::new(), // alloc: once per generic body and options, this query's miss
-        derefs: FxHashSet::default(),
+        derefs: HashSet::default(),
     };
     collect.body();
     Ok(Sites {
@@ -399,7 +548,7 @@ struct Collect<'a, 'db> {
     kept: Vec<GenericArg<'db>>,
     ops: Vec<Op>,
     /// The places whose `Deref`s are recorded, once each.
-    derefs: FxHashSet<&'a StoredPlace>,
+    derefs: HashSet<&'a StoredPlace>,
 }
 
 impl<'a, 'db> Collect<'a, 'db> {
@@ -1033,6 +1182,7 @@ impl<'a, 'db> Walk<'a, 'db> {
         match stdx::ensure_sufficient_stack(|| share(db, instance, stored, self.options)) {
             Ok(key) => h.update(&[tag::CALLEE_SHARED]).id(&key.0),
             Err(Unshared::Recursive) => return Err(Unshared::Recursive),
+            Err(why @ Unshared::RecursionLimit { .. }) => return Err(why.clone()),
             Err(_) => h.update(&[tag::CALLEE_ARGS]).id(&identity::args(db, args)?),
         };
         Ok(h.finish())

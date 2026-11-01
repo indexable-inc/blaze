@@ -25,8 +25,9 @@ use std::{
 use crate::{Address, RECV_MOST};
 
 pub(crate) enum Listener {
-    /// `path` is the file it made, removed when it is dropped; `None` for an inherited one.
-    Unix { listener: UnixListener, path: Option<PathBuf> },
+    /// `path` is the file it made and its identity, removed when it is dropped while the name
+    /// is still that file; `None` for an inherited one.
+    Unix { listener: UnixListener, path: Option<(PathBuf, Made)> },
     Tcp(TcpListener),
 }
 
@@ -69,9 +70,31 @@ impl Listener {
     }
 }
 
+/// The device and inode of the socket file a listen made: its name may name another's by the
+/// time the listener is dropped.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Made {
+    dev: u64,
+    ino: u64,
+}
+
+impl Made {
+    fn of(path: &Path) -> io::Result<Made> {
+        use std::os::unix::fs::MetadataExt as _;
+        let it = std::fs::symlink_metadata(path)?;
+        Ok(Made { dev: it.dev(), ino: it.ino() })
+    }
+}
+
 impl Drop for Listener {
     fn drop(&mut self) {
-        if let Listener::Unix { path: Some(path), .. } = self {
+        // A daemon whose listener goes after the next one renamed its socket into the name (the
+        // threads driver ends a listen on its accept thread, after the hang-ups) leaves that
+        // one's be. The look and the unlink are two calls: a rename into the name between them
+        // is still lost, a window of one system call where it was the whole exit before.
+        if let Listener::Unix { path: Some((path, made)), .. } = self
+            && Made::of(path).is_ok_and(|now| now == *made)
+        {
             _ = std::fs::remove_file(&*path);
         }
     }
@@ -105,12 +128,16 @@ pub(crate) fn listen(root: &Path, at: &Address) -> io::Result<Listener> {
             let temporary = crate::fs::temporary_next_to(&path);
             let listener = bind(&temporary)?;
             let placed = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
-                .and_then(|()| std::fs::rename(&temporary, &path));
-            if let Err(error) = placed {
-                _ = std::fs::remove_file(&temporary);
-                return Err(error);
-            }
-            Ok(Listener::Unix { listener, path: Some(path) })
+                .and_then(|()| Made::of(&temporary))
+                .and_then(|made| std::fs::rename(&temporary, &path).map(|()| made));
+            let made = match placed {
+                Ok(made) => made,
+                Err(error) => {
+                    _ = std::fs::remove_file(&temporary);
+                    return Err(error);
+                }
+            };
+            Ok(Listener::Unix { listener, path: Some((path, made)) })
         }
         Address::Inherited { fd, at } => inherited(root, *fd, at),
         Address::Tcp(address) => Ok(Listener::Tcp(TcpListener::bind(address)?)),
@@ -254,9 +281,11 @@ fn accepting(fd: &OwnedFd, option: impl Fn(libc::c_int) -> io::Result<libc::c_in
     // Larger than `socket_fdinfo` (792 bytes): the call refuses a smaller buffer only.
     let mut info = [0u64; 256];
     let size = std::mem::size_of_val(&info) as libc::c_int;
+    // SAFETY: takes nothing and reads no memory of this process.
+    let pid = unsafe { libc::getpid() };
     // SAFETY: `info` is valid for writes of `size` bytes, and the call writes at most that.
     let got = unsafe {
-        libc::proc_pidfdinfo(libc::getpid(), fd.as_raw_fd(), PROC_PIDFDSOCKETINFO, info.as_mut_ptr().cast(), size)
+        libc::proc_pidfdinfo(pid, fd.as_raw_fd(), PROC_PIDFDSOCKETINFO, info.as_mut_ptr().cast(), size)
     };
     if got <= 0 {
         return Err(io::Error::last_os_error());

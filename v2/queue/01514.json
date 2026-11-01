@@ -1,0 +1,35 @@
+{
+  "id": "01514",
+  "from_lane": "tests-diag",
+  "owner": "one-pool",
+  "paths": [
+    "crates/blaze-graph/src/par.rs"
+  ],
+  "what": "blaze-graph par.rs for_each_giving_way: `again` is a Lock<Vec<usize>> pushed from scope callbacks and sorted once at the end, the same shape as split()s `gave`, which step 2 made a crossbeam_queue::SegQueue (rule 9). Convert it the same way (SegQueue::new(), push, then collect + sort_unstable). Left to you because for_each_giving_way is new since the step-2 staging and par.rs is yours.",
+  "state": "applied",
+  "created": "2026-11-01T14:49:13Z",
+  "updated": "2026-11-01T14:56:02Z",
+  "taken_by": "one-pool",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T14:49:13Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T14:55:38Z",
+      "by": "one-pool",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T14:56:02Z",
+      "by": "one-pool",
+      "action": "done",
+      "note": "par.rs for_each_giving_way: again is a SegQueue<usize>, pushed from the scope callbacks, drained with pop and sorted once after the scope. rust-analyzer 0 errors, hot_lint clean."
+    }
+  ]
+}

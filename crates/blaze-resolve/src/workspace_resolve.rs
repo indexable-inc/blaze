@@ -9,7 +9,7 @@
 //! written.
 
 use anyhow::{Context as _, Result, anyhow};
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_hash::{HashMap, HashSet};
 use tracing::{debug, trace};
 use url::Url;
 
@@ -68,7 +68,7 @@ pub type PatchDependency<'a> = (&'a Patch, Option<LockedPatchDependency>);
 /// has a `PackageId` for which package it represents as well as a list of
 /// `PackageId` for the resolved dependencies. The hash map is otherwise
 /// structured though for easy access throughout this registry.
-type LockedMap = FxHashMap<
+type LockedMap = HashMap<
     // The first level of key-ing done in this hash map is the source that
     // dependencies come from, identified by a `SourceId`.
     // The next level is keyed by the name of the package...
@@ -91,7 +91,7 @@ pub struct PackageRegistry<R> {
     ///
     /// These are available for `query` after calling [`PackageRegistry::lock_patches`],
     /// which `lock`s them all to specific versions.
-    patches: FxHashMap<CanonicalUrl, Vec<Summary>>,
+    patches: HashMap<CanonicalUrl, Vec<Summary>>,
     /// Whether patches are locked. That is, they are available to resolution.
     ///
     /// See [`PackageRegistry::lock_patches`] and [`PackageRegistry::patch`] for more.
@@ -104,24 +104,24 @@ pub struct PackageRegistry<R> {
     ///
     /// This is constructed during calls to [`PackageRegistry::patch`],
     /// along with the `patches` field, thoough these entries never get locked.
-    patches_available: FxHashMap<CanonicalUrl, Vec<PackageId>>,
+    patches_available: HashMap<CanonicalUrl, Vec<PackageId>>,
 }
 
 impl<R: Registry> PackageRegistry<R> {
     pub fn new(sources: R) -> PackageRegistry<R> {
         PackageRegistry {
             sources,
-            locked: FxHashMap::default(),
-            patches: FxHashMap::default(),
+            locked: HashMap::default(),
+            patches: HashMap::default(),
             patches_locked: false,
-            patches_available: FxHashMap::default(),
+            patches_available: HashMap::default(),
         }
     }
 
     /// remove all residual state from previous lock files.
     pub fn clear_lock(&mut self) {
         trace!("clear_lock");
-        self.locked = FxHashMap::default();
+        self.locked = HashMap::default();
     }
 
     /// Registers one "locked package" to the registry, for guiding the
@@ -212,7 +212,7 @@ impl<R: Registry> PackageRegistry<R> {
             unlocked_summaries.push(summary);
         }
 
-        let mut name_and_version = FxHashSet::default();
+        let mut name_and_version = HashSet::default();
         for summary in unlocked_summaries.iter() {
             let name = summary.package_id().name();
             let version = summary.package_id().version();
@@ -281,7 +281,7 @@ impl<R: Registry> PackageRegistry<R> {
     ///
     /// These patches are mainly collected from [`patch`](Self::patch).
     /// They might not be the same as patches actually used during dependency resolving.
-    pub fn patches(&self) -> &FxHashMap<CanonicalUrl, Vec<Summary>> {
+    pub fn patches(&self) -> &HashMap<CanonicalUrl, Vec<Summary>> {
         &self.patches
     }
 
@@ -377,7 +377,7 @@ impl<R: Registry> Registry for PackageRegistry<R> {
 /// See [`PackageRegistry::lock`].
 fn lock(
     locked: &LockedMap,
-    patches: &FxHashMap<CanonicalUrl, Vec<PackageId>>,
+    patches: &HashMap<CanonicalUrl, Vec<PackageId>>,
     summary: Summary,
 ) -> Summary {
     let pair = locked
@@ -587,7 +587,7 @@ pub struct Workspace<'a> {
     /// Every package with a path source the workspace can reach (its members, their path
     /// dependencies and those of `[patch]` and `[replace]`), by source: cargo reads their
     /// manifests to tell what changed since the previous resolve.
-    pub path_packages: &'a FxHashMap<SourceId, Summary>,
+    pub path_packages: &'a HashMap<SourceId, Summary>,
     /// The root manifest's `[patch]`, by the URL patched.
     pub patch: &'a [(Url, Vec<Patch>)],
     /// The root manifest's `[replace]`.
@@ -681,7 +681,7 @@ pub fn resolve_with_previous<R: Registry>(
     let avoid_patch_ids = if register_patches {
         register_patch_entries(registry, ws, previous, &mut version_prefs)?
     } else {
-        FxHashSet::default()
+        HashSet::default()
     };
 
     // Keep all of the previous resolve but the patches that should avoid locking.
@@ -789,7 +789,7 @@ fn register_previous_locks<R: Registry>(
     // however, nothing else in the dependency graph depends on `log` and the
     // newer version of `serde` requires a new version of `log` it'll get pulled
     // in (as we didn't accidentally lock it to an old version).
-    let mut avoid_locking = FxHashSet::default();
+    let mut avoid_locking = HashSet::default();
     for node in resolve.iter() {
         if !keep(&node) {
             add_deps(resolve, node, &mut avoid_locking);
@@ -829,7 +829,7 @@ fn register_previous_locks<R: Registry>(
     // come up first before newer version, if newer version are available.
     {
         let mut path_deps: Vec<&Summary> = ws.members.members.to_vec();
-        let mut visited = FxHashSet::default();
+        let mut visited = HashSet::default();
         while let Some(member) = path_deps.pop() {
             if !visited.insert(member.package_id()) {
                 continue;
@@ -930,7 +930,7 @@ fn register_previous_locks<R: Registry>(
     }
 
     /// Recursively add `node` and all its transitive dependencies to `set`.
-    fn add_deps(resolve: &Resolve, node: PackageId, set: &mut FxHashSet<PackageId>) {
+    fn add_deps(resolve: &Resolve, node: PackageId, set: &mut HashSet<PackageId>) {
         if !set.insert(node) {
             return;
         }
@@ -966,8 +966,8 @@ fn register_patch_entries<R: Registry>(
     ws: &Workspace<'_>,
     previous: Option<&Resolve>,
     version_prefs: &mut VersionPreferences,
-) -> Result<FxHashSet<PackageId>> {
-    let mut avoid_patch_ids = FxHashSet::default();
+) -> Result<HashSet<PackageId>> {
+    let mut avoid_patch_ids = HashSet::default();
     for (url, patches) in ws.patch.iter() {
         for patch in patches {
             version_prefs.prefer_dependency(patch.dep.clone());

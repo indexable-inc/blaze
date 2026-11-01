@@ -102,10 +102,10 @@ impl Mounted {
         &self.root
     }
 
-    /// The sources the snippets of `diags` are read from, by the names [`Mounted::name`] gives,
-    /// each file read once; a file whose bytes fail their check gives no snippet.
-    pub(crate) fn sources(&self, diags: &[blaze_diagnostics::Diag]) -> blaze_diagnostics::emit::Sources {
-        let mut sources = blaze_diagnostics::emit::Sources::default();
+    /// Adds to `sources` the files the snippets of `diags` are read from that it lacks, by the
+    /// names [`Mounted::name`] gives, each file read once; a file no mount holds, or whose bytes
+    /// fail their check, is added as unread.
+    pub(crate) fn add_sources(&self, sources: &mut blaze_diagnostics::emit::Sources, diags: &[blaze_diagnostics::Diag]) {
         for name in sources.unread(diags) {
             let text = match self.read(&self.absolute(name)) {
                 Ok(Some((_, _, bytes))) => String::from_utf8(bytes.to_vec()).ok(),
@@ -113,7 +113,6 @@ impl Mounted {
             };
             sources.add(name, text);
         }
-        sources
     }
 }
 

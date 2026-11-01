@@ -68,7 +68,7 @@ impl Checked {
                 }
                 out.push_str("Future breakage diagnostic:\n");
             }
-            out.push_str(&crate::emit::written(diag, &sources, style));
+            out.push_str(&crate::emit::written(diag, &sources, style).unwrap());
         }
         out
     }

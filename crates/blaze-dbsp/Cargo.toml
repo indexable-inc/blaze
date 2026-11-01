@@ -14,8 +14,8 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-hash.workspace = true
 blaze-ids.workspace = true
-rustc-hash.workspace = true
 smallvec.workspace = true
 
 [dev-dependencies]

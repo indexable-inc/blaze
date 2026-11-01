@@ -91,12 +91,12 @@
 use std::{collections::hash_map::Entry, sync::Arc};
 
 use base_db::{Crate, Db, relevant_crates};
+use blaze_hash::{HashMap, HashSet};
 use hir_def::{
     AdtId, DefWithBodyId, EnumId, ExpressionStoreOwnerId, GenericDefId, ImplId, Lookup, ModuleId,
     TraitId, VariantId, dyn_map::DynMap, nameres::crate_def_map,
 };
 use hir_expand::{EditionedFileId, ExpansionInfo, HirFileId, MacroCallId};
-use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use span::FileId;
 use stdx::impl_from;
@@ -105,14 +105,14 @@ use crate::db::HirDatabase;
 
 #[derive(Default)]
 pub(super) struct SourceToDefCache<'db> {
-    pub(super) dynmap_cache: FxHashMap<(ChildContainer, HirFileId), DynMap>,
+    pub(super) dynmap_cache: HashMap<(ChildContainer, HirFileId), DynMap>,
     /// Where each macro file's expansion is in `expansions`.
-    expansion_at: FxHashMap<MacroCallId, u32>,
+    expansion_at: HashMap<MacroCallId, u32>,
     expansions: Vec<ExpansionInfo<'db>>,
-    pub(super) file_to_def_cache: FxHashMap<FileId, SmallVec<[ModuleId; 1]>>,
-    pub(super) included_file_cache: FxHashMap<EditionedFileId, Option<MacroCallId>>,
+    pub(super) file_to_def_cache: HashMap<FileId, SmallVec<[ModuleId; 1]>>,
+    pub(super) included_file_cache: HashMap<EditionedFileId, Option<MacroCallId>>,
     /// The crates a file is taken to be a module of, of those it may be, when any is.
-    pub(super) within: Option<Arc<FxHashSet<Crate>>>,
+    pub(super) within: Option<Arc<HashSet<Crate>>>,
 }
 
 /// The crates `file` may be a module of: those `within` first, then the others. The file of a
@@ -120,7 +120,7 @@ pub(super) struct SourceToDefCache<'db> {
 /// module tree built.
 fn crates_of<'a>(
     db: &'a Db,
-    within: Option<&'a FxHashSet<Crate>>,
+    within: Option<&'a HashSet<Crate>>,
     file: FileId,
     first: bool,
 ) -> impl Iterator<Item = Crate> + 'a {
@@ -209,7 +209,7 @@ impl<'db> SourceToDefCtx<'db, '_> {
     ) -> SmallVec<[ModuleId; 1]> {
         let mut mods = SmallVec::new();
         for crate_id in crates {
-            // Note: `mod` declarations in block modules cannot be supported here
+            // A module only a block's def map has is the view's `block_declared_module`.
             let crate_def_map = crate_def_map(self.db, crate_id);
             let n_mods = mods.len();
             let modules = |file| crate_def_map.modules_for_file(self.db, file);
@@ -289,12 +289,12 @@ impl ChildContainer {
 #[derive(Default)]
 struct Carry {
     at: Option<(base_db::Nonce, blaze_query::db::View)>,
-    dynmap_cache: FxHashMap<(ChildContainer, HirFileId), DynMap>,
-    expansion_at: FxHashMap<MacroCallId, u32>,
+    dynmap_cache: HashMap<(ChildContainer, HirFileId), DynMap>,
+    expansion_at: HashMap<MacroCallId, u32>,
     /// Always empty: its storage, for the next `Semantics`' expansions.
     expansions: Vec<ExpansionInfo<'static>>,
-    file_to_def_cache: FxHashMap<FileId, SmallVec<[ModuleId; 1]>>,
-    included_file_cache: FxHashMap<EditionedFileId, Option<MacroCallId>>,
+    file_to_def_cache: HashMap<FileId, SmallVec<[ModuleId; 1]>>,
+    included_file_cache: HashMap<EditionedFileId, Option<MacroCallId>>,
 }
 
 /// More dyn maps than this are not carried: a thread that walked many files keeps their

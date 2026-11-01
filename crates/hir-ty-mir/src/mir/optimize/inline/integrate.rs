@@ -4,8 +4,8 @@
 
 use std::ops::Range;
 
+use blaze_hash::HashMap;
 use rustc_ast_ir::Mutability;
-use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
 use smallvec::SmallVec;
 
@@ -83,7 +83,7 @@ struct Spans<'a> {
     scope: u32,
     /// Where the callee's own inlined spans start among the caller's.
     base: u32,
-    own: FxHashMap<MirSpan, u32>,
+    own: HashMap<MirSpan, u32>,
     spans: &'a mut Vec<InlinedSpan>,
 }
 
@@ -231,8 +231,7 @@ pub(super) fn inline_call<'db>(
             .iter()
             .map(|it| InlinedSpan { scope: scope_base + it.scope, span: it.span }),
     );
-    let mut spans =
-        Spans { scope, base, own: FxHashMap::default(), spans: &mut body.inlined.spans };
+    let mut spans = Spans { scope, base, own: HashMap::default(), spans: &mut body.inlined.spans };
     body.inlined.scopes.extend(callee.inlined.scopes.iter().map(|it| InlinedScope {
         callee: site.nested[it.callee as usize],
         call_site: spans.map(it.call_site),

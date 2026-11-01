@@ -14,7 +14,7 @@ use blaze_format::cursor::Put;
 use blaze_graph::par;
 use blaze_ids::radix;
 use object::elf;
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 use super::{
     BUILD_ID, DYNAMIC, DYNSTR, DYNSYM, EH_FRAME_HDR, Elf, GNU_HASH, INTERP, RELA_DYN, Segment, VERNEED,
@@ -107,11 +107,11 @@ pub(crate) fn sizes(output: &Output, counts: &Counts) -> Vec<(Class, u64)> {
 
 const NOTE_HEADER: u64 = 12 + 4;
 
-/// A string table: `\0` first, each string once. Keys borrow the image's names: one FxHash
+/// A string table: `\0` first, each string once. Keys borrow the image's names: one hash
 /// probe (entry API) per string and no allocation per string.
 pub(crate) struct Strings<'a> {
     pub(crate) bytes: Vec<u8>,
-    at: FxHashMap<&'a str, u32>,
+    at: HashMap<&'a str, u32>,
 }
 
 impl<'a> Strings<'a> {
@@ -119,7 +119,7 @@ impl<'a> Strings<'a> {
     pub(crate) fn with_capacity(bytes: usize, strings: usize) -> Strings<'a> {
         let mut table = Vec::with_capacity(1 + bytes);
         table.push(0);
-        Strings { bytes: table, at: FxHashMap::with_capacity_and_hasher(strings, Default::default()) }
+        Strings { bytes: table, at: HashMap::with_capacity_and_hasher(strings, Default::default()) }
     }
 
     pub(crate) fn add(&mut self, string: &'a str) -> u32 {
@@ -330,8 +330,8 @@ impl Tables {
         versym.put_u16(elf::VER_NDX_LOCAL.0);
         let versioned = imports.iter().filter(|it| it.library.is_some() && it.version.is_some()).count();
         let mut needs: Vec<(u32, &str, u16)> = Vec::with_capacity(versioned);
-        let mut version_index: FxHashMap<(u32, &str), u16> =
-            FxHashMap::with_capacity_and_hasher(versioned, Default::default());
+        let mut version_index: HashMap<(u32, &str), u16> =
+            HashMap::with_capacity_and_hasher(versioned, Default::default());
         let mut next = 2u16;
         for import in imports {
             let version = match (import.library, &import.version) {
@@ -1115,7 +1115,7 @@ fn fde_of(section: u64) -> impl Fn(usize, Frame, &mut Vec<(u64, u64)>) -> Result
 mod tests {
     use blaze_ids::rng::SplitMix64;
     use gimli::UnwindSection;
-    use rustc_hash::FxHashMap;
+    use blaze_hash::HashMap;
 
     use super::fdes;
     use crate::cow::CowBytes;
@@ -1127,7 +1127,7 @@ mod tests {
         eh_frame.set_address_size(8);
         let bases = gimli::BaseAddresses::default().set_eh_frame(section);
         let mut entries = eh_frame.entries(&bases);
-        let mut cies = FxHashMap::default();
+        let mut cies = HashMap::default();
         let mut table = Vec::new();
         while let Some(entry) = entries.next().map_err(|it| it.to_string())? {
             match entry {

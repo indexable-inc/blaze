@@ -16,10 +16,12 @@
 //! (`NoAssociatedItem`, `CandidateTraitNote`) and `compiler/rustc_parse/src/parser/item.rs`
 //! (`inject_use_span`) (MIT or Apache-2.0).
 
+use blaze_hash::HashSet;
 use blaze_items::{Fact, ItemId};
 use hir::{AsAssocItem as _, HasVisibility as _, InFile};
-use rustc_hash::FxHashSet;
-use stdx::edit_distance::{edit_distance_with_substrings, find_best_match_for_name_with_substrings};
+use stdx::edit_distance::{
+    edit_distance_with_substrings, find_best_match_for_name_with_substrings,
+};
 use syntax::{
     SyntaxKind, T, TextRange,
     view::{self as ast, AstNode as _, HasArgList as _, HasName as _, HasTypeBounds as _},
@@ -540,7 +542,7 @@ pub(crate) fn similar_candidate<'db>(cx: &Cx<'_, 'db>, no_match: &NoMatch<'db>) 
     let lookup = no_match.name.as_str();
     let max_dist = std::cmp::max(lookup.len(), 3) / 3;
     // alloc: the error's parts, for an error hir found
-    let traits: FxHashSet<hir_def::TraitId> = all_traits(cx).into_iter().map(Into::into).collect();
+    let traits: HashSet<hir_def::TraitId> = all_traits(cx).into_iter().map(Into::into).collect();
     // alloc: the error's parts, for an error hir found
     let mut found: Vec<hir::AssocItem> = Vec::new();
     let mut close = |item: hir::AssocItem| {
@@ -824,7 +826,7 @@ fn trait_applies<'db>(cx: &Cx<'_, 'db>, no_match: &NoMatch<'db>, scope: &hir::Se
         return false;
     }
     // alloc: the error's parts, for an error hir found
-    let traits: FxHashSet<hir_def::TraitId> = std::iter::once(t.into()).collect();
+    let traits: HashSet<hir_def::TraitId> = std::iter::once(t.into()).collect();
     let of_trait = |item: hir::AssocItem| (item.container_or_implemented_trait(cx.db) == Some(t)).then_some(());
     match no_match.is_method {
         true => no_match

@@ -13,7 +13,9 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
-rustc-hash.workspace = true
+blaze-hash.workspace = true
+crossbeam-queue.workspace = true
+parking_lot.workspace = true
 rustc_lexer.workspace = true
 
 # local deps

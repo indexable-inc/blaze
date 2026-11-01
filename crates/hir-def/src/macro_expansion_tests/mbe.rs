@@ -35,9 +35,9 @@ macro_rules! f {
     };
 }
 
-struct#0:MacroRules[BE8F, 0]@58..64#22529# MyTraitMap2#0:MacroCall[BE8F, 0]@31..42#ROOT2024# {#0:MacroRules[BE8F, 0]@72..73#22529#
-    map#0:MacroRules[BE8F, 0]@86..89#22529#:#0:MacroRules[BE8F, 0]@89..90#22529# #0:MacroRules[BE8F, 0]@89..90#22529#::#0:MacroRules[BE8F, 0]@91..93#22529#std#0:MacroRules[BE8F, 0]@93..96#22529#::#0:MacroRules[BE8F, 0]@96..98#22529#collections#0:MacroRules[BE8F, 0]@98..109#22529#::#0:MacroRules[BE8F, 0]@109..111#22529#HashSet#0:MacroRules[BE8F, 0]@111..118#22529#<#0:MacroRules[BE8F, 0]@118..119#22529#(#0:MacroRules[BE8F, 0]@119..120#22529#)#0:MacroRules[BE8F, 0]@120..121#22529#>#0:MacroRules[BE8F, 0]@121..122#22529#,#0:MacroRules[BE8F, 0]@122..123#22529#
-}#0:MacroRules[BE8F, 0]@132..133#22529#
+struct#0:MacroRules[AFBF, 0]@58..64#22529# MyTraitMap2#0:MacroCall[D606, 0]@31..42#ROOT2024# {#0:MacroRules[AFBF, 0]@72..73#22529#
+    map#0:MacroRules[AFBF, 0]@86..89#22529#:#0:MacroRules[AFBF, 0]@89..90#22529# #0:MacroRules[AFBF, 0]@89..90#22529#::#0:MacroRules[AFBF, 0]@91..93#22529#std#0:MacroRules[AFBF, 0]@93..96#22529#::#0:MacroRules[AFBF, 0]@96..98#22529#collections#0:MacroRules[AFBF, 0]@98..109#22529#::#0:MacroRules[AFBF, 0]@109..111#22529#HashSet#0:MacroRules[AFBF, 0]@111..118#22529#<#0:MacroRules[AFBF, 0]@118..119#22529#(#0:MacroRules[AFBF, 0]@119..120#22529#)#0:MacroRules[AFBF, 0]@120..121#22529#>#0:MacroRules[AFBF, 0]@121..122#22529#,#0:MacroRules[AFBF, 0]@122..123#22529#
+}#0:MacroRules[AFBF, 0]@132..133#22529#
 "#]],
     );
 }
@@ -75,12 +75,12 @@ macro_rules! f {
     };
 }
 
-fn#0:MacroCall[BE8F, 0]@30..32#ROOT2024# main#0:MacroCall[BE8F, 0]@33..37#ROOT2024#(#0:MacroCall[BE8F, 0]@37..38#ROOT2024#)#0:MacroCall[BE8F, 0]@38..39#ROOT2024# {#0:MacroCall[BE8F, 0]@40..41#ROOT2024#
-    1#0:MacroCall[BE8F, 0]@50..51#ROOT2024#;#0:MacroCall[BE8F, 0]@51..52#ROOT2024#
-    1.0#0:MacroCall[BE8F, 0]@61..64#ROOT2024#;#0:MacroCall[BE8F, 0]@64..65#ROOT2024#
-    (#0:MacroCall[BE8F, 0]@74..75#ROOT2024#(#0:MacroCall[BE8F, 0]@75..76#ROOT2024#1#0:MacroCall[BE8F, 0]@76..77#ROOT2024#,#0:MacroCall[BE8F, 0]@77..78#ROOT2024# )#0:MacroCall[BE8F, 0]@78..79#ROOT2024#,#0:MacroCall[BE8F, 0]@79..80#ROOT2024# )#0:MacroCall[BE8F, 0]@80..81#ROOT2024#.#0:MacroCall[BE8F, 0]@81..82#ROOT2024#0#0:MacroCall[BE8F, 0]@82..83#ROOT2024#.#0:MacroCall[BE8F, 0]@83..84#ROOT2024#0#0:MacroCall[BE8F, 0]@84..85#ROOT2024#;#0:MacroCall[BE8F, 0]@85..86#ROOT2024#
-    let#0:MacroCall[BE8F, 0]@95..98#ROOT2024# x#0:MacroCall[BE8F, 0]@99..100#ROOT2024# =#0:MacroCall[BE8F, 0]@101..102#ROOT2024# 1#0:MacroCall[BE8F, 0]@103..104#ROOT2024#;#0:MacroCall[BE8F, 0]@104..105#ROOT2024#
-}#0:MacroCall[BE8F, 0]@110..111#ROOT2024#
+fn#0:MacroCall[D606, 0]@30..32#ROOT2024# main#0:MacroCall[D606, 0]@33..37#ROOT2024#(#0:MacroCall[D606, 0]@37..38#ROOT2024#)#0:MacroCall[D606, 0]@38..39#ROOT2024# {#0:MacroCall[D606, 0]@40..41#ROOT2024#
+    1#0:MacroCall[D606, 0]@50..51#ROOT2024#;#0:MacroCall[D606, 0]@51..52#ROOT2024#
+    1.0#0:MacroCall[D606, 0]@61..64#ROOT2024#;#0:MacroCall[D606, 0]@64..65#ROOT2024#
+    (#0:MacroCall[D606, 0]@74..75#ROOT2024#(#0:MacroCall[D606, 0]@75..76#ROOT2024#1#0:MacroCall[D606, 0]@76..77#ROOT2024#,#0:MacroCall[D606, 0]@77..78#ROOT2024# )#0:MacroCall[D606, 0]@78..79#ROOT2024#,#0:MacroCall[D606, 0]@79..80#ROOT2024# )#0:MacroCall[D606, 0]@80..81#ROOT2024#.#0:MacroCall[D606, 0]@81..82#ROOT2024#0#0:MacroCall[D606, 0]@82..83#ROOT2024#.#0:MacroCall[D606, 0]@83..84#ROOT2024#0#0:MacroCall[D606, 0]@84..85#ROOT2024#;#0:MacroCall[D606, 0]@85..86#ROOT2024#
+    let#0:MacroCall[D606, 0]@95..98#ROOT2024# x#0:MacroCall[D606, 0]@99..100#ROOT2024# =#0:MacroCall[D606, 0]@101..102#ROOT2024# 1#0:MacroCall[D606, 0]@103..104#ROOT2024#;#0:MacroCall[D606, 0]@104..105#ROOT2024#
+}#0:MacroCall[D606, 0]@110..111#ROOT2024#
 
 
 "#]],
@@ -171,7 +171,7 @@ fn main(foo: ()) {
     }
 
     fn main(foo: ()) {
-        /* error: unresolved macro unresolved */"helloworld!"#0:Fn[15AE, 0]@236..321#ROOT2024#;
+        /* error: unresolved macro unresolved */"helloworld!"#0:Fn[50EA, 0]@236..321#ROOT2024#;
     }
 }
 
@@ -197,7 +197,7 @@ macro_rules! mk_struct {
 #[macro_use]
 mod foo;
 
-struct#1:MacroRules[DB0C, 0]@59..65#25601# Foo#0:MacroCall[DB0C, 0]@32..35#ROOT2024#(#1:MacroRules[DB0C, 0]@70..71#25601#u32#0:MacroCall[DB0C, 0]@41..44#ROOT2024#)#1:MacroRules[DB0C, 0]@74..75#25601#;#1:MacroRules[DB0C, 0]@75..76#25601#
+struct#1:MacroRules[B77A, 0]@59..65#25601# Foo#0:MacroCall[2849, 0]@32..35#ROOT2024#(#1:MacroRules[B77A, 0]@70..71#25601#u32#0:MacroCall[2849, 0]@41..44#ROOT2024#)#1:MacroRules[B77A, 0]@74..75#25601#;#1:MacroRules[B77A, 0]@75..76#25601#
 "#]],
     );
 }

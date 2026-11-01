@@ -1,0 +1,24 @@
+{
+  "id": "01516",
+  "from_lane": "one-pool",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-mem/src/frame.rs",
+    "crates/blaze-graph/src/par.rs"
+  ],
+  "what": "A1 frame crash: rebuild the release blaze from the tree with blaze-mem frame.rs opened_at/ended_on (06:50, READY) and rerun the repro: cd /Volumes/Projects/blaze-v2-hash && BLAZE_BIN=<new release blaze> uv run --frozen python harness/outdirwarn.py \"{}\" (about 25 s), with RUST_BACKTRACE=1. Save the panic to /tmp/blaze-lanes/frame-repro/warm-diag.log. The 06:38 logs came from a binary without the fields: their message lacks Task N was opened at <file:line> and ended on this/another thread, which is what pins the carry hole. Also the par.rs 01514 fix (for_each_giving_way SegQueue) is READY.",
+  "state": "open",
+  "created": "2026-11-01T14:56:47Z",
+  "updated": "2026-11-01T14:56:47Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T14:56:47Z",
+      "by": "one-pool",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

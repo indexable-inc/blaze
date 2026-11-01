@@ -4,8 +4,8 @@ use blaze_core::{
     Completion, Done, Driver, Effect, FileName, IoError, Tag,
     sim::{Faults, Rng, Sim},
 };
+use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Hasher};
-use rustc_hash::FxHashMap;
 
 use crate::{
     Change, ChangeKind, CommitError, DIR_DOMAIN, FILE_DOMAIN, Mode, Op, OpError, Reader, Ticket,
@@ -615,10 +615,9 @@ fn a_directory_deleted_and_written_under_again_keeps_its_dotted_sibling() {
 #[cfg(not(blaze_check))] // many threads, long loops
 #[test]
 fn readers_on_many_threads_see_whole_roots_while_commits_and_collections_run() {
-    use std::sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use parking_lot::Mutex;
 
     let mut vfs = new_vfs();
     let reader = vfs.reader();
@@ -634,7 +633,7 @@ fn readers_on_many_threads_see_whole_roots_while_commits_and_collections_run() {
                     let (mut whole, mut gone) = (0, 0);
                     while whole + gone < 3000 {
                         let root = {
-                            let roots = published.lock().unwrap();
+                            let roots = published.lock();
                             let len = roots.len() as u64;
                             // The latest half the time: the head keeps it, so most reads find
                             // one.
@@ -675,10 +674,10 @@ fn readers_on_many_threads_see_whole_roots_while_commits_and_collections_run() {
                 write(&format!("x/{}", at % 8), &bytes),
             ];
             root = vfs.commit("w", root, &ops).unwrap().root;
-            published.lock().unwrap().push(root);
+            published.lock().push(root);
             if at % 25 == 24 {
                 let keep = {
-                    let roots = published.lock().unwrap();
+                    let roots = published.lock();
                     roots[roots.len().saturating_sub(3)..].to_vec()
                 };
                 vfs.collect(&keep);
@@ -1042,15 +1041,15 @@ fn journal_run(seed: u64) {
     let mut effects = Vec::new();
     let mut done = Vec::new();
     // Each head move's sequence number, and the head and files it moved to.
-    let mut moves: FxHashMap<u64, (String, BTreeMap<String, Vec<u8>>)> = FxHashMap::default();
+    let mut moves: HashMap<u64, (String, BTreeMap<String, Vec<u8>>)> = HashMap::default();
     // Each ticket's head, sequence and whether it removed the head.
-    let mut tickets: FxHashMap<Ticket, (String, u64, bool)> = FxHashMap::default();
+    let mut tickets: HashMap<Ticket, (String, u64, bool)> = HashMap::default();
     // By head: the latest record acknowledged durable, and whether it was a removal.
-    let mut acknowledged: FxHashMap<String, (u64, bool)> = FxHashMap::default();
+    let mut acknowledged: HashMap<String, (u64, bool)> = HashMap::default();
     // By head: the sequence of each removal, acknowledged or not. A crash keeps a random prefix
     // of what was appended and not synced, so an unacknowledged removal can survive one while
     // a later one of the same head (after it was made again) is cut.
-    let mut removed: FxHashMap<String, Vec<u64>> = FxHashMap::default();
+    let mut removed: HashMap<String, Vec<u64>> = HashMap::default();
     let mut old_bases: Vec<ContentId> = Vec::new();
 
     for step in 0..300 {

@@ -30,7 +30,7 @@ fn ui_only(fixture: &str, keep: impl Fn(&Diag) -> bool) -> String {
         .diags
         .iter()
         .filter(|it| keep(it))
-        .map(|it| written(it, &sources, ui_testing()))
+        .map(|it| written(it, &sources, ui_testing()).unwrap())
         .collect();
     if stderr.ends_with("\n\n") {
         stderr.pop();

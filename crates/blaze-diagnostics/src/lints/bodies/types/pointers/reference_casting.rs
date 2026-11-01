@@ -8,6 +8,7 @@
 //! utils.rs` (`peel_casts`) and `compiler/rustc_lint/src/lints.rs`
 //! (`InvalidReferenceCastingDiag`) (MIT or Apache-2.0).
 
+use blaze_hash::HashMap;
 use hir_def::{
     AdtId, HasModule, VariantId,
     hir::{BinaryOp, BindingId, Expr, ExprId, Pat, UnaryOp},
@@ -16,7 +17,6 @@ use hir_ty::{
     db::HirDatabase as _,
     next_solver::{DbInterner, Ty, TyKind},
 };
-use rustc_hash::FxHashMap;
 use rustc_type_ir::{
     Interner as _, Mutability,
     inherent::{AdtDef as _, IntoKind as _},
@@ -24,7 +24,7 @@ use rustc_type_ir::{
 
 use super::{Inits, LayoutFacts, callee_item, expr_or_init, layout, peel_casts, span, type_info};
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKind, ExprKinds, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -155,7 +155,7 @@ struct Bigger {
 
 fn is_cast_to_bigger_memory_layout(
     b: &BodyCx<'_, '_, '_>,
-    inits: &FxHashMap<BindingId, ExprId>,
+    inits: &HashMap<BindingId, ExprId>,
     orig: ExprId,
     peel: &mut impl FnMut() -> ExprId,
 ) -> Option<Bigger> {

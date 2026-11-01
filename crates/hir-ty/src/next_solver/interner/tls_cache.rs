@@ -16,11 +16,11 @@
 
 
 use super::DbInterner;
-use base_db::{Db, Crate, Nonce};
+use base_db::{Crate, Db, Nonce};
+use blaze_hash::FixedState;
 use blaze_mem::{Cache, Pool, Pooled, Tag, lock::SpinLock, pool::Limbo};
-use rustc_hash::FxBuildHasher;
-use rustc_type_ir::search_graph::GlobalCache;
 use blaze_query::db::View;
+use rustc_type_ir::search_graph::GlobalCache;
 use std::{
     cell::Cell,
     hash::BuildHasher,
@@ -187,7 +187,7 @@ trait Key: Copy + Eq + Send + Sync + 'static {
 impl Key for Scope {
     #[inline]
     fn hint(self) -> u64 {
-        FxBuildHasher.hash_one(self) | 1
+        FixedState.hash_one(self) | 1
     }
 }
 
@@ -491,11 +491,13 @@ mod tests {
     use std::{
         collections::{HashMap, HashSet},
         sync::{
-            Barrier, Mutex,
+            Barrier,
             atomic::{AtomicUsize, Ordering},
         },
         thread,
     };
+
+    use parking_lot::Mutex;
 
     use super::{EMPTY, Key, SOLVED_BLOCK, Shared, Solved, pool};
 
@@ -608,9 +610,9 @@ mod tests {
         let table = table::<SharedGoals>(4);
         let task = blaze_reclaim::enter();
         let (one, other) = (key(), key());
-        table.of(&task, one, 0).lock().unwrap().insert(7, 1);
-        assert_eq!(table.of(&task, other, 0).lock().unwrap().get(&7), None);
-        assert_eq!(table.of(&task, one, 0).lock().unwrap().get(&7), Some(&1));
+        table.of(&task, one, 0).lock().insert(7, 1);
+        assert_eq!(table.of(&task, other, 0).lock().get(&7), None);
+        assert_eq!(table.of(&task, one, 0).lock().get(&7), Some(&1));
     }
 
     #[test]
@@ -621,13 +623,13 @@ mod tests {
             scope
                 .spawn(|| {
                     let task = blaze_reclaim::enter();
-                    table.of(&task, query, 0).lock().unwrap().insert(7, 1);
+                    table.of(&task, query, 0).lock().insert(7, 1);
                 })
                 .join()
                 .unwrap();
             let found = scope.spawn(|| {
                 let task = blaze_reclaim::enter();
-                table.of(&task, query, 0).lock().unwrap().get(&7).copied()
+                table.of(&task, query, 0).lock().get(&7).copied()
             });
             assert_eq!(found.join().unwrap(), Some(1));
         });
@@ -662,11 +664,11 @@ mod tests {
         let table = table::<SharedGoals>(4);
         let task = blaze_reclaim::enter();
         let query = key();
-        table.of(&task, query, 0).lock().unwrap().insert(1, 1);
-        assert_eq!(table.of(&task, query, 1).lock().unwrap().get(&1), None);
-        assert_eq!(table.of(&task, query, 1).lock().unwrap().len(), 0);
+        table.of(&task, query, 0).lock().insert(1, 1);
+        assert_eq!(table.of(&task, query, 1).lock().get(&1), None);
+        assert_eq!(table.of(&task, query, 1).lock().len(), 0);
         // The old state's value is gone, not kept beside the new one.
-        assert_eq!(table.of(&task, query, 0).lock().unwrap().get(&1), None);
+        assert_eq!(table.of(&task, query, 0).lock().get(&1), None);
         assert_eq!(holding(&table, query), 1);
     }
 
@@ -677,7 +679,7 @@ mod tests {
         let task = blaze_reclaim::enter();
         let queries: Vec<Solved> = (0..16).map(|_| key()).collect();
         for &query in &queries {
-            table.of(&task, query, 0).lock().unwrap().insert(7, 1);
+            table.of(&task, query, 0).lock().insert(7, 1);
         }
         let (sixteenth, seventeenth) = (key(), key());
         table.of(&task, sixteenth, 0);
@@ -687,7 +689,7 @@ mod tests {
         // That sweep cleared every mark; all but one of the queries left are used again.
         let idle = kept[0];
         for &query in &kept[1..] {
-            assert_eq!(table.of(&task, query, 0).lock().unwrap().get(&7), Some(&1));
+            assert_eq!(table.of(&task, query, 0).lock().get(&7), Some(&1));
         }
         table.of(&task, seventeenth, 0);
         assert_eq!(holding(&table, idle), 0);
@@ -702,12 +704,12 @@ mod tests {
         let task = blaze_reclaim::enter();
         let queries: Vec<Solved> = (0..8).map(|_| key()).collect();
         for &query in &queries {
-            table.of(&task, query, 0).lock().unwrap().insert(1, 1);
+            table.of(&task, query, 0).lock().insert(1, 1);
         }
         table.clear();
         assert!(table.hints.iter().all(|it| it.load(Ordering::Relaxed) == EMPTY));
         for &query in &queries {
-            assert_eq!(table.of(&task, query, 0).lock().unwrap().get(&1), None);
+            assert_eq!(table.of(&task, query, 0).lock().get(&1), None);
         }
     }
 
@@ -828,7 +830,7 @@ mod tests {
                         let goal = rng.below(64) as u32;
                         let truth = solve(query, state, goal);
                         let shared = {
-                            let mut goals = table.of(&task, query, state).lock().unwrap();
+                            let mut goals = table.of(&task, query, state).lock();
                             if goals.contains_key(&goal) {
                                 shared_hits.fetch_add(1, Ordering::Relaxed);
                             }

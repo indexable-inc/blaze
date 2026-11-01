@@ -14,7 +14,6 @@ use std::{
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
-    sync::Mutex,
 };
 
 use blaze_graph::par;
@@ -45,45 +44,37 @@ impl Entry {
     }
 }
 
-struct Found {
-    entries: Mutex<Vec<Entry>>,
-    error: Mutex<Option<io::Error>>,
-    dirs: Mutex<Vec<(PathBuf, String)>>,
-    files: Mutex<Vec<Vec<(PathBuf, String)>>>,
-}
-
-impl Found {
-    fn add(&self, mut entries: Vec<Entry>) {
-        self.entries.lock().expect("a walk's task panicked").append(&mut entries);
-    }
-
-    fn fail(&self, error: io::Error) {
-        self.error.lock().expect("a walk's task panicked").get_or_insert(error);
-    }
+/// What listing one directory found: its links, its directories, and its files in tasks of up
+/// to [`FILES_A_TASK`].
+struct Listed {
+    links: Vec<Entry>,
+    dirs: Vec<(PathBuf, String)>,
+    files: Vec<Vec<(PathBuf, String)>>,
 }
 
 /// The digest of the tree at `root`, the directories named in `skip` at its top left out. An
-/// entry that can't be read, or a name or link target that is not UTF-8, is an error naming it.
+/// entry that can't be read, or a name or link target that is not UTF-8, is an error naming it:
+/// the first in the walk's order.
 pub fn digest(root: &Path, skip: &[String]) -> io::Result<[u8; 32]> {
-    let found = Found {
-        // alloc: once a digest
-        entries: Mutex::new(Vec::new()),
-        error: Mutex::new(None),
-        dirs: Mutex::new(Vec::new()),
-        files: Mutex::new(Vec::new()),
-    };
+    // alloc: once a digest
+    let mut entries = Vec::new();
     // alloc: the walk's paths, once a directory
     let mut dirs = vec![(root.to_path_buf(), String::new())];
     while !dirs.is_empty() {
-        par::for_each(dirs, |(dir, rel)| walk(dir, rel, skip, &found));
-        let files = std::mem::take(&mut *found.files.lock().expect("a walk's task panicked"));
-        par::for_each(files, |files| hash_files(files, &found));
-        dirs = std::mem::take(&mut *found.dirs.lock().expect("a walk's task panicked"));
+        let listed = par::map(dirs, |(dir, rel)| list(&dir, &rel, skip));
+        // alloc: once a level of the walk, its directories and its files' tasks
+        let (mut next, mut files) = (Vec::new(), Vec::new());
+        for it in listed {
+            let Listed { links, dirs, files: tasks } = it?;
+            entries.extend(links);
+            next.extend(dirs);
+            files.extend(tasks);
+        }
+        for hashed in par::map(files, hash_files) {
+            entries.extend(hashed?);
+        }
+        dirs = next;
     }
-    if let Some(error) = found.error.into_inner().expect("a walk's task panicked") {
-        return Err(error);
-    }
-    let mut entries = found.entries.into_inner().expect("a walk's task panicked");
     entries.sort_unstable_by(|a, b| a.order().cmp(&b.order()));
     let mut hasher = b3::Hasher::new();
     hasher.update(DOMAIN);
@@ -120,15 +111,9 @@ pub fn hex(hash: &[u8; 32], out: &mut Vec<u8>) {
     }
 }
 
-fn walk(dir: PathBuf, rel: String, skip: &[String], found: &Found) {
-    if let Err(error) = list(&dir, &rel, skip, found) {
-        found.fail(error);
-    }
-}
-
-fn list(dir: &Path, rel: &str, skip: &[String], found: &Found) -> io::Result<()> {
-    // alloc: per directory, its links
-    let mut links = Vec::new();
+fn list(dir: &Path, rel: &str, skip: &[String]) -> io::Result<Listed> {
+    // alloc: per directory, its links, directories and files' tasks
+    let mut listed = Listed { links: Vec::new(), dirs: Vec::new(), files: Vec::new() };
     // alloc: per directory, its files until a task takes them
     let mut files: Vec<(PathBuf, String)> = Vec::new();
     for entry in fs::read_dir(dir).map_err(|e| named(dir, e))? {
@@ -156,36 +141,30 @@ fn list(dir: &Path, rel: &str, skip: &[String], found: &Found) -> io::Result<()>
                 return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{}: a link target that is not UTF-8", path.display())));
             };
             // alloc: per link, its target
-            links.push(Entry::Link { rel: child, to: to.to_owned() });
+            listed.links.push(Entry::Link { rel: child, to: to.to_owned() });
         } else if kind.is_dir() {
-            found.dirs.lock().expect("a walk's task panicked").push((path, child));
+            listed.dirs.push((path, child));
         } else if kind.is_file() {
             files.push((path, child));
             if files.len() == FILES_A_TASK {
-                let taken = std::mem::take(&mut files);
-                found.files.lock().expect("a walk's task panicked").push(taken);
+                listed.files.push(std::mem::take(&mut files));
             }
         }
     }
     if !files.is_empty() {
-        found.files.lock().expect("a walk's task panicked").push(files);
+        listed.files.push(files);
     }
-    if !links.is_empty() {
-        found.add(links);
-    }
-    Ok(())
+    Ok(listed)
 }
 
-fn hash_files(files: Vec<(PathBuf, String)>, found: &Found) {
+fn hash_files(files: Vec<(PathBuf, String)>) -> io::Result<Vec<Entry>> {
     // alloc: per task, its entries
     let mut entries = Vec::with_capacity(files.len());
     for (path, rel) in files {
-        match hash_file(&path) {
-            Ok((executable, hash)) => entries.push(Entry::File { rel, executable, hash }),
-            Err(error) => return found.fail(named(&path, error)),
-        }
+        let (executable, hash) = hash_file(&path).map_err(|e| named(&path, e))?;
+        entries.push(Entry::File { rel, executable, hash });
     }
-    found.add(entries);
+    Ok(entries)
 }
 
 thread_local! {

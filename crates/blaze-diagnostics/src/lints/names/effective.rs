@@ -33,7 +33,11 @@
 use std::cmp::Ordering;
 
 use base_db::Db;
-use hir::{AsAssocItem as _, AssocItem, AssocItemContainer, GenericDef, HasVisibility as _, ModuleDef, db::HirDatabase as _};
+use blaze_hash::{HashMap, HashSet};
+use hir::{
+    AsAssocItem as _, AssocItem, AssocItemContainer, GenericDef, HasVisibility as _, ModuleDef,
+    db::HirDatabase as _,
+};
 use hir_def::{
     CallableDefId, FunctionId, ItemContainerId, Lookup as _, ModuleDefId, TypeAliasId, UseId,
     expr_store::Body,
@@ -41,9 +45,9 @@ use hir_def::{
     nameres::demand::every_body,
 };
 use hir_ty::next_solver::{AliasTy, Clause, ClauseKind, DbInterner, Ty, TyKind};
-use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
-    AliasTyKind, TypeSuperVisitable, TypeVisitable, TypeVisitableExt as _, TypeVisitor, inherent::IntoKind as _,
+    AliasTyKind, TypeSuperVisitable, TypeVisitable, TypeVisitableExt as _, TypeVisitor,
+    inherent::IntoKind as _,
 };
 
 use crate::cx::Cx;
@@ -107,7 +111,7 @@ impl Ev {
 /// The effective visibilities of the crate's definitions.
 #[derive(Default)]
 pub(crate) struct Effective {
-    ids: FxHashMap<Def, u32>,
+    ids: HashMap<Def, u32>,
     defs: Vec<Def>,
     /// rustc's table: `None` where it has no entry.
     ev: Vec<Option<Ev>>,
@@ -134,7 +138,7 @@ impl Effective {
             t: Effective::default(),
             queue: Vec::new(),  // alloc: setup, a definition is queued once at a time
             queued: Vec::new(), // alloc: setup, a column over the numbering
-            impls_of: FxHashMap::default(),
+            impls_of: HashMap::default(),
             names: Names::new(db, false),
         };
         build.resolve(&modules);
@@ -320,7 +324,7 @@ struct Build<'c, 'a, 'db> {
     queue: Vec<u32>,
     queued: Vec<bool>,
     /// rustc's `def_ids_to_impls`: the impls whose outermost self type or trait a type or trait is.
-    impls_of: FxHashMap<u32, Vec<u32>>,
+    impls_of: HashMap<u32, Vec<u32>>,
     /// The definitions a walk names, reused from walk to walk.
     names: Names<'db>,
 }
@@ -841,7 +845,7 @@ struct Names<'db> {
     db: &'db Db,
     found: Vec<Def>,
     /// The aliases and opaque types walked, each once.
-    seen: FxHashSet<Ty<'db>>,
+    seen: HashSet<Ty<'db>>,
     /// `skip_assoc_tys`: projections not looked into.
     skip_assoc: bool,
 }
@@ -849,7 +853,7 @@ struct Names<'db> {
 impl<'db> Names<'db> {
     fn new(db: &'db Db, skip_assoc: bool) -> Names<'db> {
         // alloc: setup, the buffers are reused for every walk
-        Names { db, found: Vec::new(), seen: FxHashSet::default(), skip_assoc }
+        Names { db, found: Vec::new(), seen: HashSet::default(), skip_assoc }
     }
 
     fn push(&mut self, def: Def) {

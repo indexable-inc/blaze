@@ -230,7 +230,7 @@ pub(super) fn walk(
 
 /// The inode of the real path `path`: the same for it every run, and nonzero.
 pub(super) fn ino_of(path: &[u8]) -> u64 {
-    let mut hasher = rustc_hash::FxHasher::default();
+    let mut hasher = blaze_hash::FixedHasher::default();
     hasher.write(path);
     hasher.finish() | 1
 }

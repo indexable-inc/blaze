@@ -13,15 +13,17 @@ publish = false
 
 [dependencies]
 blaze-bytes.workspace = true
+blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
-rustc-hash.workspace = true
 text-size.workspace = true
 
 serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+blaze-spin.workspace = true
+parking_lot.workspace = true
 
 [features]
 serde1 = ["serde", "text-size/serde"]

@@ -22,16 +22,13 @@
 
 #![forbid(unsafe_code)]
 
-use std::{
-    cell::RefCell,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{cell::RefCell, sync::Arc, time::Duration};
 
 use base_db::Db;
+use blaze_hash::{HashMap, HashSet};
 use cranelift_codegen::ir::{self, InstBuilder, Opcode, types};
 use hir_def::{FunctionId, HasModule, attrs::AttrFlags};
-use rustc_hash::{FxHashMap, FxHashSet};
+use parking_lot::Mutex;
 
 use hir_ty::{db::HirDatabase, next_solver::StoredGenericArgs, traits::StoredParamEnvAndCrate};
 
@@ -179,7 +176,7 @@ impl Tiered {
 /// The functions of a program at a level above 1.
 #[derive(Default)]
 pub struct Tiers {
-    nodes: FxHashMap<Node, Arc<Tiered>>,
+    nodes: HashMap<Node, Arc<Tiered>>,
     /// What was installed since a patch last held the code, with the code each replaced.
     fresh: Vec<(Node, Option<Arc<Tiered>>)>,
     /// Code installed together with code no patch could hold, to install again one by one.
@@ -272,7 +269,7 @@ impl Tiers {
     pub fn clear(&mut self) {
         self.fresh.clear();
         self.trial.clear();
-        let mut demoted = self.demoted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut demoted = self.demoted.lock();
         for (node, _) in self.nodes.drain() {
             // alloc: the reason reported to the daemon, once per tiered function per full build
             demoted.push((node, "the program was linked again".to_owned()));
@@ -281,7 +278,7 @@ impl Tiers {
 
     /// The functions a build since the last call found edited, which are at level 1 again.
     pub fn take_demoted(&mut self) -> Vec<(Node, String)> {
-        let demoted = std::mem::take(&mut *self.demoted.lock().unwrap_or_else(|e| e.into_inner()));
+        let demoted = std::mem::take(&mut *self.demoted.lock());
         for (node, _) in &demoted {
             self.nodes.remove(node);
             self.fresh.retain(|it| it.0 != *node);
@@ -306,7 +303,7 @@ impl Tiers {
             None
         };
         if let Some(why) = edited {
-            let mut demoted = self.demoted.lock().unwrap_or_else(|e| e.into_inner());
+            let mut demoted = self.demoted.lock();
             if !demoted.iter().any(|(it, _)| it == node) {
                 // alloc: the reason reported to the daemon, once per function an edit demotes
                 demoted.push((node.clone(), why.to_owned()));
@@ -327,10 +324,10 @@ pub(super) struct Request {
 
 /// The hot functions the compile under way on this thread may build into what it compiles.
 struct Inlining {
-    roots: FxHashSet<FunctionId>,
+    roots: HashSet<FunctionId>,
     /// By what they are and their generic arguments: whether a call checks overflow is the
     /// caller's to say, which the last build may have settled otherwise.
-    instances: FxHashSet<(InstanceDef, StoredGenericArgs)>,
+    instances: HashSet<(InstanceDef, StoredGenericArgs)>,
     inlined: Vec<(Instance, StoredParamEnvAndCrate)>,
     /// Of a build's compile ([`for_build`]) rather than of one at a level above 1.
     whole: bool,
@@ -345,7 +342,7 @@ struct Inlining {
     spent: usize,
     seen: usize,
     /// The bodies built so far, by what they are of: `None` for one that is not built in.
-    built: FxHashMap<
+    built: HashMap<
         (InstanceDef, StoredGenericArgs, bool),
         Option<std::rc::Rc<super::fragment::Inlinable>>,
     >,
@@ -354,7 +351,7 @@ struct Inlining {
     /// built while its callees found no room is not kept in [`Inlining::built`], and what it
     /// counted is given back ([`untally`]), so each call would build it again, and each of
     /// its callees, at every depth.
-    oversized: FxHashMap<(InstanceDef, StoredGenericArgs, bool), usize>,
+    oversized: HashMap<(InstanceDef, StoredGenericArgs, bool), usize>,
 }
 
 thread_local! {
@@ -381,8 +378,8 @@ pub(super) fn for_build<T>(work: impl FnOnce() -> T) -> T {
     #[cfg(not(feature = "llvm"))]
     let imports = false;
     let fresh = (across() && !imports).then(|| Inlining {
-        roots: FxHashSet::default(),
-        instances: FxHashSet::default(),
+        roots: HashSet::default(),
+        instances: HashSet::default(),
         // alloc: empty until a body is built in, then one small list per function compile
         inlined: Vec::new(),
         whole: true,
@@ -391,8 +388,8 @@ pub(super) fn for_build<T>(work: impl FnOnce() -> T) -> T {
         depth: 0,
         spent: 0,
         seen: 0,
-        built: FxHashMap::default(),
-        oversized: FxHashMap::default(),
+        built: HashMap::default(),
+        oversized: HashMap::default(),
     });
     let held = INLINING.with(|it| std::mem::replace(&mut *it.borrow_mut(), fresh));
     let out = work();
@@ -891,8 +888,8 @@ pub fn prepare(db: &Db, asked: &Asked) -> std::result::Result<Prepared, String> 
         return Err("Cranelift does not compile it".to_owned());
     }
     let mut inlining = Inlining {
-        roots: FxHashSet::default(),
-        instances: FxHashSet::default(),
+        roots: HashSet::default(),
+        instances: HashSet::default(),
         // alloc: empty until a body is built in; once per function the daemon tiers
         inlined: Vec::new(),
         whole: false,
@@ -901,8 +898,8 @@ pub fn prepare(db: &Db, asked: &Asked) -> std::result::Result<Prepared, String> 
         depth: 0,
         spent: 0,
         seen: 0,
-        built: FxHashMap::default(),
-        oversized: FxHashMap::default(),
+        built: HashMap::default(),
+        oversized: HashMap::default(),
     };
     for node in &asked.hot {
         match &node.0 {
@@ -1095,7 +1092,7 @@ pub(super) fn emit(
 #[cfg_attr(not(feature = "llvm"), allow(dead_code))]
 pub(super) struct Weights {
     pub(super) entered: u64,
-    pub(super) taken: FxHashMap<ir::Inst, [u64; 2]>,
+    pub(super) taken: HashMap<ir::Inst, [u64; 2]>,
 }
 
 #[cfg(feature = "llvm")]

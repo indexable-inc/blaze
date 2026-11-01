@@ -51,21 +51,21 @@
 use std::{any::TypeId, str::FromStr, sync};
 
 use base_db::{
-    AbsPathBuf, ConstEvalBudget, ContentId, Crate, CrateDisplayName, CrateGraphBuilder,
-    CrateName, CrateOrigin, CrateWorkspaceData, Db, DependencyBuilder, Env, FileId, FileSet,
-    FxIndexMap, LangCrateOrigin, LibraryRoots, LocalRoots, SourceRoot, SourceRootId, TargetKind,
-    VfsPath, Version, ViewFile, ViewRoot, all_crates,
+    AbsPathBuf, ConstEvalBudget, ContentId, Crate, CrateDisplayName, CrateGraphBuilder, CrateName,
+    CrateOrigin, CrateWorkspaceData, Db, DependencyBuilder, Env, FileId, FileSet, FxIndexMap,
+    LangCrateOrigin, LibraryRoots, LocalRoots, SourceRoot, SourceRootId, TargetKind, Version,
+    VfsPath, ViewFile, ViewRoot, all_crates,
     target::{Arch, TargetData},
 };
+use blaze_hash::HashSet;
+use blaze_query::db::{Durability, Setter};
 use cfg::CfgOptions;
 use intern::{Symbol, sym};
 use itertools::Itertools;
-use rustc_hash::FxHashSet;
-use blaze_query::db::{Durability, Setter};
 use span::Edition;
 use test_utils::{
-    CURSOR_MARKER, ESCAPED_CURSOR_MARKER, Fixture as FixtureFile, FixtureWithProjectMeta,
-    MiniCore, RangeOrOffset, extract_range_or_offset,
+    CURSOR_MARKER, ESCAPED_CURSOR_MARKER, Fixture as FixtureFile, FixtureWithProjectMeta, MiniCore,
+    RangeOrOffset, extract_range_or_offset,
 };
 use triomphe::Arc;
 use tt::{Leaf, TokenTree, TopSubtree, TopSubtreeBuilder, TtElement, TtIter};
@@ -128,7 +128,7 @@ pub fn db_with_proc_macros(
 /// a dependency: `proc_macros`, or `foo` of `crate:main deps:foo`.
 pub fn test_crate(db: &Db) -> Crate {
     let all = all_crates(db);
-    let depended_on: FxHashSet<Crate> = all
+    let depended_on: HashSet<Crate> = all
         .iter()
         .flat_map(|krate| krate.data(db).dependencies.iter().map(|dep| dep.crate_id))
         .collect();
@@ -553,8 +553,8 @@ fn set_files(
 ) -> Vec<FileId> {
     let mut by_id = roots.to_vec();
     by_id.sort_unstable_by_key(|(id, _)| id.0);
-    let mut local = FxHashSet::default();
-    let mut library = FxHashSet::default();
+    let mut local = HashSet::default();
+    let mut library = HashSet::default();
     for (id, kind) in by_id {
         let root = match kind {
             SourceRootKind::Local => {

@@ -1,5 +1,6 @@
 //! Forms: which edits reach an item's interface, body and closures, and which leave them.
 
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use hir_def::{
     AdtId, DefWithBodyId, VariantId,
@@ -11,7 +12,6 @@ use hir_ty::{
     db::{HirDatabase, InternedClosure, InternedClosureId},
     mir::{BasicBlockId, MirBody, TerminatorKind},
 };
-use rustc_hash::FxHashMap;
 
 use super::{TestDB, edit, item, items, single};
 use crate::{
@@ -617,15 +617,12 @@ fn shared_type_forms_are_the_forms_each_cx_spelled() {
 }
 
 /// A walk's order, block numbers and unwinds, kept as `Canon` kept them before its columns.
-type HashedWalk = (
-    Vec<BasicBlockId>,
-    FxHashMap<BasicBlockId, u32>,
-    FxHashMap<(BasicBlockId, usize), BasicBlockId>,
-);
+type HashedWalk =
+    (Vec<BasicBlockId>, HashMap<BasicBlockId, u32>, HashMap<(BasicBlockId, usize), BasicBlockId>);
 
 fn hashed_walk(body: &MirBody<'_>) -> HashedWalk {
     let mut order = Vec::new();
-    let mut blocks = FxHashMap::default();
+    let mut blocks = HashMap::default();
     let mut stack = vec![body.start_block];
     while let Some(id) = stack.pop() {
         if blocks.contains_key(&id) {

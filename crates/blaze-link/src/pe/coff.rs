@@ -15,13 +15,14 @@
 //! An import library read whole parses its members and groups the imports by DLL on every
 //! thread; walking the member headers stays one pass, in member order.
 
+use parking_lot::Mutex;
 use std::borrow::Cow;
 use std::fmt::{self, Write as _};
-use std::sync::Mutex;
 
 use blaze_bytes::le::{get_u16 as u16_at, get_u32 as u32_at, get_u64 as u64_at};
 use blaze_core::decimal::decimal;
 use blaze_graph::par;
+use blaze_hash::HashMap;
 use blaze_ids::radix;
 use blaze_mem::scratch::{self, Lent};
 use object::LittleEndian as LE;
@@ -29,13 +30,13 @@ use object::pe;
 use object::read::SymbolIndex;
 use object::read::archive::{ArchiveFile, ArchiveKind};
 use object::read::coff::{CoffHeader, SectionTable, Symbol as _, SymbolTable};
-use rustc_hash::FxHashMap;
 
 use super::{OBJ_PDATA, Pe};
 use crate::NativeKind;
 use crate::model::{
-    Apply, Archive, Binding, Class, Data, Directive, Group, Member, Name, Names, NativeFile, NativeFixup, Object,
-    Section, SectionKind, Shared, SharedSymbol, Symbol, SymbolDef, SymbolKind, Tie, Writer,
+    Apply, Archive, Binding, Class, Data, Directive, Group, Member, Name, Names, NativeFile,
+    NativeFixup, Object, Section, SectionKind, Shared, SharedSymbol, Symbol, SymbolDef, SymbolKind,
+    Tie, Writer,
 };
 
 /// The size of an archive member's header.
@@ -65,7 +66,7 @@ const NONE: u32 = u32::MAX;
 const ASSOCIATIVE: u32 = u32::MAX - 1;
 
 /// The DLL of each `__IMPORT_DESCRIPTOR_<lib>`, by that name.
-pub(crate) type Descriptors = FxHashMap<String, String>;
+pub(crate) type Descriptors = HashMap<String, String>;
 
 /// What errors call an input: a file, or a member of an archive (`lib(member)`). Formatted only
 /// when an error is.
@@ -121,7 +122,7 @@ impl<'a> Dlls<'a> {
     fn get(self, descriptor: &str) -> Option<Cow<'a, str>> {
         match self {
             Dlls::Read(map) => {
-                map.lock().unwrap_or_else(|e| e.into_inner()).get(descriptor).cloned().map(Cow::Owned)
+                map.lock().get(descriptor).cloned().map(Cow::Owned)
             }
             Dlls::Library(map) => map.get(descriptor).map(|it| Cow::Borrowed(it.as_str())),
         }
@@ -181,7 +182,7 @@ pub(super) fn read(pe: &Pe, name: &str, bytes: &[u8], kind: &NativeKind) -> Resu
         NativeKind::Archive { whole } => {
             let (archive, descriptors) = archive(input, bytes, *whole)?;
             if !descriptors.is_empty() {
-                pe.descriptors.lock().unwrap_or_else(|e| e.into_inner()).extend(descriptors);
+                pe.descriptors.lock().extend(descriptors);
             }
             Ok(NativeFile::Archive(archive))
         }

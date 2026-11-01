@@ -32,17 +32,19 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use blaze_codegen::{CompiledFunction, InstanceKey};
+use blaze_hash::{HashMap, SharedMap};
 use blaze_inproc::CellView;
 use blaze_inproc::ask::{self, Reader, Sender};
 use blaze_inproc::frame::Kind;
 use blaze_items::{CodeHash, ItemKey};
 use blaze_stencil::tier::{self, Tier};
-use rustc_hash::FxHashMap;
+use crossbeam_queue::SegQueue;
+use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use crate::{
     LazyId,
@@ -137,7 +139,7 @@ struct Tiered<C: Compiler, P: Placer, A: Answers> {
     /// Per function: bound to the runner, once its first code was published.
     bound: Vec<bool>,
     /// The tiers the daemon's history remembered for functions not bound yet.
-    remembered: FxHashMap<u32, Tier>,
+    remembered: HashMap<u32, Tier>,
 }
 
 struct State {
@@ -192,8 +194,10 @@ struct Shared<C: Compiler, P: Placer, A: Answers> {
     /// never with the fetcher's or the placer's lock.
     tier: Mutex<Option<Tiered<C, P, A>>>,
     /// The functions whose first code could not be bound to the tier runner, and why.
-    unbound: Mutex<Vec<(LazyId, String)>>,
-    /// The asking threads' buffers, between the hits they answer.
+    unbound: SegQueue<(LazyId, String)>,
+    /// The asking threads' buffers, between the hits they answer: popped and pushed once a lone
+    /// hit, which allocates nothing, so a lock held for the one pop or push (a `SegQueue` takes a
+    /// new block every 31 pushes, and the asking threads are too many to bound an `ArrayQueue`).
     spare: Mutex<Vec<Buffers>>,
 }
 
@@ -215,7 +219,7 @@ pub struct Closed {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    mutex.lock()
 }
 
 impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
@@ -248,7 +252,7 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
             answers,
             idle: config.idle,
             tier: Mutex::new(None),
-            unbound: Mutex::new(Vec::new()), // alloc: setup; grows only for a failed bind
+            unbound: SegQueue::new(),
             spare: Mutex::new(Vec::new()),   // alloc: setup; a buffer per thread that asks at once
         });
         if let Some(up) = tier {
@@ -257,7 +261,7 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
             *lock(&shared.tier) = Some(Tiered {
                 runner,
                 bound: vec![false; functions as usize], // alloc: setup, once per run
-                remembered: FxHashMap::default(),
+                remembered: HashMap::default(),
             });
         }
         let mut threads = Vec::with_capacity(workers as usize);
@@ -364,6 +368,12 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
         out
     }
 
+    /// How many workers sleep until an ask wakes them, past their spin.
+    #[cfg(test)]
+    pub(crate) fn parked(&self) -> u32 {
+        lock(&self.shared.state).parked
+    }
+
     /// Stops the tier runner, then the workers once the compiles running end, and says what
     /// failed.
     pub fn close(mut self) -> Closed {
@@ -383,7 +393,8 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
                 .collect(), // alloc: the close's report
             compiles: state.fetcher.compiles(),
             tier,
-            unbound: std::mem::take(&mut *lock(&self.shared.unbound)),
+            // alloc: the close's report
+            unbound: std::iter::from_fn(|| self.shared.unbound.pop()).collect(),
         }
     }
 }
@@ -500,7 +511,7 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
                 continue;
             }
             state.parked += 1;
-            state = self.wake.wait(state).unwrap_or_else(PoisonError::into_inner);
+            self.wake.wait(&mut state);
             state.parked -= 1;
             spun = false;
         }
@@ -509,12 +520,13 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
     /// Watches [`Shared::jobs`] move from `seen`, for up to [`SPIN`]: whether it did.
     fn spin(&self, seen: u64) -> bool {
         let start = Instant::now();
+        let mut spin = blaze_spin::SpinWait::new();
         loop {
             for _ in 0..SPIN_LOADS {
                 if self.jobs.load(Ordering::Acquire) != seen {
                     return true;
                 }
-                std::hint::spin_loop();
+                spin.relax();
             }
             if start.elapsed() >= SPIN {
                 return false;
@@ -576,7 +588,7 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
         let mut tiered = lock(&self.tier);
         let Some(tiered) = tiered.as_mut() else { return };
         if let Err(why) = tiered.runner.bind(id.0, cells) {
-            lock(&self.unbound).push((id, why));
+            self.unbound.push((id, why));
             return;
         }
         tiered.bound[id.index()] = true;
@@ -713,20 +725,20 @@ pub(crate) fn fit(why: &str) -> &str {
 /// function that can't be compiled, is killed, that its error.
 #[derive(Default)]
 pub struct Runs {
-    senders: Mutex<FxHashMap<u32, Sender>>,
+    senders: SharedMap<u32, Sender>,
 }
 
 impl Runs {
     /// Answers `sender`'s process from now on: its client.
     pub fn add(&self, sender: Sender) -> u32 {
         let client = sender.pid();
-        lock(&self.senders).insert(client, sender);
+        self.senders.pin().insert(client, sender);
         client
     }
 
     /// Once `client`'s process ended.
     pub fn remove(&self, client: u32) {
-        lock(&self.senders).remove(&client);
+        self.senders.pin().remove(&client);
     }
 }
 
@@ -738,18 +750,17 @@ fn kill(sender: &Sender, why: &str) {
 
 impl Answers for Runs {
     fn send(&self, client: u32, seq: u32, kind: Kind, body: &[u8]) {
-        let Some(sender) = lock(&self.senders).get(&client).cloned() else { return };
+        let senders = self.senders.pin();
+        let Some(sender) = senders.get(&client) else { return };
         if let Err(error) = sender.send(kind, seq, body) {
             // alloc: the run's end.
-            kill(&sender, &format!("answering its ask for a lazy function's code: {error}"));
+            kill(sender, &format!("answering its ask for a lazy function's code: {error}"));
         }
     }
 
     /// Kills every run process it answers: they run one program, which called the function.
     fn stop(&self, _: Option<(InstanceKey, ItemKey)>, why: &str) {
-        // alloc: the run's end; the kills are made with the lock let go.
-        let senders: Vec<Sender> = lock(&self.senders).values().cloned().collect();
-        for sender in &senders {
+        for sender in self.senders.pin().values() {
             kill(sender, why);
         }
     }

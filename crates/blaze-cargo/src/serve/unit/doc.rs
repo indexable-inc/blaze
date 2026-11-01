@@ -5,12 +5,12 @@
 
 use blaze_api::{ApiError, Diagnostic, Documented, DocumentedCrate, Level, Response};
 use blaze_doc::{Asked, TestOnly, html::Pages, model::Warning};
+use blaze_hash::HashMap;
 use blaze_lower::Lowered;
 use blaze_units::{
     query::{PackagePlan, Units},
     schema::Mode,
 };
-use rustc_hash::FxHashMap;
 
 use super::Job;
 
@@ -86,9 +86,9 @@ fn asked(units: &Units, lowered: &Lowered, private: bool) -> Result<Vec<Asked>, 
 }
 
 /// Each lowered crate's package.
-fn packages<'a>(units: &'a Units, lowered: &Lowered) -> FxHashMap<base_db::Crate, &'a PackagePlan> {
-    let by_id: FxHashMap<&str, &PackagePlan> = units.packages.iter().map(|it| (it.id.as_str(), it)).collect();
-    let mut out = FxHashMap::default();
+fn packages<'a>(units: &'a Units, lowered: &Lowered) -> HashMap<base_db::Crate, &'a PackagePlan> {
+    let by_id: HashMap<&str, &PackagePlan> = units.packages.iter().map(|it| (it.id.as_str(), it)).collect();
+    let mut out = HashMap::default();
     for (at, unit) in units.graph.units.iter().enumerate() {
         if let (Some(krate), Some(plan)) = (lowered.krate(at), by_id.get(unit.pkg_id.as_str())) {
             out.entry(krate).or_insert(*plan);

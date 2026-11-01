@@ -1,6 +1,5 @@
 use std::{
     panic::AssertUnwindSafe,
-    sync::mpsc,
     time::{Duration, Instant},
 };
 
@@ -27,7 +26,7 @@ fn a_write_stops_a_held_reader_and_waits_for_it_to_let_go() {
     let (mut shared, file) = shared_with("fn main() {}\n");
     let text = shared.file_text(file);
     let reader = shared.reader();
-    let (started, has_started) = mpsc::channel();
+    let (started, has_started) = crossbeam_channel::unbounded();
     let thread = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(30);
         let ran = Cancelled::catch(AssertUnwindSafe(|| {

@@ -8,18 +8,21 @@
 //! (`peel_casts`) and `compiler/rustc_lint/src/lints.rs` (`UselessPtrNullChecksDiag`,
 //! `InvalidNullArgumentsDiag`) (MIT or Apache-2.0).
 
+use blaze_hash::HashMap;
 use hir_def::{
     hir::{BinaryOp, BindingId, CmpOp, Expr, ExprId, type_ref::TypeRef},
     signatures::FunctionSignature,
 };
 use hir_ty::next_solver::TyKind;
 use intern::Symbol;
-use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::IntoKind as _;
 
-use super::{Inits, callee_fn, callee_item, has_attr, is_zero, layout, method_item, peel_casts, span, ty_text};
+use super::{
+    Inits, callee_fn, callee_item, has_attr, is_zero, layout, method_item, peel_casts, span,
+    ty_text,
+};
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKind, ExprKinds, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -220,7 +223,7 @@ fn useless_check(b: &BodyCx<'_, '_, '_>, mut e: ExprId) -> Option<Useless> {
 
 /// rustc's `is_null_ptr` of this pass: through `peel_casts`, a call of `ptr::null()` or
 /// `ptr::null_mut()`, or the literal `0`, with where it is.
-fn is_null_ptr(b: &BodyCx<'_, '_, '_>, inits: &FxHashMap<BindingId, ExprId>, expr: ExprId) -> Option<Span> {
+fn is_null_ptr(b: &BodyCx<'_, '_, '_>, inits: &HashMap<BindingId, ExprId>, expr: ExprId) -> Option<Span> {
     let expr = peel_casts(b, inits, expr);
     let is_null = match b.store().expr(expr) {
         Expr::Call { callee, args } if args.is_empty() => {

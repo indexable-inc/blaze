@@ -15,13 +15,15 @@
 
 use std::sync::Arc;
 
-use blaze_codegen::{Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Relocs, Static, Target, Unwind};
+use blaze_codegen::{
+    Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Relocs, Static, Target, Unwind,
+};
 use blaze_format::cursor::{self, Reader};
 use blaze_graph::par;
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::{Hasher, radix};
 use blaze_live::patch::exec;
 use blaze_mem::Frame;
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::arena::{FrameVec, collect_in};
 use crate::cow::{IdSet, SymSet};
@@ -86,12 +88,12 @@ impl<'a> Content<'a> {
 pub(crate) struct Contents<'a> {
     first: PieceId,
     fresh: FrameVec<'a, Option<Content<'a>>>,
-    other: FxHashMap<PieceId, Content<'a>>,
+    other: HashMap<PieceId, Content<'a>>,
 }
 
 impl<'a> Contents<'a> {
     pub fn new(first: PieceId, arena: &'a Frame) -> Contents<'a> {
-        Contents { first, fresh: Vec::new_in(arena), other: FxHashMap::default() }
+        Contents { first, fresh: Vec::new_in(arena), other: HashMap::default() }
     }
 
     #[inline]
@@ -140,7 +142,7 @@ pub(crate) struct Stage<'a> {
     pub writer: &'a Formats,
     pub plan: &'a Plan,
     pub symbols: &'a mut Symbols,
-    pub objects: &'a mut FxHashMap<Obj, crate::native::Read>,
+    pub objects: &'a mut HashMap<Obj, crate::native::Read>,
     /// Each native input's bytes, borrowed for the stage ([`crate::native`]).
     pub native: crate::native::Pass<'a>,
     pub old: &'a State,
@@ -670,7 +672,7 @@ impl<'a> Stage<'a> {
             return Ok(());
         }
         let arena = self.arena;
-        let mut seen: FxHashSet<&InstanceKey> = FxHashSet::default();
+        let mut seen: HashSet<&InstanceKey> = HashSet::default();
         seen.reserve(added.len());
         let mut todo: FrameVec<'a, &'a CompiledFunction> = Vec::with_capacity_in(added.len(), arena);
         for function in added {

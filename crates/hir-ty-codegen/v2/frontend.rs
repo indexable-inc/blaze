@@ -3,20 +3,19 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use base_db::{Db, Crate, CrateOrigin};
+use base_db::{Crate, CrateOrigin, Db};
 use blaze_codegen::{
-    CodegenError,
-    Owner,
+    CodegenError, Owner,
     backend::{Address, Described, DescribedStatic, FrontRef, Frontend},
     plan::{Mode, Origin, Package, PlanError, Policy},
 };
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemId, ItemKey};
+use blaze_query::db::FromId;
 use hir_def::{
-    AdtId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, GenericDefId, GenericParamId,
-    HasModule, Lookup,
-    attrs::AttrFlags,
-    expr_store::ExpressionStore,
+    AdtId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, GenericDefId,
+    GenericParamId, HasModule, Lookup, attrs::AttrFlags, expr_store::ExpressionStore,
     signatures::FunctionSignature,
 };
 use hir_ty::{
@@ -26,17 +25,17 @@ use hir_ty::{
 };
 use hir_ty_mir::mir::{MirOptions, overflow::crate_checks_overflow};
 use hir_ty_share::{BodyOptions, OptionsSet, ShareDef, ShareInstance, Unshared};
-use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::{
     BoundExistentialPredicates as _, GenericArgs as _, IntoKind, SliceLike as _,
 };
-use blaze_query::db::FromId;
 use smallvec::{SmallVec, smallvec};
 
-use super::{Body, BuildTime, HashSource, Hashes, HirInstance, HirStatic, Kind, build::Build, refs, undescribed};
+use super::{
+    Body, BuildTime, HashSource, Hashes, HirInstance, HirStatic, Kind, build::Build, refs,
+    undescribed,
+};
 use crate::{
-    Instance, InstanceDef, exported_static, exported_symbol, fncache, home::Homes,
-    linked_symbol,
+    Instance, InstanceDef, exported_static, exported_symbol, fncache, home::Homes, linked_symbol,
 };
 
 /// The build's database, `Sync` and shared by reference by every task. Nothing here locks:
@@ -90,7 +89,7 @@ struct ByOrigin<T> {
     dependency: T,
     build_time: T,
     /// Of a package the profile names (`[profile.*.package.<name>]`), the same three.
-    packages: FxHashMap<Package, [T; 3]>,
+    packages: HashMap<Package, [T; 3]>,
     std: T,
 }
 
@@ -102,7 +101,7 @@ impl<T> ByOrigin<T> {
         };
         // No package is named the empty name: these are of one the profile has nothing for.
         let [member, dependency, build_time] = kinds(Package::new(""));
-        let packages: FxHashMap<_, _> = (policy.profile.packages.keys())
+        let packages: HashMap<_, _> = (policy.profile.packages.keys())
             .filter(|it| *it != "*")
             .map(|name| {
                 let name = Package::new(name);
@@ -166,7 +165,7 @@ impl Units {
         });
         let any = inlines.values().any(|it| it == &Ok(true));
         let crates = base_db::all_crates(db);
-        let mut by_build: FxHashMap<Build, Asked> = FxHashMap::default();
+        let mut by_build: HashMap<Build, Asked> = HashMap::default();
         let options = builds.map(|it| -> Result<BodyOptions, String> {
             let builds = it.as_ref().map_err(ToString::to_string)?;
             let mut asked = Asked::default();
@@ -680,7 +679,7 @@ pub(crate) fn inlined<'a>(
     let mut found = Vec::new(); // alloc: the list returned, empty for nearly every instance
     // alloc: inline, eight on the stack
     let mut queue: SmallVec<[&HirInstance; 8]> = smallvec![instance];
-    let mut seen = FxHashSet::default();
+    let mut seen = HashSet::default();
     while let Some(at) = queue.pop() {
         let built_in = refs::built_in(db, at, inlined)?;
         if built_in.is_empty() {
@@ -797,7 +796,8 @@ fn per_instance(why: &Unshared) -> bool {
         | Unshared::NoContent(_)
         | Unshared::ConstEval(_)
         | Unshared::Unhashable(_)
-        | Unshared::Shape(_) => false,
+        | Unshared::Shape(_)
+        | Unshared::RecursionLimit { .. } => false,
     }
 }
 

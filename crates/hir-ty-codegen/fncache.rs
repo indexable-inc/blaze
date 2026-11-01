@@ -34,7 +34,9 @@ use std::borrow::Cow;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::LazyLock;
 
-use base_db::{Db, Crate, LangCrateOrigin};
+use base_db::{Crate, Db, LangCrateOrigin};
+use blaze_hash::{FixedState, HashMap, HashSet};
+use blaze_query::db::{AsId, FromId};
 use cranelift_codegen::ir::{InstBuilder, Value, types};
 use hir_def::{
     AdtId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId, VariantId,
@@ -42,9 +44,7 @@ use hir_def::{
         FunctionSignature, StaticFlags, StaticSignature, StructSignature, TraitSignature,
     },
 };
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
-use blaze_query::db::{AsId, FromId};
 
 use hir_ty::{
     InferBodyId,
@@ -63,8 +63,7 @@ mod dispatch;
 
 use super::{
     CodegenError, CompiledFunction, ConstBlob, DataRequest, FuncTarget, FunctionCx, Instance,
-    InstanceDef, MEM, Requests, Result, compiled_instance, compiled_root,
-    compiled_static,
+    InstanceDef, MEM, Requests, Result, compiled_instance, compiled_root, compiled_static,
     fragment::{Code, TextPart},
     home::Homes,
     is_thread_local, link_name, ptr, type_id,
@@ -468,8 +467,8 @@ impl Why {
 /// What [`Walk::library`] goes through, kept between the functions it looks into.
 #[derive(Default)]
 struct LibraryWalk<'db> {
-    parent: FxHashMap<LibraryBody<'db>, LibraryBody<'db>>,
-    seen: FxHashSet<LibraryBody<'db>>,
+    parent: HashMap<LibraryBody<'db>, LibraryBody<'db>>,
+    seen: HashSet<LibraryBody<'db>>,
     queue: std::collections::VecDeque<LibraryBody<'db>>,
     calls: Vec<LibraryBody<'db>>,
 }
@@ -489,20 +488,20 @@ struct Walk<'db> {
     /// each root hashes in an order of its own.
     tests: bool,
     /// The nodes blaze can't compile, whose code tells nothing of what they do.
-    uncompiled: FxHashSet<u32>,
+    uncompiled: HashSet<u32>,
     /// For [`tests_reach`], what each node is that makes a test's end depend on more than its
     /// code: of which kind, what by name, and why.
-    kinds: FxHashMap<u32, (Kind, String, String)>,
+    kinds: HashMap<u32, (Kind, String, String)>,
     /// Where a node refers to the next by a site, as [`Walk::site_location`] found it.
-    locations: std::cell::RefCell<FxHashMap<(u32, Site), Option<String>>>,
+    locations: std::cell::RefCell<HashMap<(u32, Site), Option<String>>>,
     /// An argument holds a reference count, which what reads one gives and the key does not
     /// tell: two arguments can share a value or not.
     counted: bool,
     /// What each function of core and alloc known by its name does that is not pure.
-    library: FxHashMap<FunctionId, Option<String>>,
+    library: HashMap<FunctionId, Option<String>>,
     library_walk: LibraryWalk<'db>,
     /// Whether a static chooses a function by the CPU, as [`dispatch`] tells.
-    dispatch: std::cell::RefCell<FxHashMap<StaticId, bool>>,
+    dispatch: std::cell::RefCell<HashMap<StaticId, bool>>,
 }
 
 /// A body of core or alloc looked through: a function's, or a closure's.
@@ -525,11 +524,11 @@ impl<'db> Walk<'db> {
             // alloc: a hash a node, grown once a node hashed (a walk is a miss)
             segments: Vec::new(),
             tests: false,
-            uncompiled: FxHashSet::default(),
-            kinds: FxHashMap::default(),
+            uncompiled: HashSet::default(),
+            kinds: HashMap::default(),
             locations: Default::default(),
             counted,
-            library: FxHashMap::default(),
+            library: HashMap::default(),
             library_walk: LibraryWalk::default(),
             dispatch: Default::default(),
         }
@@ -543,11 +542,11 @@ impl<'db> Walk<'db> {
 
     fn reach(&mut self, node: Node) -> u32 {
         let nodes = &self.nodes;
-        let hash = FxBuildHasher.hash_one(&node);
+        let hash = FixedState.hash_one(&node);
         let entry = self.index.entry(
             hash,
             |&at| nodes[at as usize].node == node,
-            |&at| FxBuildHasher.hash_one(&nodes[at as usize].node),
+            |&at| FixedState.hash_one(&nodes[at as usize].node),
         );
         match entry {
             hashbrown::hash_table::Entry::Occupied(found) => *found.get(),
@@ -1133,8 +1132,8 @@ impl<'db> Walk<'db> {
     /// Why what `from` reaches is not pure, by the shortest way to the first that is not:
     /// the edges to the codec are left out.
     fn impure(&self, from: u32) -> Option<String> {
-        let mut parent: FxHashMap<u32, (u32, usize)> = FxHashMap::default();
-        let mut seen = FxHashSet::default();
+        let mut parent: HashMap<u32, (u32, usize)> = HashMap::default();
+        let mut seen = HashSet::default();
         let mut queue = std::collections::VecDeque::from([from]);
         seen.insert(from);
         while let Some(at) = queue.pop_front() {
@@ -1168,7 +1167,7 @@ impl<'db> Walk<'db> {
     fn told(
         &self,
         at: u32,
-        parent: &FxHashMap<u32, (u32, usize)>,
+        parent: &HashMap<u32, (u32, usize)>,
         text: &str,
         of_user: bool,
         place: Option<&str>,
@@ -1854,7 +1853,7 @@ fn library_name(db: &Db, body: LibraryBody<'_>) -> String {
 /// not pure: `what`, or "reaches `a` → `b`, which" it, by the bodies on the way.
 fn library_told<'db>(
     db: &'db Db,
-    parent: &FxHashMap<LibraryBody<'db>, LibraryBody<'db>>,
+    parent: &HashMap<LibraryBody<'db>, LibraryBody<'db>>,
     at: LibraryBody<'db>,
     what: String,
 ) -> String {
@@ -1898,7 +1897,7 @@ fn arguments_trouble(
         return (None, false);
     };
     let interner = DbInterner::new_with(db, env.krate);
-    let mut seen = FxHashSet::default();
+    let mut seen = HashSet::default();
     let mut counted = false;
     // The first parameter is the closure itself, which captures nothing.
     for ty in types.params.iter().skip(1) {
@@ -1921,7 +1920,7 @@ fn trouble<'db>(
     interner: DbInterner<'db>,
     ty: Ty<'db>,
     in_library: bool,
-    seen: &mut FxHashSet<Ty<'db>>,
+    seen: &mut HashSet<Ty<'db>>,
     counted: &mut bool,
 ) -> Option<&'static str> {
     if !seen.insert(ty) {

@@ -25,9 +25,9 @@
 use std::fmt;
 
 use blaze_format::cursor::{self, Put as _, Reader};
+use blaze_hash::HashMap;
 use blaze_mem::{Tag, tag};
 use blaze_radix as radix;
-use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 /// How many peaks under a prediction, in a row, bring it down a step.
@@ -181,13 +181,13 @@ impl Estimate {
     }
 }
 
-/// Each kind's [`Estimate`], learned as tasks finish. A predict or an observe is one Fx hash of
+/// Each kind's [`Estimate`], learned as tasks finish. A predict or an observe is one hash of
 /// the kind's `u32` and one probe; an observe of a kind seen before allocates nothing. Kinds
 /// are written in order of their numbers, by [`Estimates::encode`] and by serde alike.
 #[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 pub struct Estimates {
     #[serde(with = "in_order")]
-    pub by_kind: FxHashMap<TaskKind, Estimate>,
+    pub by_kind: HashMap<TaskKind, Estimate>,
     /// What a task of a kind never measured is predicted to hold.
     pub unseen: u64,
 }
@@ -195,13 +195,13 @@ pub struct Estimates {
 /// [`Estimates::by_kind`] for serde, its kinds in order, so the same estimates give the same
 /// bytes whatever order their kinds were first seen in.
 mod in_order {
-    use rustc_hash::FxHashMap;
+    use blaze_hash::HashMap;
     use serde::{Deserialize, Deserializer, Serializer};
 
     use super::{Estimate, TaskKind};
 
     pub(super) fn serialize<S: Serializer>(
-        by_kind: &FxHashMap<TaskKind, Estimate>,
+        by_kind: &HashMap<TaskKind, Estimate>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         serializer.collect_map(super::sorted(by_kind))
@@ -209,13 +209,13 @@ mod in_order {
 
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<FxHashMap<TaskKind, Estimate>, D::Error> {
-        FxHashMap::deserialize(deserializer)
+    ) -> Result<HashMap<TaskKind, Estimate>, D::Error> {
+        HashMap::deserialize(deserializer)
     }
 }
 
 /// The kinds of `by_kind` and their estimates, in order of the kinds' numbers.
-fn sorted(by_kind: &FxHashMap<TaskKind, Estimate>) -> Vec<(TaskKind, Estimate)> {
+fn sorted(by_kind: &HashMap<TaskKind, Estimate>) -> Vec<(TaskKind, Estimate)> {
     // alloc: once per encoding of the estimates, as the daemon's image is written
     let mut kinds: Vec<(TaskKind, Estimate)> = by_kind.iter().map(|(&k, &e)| (k, e)).collect();
     radix::sort_copy_by_key(&mut kinds, |it| it.0.0);
@@ -230,7 +230,7 @@ const KIND_BYTES: usize = 4 + 4 + 8 * 4;
 impl Estimates {
     /// No kind measured yet, each predicted to hold `unseen`.
     pub fn new(unseen: u64) -> Estimates {
-        Estimates { by_kind: FxHashMap::default(), unseen }
+        Estimates { by_kind: HashMap::default(), unseen }
     }
 
     /// The peak a task of `kind` is predicted to hold, in bytes.
@@ -277,7 +277,7 @@ impl Estimates {
         if count.checked_mul(KIND_BYTES as u64) != Some(read.left() as u64) {
             return Err(DecodeError::Length { count, bytes: bytes.len() });
         }
-        let mut by_kind = FxHashMap::default();
+        let mut by_kind = HashMap::default();
         by_kind.reserve(count as usize);
         let mut last: Option<u32> = None;
         for _ in 0..count {

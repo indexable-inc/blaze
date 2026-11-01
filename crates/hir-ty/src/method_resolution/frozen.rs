@@ -7,14 +7,14 @@
 
 use std::sync::Arc as StdArc;
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_format::cursor::{Put, Reader};
+use blaze_hash::HashMap;
 use blaze_mem::Frame;
 use hir_def::{
     ModuleDefId,
     nameres::frozen::{Dec, Enc, Frozen, Mode, check_frozen},
 };
-use rustc_hash::FxHashMap;
 use rustc_type_ir::{FloatTy, IntTy, Mutability, UintTy, fast_reject::SimplifiedType as S};
 
 use super::{InherentImpls, InherentImplsBuilder, TraitImpls, TraitImplsBuilder};
@@ -29,11 +29,11 @@ type R<T = ()> = Result<T, String>;
 #[blaze_query::input(singleton, debug)]
 pub struct FrozenImpls {
     #[returns(ref)]
-    pub maps: StdArc<FxHashMap<Crate, Frozen>>,
+    pub maps: StdArc<HashMap<Crate, Frozen>>,
 }
 
 /// Has finding the impls of a crate use `maps`.
-pub fn set(db: &mut Db, maps: FxHashMap<Crate, Frozen>) {
+pub fn set(db: &mut Db, maps: HashMap<Crate, Frozen>) {
     use blaze_query::db::{Durability, Setter};
     let maps = StdArc::new(maps);
     match FrozenImpls::try_get(db) {

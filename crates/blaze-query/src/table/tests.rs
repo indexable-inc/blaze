@@ -22,7 +22,7 @@ fn freed<V: Send + Sync + 'static>(map: &Map<V>) {
             return;
         }
         assert!(Instant::now() < until, "what the map unlinked was never freed");
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::yield_now();
     }
 }
 
@@ -77,14 +77,14 @@ fn a_parallel_edit_of_every_entry_is_the_serial_one() {
         };
         let mut said = Vec::new();
         serial.edit_all_with(&task, |_, &value| decide(value), |&old, new| said.push((old, new.copied())));
-        let heard = std::sync::Mutex::new(Vec::new());
+        let heard = parking_lot::Mutex::new(Vec::new());
         parallel.edit_all_parallel(
             Vec::new,
             |_, _, _, &value| decide(value),
             |mine: &mut Vec<(u64, Option<u64>)>, &old, new| mine.push((old, new.copied())),
-            |mine| heard.lock().expect("the list").extend(mine),
+            |mine| heard.lock().extend(mine),
         );
-        let mut heard = heard.into_inner().expect("the list");
+        let mut heard = heard.into_inner();
         said.sort_unstable();
         heard.sort_unstable();
         assert_eq!(heard, said, "round {round}: the edits each made");

@@ -10,10 +10,10 @@
 
 use std::{ops::ControlFlow, rc::Rc};
 
+use blaze_hash::HashMap;
 use blaze_ids::radix;
 use blaze_mem::Frame;
 use hir::{HirFileId, InFile, view::ModuleSourceView};
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use syntax::{
     SyntaxKind, SyntaxNodePtr, TextRange,
@@ -85,11 +85,11 @@ impl<'db> Item<'db> {
 pub(super) type Order = SmallVec<[u32; 4]>;
 
 /// Each module's place in the crate as the AST has it (the offsets of the declarations of it
-/// and the modules it is in, from the crate's root), made once per module: one FxHash lookup
+/// and the modules it is in, from the crate's root), made once per module: one hash lookup
 /// per key after that.
 #[derive(Default)]
 pub(super) struct Orders {
-    of: FxHashMap<hir::Module, Order>,
+    of: HashMap<hir::Module, Order>,
 }
 
 impl Orders {

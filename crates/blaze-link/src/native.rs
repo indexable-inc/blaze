@@ -35,17 +35,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use blaze_graph::par;
+use blaze_hash::{FixedHasher, HashMap, HashSet};
 use blaze_ids::{
     bits::locate,
     radix::{self, Csr},
 };
-use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use smallvec::SmallVec;
 
 use crate::cow::{CowList, CowVec, ListRef};
 use crate::model::{
-    Apply, Archive, Binding, Class, Data, Directive, Fixup, Formats, Import, Library, Name, Names, NativeFile,
-    Object, SectionKind, Shared, Special, Sym, Symbol, SymbolDef, SymbolKind, Tie, Writer,
+    Apply, Archive, Binding, Class, Data, Directive, Fixup, Formats, Import, Library, Name, Names,
+    NativeFile, Object, SectionKind, Shared, Special, Sym, Symbol, SymbolDef, SymbolKind, Tie,
+    Writer,
 };
 use crate::premap::{Outside, Strength, outside_def};
 use crate::stage::{Content, Stage, error};
@@ -68,7 +69,7 @@ fn unpack(it: u64) -> (u32, u32) {
 }
 
 fn hash(name: &str) -> u64 {
-    let mut hasher = FxHasher::default();
+    let mut hasher = FixedHasher::default();
     hasher.write(name.as_bytes());
     hasher.finish()
 }
@@ -151,7 +152,7 @@ const EMPTY: u64 = NONE as u64;
 ///
 /// A slot is one `u64`, 8 bytes: the high 32 bits of the hash over the value ([`EMPTY`] for
 /// none), so a probe reads one cache line, and the table is at most half full: 16 to 32 bytes
-/// a name. The probe starts at the hash's high bits, which FxHash mixes best, and a table has
+/// a name. The probe starts at the hash's high bits, as well mixed as its low ones, and a table has
 /// at most 2^32 slots, so the high half alone places a slot again when the table grows.
 #[derive(Default, Debug)]
 pub(crate) struct Table {
@@ -416,7 +417,7 @@ fn check_shared(shared: &Shared) -> Result<(), String> {
 /// Whether the line, by its inputs' `names`, has what a linker script names as `wanted`: a
 /// path as written or ending in `/wanted`, `-lNAME` as an input whose file is `libNAME.so` or
 /// `libNAME.a`, `-l:FILE` as one whose file is `FILE`.
-fn line_has(names: &FxHashSet<&str>, wanted: &str) -> bool {
+fn line_has(names: &HashSet<&str>, wanted: &str) -> bool {
     fn file(it: &str) -> &str {
         it.rsplit('/').next().unwrap_or(it)
     }
@@ -882,7 +883,7 @@ impl Exports {
             }
             orders.resize(flat.len(), *order);
         }
-        let mut first: FxHashMap<&str, u32> = FxHashMap::with_capacity_and_hasher(flat.len(), Default::default());
+        let mut first: HashMap<&str, u32> = HashMap::with_capacity_and_hasher(flat.len(), Default::default());
         let mut canonical: Vec<u32> = Vec::with_capacity(flat.len());
         canonical.extend(flat.iter().enumerate().map(|(at, (it, _))| *first.entry(it.name.as_str()).or_insert(at as u32)));
         let mut libraries = Vec::with_capacity(flat.len());
@@ -894,7 +895,7 @@ impl Exports {
         let mut symbols: Vec<Export> = Vec::with_capacity(count);
         let distinct: usize = flat.iter().map(|it| it.0.versions.len()).sum();
         let mut versions: Vec<String> = Vec::with_capacity(distinct);
-        let mut version_of: FxHashMap<&str, u32> = FxHashMap::with_capacity_and_hasher(distinct, Default::default());
+        let mut version_of: HashMap<&str, u32> = HashMap::with_capacity_and_hasher(distinct, Default::default());
         for (at, (shared, _)) in flat.iter().enumerate() {
             for symbol in &shared.symbols {
                 let name = shared.symbol_name(symbol);
@@ -998,8 +999,8 @@ pub(crate) struct Graph {
     #[cfg_attr(not(test), allow(dead_code))]
     id: u64,
     loads: Vec<Load>,
-    by_obj: FxHashMap<Obj, u32>,
-    slot_of: FxHashMap<Sym, u32>,
+    by_obj: HashMap<Obj, u32>,
+    slot_of: HashMap<Sym, u32>,
     slots: Vec<Slot>,
     /// Sections (flat) of a group that lost.
     discarded: CowFlags,
@@ -1021,10 +1022,10 @@ pub(crate) struct Graph {
     /// What the objects' `/EXPORT` directives export.
     asked: Arc<Vec<(String, String, bool)>>,
     /// wasm: what objects say a name is imported as, and the input saying it.
-    wasm: FxHashMap<Sym, (u32, blaze_codegen::wasm::Import)>,
+    wasm: HashMap<Sym, (u32, blaze_codegen::wasm::Import)>,
     entry: Option<Sym>,
     /// Of each [`OUTSIDE`] slot, what the image beside defines it as.
-    outside: FxHashMap<u32, Def>,
+    outside: HashMap<u32, Def>,
 }
 
 impl Graph {
@@ -1035,8 +1036,8 @@ impl Graph {
             id: GRAPHS.fetch_add(1, Ordering::Relaxed),
             // alloc: none (an empty `Vec`); the loads, once per graph built
             loads: Vec::new(),
-            by_obj: FxHashMap::default(),
-            slot_of: FxHashMap::default(),
+            by_obj: HashMap::default(),
+            slot_of: HashMap::default(),
             // alloc: none (an empty `Vec`); the slots, once per graph built
             slots: Vec::new(),
             discarded: CowFlags::default(),
@@ -1053,9 +1054,9 @@ impl Graph {
             archives: Vec::new(),
             exports: Arc::default(),
             asked: Arc::default(),
-            wasm: FxHashMap::default(),
+            wasm: HashMap::default(),
             entry: None,
-            outside: FxHashMap::default(),
+            outside: HashMap::default(),
         }
     }
 
@@ -1609,7 +1610,7 @@ pub(crate) struct Resolved {
     /// What it was resolved from.
     inputs: Arc<Vec<Input>>,
     names: Arc<BTreeMap<NameId, Sym>>,
-    wasm: Arc<FxHashMap<NameId, blaze_codegen::wasm::Import>>,
+    wasm: Arc<HashMap<NameId, blaze_codegen::wasm::Import>>,
     graph: Option<Arc<Graph>>,
     marks: Marks,
     /// Of each name resolved, by [`Symbols::dense`]: `O_*` bits.
@@ -1676,17 +1677,17 @@ struct Build {
     graph: Graph,
     /// Slots to look for in the archives after the round.
     queue: Vec<u32>,
-    pulled: FxHashSet<(u32, u32)>,
+    pulled: HashSet<(u32, u32)>,
     /// COMDAT groups by name: the winner's `(load, group)` in `group_list`.
     groups: Table,
     group_list: Vec<(u32, u32)>,
-    mismatches: FxHashMap<String, (String, u32)>,
-    asked: FxHashSet<String>,
+    mismatches: HashMap<String, (String, u32)>,
+    asked: HashSet<String>,
     /// The line's shared libraries: file, `as_needed`, place on the line.
     shared: Vec<(Arc<NativeFile>, bool, u32)>,
     /// Import libraries' members, in load order, and their archive's place on the line.
     members: Vec<(Arc<NativeFile>, u32)>,
-    commons: FxHashMap<u32, (u64, u64)>,
+    commons: HashMap<u32, (u64, u64)>,
 }
 
 impl Build {
@@ -1695,17 +1696,17 @@ impl Build {
             graph: Graph::new(),
             // alloc: none (an empty `Vec`); it grows once per graph built
             queue: Vec::new(),
-            pulled: FxHashSet::default(),
+            pulled: HashSet::default(),
             groups: Table::default(),
             // alloc: none (an empty `Vec`); it grows once per graph built
             group_list: Vec::new(),
-            mismatches: FxHashMap::default(),
-            asked: FxHashSet::default(),
+            mismatches: HashMap::default(),
+            asked: HashSet::default(),
             // alloc: none (an empty `Vec`); it grows once per graph built
             shared: Vec::new(),
             // alloc: none (an empty `Vec`); it grows once per graph built
             members: Vec::new(),
-            commons: FxHashMap::default(),
+            commons: HashMap::default(),
         }
     }
 
@@ -1813,8 +1814,8 @@ impl<'a> Stage<'a> {
         }
         // An archive or library twice on the line is searched once (lld searches every
         // archive whatever its place); an object twice is an error.
-        let mut given: FxHashMap<blaze_ids::ContentId, usize> =
-            FxHashMap::with_capacity_and_hasher(change.natives.len(), Default::default());
+        let mut given: HashMap<blaze_ids::ContentId, usize> =
+            HashMap::with_capacity_and_hasher(change.natives.len(), Default::default());
         let mut natives = Vec::with_capacity(change.natives.len());
         for (at, native) in change.natives.iter().enumerate() {
             match given.entry(native.id) {
@@ -1829,13 +1830,13 @@ impl<'a> Stage<'a> {
                 Entry::Occupied(_) => {}
             }
         }
-        let mut removed: FxHashSet<blaze_ids::ContentId> =
-            FxHashSet::with_capacity_and_hasher(change.removed_natives.len(), Default::default());
+        let mut removed: HashSet<blaze_ids::ContentId> =
+            HashSet::with_capacity_and_hasher(change.removed_natives.len(), Default::default());
         removed.extend(change.removed_natives.iter().copied());
         let inputs = Arc::make_mut(&mut self.new.inputs);
         inputs.retain(|it| !removed.contains(&it.id));
-        let mut have: FxHashMap<blaze_ids::ContentId, usize> =
-            FxHashMap::with_capacity_and_hasher(inputs.len(), Default::default());
+        let mut have: HashMap<blaze_ids::ContentId, usize> =
+            HashMap::with_capacity_and_hasher(inputs.len(), Default::default());
         have.extend(inputs.iter().enumerate().map(|(at, it)| (it.id, at)));
         let mut fresh = Vec::with_capacity(natives.len());
         for at in natives {
@@ -1861,8 +1862,8 @@ impl<'a> Stage<'a> {
                 Ok(file)
             },
         );
-        let mut bytes: FxHashMap<blaze_ids::ContentId, &'a [u8]> =
-            FxHashMap::with_capacity_and_hasher(inputs.len() + fresh.len(), Default::default());
+        let mut bytes: HashMap<blaze_ids::ContentId, &'a [u8]> =
+            HashMap::with_capacity_and_hasher(inputs.len() + fresh.len(), Default::default());
         inputs.reserve(fresh.len());
         for (at, file) in fresh.iter().zip(files) {
             let native = &change.natives[*at];
@@ -1879,7 +1880,7 @@ impl<'a> Stage<'a> {
             bytes.insert(native.id, &native.bytes[..]);
         }
         inputs.sort_by_key(|it| (it.order, it.id));
-        let mut names: FxHashSet<&str> = FxHashSet::with_capacity_and_hasher(inputs.len(), Default::default());
+        let mut names: HashSet<&str> = HashSet::with_capacity_and_hasher(inputs.len(), Default::default());
         names.extend(inputs.iter().map(|it| &*it.name));
         for input in inputs.iter() {
             let NativeFile::Shared(shared) = &*input.file else { continue };
@@ -1909,7 +1910,7 @@ impl<'a> Stage<'a> {
         self.native.bytes.extend(inputs.iter().map(|it| bytes[&it.id]));
         self.native.filled = true;
         if !removed.is_empty() {
-            let mut gone: FxHashSet<u32> = FxHashSet::with_capacity_and_hasher(removed.len(), Default::default());
+            let mut gone: HashSet<u32> = HashSet::with_capacity_and_hasher(removed.len(), Default::default());
             gone.extend(removed.iter().filter(|it| !given.contains_key(*it)).filter_map(|it| self.symbols.find_id(it)).map(|it| it.0));
             if !gone.is_empty() {
                 self.objects.retain(|obj, _| !gone.contains(&obj.native.0));
@@ -3263,7 +3264,7 @@ impl<'a> Stage<'a> {
                 wanted.push(it.sym);
             }
         }
-        let mut cells: FxHashSet<Sym> = FxHashSet::default();
+        let mut cells: HashSet<Sym> = HashSet::default();
         for sym in &wanted {
             if kind_of(*sym).is_some() {
                 continue;
@@ -3354,7 +3355,7 @@ impl<'a> Stage<'a> {
                 library_orders.push(exports.orders[at]);
             }
         }
-        let mut current: FxHashMap<Sym, Import> = FxHashMap::with_capacity_and_hasher(imports.len(), Default::default());
+        let mut current: HashMap<Sym, Import> = HashMap::with_capacity_and_hasher(imports.len(), Default::default());
         for (sym, mut import, library) in imports {
             import.library = (library != NONE).then(|| index[library as usize]).filter(|it| *it != NONE);
             current.insert(sym, import);

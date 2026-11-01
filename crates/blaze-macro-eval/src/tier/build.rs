@@ -10,7 +10,7 @@
 //! make the client's input buffer: what the evaluator's run calls. Everything is resolved
 //! here; the loader only places and patches.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use base_db::{Crate, Db, FileId};
 use blaze_codegen::{
@@ -22,14 +22,14 @@ use blaze_codegen::{
     settings::{DebugInfo, Panic, Pgo, Relocation, Sanitize, Spec},
 };
 use blaze_format::SpanRef;
+use blaze_hash::{HashMap, SharedByHash};
 use blaze_ids::ContentId;
 use cranelift_codegen::{binemit::Reloc as Kind, ir, isa::CallConv};
 use hir_def::{FunctionId, StaticId};
 use hir_ty_codegen::v2::{
-    Backends, BuildTime, Databases, HashSource, HirFrontend, HirInstance, HirStatic, ItemHashes, Lowering, Runs,
-    lowered, span_tables_of,
+    Backends, BuildTime, Databases, HashSource, HirFrontend, HirInstance, HirStatic, ItemHashes,
+    Lowering, Runs, lowered, span_tables_of,
 };
-use rustc_hash::FxHashMap;
 
 use super::{
     bind::{self, Binding, Refusal, Use, Why},
@@ -56,7 +56,7 @@ pub(crate) struct Compiled {
     /// Each function's table signature, by function index; `Sig::NONE` for one with none.
     sigs: Vec<Sig>,
     /// The confined signature of each [`Sig`] some entry or root has, by its id.
-    signatures: FxHashMap<Sig, ir::Signature>,
+    signatures: HashMap<Sig, ir::Signature>,
     /// Every static, with its blob and its size.
     pub(crate) statics: Vec<(StaticId, u32, u32)>,
     /// How the bridge's `Closure::call` is passed its values, when the crate calls it.
@@ -104,12 +104,9 @@ pub(crate) fn compiled(
     macros: &[(FunctionId, bool)],
 ) -> Result<Arc<Compiled>, Stop> {
     type Cell = Arc<OnceLock<Result<Arc<Compiled>, Stop>>>;
-    static IMAGES: OnceLock<Mutex<FxHashMap<ContentId, Cell>>> = OnceLock::new();
-    let cell = {
-        let mut images = IMAGES.get_or_init(Mutex::default).lock().unwrap_or_else(|it| it.into_inner());
-        // clone: one reference count per expansion, outside the lock's hold of the compile
-        Arc::clone(images.entry(code).or_default())
-    };
+    static IMAGES: LazyLock<SharedByHash<ContentId, Cell>> = LazyLock::new(Default::default);
+    // clone: one reference count per expansion, so the table's guard is let go before the compile
+    let cell = Arc::clone(IMAGES.pin().get_or_insert_with(code, Cell::default));
     cell.get_or_init(|| compile(db, krate, bridge, macros).map(Arc::new)).clone() // clone: an `Arc` or the crate's refusal
 }
 
@@ -216,15 +213,15 @@ struct PendBlob {
 struct Builder<'a> {
     claims: &'a Claims<'a>,
     /// Each reached function's code, by its key in the build.
-    slots: FxHashMap<InstanceKey, Code>,
+    slots: HashMap<InstanceKey, Code>,
     stubs: Vec<StubPlan>,
     /// Stubs by the symbol or instance they stand for.
-    stub_of_symbol: FxHashMap<String, u32>,
+    stub_of_symbol: HashMap<String, u32>,
     blobs: Vec<PendBlob>,
-    data: FxHashMap<ContentId, u32>,
-    statics: FxHashMap<(blaze_items::ItemKey, ContentId), u32>,
+    data: HashMap<ContentId, u32>,
+    statics: HashMap<(blaze_items::ItemKey, ContentId), u32>,
     positions: Vec<SpanRef>,
-    by_sig: FxHashMap<Sig, ir::Signature>,
+    by_sig: HashMap<Sig, ir::Signature>,
     /// Functions and stubs whose address is taken: they get table entries.
     taken: Vec<Code>,
 }
@@ -338,7 +335,7 @@ impl Builder<'_> {
 
 /// The names `func` has, by position, from their user name: what a relocation of its code
 /// names.
-fn name_positions(func: &ir::Function) -> FxHashMap<(u32, u32), u32> {
+fn name_positions(func: &ir::Function) -> HashMap<(u32, u32), u32> {
     func.params
         .user_named_funcs()
         .values()
@@ -367,8 +364,8 @@ fn libcall_symbol(call: ir::LibCall) -> Option<&'static str> {
 
 /// The names of the files of `krate` and every crate it depends on, as the evaluator names
 /// them (`file!()`, `Location`).
-fn file_names(db: &Db, krate: Crate) -> FxHashMap<FileId, String> {
-    let mut names = FxHashMap::default();
+fn file_names(db: &Db, krate: Crate) -> HashMap<FileId, String> {
+    let mut names = HashMap::default();
     for &each in krate.transitive_deps(db) {
         let root = each.root_file_id(db).file_id(db);
         let source_root = db.source_root(db.file_source_root(root).source_root_id(db)).source_root_ref(db);
@@ -384,7 +381,7 @@ fn file_names(db: &Db, krate: Crate) -> FxHashMap<FileId, String> {
     names
 }
 
-fn hashes(names: &Arc<FxHashMap<FileId, String>>) -> HashSource {
+fn hashes(names: &Arc<HashMap<FileId, String>>) -> HashSource {
     let names = Arc::clone(names);
     // alloc: once per crate compiled, the files' names
     HashSource::Items(ItemHashes::new(Box::new(move |file: FileId| names.get(&file).cloned()))) // clone: a file's name, once per position
@@ -478,7 +475,10 @@ fn bridge_abi(sig: &ir::Signature) -> Result<BridgeAbi, Stop> {
 }
 
 fn compile(db: &Db, krate: Crate, bridge: &Bridge, macros: &[(FunctionId, bool)]) -> Result<Compiled, Stop> {
-    let overflow_checks = hir_ty_mir::mir::overflow::crate_checks_overflow(db, krate).unwrap_or(false);
+    let Some(overflow_checks) = hir_ty_mir::mir::overflow::crate_checks_overflow(db, krate) else {
+        // alloc: error path
+        return Err(Stop("is a crate of the standard library, which has no overflow-checks setting of its own".to_owned()));
+    };
     let debug_assertions = krate.cfg_options(db).check_atom(&cfg::CfgAtom::Flag(intern::sym::debug_assertions));
     let (policy, stencils) = policy(overflow_checks, debug_assertions)?;
     let names = Arc::new(file_names(db, krate)); // alloc: once per crate compiled, the files' names
@@ -509,14 +509,14 @@ fn compile(db: &Db, krate: Crate, bridge: &Bridge, macros: &[(FunctionId, bool)]
     let mut items = Vec::with_capacity(reached.functions.len() + reached.statics.len()); // alloc: once per crate compiled
     let mut b = Builder {
         claims: &claims,
-        slots: FxHashMap::default(),
+        slots: HashMap::default(),
         stubs: Vec::new(), // alloc: none, empty until a name is bound
-        stub_of_symbol: FxHashMap::default(),
+        stub_of_symbol: HashMap::default(),
         blobs: Vec::new(), // alloc: none, empty until a blob is made
-        data: FxHashMap::default(),
-        statics: FxHashMap::default(),
+        data: HashMap::default(),
+        statics: HashMap::default(),
         positions: Vec::new(), // alloc: none, empty until a position is named
-        by_sig: FxHashMap::default(),
+        by_sig: HashMap::default(),
         taken: Vec::new(), // alloc: none, empty until an address is taken
     };
 
@@ -917,8 +917,8 @@ fn locations(
     hashes: &HashSource,
     items: &[blaze_items::ItemKey],
     b: &mut Builder<'_>,
-) -> Result<FxHashMap<SpanRef, u32>, Stop> {
-    let mut out = FxHashMap::default();
+) -> Result<HashMap<SpanRef, u32>, Stop> {
+    let mut out = HashMap::default();
     if b.positions.is_empty() {
         return Ok(out);
     }
@@ -932,7 +932,7 @@ fn locations(
     };
     // alloc: error path
     let tables = span_tables_of(db, hashes, items, anchors).map_err(|what| Stop(format!("can't place its positions: {what}")))?;
-    let mut files: FxHashMap<String, u32> = FxHashMap::default();
+    let mut files: HashMap<String, u32> = HashMap::default();
     for (anchor, bytes) in tables {
         // alloc: error path
         let table = blaze_link::SpanTable::decode(&bytes).map_err(|what| Stop(format!("has a span table it can't read: {what}")))?;

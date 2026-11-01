@@ -11,9 +11,9 @@ use blaze_api::{ApiError, Artifact, ArtifactKind, Response, TargetKind};
 use blaze_cas::Store;
 use blaze_codegen::plan::{Mode as BuildMode, Policy};
 use blaze_core::{Command, Completion, Done, Effect, Sandbox, Tag};
+use blaze_hash::HashMap;
 use blaze_lazy::{Purpose, Refused};
 use blaze_units::schema::Mode;
-use rustc_hash::FxHashMap;
 
 use super::{
     Job, Real, UnitWriter, codegen,
@@ -76,7 +76,7 @@ pub(crate) fn process_env(job: &[(String, String)], artifact: &Artifact, os: &st
         "windows" => ";",
         _ => ":",
     };
-    let mut env: FxHashMap<String, String> = job.iter().cloned().collect();
+    let mut env: HashMap<String, String> = job.iter().cloned().collect();
     for (name, value) in &artifact.env {
         let joined = match env.get(name).filter(|_| name == var) {
             Some(theirs) if theirs.starts_with(value.as_str()) => theirs.clone(),

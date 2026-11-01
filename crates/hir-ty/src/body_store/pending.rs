@@ -10,15 +10,13 @@
 use std::{
     collections::hash_map::Entry as Slot,
     mem,
-    sync::{
-        Mutex, MutexGuard,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use hir_def::DefWithBodyId;
-use rustc_hash::FxHashMap;
+use parking_lot::{Mutex, MutexGuard};
 
 use super::{Refusal, Step, StepCounts};
 
@@ -45,7 +43,7 @@ struct Shard {
     bytes: Vec<u8>,
     defs: Vec<DefWithBodyId>,
     tallies: Counts,
-    refused: FxHashMap<&'static str, u64>,
+    refused: HashMap<&'static str, u64>,
 }
 
 /// Why offered steps were not kept, by every reason but a read, and what each step's lookups
@@ -114,7 +112,7 @@ impl Pending {
 
     fn shard(&self) -> MutexGuard<'_, Shard> {
         let at = SHARD.with(|at| *at);
-        self.shards[at].0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.shards[at].0.lock()
     }
 
     pub(super) fn push(&self, offered: Offered<'_>) {
@@ -178,7 +176,7 @@ impl Pending {
     pub(super) fn steps(&self) -> [StepCounts; 3] {
         let mut counts = Counts::default();
         for shard in &self.shards {
-            let shard = shard.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let shard = shard.0.lock();
             counts.add(&Counts { steps: shard.tallies.steps, ..Counts::default() });
         }
         counts.steps
@@ -188,11 +186,11 @@ impl Pending {
     pub(super) fn take(&self) -> (Vec<Taken>, Tallies) {
         let mut tallies = Tallies::default();
         // alloc: flush, once per build
-        let mut refused = FxHashMap::<&'static str, u64>::default();
+        let mut refused = HashMap::<&'static str, u64>::default();
         // alloc: flush, once per build
         let mut taken = Vec::with_capacity(SHARDS);
         for shard in &self.shards {
-            let mut shard = shard.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut shard = shard.0.lock();
             taken.push(Taken { bytes: mem::take(&mut shard.bytes), defs: mem::take(&mut shard.defs) });
             for (name, count) in shard.refused.drain() {
                 *refused.entry(name).or_default() += count;

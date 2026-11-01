@@ -3102,3 +3102,53 @@ fn main() {
 "#,
     );
 }
+
+#[test]
+fn a_body_that_inherits_its_overflow_checks_takes_those_of_the_crate_the_run_is_compiled_as() {
+    let fx = fixture::db(
+        r#"
+//- /std.rs crate:std
+#[rustc_inherit_overflow_checks]
+pub fn inc(x: u8) -> u8 {
+    x + 1
+}
+//- /main.rs crate:main deps:std
+fn main() {}
+"#,
+    );
+    let file_ids = fx.files().to_vec();
+    let db = fx.into_db();
+    crate::attach_db(&db, || {
+        let module_id = db.module_for_file(file_ids[0].file_id(&db));
+        let inc = module_id
+            .def_map(&db)
+            .module(&db, module_id)
+            .scope(&db)
+            .declarations()
+            .find_map(|x| match x {
+                hir_def::ModuleDefId::FunctionId(x)
+                    if FunctionSignature::of(&db, x).name.display(&db, Edition::CURRENT).to_string() == "inc" =>
+                {
+                    Some(x)
+                }
+                _ => None,
+            })
+            .expect("no inc function found");
+        let main_crate = db.module_for_file(file_ids[1].file_id(&db)).krate(&db);
+        let env = crate::ParamEnvAndCrate { param_env: db.trait_environment(inc.into()), krate: main_crate };
+        let run = |inherited: Option<bool>| {
+            let mut eval = crate::mir::Evaluator::new(&db, inc.into(), Some(env)).unwrap();
+            if let Some(checks) = inherited {
+                eval.set_inherited_overflow_checks(checks);
+            }
+            eval.call(inc, GenericArgs::empty(), &[&[255]])
+        };
+        let panics = |ran: Result<Vec<u8>, MirEvalError<'_>>| match ran {
+            Err(e) => matches!(innermost(&e), MirEvalError::Panic(_)),
+            Ok(bytes) => panic!("255 + 1 ran to {bytes:?}"),
+        };
+        assert_eq!(run(Some(false)).unwrap(), [0], "a crate built without overflow checks wraps");
+        assert!(panics(run(Some(true))), "a crate built with overflow checks panics");
+        assert!(panics(run(None)), "unset, as in a constant, it checks");
+    })
+}

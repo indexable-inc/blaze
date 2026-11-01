@@ -7,8 +7,8 @@
 
 use std::alloc::{Allocator, Global};
 
+use blaze_hash::HashMap;
 use parser::TopEntryPoint;
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use span::{Edition, Span, SpanMap, SyntaxContext};
 use stdx::never;
@@ -65,7 +65,7 @@ fn convert<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
     let mut fragment_at = None;
 
     let mut current = buffer.cursor();
-    let mut syntax_context_to_edition_cache = FxHashMap::default();
+    let mut syntax_context_to_edition_cache = HashMap::default();
     let mut last: Option<(SyntaxContext, Edition)> = None;
     let mut ctx_edition = |ctx: SyntaxContext| {
         if let Some((last_ctx, edition)) = last

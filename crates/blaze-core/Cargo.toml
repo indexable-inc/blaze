@@ -14,11 +14,13 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-hash.workspace = true
 blaze-mem.workspace = true
 blaze-radix.workspace = true
 blaze-rng.workspace = true
 crossbeam-channel.workspace = true
-rustc-hash.workspace = true
+crossbeam-queue.workspace = true
+parking_lot.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
@@ -35,4 +37,5 @@ workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-ids.workspace = true
+blaze-spin.workspace = true
 hegeltest.workspace = true

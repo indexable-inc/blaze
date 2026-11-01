@@ -11,15 +11,15 @@
 use std::collections::hash_map::Entry;
 use std::ops::Range;
 
+use blaze_hash::HashMap;
 use blaze_ids::radix;
-use rustc_hash::FxHashMap;
 
 use super::code::{self, Parts, Sig};
 use super::reader::{self, Reader, Wasm};
 use super::reloc::{self, Kind};
 use crate::model::{
-    Apply, Archive, Binding, Class, Data, Group, Member, Name, Names, NativeFile, NativeFixup, Object,
-    Section, SectionKind, Symbol, SymbolDef, SymbolKind, WasmImport,
+    Apply, Archive, Binding, Class, Data, Group, Member, Name, Names, NativeFile, NativeFixup,
+    Object, Section, SectionKind, Symbol, SymbolDef, SymbolKind, WasmImport,
 };
 use crate::output::NativeKind;
 
@@ -147,8 +147,8 @@ fn archive(bytes: &[u8], whole: bool) -> Result<Archive, String> {
             // A BSD `__.SYMDEF` names its strings by offset, so many entries may name one: each
             // string is pushed once, keyed by where it is in the input (O(1) per entry, and the
             // arena no bigger than the index's strings).
-            let mut pushed: FxHashMap<(usize, usize), Name> =
-                FxHashMap::with_capacity_and_hasher(entries, Default::default());
+            let mut pushed: HashMap<(usize, usize), Name> =
+                HashMap::with_capacity_and_hasher(entries, Default::default());
             for symbol in symbols {
                 // alloc: error path
                 let symbol = symbol.map_err(|e| format!("the archive's index: {e}"))?;

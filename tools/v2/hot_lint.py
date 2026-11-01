@@ -34,7 +34,7 @@ CHECKS = (
     ("alloc", re.compile(r"\bVec::new\(\)|\bvec!\[|\.to_vec\(\)"), "fresh `Vec`: arena, reused buffer, `with_capacity`, or `SmallVec`"),
     ("alloc", re.compile(r"\.collect::<Vec|\.collect\(\)"), "`collect()`: write into a reused buffer or iterate lazily"),
     ("alloc", re.compile(r"\bBox::new\(|\bArc::new\(|\bRc::new\("), "per-value box: arena slot and `u32` ID"),
-    ("alloc", re.compile(r"std::collections::Hash(Map|Set)"), "SipHash map: `FxHashMap`, or direct index by content hash"),
+    ("alloc", re.compile(r"std::collections::Hash(Map|Set)"), "SipHash map: `blaze_hash::HashMap`, or direct index by content hash (`blaze_hash::ByHash`)"),
 )
 EXEMPT = re.compile(r"//\s*(alloc|dyn|clone):\s*\S")
 # Comments and string, raw string and char literals, over a whole file (they may span lines), so

@@ -1158,7 +1158,7 @@ fn frame_matches_a_model_on_random_allocations_grows_shrinks_and_rollbacks() {
         for i in from..live.layout.size() {
             let byte = (seed as u8) ^ (i as u8).wrapping_mul(7);
             // SAFETY: `ptr` is a live allocation of the frame of `layout.size()` bytes.
-            unsafe { live.ptr.as_ptr().add(i).write(byte) };
+            unsafe { live.ptr.as_ptr().wrapping_add(i).write(byte) };
             live.model.push(byte);
         }
     }
@@ -1370,7 +1370,7 @@ fn frame_cap_waits_past_its_limit_until_bytes_come_back() {
 fn frame_cap_cancels_the_newest_wait_when_every_holder_waits() {
     let (cap, _spills) = frame::Cap::new(100, 100);
     let mine = cap.reserve(60).expect("fits");
-    let (go, ready) = std::sync::mpsc::channel();
+    let (go, ready) = crossbeam_channel::unbounded();
     let older = thread::spawn(move || {
         let first = cap.reserve(30).expect("fits");
         go.send(()).expect("the test waits for it");
@@ -1871,7 +1871,7 @@ fn pool_a_producer_and_a_consumer_move_batches_and_reuse_descriptors() {
     const ROUNDS: u64 = 400;
     const EACH: u64 = 1000;
     let pool = Pool::<u64>::new(1 << 20, Tag::Io).expect("reserve");
-    let (send, take) = std::sync::mpsc::sync_channel::<Vec<pool::Pooled<'_, u64>>>(4);
+    let (send, take) = crossbeam_channel::bounded::<Vec<pool::Pooled<'_, u64>>>(4);
     thread::scope(|scope| {
         let pool = &pool;
         scope.spawn(move || {

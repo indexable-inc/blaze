@@ -158,10 +158,10 @@ mod tests {
 
     /// Runs `f` on `worker`'s thread and gives back what it made.
     fn on<R: Send + 'static>(
-        worker: &std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>,
+        worker: &crossbeam_channel::Sender<Box<dyn FnOnce() + Send>>,
         f: impl FnOnce() -> R + Send + 'static,
     ) -> R {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = crossbeam_channel::unbounded();
         worker.send(Box::new(move || tx.send(f()).unwrap())).unwrap();
         rx.recv().unwrap()
     }
@@ -182,7 +182,7 @@ mod tests {
     fn jobs_swapped_crosswise_onto_threads_whose_slots_are_held_each_see_their_own() {
         let workers: Vec<_> = (0..2u32)
             .map(|at| {
-                let (tx, rx) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
+                let (tx, rx) = crossbeam_channel::unbounded::<Box<dyn FnOnce() + Send>>();
                 let thread = std::thread::spawn(move || {
                     SLOT.set(Some(vec![900 + at]));
                     for f in rx {

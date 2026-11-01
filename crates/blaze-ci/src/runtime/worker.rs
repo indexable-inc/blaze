@@ -9,7 +9,7 @@ use std::{
     io::{self, Write},
     net::Shutdown,
     os::unix::net::UnixStream,
-    sync::{Arc, PoisonError, mpsc},
+    sync::Arc,
     thread,
 };
 
@@ -18,10 +18,10 @@ use blaze_api::{
     client::Client,
     frames::{self, Frames},
 };
+use blaze_hash::HashMap;
 use blaze_ids::{ContentId, radix};
 use blaze_protocol::cbor;
 use blaze_vfs::{Op, View};
-use rustc_hash::FxHashMap;
 
 use super::{EMPTY_HEAD, MOST_BATCH, Shared, api_error, batches, pins, said_or};
 use crate::{
@@ -42,8 +42,8 @@ pub(crate) enum Command {
 }
 
 /// Starts the job's worker; it ends at [`Command::End`].
-pub(crate) fn start(job: JobId, shared: Arc<Shared>) -> mpsc::Sender<Command> {
-    let (commands, receive) = mpsc::channel();
+pub(crate) fn start(job: JobId, shared: Arc<Shared>) -> crossbeam_channel::Sender<Command> {
+    let (commands, receive) = crossbeam_channel::unbounded();
     let me = commands.clone(); // clone: once per job, the reader's way back
     thread::spawn(move || Worker::new(job, shared, me).run(&receive));
     commands
@@ -52,14 +52,14 @@ pub(crate) fn start(job: JobId, shared: Arc<Shared>) -> mpsc::Sender<Command> {
 struct Worker {
     job: JobId,
     shared: Arc<Shared>,
-    me: mpsc::Sender<Command>,
+    me: crossbeam_channel::Sender<Command>,
     /// The writing half of the job's connection.
     stream: Option<UnixStream>,
     /// Ids increase over every connection the job makes, so a late frame of an old one can't be
     /// taken for a new request's.
     next_id: u64,
     /// Sorted by id where it is walked, so cancels and failures go out in request order.
-    running: FxHashMap<u64, RunId>,
+    running: HashMap<u64, RunId>,
     /// Each request is encoded here, then written: one buffer for the job's every request.
     out: Outgoing,
     /// The ids being cancelled or failed, sorted: kept from one cancel to the next.
@@ -67,13 +67,13 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(job: JobId, shared: Arc<Shared>, me: mpsc::Sender<Command>) -> Worker {
-        let running = FxHashMap::default();
+    fn new(job: JobId, shared: Arc<Shared>, me: crossbeam_channel::Sender<Command>) -> Worker {
+        let running = HashMap::default();
         // alloc: once per job
         Worker { job, shared, me, stream: None, next_id: 1, running, out: Outgoing::default(), ids: Vec::new() }
     }
 
-    fn run(mut self, commands: &mpsc::Receiver<Command>) {
+    fn run(mut self, commands: &crossbeam_channel::Receiver<Command>) {
         while let Ok(command) = commands.recv() {
             match command {
                 Command::Checkout { commit, fetch, from, head } => {
@@ -200,7 +200,7 @@ impl Outgoing {
 }
 
 /// Reads the connection's responses until it ends.
-fn read(mut stream: UnixStream, socket: &str, to: &mpsc::Sender<Command>) {
+fn read(mut stream: UnixStream, socket: &str, to: &crossbeam_channel::Sender<Command>) {
     let mut frames = Frames::new();
     loop {
         let most = frames.wanted(64 << 10);
@@ -270,7 +270,7 @@ fn checkout(
 ) -> Result<ContentId, String> {
     let same = from.is_some_and(|from| from.commit == commit);
     // clone: once per checkout, so the diff runs outside the lock
-    let git = shared.git.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let git = shared.git.lock().clone();
     let ops = if same {
         Vec::new() // alloc: none, an empty list
     } else {
@@ -282,11 +282,10 @@ fn checkout(
             let token = shared
                 .github
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner)
                 .token()
                 // alloc: error path
                 .map_err(|error| format!("minting the installation token to fetch {commit} failed: {error}"))?;
-            let git = shared.git.lock().unwrap_or_else(PoisonError::into_inner);
+            let git = shared.git.lock();
             git.fetch(fetch, Some(&token)).map_err(|error| {
                 // alloc: error path
                 format!("fetching {} into {} failed: {error}", fetch.join(" "), git.dir.display())
@@ -403,7 +402,7 @@ fn commit_head(
 }
 
 fn pin(shared: &Shared, view: ViewRef) -> Result<ContentId, String> {
-    let (reply, answer) = mpsc::channel();
+    let (reply, answer) = crossbeam_channel::unbounded();
     shared
         .pins
         .send(pins::Command::Open { view, reply: Some(reply) })

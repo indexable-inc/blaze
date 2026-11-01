@@ -28,9 +28,9 @@ use std::{
     sync::LazyLock,
 };
 
+use blaze_hash::HashMap;
 use blaze_mem::scratch::Scratch as Stack;
 use intern::Symbol;
-use rustc_hash::FxHashMap;
 use span::{
     Edition, EditionedFileId, FileId, ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor, SyntaxContext,
     TextRange, TextSize,
@@ -170,13 +170,13 @@ impl PackedSpan {
 #[derive(Debug)]
 pub struct IndexTable<T> {
     list: Vec<T>,
-    map: FxHashMap<T, u32>,
+    map: HashMap<T, u32>,
 }
 
 impl<T> Default for IndexTable<T> {
     fn default() -> Self {
         // alloc: kept per thread with the builder's buffers, grown at the first parts.
-        IndexTable { list: Vec::new(), map: FxHashMap::default() }
+        IndexTable { list: Vec::new(), map: HashMap::default() }
     }
 }
 
@@ -950,7 +950,7 @@ impl Tree {
 thread_local! {
     /// [`has_duplicates`]' set, kept for the next column of more than [`SCAN`] parts.
     // alloc: one set per thread, grown to the most parts checked, up to `KEEP`.
-    static SEEN: Cell<Option<rustc_hash::FxHashSet<[u32; 3]>>> = const { Cell::new(None) };
+    static SEEN: Cell<Option<blaze_hash::HashSet<[u32; 3]>>> = const { Cell::new(None) };
 }
 
 /// Whether the parts column holds a row twice.

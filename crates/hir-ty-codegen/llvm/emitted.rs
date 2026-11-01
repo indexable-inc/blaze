@@ -12,6 +12,7 @@
 
 use std::borrow::Borrow;
 
+use blaze_hash::{HashMap, HashSet};
 use cranelift_codegen::{
     binemit::Reloc,
     gimli::{
@@ -25,7 +26,6 @@ use object::{
     Architecture, BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationFlags,
     RelocationTarget, SectionIndex, SectionKind, SymbolSection, elf, macho, pe,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use super::{
@@ -44,13 +44,13 @@ pub(super) struct Emitted<'data, 'file> {
     /// The section of the function.
     text: SectionIndex,
     /// The sections of every function of the object that is read.
-    texts: &'file FxHashSet<SectionIndex>,
+    texts: &'file HashSet<SectionIndex>,
     /// Sections the code of more than one of them refers to.
-    shared: &'file FxHashSet<SectionIndex>,
+    shared: &'file HashSet<SectionIndex>,
     /// The name of the function, which is that of the file its lines are of.
     name: &'file str,
     /// What became of each section the code leads to.
-    placed: FxHashMap<SectionIndex, Placement>,
+    placed: HashMap<SectionIndex, Placement>,
     /// The sections that are part of the code, in the order they are in `bytes`.
     inline: Vec<SectionIndex>,
     bytes: Vec<u8>,
@@ -144,11 +144,11 @@ fn read_all<S: Borrow<Signature>>(
         }
     }
     // alloc: once per object, the sections of its functions, which `Emitted` looks up per relocation
-    let texts: FxHashSet<SectionIndex> = found.iter().flatten().map(|it| it.0).collect();
-    let mut referrers: FxHashMap<SectionIndex, usize> = FxHashMap::default();
+    let texts: HashSet<SectionIndex> = found.iter().flatten().map(|it| it.0).collect();
+    let mut referrers: HashMap<SectionIndex, usize> = HashMap::default();
     if texts.len() > 1 {
         for &text in &texts {
-            let mut targets = FxHashSet::default();
+            let mut targets = HashSet::default();
             for (_, relocation) in file.section_by_index(text)?.relocations() {
                 if let Destination::Section(target) = Emitted::destination(&file, &relocation)?
                     && !texts.contains(&target)
@@ -197,8 +197,8 @@ impl<'data, 'file> Emitted<'data, 'file> {
     fn code(
         file: &'file object::File<'data>,
         text: SectionIndex,
-        texts: &'file FxHashSet<SectionIndex>,
-        shared: &'file FxHashSet<SectionIndex>,
+        texts: &'file HashSet<SectionIndex>,
+        shared: &'file HashSet<SectionIndex>,
         name: &'file str,
         signature: Signature,
         recorder: &mut Wants,
@@ -217,7 +217,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
             texts,
             shared,
             name,
-            placed: FxHashMap::default(),
+            placed: HashMap::default(),
             // alloc: once per function read, the sections of its code
             inline: Vec::new(),
             // alloc: the code, which the `Code` keeps
@@ -1073,7 +1073,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
         let malformed = |_| Unhandled::Shape("an unwind table that does not parse");
         // Of an object of more than one function, the entries of this one: those whose
         // start, eight bytes in, is relocated against its section.
-        let ours: Option<FxHashSet<u64>> = (self.texts.len() > 1).then(|| {
+        let ours: Option<HashSet<u64>> = (self.texts.len() > 1).then(|| {
             let starts = section.relocations().filter(|(_, relocation)| {
                 Self::symbol(self.file, relocation)
                     .is_ok_and(|it| it.section() == SymbolSection::Section(self.text))

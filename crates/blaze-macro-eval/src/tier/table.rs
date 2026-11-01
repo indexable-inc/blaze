@@ -13,7 +13,7 @@
 //! The shims and the server check a pointer the same way ([`Table::target`]) before they
 //! call back into the macro (the bridge buffer's `reserve` and `drop`, a client's `run`).
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 /// One entry, as the confined code reads it: 16 bytes, so a pointer is the entry's offset.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -45,7 +45,7 @@ impl Sig {
 /// types, purposes and extensions, and the calling convention) to its id.
 #[derive(Default)]
 pub(crate) struct Signatures {
-    ids: FxHashMap<Box<[u8]>, Sig>,
+    ids: HashMap<Box<[u8]>, Sig>,
 }
 
 impl Signatures {

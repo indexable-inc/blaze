@@ -460,7 +460,7 @@ impl Head {
             let content = ContentId(*read.array()?);
             head.externals.push(ExternalRef { content, len: read.u64()? });
         }
-        let mut seen = rustc_hash::FxHashSet::default();
+        let mut seen = blaze_hash::HashSet::default();
         for _ in 0..units {
             let unit = ContentId(*read.array()?);
             if unit == ContentId::default() || !seen.insert(unit) {

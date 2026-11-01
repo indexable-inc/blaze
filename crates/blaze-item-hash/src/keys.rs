@@ -17,6 +17,7 @@
 //! hash is.
 
 use base_db::Db;
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_items::{
     ItemId, ItemKey,
@@ -36,7 +37,6 @@ use hir_ty::{
     next_solver::{ImplTraitIdx, SolverDefId},
 };
 use la_arena::{Idx, RawIdx};
-use rustc_hash::FxHashMap;
 
 use crate::identity::names::{Target, names_of};
 
@@ -135,10 +135,10 @@ fn relative<'db>(db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> Opt
 /// The index of each target among `body`'s resolutions ([`Target`]), empty when its paths
 /// could not be hashed (it then has no identity, and no record).
 #[blaze_query::tracked(returns(ref))]
-fn target_indices(db: &Db, body: DefWithBodyId) -> FxHashMap<Target, u32> {
-    let Ok(names) = names_of(db, body) else { return FxHashMap::default() };
+fn target_indices(db: &Db, body: DefWithBodyId) -> HashMap<Target, u32> {
+    let Ok(names) = names_of(db, body) else { return HashMap::default() };
     // alloc: the query's value, once per body a record is written or read for
-    let mut indices = FxHashMap::default();
+    let mut indices = HashMap::default();
     for (at, &target) in names.targets.iter().enumerate() {
         indices.insert(target, u32::try_from(at).expect("more than 2^32 targets of one body"));
     }

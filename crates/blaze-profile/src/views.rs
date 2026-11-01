@@ -83,7 +83,7 @@ pub const VIEWS: &[View] = &[
     view("slowest_queries", &[BUILD, LIMIT]),
     view("slower_between_commits", &[EARLIER, LATER, LIMIT]),
     view("memo_hit_rate_per_crate", &[BUILD]),
-    view("critical_path", &[BUILD, LIMIT]),
+    view("critical_path", &[ENDED_BUILD, LIMIT]),
     view("allocations_per_query_kind", &[BUILD]),
     view("what_reran", &[BUILD, LIMIT]),
     view("busiest_threads", &[BUILD, LIMIT]),
@@ -94,6 +94,13 @@ pub const VIEWS: &[View] = &[
     view("jobs_by_stack_high_water", &[BUILD, LIMIT]),
     view("utilization_per_second", &[ENDED_BUILD]),
     view("uncovered_time", &[ENDED_BUILD]),
+    view("worker_states", &[ENDED_BUILD]),
+    view("uncovered_per_worker", &[ENDED_BUILD]),
+    view("raw_blocks", &[ENDED_BUILD, LIMIT]),
+    view("reexecution_per_query_kind", &[BUILD, LIMIT]),
+    view("footprint_per_build", &[LIMIT]),
+    view("derive_panics_per_build", &[LIMIT]),
+    view("errors_by_kind", &[ENDED_BUILD]),
 ];
 
 /// The view named `name`.
@@ -556,13 +563,13 @@ mod tests {
         "having", "in", "is", "join", "last", "left", "like", "limit", "not", "null", "nulls",
         "on", "or", "order", "over", "partition", "qualify", "recursive", "replace", "select",
         "then", "union", "union_by_name", "using", "view", "when", "where", "with", "true",
-        "false", "rows", "unbounded", "preceding", "bigint",
+        "false", "rows", "unbounded", "preceding", "bigint", "cross", "ubigint", "varchar",
     ];
     /// DuckDB's functions the SQL files call.
     const FUNCTIONS: &[&str] = &[
         "any_value", "arg_max", "array_to_string", "count", "lag", "lead", "max", "median", "min",
         "rank", "read_parquet", "round", "starts_with", "sum", "unnest", "range", "least", "greatest",
-        "coalesce", "string_agg",
+        "coalesce", "string_agg", "regexp_matches",
     ];
 
     /// The identifiers of `sql` outside comments, strings, numbers and `$`/`@` names, each with

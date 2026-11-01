@@ -201,10 +201,15 @@ fn carve(space: &Space) -> Result<u32, MemError> {
 }
 
 /// Gives back a chunk `owner` held; its contents are dead. It goes back to its own space.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the chunk is given up: taking it ends its holder's hold, as `Chunk` is not `Copy` so it is held once"
+)]
 pub(crate) fn give(chunk: Chunk, owner: Tag) {
-    let space = made(place_of(chunk.0));
+    let Chunk(chunk) = chunk;
+    let space = made(place_of(chunk));
     tag::transfer(owner, Tag::Chunks, CHUNK);
-    space.warm.push(local_of(chunk.0), &space.links);
+    space.warm.push(local_of(chunk), &space.links);
 }
 
 /// Chunks [`give_all`] moves to a space at once.
@@ -232,12 +237,17 @@ pub(crate) fn give_all(chunks: &[u32], owner: Tag) {
 
 /// As [`give`], and lets the kernel take its pages first: for a chunk an owner trims after a
 /// burst rather than keeps warm.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the chunk is given up: taking it ends its holder's hold, as `Chunk` is not `Copy` so it is held once"
+)]
 pub(crate) fn give_cold(chunk: Chunk, owner: Tag) {
-    let space = made(place_of(chunk.0));
+    let Chunk(chunk) = chunk;
+    let space = made(place_of(chunk));
     // SAFETY: the owner gives the chunk up, so no one reads its contents before writing them.
-    unsafe { space.region.purge(local_of(chunk.0) as usize * CHUNK, CHUNK) };
+    unsafe { space.region.purge(local_of(chunk) as usize * CHUNK, CHUNK) };
     tag::transfer(owner, Tag::Chunks, CHUNK);
-    space.cold.push(local_of(chunk.0), &space.links);
+    space.cold.push(local_of(chunk), &space.links);
 }
 
 /// The link of a held chunk, for its owner's list of the chunks it holds (a chunk is on one

@@ -2,20 +2,20 @@
 //! path is in ([`FileSetConfig`]). A path under no prefix is in the last set.
 use std::fmt;
 
+use blaze_hash::{FixedState, HashMap};
 use blaze_mem::scratch;
 use indexmap::IndexMap;
-use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::{AnchoredPath, FileId, VfsPath};
 
 /// A set of [`VfsPath`]s identified by [`FileId`]s.
 #[derive(Default, Clone, Eq, PartialEq)]
 pub struct FileSet {
-    files: FxHashMap<VfsPath, FileId>,
-    paths: IndexMap<FileId, VfsPath, FxBuildHasher>,
+    files: HashMap<VfsPath, FileId>,
+    paths: IndexMap<FileId, VfsPath, FixedState>,
     /// Files that have another file's path, each with that file ([`FileSet::alias`]): found by
     /// file alone, never by path, and not among the set's files.
-    aliases: FxHashMap<FileId, FileId>,
+    aliases: HashMap<FileId, FileId>,
 }
 
 impl FileSet {
@@ -114,7 +114,7 @@ pub struct FileSetConfig {
     /// The sets `partition` makes: one per prefix list, then the set of everything else.
     n_file_sets: usize,
     /// Each prefix's key, with the first set it was given to.
-    prefixes: FxHashMap<Box<[u8]>, u32>,
+    prefixes: HashMap<Box<[u8]>, u32>,
     /// The distinct lengths of `prefixes`' keys, longest first.
     lengths: Box<[usize]>,
 }
@@ -191,7 +191,7 @@ impl FileSetConfigBuilder {
     /// A prefix in more than one list belongs to the first.
     pub fn build(self) -> FileSetConfig {
         let n_file_sets = self.roots.len() + 1;
-        let mut prefixes: FxHashMap<Box<[u8]>, u32> = FxHashMap::default();
+        let mut prefixes: HashMap<Box<[u8]>, u32> = HashMap::default();
         scratch::with_bytes(|key| {
             for (set, paths) in self.roots.iter().enumerate() {
                 let set = u32::try_from(set).expect("fewer than 2^32 source roots");

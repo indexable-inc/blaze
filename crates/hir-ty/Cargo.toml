@@ -13,15 +13,17 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
+blaze-hash.workspace = true
 cov-mark.workspace = true
+crossbeam-queue.workspace = true
 itertools.workspace = true
 arrayvec.workspace = true
+parking_lot.workspace = true
 smallvec.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
 either.workspace = true
 tracing = { workspace = true, features = ["attributes"] }
-rustc-hash.workspace = true
 la-arena.workspace = true
 triomphe.workspace = true
 indexmap.workspace = true
@@ -68,6 +70,7 @@ blaze-check.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-graph.workspace = true
+crossbeam-channel.workspace = true
 expect-test.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 

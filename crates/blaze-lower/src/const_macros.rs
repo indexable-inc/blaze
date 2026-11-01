@@ -13,10 +13,12 @@
 #![forbid(unsafe_code)]
 
 use base_db::{
-    AbsPathBuf, BuiltDependency, Crate, CrateDisplayName, CrateName, CrateOrigin, CrateType, CrateTypes,
-    CrateWorkspaceData, Db, Env, FileId,
+    AbsPathBuf, BuiltDependency, Crate, CrateDisplayName, CrateName, CrateOrigin, CrateType,
+    CrateTypes, CrateWorkspaceData, Db, Env, FileId,
 };
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
+use blaze_query::db::{Durability, Setter};
 use blaze_units::{
     query::{PackagePlan, Units},
     schema::{Mode, Unit},
@@ -26,8 +28,6 @@ use cfg::{CfgAtom, CfgDiff, CfgOptions};
 use hir_expand::proc_macro::{CrateProcMacros, ProcMacro, ProcMacros};
 use hir_ty_mir::const_macro::{CONST_AST, CONST_AST_NAME};
 use intern::Symbol;
-use rustc_hash::FxHashMap;
-use blaze_query::db::{Durability, Setter};
 use span::Edition;
 use triomphe::Arc;
 
@@ -61,7 +61,7 @@ pub(crate) struct Plan {
     /// group's macro crate is made before it (`crates::topological`).
     pub(crate) after: Vec<Vec<usize>>,
     /// By platform (none: the host): the crate of `const-ast`, once made.
-    pub(crate) const_ast: FxHashMap<Option<String>, Crate>,
+    pub(crate) const_ast: HashMap<Option<String>, Crate>,
 }
 
 impl Plan {
@@ -83,15 +83,15 @@ pub(crate) struct Loaded {
 
 /// The macro crates `units` need: one for each package with const macros and platform a unit of
 /// it compiles for but its build script.
-pub(crate) fn plan(units: &Units, package_of: &FxHashMap<&str, usize>, whats: &[String]) -> Result<Plan, LowerError> {
+pub(crate) fn plan(units: &Units, package_of: &HashMap<&str, usize>, whats: &[String]) -> Result<Plan, LowerError> {
     let all = &units.graph.units;
     let mut plan = Plan {
         group_of: vec![None; all.len()],
         groups: Vec::new(),
         after: vec![Vec::new(); all.len()],
-        const_ast: FxHashMap::default(),
+        const_ast: HashMap::default(),
     };
-    let mut by: FxHashMap<(usize, Option<&str>), usize> = FxHashMap::default();
+    let mut by: HashMap<(usize, Option<&str>), usize> = HashMap::default();
     for (index, unit) in all.iter().enumerate() {
         if unit.mode == Mode::RunCustomBuild || unit.target.is_custom_build() {
             continue;

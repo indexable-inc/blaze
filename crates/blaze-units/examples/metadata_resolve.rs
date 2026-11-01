@@ -16,16 +16,16 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
+use blaze_hash::HashMap;
 use blaze_resolve::lockfile::{self, PathDeps};
 use blaze_resolve::metadata::{MetadataPackages, resolve_graph};
 use blaze_resolve::resolver::{CliFeatures, CompileKind, HasDevUnits, Members, VersionOrdering};
 use blaze_resolve::workspace_resolve::{PackageRegistry, Patch, Workspace, resolve_ws};
 use blaze_resolve::{
-    DepKind, Dependency, IndexSummary, InternedString, MemRegistry, PackageId,
-    PackageIdSpec, Platform, QueryKind, Registry, ResolveVersion, SourceId, Summary,
+    DepKind, Dependency, IndexSummary, InternedString, MemRegistry, PackageId, PackageIdSpec,
+    Platform, QueryKind, Registry, ResolveVersion, SourceId, Summary,
 };
 use blaze_units::read::{self, Root};
-use rustc_hash::FxHashMap;
 use serde_json::Value;
 use url::Url;
 
@@ -190,7 +190,7 @@ fn main() -> Result<()> {
     }
 
     let workspace_root = Path::new(str_of(&metadata, "workspace_root")?);
-    let path_packages: FxHashMap<SourceId, Summary> = by_spec
+    let path_packages: HashMap<SourceId, Summary> = by_spec
         .values()
         .filter(|s| s.source_id().is_path())
         .map(|s| (s.source_id(), s.clone()))

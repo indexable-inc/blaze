@@ -7,6 +7,7 @@
 mod helpers;
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use anyhow::Result as CargoResult;
 use blaze_resolve::resolver::{
@@ -122,14 +123,17 @@ impl Ws {
             let features: Vec<_> = features.iter().map(|f| f.as_str()).collect();
             lines.insert(format!("{}{host}", pkg.name()), features.join(" "));
         }
-        Ok(lines.into_iter().map(|(pkg, features)| format!("{pkg}: {features}\n")).collect())
+        Ok(lines.into_iter().fold(String::new(), |mut output, (pkg, features)| {
+            writeln!(output, "{pkg}: {features}").unwrap();
+            output
+        }))
     }
 }
 
 fn features(name: &'static str, features: &[&'static str]) -> Summary {
     let map: Vec<(&'static str, &[&'static str])> =
         features.iter().map(|f| (*f, &[][..])).collect();
-    pkg_dep_with(name, vec![], &map)
+    pkg_dep_with(&name, vec![], &map)
 }
 
 fn with(dep: Dependency, features: &[&'static str]) -> Dependency {
@@ -140,9 +144,9 @@ fn with(dep: Dependency, features: &[&'static str]) -> Dependency {
 fn inactivate_targets() {
     let registry = vec![
         features("common", &["f1"]),
-        pkg_dep("bar", vec![with(dep_platform("common", "cfg(whatever)"), &["f1"])]),
+        pkg_dep(&"bar", vec![with(dep_platform("common", "cfg(whatever)"), &["f1"])]),
     ];
-    let foo = pkg_dep("foo", vec![dep("common"), dep("bar")]);
+    let foo = pkg_dep(&"foo", vec![dep("common"), dep("bar")]);
 
     let ws = Ws::new(vec![foo.clone()], registry.clone(), ResolveBehavior::V1);
     assert_eq!(ws.build("", HasDevUnits::No).unwrap(), "bar: \ncommon: f1\nfoo: \n");
@@ -155,11 +159,11 @@ fn inactivate_targets() {
 fn inactive_target_optional() {
     let registry = vec![
         features("common", &["f1", "f2", "f3", "f4"]),
-        pkg_dep_with("dep1", vec![dep("common").with(&["f1"])], &[("f2", &["common/f2"])]),
-        pkg_dep_with("dep2", vec![dep("common")], &[("f3", &["common/f3"])]),
+        pkg_dep_with(&"dep1", vec![dep("common").with(&["f1"])], &[("f2", &["common/f2"])]),
+        pkg_dep_with(&"dep2", vec![dep("common")], &[("f3", &["common/f3"])]),
     ];
     let foo = pkg_dep_with(
-        "foo",
+        &"foo",
         vec![
             dep("common"),
             dep_platform("dep1", "cfg(whatever)").opt(),
@@ -193,7 +197,7 @@ fn inactive_target_optional() {
 fn decouple_host_deps() {
     let registry = vec![features("common", &["f1"])];
     let foo =
-        pkg_dep("foo", vec![with(dep_kind("common", DepKind::Build), &["f1"]), dep("common")]);
+        pkg_dep(&"foo", vec![with(dep_kind("common", DepKind::Build), &["f1"]), dep("common")]);
 
     let ws = Ws::new(vec![foo.clone()], registry.clone(), ResolveBehavior::V1);
     assert_eq!(ws.build("", HasDevUnits::No).unwrap(), "common: f1\nfoo: \n");
@@ -205,8 +209,8 @@ fn decouple_host_deps() {
 #[test]
 fn decouple_host_deps_nested() {
     let registry =
-        vec![features("common", &["f1"]), pkg_dep("bdep", vec![dep("common").with(&["f1"])])];
-    let foo = pkg_dep("foo", vec![dep_kind("bdep", DepKind::Build), dep("common")]);
+        vec![features("common", &["f1"]), pkg_dep(&"bdep", vec![dep("common").with(&["f1"])])];
+    let foo = pkg_dep(&"foo", vec![dep_kind("bdep", DepKind::Build), dep("common")]);
 
     let ws = Ws::new(vec![foo.clone()], registry.clone(), ResolveBehavior::V1);
     assert_eq!(ws.build("", HasDevUnits::No).unwrap(), "bdep: \ncommon: f1\nfoo: \n");
@@ -222,7 +226,7 @@ fn decouple_host_deps_nested() {
 fn decouple_dev_deps() {
     let registry = vec![features("common", &["f1", "f2"])];
     let foo = pkg_dep(
-        "foo",
+        &"foo",
         vec![dep("common").with(&["f1"]), with(dep_kind("common", DepKind::Development), &["f2"])],
     );
 
@@ -240,9 +244,9 @@ fn decouple_dev_deps() {
 fn decouple_proc_macro() {
     let registry = vec![
         features("common", &["somefeat"]),
-        pkg_dep("pm", vec![dep("common").with(&["somefeat"])]),
+        pkg_dep(&"pm", vec![dep("common").with(&["somefeat"])]),
     ];
-    let foo = pkg_dep("foo", vec![dep("pm"), dep("common")]);
+    let foo = pkg_dep(&"foo", vec![dep("pm"), dep("common")]);
 
     let mut ws = Ws::new(vec![foo.clone()], registry.clone(), ResolveBehavior::V1);
     ws.proc_macros = &["pm"];
@@ -259,7 +263,7 @@ fn decouple_proc_macro() {
 #[test]
 fn weak_simple() {
     let registry = vec![features("bar", &["feat"])];
-    let foo = pkg_dep_with("foo", vec!["bar".opt()], &[("f1", &["bar?/feat"])]);
+    let foo = pkg_dep_with(&"foo", vec!["bar".opt()], &[("f1", &["bar?/feat"])]);
     let ws = Ws::new(vec![foo], registry, ResolveBehavior::V1);
     assert_eq!(ws.build("--features f1", HasDevUnits::No).unwrap(), "foo: f1\n");
     assert_eq!(ws.build("--features f1,bar", HasDevUnits::No).unwrap(), "bar: feat\nfoo: bar f1\n");
@@ -271,10 +275,10 @@ fn weak_deferred() {
     // another dependency getting enabled.
     let registry = vec![
         features("bar", &["feat"]),
-        pkg_dep_with("dep", vec!["bar".opt()], &[("feat", &["bar?/feat"])]),
-        pkg_dep("bar_activator", vec![dep("dep").with(&["bar"])]),
+        pkg_dep_with(&"dep", vec!["bar".opt()], &[("feat", &["bar?/feat"])]),
+        pkg_dep(&"bar_activator", vec![dep("dep").with(&["bar"])]),
     ];
-    let foo = pkg_dep("foo", vec![dep("dep").with(&["feat"]), dep("bar_activator")]);
+    let foo = pkg_dep(&"foo", vec![dep("dep").with(&["feat"]), dep("bar_activator")]);
     let ws = Ws::new(vec![foo], registry, ResolveBehavior::V1);
     assert_eq!(
         ws.build("", HasDevUnits::No).unwrap(),
@@ -285,7 +289,7 @@ fn weak_deferred() {
 #[test]
 fn other_member_from_current() {
     // -p for another member while in the current directory.
-    let foo = pkg_dep_with("foo", vec![dep("bar").with(&["f3"])], &[("f1", &["bar/f4"])]);
+    let foo = pkg_dep_with(&"foo", vec![dep("bar").with(&["f3"])], &[("f1", &["bar/f4"])]);
     let bar = features("bar", &["f1", "f2", "f3", "f4"]);
     let bar_features = |ws: &Ws, args| {
         let out = ws.build(args, HasDevUnits::No)?;
@@ -343,7 +347,7 @@ fn virtual_typo_member_feature() {
 #[test]
 fn non_member() {
     // -p for a non-member
-    let foo = pkg_dep_with("foo", vec![dep("dep")], &[("f1", &[])]);
+    let foo = pkg_dep_with(&"foo", vec![dep("dep")], &[("f1", &[])]);
     let ws = Ws::new(vec![foo], vec![pkg("dep")], ResolveBehavior::V2);
     for args in ["-p dep --features f1", "-p dep --all-features", "-p dep --no-default-features"] {
         assert_eq!(

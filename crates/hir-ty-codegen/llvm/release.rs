@@ -33,7 +33,7 @@ use inkwell::{
 };
 use std::sync::Arc;
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_hash::{HashMap, HashSet};
 use smallvec::SmallVec;
 
 use super::{
@@ -166,11 +166,11 @@ pub(crate) fn prelink(
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
         // alloc: once per module; `Wants` (fragment.rs) lists these, and the lowering looks them up
-        let constants: FxHashMap<u32, &[u8]> = wants.constants().collect();
+        let constants: HashMap<u32, &[u8]> = wants.constants().collect();
         // alloc: once per module, as `constants`
-        let statics: FxHashSet<u32> = wants.statics().collect();
+        let statics: HashSet<u32> = wants.statics().collect();
         // alloc: once per module, as `constants`
-        let readonly: FxHashMap<u32, &crate::ConstBlob> = wants.readonly().collect();
+        let readonly: HashMap<u32, &crate::ConstBlob> = wants.readonly().collect();
         let pointer = machine.get_target_data().get_pointer_byte_size(None) as usize;
         told_constants(context, &module, &readonly, pointer);
         let lines = if debug { Debug::of(&module)? } else { None };
@@ -183,7 +183,7 @@ pub(crate) fn prelink(
             marked: debug,
         };
         let blocks_asm = wants.asm_blocks();
-        let shown = FxHashMap::default();
+        let shown = HashMap::default();
         let function = tally.time(Phase::Lower, || {
             let function = Lowering::add(context, &module, &own)?;
             mark_hint(context, function, hint);
@@ -623,7 +623,7 @@ pub(crate) fn compile(
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
         // alloc: once per module; `Wants` (fragment.rs) lists these, and the lowering looks them up
-        let readonly: FxHashMap<u32, &crate::ConstBlob> = wants.readonly().collect();
+        let readonly: HashMap<u32, &crate::ConstBlob> = wants.readonly().collect();
         let pointer = machine.get_target_data().get_pointer_byte_size(None) as usize;
         told_constants(context, &module, &readonly, pointer);
         tally.time(Phase::Lower, || {

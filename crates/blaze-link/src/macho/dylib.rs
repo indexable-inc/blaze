@@ -339,7 +339,7 @@ fn reference_trie_exports(data: &[u8], base: u64, sections: &[Section]) -> Resul
     };
     // alloc: the reference walk, for tests and the fuzz differential only
     let mut out = Vec::new();
-    let mut visited = rustc_hash::FxHashSet::default();
+    let mut visited = blaze_hash::HashSet::default();
     // alloc: the reference walk, for tests and the fuzz differential only
     let mut stack = vec![(0usize, Vec::new())];
     while let Some((node, prefix)) = stack.pop() {

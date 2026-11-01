@@ -25,6 +25,7 @@ mod valid;
 use std::ops::Range;
 
 use base_db::Db;
+use blaze_hash::HashMap;
 use hir_def::{FunctionId, HasModule};
 use hir_ty::{
     InferBodyId,
@@ -33,13 +34,12 @@ use hir_ty::{
     next_solver::Ty,
 };
 use hir_ty_mir::mir::{
-    self as eval, Access, EvalThread, MResult, Machine, MemKind, Ptr, RetagMode,
-    Site, Stop, TypedCx,
+    self as eval, Access, EvalThread, MResult, Machine, MemKind, Ptr, RetagMode, Site, Stop,
+    TypedCx,
 };
-use rustc_hash::FxHashMap;
 
-pub use self::{offset::OffsetFromError, valid::ValueError};
 use self::valid::{Fail, Plans};
+pub use self::{offset::OffsetFromError, valid::ValueError};
 use crate::{
     borrows::{self, Borrows, NewPermission, PtrKind},
     ids::{AccessKind, AllocId, AtomicOrd, Prov, SiteId, Span, ThreadId},
@@ -81,7 +81,7 @@ impl eval::Shadow<Prov> for Shadow {
 #[derive(Debug, Default)]
 pub struct Sites<'db> {
     sites: Vec<Site<'db>>,
-    bodies: FxHashMap<InferBodyId<'db>, u32>,
+    bodies: HashMap<InferBodyId<'db>, u32>,
     /// By the index in `bodies`: per span kind, the `SiteId` of each arena index
     /// (`SiteId::START` where not yet interned).
     spans: Vec<[Vec<SiteId>; 7]>,

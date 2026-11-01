@@ -1,15 +1,11 @@
 #![forbid(unsafe_code)]
 
-use std::{
-    collections::VecDeque,
-    io::Write,
-    path::Path,
-    sync::{Arc, Mutex},
-};
+use std::{collections::VecDeque, io::Write, path::Path, sync::Arc};
 
 use blaze_registry::http::{Http, Response, Retry, Transport};
 use blaze_units::query::{Fetch, FetchKind};
 use blaze_vfs::Mode;
+use parking_lot::Mutex;
 
 use super::{Fetcher, redact};
 use crate::serve::work::{Source, SourceFile};
@@ -33,15 +29,15 @@ impl Fake {
     }
 
     fn asked(&self) -> Vec<(String, Vec<(String, String)>)> {
-        self.asked.lock().unwrap().clone()
+        self.asked.lock().clone()
     }
 }
 
 impl Http for Fake {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<Response> {
         let headers = headers.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
-        self.asked.lock().unwrap().push((url.to_owned(), headers));
-        match self.answers.lock().unwrap().pop_front().expect("asked more than the test answers") {
+        self.asked.lock().push((url.to_owned(), headers));
+        match self.answers.lock().pop_front().expect("asked more than the test answers") {
             Answer::Status(status, body) => Ok(Response { status, headers: Vec::new(), body }),
             Answer::Reset => Err(Transport(format!("asking {url}: connection reset")).into()),
         }

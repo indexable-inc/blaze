@@ -20,7 +20,7 @@ use std::ops::Range;
 
 use blaze_codegen::Arch;
 use blaze_graph::par;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use blaze_hash::{FixedState, HashMap, HashSet};
 
 use crate::model::{Names, Shared, SharedSymbol, SymbolKind};
 
@@ -61,13 +61,13 @@ fn read_documents(text: &str, arch: Arch, platform: u32) -> Result<Shared, Strin
     let (tape, docs, targets) = parse_all(text, &raw, raw.len() > 1 && text.len() >= PARALLEL)?;
 
     let view = tape.view(text);
-    let mut by_name = FxHashMap::default();
+    let mut by_name = HashMap::default();
     for (at, doc) in docs.iter().enumerate() {
         by_name.entry(view.str(doc.install_name)).or_insert(at);
     }
     let stream = Stream { view, docs: &docs, targets: &targets, by_name };
     let mut plan = Plan::default();
-    let mut seen = FxHashSet::default();
+    let mut seen = HashSet::default();
     seen.insert(view.str(docs[0].install_name));
     stream.fold(0, arch, platform, &mut seen, &mut plan)?;
     let Exports { symbols, names, .. } = decode(view, &plan)?;
@@ -187,7 +187,7 @@ struct Stream<'s, 'd> {
     docs: &'d [Doc],
     targets: &'d [Target],
     /// The first document of each install name.
-    by_name: FxHashMap<&'s str, usize>,
+    by_name: HashMap<&'s str, usize>,
 }
 
 /// The lists to decode, in the order their names are added, how many names they give at
@@ -227,7 +227,7 @@ impl<'s> Stream<'s, '_> {
         at: usize,
         arch: Arch,
         platform: u32,
-        seen: &mut FxHashSet<&'s str>,
+        seen: &mut HashSet<&'s str>,
         plan: &mut Plan<'s>,
     ) -> Result<(), String> {
         let doc = &self.docs[at];
@@ -516,7 +516,7 @@ impl Seen {
         if symbols.len() * 2 >= self.slots.len() {
             self.grow(symbols, names);
         }
-        let mut at = FxBuildHasher.hash_one(name) as usize & self.mask;
+        let mut at = FixedState.hash_one(name) as usize & self.mask;
         loop {
             match self.slots[at] {
                 EMPTY => {
@@ -535,7 +535,7 @@ impl Seen {
         self.slots.resize(len, EMPTY);
         self.mask = len - 1;
         for (index, symbol) in symbols.iter().enumerate() {
-            let mut at = FxBuildHasher.hash_one(names.at(symbol.name)) as usize & self.mask;
+            let mut at = FixedState.hash_one(names.at(symbol.name)) as usize & self.mask;
             while self.slots[at] != EMPTY {
                 at = (at + 1) & self.mask;
             }
@@ -2589,13 +2589,13 @@ e:
                 continue;
             }
             let view = tape.view(&text);
-            let mut by_name = FxHashMap::default();
+            let mut by_name = HashMap::default();
             for (at, doc) in docs.iter().enumerate() {
                 by_name.entry(view.str(doc.install_name)).or_insert(at);
             }
             let stream = Stream { view, docs: &docs, targets: &targets, by_name };
             let mut plan = Plan::default();
-            let mut seen = FxHashSet::default();
+            let mut seen = HashSet::default();
             seen.insert(view.str(docs[0].install_name));
             if stream.fold(0, Arch::Aarch64, 1, &mut seen, &mut plan).is_err() {
                 continue;
@@ -2662,7 +2662,7 @@ e:
         for arch in [Arch::Aarch64, Arch::X86_64] {
             let shared = read(&path, &text, arch, 1).unwrap();
             assert_eq!(shared.name, "/usr/lib/libSystem.B.dylib");
-            let names: FxHashSet<&str> = names(&shared).into_iter().collect();
+            let names: HashSet<&str> = names(&shared).into_iter().collect();
             for name in ["malloc", "printf", "pthread_create", "_tlv_bootstrap", binder.as_str()] {
                 assert!(names.contains(name), "{arch:?}: no `{name:?}` in {path}");
             }

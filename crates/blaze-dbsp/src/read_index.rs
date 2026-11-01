@@ -1,6 +1,6 @@
 use std::hash::Hash;
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use smallvec::SmallVec;
 
 /// Readers of keys, both ways: what woke whom. K: the key read ((module, name), negative reads
@@ -15,12 +15,12 @@ pub struct ReadIndex<K, R> {
     by_key: Side<K, R>,
     by_reader: Side<R, K>,
     /// (key row, reader row) -> (place in the key's list, place in the reader's list).
-    pairs: FxHashMap<(u32, u32), (u32, u32)>,
+    pairs: HashMap<(u32, u32), (u32, u32)>,
 }
 
 #[derive(Debug)]
 struct Side<A, B> {
-    slot: FxHashMap<A, u32>,
+    slot: HashMap<A, u32>,
     rows: Vec<Row<A, B>>,
     free: Vec<u32>,
 }
@@ -34,7 +34,7 @@ struct Row<A, B> {
 
 impl<A: Copy + Eq + Hash, B: Copy> Side<A, B> {
     fn new() -> Self {
-        Side { slot: FxHashMap::default(), rows: Vec::new(), free: Vec::new() } // alloc: setup: empty buffers, grown once and kept
+        Side { slot: HashMap::default(), rows: Vec::new(), free: Vec::new() } // alloc: setup: empty buffers, grown once and kept
     }
 
     fn intern(&mut self, a: A) -> u32 {
@@ -86,7 +86,7 @@ impl<K: Copy + Eq + Hash, R: Copy + Eq + Hash> Default for ReadIndex<K, R> {
 
 impl<K: Copy + Eq + Hash, R: Copy + Eq + Hash> ReadIndex<K, R> {
     pub fn new() -> Self {
-        ReadIndex { by_key: Side::new(), by_reader: Side::new(), pairs: FxHashMap::default() }
+        ReadIndex { by_key: Side::new(), by_reader: Side::new(), pairs: HashMap::default() }
     }
 
     pub fn add(&mut self, key: K, reader: R) {

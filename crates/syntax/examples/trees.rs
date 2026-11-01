@@ -121,7 +121,7 @@ fn measure(texts: &[Arc<str>], outline: bool) -> Measured {
     drop(parses);
     let mut last = HELD.load(Ordering::Relaxed);
     loop {
-        std::thread::sleep(Duration::from_millis(300));
+        blaze_graph::spin::busy(Duration::from_millis(300));
         let now = HELD.load(Ordering::Relaxed);
         if now == last {
             break;

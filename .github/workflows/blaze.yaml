@@ -14,17 +14,17 @@
 #       newer one replaces it, so each run ends and writes the caches as of its commit.
 #
 # A change runs the build and the unit tests only when it touches a file they read: the crates,
-# the vendored crates, the workspace's manifest, lock file, cargo config, .rustfmt.toml and
-# .clippy.toml, the pinned nightly (harness/toolchain), harness/unittests.py, the flake, the
-# release of blaze that builds blaze (.github/blaze-version, install.sh), and these workflows
-# and the actions they use; on a push to main, also the smoke corpus (harness/smoke.py,
-# harness/smoke/). .github/scripts/gate_changes.py has the list and why each path is on it. It
-# names what is code, so a new directory is not: any other change (documentation, the site,
-# benches, the other harnesses and workflows) runs the script checks alone, and a list of files
-# that cannot be had counts as code. `ci` is the one check that says whether everything that
-# ran passed: it is the check branch rules and the merge queue require. The queue tests each
-# pull request merged onto main and whatever is ahead of it, and main moves only to what it
-# tested.
+# the vendored crates, astlog (tools/astlog), the workspace's manifest, lock file, cargo
+# config, .rustfmt.toml and .clippy.toml, the pinned nightly (harness/toolchain),
+# harness/unittests.py, the flake, the release of blaze that builds blaze
+# (.github/blaze-version, install.sh), and these workflows and the actions they use; on a push
+# to main, also the smoke corpus (harness/smoke.py, harness/smoke/).
+# .github/scripts/gate_changes.py has the list and why each path is on it. It names what is
+# code, so a new directory is not: any other change (documentation, the site, benches, the
+# other harnesses and workflows) runs the script checks alone, and a list of files that cannot
+# be had counts as code. `ci` is the one check that says whether everything that ran passed: it
+# is the check branch rules and the merge queue require. The queue tests each pull request
+# merged onto main and whatever is ahead of it, and main moves only to what it tested.
 name: blaze
 on:
   push:
@@ -164,6 +164,12 @@ jobs:
           job: check
           llvm: true
       - run: blaze check --workspace --message-format short
+      # astlog's rules (tools/astlog/rules) over the crates and tools, each file on its own: a
+      # finding of an error rule fails the job (tools/astlog/README.md#rules-in-blaze).
+      - run: blaze build -p astlog
+      - run: >-
+          PYTHONPATH=python/typed-input/src python3 tools/astlog/scan.py
+          '{"astlog": "target/debug/astlog", "rules": "tools/astlog/rules", "paths": ["crates", "tools"]}'
 
   ci:
     name: ci

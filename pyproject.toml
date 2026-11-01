@@ -39,6 +39,7 @@ include = [
   "harness/toolchain_bump.py",
   "harness/v2",
   "python/**/*.py",
+  "tools/astlog/scan.py",
   "tools/similar",
   "tools/v2",
 ]
@@ -65,6 +66,7 @@ include = [
   "harness/toolchain_bump.py",
   "harness/v2",
   "python",
+  "tools/astlog/scan.py",
   "tools/v2",
 ]
 pythonVersion = "3.13"

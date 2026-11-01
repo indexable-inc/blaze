@@ -24,10 +24,12 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Write as _},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
+    sync::Arc,
     thread::JoinHandle,
     time::{Duration, Instant},
 };
+
+use parking_lot::{Condvar, Mutex, MutexGuard};
 
 #[cfg(unix)]
 use blaze_mem::{Slab, Tag as MemTag};
@@ -57,8 +59,8 @@ const UNIX_ONLY: &str =
 /// driver keeps of the spawns, watches and listens in flight. A handle of one removed, or
 /// replaced by another of its tag, names nothing.
 pub(crate) mod tagged {
+    use blaze_hash::HashMap;
     use blaze_mem::{Slab, Tag as MemTag};
-    use rustc_hash::FxHashMap;
 
     use crate::Tag;
 
@@ -74,7 +76,7 @@ pub(crate) mod tagged {
 
     pub(crate) struct Tagged<T> {
         slab: Slab<Entry<T>>,
-        by_tag: FxHashMap<Tag, Id<T>>,
+        by_tag: HashMap<Tag, Id<T>>,
     }
 
     impl<T> Tagged<T> {
@@ -87,7 +89,7 @@ pub(crate) mod tagged {
                 Err(error) => panic!("{error}"),
             };
             // alloc: once per driver, the room of the tags in flight at once.
-            let by_tag = FxHashMap::with_capacity_and_hasher(reserve, Default::default());
+            let by_tag = HashMap::with_capacity_and_hasher(reserve, Default::default());
             Tagged { slab, by_tag }
         }
 
@@ -161,7 +163,7 @@ pub(crate) mod tagged {
 
     #[cfg(test)]
     mod tests {
-        use rustc_hash::FxHashMap;
+        use blaze_hash::HashMap;
 
         use super::Tagged;
         use crate::{Tag, sim::Rng};
@@ -171,7 +173,7 @@ pub(crate) mod tagged {
             for seed in 0..50 {
                 let mut rng = Rng::new(seed);
                 let mut tagged = Tagged::new(4);
-                let mut model: FxHashMap<Tag, u64> = FxHashMap::default();
+                let mut model: HashMap<Tag, u64> = HashMap::default();
                 let mut ids = Vec::new();
                 for step in 0..2000u64 {
                     let tag = Tag(rng.below(16));
@@ -226,7 +228,7 @@ pub(crate) mod tagged {
 use tagged::{Id, Tagged};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    mutex.lock()
 }
 
 /// A queue many threads put into and one or a few take from, under a lock. A put never
@@ -273,7 +275,7 @@ impl<T> Mailbox<T> {
                 return None;
             }
             state.waiting += 1;
-            state = self.ready.wait(state).unwrap_or_else(PoisonError::into_inner);
+            self.ready.wait(&mut state);
             state.waiting -= 1;
         }
     }
@@ -284,16 +286,12 @@ impl<T> Mailbox<T> {
         let mut state = lock(&self.state);
         if state.items.is_empty() && !state.closed && !wait.is_zero() {
             state.waiting += 1;
-            state = self
-                .ready
-                .wait_timeout_while(state, wait, |it| it.items.is_empty() && !it.closed)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+            self.ready.wait_while_for(&mut state, |it| it.items.is_empty() && !it.closed, wait);
             state.waiting -= 1;
         }
         match into.is_empty() {
             true => std::mem::swap(&mut state.items, into),
-            false => into.extend(state.items.drain(..)),
+            false => into.append(&mut state.items),
         }
     }
 
@@ -429,7 +427,7 @@ impl Threads {
         });
         let workers = (0..threads.max(1))
             .map(|n| {
-                let shared = shared.clone(); // clone: once per worker, the state it shares.
+                let shared = Arc::clone(&shared); // clone: once per worker, the state it shares.
                 std::thread::Builder::new()
                     // alloc: once per worker, its name.
                     .name(format!("blaze-io-{n}"))
@@ -582,7 +580,7 @@ impl Threads {
     #[cfg(unix)]
     fn socket(&self, conn: crate::Conn) -> Option<Arc<crate::net::Socket>> {
         // clone: the connection's socket, for the errand that reads or writes it.
-        self.conns.get(blaze_mem::Handle::from_bits(conn.0)).map(|it| it.socket.clone())
+        self.conns.get(blaze_mem::Handle::from_bits(conn.0)).map(|it| Arc::clone(&it.socket))
     }
 
     #[cfg(unix)]
@@ -647,7 +645,7 @@ impl Threads {
         let watch = match self.spare.pop() {
             Some(watch) => watch,
             // clone: once per watch made, the state its sink tells into.
-            None => crate::fsevents::Watch::new(Sink(self.shared.clone()))?,
+            None => crate::fsevents::Watch::new(Sink(Arc::clone(&self.shared)))?,
         };
         let (id, _) = self.watches.insert(tag, Watching(watch));
         let (_, Watching(watch)) = self.watches.by_id_mut(id).expect("inserted above");
@@ -1145,7 +1143,7 @@ fn dispatch(shared: &Arc<Shared>, errand: Errand) {
         return;
     }
     drop(errands);
-    let pool = shared.clone(); // clone: the state a thread more shares.
+    let pool = Arc::clone(shared); // clone: the state a thread more shares.
     // alloc: a thread more, for the most errands at once; kept for the next.
     let started = std::thread::Builder::new().name("blaze-errand".into()).spawn(move || errand_thread(&pool));
     if let Err(error) = started {
@@ -1185,7 +1183,7 @@ impl Shared {
                 }
                 return None;
             }
-            errands = self.errand.wait(errands).unwrap_or_else(PoisonError::into_inner);
+            self.errand.wait(&mut errands);
         }
     }
 
@@ -1379,8 +1377,10 @@ mod linux {
     use std::{
         io,
         os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd},
-        sync::{Arc, Condvar, Mutex},
+        sync::Arc,
     };
+
+    use parking_lot::{Condvar, Mutex};
 
     use super::{Id, Room, Shared, Told, Watching, lock};
     use crate::{Completion, Done, FileName, IoError, Tag};
@@ -1471,7 +1471,7 @@ mod linux {
                 if let Some(started) = state.started.take() {
                     return started;
                 }
-                state = self.started.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.started.wait(&mut state);
             }
         }
     }
@@ -1657,7 +1657,7 @@ impl Driver for Threads {
                     // alloc: once per spawn, where it is, shared with its errand.
                     let life = Arc::new(Life::default());
                     // clone: as above.
-                    let (spawn, _) = self.spawns.insert(tag, life.clone());
+                    let (spawn, _) = self.spawns.insert(tag, Arc::clone(&life));
                     // clone: the driver's sandbox maker, for the spawn.
                     let confine = self.confine.clone();
                     self.dispatch(Errand::Spawn { command, confine, life, spawn, tag });

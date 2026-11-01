@@ -13,7 +13,20 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         Lint::HotClone => Some("clone"),
         Lint::HotAlloc | Lint::HotAllocCall | Lint::StdHashmap => Some("alloc"),
         Lint::HotDyn => Some("dyn"),
-        Lint::Parallelizable | Lint::SerialDependence | Lint::FiberBoundary => None,
+        Lint::Parallelizable
+        | Lint::SerialDependence
+        | Lint::FiberBoundary
+        | Lint::ErrorDebug
+        | Lint::WallClock
+        | Lint::UntypedError
+        | Lint::DroppedError
+        | Lint::HashOrderOutput
+        | Lint::HeldAcrossWait
+        | Lint::LockAcrossQuery
+        | Lint::BlockingOnPool
+        | Lint::UnnamedWait
+        | Lint::SharedCollectionLock
+        | Lint::OpenWaitLoop => None,
     }
 }
 

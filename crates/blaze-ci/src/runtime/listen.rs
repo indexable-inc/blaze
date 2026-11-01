@@ -13,17 +13,17 @@ use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc,
         atomic::{AtomicUsize, Ordering},
-        mpsc,
     },
     thread,
     time::Duration,
 };
 
 use blaze_api::http::{self, RequestParser};
+use blaze_hash::FixedState;
 use hashbrown::HashTable;
-use rustc_hash::FxBuildHasher;
+use parking_lot::Mutex;
 
 use super::log;
 use crate::{
@@ -49,7 +49,7 @@ const HEADERS: [(&str, &str); 2] = [("Content-Type", "text/plain; charset=utf-8"
 
 /// The last `most` delivery ids, in a ring of strings reused in place: once every slot has held
 /// an id, remembering another moves no memory unless it is longer than the slot's room. Each
-/// lookup is one FxHash of the id (ids come only from deliveries whose signature checked) and
+/// lookup is one hash of the id (ids come only from deliveries whose signature checked) and
 /// one compare per matching hash. About 100 bytes an id: its slot's 64 and the table's share.
 pub(crate) struct Seen {
     ids: Vec<String>,
@@ -70,7 +70,7 @@ impl Seen {
 
     /// Whether `id` is new; it is remembered either way.
     pub(crate) fn first(&mut self, id: &str) -> bool {
-        let hash = FxBuildHasher.hash_one(id);
+        let hash = FixedState.hash_one(id);
         let ids = &self.ids;
         if self.slots.find(hash, |&slot| ids[slot as usize] == id).is_some() {
             return false;
@@ -85,7 +85,7 @@ impl Seen {
             let slot = self.next;
             self.next = (slot + 1) % self.most;
             let oldest = &mut self.ids[slot];
-            let old = FxBuildHasher.hash_one(oldest.as_str());
+            let old = FixedState.hash_one(oldest.as_str());
             if let Ok(entry) = self.slots.find_entry(old, |&it| it as usize == slot) {
                 entry.remove();
             }
@@ -94,7 +94,7 @@ impl Seen {
             slot
         };
         let ids = &self.ids;
-        self.slots.insert_unique(hash, slot as u32, |&it| FxBuildHasher.hash_one(ids[it as usize].as_str()));
+        self.slots.insert_unique(hash, slot as u32, |&it| FixedState.hash_one(ids[it as usize].as_str()));
         true
     }
 }
@@ -102,13 +102,17 @@ impl Seen {
 pub(crate) struct Listener {
     pub(crate) verifier: Verifier,
     pub(crate) repo: String,
-    pub(crate) service: mpsc::Sender<Input>,
+    pub(crate) service: crossbeam_channel::Sender<Input>,
     pub(crate) seen: Mutex<Seen>,
     open: AtomicUsize,
 }
 
 impl Listener {
-    pub(crate) fn new(secret: Arc<Secret>, repo: String, service: mpsc::Sender<Input>) -> Listener {
+    pub(crate) fn new(
+        secret: Arc<Secret>,
+        repo: String,
+        service: crossbeam_channel::Sender<Input>,
+    ) -> Listener {
         Listener::remembering(secret, repo, service, REMEMBERED)
     }
 
@@ -116,7 +120,7 @@ impl Listener {
     pub(crate) fn remembering(
         secret: Arc<Secret>,
         repo: String,
-        service: mpsc::Sender<Input>,
+        service: crossbeam_channel::Sender<Input>,
         most: usize,
     ) -> Listener {
         let verifier = Verifier::new(secret.expose());
@@ -124,7 +128,15 @@ impl Listener {
     }
 }
 
-pub(crate) fn run(listener: TcpListener, secret: Arc<Secret>, repo: String, service: mpsc::Sender<Input>) {
+impl Listener {
+    /// Connections taken and not yet answered.
+    #[cfg(test)]
+    pub(crate) fn open(&self) -> usize {
+        self.open.load(Ordering::Acquire)
+    }
+}
+
+pub(crate) fn run(listener: TcpListener, secret: Arc<Secret>, repo: String, service: crossbeam_channel::Sender<Input>) {
     // alloc: once, at start
     serve(listener, Arc::new(Listener::new(secret, repo, service)));
 }
@@ -142,7 +154,8 @@ pub(crate) fn serve(listener: TcpListener, shared: Arc<Listener>) {
             Ok(stream) => stream,
             Err(error) => {
                 log(&format!("the webhook's accept failed: {error}")); // alloc: error path
-                thread::sleep(Duration::from_millis(100));
+                // Nothing says when a failed accept (out of descriptors, say) would pass.
+                crate::hold(Duration::from_millis(100));
                 continue;
             }
         };
@@ -265,7 +278,7 @@ pub(crate) fn accept(shared: &Listener, delivery: DeliveryRef<'_>, said: &mut St
         let _ = write!(said, "a delivery for {}, and this service is for {}", delivery.repo, shared.repo);
         return 403;
     }
-    if !shared.seen.lock().unwrap_or_else(PoisonError::into_inner).first(delivery.id) {
+    if !shared.seen.lock().first(delivery.id) {
         let _ = write!(said, "delivery {} was already received", delivery.id);
         return 202;
     }

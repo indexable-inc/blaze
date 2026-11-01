@@ -18,11 +18,11 @@ use std::collections::hash_map::Entry;
 use std::fmt;
 
 use blaze_codegen::Arch;
+use blaze_hash::HashMap;
 use object::Endianness;
 use object::SectionIndex;
 use object::elf;
 use object::read::elf::{FileHeader as _, Rela as _, SectionHeader as _, SectionTable, Sym as _};
-use rustc_hash::FxHashMap;
 
 use self::strings::Table;
 use crate::NativeKind;
@@ -756,12 +756,12 @@ struct Added {
     module: Option<u32>,
     got: Option<u32>,
     /// By the ELF symbol whose size each holds.
-    sizes: FxHashMap<u32, u32>,
+    sizes: HashMap<u32, u32>,
 }
 
 impl Added {
     fn new(empty: Name) -> Added {
-        Added { empty, module: None, got: None, sizes: FxHashMap::default() }
+        Added { empty, module: None, got: None, sizes: HashMap::default() }
     }
 
     fn push(symbols: &mut Vec<Symbol>, symbol: Symbol) -> u32 {

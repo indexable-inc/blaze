@@ -300,6 +300,8 @@ pub enum Asked {
     Debug(Vec<OsString>),
     /// `blaze explain VIEW ...`, with the words after it ([`super::observe::explain`]).
     Explain(Vec<OsString>),
+    /// `blaze fix --replace FROM=TO ...`, with the words after it ([`super::fix::main`]).
+    Fix(Vec<OsString>),
     Help(Option<Command>),
     Version,
     /// A command that is none of blaze's.
@@ -545,6 +547,7 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
             Some("explore") => return Ok(Asked::Explore(words.collect())),
             Some("debug") => return Ok(Asked::Debug(words.collect())),
             Some("explain") => return Ok(Asked::Explain(words.collect())),
+            Some("fix") => return Ok(Asked::Fix(words.collect())),
             Some("daemon") => {
                 return Ok(match words.next().as_deref().and_then(std::ffi::OsStr::to_str) {
                     Some("install") => Asked::Daemon(DaemonVerb::Install),

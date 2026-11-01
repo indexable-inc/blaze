@@ -2,8 +2,8 @@
 //! `Configuration` never shadows the user's own.
 
 // alloc: expansion time, once per annotated item; no query runs this
-use std::collections::HashSet;
 
+use blaze_hash::HashSet;
 use proc_macro2::{Span, TokenStream, TokenTree};
 use quote::ToTokens;
 
@@ -13,7 +13,7 @@ pub(crate) struct Hygiene {
 
 impl Hygiene {
     pub(crate) fn of(item: &impl ToTokens) -> Hygiene {
-        let mut used = HashSet::new();
+        let mut used = HashSet::default();
         collect(item.to_token_stream(), &mut used);
         Hygiene { used }
     }

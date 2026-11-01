@@ -20,9 +20,9 @@ use std::sync::Arc;
 
 use base_db::{Crate, Db};
 use blaze_format::cursor::{Put, Reader};
+use blaze_hash::HashSet;
 use blaze_ids::{ContentId, Hasher};
 use hir_expand::{HirFileId, MacroCallId, MacroDefKind, proc_macro::ExpansionReads};
-use rustc_hash::FxHashSet;
 
 use crate::{
     Lookup,
@@ -84,7 +84,7 @@ impl Reads {
         mut todo: Vec<MacroCallId>,
     ) -> Result<Reads, Refused> {
         let own = krate.env(db);
-        let mut seen = FxHashSet::default();
+        let mut seen = HashSet::default();
         let mut reads = Reads::default();
         while let Some(call) = todo.pop() {
             if !seen.insert(call) {

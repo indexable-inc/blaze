@@ -17,12 +17,11 @@
 //! - A reader proves it is in a task with a [`Guard`] borrowed for as long as it holds what it
 //!   read.
 
-use std::{collections::VecDeque, hash::BuildHasherDefault, marker::PhantomData, ptr, sync::PoisonError};
+use std::{collections::VecDeque, marker::PhantomData, ptr};
 
 use blaze_ids::{ContentId, Fingerprint};
 use blaze_mem::{Region, Tag};
 use blaze_reclaim::{Grace, Guard};
-use rustc_hash::FxHasher;
 
 #[allow(clippy::disallowed_types)]
 use crate::sync::{Mutex, MutexGuard};
@@ -41,8 +40,8 @@ use crate::{
 type PlainFlag = std::sync::atomic::AtomicBool;
 type PlainWord = std::sync::atomic::AtomicU32;
 
-pub(crate) type FxMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>; // alloc: FxHash, not SipHash
-pub(crate) type FxSet<K> = std::collections::HashSet<K, BuildHasherDefault<FxHasher>>; // alloc: FxHash, not SipHash
+pub(crate) type FxMap<K, V> = std::collections::HashMap<K, V, blaze_hash::FixedState>; // alloc: blaze_hash's hasher, not SipHash
+pub(crate) type FxSet<K> = std::collections::HashSet<K, blaze_hash::FixedState>; // alloc: blaze_hash's hasher, not SipHash
 
 /// A lock held for a few loads and stores: claiming or swapping a slot, copying a table to
 /// grow it, claiming rows, holding what was unlinked. Nothing that holds it calls a query,
@@ -59,11 +58,11 @@ impl<T> ShortLock<T> {
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, T> {
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+        self.inner.lock()
     }
 
     pub(crate) fn get_mut(&mut self) -> &mut T {
-        self.inner.get_mut().unwrap_or_else(PoisonError::into_inner)
+        self.inner.get_mut()
     }
 }
 

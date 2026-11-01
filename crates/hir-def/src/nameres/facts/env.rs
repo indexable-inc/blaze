@@ -9,7 +9,8 @@
 
 use std::alloc::{Allocator, Global};
 
-use base_db::{Db, BuiltDependency};
+use base_db::{BuiltDependency, Db};
+use blaze_hash::FixedState;
 use blaze_mem::Frame;
 use cfg::CfgOptions;
 use hashbrown::HashMap;
@@ -17,7 +18,6 @@ use hir_expand::{
     EditionedFileId, InFile, MacroCallId, attrs::AttrId, mod_path::ModPath, name::Name,
     proc_macro::CustomProcMacroExpander,
 };
-use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
 use syntax::ast;
 use triomphe::Arc;
@@ -164,17 +164,15 @@ impl<'db> CollectCx<'db, '_> {
 #[derive(Clone, Debug)]
 pub(crate) struct SideTables<A: Allocator + Clone = Global> {
     /// The directory `mod` declarations of each module resolve in (`mod_dirs`).
-    pub(crate) mod_dirs: HashMap<ModuleId, ModDir, FxBuildHasher, A>,
+    pub(crate) mod_dirs: HashMap<ModuleId, ModDir, FixedState, A>,
     /// `skip_attrs`.
-    pub(crate) skip_attrs: HashMap<InFile<ModItemId>, AttrId, FxBuildHasher, A>,
+    pub(crate) skip_attrs: HashMap<InFile<ModItemId>, AttrId, FixedState, A>,
     /// `prev_active_attrs`.
-    pub(crate) prev_active_attrs:
-        HashMap<AstId<ast::Item>, SmallVec<[AttrId; 1]>, FxBuildHasher, A>,
+    pub(crate) prev_active_attrs: HashMap<AstId<ast::Item>, SmallVec<[AttrId; 1]>, FixedState, A>,
     /// The module's part of `DefMap::derive_helpers_in_scope`.
-    pub(crate) derive_helpers: HashMap<AstId<ast::Item>, Vec<DeriveHelper, A>, FxBuildHasher, A>,
+    pub(crate) derive_helpers: HashMap<AstId<ast::Item>, Vec<DeriveHelper, A>, FixedState, A>,
     /// `deferred_builtin_derives`.
-    pub(crate) deferred_derives:
-        HashMap<AstId<ast::Item>, Vec<DeferredDerive, A>, FxBuildHasher, A>,
+    pub(crate) deferred_derives: HashMap<AstId<ast::Item>, Vec<DeferredDerive, A>, FixedState, A>,
 }
 
 /// A block's side tables, in the frame of its `block_def_map` query.
@@ -185,11 +183,11 @@ impl<A: Allocator + Clone> SideTables<A> {
         // clone: the allocator, a `&Frame` or `Global`: no allocation.
         let a = || alloc.clone();
         SideTables {
-            mod_dirs: HashMap::with_hasher_in(FxBuildHasher, a()),
-            skip_attrs: HashMap::with_hasher_in(FxBuildHasher, a()),
-            prev_active_attrs: HashMap::with_hasher_in(FxBuildHasher, a()),
-            derive_helpers: HashMap::with_hasher_in(FxBuildHasher, a()),
-            deferred_derives: HashMap::with_hasher_in(FxBuildHasher, a()),
+            mod_dirs: HashMap::with_hasher_in(FixedState, a()),
+            skip_attrs: HashMap::with_hasher_in(FixedState, a()),
+            prev_active_attrs: HashMap::with_hasher_in(FixedState, a()),
+            derive_helpers: HashMap::with_hasher_in(FixedState, a()),
+            deferred_derives: HashMap::with_hasher_in(FixedState, a()),
         }
     }
 

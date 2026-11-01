@@ -77,7 +77,7 @@ a build first needs it.
     blaze test  [cargo's flags] [TESTNAME] [-- test arguments]        (t)
     blaze bench [cargo's flags] [BENCHNAME] [-- bench arguments]
     blaze doc   [cargo's flags]                                       (d)
-    blaze serve [--socket PATH] [--http ADDR] [--activated]
+    blaze serve [--socket PATH] [--http ADDR] [--activated] [--ready-fd N]
     blaze stop
     blaze status
     blaze daemon install | uninstall
@@ -85,6 +85,7 @@ a build first needs it.
     blaze trace --out PATH
     blaze tables --format=json
     blaze pack -p PACKAGE --out PATH [cargo's flags]
+    blaze fix --replace FROM=TO [--replace FROM=TO ...]
     blaze pin
     blaze --version
 
@@ -102,7 +103,16 @@ the package for `wasm32-unknown-unknown` with debug assertions off (as `--releas
 scripts run and proc macros loaded in the sandbox as any check's, and writes the program's crate
 and every crate it is made of, with each macro expansion its names and bodies needed, to `PATH`
 as one JSON file for the in-browser compiler (`crates/blaze-wasm-pack`, the agent API's
-`Request::Pack`); `pin` is [below](#pinning-a-release-of-blaze). Any other command (v1's `fmt`, `clippy`, `tree`,
+`Request::Pack`); `fix --replace std::sync::Mutex=parking_lot::Mutex` retargets every
+reference that resolves to the item `FROM` names to the item `TO` names, each a def path from a
+crate's name: the daemon's front end finds them by name resolution (imports, renames, globs,
+re-exports, the prelude, a macro's input), never by text, rewrites a `use` of it or a path that
+qualifies it, leaves a path through the checkout's own import of it (which moves instead),
+and commits the edits to the checkout's head, and the client writes them to its files
+(`crates/blaze-intent/src/replace.rs`, the agent API's `Edit::Replace`). A crate that would have
+to name `TO` without depending on its crate, or a name the front end can't place (a
+`macro_rules!` body, cfg'd out code), stops it with an error naming the file and line, before
+anything is written; `pin` is [below](#pinning-a-release-of-blaze). Any other command (v1's `fmt`, `clippy`, `tree`,
 `metadata`, `toolchain`, ...) fails with `error: no such command` and status 101; none is
 passed to cargo, and no cargo plugin is run ([Every subcommand](#every-subcommand)).
 
@@ -586,9 +596,21 @@ library's unit and integration tests and none of its examples.
 
 There is one daemon per user, `blaze serve` (`crates/blaze-cargo/src/serve.rs`). The first
 `blaze` that finds nothing listening starts it in a process group of its own, so it outlives
-the command, or systemd or launchd start it on the first connection after `blaze daemon
-install` (socket activation; `blaze daemon uninstall` removes the units). It does not exit
-when idle: it stops on `blaze stop` or SIGTERM, writing its state first.
+the command, and waits on a pipe (`--ready-fd`) the daemon writes a byte to as it enters each
+phase of its start (reading its state, setting up its store), then a newline once its socket is
+bound; the command connects only after that newline, and gives each phase 60 s. A start that
+stops short is an error naming the phase it reached and, when the daemon ended, its exit code
+or signal; or systemd or launchd start it on the first connection
+after `blaze daemon install` (socket activation; `blaze daemon uninstall` removes the units). It does not exit
+when idle: it stops on `blaze stop` or SIGTERM, letting go of its socket first and then writing its state.
+
+A daemon holds `serve.lock` in its state directory, which names its pid, for as long as it runs.
+One started while the one before it still ends (writing its image) says so on the pipe and
+waits at most 300 s for that lock, then stops with an error naming the other's pid; it never
+starts over a live daemon. A listener removes its socket's file only while that file is still
+the socket it bound, so an ending daemon never removes the next one's. A command that finds a
+daemon of another build tells it to stop and waits for its process to end before starting
+its own.
 
 It is one process, with no workers: one loop holds the API server, the watched files, the
 database, the store and the scheduler, for every workspace and checkout it is asked about.
@@ -807,7 +829,7 @@ any other fails with status 101 and does nothing:
 
     error: no such command: `fmt`
 
-    help: blaze's commands are build, check, run, test, bench, doc, serve, stop, status, daemon, codegen-inputs, trace, tables and pack
+    help: blaze's commands are build, check, run, test, bench, doc, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, pack, explore, debug, explain and fix
 
 The table below is a record of what v1 had (as of 2026-10-30): the crates it names
 (blaze-metadata, blaze-fmt, blaze-lints, ...) are still in the tree, and a command comes back

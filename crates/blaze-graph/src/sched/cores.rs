@@ -175,10 +175,8 @@ impl Cores {
             }
         }
         let words = n.div_ceil(64);
-        let mut all = Vec::with_capacity(words);
-        all.resize(words, 0u64);
-        let mut big = Vec::with_capacity(words);
-        big.resize(words, 0u64);
+        let mut all = vec![0u64; words];
+        let mut big = vec![0u64; words];
         let top = info.iter().map(|it| it.capacity).max().unwrap_or(0);
         for (b, y) in info.iter().enumerate() {
             all[b / 64] |= 1 << (b % 64);

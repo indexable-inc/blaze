@@ -13,7 +13,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
 
 use blaze_api::{ApiError, Artifact, Diagnostic, Level};
 use blaze_cas::{Key, Kind};
@@ -21,9 +21,10 @@ use blaze_codegen::settings::Pgo;
 use blaze_diagnostics::{Diag, Options, lints::CommandLine};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::CodeHash;
+use blaze_lower::{ProcMacroLoadResult, ProcMacroLoadingError};
 use blaze_units::schema::Unit;
 use hir_ty_codegen::v2::BodyChecks;
-use blaze_lower::{ProcMacroLoadResult, ProcMacroLoadingError};
+use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -478,6 +479,9 @@ pub(crate) struct Phases {
     checking: Option<Arc<Checking>>,
     /// The check's diagnostics, or those of the check served for it.
     diags: Option<Vec<Diag>>,
+    /// The text of each file `diags` point into that no mount of the build holds, by its name
+    /// in them ([`unmounted`]).
+    unmounted: Vec<(String, String)>,
     /// What [`Phase::Codegen`] gave; none when the unit compiles no code.
     generated: Option<Generated>,
     /// The unit as [`Phase::Link`] left it, for [`Phase::Store`].
@@ -559,7 +563,7 @@ pub(crate) fn compile(
 /// [`Phase::Codegen`], side by side, ever wait on it, each only to read or leave a field.
 fn lock(slot: &Mutex<Phases>) -> MutexGuard<'_, Phases> {
     // A phase that panicked took nothing it read: it changes the unit's only once it is done.
-    slot.lock().unwrap_or_else(PoisonError::into_inner)
+    slot.lock()
 }
 
 /// [`Phase::Names`]: the unit's record, replayed when the store keeps it; otherwise its
@@ -610,10 +614,41 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> R
         // alloc: once per unit checked, shared by its check and its codegen
         None => (Some(Arc::new(Checking::new(db, hir::Crate::from(krate)))), None),
     };
+    let unmounted = diags.as_deref().map_or_else(Vec::new, |diags| unmounted(reader, &job.mounted, diags));
     let mut phases = lock(slot);
     phases.does = Some(Does { inert, builds_code });
-    (phases.checking, phases.diags) = (checking, diags);
+    (phases.checking, phases.diags, phases.unmounted) = (checking, diags, unmounted);
     Ok(())
+}
+
+/// The text of each file `diags` point into that no mount of the build holds (a build script's
+/// output under `OUT_DIR`, read by an `include!`), as the database has it: the text their spans
+/// were made against, which [`assemble`], with no database, can't read through `mounted`. A
+/// file the database has no text of is left out, and [`assemble`] names it as unread.
+fn unmounted(reader: &UnitReader, mounted: &Mounted, diags: &[Diag]) -> Vec<(String, String)> {
+    let (db, paths) = (reader.db(), reader.paths());
+    let names: Vec<&str> = blaze_diagnostics::emit::Sources::default()
+        .unread(diags)
+        .into_iter()
+        .filter(|name| mounted.locate(&mounted.absolute(name)).is_none())
+        .collect(); // alloc: the few names of a unit's diagnostics no mount holds
+    if names.is_empty() {
+        return Vec::new(); // alloc: empty, allocates nothing
+    }
+    let mut found: Vec<(String, base_db::FileId)> = paths
+        .iter()
+        .filter(|&(&file, _)| db.has_file_text(file))
+        .map(|(&file, path)| (mounted.name(path), file))
+        .filter(|(name, _)| names.contains(&name.as_str()))
+        .collect(); // alloc: as above
+    // The first file of a name by ID, whatever order the map is in.
+    found.sort_by_key(|(name, file)| (name.clone(), file.index())); // clone: a few names, sorted once
+    found.dedup_by(|a, b| a.0 == b.0);
+    found
+        .into_iter()
+        // alloc: a file's text, once per file of a unit's diagnostics no mount holds
+        .map(|(name, file)| (name, db.file_text(file).text(db).to_string()))
+        .collect()
 }
 
 /// [`Phase::Bodies`]: the check of every body of the unit's crate, when one runs, its outcome
@@ -634,7 +669,9 @@ fn bodies(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> 
         // clone: once per dependency crate checked this build
         job.check_later(krate, flags, diags.clone(), refused);
     }
-    lock(slot).diags = Some(diags);
+    let unmounted = unmounted(reader, &job.mounted, &diags);
+    let mut phases = lock(slot);
+    (phases.diags, phases.unmounted) = (Some(diags), unmounted);
     Ok(())
 }
 
@@ -687,7 +724,10 @@ fn link(job: &Job, reader: &UnitReader, unit: usize, phases: &mut Phases, images
         && !parts.built.memo_used.is_empty()
     {
         let used = std::mem::take(&mut parts.built.memo_used);
-        job.memo_used.lock().unwrap_or_else(PoisonError::into_inner).extend_from_slice(&used);
+        if let Some(slot) = job.memo_used.get(unit) {
+            // A unit links once a job: a second set has nothing the first lacks.
+            let _ = slot.set(used);
+        }
     }
     phases.linked = Some(Linked::Made(Box::new(making)));
     Ok(())
@@ -870,7 +910,12 @@ fn assemble(job: &Job, reader: &UnitReader, unit: usize, phases: &Phases, images
         let what = format!("unit {unit} (`{}`) is linked before its names are read and its check is done", u.target.name);
         return Err(ApiError::new(what, None).into());
     };
-    let sources = mounted.sources(diags);
+    let mut sources = blaze_diagnostics::emit::Sources::default();
+    for (name, text) in &phases.unmounted {
+        // clone: a file no mount holds, once per unit whose diagnostics point into one
+        sources.add(name, Some(text.clone()));
+    }
+    mounted.add_sources(&mut sources, diags);
     let mut style = blaze_diagnostics::emit::Style { ansi: color, short: job.input.short, ..Default::default() };
     if let Some(width) = job.input.width {
         style.width = usize::try_from(width).unwrap_or(usize::MAX);
@@ -879,7 +924,9 @@ fn assemble(job: &Job, reader: &UnitReader, unit: usize, phases: &Phases, images
         .iter()
         .filter(|it| !cargo_hides(&it.message))
         .map(|it| blaze_diagnostics::api::diagnostic(it, &sources, style, Some(unit_of.clone())))
-        .collect();
+        .collect::<Result<_, _>>()
+        // clone: the unit's name, on the error path
+        .map_err(|why| ApiError::new(why.to_string(), Some(u.target.name.clone())))?;
     let failed = diagnostics.iter().any(|it| it.level == Level::Error);
     let mut made = Made::default();
     let nothing = |diagnostics: Vec<Diagnostic>, ok: bool, made: Made| Making {
@@ -1033,7 +1080,7 @@ fn work_out_runs(job: &Job, unit: usize) -> artifact::Runs {
     let package = job.graph.package(unit as u32);
     let mut own: &[(String, String)] = &[];
     let mut native: Vec<String> = Vec::new();
-    let mut seen = rustc_hash::FxHashSet::default();
+    let mut seen = blaze_hash::HashSet::default();
     for at in job.graph.closure(unit as u32) {
         if !job.graph.has(at, graph::flag::RUN) {
             continue;

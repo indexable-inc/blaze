@@ -6,10 +6,10 @@
     "crates/hir-ty-codegen/mod.rs"
   ],
   "what": "hir-firewall exceptions an_edit_compiles_again_only_its_instances_and_those_over_its_closures (exceptions.rs:162, round15-test.log) fails with 32 leaks of codegen's walk: code_walk and body_types, keyed by hir-ty-codegen's `Instance` (mod.rs:679), and share/sites, keyed by hir-ty-share's ShareInstance/ShareDef. Each is the edited body's own work (an edit of `plain` runs plain's code_walk again, one of `apply` its share/sites and apply::<closure>), but the harness tells a key's owner by `Storage::ids_of`, and these key types name no ids, so every one reads as another item's. hir-ty-share now has `impl NamesIds for ShareDef` (Fn/VtableShim push the FunctionId, Closure/Coroutine/CoroutineByMove the id; shims nothing) and for ShareInstance (def, then args), uncommitted (tests-misc-front1, crates/hir-ty-share/src/lib.rs). Ask, in crates/hir-ty-codegen/mod.rs: the same two impls for `InstanceDef` and `Instance` (its `def`, then `args: StoredGenericArgs`, which already implements NamesIds through hir-ty's push_named_ids; `checked` names nothing). `ids_of` is read only by crates/hir-firewall, so this changes nothing else. Acceptance: that test goes clean.",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T00:55:06Z",
-  "updated": "2026-11-01T00:55:06Z",
-  "taken_by": null,
+  "updated": "2026-11-01T12:49:57Z",
+  "taken_by": "codegen",
   "why": null,
   "source": null,
   "history": [
@@ -18,6 +18,18 @@
       "by": "tests-misc-front1",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T12:49:57Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T12:49:57Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "hir-ty-codegen mod.rs: impl NamesIds for InstanceDef (Fn/VtableShim the FunctionId, Closure/Coroutine/CoroutineByMove the id, shims nothing) and for Instance (def, then args). ra clean, not built."
     }
   ]
 }

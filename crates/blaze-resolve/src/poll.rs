@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::Thread;
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 /// Caches and runs an async method from code that is not async, on one thread.
 ///
@@ -19,7 +19,7 @@ use rustc_hash::FxHashMap;
 /// one computation per key is in flight; a success is kept, an error is handed out once.
 pub(crate) struct LocalPollAdapter<S, K, R, Q> {
     pool: Vec<Pin<Box<Q>>>,
-    cache: FxHashMap<K, Poll<R>>,
+    cache: HashMap<K, Poll<R>>,
     self_parameter: S,
     start: fn(S, K) -> Q,
 }
@@ -32,7 +32,7 @@ where
     Q: Future<Output = (K, Result<V, E>)>,
 {
     pub(crate) fn new(self_parameter: S, start: fn(S, K) -> Q) -> Self {
-        Self { pool: Vec::new(), cache: FxHashMap::default(), self_parameter, start }
+        Self { pool: Vec::new(), cache: HashMap::default(), self_parameter, start }
     }
 
     /// The result for `key`, starting the work if needed. On [`Poll::Pending`], call
@@ -154,20 +154,20 @@ pub(crate) mod tests {
     /// A future woken from another thread, as one waiting on a download is. Each poll leaves
     /// its waker for the thread, as a future must.
     fn woken_from_elsewhere() -> impl Future<Output = ()> {
-        let state = Arc::new(std::sync::Mutex::new((false, None::<Waker>)));
+        let state = Arc::new(parking_lot::Mutex::new((false, None::<Waker>)));
         let mut started = false;
         std::future::poll_fn(move |cx| {
-            let mut guard = state.lock().unwrap();
+            let mut guard = state.lock();
             if guard.0 {
                 return Poll::Ready(());
             }
             guard.1 = Some(cx.waker().clone());
             if !started {
                 started = true;
-                let state = state.clone();
+                let state = Arc::clone(&state);
                 std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                    let mut guard = state.lock().unwrap();
+                    blaze_spin::busy(std::time::Duration::from_millis(20));
+                    let mut guard = state.lock();
                     guard.0 = true;
                     guard.1.take().unwrap().wake();
                 });

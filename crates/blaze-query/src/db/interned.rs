@@ -8,14 +8,12 @@ use std::{
     hash::{BuildHasher, Hash},
     marker::PhantomData,
     mem::MaybeUninit,
-    sync::{
-        Mutex, PoisonError,
-        atomic::{AtomicU32, AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
+use blaze_hash::FixedState;
 use blaze_mem::{Tag, swiss};
-use rustc_hash::FxBuildHasher;
+use parking_lot::Mutex;
 
 use super::{
     DatabaseKeyIndex, EventKind, Id, MemoryUsage,
@@ -118,7 +116,7 @@ impl Vtable {
 /// The hash every interned value is keyed by: what [`intern_by`]'s `Q` must hash like.
 #[inline]
 pub(crate) fn hash_of<Q: Hash + ?Sized>(value: &Q) -> u64 {
-    FxBuildHasher.hash_one(value)
+    FixedState.hash_one(value)
 }
 
 #[inline]
@@ -216,7 +214,7 @@ fn insert<F, K>(
     eq: impl Fn(&F, &K) -> bool,
     make: impl FnOnce(K) -> F,
 ) -> (Id, Option<K>) {
-    let mut len = shard.len.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut len = shard.len.lock();
     if let Some(id) = find(table, shard, hash, |row| eq(row, &key)) {
         return (id, Some(key));
     }

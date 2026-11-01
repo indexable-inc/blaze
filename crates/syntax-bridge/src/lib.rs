@@ -30,9 +30,9 @@ use tt::{Punct, buffer::Cursor, token_to_literal};
 /// The leaves a conversion's callback inserts at one event: at most three, inline.
 pub type Inserted = SmallVec<[tt::Leaf; 3]>;
 /// The leaves to append after an element (a view's `NodeId`), by element.
-pub type Appended<K, A = Global> = hashbrown::HashMap<K, Inserted, rustc_hash::FxBuildHasher, A>;
+pub type Appended<K, A = Global> = hashbrown::HashMap<K, Inserted, blaze_hash::FixedState, A>;
 /// The elements to leave out.
-pub type Removed<K, A = Global> = hashbrown::HashSet<K, rustc_hash::FxBuildHasher, A>;
+pub type Removed<K, A = Global> = hashbrown::HashSet<K, blaze_hash::FixedState, A>;
 
 pub mod prettify_macro_expansion;
 #[cfg(any(test, feature = "reference"))]

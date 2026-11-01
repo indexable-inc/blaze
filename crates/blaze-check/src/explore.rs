@@ -2,13 +2,9 @@
 //! along the path the last one left, until every branch is taken (or the random runs are done),
 //! and stops at the first finding with the seed and the schedule that replay it.
 
-use std::{
-    any::Any,
-    env,
-    rc::Rc,
-    str::FromStr,
-    sync::{Mutex, PoisonError},
-};
+use std::{any::Any, env, rc::Rc, str::FromStr};
+
+use parking_lot::Mutex;
 
 use crate::{
     clock::MAX_THREADS,
@@ -84,7 +80,7 @@ impl Builder {
             !coro::inside() && rt::explorer(|rt| rt.is_none()),
             "blaze-check: `model` called inside a model"
         );
-        let _one = MODELS.lock().unwrap_or_else(PoisonError::into_inner);
+        let _one = MODELS.lock();
         // dyn: the test's closure, once per model (`coro::Job::Main`).
         let main: Rc<dyn Fn()> = Rc::new(move || {
             f();

@@ -36,6 +36,14 @@ pub mod webhook;
 use blaze_ids::ContentId;
 use serde::{Deserialize, Serialize};
 
+/// Holds this thread for `wait`: the one timer of blaze-ci's drivers, for the waits whose end
+/// no event says (a post's backoff, the standby's next poll, an accept that failed). Each
+/// caller's schedule decides the wait.
+#[allow(clippy::disallowed_methods, reason = "the drivers' timer: no event ends these waits, and the callers' schedules decide them")]
+pub(crate) fn hold(wait: std::time::Duration) {
+    std::thread::sleep(wait);
+}
+
 /// What GitHub said happened, after its signature was checked.
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub enum Event {

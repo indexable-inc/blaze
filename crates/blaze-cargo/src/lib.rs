@@ -73,8 +73,8 @@ mod refused_tests {
 /// The lock, also after a thread panicked with it: a build that is interrupted or that
 /// panics unwinds, and what a lock here guards is whole between any two statements, so the
 /// requests after it go on with what is there.
-pub fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+pub fn lock<T>(mutex: &parking_lot::Mutex<T>) -> parking_lot::MutexGuard<'_, T> {
+    mutex.lock()
 }
 
 /// Has a command that prints for a reader end quietly when the reader stops reading,

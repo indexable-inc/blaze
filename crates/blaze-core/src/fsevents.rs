@@ -36,12 +36,11 @@ use std::{
     io,
     os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
-    sync::{
-        Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
 };
+
+use parking_lot::{Mutex, MutexGuard};
 
 use crate::{Completion, Cursor, Done, FileName, Journaled, Lost, Tag};
 
@@ -158,20 +157,14 @@ pub(crate) trait Tell: Send + Sync + 'static {
     fn tell(&self, completion: Completion, wait: Duration) -> Result<(), Option<Completion>>;
 }
 
-/// A bounded channel: no allocation per completion.
+/// A bounded channel waits up to `wait` for room and allocates nothing per completion; an
+/// unbounded one always has room, and allocates a block per 31 completions.
 impl Tell for crossbeam_channel::Sender<Completion> {
     fn tell(&self, completion: Completion, wait: Duration) -> Result<(), Option<Completion>> {
         self.send_timeout(completion, wait).map_err(|error| match error {
             crossbeam_channel::SendTimeoutError::Timeout(completion) => Some(completion),
             crossbeam_channel::SendTimeoutError::Disconnected(_) => None,
         })
-    }
-}
-
-/// An unbounded channel: always room, and a block of it allocated per 31 completions.
-impl Tell for std::sync::mpsc::Sender<Completion> {
-    fn tell(&self, completion: Completion, _: Duration) -> Result<(), Option<Completion>> {
-        self.send(completion).map_err(|_| None)
     }
 }
 
@@ -250,7 +243,7 @@ impl Heard {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    mutex.lock()
 }
 
 /// `dir` in a buffer with room for a cookie's name after it, for [`with_cookie`].
@@ -1026,6 +1019,15 @@ fn tell_flushes<S: Tell>(shared: &Shared<S>, heard: &mut Heard) {
     }
 }
 
+/// Gives fseventsd `long` to put what was written into its store, for a test that reads it
+/// back from a cursor: it writes its store on its own schedule, and nothing says when an event
+/// is in it.
+#[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "fseventsd's store has no event that says what it holds")]
+pub(crate) fn fseventsd_keeps(long: Duration) {
+    std::thread::sleep(long);
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1101,8 +1103,7 @@ mod tests {
         assert!(files.iter().all(|it| it.is_under(&dir)), "{files:?}");
         // Nothing is told once it has stopped.
         std::fs::write(root.join("src/after"), b"late").unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        while let Ok(completion) = heard.try_recv() {
+        while let Ok(completion) = heard.recv_timeout(Duration::from_millis(200)) {
             let Done::Changed { files, .. } = completion.done else { panic!() };
             assert!(!files.contains(&FileName::new("src/after").unwrap()), "{files:?}");
         }
@@ -1243,7 +1244,7 @@ mod tests {
         std::fs::create_dir_all(root.join("src/down")).unwrap();
         std::fs::write(root.join("src/down/lib.rs"), b"fn g() {}").unwrap();
         std::fs::write(root.join("target/out"), b"not watched").unwrap();
-        std::thread::sleep(Duration::from_secs(1));
+        fseventsd_keeps(Duration::from_secs(1));
         while heard.try_recv().is_ok() {}
         // The same watch, started again from the cursor.
         let first = journal(&mut watch, &root, &dir, last, Tag(2));

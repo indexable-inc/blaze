@@ -97,7 +97,7 @@ fn unused_qualifications_suggestion() {
 fn unused_qualifications_not_of_global_paths() {
     let source = include_str!("imports/unused-qualifications-global-paths.rs");
     let fixture = format!(
-        "//- minicore: default\n//- /std.rs crate:std edition:2021 library\npub use core::default;\n\
+        "//- minicore: default\n//- /std.rs crate:std edition:2021 library\npub use core::default;\npub mod prelude {{ pub mod rust_2015 {{}} }}\n\
          //- /unused-qualifications-global-paths.rs crate:other:main edition:2015 deps:std\n{source}"
     );
     let stderr = ui_fixture(&fixture);

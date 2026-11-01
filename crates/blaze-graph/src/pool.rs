@@ -59,7 +59,6 @@ use crate::{
     sync::{
         OnceLock,
         atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence},
-        hint,
         thread::{self, JoinHandle, Thread},
         thread_local,
     },
@@ -264,12 +263,15 @@ impl Job {
         /// this is its one run (it gives the cell back).
         unsafe fn run<F: FnOnce()>(header: NonNull<Header>) {
             let at = header.cast::<Placed<F>>().as_ptr();
-            // SAFETY: `at` is the live `Placed<F>` that `erase` wrote, run once: its cell is read
-            // out once here, and the rest of it needs no drop. Read twice, the cell would be
-            // given back twice.
-            let cell = unsafe { (&raw const (*at).cell).read() };
-            // SAFETY: as above, for the closure: read out once, so it runs and drops once.
-            let f = unsafe { (&raw const (*at).f).read() };
+            // SAFETY: `at` is the live `Placed<F>` that `erase` wrote.
+            let cell = unsafe { &raw const (*at).cell };
+            // SAFETY: its cell is read out once here, and the rest of it needs no drop.
+            // Read twice, the cell would be given back twice.
+            let cell = unsafe { cell.read() };
+            // SAFETY: `at` is the live `Placed<F>` that `erase` wrote.
+            let f = unsafe { &raw const (*at).f };
+            // SAFETY: the closure is read out once, so it runs and drops once.
+            let f = unsafe { f.read() };
             give_back(cell);
             f();
         }
@@ -351,12 +353,13 @@ impl Inject {
         self.len.load(Ordering::SeqCst) == 0
     }
 
+    #[allow(clippy::needless_pass_by_value, reason = "the queue takes sole ownership of the job until it is popped")]
     fn push(&self, job: Job) {
         let at = job.0.as_ptr();
         // SAFETY: the job's header lives until it has run, and from here until a worker takes
         // it back out this queue is the one place that names it.
         unsafe { (*at).next.store(ptr::null_mut(), Ordering::Relaxed) };
-        let mut list = self.list.lock();
+        let mut list = self.list.lock_said("a group's job queue");
         match NonNull::new(list.tail) {
             // SAFETY: the tail is a job of this list, alive until it is taken out, under this
             // lock.
@@ -372,7 +375,7 @@ impl Inject {
         if self.is_empty() {
             return None;
         }
-        let mut list = self.list.lock();
+        let mut list = self.list.lock_said("a group's job queue");
         let head = NonNull::new(list.head)?;
         // SAFETY: as in `push`: the head is a job of this list, under its lock.
         list.head = unsafe { head.as_ref() }.next.load(Ordering::Relaxed);
@@ -389,7 +392,7 @@ impl Inject {
             return;
         }
         let (head, tail, count) = {
-            let mut list = self.list.lock();
+            let mut list = self.list.lock_said("a group's job queue");
             let taken = (list.head, list.tail);
             list.head = ptr::null_mut();
             list.tail = ptr::null_mut();
@@ -397,7 +400,7 @@ impl Inject {
             (taken.0, taken.1, count)
         };
         let Some(head) = NonNull::new(head) else { return };
-        let mut list = to.list.lock();
+        let mut list = to.list.lock_said("a group's job queue");
         match NonNull::new(list.tail) {
             // SAFETY: as in `push`: the tail is a job of `to`'s list, under its lock.
             Some(old) => unsafe { old.as_ref() }.next.store(head.as_ptr(), Ordering::Relaxed),
@@ -414,7 +417,7 @@ impl Inject {
         }
         let mut taken: [Option<NonNull<Header>>; BATCH] = [None; BATCH];
         {
-            let mut list = self.list.lock();
+            let mut list = self.list.lock_said("a group's job queue");
             let mut count = 0;
             for slot in &mut taken {
                 let Some(head) = NonNull::new(list.head) else { break };
@@ -489,8 +492,8 @@ struct Shared {
     /// The pool's member of the scheduler ([`crate::sched::join_pool`]).
     #[cfg(not(blaze_check))]
     member: AtomicU32,
-    /// Its jobs parked on a wait now: its workers stop only once there are none.
-    #[cfg(not(blaze_check))]
+    /// Its jobs parked on a wait now: its workers stop only once there are none. Under
+    /// `blaze_check` jobs run on their worker's stack and never park, so it stays 0.
     parked: AtomicUsize,
     #[cfg(test)]
     critical: AtomicUsize,
@@ -620,7 +623,6 @@ impl Pool {
             stray: Lock::new(None),
             #[cfg(not(blaze_check))]
             member: AtomicU32::new(0),
-            #[cfg(not(blaze_check))]
             parked: AtomicUsize::new(0),
             #[cfg(test)]
             critical: AtomicUsize::new(0),
@@ -635,7 +637,7 @@ impl Pool {
         let mut failed = None;
         for (index, deque) in deques.into_iter().enumerate() {
             // clone: setup, once per worker thread.
-            let (cpu, shared, ready) = (topology.cpus[index], shared.clone(), ready_tx.clone());
+            let (cpu, shared, ready) = (topology.cpus[index], Arc::clone(&shared), ready_tx.clone());
             let spawned = thread::Builder::new()
                 // alloc: setup, once per worker thread.
                 .name(format!("blaze-work-{index}"))
@@ -669,7 +671,7 @@ impl Pool {
         }
         drop(ready_tx);
         for _ in 0..threads.len() {
-            match ready_rx.recv() {
+            match crate::wait::wait(crate::wait::WaitOn::Channel("the pool's workers started"), None, || ready_rx.recv()) {
                 Ok(Ok(())) => {}
                 Ok(Err(why)) => _ = failed.get_or_insert(why),
                 Err(_) => break,
@@ -854,13 +856,14 @@ fn scope_in<'env, R>(shared: &Shared, f: impl FnOnce(&Scope<'env>) -> R) -> R {
     drop(Left(&raw const pending));
     #[cfg(not(blaze_check))]
     {
-        if let Err(cycle) = crate::sched::wait(crate::sched::Wait::Counter(pending.counter)) {
+        let waited = crate::wait::wait(crate::wait::WaitOn::Channel("a scope's jobs"), None, || {
+            crate::sched::wait(crate::sched::Wait::Counter(pending.counter))
+        });
+        if let Err(cycle) = waited {
             panic!("a scope's caller closed a cycle of waits, which its scope's jobs would have: {cycle:?}");
         }
         // The last job released the counter just before it says so, as the last thing it does.
-        while !pending.finished.load(Ordering::Acquire) {
-            hint::spin_loop();
-        }
+        crate::spin::SpinWait::until("a scope's last job to let go of it", || pending.finished.load(Ordering::Acquire));
         crate::sched::close_scope(pending.counter);
     }
     #[cfg(blaze_check)]
@@ -880,7 +883,7 @@ fn run_jobs(shared: &Shared, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
         for at in 0..jobs {
             scope.submit(None, move || job(at), |it| {
                 if let Err(panic) = it {
-                    failed.lock().get_or_insert(panic);
+                    failed.lock_said("a scope's first panic").get_or_insert(panic);
                 }
             });
         }
@@ -949,7 +952,7 @@ impl Drop for Pool {
         }
         #[cfg(blaze_check)]
         let _ = joined;
-        if let Some(panic) = self.shared.stray.lock().take()
+        if let Some(panic) = self.shared.stray.lock_said("the pool's stray panic").take()
             && !thread::panicking()
         {
             resume_unwind(panic);
@@ -1230,6 +1233,7 @@ fn least(count: usize, only_fast: bool, of: impl Fn(usize) -> (u64, u64, bool)) 
 }
 
 impl Local {
+    #[allow(clippy::needless_pass_by_value, reason = "the LIFO slot takes sole ownership of the job until it is taken")]
     fn push_next(&self, job: Job) {
         let slot = &self.shared.slots[self.index];
         if let Some(old) = NonNull::new(slot.next.swap(job.0.as_ptr(), Ordering::AcqRel)) {
@@ -1331,15 +1335,14 @@ impl Local {
 
     /// Searches, as a searcher, up to `rounds` times; the search ends either way.
     fn search(&self, rounds: u32) -> Option<Job> {
+        let mut back_off = crate::spin::SpinWait::new();
         for round in 0..rounds {
             if let Some(job) = self.steal() {
                 self.end_search(true);
                 return Some(job);
             }
             if round + 1 < rounds {
-                for _ in 0..32 {
-                    hint::spin_loop();
-                }
+                back_off.pause();
             }
         }
         self.end_search(false);
@@ -1349,7 +1352,7 @@ impl Local {
     /// `job` catches its own panic and gives it to `done`; only `done`'s comes here.
     fn run(&self, runner: &mut Runner<'_>, job: Job) {
         if let Some(panic) = runner.run(job) {
-            self.shared.stray.lock().get_or_insert(panic);
+            self.shared.stray.lock_said("the pool's stray panic").get_or_insert(panic);
         }
     }
 
@@ -1441,6 +1444,8 @@ fn work(local: &Local) {
     #[cfg(blaze_check)]
     let mut runner = Runner(PhantomData);
     let mut searching = false;
+    // What the stop's drain backs off with while another worker takes what is left.
+    let mut drain = crate::spin::SpinWait::new();
     loop {
         if let Some(job) = local.next() {
             if searching {
@@ -1465,7 +1470,9 @@ fn work(local: &Local) {
             // Every job given before the stop is run, and every parked one resumed and run:
             // what is left was found by none.
             if shared.any_work() {
-                hint::spin_loop();
+                if !drain.spin() {
+                    drain = crate::spin::SpinWait::new();
+                }
                 continue;
             }
             #[cfg(not(blaze_check))]
@@ -1523,15 +1530,16 @@ fn bind_to(cpu: &Cpu) -> io::Result<()> {
 mod tests {
     use std::{
         sync::{
-            Arc, Mutex,
+            Arc,
             atomic::{AtomicU32, AtomicUsize, Ordering},
         },
-        time::{Duration, Instant},
+        time::Duration,
     };
 
     use blaze_alloc_count::measure;
     use blaze_ids::rng::SplitMix64 as Rng;
     use crossbeam_channel::{bounded, unbounded};
+    use parking_lot::Mutex;
 
     use super::{Class, Group, Header, Job, Pending, Placed, Pool, Slot, group, searching, sleeping};
     use crate::{
@@ -1551,11 +1559,7 @@ mod tests {
     }
 
     fn until(what: &str, done: impl Fn() -> bool) {
-        let until = Instant::now() + LONG;
-        while !done() {
-            assert!(Instant::now() < until, "timed out waiting for {what}");
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        crate::spin::SpinWait::within(what, LONG, done);
     }
 
     #[test]
@@ -1596,9 +1600,9 @@ mod tests {
     #[test]
     fn a_job_takes_the_smallest_cell_that_holds_it() {
         let drops = Arc::new(AtomicUsize::new(0));
-        let small = closure::<2>(1, Dropped(drops.clone()));
-        let medium = closure::<40>(1, Dropped(drops.clone()));
-        let large = closure::<200>(1, Dropped(drops.clone()));
+        let small = closure::<2>(1, Dropped(Arc::clone(&drops)));
+        let medium = closure::<40>(1, Dropped(Arc::clone(&drops)));
+        let large = closure::<200>(1, Dropped(drops));
         assert_eq!((class(&small), class(&medium), class(&large)), (0, 1, 2));
         assert_eq!(class(&|| ()), 0);
         let largest = [0u8; 2048 - size_of::<Placed<()>>()];
@@ -1617,8 +1621,8 @@ mod tests {
             tx: crossbeam_channel::Sender<(usize, u64)>,
             job: usize,
         ) -> u64 {
-            let in_place = closure::<N>(fill, Dropped(drops.clone()));
-            pool.submit(None, closure::<N>(fill, Dropped(drops.clone())), move |it| {
+            let in_place = closure::<N>(fill, Dropped(Arc::clone(drops)));
+            pool.submit(None, closure::<N>(fill, Dropped(Arc::clone(drops))), move |it| {
                 _ = tx.send((job, it.unwrap()));
             });
             in_place()
@@ -1654,7 +1658,7 @@ mod tests {
     fn a_warm_job_allocates_nothing() {
         let pool = Arc::new(Pool::new(&Topology::flat(1), false).unwrap());
         let (tx, rx) = bounded::<(u64, usize)>(1);
-        let inner = pool.clone();
+        let inner = Arc::clone(&pool);
         pool.submit(
             None,
             move || {
@@ -1777,11 +1781,11 @@ mod tests {
         let ran = Arc::new(AtomicUsize::new(0));
         let pool = Pool::new(&Topology::flat(3), false).unwrap();
         for _ in 0..200 {
-            let ran = ran.clone();
+            let ran = Arc::clone(&ran);
             pool.submit(
                 None,
                 move || {
-                    std::thread::sleep(Duration::from_micros(50));
+                    crate::spin::busy(Duration::from_micros(50));
                     ran.fetch_add(1, Ordering::SeqCst);
                 },
                 |it| it.unwrap(),
@@ -1799,13 +1803,13 @@ mod tests {
         let total = pool.scope(|scope| {
             for chunk in numbers.chunks(10) {
                 scope.submit(None, move || chunk.iter().sum::<u64>(), |it| {
-                    sums.lock().unwrap().push(it.unwrap());
+                    sums.lock().push(it.unwrap());
                 });
             }
             7
         });
         assert_eq!(total, 7);
-        let sums = sums.into_inner().unwrap();
+        let sums = sums.into_inner();
         assert_eq!(sums.len(), 10);
         assert_eq!(sums.iter().sum::<u64>(), 4950);
         assert_eq!(pool.scope(|_| 3), 3, "a scope of no job returns at once");
@@ -1817,7 +1821,7 @@ mod tests {
     fn a_scope_inside_a_job_of_one_worker_ends() {
         let pool = Arc::new(Pool::new(&Topology::flat(1), false).unwrap());
         let (tx, rx) = bounded::<u64>(1);
-        let inner = pool.clone();
+        let inner = Arc::clone(&pool);
         pool.submit(
             None,
             move || {
@@ -1862,7 +1866,7 @@ mod tests {
         let (tx, rx) = unbounded::<(u32, Result<u32, Cancelled>)>();
         let last = flights.get_or_run(key(JOBS), || {
             for at in 0..JOBS {
-                let (flights, started, tx) = (flights.clone(), started.clone(), tx.clone());
+                let (flights, started, tx) = (Arc::clone(&flights), Arc::clone(&started), tx.clone());
                 pool.submit(
                     None,
                     move || {
@@ -1912,7 +1916,7 @@ mod tests {
             let waiting = Arc::new(AtomicUsize::new(0));
             let held = flights.get_or_run(at, || {
                 {
-                    let (flights, waiting, tx) = (flights.clone(), waiting.clone(), tx.clone());
+                    let (flights, waiting, tx) = (Arc::clone(&flights), Arc::clone(&waiting), tx.clone());
                     pool.submit(
                         None,
                         move || {
@@ -1937,7 +1941,9 @@ mod tests {
                         move |it| _ = tx.send(it.map_err(|_| "the waiting job panicked".to_owned())),
                     );
                 }
-                until("the job to wait", || waiting.load(Ordering::SeqCst) == 1);
+                until("the job to park", || {
+                    waiting.load(Ordering::SeqCst) == 1 && pool.shared.parked.load(Ordering::SeqCst) == 1
+                });
                 for _ in 0..2 {
                     let tx = tx.clone();
                     pool.submit(
@@ -1945,13 +1951,98 @@ mod tests {
                         || {
                             assert!(!frame::in_task(), "a job began inside a parked job's frame task");
                             assert_eq!(MARK.get(), 0, "a job began with a parked job's carried thread-local");
-                            frame::task(Tag::Plane, |_| std::thread::sleep(Duration::from_millis(5)));
+                            frame::task(Tag::Plane, |_| crate::spin::busy(Duration::from_millis(5)));
                             None
                         },
                         move |it| _ = tx.send(it.map_err(|_| "a job meanwhile panicked".to_owned())),
                     );
                 }
-                std::thread::sleep(Duration::from_millis(2));
+                crate::spin::busy(Duration::from_millis(2));
+                Ok(round)
+            });
+            assert_eq!(held, Ok(round));
+            for _ in 0..3 {
+                if let Some((before, after)) = rx.recv_timeout(LONG).unwrap().unwrap() {
+                    moved += usize::from(before != after);
+                }
+            }
+        }
+        assert!(moved > 0, "in 50 rounds the waiting job never resumed on the other worker");
+    }
+
+    /// A job that waits in a task inside a task resumes in the inner task's frame, on whichever
+    /// worker takes it, and a task it opens after the switch starts in the rest of its own outer
+    /// frame's chunk (`frame::task` lends it), while the jobs the other worker runs meanwhile
+    /// open and fill tasks of their own: a query that waits for another's flight, then opens the
+    /// next query's task.
+    #[test]
+    fn a_task_opened_after_a_switch_starts_in_the_jobs_own_frame() {
+        use blaze_mem::{Tag, frame};
+        let pool = Pool::new(&Topology::flat(2), false).unwrap();
+        let flights = Arc::new(Flights::<u32>::new());
+        let mut moved = 0;
+        for round in 0..50u32 {
+            let at = key(2_000 + round);
+            let (tx, rx) = unbounded::<Result<Option<(usize, usize)>, String>>();
+            let waiting = Arc::new(AtomicUsize::new(0));
+            let held = flights.get_or_run(at, || {
+                {
+                    let (flights, waiting, tx) = (Arc::clone(&flights), Arc::clone(&waiting), tx.clone());
+                    pool.submit(
+                        None,
+                        move || {
+                            frame::task(Tag::Plane, |outer| {
+                                *outer.alloc(1u64) += 1;
+                                let before = super::with_local(|local| local.index).unwrap();
+                                frame::task(Tag::Plane, |inner| {
+                                    *inner.alloc(2u64) += 1;
+                                    waiting.store(1, Ordering::SeqCst);
+                                    assert_eq!(flights.get_or_run(at, || panic!("the client runs the key")), Ok(round));
+                                    frame::current(|now| {
+                                        assert!(std::ptr::eq(now, inner), "the job resumed in another frame");
+                                        let value: *const u64 = now.alloc(3u64);
+                                        assert!(inner.contains(value.cast()), "the job allocated outside its own frame");
+                                    });
+                                });
+                                frame::task(Tag::Plane, |after| {
+                                    frame::current(|now| {
+                                        assert!(std::ptr::eq(now, after), "a task opened after the switch is not current");
+                                        let values = now.alloc_slice_fill_with(64, |at| at as u64 + u64::from(round));
+                                        assert!(
+                                            outer.contains(values.as_ptr().cast()),
+                                            "a task opened after the switch did not start in its own job's frame"
+                                        );
+                                        assert_eq!(values[63], 63 + u64::from(round));
+                                    });
+                                });
+                                assert_eq!(*outer.alloc(4u64), 4, "the outer frame took its chunk back");
+                                let after = super::with_local(|local| local.index).unwrap();
+                                Some((before, after))
+                            })
+                        },
+                        move |it| _ = tx.send(it.map_err(|_| "the waiting job panicked".to_owned())),
+                    );
+                }
+                until("the job to park", || {
+                    waiting.load(Ordering::SeqCst) == 1 && pool.shared.parked.load(Ordering::SeqCst) == 1
+                });
+                for _ in 0..2 {
+                    let tx = tx.clone();
+                    pool.submit(
+                        None,
+                        || {
+                            assert!(!frame::in_task(), "a job began inside a parked job's frame task");
+                            frame::task(Tag::Plane, |mine| {
+                                let filled = mine.alloc_slice_fill_with(1024, |at| at as u64);
+                                frame::task(Tag::Plane, |_| crate::spin::busy(Duration::from_millis(5)));
+                                assert_eq!(filled[1023], 1023, "another job wrote into this job's frame");
+                            });
+                            None
+                        },
+                        move |it| _ = tx.send(it.map_err(|_| "a job meanwhile panicked".to_owned())),
+                    );
+                }
+                crate::spin::busy(Duration::from_millis(2));
                 Ok(round)
             });
             assert_eq!(held, Ok(round));
@@ -1984,14 +2075,14 @@ mod tests {
             let held = flights.get_or_run(at, || {
                 {
                     let (inner, flights, waiting, scoped, tx) =
-                        (pool.clone(), flights.clone(), waiting.clone(), scoped.clone(), tx.clone());
+                        (Arc::clone(&pool), Arc::clone(&flights), Arc::clone(&waiting), Arc::clone(&scoped), tx.clone());
                     pool.submit(
                         None,
                         move || {
                             inner.scope(|scope| {
                                 scope.submit(
                                     None,
-                                    || std::thread::sleep(Duration::from_millis(3)),
+                                    || crate::spin::busy(Duration::from_millis(3)),
                                     |_| _ = scoped.fetch_add(1, Ordering::SeqCst),
                                 );
                                 waiting.store(1, Ordering::SeqCst);
@@ -2010,7 +2101,6 @@ mod tests {
             assert_eq!(held, Ok(round));
             assert_eq!(rx.recv_timeout(LONG).unwrap(), Err(format!("round {round} failed inside its scope")));
             assert_eq!(scoped.load(Ordering::SeqCst), 1, "the scope's job did not end before its owner failed");
-            let tx = tx.clone();
             pool.submit(None, move || round + 1, move |it| _ = tx.send(it.map_err(|it| message(&*it))));
             assert_eq!(rx.recv_timeout(LONG).unwrap(), Ok(round + 1), "the pool ran no job after the failure");
         }
@@ -2049,7 +2139,8 @@ mod tests {
             let unwound = Arc::new(AtomicUsize::new(0));
             let held = flights.get_or_run(at, || {
                 {
-                    let (flights, waiting, unwound, tx) = (flights.clone(), waiting.clone(), unwound.clone(), tx.clone());
+                    let (flights, waiting, unwound, tx) =
+                        (Arc::clone(&flights), Arc::clone(&waiting), Arc::clone(&unwound), tx.clone());
                     pool.submit(
                         None,
                         move || {
@@ -2078,7 +2169,6 @@ mod tests {
             let failed = rx.recv_timeout(LONG).unwrap().unwrap_err();
             assert!(failed.contains("a carried thread-local refused to move"), "{failed}");
             assert_eq!(unwound.load(Ordering::SeqCst), 1, "the job's own unwind did not run");
-            let tx = tx.clone();
             pool.submit(None, move || round + 1, move |it| _ = tx.send(it.map_err(|it| message(&*it))));
             assert_eq!(rx.recv_timeout(LONG).unwrap(), Ok(round + 1), "the pool ran no job after the failure");
         }
@@ -2115,7 +2205,7 @@ mod tests {
             let (tx, rx) = unbounded::<Result<Option<(usize, usize)>, String>>();
             let leaving = Arc::new(AtomicUsize::new(0));
             for at in 0..2u32 {
-                let (tx, leaving) = (tx.clone(), leaving.clone());
+                let (tx, leaving) = (tx.clone(), Arc::clone(&leaving));
                 pool.submit(
                     None,
                     move || {
@@ -2135,7 +2225,7 @@ mod tests {
             let waiting = Arc::new(AtomicUsize::new(0));
             let held = flights.get_or_run(at, || {
                 for mine in 0..2u32 {
-                    let (flights, waiting, tx) = (flights.clone(), waiting.clone(), tx.clone());
+                    let (flights, waiting, tx) = (Arc::clone(&flights), Arc::clone(&waiting), tx.clone());
                     pool.submit(
                         None,
                         move || {
@@ -2211,7 +2301,7 @@ mod tests {
             let parked = |count: usize| until("the jobs to park", || pool.shared.parked.load(Ordering::SeqCst) == count);
             let held = flights.get_or_run(first, || {
                 let job = |mine: u32, on: Key| {
-                    let (flights, order, tx) = (flights.clone(), order.clone(), tx.clone());
+                    let (flights, order, tx) = (Arc::clone(&flights), Arc::clone(&order), tx.clone());
                     pool.submit(
                         None,
                         move || {
@@ -2220,7 +2310,7 @@ mod tests {
                                 assert_eq!(flights.get_or_run(on, || panic!("the client runs the key")), Ok(round));
                                 assert_eq!(LENT.with_borrow(|it| *it), Some(100 + mine), "a job resumed with another's value");
                             });
-                            order.lock().unwrap().push(mine);
+                            order.lock().push(mine);
                             mine
                         },
                         move |it| _ = tx.send(it.map_err(|it| message(&*it))),
@@ -2234,16 +2324,15 @@ mod tests {
                     Ok(round)
                 });
                 assert_eq!(held, Ok(round));
-                until("the second job to end", || order.lock().unwrap().len() == 1);
+                until("the second job to end", || order.lock().len() == 1);
                 Ok(round)
             });
             assert_eq!(held, Ok(round));
             let mut ended = [rx.recv_timeout(LONG).unwrap(), rx.recv_timeout(LONG).unwrap()];
             ended.sort();
             assert_eq!(ended, [Ok(0), Ok(1)]);
-            assert_eq!(*order.lock().unwrap(), [1, 0], "the jobs did not resume in the swapped order");
+            assert_eq!(*order.lock(), [1, 0], "the jobs did not resume in the swapped order");
             {
-                let tx = tx.clone();
                 pool.submit(
                     None,
                     || {
@@ -2269,7 +2358,7 @@ mod tests {
         let at = key(7_000);
         let claimed = Arc::new(AtomicUsize::new(0));
         {
-            let (tx, claimed) = (tx.clone(), claimed.clone());
+            let (tx, claimed) = (tx.clone(), Arc::clone(&claimed));
             pool.submit(
                 None,
                 move || {
@@ -2292,15 +2381,59 @@ mod tests {
                 move |it| _ = tx.send(it.map_err(|it| message(&*it))),
             );
         }
-        let named: String = at.0.iter().map(|byte| format!("{byte:02x}")).collect();
+        let named = at.0.iter().fold(String::new(), |mut text, byte| {
+            use std::fmt::Write as _;
+            write!(text, "{byte:02x}").expect("writing to a String cannot fail");
+            text
+        });
         for _ in 0..2 {
             let failed = rx.recv_timeout(LONG).unwrap().expect_err("a stalled job fails");
             assert!(failed.starts_with("stalled: "), "{failed}");
             assert!(failed.contains(&format!("key {named}, claimed by job ")), "the stall names the key: {failed}");
         }
-        let tx = tx.clone();
         pool.submit(None, || (), move |it| _ = tx.send(it.map_err(|it| message(&*it))));
         assert_eq!(rx.recv_timeout(LONG).unwrap(), Ok(()), "the pool ran no job after the stall");
+    }
+
+    /// On a pool of one worker, a job waits on an event and holds no thread: the worker runs
+    /// another job meanwhile. A thread of no pool fires it; the job goes on, and a wait after
+    /// the fire, on a worker or on no pool, ends at once.
+    #[test]
+    fn a_job_waiting_on_an_event_holds_no_thread_until_another_thread_fires_it() {
+        use crate::sched::{Event, EventWait};
+        let pool = Pool::new(&Topology::flat(1), false).unwrap();
+        let event = Event::new();
+        let on: EventWait = event.waiter();
+        let (tx, rx) = unbounded::<&'static str>();
+        {
+            let tx = tx.clone();
+            pool.submit(
+                None,
+                move || {
+                    on.wait().unwrap();
+                    "the waiter"
+                },
+                move |it| _ = tx.send(it.unwrap()),
+            );
+        }
+        until("the waiter to park", || pool.shared.parked.load(Ordering::SeqCst) == 1);
+        {
+            let tx = tx.clone();
+            pool.submit(None, || "a job meanwhile", move |it| _ = tx.send(it.unwrap()));
+        }
+        assert_eq!(rx.recv_timeout(LONG).unwrap(), "a job meanwhile");
+        std::thread::spawn(move || event.fire()).join().unwrap();
+        assert_eq!(rx.recv_timeout(LONG).unwrap(), "the waiter");
+        on.wait().unwrap();
+        pool.submit(
+            None,
+            move || {
+                on.wait().unwrap();
+                "after the fire"
+            },
+            move |it| _ = tx.send(it.unwrap()),
+        );
+        assert_eq!(rx.recv_timeout(LONG).unwrap(), "after the fire");
     }
 
     /// On a pool of one worker, busy while a background job and then two normal ones are
@@ -2312,7 +2445,7 @@ mod tests {
         let (tx, rx) = unbounded::<&'static str>();
         let started = Arc::new(AtomicUsize::new(0));
         {
-            let started = started.clone();
+            let started = Arc::clone(&started);
             pool.submit(
                 None,
                 move || {
@@ -2337,15 +2470,15 @@ mod tests {
     /// on it, promoted behind the queued one.
     #[test]
     fn a_scope_waiting_on_its_background_job_runs_it_ahead_of_normal_work() {
-        fn again(pool: Arc<Pool>, stop: Arc<AtomicUsize>) {
+        fn again(pool: &Arc<Pool>, stop: Arc<AtomicUsize>) {
             if stop.load(Ordering::SeqCst) == 0 {
-                let next = pool.clone();
-                pool.submit(None, move || again(next, stop), |it| it.unwrap());
+                let next = Arc::clone(pool);
+                pool.submit(None, move || again(&next, stop), |it| it.unwrap());
             }
         }
         let pool = Arc::new(Pool::new(&Topology::flat(1), false).unwrap());
         let stop = Arc::new(AtomicUsize::new(0));
-        again(pool.clone(), stop.clone());
+        again(&pool, Arc::clone(&stop));
         let ran = AtomicUsize::new(0);
         pool.scope(|scope| {
             scope.submit_as(None, Class::Background, || ran.store(1, Ordering::SeqCst), |it| it.unwrap());
@@ -2367,7 +2500,7 @@ mod tests {
         let at = key(7_100);
         let claimed = Arc::new(AtomicUsize::new(0));
         {
-            let (tx, claimed) = (tx.clone(), claimed.clone());
+            let (tx, claimed) = (tx.clone(), Arc::clone(&claimed));
             pool.submit(
                 None,
                 move || {
@@ -2382,8 +2515,8 @@ mod tests {
         until("the key to be claimed", || claimed.load(Ordering::SeqCst) == 1);
         let ended = Arc::new(AtomicUsize::new(0));
         {
-            let (tx, ended) = (tx.clone(), ended.clone());
-            let scoped = pool.clone();
+            let (tx, ended) = (tx.clone(), ended);
+            let scoped = Arc::clone(&pool);
             pool.submit(
                 None,
                 move || {
@@ -2410,7 +2543,6 @@ mod tests {
         got.sort();
         assert!(got[0].is_ok(), "the scope's caller saw its job's stall: {got:?}");
         assert!(got[1].as_ref().is_err_and(|it| it.starts_with("stalled: ")), "the key's claimer fails: {got:?}");
-        let tx = tx.clone();
         pool.submit(None, || (), move |it| _ = tx.send(it.map_err(|it| message(&*it))));
         assert_eq!(rx.recv_timeout(LONG).unwrap(), Ok(()), "the pool ran no job after the stall");
     }
@@ -2421,13 +2553,13 @@ mod tests {
     fn a_job_in_a_blocked_workers_slot_is_stolen() {
         let pool = Arc::new(Pool::new(&Topology::flat(2), false).unwrap());
         let (tx, rx) = bounded::<Option<u32>>(1);
-        let inner = pool.clone();
+        let inner = Arc::clone(&pool);
         pool.submit(
             None,
             move || {
                 let mine = inner.worker();
                 let (ran_tx, ran_rx) = bounded::<Option<u32>>(1);
-                let asked = inner.clone();
+                let asked = Arc::clone(&inner);
                 inner.scope(|scope| {
                     scope.submit(None, move || asked.worker(), move |it| _ = ran_tx.send(it.unwrap()));
                     // Blocks this worker's thread: only the other can run the job.
@@ -2446,33 +2578,32 @@ mod tests {
     /// but `a` runs after at most three of it.
     #[test]
     fn the_lifo_slot_runs_the_job_just_given_but_never_starves_the_deque() {
-        fn chain(pool: Arc<Pool>, log: Arc<Mutex<Vec<String>>>, n: u32) {
-            log.lock().unwrap().push(format!("b{n}"));
+        fn chain(pool: &Arc<Pool>, log: Arc<Mutex<Vec<String>>>, n: u32) {
+            log.lock().push(format!("b{n}"));
             if n < 20 {
-                let next = pool.clone();
-                pool.submit_next(move || chain(next, log, n + 1), |it| it.unwrap());
+                let next = Arc::clone(pool);
+                pool.submit_next(move || chain(&next, log, n + 1), |it| it.unwrap());
             }
         }
         let pool = Arc::new(Pool::new(&Topology::flat(1), false).unwrap());
         let log = Arc::new(Mutex::new(Vec::new()));
         {
-            let (inner, log) = (pool.clone(), log.clone());
+            let (inner, log) = (Arc::clone(&pool), Arc::clone(&log));
             pool.submit(
                 None,
                 move || {
-                    let a = log.clone();
-                    inner.submit_next(move || a.lock().unwrap().push("a".to_owned()), |it| it.unwrap());
-                    let next = inner.clone();
-                    inner.submit_next(move || chain(next, log, 0), |it| it.unwrap());
+                    let a = Arc::clone(&log);
+                    inner.submit_next(move || a.lock().push("a".to_owned()), |it| it.unwrap());
+                    let next = Arc::clone(&inner);
+                    inner.submit_next(move || chain(&next, log, 0), |it| it.unwrap());
                 },
                 |it| it.unwrap(),
             );
         }
         {
-            let log = log.clone();
-            until("the chain to end", || log.lock().unwrap().len() == 22);
+            until("the chain to end", || log.lock().len() == 22);
         }
-        let log = log.lock().unwrap().clone();
+        let log = log.lock().clone();
         assert_eq!(&log[..3], ["b0", "b1", "b2"], "the job just given runs next: {log:?}");
         assert_eq!(log[3], "a", "after three from the slot, the deque's job: {log:?}");
         assert_eq!(log.iter().filter(|it| it.starts_with('b')).count(), 21);
@@ -2486,7 +2617,7 @@ mod tests {
         let other = Arc::new(Pool::new(&Topology::flat(1), false).unwrap());
         let (tx, rx) = unbounded::<(Option<u32>, Option<u32>)>();
         for _ in 0..64 {
-            let (tx, mine, theirs) = (tx.clone(), pool.clone(), other.clone());
+            let (tx, mine, theirs) = (tx.clone(), Arc::clone(&pool), Arc::clone(&other));
             pool.submit_next(move || (mine.worker(), theirs.worker()), move |it| _ = tx.send(it.unwrap()));
         }
         for _ in 0..64 {
@@ -2503,7 +2634,7 @@ mod tests {
         let (tx, rx) = unbounded::<()>();
         for job in 0..500u32 {
             let tx = tx.clone();
-            pool.submit((job % 3 != 0).then_some(job % 2), || std::hint::spin_loop(), move |_| {
+            pool.submit((job % 3 != 0).then_some(job % 2), || std::hint::black_box(()), move |_| {
                 _ = tx.send(());
             });
         }
@@ -2535,7 +2666,7 @@ mod tests {
         tree.ran[node].fetch_add(1, Ordering::SeqCst);
         let mut scoped = Vec::new();
         for &(how, child) in &tree.children[node] {
-            let (pool2, tree2) = (pool.clone(), tree.clone());
+            let (pool2, tree2) = (Arc::clone(pool), Arc::clone(tree));
             let job = move || run_node(&pool2, &tree2, child);
             match how {
                 How::Submit(near) => pool.submit(near, job, |it| it.unwrap()),
@@ -2593,7 +2724,7 @@ mod tests {
             });
             let pool = Arc::new(Pool::new(&groups_of(count, each), false).unwrap());
             {
-                let (inner, tree) = (pool.clone(), tree.clone());
+                let (inner, tree) = (Arc::clone(&pool), Arc::clone(&tree));
                 pool.submit(None, move || run_node(&inner, &tree, 0), |it| it.unwrap());
             }
             until("the tree to run", || tree.ended.load(Ordering::SeqCst) == nodes);
@@ -2847,6 +2978,7 @@ mod model {
             stop: AtomicBool::new(false),
             mixed: false,
             stray: Lock::new(None),
+            parked: AtomicUsize::new(0),
             critical: AtomicUsize::new(0),
         });
         (shared, deques)

@@ -254,7 +254,7 @@ pub fn write_section(db: &Db, out: &mut Vec<u8>) {
     // alloc: the index, once per image written
     let mut rows: Vec<(Key, u64, u32)> = Vec::new();
     // alloc: as above
-    let mut written = rustc_hash::FxHashSet::default();
+    let mut written = blaze_hash::HashSet::default();
     // alloc: as above
     let mut texts: Vec<[u8; 32]> = Vec::new();
     for input in db.files().texts() {

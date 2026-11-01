@@ -8,7 +8,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use blaze_manifest::config::schema::{CargoResolverConfig, FeatureUnification, IncompatibleRustVersions};
+use blaze_hash::HashSet;
+use blaze_manifest::config::schema::{
+    CargoResolverConfig, FeatureUnification, IncompatibleRustVersions,
+};
 use blaze_manifest::dependency::SerializedDependency;
 use blaze_manifest::files::Files;
 use blaze_manifest::manifest::{EitherManifest, Manifest, read_manifest};
@@ -22,7 +25,6 @@ use blaze_resolve::{
     DepKind, Dependency, GitReference, InternedString, PackageIdSpec, PartialVersion, RustVersion,
     SourceId, Summary,
 };
-use rustc_hash::FxHashSet;
 use url::Url;
 
 /// What the resolve and its graph read of one package.
@@ -278,7 +280,7 @@ pub fn path_packages<F: Files>(
     ctx: &Context<F>,
 ) -> Result<Vec<Package>> {
     // alloc: the directories seen, once per load
-    let mut seen: FxHashSet<PathBuf> = ws.members().filter_map(|(path, _)| path.parent().map(Path::to_owned)).collect();
+    let mut seen: HashSet<PathBuf> = ws.members().filter_map(|(path, _)| path.parent().map(Path::to_owned)).collect();
     let mut queue = patch_paths(root);
     queue.extend(replace_paths(replace));
     for (path, m) in ws.members() {

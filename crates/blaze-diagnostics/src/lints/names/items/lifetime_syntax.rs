@@ -19,7 +19,7 @@ use blaze_items::Fact;
 use hir::{InFile, ModuleDef, PathResolution};
 use std::collections::hash_map::Entry;
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use smallvec::SmallVec;
 use syntax::{
     SmolStr, SyntaxKind, TextRange, TextSize,
@@ -694,7 +694,7 @@ fn mismatch<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, inputs: &[&Info], outputs: 
 fn for_lifetime(name: &str, infos: &[&Info]) -> Vec<(TextRange, String)> {
     let mut parts = Vec::new(); // alloc: the firing lint's suggestion
     let mut paths: Vec<((TextRange, Angle), (TextRange, usize))> = Vec::new(); // alloc: the firing lint's suggestion
-    let mut index: FxHashMap<(TextRange, Angle), usize> = FxHashMap::default();
+    let mut index: HashMap<(TextRange, Angle), usize> = HashMap::default();
     for info in infos {
         if let (Syntax::Implicit, Source::Path(angle)) = (info.syntax, info.source) {
             let at = match angle {

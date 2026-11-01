@@ -54,9 +54,9 @@ pub trait Http: Send + Sync {
         Box::pin(std::future::ready(self.get(url, headers)))
     }
 
-    /// A wait that holds no thread; by default it holds this one.
+    /// A wait that holds no thread; by default it holds this one ([`wait_out`]).
     fn sleep(&self, duration: Duration) -> Pending<()> {
-        std::thread::sleep(duration);
+        wait_out(duration);
         Box::pin(std::future::ready(()))
     }
 }
@@ -126,8 +126,8 @@ impl Retry {
         let mut tried = 0;
         loop {
             match attempt() {
-                Err(e) => match self.again(&mut tried, &e) {
-                    Some(wait) => std::thread::sleep(wait),
+                Err(e) => match self.again(&mut tried, &e, SystemTime::now()) {
+                    Some(wait) => wait_out(wait),
                     None => return Err(e),
                 },
                 it => return it,
@@ -146,7 +146,7 @@ impl Retry {
         let mut tried = 0;
         loop {
             match attempt().await {
-                Err(e) => match self.again(&mut tried, &e) {
+                Err(e) => match self.again(&mut tried, &e, SystemTime::now()) {
                     Some(wait) => http.sleep(wait).await,
                     None => return Err(e),
                 },
@@ -155,9 +155,10 @@ impl Retry {
         }
     }
 
-    /// How long to wait before trying again after `e`, said as cargo says it; none when `e`
-    /// is not worth another try or the tries are used up.
-    fn again(&self, tried: &mut u32, e: &anyhow::Error) -> Option<Duration> {
+    /// How long to wait before trying again after `e`, said as cargo says it, at `now` (the
+    /// first wait's jitter is read from it); none when `e` is not worth another try or the
+    /// tries are used up.
+    fn again(&self, tried: &mut u32, e: &anyhow::Error, now: SystemTime) -> Option<Duration> {
         if *tried >= self.retries || !spurious(e) {
             return None;
         }
@@ -169,7 +170,7 @@ impl Retry {
         *tried += 1;
         let after = e.downcast_ref::<HttpNotSuccessful>().and_then(retry_after);
         let sleep = after.map_or_else(
-            || self.fixed_sleep_ms.unwrap_or_else(|| sleep_ms(*tried)),
+            || self.fixed_sleep_ms.unwrap_or_else(|| sleep_ms(*tried, now)),
             |it| it.min(MAX_RETRY_SLEEP_MS),
         );
         Some(Duration::from_millis(sleep))
@@ -184,15 +185,22 @@ fn spurious(e: &anyhow::Error) -> bool {
     }
 }
 
-/// The wait before try `tried + 1`: half a second and up to a second more at random first,
-/// then three seconds more each time, to ten.
-fn sleep_ms(tried: u32) -> u64 {
+/// The wait before try `tried + 1`: half a second and up to a second more at random first
+/// (from `now`'s milliseconds), then three seconds more each time, to ten.
+fn sleep_ms(tried: u32, now: SystemTime) -> u64 {
     if tried == 1 {
-        let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
-        INITIAL_RETRY_SLEEP_BASE_MS + u64::from(nanos.subsec_nanos()) % INITIAL_RETRY_JITTER_MS
+        let since = now.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+        INITIAL_RETRY_SLEEP_BASE_MS + u64::from(since.subsec_millis()) % INITIAL_RETRY_JITTER_MS
     } else {
         (u64::from(tried - 1) * 3 * 1000 + INITIAL_RETRY_SLEEP_BASE_MS).min(MAX_RETRY_SLEEP_MS)
     }
+}
+
+/// Holds this thread for a wait [`Retry::again`] gave: the retries' one timer, where the asker
+/// has no runtime to wait on.
+#[allow(clippy::disallowed_methods, reason = "the retries' timer: `Retry::again` decides the wait, from the time it is given")]
+fn wait_out(wait: Duration) {
+    std::thread::sleep(wait);
 }
 
 /// A `Retry-After` of seconds, on the answers it applies to, 429 and 503.
@@ -409,11 +417,14 @@ mod tests {
 
     #[test]
     fn sleeps_as_cargo() {
-        assert!((500..1500).contains(&sleep_ms(1)));
-        assert_eq!(sleep_ms(2), 3500);
-        assert_eq!(sleep_ms(3), 6500);
-        assert_eq!(sleep_ms(4), 9500);
-        assert_eq!(sleep_ms(5), 10000);
+        let at = |nanos| SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, nanos);
+        assert_eq!(sleep_ms(1, at(0)), 500);
+        assert_eq!(sleep_ms(1, at(250_000_000)), 750);
+        assert_eq!(sleep_ms(1, at(999_999_999)), 1499);
+        assert_eq!(sleep_ms(2, at(250_000_000)), 3500);
+        assert_eq!(sleep_ms(3, at(0)), 6500);
+        assert_eq!(sleep_ms(4, at(0)), 9500);
+        assert_eq!(sleep_ms(5, at(0)), 10000);
         let answer = |code, after: &str| HttpNotSuccessful {
             url: String::new(),
             code,
@@ -422,5 +433,43 @@ mod tests {
         };
         assert_eq!(retry_after(&answer(429, "2")), Some(2000));
         assert_eq!(retry_after(&answer(500, "2")), None);
+    }
+
+    /// The waits [`Retry::again`] gives, at a time the test picks: a `Retry-After` of seconds
+    /// on a 429 or a 503, to ten seconds; cargo's schedule where there is none, it is not
+    /// seconds, or the answer is another; none past the tries or for an answer not worth one.
+    #[test]
+    fn the_waits_between_tries_follow_retry_after_then_cargos_schedule() {
+        let now = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 250_000_000);
+        let retry = Retry { retries: 3, quiet: true, fixed_sleep_ms: None };
+        let failed = |status: u16, after: Option<&str>| -> anyhow::Error {
+            let headers = after.map(|it| vec![("retry-after".to_owned(), it.to_owned())]).unwrap_or_default();
+            HttpNotSuccessful::new("u", &Response { status, headers, body: Vec::new() }).into()
+        };
+        let waits = |errors: &[anyhow::Error]| -> Vec<Option<u64>> {
+            let mut tried = 0;
+            errors.iter().map(|e| retry.again(&mut tried, e, now).map(|it| u64::try_from(it.as_millis()).unwrap())).collect()
+        };
+        assert_eq!(waits(&[failed(429, Some("2")), failed(503, Some("4")), failed(429, Some("60"))]), [
+            Some(2000),
+            Some(4000),
+            Some(10000)
+        ]);
+        assert_eq!(waits(&[failed(500, Some("2")), failed(503, None), failed(429, Some("soon"))]), [
+            Some(750),
+            Some(3500),
+            Some(6500)
+        ]);
+        assert_eq!(waits(&[failed(500, None), failed(500, None), failed(500, None), failed(500, None)]), [
+            Some(750),
+            Some(3500),
+            Some(6500),
+            None
+        ]);
+        assert_eq!(waits(&[failed(403, Some("2"))]), [None]);
+        let fixed = Retry { fixed_sleep_ms: Some(7), ..retry };
+        let mut tried = 0;
+        assert_eq!(fixed.again(&mut tried, &failed(429, Some("2")), now), Some(Duration::from_secs(2)));
+        assert_eq!(fixed.again(&mut tried, &failed(500, None), now), Some(Duration::from_millis(7)));
     }
 }

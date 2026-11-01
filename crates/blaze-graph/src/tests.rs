@@ -1,12 +1,10 @@
-use std::sync::{
-    Mutex,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::rng::SplitMix64;
 use blaze_protocol::events::{Event, NodeKind, NodeState, Record};
 use expect_test::{expect, expect_file};
-use rustc_hash::{FxHashMap, FxHashSet};
+use parking_lot::Mutex;
 
 use crate::{
     exec::{Did, drive},
@@ -312,7 +310,7 @@ fn random_builds_keep_the_rules() {
         };
         let mut specs = Vec::new();
         for id in 0..nodes {
-            let deps: FxHashSet<u32> = (0..random.below(4))
+            let deps: HashSet<u32> = (0..random.below(4))
                 .filter(|_| id > 0)
                 .map(|_| random.below(id.into()) as u32)
                 .collect();
@@ -321,17 +319,17 @@ fn random_builds_keep_the_rules() {
             let pool = if random.below(3) == 0 { Pool::Io } else { Pool::Work };
             specs.push(spec(id, NodeKind::Names, &deps, pool, random.below(10)));
         }
-        let deps_of: FxHashMap<u32, Vec<u32>> =
+        let deps_of: HashMap<u32, Vec<u32>> =
             specs.iter().map(|it| (it.id.0, it.deps.iter().map(|it| it.0).collect())).collect();
-        let pool_of: FxHashMap<u32, Pool> = specs.iter().map(|it| (it.id.0, it.pool)).collect();
+        let pool_of: HashMap<u32, Pool> = specs.iter().map(|it| (it.id.0, it.pool)).collect();
         let mut machine = Machine::new(config).unwrap();
         let mut running: Vec<u32> = Vec::new();
         let mut finished = None;
-        let mut states: FxHashMap<u32, NodeState> = FxHashMap::default();
+        let mut states: HashMap<u32, NodeState> = HashMap::default();
         let mut critical = Vec::new();
         let take = |outputs: Vec<Output>,
                     running: &mut Vec<u32>,
-                    states: &mut FxHashMap<u32, NodeState>,
+                    states: &mut HashMap<u32, NodeState>,
                     finished: &mut Option<bool>,
                     critical: &mut Vec<u32>| {
             for output in outputs {
@@ -408,7 +406,7 @@ fn step_into_gives_what_step_gives() {
         };
         let mut specs = Vec::new();
         for id in 0..nodes {
-            let deps: FxHashSet<u32> = (0..random.below(4))
+            let deps: HashSet<u32> = (0..random.below(4))
                 .filter(|_| id > 0)
                 .map(|_| random.below(id.into()) as u32)
                 .collect();
@@ -533,7 +531,7 @@ fn the_executor_adds_what_work_finds_and_fails_on_a_panic() {
             &mut machine,
             vec![spec(0, NodeKind::Manifest, &[], Pool::Io, 1)],
             &|id| {
-                ran.lock().unwrap().push(id.0);
+                ran.lock().push(id.0);
                 match id.0 {
                     0 => Did {
                         outcome: Outcome::Built,
@@ -551,7 +549,7 @@ fn the_executor_adds_what_work_finds_and_fails_on_a_panic() {
     let panic = drove.err().expect("the work's panic reaches the caller");
     assert_eq!(panic.downcast_ref::<&str>(), Some(&"no def map"));
     assert!(matches!(records.last().map(|it| &it.event), Some(Event::Critical { .. })));
-    let mut ran = ran.into_inner().unwrap();
+    let mut ran = ran.into_inner();
     ran.sort();
     assert_eq!(ran, [0, 1, 2]);
     assert_eq!(

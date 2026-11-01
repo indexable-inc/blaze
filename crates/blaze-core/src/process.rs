@@ -84,7 +84,7 @@ pub(crate) fn start(
             std::fs::create_dir_all(&scratch)?;
             match confine.confine(&command, &scratch) {
                 // clone: the sandbox maker, kept to ask what the process read.
-                Ok(confined) => (Some(confined), Some(scratch), Some(confine.clone())),
+                Ok(confined) => (Some(confined), Some(scratch), Some(Arc::clone(confine))),
                 Err(why) => {
                     _ = std::fs::remove_dir_all(&scratch);
                     // alloc: an error path.

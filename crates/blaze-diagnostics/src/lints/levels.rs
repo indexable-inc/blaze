@@ -10,7 +10,7 @@
 //! - `builder`: the diagnostics of what the front end's builder finds.
 //!
 //! Cost: a node with no attribute costs the walk a check of its kind. A lint found costs one
-//! perfect hash of its name to its lint, one FxHash of its node (or of each node out to the
+//! perfect hash of its name to its lint, one hash of its node (or of each node out to the
 //! nearest one seen), and one bit test for a lint no attribute nor flag names; else one bit
 //! test of each set of levels from there out and a scan of the 2-byte lint ids of the one that
 //! has it. A level is a 12-byte `Spec`. Nothing is allocated for a lint unless it is shown.
@@ -332,7 +332,7 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
 /// `unsafe_op_in_unsafe_fn`) at a node of a body; at an item, it is
 /// `hir_lint_levels::lint_level`'s.
 ///
-/// Cost: a level at a node seen before is one FxHash probe and the bit tests of
+/// Cost: a level at a node seen before is one hash probe and the bit tests of
 /// [`Levels::spec`], with nothing allocated. At a node not seen, the node is found in its tree
 /// and each node between it and the nearest one seen is hashed once and read for attributes.
 /// Nothing is said of the names in the attributes: [`decide`]'s builders say it.

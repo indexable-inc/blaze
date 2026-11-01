@@ -6,7 +6,7 @@ use std::{panic::RefUnwindSafe, sync};
 
 use base_db::{Crate, CrateBuilderId, CratesIdMap, Db, Env, ProcMacroLoadingError};
 use intern::Symbol;
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use blaze_query::db::{Durability, Setter};
 use span::Span;
 use triomphe::Arc;
@@ -136,7 +136,7 @@ pub type ProcMacroLoadResult = Result<Vec<ProcMacro>, ProcMacroLoadingError>;
 type StoredProcMacroLoadResult = Result<Box<[ProcMacro]>, ProcMacroLoadingError>;
 
 #[derive(Default, Debug)]
-pub struct ProcMacrosBuilder(FxHashMap<CrateBuilderId, Arc<CrateProcMacros>>);
+pub struct ProcMacrosBuilder(HashMap<CrateBuilderId, Arc<CrateProcMacros>>);
 
 impl ProcMacrosBuilder {
     pub fn insert(
@@ -169,7 +169,7 @@ impl ProcMacrosBuilder {
             .0
             .into_iter()
             .map(|(krate, proc_macro)| (crates_id_map[&krate], proc_macro))
-            .collect::<FxHashMap<_, _>>();
+            .collect::<HashMap<_, _>>();
         map.shrink_to_fit();
         ProcMacros::try_get(db)
             .unwrap_or_else(|| ProcMacros::new(db, Default::default()))
@@ -197,7 +197,7 @@ pub struct CrateProcMacros(StoredProcMacroLoadResult);
 #[blaze_query::input(singleton, debug)]
 pub struct ProcMacros {
     #[returns(ref)]
-    pub by_crate: FxHashMap<Crate, Arc<CrateProcMacros>>,
+    pub by_crate: HashMap<Crate, Arc<CrateProcMacros>>,
 }
 
 impl ProcMacros {
@@ -315,6 +315,23 @@ impl PartialEq for ProcMacro {
 }
 
 /// A custom proc-macro expander handle. This handle together with its crate resolves to a [`ProcMacro`]
+/// Why a macro of proc-macro crate `krate` has no expander, as the proc-macro map says now:
+/// what the call's error keeps, so it says the reason the expansion had even once the map
+/// changes. An unexpanded macro fails the build whatever the reason.
+fn missing(db: &Db, krate: Crate) -> ExpandErrorKind {
+    let name = krate.extra_data(db).display_name.as_ref().map(|it| it.canonical_name().as_str());
+    let name = name.unwrap_or("<unnamed>");
+    let why = match ProcMacros::get_for_crate(db, krate).map(|it| &it.0) {
+        // alloc: an error's message, once per macro call that can't be expanded
+        None => format!("the proc-macro crate `{name}` ({krate:?}) has no entry in the proc-macro map"),
+        // alloc: as above
+        Some(Err(e)) => format!("the proc-macro crate `{name}` ({krate:?}): {e}"),
+        // alloc: as above
+        Some(Ok(_)) => format!("the proc-macro crate `{name}` ({krate:?}) loaded and exports no macro of this name"),
+    };
+    ExpandErrorKind::MissingProcMacroExpander { krate, why: why.into_boxed_str() }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct CustomProcMacroExpander {
     proc_macro_id: u32,
@@ -380,11 +397,11 @@ impl CustomProcMacroExpander {
             .is_some_and(|it| it.expander.requires_session())
     }
 
-    pub fn as_expand_error(&self, def_crate: Crate) -> Option<ExpandErrorKind> {
+    pub fn as_expand_error(&self, db: &Db, def_crate: Crate) -> Option<ExpandErrorKind> {
         match self.proc_macro_id {
             Self::PROC_MACRO_ATTR_DISABLED => Some(ExpandErrorKind::ProcMacroAttrExpansionDisabled),
             Self::DISABLED_ID => Some(ExpandErrorKind::MacroDisabled),
-            Self::MISSING_EXPANDER => Some(ExpandErrorKind::MissingProcMacroExpander(def_crate)),
+            Self::MISSING_EXPANDER => Some(missing(db, def_crate)),
             _ => None,
         }
     }
@@ -407,7 +424,7 @@ impl CustomProcMacroExpander {
             ),
             Self::MISSING_EXPANDER => ExpandResult::new(
                 tt::TopSubtree::empty(tt::DelimSpan { open: call_site, close: call_site }),
-                ExpandError::new(call_site, ExpandErrorKind::MissingProcMacroExpander(def_crate)),
+                ExpandError::new(call_site, missing(db, def_crate)),
             ),
             Self::DISABLED_ID => ExpandResult::new(
                 tt::TopSubtree::empty(tt::DelimSpan { open: call_site, close: call_site }),
@@ -481,5 +498,48 @@ impl CustomProcMacroExpander {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixture::{db, test_crate};
+
+    fn why(db: &Db, krate: Crate) -> Box<str> {
+        match missing(db, krate) {
+            ExpandErrorKind::MissingProcMacroExpander { krate: of, why } => {
+                assert_eq!(of, krate);
+                why
+            }
+            other => panic!("not a missing expander: {other:?}"),
+        }
+    }
+
+    fn set(db: &mut Db, krate: Crate, macros: ProcMacroLoadResult) {
+        let mut map = HashMap::default();
+        map.insert(krate, Arc::new(CrateProcMacros::new(macros)));
+        ProcMacros::try_get(db)
+            .unwrap_or_else(|| ProcMacros::new(db, Default::default()))
+            .set_by_crate(db)
+            .with_durability(Durability::HIGH)
+            .to(map);
+    }
+
+    #[test]
+    fn a_missing_expander_says_why_as_the_map_had_it_at_the_call() {
+        let mut fixture = db("//- /lib.rs crate:pm\npub fn f() {}\n");
+        let krate = test_crate(fixture.db());
+        let none = why(fixture.db(), krate);
+        assert!(none.contains("`pm`") && none.contains("no entry in the proc-macro map"), "{none}");
+        set(fixture.db_mut(), krate, Err(ProcMacroLoadingError::NotYetBuilt));
+        let unbuilt = why(fixture.db(), krate);
+        assert!(unbuilt.contains("`pm`") && unbuilt.contains("proc-macro not yet built"), "{unbuilt}");
+        set(fixture.db_mut(), krate, Ok(Vec::new()));
+        let loaded = why(fixture.db(), krate);
+        assert!(loaded.contains("exports no macro of this name"), "{loaded}");
+        let error = ExpandErrorKind::MissingProcMacroExpander { krate, why: unbuilt.clone() };
+        let rendered = error.render_to_string(fixture.db());
+        assert_eq!((rendered.message.as_str(), rendered.error), (&*unbuilt, true));
     }
 }

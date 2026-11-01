@@ -14,12 +14,12 @@ mod tests;
 use std::{borrow::Borrow, cell::RefCell, mem, ops::Index, sync::LazyLock};
 
 use base_db::Db;
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::radix;
 use cfg::CfgExpr;
 use either::Either;
 use hir_expand::{InFile, MacroCallId, mod_path::ModPath, name::Name};
 use la_arena::Arena;
-use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use span::{Edition, SyntaxContext};
 use syntax::{AstPtr, SyntaxNodePtr, ast};
@@ -41,8 +41,8 @@ use crate::{
     nameres::{DefMap, block_def_map},
     signatures::VariantFields,
     type_ref::{
-        ArrayType, ConstRef, FnType, LifetimeRef, LifetimeRefId, RefType, TypeBound,
-        TypeColumns, TypeRef, TypeRefId, UseArgRef,
+        ArrayType, ConstRef, FnType, LifetimeRef, LifetimeRefId, RefType, TypeBound, TypeColumns,
+        TypeRef, TypeRefId, UseArgRef,
     },
 };
 
@@ -226,14 +226,14 @@ pub struct ExpressionStoreBuilder {
     pub bindings: Arena<Binding>,
     pub labels: Arena<Label>,
     pub lifetimes: Arena<LifetimeRef>,
-    pub binding_owners: FxHashMap<BindingId, ExprId>,
+    pub binding_owners: HashMap<BindingId, ExprId>,
     block_scopes: Vec<BlockId>,
-    ident_hygiene: FxHashMap<ExprOrPatIdPacked, HygieneId>,
+    ident_hygiene: HashMap<ExprOrPatIdPacked, HygieneId>,
     pub(crate) type_hygiene: Vec<(TypeRefId, HygieneId)>,
-    block_editions: FxHashMap<ExprId, Edition>,
+    block_editions: HashMap<ExprId, Edition>,
 
     /// The closures written with `#[rustc_inherit_overflow_checks]`.
-    overflow_inheriting: FxHashSet<ExprId>,
+    overflow_inheriting: HashSet<ExprId>,
     inference_roots: Option<SmallVec<[ExprRoot; 1]>>,
 
     // AST expressions can create patterns in destructuring assignments. Therefore, `ExprSource` can also map
@@ -526,12 +526,12 @@ struct Scratch {
     bindings: Arena<Binding>,
     labels: Arena<Label>,
     lifetimes: Arena<LifetimeRef>,
-    binding_owners: FxHashMap<BindingId, ExprId>,
+    binding_owners: HashMap<BindingId, ExprId>,
     block_scopes: Vec<BlockId>,
-    ident_hygiene: FxHashMap<ExprOrPatIdPacked, HygieneId>,
+    ident_hygiene: HashMap<ExprOrPatIdPacked, HygieneId>,
     type_hygiene: Vec<(TypeRefId, HygieneId)>,
-    block_editions: FxHashMap<ExprId, Edition>,
-    overflow_inheriting: FxHashSet<ExprId>,
+    block_editions: HashMap<ExprId, Edition>,
+    overflow_inheriting: HashSet<ExprId>,
     expr_map: Vec<(ExprSource, ExprOrPatIdPacked)>,
     pat_map: Vec<(PatSource, ExprOrPatIdPacked)>,
     label_map: Vec<(LabelSource, LabelId)>,

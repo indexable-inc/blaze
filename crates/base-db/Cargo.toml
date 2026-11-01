@@ -13,9 +13,11 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
+blaze-hash.workspace = true
+crossbeam-queue.workspace = true
 la-arena.workspace = true
 blaze-query.workspace = true
-rustc-hash.workspace = true
+parking_lot.workspace = true
 hashbrown.workspace = true
 smallvec.workspace = true
 triomphe.workspace = true
@@ -41,6 +43,7 @@ intern.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+crossbeam-channel.workspace = true
 hegeltest.workspace = true
 
 [features]

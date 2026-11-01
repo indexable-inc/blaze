@@ -20,8 +20,8 @@ use arrow_array::{
     types::{Int32Type, Int64Type, UInt16Type, UInt32Type, UInt64Type},
 };
 use arrow_schema::{ArrowError, DataType};
+use blaze_hash::HashMap;
 use blaze_profile::{batches::schema_of, schema};
-use rustc_hash::FxHashMap;
 
 /// The most buckets one request may ask for: eight 8K screens across.
 pub const MAX_BUCKETS: u64 = 1 << 16;
@@ -242,7 +242,7 @@ fn names<'a>(batch: &'a RecordBatch) -> Result<Names<'a>, TilesError> {
 /// The names of the output, each once: their number is their key in the output's dictionary.
 #[derive(Default)]
 struct NameTable<'a> {
-    ids: FxHashMap<&'a str, u32>,
+    ids: HashMap<&'a str, u32>,
     names: Vec<&'a str>,
 }
 

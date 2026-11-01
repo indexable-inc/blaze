@@ -20,14 +20,14 @@ use std::sync::Arc;
 
 use blaze_codegen::Arch;
 use blaze_graph::par;
+use blaze_hash::HashMap;
 use blaze_ids::radix;
-use rustc_hash::FxHashMap;
 
 use crate::arena::{FrameVec, collect_in};
 use crate::cow::{CowBytes, IdSet};
 use crate::model::{
-    Apply, Bind, Class, Delta, Export, Fixup, Formats, Function, GotEntry, Holds, Import, Pages, Placed, Region, Special,
-    Splice, Sym, SymbolKind, Tls, WindowsUnwind, Writer,
+    Apply, Bind, Class, Delta, Export, Fixup, Formats, Function, GotEntry, Holds, Import, Pages,
+    Placed, Region, Special, Splice, Sym, SymbolKind, Tls, WindowsUnwind, Writer,
 };
 use crate::place::Totals;
 use crate::reloc::{self, Bad, Ctx, GotKind};
@@ -1672,7 +1672,7 @@ impl<'a> Stage<'a> {
                 let from = chunk * DEBUG_CHUNK;
                 // alloc: once per task of DEBUG_CHUNK functions, its files (a few)
                 let mut met: Met<'_> = Vec::new();
-                let mut file_of: FxHashMap<(IdNo, u32), u32> = FxHashMap::default();
+                let mut file_of: HashMap<(IdNo, u32), u32> = HashMap::default();
                 let mut last: Option<(&blaze_ids::ContentId, IdNo, &crate::position::Spans)> = None;
                 let mut at = 0;
                 for (info, _) in &functions[from..(from + DEBUG_CHUNK).min(functions.len())] {
@@ -1707,7 +1707,7 @@ impl<'a> Stage<'a> {
             }); // alloc: once per stage that makes debug info, a result per task
         // alloc: once per stage that makes debug info, the files and each task's numbers for its own
         let mut files: Vec<&str> = Vec::new();
-        let mut file_of: FxHashMap<(IdNo, u32), u32> = FxHashMap::default();
+        let mut file_of: HashMap<(IdNo, u32), u32> = HashMap::default();
         let mut renumber: Vec<Vec<u32>> = Vec::with_capacity(met.len());
         for met in met {
             let numbers = met?

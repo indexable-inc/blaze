@@ -15,13 +15,13 @@ doctest = false
 
 [dependencies]
 blaze-format.workspace = true
+blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
 blaze-mem.workspace = true
 blaze-query.workspace = true
 
 la-arena.workspace = true
-rustc-hash.workspace = true
 smallvec.workspace = true
 rustc_type_ir.workspace = true
 
@@ -39,6 +39,7 @@ syntax.workspace = true
 blaze-alloc-count.workspace = true
 hegeltest.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
+parking_lot.workspace = true
 
 [lints]
 workspace = true

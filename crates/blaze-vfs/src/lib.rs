@@ -40,8 +40,8 @@ pub mod watch;
 use std::{borrow::Cow, fmt};
 
 use blaze_core::{Completion, Effect, FileName, Tag};
+use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Idx};
-use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -264,7 +264,7 @@ pub struct Ticket(pub u64);
 /// through effects.
 pub struct Vfs {
     tree: Tree,
-    heads: FxHashMap<Box<str>, NodeId>,
+    heads: HashMap<Box<str>, NodeId>,
     /// By view: its root while it is open. A closed view's number is not given out again.
     views: Vec<Option<NodeId>>,
     journal: Journal,

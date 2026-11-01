@@ -25,12 +25,13 @@ mod journal;
 
 use std::{mem, path::PathBuf, time::Duration};
 
+use blaze_hash::HashMap;
 use blaze_mem::{Slab, Tag as MemTag};
-use rustc_hash::FxHashMap;
 
 pub use self::journal::Journal;
 use crate::{
-    Access, Address, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName, IoError, Meta, RECV_MOST, Tag,
+    Access, Address, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName, IoError,
+    Meta, RECV_MOST, Tag,
     threads::tagged::{Id, Tagged},
     wheel::{self, Wheel},
 };
@@ -255,10 +256,10 @@ pub struct Sim {
     rng: Rng,
     faults: Faults,
     now: Duration,
-    files: FxHashMap<FileName, SimFile>,
+    files: HashMap<FileName, SimFile>,
     /// Whose a file or directory is and who else can write it, where a test said it is not
     /// the user's alone ([`Sim::set_access`]).
-    access: FxHashMap<FileName, Access>,
+    access: HashMap<FileName, Access>,
     /// Effects in flight by the tick of the virtual clock they are ready at. The clock ends
     /// some 584 years in ([`wheel::ticks`]): one due later is due at its end.
     pending: Wheel<Pending>,
@@ -276,7 +277,7 @@ pub struct Sim {
     told: Vec<Told>,
     /// What a poll left in `told`, swapped with it: both keep their room.
     later: Vec<Told>,
-    programs: FxHashMap<PathBuf, Program>,
+    programs: HashMap<PathBuf, Program>,
     listens: Tagged<Address>,
     ends: Slab<End>,
     /// Receives waiting for bytes or a hang-up.
@@ -301,7 +302,7 @@ fn after_told(told: &[Told], at: Duration, a: Tag, b: Tag) -> Duration {
 }
 
 /// The file `name` of the simulated disk, made empty if it is not there.
-fn file_mut<'a>(files: &'a mut FxHashMap<FileName, SimFile>, name: &FileName) -> &'a mut SimFile {
+fn file_mut<'a>(files: &'a mut HashMap<FileName, SimFile>, name: &FileName) -> &'a mut SimFile {
     if !files.contains_key(name) {
         // clone: once per file new to the simulated disk, its key.
         files.insert(name.clone(), SimFile::default());
@@ -315,8 +316,8 @@ impl Sim {
             rng: Rng::new(seed),
             faults,
             now: Duration::ZERO,
-            files: FxHashMap::default(),
-            access: FxHashMap::default(),
+            files: HashMap::default(),
+            access: HashMap::default(),
             pending: Wheel::new(),
             spawns: Tagged::new(RESERVE),
             ready: Vec::with_capacity(RESERVE),
@@ -325,7 +326,7 @@ impl Sim {
             disk: journal::Disk::default(),
             told: Vec::with_capacity(RESERVE),
             later: Vec::with_capacity(RESERVE),
-            programs: FxHashMap::default(),
+            programs: HashMap::default(),
             listens: Tagged::new(RESERVE),
             ends: match Slab::new(MAX_ENDS, MemTag::Io) {
                 Ok(ends) => ends,
@@ -1942,7 +1943,7 @@ mod tests {
     }
 
     /// The ends of connections in their slab, named by handle bits, against the map of
-    /// connections they replace (an `FxHashMap<Conn, End>` keyed by a counter, an end gone once
+    /// connections they replace (an `HashMap<Conn, End>` keyed by a counter, an end gone once
     /// hung up and the peer outside hung up too): the same answers to the same random sends,
     /// hang-ups, peer hang-ups and takes on every seed, stale conns included.
     #[test]
@@ -1969,7 +1970,7 @@ mod tests {
         for seed in 0..100 {
             let mut sim = Sim::new(seed, Faults::default());
             sim.submit(&mut vec![Effect::Listen { at: at.clone(), tag: Tag(1) }]);
-            let mut model: FxHashMap<u64, Old> = FxHashMap::default();
+            let mut model: HashMap<u64, Old> = HashMap::default();
             let mut conns: Vec<Conn> = Vec::new();
             let mut rng = Rng::new(seed ^ 0x5eed);
             let mut out = Vec::new();

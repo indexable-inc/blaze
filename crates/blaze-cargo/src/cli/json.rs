@@ -15,7 +15,7 @@ use blaze_api::{
     Applicability, Artifact, BuildScriptRanRef, CrateType, DiagnosticRef, SpanRef, UnitOfRef, UnitTarget,
     UnitTargetRef,
 };
-use rustc_hash::FxBuildHasher;
+use blaze_hash::FixedState;
 
 use super::print::ByHash;
 
@@ -531,7 +531,7 @@ struct Source {
 }
 
 /// The source files spans point into, as on disk, each read once: rustc's JSON carries the
-/// text of the lines a span covers. A name is found by the Fx hash of the directory of its
+/// text of the lines a span covers. A name is found by the hash of the directory of its
 /// unit's manifest and the name as the span has it, with one probe; every file's text goes into
 /// one buffer and every line start into another, 4 bytes a line, so that once the buffers have
 /// grown a lookup or a read allocates nothing.
@@ -579,7 +579,7 @@ impl Sources {
     /// in, which is the workspace root, an ancestor of the unit's manifest directory `dir`: the
     /// nearest one that has it.
     pub fn file(&mut self, name: &str, dir: &str) -> Option<u32> {
-        match self.named.entry(FxBuildHasher.hash_one((dir, name))) {
+        match self.named.entry(FixedState.hash_one((dir, name))) {
             Entry::Occupied(found) => *found.get(),
             Entry::Vacant(slot) => *slot.insert(self.texts.file(Path::new(name), Path::new(dir))),
         }
@@ -630,7 +630,7 @@ impl Texts {
     /// The file at `path`, read the first time; `None` for no file there.
     fn read(&mut self) -> Option<u32> {
         let Texts { at, files, text, starts, path, bytes, .. } = self;
-        let slot = match at.entry(FxBuildHasher.hash_one(path.as_os_str().as_encoded_bytes())) {
+        let slot = match at.entry(FixedState.hash_one(path.as_os_str().as_encoded_bytes())) {
             Entry::Occupied(found) => return Some(*found.get()),
             Entry::Vacant(slot) => slot,
         };

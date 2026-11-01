@@ -14,10 +14,9 @@
 //!   no lock taken while a thread is stopped.
 //! - Elsewhere [`start`] says there is no sampler.
 
-use std::{
-    sync::{Mutex, MutexGuard, atomic::AtomicBool},
-    time::Instant,
-};
+use std::{sync::atomic::AtomicBool, time::Instant};
+
+use parking_lot::{Mutex, MutexGuard};
 
 use crate::{Sampled, flight::Epoch};
 
@@ -43,6 +42,13 @@ pub(crate) struct Sample {
     pub(crate) tid: u64,
     pub(crate) depth: u8,
     pub(crate) pcs: [u64; DEPTH],
+    /// The innermost span its thread was inside, 0 for none or not known, and that span's
+    /// build (0: none).
+    pub(crate) span: u64,
+    pub(crate) build: u32,
+    /// Whether it was on a CPU: a blocked thread is sampled too where the sampler can stop it
+    /// (macOS), so a block no wait span says shows in its stack.
+    pub(crate) on_cpu: bool,
 }
 
 struct Samples {
@@ -57,7 +63,7 @@ static SAMPLES: Mutex<Samples> =
     Mutex::new(Samples { ring: Vec::new(), next: 0, state: String::new() });
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|it| it.into_inner())
+    mutex.lock()
 }
 
 /// Keeps `batch`, over the oldest once [`KEPT`] are.
@@ -224,7 +230,7 @@ mod tests {
     #[test]
     fn the_ring_keeps_the_newest_samples() {
         let at = Instant::now();
-        let sample = |tid| Sample { at, tid, depth: 0, pcs: [0; DEPTH] };
+        let sample = |tid| Sample { at, tid, depth: 0, pcs: [0; DEPTH], span: 0, build: 0, on_cpu: true };
         let batch: Vec<Sample> = (0..KEPT as u64 + 10).map(sample).collect();
         keep(&batch);
         let samples = lock(&SAMPLES);
@@ -263,8 +269,14 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let (samples, state) = taken(since, &Epoch::now());
+        let mut kept = None;
+        blaze_graph::spin::SpinWait::within("the sampler to keep the spinner's samples", std::time::Duration::from_secs(10), || {
+            let (samples, state) = taken(since, &Epoch::now());
+            let named = samples.iter().any(|it| it.stack.iter().any(|name| name.contains("spins_for_the_sampler")));
+            kept = Some((samples, state));
+            named
+        });
+        let (samples, state) = kept.expect("taken at least once");
         assert!(state.starts_with("on:"), "{state}");
         assert!(!samples.is_empty(), "a thread that spun for 1.5 s at 980 Hz was not sampled");
         assert!(

@@ -42,18 +42,20 @@ use std::{
     os::windows::ffi::OsStrExt as _,
     path::{Path, PathBuf},
     ptr::{null, null_mut},
-    sync::{Condvar, Mutex, OnceLock, PoisonError},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
 use blaze_usercode::confine::Spec;
+use parking_lot::{Condvar, Mutex};
 use windows_sys::{
     Win32::{
         Foundation::{
             CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ALREADY_EXISTS,
             ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, GENERIC_ALL, GENERIC_EXECUTE,
-            GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
-            STATUS_CONTROL_C_EXIT, WAIT_ABANDONED, WAIT_OBJECT_0,
+            ERROR_MORE_DATA, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
+            INVALID_HANDLE_VALUE, LocalFree, STATUS_CONTROL_C_EXIT, WAIT_ABANDONED, WAIT_FAILED,
+            WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         Security::{
             ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation,
@@ -94,8 +96,9 @@ use windows_sys::{
                 JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES,
                 JOB_OBJECT_UILIMIT_READCLIPBOARD, JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS,
                 JOB_OBJECT_UILIMIT_WRITECLIPBOARD, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-                JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-                JOBOBJECTINFOCLASS, JobObjectBasicAccountingInformation,
+                JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOBOBJECTINFOCLASS, IsProcessInJob,
+                JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
                 JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation,
                 QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
             },
@@ -104,10 +107,11 @@ use windows_sys::{
                 CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateMutexW, CreateProcessW,
                 DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
                 GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
-                LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
                 PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-                PROCESS_INFORMATION, ReleaseMutex, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-                STARTUPINFOW, UpdateProcThreadAttribute, WaitForSingleObject,
+                PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+                ReleaseMutex, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+                UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
             },
         },
     },
@@ -512,7 +516,7 @@ impl Drop for Handle {
     fn drop(&mut self) {
         if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
             // SAFETY: every `Handle` is made from a handle a call just returned to this module
-            // (CreateProcessW, DuplicateHandle, CreateJobObjectW, CreateFileW), never copied
+            // (CreateProcessW, DuplicateHandle, CreateJobObjectW, CreateFileW, OpenProcess), never copied
             // into another `Handle`, so this is its one close; closing it twice could close
             // whatever reused its number.
             unsafe { CloseHandle(self.0) };
@@ -738,48 +742,126 @@ unsafe fn set_job<T>(job: &Handle, class: JOBOBJECTINFOCLASS, info: &T, what: &s
     }
 }
 
-/// Ends every process of `job` with `code` and waits, for a while, for them to be gone, so what
-/// they had open is closed before the run's directories are taken back.
+/// Ends every process of `job` with `code` and waits, at most [`ENDING`], for them to be gone,
+/// so what they had open is closed before the run's directories are taken back.
 fn end(job: &Handle, code: u32) {
-    let started = Instant::now();
-    let mut ended = false;
+    if listed(job).is_none_or(|(_, count)| count == 0) {
+        // The usual run, whose program started nothing that outlived it, costs this one call.
+        return;
+    }
+    // SAFETY: `job` owns an open job handle, borrowed for the call; the call reads no memory
+    // of this process.
+    unsafe { TerminateJobObject(job.0, code) };
+    if let Err(left) = gone_within(job, ENDING) {
+        eprintln!("blaze: {left} processes of the sandbox's job did not end within {ENDING:?}");
+    }
+}
+
+/// Room for this many process numbers in one ask of the job's list: past it the ask is
+/// refused with `ERROR_MORE_DATA` and lists the first, which [`gone_within`] waits for before
+/// it asks again.
+const LISTED: usize = 256;
+
+/// `JOBOBJECT_BASIC_PROCESS_ID_LIST` with room for [`LISTED`] numbers: the structure the system
+/// writes is its two counts then as many numbers as fit.
+#[repr(C)]
+struct Listed {
+    head: JOBOBJECT_BASIC_PROCESS_ID_LIST,
+    more: [usize; LISTED - 1],
+}
+
+/// The numbers of the processes in `job`, as many as fit, and how many it holds; `None` when
+/// the job could not be asked.
+fn listed(job: &Handle) -> Option<(Box<Listed>, usize)> {
+    // SAFETY: all zeros is a list of nothing.
+    // alloc: once per ended run that started something, 2 KiB off the launcher's stack.
+    let mut list: Box<Listed> = Box::new(unsafe { std::mem::zeroed() });
+    // SAFETY: JobObjectBasicProcessIdList names a JOBOBJECT_BASIC_PROCESS_ID_LIST, whose list
+    // runs on past its declared one entry into `more`: `list` is a live, exclusive buffer of the
+    // size the call is told, which it writes and nothing more; a null length out-pointer is
+    // allowed. `job` owns an open job handle.
+    let asked = unsafe {
+        QueryInformationJobObject(
+            job.0,
+            JobObjectBasicProcessIdList,
+            (&raw mut *list).cast(),
+            size_of::<Listed>() as u32,
+            null_mut(),
+        )
+    };
+    // SAFETY: reads the calling thread's last error, nothing else.
+    if asked == 0 && unsafe { GetLastError() } != ERROR_MORE_DATA {
+        return None;
+    }
+    let count = (list.head.NumberOfProcessIdsInList as usize).min(LISTED);
+    Some((list, count))
+}
+
+/// Waits until every process in `job` is gone, at most `long` in all: on each one's own
+/// handle, which is signaled as it ends, then on what the job lists next (a child one of them
+/// started meanwhile), until it lists none. A job's completion port would say when its last
+/// process ended, but a job takes one port, and a job a driver handed carries the driver's, in
+/// the driver's process. `Err` with how many were left when `long` ran out.
+fn gone_within(job: &Handle, long: Duration) -> Result<(), usize> {
+    /// The most handles one `WaitForMultipleObjects` takes (`MAXIMUM_WAIT_OBJECTS`).
+    const AT_ONCE: usize = 64;
+    let until = Instant::now() + long;
     loop {
-        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-        // SAFETY: JobObjectBasicAccountingInformation names a
-        // JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, and `info` is a live, exclusive one of the size
-        // the call is told, which it writes and nothing more; a null length out-pointer is
-        // allowed. `job` owns an open job handle.
-        let asked = unsafe {
-            QueryInformationJobObject(
-                job.0,
-                JobObjectBasicAccountingInformation,
-                (&raw mut info).cast(),
-                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                null_mut(),
-            )
-        };
-        // A job with no process left gains none, so it is not ended: the usual run, whose
-        // program started nothing that outlived it, costs this one call.
-        if asked != 0 && info.ActiveProcesses == 0 {
-            return;
+        let Some((list, count)) = listed(job) else { return Ok(()) };
+        if count == 0 {
+            return Ok(());
         }
-        if !ended {
-            // SAFETY: `job` owns an open job handle, borrowed for the call; the call reads no
-            // memory of this process.
-            unsafe { TerminateJobObject(job.0, code) };
-            ended = true;
-            if asked != 0 {
+        let mut held: [Option<Handle>; AT_ONCE] = std::array::from_fn(|_| None);
+        let mut waited_on = 0;
+        let ids = std::iter::once(list.head.ProcessIdList[0]).chain(list.more.iter().copied()).take(count);
+        let mut ids = ids.peekable();
+        while ids.peek().is_some() {
+            let mut open = 0;
+            for id in ids.by_ref() {
+                let Ok(id) = u32::try_from(id) else { continue };
+                // SAFETY: takes a number and flags, reads no memory of this process; the handle
+                // it gives, or null for a process already gone, is owned by the `Handle`.
+                let process = Handle(unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, id) });
+                if process.0.is_null() {
+                    continue;
+                }
+                let mut inside = 0;
+                // SAFETY: both handles are open and owned for the call; `inside` is a live
+                // BOOL for it to write. A number another process took since the list was read
+                // is not in the job, and is not waited for.
+                if unsafe { IsProcessInJob(process.0, job.0, &mut inside) } == 0 || inside == 0 {
+                    continue;
+                }
+                held[open] = Some(process);
+                open += 1;
+                if open == AT_ONCE {
+                    break;
+                }
+            }
+            if open == 0 {
                 continue;
             }
+            waited_on += open;
+            let handles: [HANDLE; AT_ONCE] = std::array::from_fn(|at| held[at].as_ref().map_or(null_mut(), |it| it.0));
+            let left = until.saturating_duration_since(Instant::now());
+            let ms = u32::try_from(left.as_millis()).unwrap_or(INFINITE - 1);
+            // SAFETY: the first `open` handles are open process handles `held` owns until the
+            // wait returns; the call reads them and nothing more.
+            let waited = unsafe { WaitForMultipleObjects(open as u32, handles.as_ptr(), 1, ms) };
+            for it in &mut held {
+                *it = None;
+            }
+            if waited == WAIT_TIMEOUT || waited == WAIT_FAILED {
+                return Err(count);
+            }
         }
-        if asked == 0 {
-            return;
+        if waited_on == 0 {
+            // Every one listed was gone by its open, and the job lets go of it as it ends.
+            if Instant::now() >= until {
+                return Err(count);
+            }
+            std::thread::yield_now();
         }
-        if started.elapsed() > ENDING {
-            eprintln!("blaze: {} processes of the sandbox's job did not end", info.ActiveProcesses);
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -1372,14 +1454,14 @@ struct Running;
 
 impl Running {
     fn start() -> Running {
-        *RUNS.0.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+        *RUNS.0.lock() += 1;
         Running
     }
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
-        *RUNS.0.lock().unwrap_or_else(PoisonError::into_inner) -= 1;
+        *RUNS.0.lock() -= 1;
         RUNS.1.notify_all();
     }
 }
@@ -1390,14 +1472,14 @@ struct Registered(usize);
 impl Registered {
     fn new(job: &Handle) -> Registered {
         let job = job.0 as usize;
-        JOBS.lock().unwrap_or_else(PoisonError::into_inner).push(job);
+        JOBS.lock().push(job);
         Registered(job)
     }
 }
 
 impl Drop for Registered {
     fn drop(&mut self) {
-        let mut jobs = JOBS.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut jobs = JOBS.lock();
         if let Some(at) = jobs.iter().position(|it| *it == self.0) {
             jobs.swap_remove(at);
         }
@@ -1428,7 +1510,7 @@ unsafe extern "system" fn interrupted(event: u32) -> BOOL {
 /// take their grants back: what a console's close does, and a warm launcher whose driver is
 /// gone ([`serve`]).
 pub fn end_every_run(code: u32, wait: Duration) {
-    let jobs = JOBS.lock().unwrap_or_else(PoisonError::into_inner);
+    let jobs = JOBS.lock();
     for &job in jobs.iter() {
         // SAFETY: a job is named in JOBS only while its `Registered` lives, which `run` declares
         // after `made` (so drops it first) and which takes the job out under the lock this holds:
@@ -1437,8 +1519,8 @@ pub fn end_every_run(code: u32, wait: Duration) {
     }
     drop(jobs);
     if !wait.is_zero() {
-        let runs = RUNS.0.lock().unwrap_or_else(PoisonError::into_inner);
-        _ = RUNS.1.wait_timeout_while(runs, wait, |runs| *runs > 0);
+        let mut runs = RUNS.0.lock();
+        RUNS.1.wait_while_for(&mut runs, |runs| *runs > 0, wait);
     }
 }
 
@@ -1461,7 +1543,7 @@ fn on_interrupt() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_JOB_MEMORY;
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, JOB_OBJECT_LIMIT_JOB_MEMORY};
 
     use super::*;
 
@@ -1630,6 +1712,61 @@ mod tests {
         let started = Instant::now();
         end(&job, 1);
         assert!(started.elapsed() < ENDING);
+    }
+
+    /// A process that runs for a minute unless it is ended, put in `job`.
+    fn in_job(job: &Handle) -> std::process::Child {
+        use std::os::windows::io::AsRawHandle as _;
+        let child = std::process::Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // SAFETY: both handles are open and owned for the call, which reads no memory.
+        assert_ne!(unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle()) }, 0);
+        child
+    }
+
+    #[test]
+    fn an_end_waits_for_its_processes_to_be_gone_not_for_its_limit() {
+        let job = job().unwrap();
+        let mut child = in_job(&job);
+        let started = Instant::now();
+        end(&job, 7);
+        assert!(started.elapsed() < ENDING / 10, "ended after {:?}", started.elapsed());
+        assert_eq!(child.try_wait().unwrap().and_then(|it| it.code()), Some(7));
+        assert_eq!(listed(&job).unwrap().1, 0);
+    }
+
+    #[test]
+    fn an_end_waits_for_a_child_that_outlived_the_process_that_started_it() {
+        use std::os::windows::io::AsRawHandle as _;
+        let job = job().unwrap();
+        // A second in, once it is in the job, it starts a ping that runs on after it ends.
+        let mut parent = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 2 127.0.0.1 >nul & start /b ping -n 60 127.0.0.1 >nul"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // SAFETY: both handles are open and owned for the call, which reads no memory.
+        assert_ne!(unsafe { AssignProcessToJobObject(job.0, parent.as_raw_handle()) }, 0);
+        parent.wait().unwrap();
+        assert_eq!(listed(&job).unwrap().1, 1, "the child runs on in the job");
+        let started = Instant::now();
+        end(&job, 7);
+        assert!(started.elapsed() < ENDING / 10, "ended after {:?}", started.elapsed());
+        assert_eq!(listed(&job).unwrap().1, 0);
+    }
+
+    #[test]
+    fn a_wait_for_a_process_that_runs_on_gives_up_at_its_limit() {
+        let job = job().unwrap();
+        let mut child = in_job(&job);
+        let started = Instant::now();
+        assert_eq!(gone_within(&job, Duration::from_millis(50)), Err(1));
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert!(child.try_wait().unwrap().is_none());
+        end(&job, 1);
     }
 
     /// A job as a driver makes one for a spawn: `flags`, and a memory limit.

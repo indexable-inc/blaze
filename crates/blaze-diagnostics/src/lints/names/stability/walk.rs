@@ -962,6 +962,26 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         self.index.deprecation(def).is_some() || self.index.foreign_stability(def).is_some()
     }
 
+    /// A path [`Self::path`] could not resolve. Name resolution finding nothing is rustc's
+    /// `Res::Err`: an error of its own (E0412, E0425, E0433), and `Checker::visit_path` has no
+    /// definition to check either. Otherwise blaze knows what the path names but not here: no
+    /// item or body holds it, or resolution finds it but not at this place. That is an error
+    /// at the path, as its use goes unchecked.
+    fn unresolved(&mut self, file: HirFileId, path: ast::Path<'db>) {
+        let cx = self.cx;
+        let why = match cx.vsema.scope(path.syntax()) {
+            None => "blaze finds no item or body it is in",
+            Some(scope) if scope.speculative_resolve_view(path).is_some() => {
+                "name resolution finds it, but blaze can't resolve it at this place"
+            }
+            Some(_) => return,
+        };
+        let span = cx.span(InFile::new(file, path.syntax().text_range()));
+        // alloc: on the error path, for the message
+        let message = format!("blaze can't check the stability of `{}`: {why}", written(path.syntax()));
+        self.reported.missing.push(Found::new(Diag::error(None, message, span), Phase::Items));
+    }
+
     /// A path as rustc's HIR has it: resolved by name resolution (`Checker::visit_path`, the
     /// parent segments for stability alone), or type-relative (typeck's or `hir_ty_lowering`'s
     /// check of what it resolves to, the type before it a path of its own). `res` is what it
@@ -982,7 +1002,10 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         {
             return;
         }
-        let Some(res) = res.or_else(|| cx.vsema.resolve_path(path)) else { return };
+        let Some(res) = res.or_else(|| cx.vsema.resolve_path(path)) else {
+            self.unresolved(file, path);
+            return;
+        };
         let (relative, qualifier_res) = match qualifier {
             Some(qualifier) => type_relative(cx, qualifier, &res),
             None => (false, None),
@@ -1562,3 +1585,6 @@ fn param_target(kind: SyntaxKind) -> Option<Target> {
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests;

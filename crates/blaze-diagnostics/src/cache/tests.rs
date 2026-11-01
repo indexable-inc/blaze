@@ -1,16 +1,14 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, sync::Arc};
 
 use base_db::{Crate, Db, Env};
 use blaze_format::Aligned;
 use blaze_ids::ContentId;
 use hir_def::deps::{self as deps, ImageBuf, ImageStore};
-use hir_ty_borrowck::Mode;
-use rustc_hash::FxHashMap;
-use span::FileId;
 use hir_expand::fixture;
+use hir_ty_borrowck::Mode;
+use parking_lot::Mutex;
+
+use span::FileId;
 
 use super::*;
 use crate::{
@@ -272,7 +270,7 @@ fn stderr(db: &Db, names: &HashMap<FileId, String>, root: &str, diags: &[Diag]) 
     let sources = Sources::of(
         names.iter().map(|(file, name)| (Files::relative(name, root).to_owned(), db.file_text(*file).text(db).as_str().to_owned())),
     );
-    diags.iter().map(|it| crate::emit::written(it, &sources, Style::default())).collect()
+    diags.iter().map(|it| crate::emit::written(it, &sources, Style::default()).unwrap()).collect()
 }
 
 #[test]
@@ -302,16 +300,16 @@ fn a_served_outcome_renders_byte_identical() {
 /// A store in memory, which refuses a second put of a key with other bytes as the store does.
 #[derive(Default)]
 struct Memory {
-    values: Mutex<FxHashMap<ContentId, Arc<Aligned>>>,
+    values: Mutex<blaze_hash::HashMap<ContentId, Arc<Aligned>>>,
 }
 
 impl ImageStore for Memory {
     fn get(&self, key: &ContentId) -> Result<Option<ImageBuf>, String> {
-        Ok(self.values.lock().unwrap().get(key).map(|it| it.clone() as ImageBuf))
+        Ok(self.values.lock().get(key).map(|it| it.clone() as ImageBuf))
     }
 
     fn put(&self, key: ContentId, value: Vec<u8>) -> Result<(), String> {
-        let mut values = self.values.lock().unwrap();
+        let mut values = self.values.lock();
         match values.get(&key) {
             Some(kept) if kept.bytes() != value.as_slice() => Err(format!("{key:?} holds other bytes")),
             Some(_) => Ok(()),

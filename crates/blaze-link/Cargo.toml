@@ -23,6 +23,7 @@ blaze-codegen.workspace = true
 blaze-core.workspace = true
 blaze-format.workspace = true
 blaze-graph.workspace = true
+blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-inproc.workspace = true
 blaze-items.workspace = true
@@ -32,7 +33,7 @@ blaze-mem.workspace = true
 blaze-sha256.workspace = true
 gimli.workspace = true
 object.workspace = true
-rustc-hash.workspace = true
+parking_lot.workspace = true
 smallvec.workspace = true
 
 [dev-dependencies]

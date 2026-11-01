@@ -2,8 +2,8 @@
 //! that lifetime erased, and `#[derive(Value)]`.
 
 // alloc: expansion time, once per annotated item; no query runs this
-use std::collections::HashSet;
 
+use blaze_hash::HashSet;
 use proc_macro2::TokenStream;
 use quote::{quote, quote_spanned};
 use syn::parse::{Parse, ParseStream};

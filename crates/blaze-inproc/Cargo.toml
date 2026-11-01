@@ -29,6 +29,9 @@ host = ["dep:blaze-core"]
 blaze-bytes.workspace = true
 blaze-core = { workspace = true, optional = true }
 blaze-mem.workspace = true
+blaze-spin.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

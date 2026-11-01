@@ -2,13 +2,9 @@
 //! its lines, the versions each kind of query is offered, offline, and the lock file's
 //! versions read with no update.
 
-use std::{
-    path::PathBuf,
-    pin::pin,
-    sync::{Arc, Mutex},
-    task::Poll,
-};
+use std::{path::PathBuf, pin::pin, sync::Arc, task::Poll};
 
+use blaze_hash::HashMap;
 use blaze_registry::{
     Context, IndexRegistry, SourceConfig, SourceDef, Sources,
     http::{Http, Response},
@@ -17,7 +13,7 @@ use blaze_resolve::{
     DepKind, Dependency, IndexSummary, MemRegistry, PackageId, QueryKind, Registry, SourceId,
     block_on,
 };
-use rustc_hash::FxHashMap as HashMap;
+use parking_lot::Mutex;
 
 const BASE: &str = "https://index.example.com/";
 
@@ -29,18 +25,18 @@ struct Server {
 
 impl Server {
     fn put(&self, path: &str, lines: &[String]) {
-        self.files.lock().unwrap().insert(format!("{BASE}{path}"), lines.join("\n").into_bytes());
+        self.files.lock().insert(format!("{BASE}{path}"), lines.join("\n").into_bytes());
     }
 
     fn take_asked(&self) -> Vec<String> {
-        self.asked.lock().unwrap().drain(..).collect()
+        self.asked.lock().drain(..).collect()
     }
 }
 
 impl Http for Server {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<Response> {
-        self.asked.lock().unwrap().push(url.to_owned());
-        let Some(body) = self.files.lock().unwrap().get(url).cloned() else {
+        self.asked.lock().push(url.to_owned());
+        let Some(body) = self.files.lock().get(url).cloned() else {
             return Ok(Response { status: 404, ..Response::default() });
         };
         let etag = format!("\"{}\"", body.len());
@@ -73,7 +69,6 @@ impl Fixture {
         server
             .files
             .lock()
-            .unwrap()
             .insert(format!("{BASE}config.json"), br#"{"dl":"https://dl.example.com"}"#.to_vec());
         Fixture { server, home }
     }

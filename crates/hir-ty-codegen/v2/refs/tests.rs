@@ -11,12 +11,12 @@ use blaze_codegen::{
     backend::FrontRef,
     settings::{DebugInfo, Panic, Relocation, Sanitize, Spec, Toolchain},
 };
+use blaze_hash::HashSet;
 use blaze_ids::ContentId;
 use cranelift_codegen::ir;
 use hir_def::{FunctionId, StaticId, signatures::FunctionSignature};
-use hir_ty::db::HirDatabase;
-use rustc_hash::FxHashSet;
 use hir_expand::fixture;
+use hir_ty::db::HirDatabase;
 
 use super::walk;
 use crate::{
@@ -25,8 +25,8 @@ use crate::{
     v2::{
         BuildTime, Built, Databases, HashSource, HirFrontend, HirInstance, HirStatic, Kind,
         backend::{built, compiled_in},
-        by_id::ById,
         build::{self, Build},
+        by_id::ById,
         places::{self, Placer, Ref, place_requests},
     },
 };
@@ -114,7 +114,7 @@ fn walked(
         .with(|db, homes| walk(db, instance, false, homes))
         .unwrap_or_else(|e| panic!("in another database: {e}"));
     assert_eq!(first, elsewhere, "{instance:?} walks otherwise in another database");
-    let distinct: FxHashSet<&Ref> = first.iter().collect();
+    let distinct: HashSet<&Ref> = first.iter().collect();
     assert_eq!(distinct.len(), first.len(), "{instance:?} lists a reference twice: {first:?}");
     first
 }
@@ -152,7 +152,7 @@ fn placed(
 fn reach(frontend: &HirFrontend, root: HirInstance) -> Reached {
     let specs = specs();
     frontend.with(|db, homes| {
-        let mut seen = FxHashSet::default();
+        let mut seen = HashSet::default();
         seen.insert(root.clone());
         let mut queue = vec![root];
         let mut reached = Reached::new();

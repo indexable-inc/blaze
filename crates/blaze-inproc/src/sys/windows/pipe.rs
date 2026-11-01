@@ -7,9 +7,9 @@
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
-use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use windows_sys::Win32::Foundation::{
     ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
     ERROR_PIPE_NOT_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -199,7 +199,7 @@ impl Listener {
     }
 
     pub(crate) fn accept(&self) -> Result<(Stream, u32), Error> {
-        let waiting = self.next.lock().unwrap_or_else(PoisonError::into_inner).take();
+        let waiting = self.next.lock().take();
         let pipe = match waiting {
             Some(pipe) => pipe,
             None => instance(&self.name, &self.security, false)?,
@@ -208,7 +208,7 @@ impl Listener {
         // The next instance waits before this one is handed out, so a start hook never finds none.
         // Where it can't be made, the next `accept` makes it and says why.
         if let Ok(next) = instance(&self.name, &self.security, false) {
-            *self.next.lock().unwrap_or_else(PoisonError::into_inner) = Some(next);
+            *self.next.lock() = Some(next);
         }
         let mut pid = 0;
         // SAFETY: a query of the pipe this listener owns; writes only `pid`.

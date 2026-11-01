@@ -5,11 +5,12 @@
 //! generics is covered, a fact, or in the refusal list below with why; and classifying a read
 //! or hashing one of this crate's facts again allocates nothing.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use base_db::{Crate, Db, all_crates};
 use blaze_alloc_count::assert_at_most;
 use blaze_format::Aligned;
+use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{Fact, ItemId, auto_traits, const_value, implements, key, method};
 use hir_def::{
@@ -17,6 +18,7 @@ use hir_def::{
     deps::{ImageBuf, ImageStore},
     nameres::{crate_def_map, demand::crate_body_owners},
 };
+use hir_expand::fixture;
 use hir_expand::name::Name;
 use hir_ty::{
     InferBodyId, InferenceResult,
@@ -27,9 +29,8 @@ use hir_ty::{
         goal_store::{FactObject, FactRef},
     },
 };
-use rustc_hash::FxHashMap;
+use parking_lot::Mutex;
 use rustc_type_ir::fast_reject::SimplifiedType;
-use hir_expand::fixture;
 
 use crate::{
     reads::{self, RULES, Rule},
@@ -495,7 +496,7 @@ impl BodyFacts for Probe {
         name: &'static str,
     ) -> Classified {
         let class = reads::classify(db, def, step, read, kind, name);
-        self.seen.lock().unwrap().push(Seen { def, step, read, kind, name, class });
+        self.seen.lock().push(Seen { def, step, read, kind, name, class });
         class
     }
 
@@ -515,16 +516,16 @@ impl BodyFacts for Probe {
 /// A store in memory.
 #[derive(Default)]
 struct Memory {
-    images: Mutex<FxHashMap<ContentId, Arc<Aligned>>>,
+    images: Mutex<HashMap<ContentId, Arc<Aligned>>>,
 }
 
 impl ImageStore for Memory {
     fn get(&self, key: &ContentId) -> Result<Option<ImageBuf>, String> {
-        Ok(self.images.lock().unwrap().get(key).map(|it| it.clone() as ImageBuf))
+        Ok(self.images.lock().get(key).map(|it| it.clone() as ImageBuf))
     }
 
     fn put(&self, key: ContentId, value: Vec<u8>) -> Result<(), String> {
-        self.images.lock().unwrap().entry(key).or_insert_with(|| Arc::new(Aligned::copy_from(&value)));
+        self.images.lock().entry(key).or_insert_with(|| Arc::new(Aligned::copy_from(&value)));
         Ok(())
     }
 
@@ -553,7 +554,7 @@ fn steps_seen() -> (Db, Vec<Seen>) {
     }
     installed.flush().expect("the test store flushes");
     drop(installed);
-    let seen = std::mem::take(&mut *probe.seen.lock().unwrap());
+    let seen = std::mem::take(&mut *probe.seen.lock());
     (db, seen)
 }
 

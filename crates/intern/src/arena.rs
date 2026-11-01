@@ -291,7 +291,7 @@ mod lock {
     use std::ops::{Deref, DerefMut};
 
     use super::State;
-    use crate::sync::{Mutex, MutexGuard, PoisonError};
+    use crate::sync::{Mutex, MutexGuard};
 
     /// The lock a shard's writers take to look again for a value and insert it. It is held
     /// only for that: the caller's `Eq` against the shard's values, one bump allocation, the
@@ -312,7 +312,7 @@ mod lock {
 
         pub(super) fn lock(&self) -> Locked<'_> {
             // A panic under the lock (in a caller's `Eq`) leaves the shard as it was.
-            Locked(self.0.lock().unwrap_or_else(PoisonError::into_inner))
+            Locked(self.0.lock())
         }
     }
 

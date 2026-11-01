@@ -7,9 +7,9 @@
 
 use std::fmt;
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
+use blaze_hash::HashSet;
 use intern::{Symbol, sym};
-use rustc_hash::FxHashSet;
 
 impl fmt::Debug for UnstableFeatures {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -59,7 +59,7 @@ macro_rules! define_unstable_features {
     ( $( $feature:ident, )* ) => {
         #[derive(Clone, Default)]
         pub struct UnstableFeatures {
-            all: FxHashSet<Symbol>,
+            all: HashSet<Symbol>,
 
             $( pub $feature: bool, )*
         }

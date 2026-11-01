@@ -4,8 +4,8 @@
 
 use std::collections::BTreeMap;
 
+use blaze_hash::HashSet;
 use blaze_ids::rng::SplitMix64;
-use rustc_hash::FxHashSet;
 
 use super::*;
 use crate::unit::{ConfigEnv, Dependency, DylibSearch, Package, Profile, Target, Tools};
@@ -636,7 +636,7 @@ fn the_sorted_environment_is_the_one_built_before() {
                     vars.into_iter().collect::<Vec<_>>(),
                     "{unit:?} {inherited:?}"
                 );
-                let set: FxHashSet<OsString> =
+                let set: HashSet<OsString> =
                     new.set_from_unit().map(|(name, _)| name.to_owned()).collect();
                 assert_eq!(set, from_unit, "{unit:?} {inherited:?}");
                 assert_eq!(new.from_unit.len(), new.vars.len());

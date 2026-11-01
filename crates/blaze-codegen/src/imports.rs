@@ -16,8 +16,8 @@
 use std::collections::VecDeque;
 
 use blaze_graph::par;
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::bits::BitSet;
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     InstanceKey,
@@ -102,7 +102,7 @@ impl std::error::Error for ImportError {}
 /// backend reaches. A summary is made external ([`Summary::external`] is a fact of the build,
 /// not of the function), so a build that does not close its summaries gets no whole-program
 /// facts, never wrong ones.
-pub fn close(summaries: &mut FxHashMap<InstanceKey, Summary>, outside: &FxHashSet<InstanceKey>) {
+pub fn close(summaries: &mut HashMap<InstanceKey, Summary>, outside: &HashSet<InstanceKey>) {
     for (key, summary) in summaries {
         summary.external = outside.contains(key);
     }
@@ -120,9 +120,9 @@ pub fn close(summaries: &mut FxHashMap<InstanceKey, Summary>, outside: &FxHashSe
 /// whatever the map's history. Each importer's imports are chosen on its own, in parallel,
 /// into the worker's scratch.
 pub fn decide(
-    summaries: &FxHashMap<InstanceKey, Summary>,
+    summaries: &HashMap<InstanceKey, Summary>,
     limits: &Limits,
-) -> Result<FxHashMap<InstanceKey, Imports>, ImportError> {
+) -> Result<HashMap<InstanceKey, Imports>, ImportError> {
     let graph = Graph::of(summaries)?;
     let attrs = graph.attrs();
     let constants = graph.constants();
@@ -199,7 +199,7 @@ struct Graph<'a> {
 impl<'a> Graph<'a> {
     /// The columns of `summaries`, checking each as it goes, in key order: the first
     /// inconsistency in that order is the error.
-    fn of(summaries: &'a FxHashMap<InstanceKey, Summary>) -> Result<Graph<'a>, ImportError> {
+    fn of(summaries: &'a HashMap<InstanceKey, Summary>) -> Result<Graph<'a>, ImportError> {
         let len = summaries.len();
         assert!(len < NONE as usize, "more than 2^32 - 1 summaries");
         // alloc: one exact-size column per build
@@ -645,11 +645,11 @@ mod tests {
         }
     }
 
-    fn build(summaries: Vec<Summary>) -> FxHashMap<InstanceKey, Summary> {
+    fn build(summaries: Vec<Summary>) -> HashMap<InstanceKey, Summary> {
         summaries.into_iter().map(|it| (it.key, it)).collect()
     }
 
-    fn decided(summaries: Vec<Summary>) -> FxHashMap<InstanceKey, Imports> {
+    fn decided(summaries: Vec<Summary>) -> HashMap<InstanceKey, Imports> {
         decide(&build(summaries), &Limits::default()).unwrap()
     }
 
@@ -776,7 +776,7 @@ mod tests {
         caller.calls = vec![Call { callee: key(2), count: 1, args: vec![int(4)] }];
         let mut summaries = build(vec![caller, callee]);
         assert_eq!(decide(&summaries, &Limits::default()).unwrap()[&key(2)].constants, vec![(0, int(4))]);
-        close(&mut summaries, &FxHashSet::from_iter([key(2)]));
+        close(&mut summaries, &HashSet::from_iter([key(2)]));
         assert!(summaries[&key(2)].external && !summaries[&key(1)].external);
         assert_eq!(decide(&summaries, &Limits::default()).unwrap()[&key(2)].constants, vec![]);
     }
@@ -898,13 +898,13 @@ mod tests {
         }
         let forward = decided(summaries.clone());
         summaries.reverse();
-        let mut map = FxHashMap::default();
+        let mut map = HashMap::default();
         for it in summaries.iter().cloned() {
             map.insert(it.key, it);
         }
         let backward = decide(&map, &Limits::default()).unwrap();
         // Another capacity, so another iteration order of the same keys.
-        let mut wide = FxHashMap::with_capacity_and_hasher(4_096, Default::default());
+        let mut wide = HashMap::with_capacity_and_hasher(4_096, Default::default());
         wide.extend(summaries.iter().map(|it| (it.key, it.clone())));
         let widened = decide(&wide, &Limits::default()).unwrap();
         assert_eq!(forward, backward);
@@ -926,7 +926,7 @@ mod tests {
             }
             summaries.push(it);
         }
-        let mut map = FxHashMap::with_capacity_and_hasher(1_024, Default::default());
+        let mut map = HashMap::with_capacity_and_hasher(1_024, Default::default());
         map.extend(summaries.into_iter().map(|it| (it.key, it)));
         assert_eq!(
             decide(&map, &Limits::default()),
@@ -961,7 +961,7 @@ mod tests {
 
     #[test]
     fn nothing_to_decide() {
-        assert_eq!(decide(&FxHashMap::default(), &Limits::default()), Ok(FxHashMap::default()));
+        assert_eq!(decide(&HashMap::default(), &Limits::default()), Ok(HashMap::default()));
     }
 
     /// A random build of summaries: keys of which some share their first 8 bytes, calls of
@@ -1043,7 +1043,7 @@ mod tests {
         let mut decided = 0;
         for case in 0..2_000 {
             let (summaries, limits) = random(&mut seeded);
-            let hashed: FxHashMap<InstanceKey, Summary> =
+            let hashed: HashMap<InstanceKey, Summary> =
                 summaries.iter().map(|(key, it)| (*key, it.clone())).collect();
             let new = decide(&hashed, &limits).map(|it| it.into_iter().collect::<BTreeMap<_, _>>());
             let old = model::decide(&summaries, &limits);

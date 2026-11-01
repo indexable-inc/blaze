@@ -14,8 +14,8 @@ pub(crate) mod invalid_atomic_ordering;
 pub(crate) mod invalid_from_utf8;
 
 use base_db::Db;
+use blaze_hash::HashMap;
 use hir_def::FunctionId;
-use rustc_hash::FxHashMap;
 
 use crate::lints::bodies::types::util;
 
@@ -23,12 +23,12 @@ use crate::lints::bodies::types::util;
 /// attributes once per function.
 struct FnItems {
     known: &'static [&'static str],
-    seen: FxHashMap<FunctionId, Option<&'static str>>,
+    seen: HashMap<FunctionId, Option<&'static str>>,
 }
 
 impl FnItems {
     fn new(known: &'static [&'static str]) -> FnItems {
-        FnItems { known, seen: FxHashMap::default() }
+        FnItems { known, seen: HashMap::default() }
     }
 
     /// rustc's `get_diagnostic_name` of `def`, when it is one of those looked for.

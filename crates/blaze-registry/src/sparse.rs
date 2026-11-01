@@ -7,13 +7,14 @@
 use std::{
     path::PathBuf,
     sync::{
-        Arc, Mutex, OnceLock, PoisonError,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
 
 use anyhow::{Context, bail};
-use rustc_hash::FxHashSet;
+use blaze_hash::SharedSet;
+use parking_lot::Mutex;
 
 use blaze_source::SourceId;
 
@@ -54,7 +55,7 @@ pub struct SparseIndex {
     /// asked about is locked and found.
     update: AtomicBool,
     /// The files asked for since the index was last updated.
-    fresh: Mutex<FxHashSet<String>>,
+    fresh: SharedSet<String>,
     config: Mutex<Option<RegistryConfig>>,
     auth: Option<Arc<Auth>>,
     /// The registry's name in the configuration, found once a token is first asked for.
@@ -90,7 +91,7 @@ impl SparseIndex {
             retry,
             offline,
             update: AtomicBool::new(false),
-            fresh: Mutex::default(),
+            fresh: SharedSet::default(),
             config: Mutex::default(),
             auth,
             name: OnceLock::new(),
@@ -110,7 +111,7 @@ impl SparseIndex {
 
     /// From now on, check every file with the server once.
     pub fn invalidate(&self) {
-        self.fresh().clear();
+        self.fresh.pin().clear();
         self.update.store(true, Ordering::Relaxed);
     }
 
@@ -118,12 +119,8 @@ impl SparseIndex {
         self.update.load(Ordering::Relaxed)
     }
 
-    fn fresh(&self) -> std::sync::MutexGuard<'_, FxHashSet<String>> {
-        self.fresh.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     fn is_fresh(&self, path: &str) -> bool {
-        !self.is_updated() || self.offline || self.fresh().contains(path)
+        !self.is_updated() || self.offline || self.fresh.pin().contains(path)
     }
 
     /// Whether [`Sparse::config`] would read `config.json` from disk, asking no server.
@@ -138,7 +135,7 @@ impl SparseIndex {
     /// The registry's `config.json`: the copy on disk while it is fresh, else the server's,
     /// which is then written to disk. `None` when the server has none.
     pub fn config(&self) -> anyhow::Result<Option<RegistryConfig>> {
-        let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut config = self.config.lock();
         if let Some(config) = &*config
             && self.is_fresh(RegistryConfig::NAME)
         {
@@ -198,7 +195,7 @@ impl SparseIndex {
             if self.is_fresh(path) {
                 return Ok(LoadResponse::CacheValid);
             }
-        } else if self.fresh().contains(path) {
+        } else if self.fresh.pin().contains(path) {
             return Ok(LoadResponse::NotFound);
         }
         let condition =
@@ -241,7 +238,7 @@ impl SparseIndex {
                 }
             })
             .await;
-        self.fresh().insert(path.to_owned());
+        self.fresh.pin().insert(path.to_owned());
         let answer = answer?;
         Ok(match answer.status {
             200 => {
@@ -284,9 +281,8 @@ impl SparseIndex {
         if !after_401 {
             return auth.token(registry, None, Operation::Read, &[], true);
         }
-        let login_url = self.login_url.lock().unwrap_or_else(PoisonError::into_inner).clone();
-        let headers =
-            self.auth_error_headers.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let login_url = self.login_url.lock().clone();
+        let headers = self.auth_error_headers.lock().clone();
         auth.token(registry, login_url.as_deref(), Operation::Read, &headers, true)
     }
 
@@ -294,10 +290,10 @@ impl SparseIndex {
     /// and, when a token was sent, cargo's words of a token refused over the answer.
     fn unauthorized(&self, url: &str, answer: &Response) -> anyhow::Result<anyhow::Error> {
         let headers = answer.headers.iter().map(|(name, value)| format!("{name}: {value}"));
-        *self.auth_error_headers.lock().unwrap_or_else(PoisonError::into_inner) = headers.collect();
+        *self.auth_error_headers.lock() = headers.collect();
         for (_, challenges) in answer.headers.iter().filter(|(it, _)| it == "www-authenticate") {
             if let Some(found) = crate::auth::login_url(challenges)? {
-                *self.login_url.lock().unwrap_or_else(PoisonError::into_inner) = Some(found);
+                *self.login_url.lock() = Some(found);
             }
         }
         let err = anyhow::Error::from(HttpNotSuccessful::new(url, answer));
@@ -305,7 +301,7 @@ impl SparseIndex {
             return Ok(err);
         }
         let auth = self.auth.as_deref().context("a token was sent")?;
-        let login_url = self.login_url.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let login_url = self.login_url.lock().clone();
         Ok(err.context(auth.rejected(self.named(auth)?, login_url.as_deref())?))
     }
 }

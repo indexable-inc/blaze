@@ -12,11 +12,12 @@
 
 use std::{
     io,
-    sync::{Condvar, Mutex, MutexGuard, Once, PoisonError},
+    sync::Once,
     time::Duration,
 };
 
 use blaze_mem::{Slab, Tag as MemTag};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 
 /// How often the footprint is read: a process faulting pages in as fast as it can gets tens of
 /// megabytes past its limit at most before it is killed.
@@ -47,7 +48,7 @@ static SAMPLER: Sampler = Sampler { entries: Mutex::new(None), wake: Condvar::ne
 static STARTED: Once = Once::new();
 
 fn entries() -> MutexGuard<'static, Option<Slab<Entry>>> {
-    SAMPLER.entries.lock().unwrap_or_else(PoisonError::into_inner)
+    SAMPLER.entries.lock()
 }
 
 pub(crate) struct Watch {
@@ -107,17 +108,13 @@ fn sample() {
     let mut entries = entries();
     loop {
         let Some(slab) = entries.as_mut().filter(|slab| slab.iter().any(|(_, it)| !it.done)) else {
-            entries = SAMPLER.wake.wait(entries).unwrap_or_else(PoisonError::into_inner);
+            SAMPLER.wake.wait(&mut entries);
             continue;
         };
         for (_, entry) in slab.iter_mut().filter(|(_, it)| !it.done) {
             check(entry);
         }
-        entries = SAMPLER
-            .wake
-            .wait_timeout(entries, INTERVAL)
-            .unwrap_or_else(PoisonError::into_inner)
-            .0;
+        SAMPLER.wake.wait_for(&mut entries, INTERVAL);
     }
 }
 

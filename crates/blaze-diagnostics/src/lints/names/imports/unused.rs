@@ -23,28 +23,30 @@
 use std::sync::LazyLock;
 
 use base_db::{CrateOrigin, LangCrateOrigin};
+use blaze_hash::{FixedState, HashMap, HashSet};
 use blaze_mem::Frame;
-use memchr::memmem;
 use cfg::CfgAtom;
 use hir::InFile;
 use hir_def::{ModuleDefId, ModuleId};
 use hir_expand::name::Name;
 use intern::sym;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use memchr::memmem;
 use smallvec::SmallVec;
 use syntax::{
     NodeOrToken, TextRange,
     view::{self as ast, AstNode as _, HasName, Node},
 };
 
-use super::used::{Binding, Entry, ExternCrate, Ns, SmallSet, Tree, TreeKind, UseItem, Used, Uses, entry};
-use stdx::list::Join;
+use super::used::{
+    Binding, Entry, ExternCrate, Ns, SmallSet, Tree, TreeKind, UseItem, Used, Uses, entry,
+};
 use crate::{
     cx::{Cx, item_range_view},
     lints::registry::LintId,
     lower::{Found, Phase},
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
+use stdx::list::Join;
 
 /// What `check_unused` finds.
 pub(super) struct Unused {
@@ -53,18 +55,18 @@ pub(super) struct Unused {
     /// What `check_unused_traits` lints after type checking.
     pub(super) bodies: Vec<Found>,
     /// The `use` trees found unused.
-    pub(super) unused: FxHashSet<Binding>,
+    pub(super) unused: HashSet<Binding>,
     /// The single imports found redundant.
-    pub(super) redundant: FxHashSet<Binding>,
+    pub(super) redundant: HashSet<Binding>,
 }
 
 impl Unused {
     pub(super) fn of(cx: &Cx<'_, '_>, uses: &Uses<'_, '_>) -> Unused {
         let mut out =
             // alloc: both hold only diagnostics that fire; empty, they allocate nothing
-            Unused { resolve: Vec::new(), bodies: Vec::new(), unused: FxHashSet::default(), redundant: FxHashSet::default() };
+            Unused { resolve: Vec::new(), bodies: Vec::new(), unused: HashSet::default(), redundant: HashSet::default() };
         let extern_crates = cx.lint_may_fire(LintId::named("unused_extern_crates"));
-        let mut maybe_unused_crates = FxHashSet::default();
+        let mut maybe_unused_crates = HashSet::default();
         for krate in &uses.crates {
             out.macro_use(cx, uses, krate);
             let binding = Binding::ExternCrate(krate.id);
@@ -134,9 +136,9 @@ impl Unused {
         // What is redundant is read by `unused_qualifications` too.
         let check_redundant = cx.lint_may_fire(LintId::named("redundant_imports"))
             || cx.lint_may_fire(LintId::named("unused_qualifications"));
-        let mut seen: hashbrown::HashSet<ModuleId, FxBuildHasher, _> = hashbrown::HashSet::with_capacity_and_hasher_in(
+        let mut seen: hashbrown::HashSet<ModuleId, FixedState, _> = hashbrown::HashSet::with_capacity_and_hasher_in(
             if check_redundant { uses.by_module.len() } else { 0 },
-            FxBuildHasher,
+            FixedState,
             cx.frame(),
         );
         for module in uses.items.iter().map(|it| it.module).filter(|_| check_redundant) {
@@ -222,7 +224,7 @@ impl Unused {
     }
 
     /// `unused_extern_crates` of `krate`: unused, or one a `use` could replace.
-    fn extern_crate(&mut self, cx: &Cx<'_, '_>, uses: &Uses<'_, '_>, krate: &ExternCrate<'_>, maybe_unused: &FxHashSet<hir_def::ExternCrateId>) {
+    fn extern_crate(&mut self, cx: &Cx<'_, '_>, uses: &Uses<'_, '_>, krate: &ExternCrate<'_>, maybe_unused: &HashSet<hir_def::ExternCrateId>) {
         let node = krate.node;
         let at = node.map(|it| ast::ptr(it.syntax()));
         let name = krate.name.as_str();
@@ -337,17 +339,17 @@ impl Unused {
 }
 
 /// rustc's `maybe_unused_trait_imports`, an `IndexSet`: the order, and each binding's place in
-/// it. `contains` and `swap_remove` are one FxHash lookup each.
+/// it. `contains` and `swap_remove` are one hash lookup each.
 struct Candidates<'f> {
     order: Vec<Binding, &'f Frame>,
-    at: hashbrown::HashMap<Binding, u32, FxBuildHasher, &'f Frame>,
+    at: hashbrown::HashMap<Binding, u32, FixedState, &'f Frame>,
 }
 
 impl<'f> Candidates<'f> {
     fn of(frame: &'f Frame, candidates: &[Binding]) -> Candidates<'f> {
         let mut order = Vec::with_capacity_in(candidates.len(), frame);
         order.extend_from_slice(candidates);
-        let mut at = hashbrown::HashMap::with_capacity_and_hasher_in(candidates.len(), FxBuildHasher, frame);
+        let mut at = hashbrown::HashMap::with_capacity_and_hasher_in(candidates.len(), FixedState, frame);
         at.extend(candidates.iter().enumerate().map(|(i, it)| (*it, i as u32)));
         Candidates { order, at }
     }
@@ -382,8 +384,8 @@ fn is_used(uses: &Uses<'_, '_>, binding: Binding, tree: &Tree<'_>) -> bool {
 }
 
 /// The trees directly in each tree of `item`, by index.
-fn children(item: &UseItem<'_>) -> FxHashMap<usize, Vec<usize>> {
-    let mut children: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+fn children(item: &UseItem<'_>) -> HashMap<usize, Vec<usize>> {
+    let mut children: HashMap<usize, Vec<usize>> = HashMap::default();
     for (j, tree) in item.trees.iter().enumerate() {
         if let Some(parent) = tree.parent {
             children.entry(parent as usize).or_default().push(j);
@@ -403,7 +405,7 @@ enum Calc {
 /// item with an unused tree.
 fn calc_unused_spans(
     item: &UseItem<'_>,
-    children: &FxHashMap<usize, Vec<usize>>,
+    children: &HashMap<usize, Vec<usize>>,
     unused: &Trees,
     j: usize,
     item_span: TextRange,

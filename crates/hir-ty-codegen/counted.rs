@@ -11,13 +11,13 @@ use std::{
     cell::RefCell,
     marker::PhantomData,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
 };
 
 use base_db::Crate;
-use rustc_hash::FxHashMap;
+use blaze_hash::SharedMap;
 
 /// The counts of one [`Counting`].
 #[derive(Default)]
@@ -30,7 +30,7 @@ pub struct Counted {
     /// Compile queries the query engine ran rather than handed back, in all and by the crate each was
     /// for: what a build says of itself as it goes.
     compiles: AtomicUsize,
-    compiles_of: Mutex<FxHashMap<Crate, usize>>,
+    compiles_of: SharedMap<Crate, AtomicUsize>,
 }
 
 impl Counted {
@@ -46,9 +46,9 @@ impl Counted {
 
     /// Compile queries run, by the crate each was for.
     pub fn compiles_by_crate(&self) -> Vec<(Crate, usize)> {
-        let of = self.compiles_of.lock().unwrap_or_else(|e| e.into_inner());
+        let of = self.compiles_of.pin();
         // alloc: once per build, for its report
-        of.iter().map(|(&krate, &count)| (krate, count)).collect()
+        of.iter().map(|(&krate, count)| (krate, count.load(Ordering::Relaxed))).collect()
     }
 }
 
@@ -124,7 +124,10 @@ pub(crate) fn compiled() {
 pub(crate) fn compiles(krate: Crate) {
     each(|it| {
         it.compiles.fetch_add(1, Ordering::Relaxed);
-        *it.compiles_of.lock().unwrap_or_else(|e| e.into_inner()).entry(krate).or_default() += 1;
+        it.compiles_of
+            .pin()
+            .get_or_insert_with(krate, AtomicUsize::default)
+            .fetch_add(1, Ordering::Relaxed);
     });
 }
 

@@ -16,7 +16,7 @@
 
 use std::ops::Range;
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use rustc_type_ir::inherent::IntoKind;
 
 use hir_ty::{
@@ -86,7 +86,7 @@ const INIT_AT: u8 = 1;
 const MOVE_OF: u8 = 2;
 
 /// The move paths as columns by preorder id: 4 bytes of local, 4 of parent and 4 of subtree
-/// end per path, the projections one CSR. Finding a path's child is one FxHash probe.
+/// end per path, the projections one CSR. Finding a path's child is one hash probe.
 pub(crate) struct MoveData {
     local: Vec<LocalId>,
     parent: Vec<u32>,
@@ -96,7 +96,7 @@ pub(crate) struct MoveData {
     /// Each local's path, by its index.
     locals: Vec<u32>,
     /// The path below a path by one step.
-    steps: FxHashMap<(u32, PlaceElem), u32>,
+    steps: HashMap<(u32, PlaceElem), u32>,
     pub(crate) moves: Vec<MoveOut>,
     pub(crate) inits: Vec<Init>,
     /// The moves and inits at each point and of each path, each in the order it was found.
@@ -115,7 +115,7 @@ struct Tree {
     /// The step from its parent of each path but a local's, by id less the number of locals.
     step: Vec<PlaceElem>,
     roots: usize,
-    steps: FxHashMap<(u32, PlaceElem), u32>,
+    steps: HashMap<(u32, PlaceElem), u32>,
     moves: Vec<MoveOut>,
     inits: Vec<Init>,
 }
@@ -132,7 +132,7 @@ impl MoveData {
             next_sibling: Vec::with_capacity(roots * 2),
             step: Vec::with_capacity(roots),
             roots,
-            steps: FxHashMap::default(),
+            steps: HashMap::default(),
             moves: Vec::with_capacity(cfg.points / 2),
             inits: Vec::with_capacity(cfg.points / 2),
         };
@@ -484,7 +484,7 @@ impl Tree {
                 end[up] = end[up].max(end[path]);
             }
         }
-        let mut steps = FxHashMap::with_capacity_and_hasher(count - self.roots, Default::default());
+        let mut steps = HashMap::with_capacity_and_hasher(count - self.roots, Default::default());
         for old in self.roots..count {
             let up = renumbered[self.parent[old] as usize];
             steps.insert((up, self.step[old - self.roots]), renumbered[old]);

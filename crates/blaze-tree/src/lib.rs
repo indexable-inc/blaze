@@ -23,20 +23,20 @@ use std::cmp::Ordering;
 use std::fmt::Write as _;
 
 use anyhow::{Context as _, Result, bail};
+use blaze_hash::HashSet;
 use blaze_manifest::Workspace;
-use blaze_manifest::files::Disk;
 use blaze_manifest::config::schema::FeatureUnification;
+use blaze_manifest::files::Disk;
 use blaze_metadata::Asked;
 use blaze_resolve::resolver::{
-    CliFeatures, CompileKind, FeatureOpts, FeatureResolver, ForceAllTargets, HasDevUnits, PackageTargets,
-    ResolveBehavior, ResolvedFeatures, members_with_features,
+    CliFeatures, CompileKind, FeatureOpts, FeatureResolver, ForceAllTargets, HasDevUnits,
+    PackageTargets, ResolveBehavior, ResolvedFeatures, members_with_features,
 };
 use blaze_resolve::{Cfg, InternedString, PackageId, PackageIdSpec, Platform, Summary};
-use rustc_hash::FxHashSet;
 
+use blaze_ids::bits::BitSet as Bits;
 pub use blaze_resolve::DepKind;
 pub use graph::EdgeKind;
-use blaze_ids::bits::BitSet as Bits;
 use graph::{BUILD, DEV, Edge, Graph, Kind, Node, NodeId, TAGS, Tag};
 use packages::{Reads, Table};
 
@@ -47,7 +47,7 @@ pub struct Options {
     /// The platform to filter for.
     pub target: Target,
     /// The dependency kinds to display.
-    pub edge_kinds: FxHashSet<EdgeKind>,
+    pub edge_kinds: HashSet<EdgeKind>,
     pub invert: Vec<String>,
     /// The packages to prune from the display of the dependency tree.
     pub pkgs_to_prune: Vec<String>,

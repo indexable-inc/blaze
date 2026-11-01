@@ -3,17 +3,15 @@
 use std::ops::ControlFlow;
 
 use base_db::Db;
+use blaze_hash::HashSet;
 use hir_def::{GenericDefId, HasModule, ImplId, TraitId, TypeAliasId};
 use rustc_abi::{Float, HasDataLayout, Integer, IntegerType, Primitive, ReprOptions};
-use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     ClausePolarity, ConstKind, CoroutineArgs, DebruijnIndex, FloatTy, INNERMOST, IntTy, Interner,
-    RegionKind, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable,
-    TypeVisitableExt, TypeVisitor, UintTy, UniverseIndex, Upcast,
+    RegionKind, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitableExt,
+    TypeVisitor, UintTy, UniverseIndex, Upcast,
     elaborate::{self, elaborate},
-    inherent::{
-        AdtDef, Clause as _, GenericArg as _, IntoKind, ParamEnv as _, SliceLike, Ty as _,
-    },
+    inherent::{AdtDef, Clause as _, GenericArg as _, IntoKind, ParamEnv as _, SliceLike, Ty as _},
     lang_items::SolverTraitLangItem,
     solve::SizedTraitKind,
 };
@@ -534,7 +532,7 @@ impl ItemBounds {
             elaborate(interner, explicit_bounds.self_bounds().skip_binder().iter().copied())
                 .filter_only_self();
 
-        let self_bounds = FxHashSet::from_iter(self_bounds);
+        let self_bounds = HashSet::from_iter(self_bounds);
         let non_self_bounds = all_bounds.filter(|bound| !self_bounds.contains(bound));
 
         let non_self_bounds_start = self_bounds.len() as u32;

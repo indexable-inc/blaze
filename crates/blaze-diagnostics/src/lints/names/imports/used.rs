@@ -25,6 +25,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 
+use blaze_hash::{FixedHasher, HashMap, HashSet};
 use blaze_ids::bits::Bits;
 use blaze_mem::Frame;
 use hashbrown::HashTable;
@@ -42,7 +43,6 @@ use hir_expand::{
     name::{AsName, Name},
 };
 use intern::sym;
-use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use smallvec::SmallVec;
 use span::Edition;
 use syntax::{
@@ -186,7 +186,7 @@ pub(super) struct ExternCrate<'db> {
 
 /// What the crate's name resolution goes through.
 ///
-/// Built once per crate, its lists in the check's frame. Each set and map is one FxHash probe
+/// Built once per crate, its lists in the check's frame. Each set and map is one hash probe
 /// per query; `by_module`, `globs` and `trees` point into `items` by `u32` index, so a
 /// module's imports or a binding's tree cost one probe and no scan. `lookups` memoizes scope
 /// lookups, hashed once over the borrowed key: a hit allocates nothing. `traits` memoizes the
@@ -198,45 +198,45 @@ pub(super) struct Uses<'f, 'db> {
     /// The `extern crate` items, in that order.
     pub(super) crates: Vec<ExternCrate<'db>, &'f Frame>,
     /// The local bindings used, each as it was used most: rustc's `import_use_map`.
-    pub(super) used: FxHashMap<Binding, Used>,
+    pub(super) used: HashMap<Binding, Used>,
     /// The trait imports a method call, field or type-relative path could use, in the order
     /// they were first found: rustc's `maybe_unused_trait_imports` before `check_unused`.
     pub(super) candidates: Vec<Binding, &'f Frame>,
     /// The bindings in `candidates`.
-    candidate_set: FxHashSet<Binding>,
+    candidate_set: HashSet<Binding>,
     /// The trait imports type checking uses: rustc's `used_trait_imports`.
-    pub(super) typeck: FxHashSet<Binding>,
+    pub(super) typeck: HashSet<Binding>,
     /// The bindings the crate re-exports: rustc's `effective_visibilities.is_exported`.
-    pub(super) exported: FxHashSet<Binding>,
+    pub(super) exported: HashSet<Binding>,
     /// Each name in a namespace a binding is re-exported as.
-    pub(super) exported_names: FxHashSet<(Binding, Name, Ns)>,
+    pub(super) exported_names: HashSet<(Binding, Name, Ns)>,
     /// The modules reachable from other crates, through public names from the root.
-    public_modules: FxHashSet<ModuleId>,
+    public_modules: HashSet<ModuleId>,
     /// The `#[macro_use]` imports used: of every macro (`None`) or of one.
-    pub(super) macro_uses: FxHashSet<(ExternCrateId, Option<Name>)>,
+    pub(super) macro_uses: HashSet<(ExternCrateId, Option<Name>)>,
     /// The macros invoked: by a call, an attribute or a derive.
-    pub(super) macros: FxHashSet<MacroId>,
+    pub(super) macros: HashSet<MacroId>,
     /// The rules of each `macro_rules!` a call matched.
-    pub(super) arms: FxHashMap<MacroId, SmallSet>,
+    pub(super) arms: HashMap<MacroId, SmallSet>,
     /// The macros invoked where which rule matched can't be told.
-    pub(super) arms_unknown: FxHashSet<MacroId>,
+    pub(super) arms_unknown: HashSet<MacroId>,
     /// The names of macro calls that don't resolve: a macro of such a name may be used.
-    pub(super) macros_unknown: FxHashSet<Name>,
+    pub(super) macros_unknown: HashSet<Name>,
     /// The names `--extern` puts in the crate's extern prelude.
-    pub(super) extern_prelude: FxHashSet<Name>,
+    pub(super) extern_prelude: HashSet<Name>,
     /// Each module's `use` items, by index into `items`, in `items`' order.
-    pub(super) by_module: FxHashMap<ModuleId, SmallVec<[u32; 4]>>,
+    pub(super) by_module: HashMap<ModuleId, SmallVec<[u32; 4]>>,
     /// Each module's glob trees, as (item, tree) indices, in `items`' order.
-    pub(super) globs: FxHashMap<ModuleId, SmallVec<[(u32, u32); 2]>>,
-    trees: FxHashMap<Binding, (u32, u32)>,
+    pub(super) globs: HashMap<ModuleId, SmallVec<[(u32, u32); 2]>>,
+    trees: HashMap<Binding, (u32, u32)>,
     /// The traits in scope at a module with a value item of a name: a range of `trait_rows`.
-    traits: FxHashMap<(ModuleId, Name), (u32, u32)>,
+    traits: HashMap<(ModuleId, Name), (u32, u32)>,
     /// A trait in scope and the imports it is found through, a range of `trait_chains`.
     trait_rows: Vec<(TraitId, u32, u32), &'f Frame>,
     trait_chains: Vec<Binding, &'f Frame>,
     /// Each module's `use` items by file and start, filled once per module.
-    use_ids: FxHashMap<(HirFileId, TextSize), UseId>,
-    indexed: FxHashSet<ModuleId>,
+    use_ids: HashMap<(HirFileId, TextSize), UseId>,
+    indexed: HashSet<ModuleId>,
     lookups: RefCell<HashTable<Lookup>>,
     krate: base_db::Crate,
 }
@@ -257,27 +257,27 @@ impl<'f, 'db> Uses<'f, 'db> {
             frame,
             items: Vec::new_in(frame),
             crates: Vec::new_in(frame),
-            used: FxHashMap::default(),
+            used: HashMap::default(),
             candidates: Vec::new_in(frame),
-            candidate_set: FxHashSet::default(),
-            typeck: FxHashSet::default(),
-            exported: FxHashSet::default(),
-            exported_names: FxHashSet::default(),
-            public_modules: FxHashSet::default(),
-            macro_uses: FxHashSet::default(),
-            macros: FxHashSet::default(),
-            arms: FxHashMap::default(),
-            arms_unknown: FxHashSet::default(),
-            macros_unknown: FxHashSet::default(),
+            candidate_set: HashSet::default(),
+            typeck: HashSet::default(),
+            exported: HashSet::default(),
+            exported_names: HashSet::default(),
+            public_modules: HashSet::default(),
+            macro_uses: HashSet::default(),
+            macros: HashSet::default(),
+            arms: HashMap::default(),
+            arms_unknown: HashSet::default(),
+            macros_unknown: HashSet::default(),
             extern_prelude,
-            by_module: FxHashMap::default(),
-            globs: FxHashMap::default(),
-            trees: FxHashMap::default(),
-            traits: FxHashMap::default(),
+            by_module: HashMap::default(),
+            globs: HashMap::default(),
+            trees: HashMap::default(),
+            traits: HashMap::default(),
             trait_rows: Vec::new_in(frame),
             trait_chains: Vec::new_in(frame),
-            use_ids: FxHashMap::default(),
-            indexed: FxHashSet::default(),
+            use_ids: HashMap::default(),
+            indexed: HashSet::default(),
             lookups: RefCell::new(HashTable::new()),
             krate: cx.krate.base(),
         };
@@ -1252,7 +1252,7 @@ fn resolve_in_items(cx: &Cx<'_, '_>, module: ModuleId, kind: PathKind, names: &[
     module.resolver(cx.db).resolve_module_path_in_items(cx.db, &path)
 }
 
-/// A memoized [`resolve_in_items`]. A lookup costs one FxHash of the module, the kind and each
+/// A memoized [`resolve_in_items`]. A lookup costs one hash of the module, the kind and each
 /// name's symbol pointer; a hit allocates and clones nothing.
 struct Lookup {
     module: ModuleId,
@@ -1262,7 +1262,7 @@ struct Lookup {
 }
 
 fn lookup_hash(module: ModuleId, kind: PathKind, names: &[Name]) -> u64 {
-    let mut hasher = FxHasher::default();
+    let mut hasher = FixedHasher::default();
     module.hash(&mut hasher);
     kind.hash(&mut hasher);
     names.hash(&mut hasher);

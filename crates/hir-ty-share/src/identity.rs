@@ -15,6 +15,7 @@
 //! bounds past four, which are sorted.
 
 use base_db::Db;
+use blaze_hash::HashSet;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, ItemKey, Unhashable, interface_hash, item_key, key, layout_hash};
 use hir_def::{AdtId, CallableDefId, HasModule};
@@ -24,11 +25,10 @@ use hir_ty::{
     mir::is_by_move_coroutine,
     next_solver::{
         AliasConst, AliasConstKind, Binder, Const, ConstExt as _, ConstKind, DbInterner,
-        FreeConstAliasId, GenericArgs, InherentAssocConstId, ParamEnv, Pattern, TermId, Ty,
-        TyKind, ValTree,
+        FreeConstAliasId, GenericArgs, InherentAssocConstId, ParamEnv, Pattern, TermId, Ty, TyKind,
+        ValTree,
     },
 };
-use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     AliasTyKind, BoundTyKind, BoundVarIndexKind, ExistentialPredicate, GenericArgKind, InferConst,
     PatternKind, TermKind, TypeVisitableExt as _, ValTreeKind,
@@ -88,7 +88,7 @@ pub fn adt(db: &Db, adt: AdtId) -> Result<ContentId, Unshared> {
     h.id(&item_key(db, item).0)
         .id(&interface_hash(db, item).map_err(unhashable(db))?.0)
         .id(&layout_hash(db, adt).map_err(unhashable(db))?.0);
-    let mut seen: FxHashSet<AdtId> = FxHashSet::default();
+    let mut seen: HashSet<AdtId> = HashSet::default();
     seen.insert(adt);
     // alloc: the ADTs the fields reach, once per ADT: this query's miss, memoized after
     let mut next = vec![adt];

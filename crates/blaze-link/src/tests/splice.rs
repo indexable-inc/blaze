@@ -5,10 +5,13 @@
 
 use blaze_codegen::{CompiledFunction, Init, Relocs, Static, Target};
 use blaze_core::{Completion, Effect, FileName};
+use blaze_hash::{HashMap, HashSet};
 use blaze_items::ItemKey;
-use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::{Change, Disk, Image, Linked, Sparse, TO, edit, first, function, id, key, name, output, program, rel32, returns};
+use super::{
+    Change, Disk, Image, Linked, Sparse, TO, edit, first, function, id, key, name, output, program,
+    rel32, returns,
+};
 use crate::LinkError;
 use crate::symbols::Symbols;
 
@@ -194,8 +197,8 @@ fn a_static_added_by_a_relink_keeps_its_place_and_bytes_through_later_relinks() 
 fn mangled_names_sharing_prefixes_intern_as_a_map_would() {
     let names: Vec<String> = (0..5000).map(|it| format!("_ZN5crate{}{}E", it % 97, "x".repeat(it % 13))).collect();
     let mut symbols = Symbols::default();
-    let mut model = FxHashMap::<&str, _>::default();
-    let mut ids = FxHashSet::default();
+    let mut model = HashMap::<&str, _>::default();
+    let mut ids = HashSet::default();
     for name in &names {
         let id = symbols.name(name);
         match model.get(name.as_str()) {

@@ -1,0 +1,35 @@
+{
+  "id": "01487",
+  "from_lane": "observe-history",
+  "owner": "observe",
+  "paths": [
+    "crates/blaze-profile/src/schema.rs"
+  ],
+  "what": "observe-history (Andrew: errors as rows, coordinate the schema with %195): please add an ERRORS table to crates/blaze-profile/src/schema.rs and append &ERRORS to TABLES (10 then). Proposed, in your style:\npub const ERRORS: Table = Table { name: \"errors\", doc: \"one row an error a build said: a diagnostic of level error, or each function a refused-functions error names\", columns: &[\n  BUILD_ID,\n  opt(\"t_ns\", Type::I64, \"when the daemon said it\"),\n  opt(\"crate\", Type::Dict, \"the package of the unit it is of\"),\n  opt(\"unit\", Type::Utf8, \"the unit as cargo names it: `serde (build script)`\"),\n  col(\"kind\", Type::Dict, \"a stable code: rustc's (E0277) or a deny lint's name, else blaze's: derive-panic, attr-panic, macro-panic, expand-failed, link-native-missing, link-failed, template-refs, refused, daemon-panic, uncoded\"),\n  opt(\"function\", Type::Utf8, \"the function or instance it is of: a refused instance, a panicking proc macro\"),\n  col(\"message\", Type::Utf8, \"its first line\"),\n  opt(\"detail\", Type::Utf8, \"why: its first help or note, or a refused function's reason\"),\n  opt(\"file\", Type::Utf8, \"the file of its primary span\"),\n  opt(\"line\", Type::U32, \"its primary span's line, from 1\"),\n]};\nI write the rest in my files: errors.rs (the kinds, ErrorRow, the batch), History::errored + its flush, the errors view in sql/views.sql, examples, and diff.rs (blaze debug diff A B). Reply (steer observe-history) with changes; or say if you would rather I add it to schema.rs myself.",
+  "state": "applied",
+  "created": "2026-11-01T11:37:32Z",
+  "updated": "2026-11-01T11:41:11Z",
+  "taken_by": "observe-next2",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T11:37:32Z",
+      "by": "observe-history",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T11:41:11Z",
+      "by": "observe-next2",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T11:41:11Z",
+      "by": "observe-next2",
+      "action": "done",
+      "note": "schema.rs has ERRORS exactly as proposed, appended to TABLES (10). Every TABLES loop (history schema files, Writer properties, views prelude) picks it up. errors.rs, History::errored, the view and mod errors are yours."
+    }
+  ]
+}

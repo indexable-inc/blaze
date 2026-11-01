@@ -73,6 +73,76 @@ export const rules = [
 		link: "docs/v2/plan/design/memory.md",
 	},
 	{
+		id: "standard-structures",
+		info: "One choice per need, never a hand-rolled or std stand-in: locks are `parking_lot::{Mutex, RwLock}`, held only for a field update and never across a query call; a shared map is `papaya::HashMap`; a single-owner map or set is `blaze_hash::{HashMap, HashSet}` (foldhash with a fixed seed), with `blaze_hash::KeyHasher` for keys that are already content hashes and `blaze_hash::Blake3Hasher` for persisted content IDs; results of parallel items come back from `blaze_graph::par` in order, never pushed into a `Mutex<Vec>`; a queue is `crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is `crossbeam-channel`; a counter or flag is an atomic. On a pool thread or fiber, a wait goes through the scheduler (a key, a counter, a job), never a `Condvar`, a channel receive, `thread::sleep` or a raw `spin_loop`; elsewhere a spin is the one bounded spin-then-park helper and a delay is a deadline in the sans-IO core or a driver's timer. `BTreeMap` only where iteration order is part of the output.",
+		reason: "Andrew, 2026-11-01: \"use the best data structure in general\", \"use proper hasher too\", parking_lot with std's Mutex denied. On macOS std's Mutex parks in the kernel with no spin; FxHash clusters on integer and pointer keys; a startup stall on 2026-11-01 was workers spinning with nothing recording why.",
+	},
+	{
+		id: "fix-through-blaze-lints",
+		info: "A change that moves a type, path, API or idiom across the code is a blaze lint with a MachineApplicable fix (`blaze::std_lock`, `blaze::std_mpsc`, `blaze::fx_hash` and the next one), applied with `blaze fix`; a one-off move of a path is `blaze fix --replace A=B`. Both find code by name resolution (imports, renames, globs, re-exports, macro output), never by text, and leave it compiling and lint-clean, so the rule keeps holding after the port. `sed`, `rg` replace and syntax-only rewriters (astlog) are for syntax-only shapes, scoped and checked by a build afterward.",
+		reason: "Andrew, 2026-11-01: \"make our own version of clippy that is incremental and has suggestions for replace\" and \"recommend doing find replace with blaze lints\". A text or tree-sitter rewrite of `std::sync::Mutex` misses `use std::sync::{Arc, Mutex}`, renames and globs, and can hit an unrelated `Mutex`; blaze-lints already runs per body as front-end queries.",
+	},
+	{
+		id: "sans-io-cores",
+		info: "Every core (a scheduler decision, a protocol, a retry or backoff policy, a lease, a maintainer's plan) is a synchronous state machine that reads time only from an injected clock (`advance_clock(now)`), owns no socket, file, thread, timer or sleep, and hands back decisions and deadlines (`take_decisions`, `next_deadline`). Drivers do the IO and stay thin. A test replays a transcript with no real clock.",
+		reason: "Andrew's rule for ix (2026-10-25), and `blaze_graph::sched` is built this way. A core that sleeps or reads wall time can only be tested by waiting, and those tests flake.",
+	},
+	{
+		id: "every-wait-says-what",
+		info: "A thread or fiber that blocks says what it waits for: the wait opens a span naming the awaited key, lock, channel, IO or child, and its owner when known. A wait with no name, and time on a worker covered by no span, are bugs; the profile test fails on them.",
+		reason: "2026-11-01: 18 codegen workers sat 77 s each in build 24 with no span saying why; only a bisect found part D's apply phase. 19,342 wait spans in that build carried no target because the table dropped the field.",
+	},
+	{
+		id: "bounded-progress",
+		info: "Every loop that waits for progress (a solver, a fixpoint, a readiness probe, a retry) has a bound (fuel, depth or a deadline from the injected clock) and ends in a typed outcome: done, or a failure naming what it was doing, the goal or key, and how far it got. Never an open loop whose only exit is success, and never a spin with no cap.",
+		reason: "2026-11-01: two self-builds ran 300 s with workers busy in type inference and the trait solver and no unit finishing; three more stalled spinning in `Flights::get_or_run_named` before any crate started. Each needed a sampler and a person to say what was stuck.",
+	},
+	{
+		id: "errors-name-the-thing",
+		info: "An error names the item it is about (the function or instance with its path, the crate, the key, the file and line) and the rule that refused it, in the message itself. \"a template made against 6 references is given 7\" is unfinished until it says which function and which template.",
+		reason: "2026-11-01: several self-build errors named only a hash or a count, so each round spent a person's time finding the function before anyone could fix it.",
+	},
+	{
+		id: "panics-fail-one-job",
+		info: "A panic inside a job (a query, a codegen unit, a proc-macro evaluation) fails that job's units with a typed error naming the panic and the job; the daemon keeps serving and `--keep-going` keeps building the rest. Formatting an error must not panic: render what needs the database while the database is attached.",
+		reason: "2026-11-01: a proc-macro evaluation error panicked while being formatted (its type needed the attached database), and the daemon dropped whole self-builds at 84 crates until it was found.",
+	},
+	{
+		id: "keys-cover-every-input",
+		info: "A query key, store key, fold key or template key covers every input its value depends on, including the data a constant points to and the identity of a closure callee. Two different values under one key is a refusal with a typed error, never an overwrite, and the fix is the key, never the check.",
+		reason: "2026-11-01: function folding merged bodies whose constants pointed at different data, two closures of one signature shared one instance, and the store refused other bytes under `Key(b75576429138)`. Each was a key missing an input.",
+	},
+	{
+		id: "measure-the-exact-tree",
+		info: "A measurement, bisect or checkpoint names the exact tree it ran on (a content digest of the sources and the blaze binary's hash) and keeps that tree; never re-sync or rebuild between measuring and committing. A result you can't tie to a tree is not evidence.",
+		reason: "2026-11-01: round 30 was committed from a snapshot taken 10 s after the next sync began, so main got a tree that built 214 crates instead of the measured 334, and a warm-cache theory was built on it before a cold run disproved it.",
+	},
+	{
+		id: "test-the-cause",
+		info: "A causal claim (this change caused the regression, this lock causes the convoy, this index makes it fast) is tested by removing the cause and watching the effect go, not by checking that its premises hold. Pin a load-bearing one with a test named for the property.",
+		reason: "2026-11-01: part D was blamed for the codegen convoy on timing alone; one run with part D's files reverted took codegen from 1,485 s to 473 s and the over-30 s units from 18 to 0, which is what made it a finding.",
+	},
+	{
+		id: "whole-ports",
+		info: "A change to a shared signature or type (a struct's fields, a trait, a lock type) updates every caller in the same batch, so the shared tree compiles at every save point. Do it through `blaze fix` or a scoped rewrite, then build, then hand the batch over. A half-ported tree blocks every lane's run.",
+		reason: "2026-11-01: the self-build loop sat blocked on `Maintainer { run }` after its fields changed, on `LifetimeParamData::is_fresh` callers, and on `into_inner().ok()` after the parking_lot port, each a signature changed without its callers.",
+	},
+	{
+		id: "deterministic-output",
+		info: "No output (an object, a diagnostic's order, a store key, a profile row's identity) depends on hash-map iteration order, thread timing, addresses or the wall clock. Hashers have fixed seeds; anything iterated into output is sorted or ordered by construction; a test builds twice and compares bytes.",
+		reason: "Content-addressed caching and replay need identical bytes from identical inputs; a nondeterministic key shows up as a store refusal or a cache that never hits.",
+	},
+	{
+		id: "persisted-state-round-trips",
+		info: "Anything blaze persists (the daemon image, the store, the plane's history) has a test that restores it and checks the result equals a fresh build byte for byte, and a budget for restart to first answer. A restore that silently starts empty is a failure the daemon reports, naming why.",
+		reason: "2026-11-01: the self-build home held a 1.8 GB image while the daemon log said \"the database starts empty: there is no daemon image\", and nothing measured whether a restart used it.",
+	},
+	{
+		id: "no-wait-across-thread-locals",
+		info: "A fiber can resume on another thread after any wait, so nothing held across a wait may be tied to a thread: no thread-local borrow, lock guard or `Rc`. Mark regions that must not wait with `NoWait`; read thread-locals in `#[inline(never)]` functions that end before any wait.",
+		reason: "2026-10-31: a job's carried thread-local was put back on a thread holding another job's (`stdx/src/lend.rs:94`), and a frame's state crashed in `blaze_mem::frame::Frame::inner`, both from state crossing a fiber switch.",
+	},
+	{
 		id: "best-long-term-design",
 		info: "Pick the best long-term design, not the least work: own the layer or port rustc's rule properly, and spend the effort on proving it right: real crates' own test suites passing under blaze, and fuzzing of blaze's own invariants.",
 		reason: "Agents write most of blaze, so the amount of code a design takes is not what limits it; what stays expensive is proving it right. Andrew, 2026-10-30, deleting the harnesses that compared blaze with rustc or cargo: \"we use other ppl['s] test[s] [of] the other crates ... it over-constrains us\".",

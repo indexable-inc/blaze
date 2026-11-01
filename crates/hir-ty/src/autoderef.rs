@@ -89,7 +89,7 @@ pub fn autoderef<'db>(
         // would revisit some already visited types. Stop here to avoid duplication.
         //
         // XXX: A walk is as long as the crate's recursion limit (128 by default), so `contains`
-        // shouldn't be too expensive. Replace this duplicate check with `FxHashSet` if it proves
+        // shouldn't be too expensive. Replace this duplicate check with `HashSet` if it proves
         // to be more performant.
         if v.contains(&resolved) {
             break;

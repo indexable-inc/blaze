@@ -12,13 +12,13 @@
 //! and `compiler/rustc_errors/src/lib.rs` (`DiagCtxtInner::emit_diagnostic`: a diagnostic
 //! emitted again is not written again, nor a `note_once` already written).
 
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 
 use base_db::Db;
-use blaze_ids::radix;
+use blaze_hash::HashSet;
+use blaze_ids::{Domain, radix};
 use blaze_mem::{Frame, Tag, frame};
 use hir::check::bodies::Plan;
-use rustc_hash::FxHashSet;
 
 use crate::{
     checks,
@@ -147,8 +147,8 @@ const DUPLICATE: &str = "duplicate diagnostic emitted due to `-Z deduplicate-dia
 /// `note_once` already written with another. rustc counts each one it writes for its closing
 /// lines, a duplicate kept included (`deduplicated_err_count`).
 fn finish(diags: Vec<Diag>, keep_duplicates: bool) -> Vec<Diag> {
-    let mut seen: FxHashSet<Key> = FxHashSet::default();
-    let mut once: FxHashSet<Key> = FxHashSet::default();
+    let mut seen: HashSet<Key> = HashSet::default();
+    let mut once: HashSet<Key> = HashSet::default();
     seen.reserve(diags.len());
     let mut written = Vec::with_capacity(diags.len());
     for mut diag in diags {
@@ -180,28 +180,15 @@ fn note_origin(diag: &mut Diag) {
 /// than a copy of it.
 type Key = [u8; 16];
 
+/// The domain of [`key`]. The keys live only as long as one check, so renaming it changes
+/// nothing stored.
+static EMITTED: Domain = Domain::new("blaze v2 diagnostics emitted 1");
+
 /// BLAKE3 over `it`'s `Hash` form, cut to 128 bits.
 fn key(it: &impl Hash) -> Key {
-    let mut hasher = Blake3(blaze_ids::b3::Hasher::new());
-    it.hash(&mut hasher);
     let mut key = [0; 16];
-    key.copy_from_slice(&hasher.0.finalize()[..16]);
+    key.copy_from_slice(&blaze_ids::Hasher::of(&EMITTED).std(it).finish().0[..16]);
     key
-}
-
-/// A [`Hasher`] that feeds BLAKE3.
-struct Blake3(blaze_ids::b3::Hasher);
-
-impl Hasher for Blake3 {
-    fn write(&mut self, bytes: &[u8]) {
-        self.0.update(bytes);
-    }
-
-    fn finish(&self) -> u64 {
-        let mut word = [0; 8];
-        word.copy_from_slice(&self.0.finalize()[..8]);
-        u64::from_le_bytes(word)
-    }
 }
 
 /// `diags` as rustc writes them, then its closing lines, then the future-incompatibility

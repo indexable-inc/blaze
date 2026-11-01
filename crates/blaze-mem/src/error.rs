@@ -63,6 +63,6 @@ impl std::error::Error for MemError {
 #[cold]
 #[inline(never)]
 #[track_caller]
-pub(crate) fn fail(error: MemError) -> ! {
+pub(crate) fn fail(error: &MemError) -> ! {
     panic!("{error}")
 }

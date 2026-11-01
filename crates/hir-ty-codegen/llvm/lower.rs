@@ -18,6 +18,7 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::isa::CallConv;
 use std::num::NonZeroU32;
 
+use blaze_hash::{HashMap, HashSet};
 use inkwell::{
     AddressSpace, AtomicOrdering, AtomicRMWBinOp, FloatPredicate, GlobalVisibility, IntPredicate,
     ThreadLocalMode,
@@ -37,7 +38,6 @@ use inkwell::{
         FunctionValue, InstructionValue, IntValue, PhiValue, PointerValue, VectorValue,
     },
 };
-use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use hir_def::hir::AsmOptions;
@@ -104,19 +104,19 @@ pub(super) struct Lowering<'ctx, 'f> {
     builder: Builder<'ctx>,
     func: &'f ir::Function,
     function: FunctionValue<'ctx>,
-    values: FxHashMap<Value, Operand<'ctx>>,
+    values: HashMap<Value, Operand<'ctx>>,
     /// The `i1` a comparison gave, for the branch or select that uses it.
-    conditions: FxHashMap<Value, IntValue<'ctx>>,
-    blocks: FxHashMap<Block, BasicBlock<'ctx>>,
-    phis: FxHashMap<Block, Vec<PhiValue<'ctx>>>,
-    slots: FxHashMap<ir::StackSlot, PointerValue<'ctx>>,
-    callees: FxHashMap<ir::FuncRef, FunctionValue<'ctx>>,
-    globals: FxHashMap<ir::GlobalValue, PointerValue<'ctx>>,
+    conditions: HashMap<Value, IntValue<'ctx>>,
+    blocks: HashMap<Block, BasicBlock<'ctx>>,
+    phis: HashMap<Block, Vec<PhiValue<'ctx>>>,
+    slots: HashMap<ir::StackSlot, PointerValue<'ctx>>,
+    callees: HashMap<ir::FuncRef, FunctionValue<'ctx>>,
+    globals: HashMap<ir::GlobalValue, PointerValue<'ctx>>,
     /// The bytes of the data objects that a load from is known to give, by the number in
     /// their names.
-    constants: &'f FxHashMap<u32, &'f [u8]>,
+    constants: &'f HashMap<u32, &'f [u8]>,
     /// The numbers in the names of the data objects that are statics.
-    statics: &'f FxHashSet<u32>,
+    statics: &'f HashSet<u32>,
     /// The number in the name of `_Unwind_Resume`, whose calls are LLVM's `resume`.
     resume: Option<u32>,
     /// The number in the name of `memcmp`, which is called by its own name: LLVM writes a
@@ -124,8 +124,8 @@ pub(super) struct Lowering<'ctx, 'f> {
     memcmp: Option<u32>,
     /// The `asm!` blocks whose wrappers are called, by the numbers in the wrappers' names, that
     /// go where they are called as LLVM's inline assembly.
-    blocks_asm: &'f FxHashMap<u32, &'static asm::Inline>,
-    pads: FxHashMap<Pad, BasicBlock<'ctx>>,
+    blocks_asm: &'f HashMap<u32, &'static asm::Inline>,
+    pads: HashMap<Pad, BasicBlock<'ctx>>,
     /// The block the allocas are in.
     frame: Option<BasicBlock<'ctx>>,
     /// Where a guarded call that unwound leaves its exception (see `unwind::seh`).
@@ -135,25 +135,25 @@ pub(super) struct Lowering<'ctx, 'f> {
     /// How often each branch went each way while code of the function ran.
     weights: Option<&'f crate::tier::Weights>,
     /// The values that are addresses, which are pointers in LLVM: see [`addresses`].
-    addresses: FxHashSet<Value>,
+    addresses: HashSet<Value>,
     /// The parameters of each callee, by its name, that are pointers: see
     /// [`Lowering::pointer_params`].
-    pointer_params: FxHashMap<String, Vec<u32>>,
+    pointer_params: HashMap<String, Vec<u32>>,
     /// The values that are or may be addresses: see [`pointerish`]. A block parameter of
     /// one is a phi of pointers.
-    pointerish: FxHashSet<Value>,
+    pointerish: HashSet<Value>,
     /// The functions called whose bodies LLVM is shown, by their place among the requests.
-    shown: &'f FxHashMap<u32, FunctionValue<'ctx>>,
+    shown: &'f HashMap<u32, FunctionValue<'ctx>>,
     /// The addresses rounded up in slots aligned beyond what Cranelift aligns: see
     /// [`realigned`].
-    realigned: FxHashMap<Inst, (ir::StackSlot, u32)>,
+    realigned: HashMap<Inst, (ir::StackSlot, u32)>,
 }
 
 /// Each `(address + align - 1) & -align` of a stack slot, with the slot and the alignment:
 /// Cranelift aligns a frame by 16 bytes, so a slot that needs more is larger by as much and
 /// the address rounded up. LLVM aligns an alloca by any power of two, and the rounded address
 /// is then the alloca's, which LLVM can follow where it can't through the arithmetic.
-fn realigned(func: &ir::Function) -> FxHashMap<Inst, (ir::StackSlot, u32)> {
+fn realigned(func: &ir::Function) -> HashMap<Inst, (ir::StackSlot, u32)> {
     let dfg = &func.dfg;
     let made = |value: Value| match dfg.value_def(dfg.resolve_aliases(value)) {
         ir::ValueDef::Result(inst, _) => Some(dfg.insts[inst]),
@@ -163,7 +163,7 @@ fn realigned(func: &ir::Function) -> FxHashMap<Inst, (ir::StackSlot, u32)> {
         InstructionData::UnaryImm { opcode: Opcode::Iconst, imm, .. } => Some(imm.bits()),
         _ => None,
     };
-    let mut found = FxHashMap::default();
+    let mut found = HashMap::default();
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             let InstructionData::Binary { opcode: Opcode::Band, args: [bumped, mask] } =
@@ -216,11 +216,11 @@ pub(super) struct Defined<'f> {
 /// passed, and what is stored at and loaded from each place of a stack slot.
 struct Flow {
     /// What each block parameter is passed; a call's result passed is the parameter itself.
-    incoming: FxHashMap<Value, Vec<Value>>,
+    incoming: HashMap<Value, Vec<Value>>,
     /// The values of pointer width stored at each place, and the place each load of pointer
     /// width reads.
-    stored: FxHashMap<(ir::StackSlot, i64), Vec<Value>>,
-    loaded: FxHashMap<Value, (ir::StackSlot, i64)>,
+    stored: HashMap<(ir::StackSlot, i64), Vec<Value>>,
+    loaded: HashMap<Value, (ir::StackSlot, i64)>,
 }
 
 impl Flow {
@@ -259,9 +259,9 @@ impl Flow {
             }
         };
         let mut flow = Flow {
-            incoming: FxHashMap::default(),
-            stored: FxHashMap::default(),
-            loaded: FxHashMap::default(),
+            incoming: HashMap::default(),
+            stored: HashMap::default(),
+            loaded: HashMap::default(),
         };
         for block in func.layout.blocks() {
             for inst in func.layout.block_insts(block) {
@@ -324,7 +324,7 @@ impl Flow {
 ///
 /// A wrong guess costs nothing but speed: a value that is used as an integer as well is
 /// turned into one there (`ptrtoint`, which LLVM takes for the address escaping).
-fn addresses(func: &ir::Function, flow: &Flow) -> FxHashSet<Value> {
+fn addresses(func: &ir::Function, flow: &Flow) -> HashSet<Value> {
     let dfg = &func.dfg;
     // alloc: once per function lowered, the analysis's worklist
     let mut work = Vec::new();
@@ -356,7 +356,7 @@ fn addresses(func: &ir::Function, flow: &Flow) -> FxHashSet<Value> {
         ),
         _ => false,
     };
-    let mut found = FxHashSet::default();
+    let mut found = HashSet::default();
     while let Some(value) = work.pop() {
         let value = dfg.resolve_aliases(value);
         if dfg.value_type(value) != types::I64 || !found.insert(value) {
@@ -385,9 +385,9 @@ fn addresses(func: &ir::Function, flow: &Flow) -> FxHashSet<Value> {
 fn pointerish(
     func: &ir::Function,
     flow: &Flow,
-    addresses: &FxHashSet<Value>,
+    addresses: &HashSet<Value>,
     params: &[Value],
-) -> FxHashSet<Value> {
+) -> HashSet<Value> {
     let dfg = &func.dfg;
     // clone: once per function lowered; `addresses` is kept beside it (`Lowering::addresses`)
     let mut found = addresses.clone();
@@ -524,7 +524,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
     fn pointers(
         func: &ir::Function,
         pointees: &[(u32, Pointee)],
-        addresses: &FxHashSet<Value>,
+        addresses: &HashSet<Value>,
     ) -> SmallVec<[u32; 8]> {
         let mut pointers = pointees.iter().map(|it| it.0).collect::<SmallVec<[u32; 8]>>();
         if let Some(entry) = func.layout.entry_block() {
@@ -584,12 +584,12 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         module: &'f Module<'ctx>,
         function: FunctionValue<'ctx>,
         defined: &Defined<'f>,
-        constants: &'f FxHashMap<u32, &'f [u8]>,
-        statics: &'f FxHashSet<u32>,
+        constants: &'f HashMap<u32, &'f [u8]>,
+        statics: &'f HashSet<u32>,
         resume: Option<u32>,
         memcmp: Option<u32>,
-        blocks_asm: &'f FxHashMap<u32, &'static asm::Inline>,
-        shown: &'f FxHashMap<u32, FunctionValue<'ctx>>,
+        blocks_asm: &'f HashMap<u32, &'static asm::Inline>,
+        shown: &'f HashMap<u32, FunctionValue<'ctx>>,
         debug: Option<&'f Debug<'ctx>>,
     ) -> Lowered<()> {
         let func = defined.func;
@@ -610,25 +610,25 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             builder: context.create_builder(),
             func,
             function,
-            values: FxHashMap::default(),
-            conditions: FxHashMap::default(),
-            blocks: FxHashMap::default(),
-            phis: FxHashMap::default(),
-            slots: FxHashMap::default(),
-            callees: FxHashMap::default(),
-            globals: FxHashMap::default(),
+            values: HashMap::default(),
+            conditions: HashMap::default(),
+            blocks: HashMap::default(),
+            phis: HashMap::default(),
+            slots: HashMap::default(),
+            callees: HashMap::default(),
+            globals: HashMap::default(),
             constants,
             statics,
             resume,
             memcmp,
             blocks_asm,
-            pads: FxHashMap::default(),
+            pads: HashMap::default(),
             frame: None,
             arrival: None,
             marks: debug.filter(|_| defined.marked).map(|debug| Marks::new(debug, function)),
             weights: defined.weights,
             addresses,
-            pointer_params: FxHashMap::default(),
+            pointer_params: HashMap::default(),
             pointerish,
             realigned: realigned(func),
             shown,
@@ -770,7 +770,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
 
     fn reverse_post_order(&self, entry: Block) -> Vec<Block> {
         let mut order = Vec::with_capacity(self.func.dfg.num_blocks());
-        let mut seen = rustc_hash::FxHashSet::default();
+        let mut seen = blaze_hash::HashSet::default();
         seen.insert(entry);
         let mut stack: SmallVec<[(Block, SmallVec<[Block; 2]>, usize); 16]> = SmallVec::new();
         stack.push((entry, self.successors(entry), 0));
@@ -2357,9 +2357,9 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
 
     /// The parameters of each callee that some call of it passes an address to, by its name:
     /// the callee is declared with pointers there.
-    fn pointer_params(&self, pointerish: &FxHashSet<Value>) -> FxHashMap<String, Vec<u32>> {
+    fn pointer_params(&self, pointerish: &HashSet<Value>) -> HashMap<String, Vec<u32>> {
         let dfg = &self.func.dfg;
-        let mut found: FxHashMap<String, Vec<u32>> = FxHashMap::default();
+        let mut found: HashMap<String, Vec<u32>> = HashMap::default();
         for block in self.func.layout.blocks() {
             for inst in self.func.layout.block_insts(block) {
                 let func_ref = match dfg.insts[inst] {

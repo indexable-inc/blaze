@@ -21,9 +21,9 @@ use std::{borrow::Cow, convert::Infallible, ffi::OsString, fmt, path::PathBuf, t
 use blaze_cas::{Corrupt, Key, Kind, Mismatch, Store, Ticket};
 use blaze_core::{Traced, Untraceable};
 use blaze_format::cursor::{Put, Reader};
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher, radix};
 use blaze_items::CodeHash;
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     Given, Reached, RunKey, RunKind,
@@ -142,7 +142,7 @@ impl Test {
     /// are in [`Suite::given_whole`].
     pub fn whole(tests: &[Test]) -> Test {
         let mut reached = Vec::new(); // alloc: empty, allocates nothing
-        let mut seen = FxHashSet::default();
+        let mut seen = HashSet::default();
         for test in tests {
             for hash in &test.reached {
                 if seen.insert(*hash) {
@@ -505,9 +505,9 @@ fn explain<P: Passes + ?Sized, I: Inputs>(
 
 /// The first input of `before` whose value `now` does not have.
 pub fn changed_input(before: &Traced, now: &Traced) -> Option<Input> {
-    let files: FxHashMap<_, _> = now.files.iter().map(|(path, hash)| (path, hash)).collect(); // alloc: the edge: an explanation for people, made only when asked
-    let dirs: FxHashMap<_, _> = now.dirs.iter().map(|(path, hash)| (path, hash)).collect(); // alloc: the edge: an explanation for people, made only when asked
-    let env: FxHashMap<_, _> = now.env.iter().map(|(name, value)| (name, value)).collect(); // alloc: the edge: an explanation for people, made only when asked
+    let files: HashMap<_, _> = now.files.iter().map(|(path, hash)| (path, hash)).collect(); // alloc: the edge: an explanation for people, made only when asked
+    let dirs: HashMap<_, _> = now.dirs.iter().map(|(path, hash)| (path, hash)).collect(); // alloc: the edge: an explanation for people, made only when asked
+    let env: HashMap<_, _> = now.env.iter().map(|(name, value)| (name, value)).collect(); // alloc: the edge: an explanation for people, made only when asked
     for (path, hash) in &before.files {
         if files.get(path) != Some(&hash) {
             return Some(Input::File(path.clone())); // clone: the edge: an explanation for people, made only when asked

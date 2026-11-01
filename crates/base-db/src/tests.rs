@@ -749,10 +749,10 @@ fn an_aliass_text_is_its_files() {
 #[test]
 fn a_table_finds_what_a_hash_map_does() {
     use crate::table::{Table, hash_of};
-    use rustc_hash::FxHashMap;
+    use blaze_hash::HashMap;
 
     let table: Table<Box<str>> = Table::new(1 << 16);
-    let mut model: FxHashMap<String, u32> = FxHashMap::default();
+    let mut model: HashMap<String, u32> = HashMap::default();
     let mut order = Vec::new();
     let mut rng = Rng::new(7);
     for _ in 0..20_000 {

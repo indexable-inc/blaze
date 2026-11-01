@@ -191,7 +191,8 @@ did about it in one line.
   harness for a daemon bug ([harness.md](harness.md#adding-a-test)).
 - The gate, under Cranelift and under LLVM, on the platform you have. Say which platforms
   you did not run. CI's merge gate is the build and the unit tests on Linux x86-64, and
-  `blaze check --workspace` with the released blaze on Linux x86-64 and macOS; every
+  `blaze check --workspace` with the released blaze on Linux x86-64 and macOS, with astlog's
+  rules after it (`tools/astlog/README.md`); every
   harness on every platform, Windows too, and the slow ones (`norustc.py`, the store,
   `blaze_cli.py` on real projects) run in the release train on
   main after the merge, and a red train opens or adds to the issue "Release train is red",
@@ -282,8 +283,8 @@ run in the lane's worktree
 
 It pushes the branch, opens its pull request ("Merge <branch>: what the branch does") and turns
 on auto-merge. The pull request's own run is the merge gate, the build and the unit tests on
-Linux x86-64 and the released blaze's `blaze check --workspace` on Linux x86-64 and macOS
-([harness.md](harness.md#ci)); a failure there ends `land.py`
+Linux x86-64 and the released blaze's `blaze check --workspace` on Linux x86-64 and macOS, with
+astlog's rules after it ([harness.md](harness.md#ci)); a failure there ends `land.py`
 with the check's link. Once it passes, GitHub merges the branch with a merge commit, as
 `git merge --no-ff` would. There is no merge queue and the branch need not be up to date with
 main: two changes that each pass but break together are caught on main by the release train.

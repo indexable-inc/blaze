@@ -2,13 +2,10 @@
 //! which source a source's packages come from, and every package of a lock file fetched from
 //! there into the directory cargo would have it in.
 
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context as _, bail};
-use rustc_hash::FxHashMap;
+use blaze_hash::{HashMap, SharedMap};
 
 use blaze_source::{CRATES_IO_REGISTRY, GitReference, SourceId, SourceKind};
 
@@ -36,7 +33,7 @@ pub struct SourceConfig {
     /// The `[source]` tables.
     pub sources: Vec<(String, SourceDef)>,
     /// `registries.<name>.index` of each `[registries.<name>]`.
-    pub registries: FxHashMap<String, String>,
+    pub registries: HashMap<String, String>,
     /// `registries.crates-io.protocol = "git"`: crates.io read from its git index.
     pub crates_io_git: bool,
 }
@@ -128,8 +125,8 @@ pub struct Locked {
 pub struct Sources {
     map: SourceMap,
     context: Arc<Context>,
-    registries: Mutex<FxHashMap<SourceId, Arc<Registry>>>,
-    directories: Mutex<FxHashMap<SourceId, Arc<Directory>>>,
+    registries: SharedMap<SourceId, Arc<Registry>>,
+    directories: SharedMap<SourceId, Arc<Directory>>,
 }
 
 impl Sources {
@@ -137,8 +134,8 @@ impl Sources {
         Ok(Sources {
             map: source_map(config)?,
             context,
-            registries: Mutex::default(),
-            directories: Mutex::default(),
+            registries: SharedMap::default(),
+            directories: SharedMap::default(),
         })
     }
 
@@ -146,28 +143,25 @@ impl Sources {
         &self.map
     }
 
-    /// The registry `id` is, remote or local.
+    /// The registry `id` is, remote or local. Opening one reads nothing, so of two threads that
+    /// open one at once, the one that loses drops its copy and takes the winner's.
     pub fn registry(&self, id: SourceId) -> anyhow::Result<Arc<Registry>> {
-        let mut open = self.registries.lock().expect("sources");
-        if let Some(registry) = open.get(&id) {
+        if let Some(registry) = self.registries.pin().get(&id) {
             return Ok(registry.clone());
         }
         let registry = Arc::new(match id.kind() {
             SourceKind::LocalRegistry => Registry::local(id, &path_of(id)?, self.context.clone()),
             _ => Registry::remote(id, self.context.clone())?,
         });
-        open.insert(id, registry.clone());
-        Ok(registry)
+        Ok(self.registries.pin().get_or_insert(id, registry).clone())
     }
 
     pub fn directory(&self, id: SourceId) -> anyhow::Result<Arc<Directory>> {
-        let mut open = self.directories.lock().expect("sources");
-        if let Some(directory) = open.get(&id) {
+        if let Some(directory) = self.directories.pin().get(&id) {
             return Ok(directory.clone());
         }
         let directory = Arc::new(Directory::new(id, path_of(id)?));
-        open.insert(id, directory.clone());
-        Ok(directory)
+        Ok(self.directories.pin().get_or_insert(id, directory).clone())
     }
 
     /// Every package of `locked` where a build reads it from, in the order given, and where it
@@ -175,7 +169,7 @@ impl Sources {
     /// `$CARGO_HOME/registry/src`, or the directory a vendored copy is in once its files are
     /// checked.
     pub fn fetch(&self, locked: &[Locked]) -> anyhow::Result<Vec<(PathBuf, From)>> {
-        let mut by_source: FxHashMap<SourceId, Vec<usize>> = FxHashMap::default();
+        let mut by_source: HashMap<SourceId, Vec<usize>> = HashMap::default();
         for (at, it) in locked.iter().enumerate() {
             let from = self.map.replacement(it.source)?;
             by_source.entry(from).or_default().push(at);
@@ -199,8 +193,8 @@ impl Sources {
                 }
                 SourceKind::Git(_) => {
                     let _lock = crate::PackageCacheLock::acquire(&self.context.cargo_home)?;
-                    let mut checkouts: FxHashMap<Option<&str>, crate::git::Checkout> =
-                        FxHashMap::default();
+                    let mut checkouts: HashMap<Option<&str>, crate::git::Checkout> =
+                        HashMap::default();
                     for &at in &at {
                         let precise = locked[at].source.precise_git_fragment();
                         let checkout = match checkouts.get(&precise) {

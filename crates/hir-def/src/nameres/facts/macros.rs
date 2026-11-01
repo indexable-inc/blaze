@@ -16,6 +16,7 @@ use std::{
 };
 
 use base_db::{Crate, Db};
+use blaze_hash::HashMap;
 use blaze_mem::Frame;
 use cfg::CfgAtom;
 use either::Either;
@@ -27,7 +28,6 @@ use hir_expand::{
     name::Name,
 };
 use intern::sym;
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use span::FileAstId;
 use syntax::ast;
@@ -543,7 +543,7 @@ fn resolve_one<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
                 // If there's no expander for the proc macro (e.g. because proc macros are
                 // disabled, or building the proc macro crate failed), report this and skip
                 // expansion like we would if it was disabled
-                if let Some(err) = exp.as_expand_error(def.krate) {
+                if let Some(err) = exp.as_expand_error(db, def.krate) {
                     sink.apply(DeclOp::Diagnostic(DefDiagnostic::macro_error(
                         module,
                         ast_id,
@@ -988,8 +988,8 @@ impl<'db, 'f> StepSink<'db, 'f> {
             root: queries::crate_root(db, krate),
             modules: ModulesSlot::Unit { own, rows: blaze_query::db::AsId::as_id(&rows) },
             prelude: None,
-            macro_use_prelude: FxHashMap::default(),
-            derive_helpers_in_scope: FxHashMap::default(),
+            macro_use_prelude: HashMap::default(),
+            derive_helpers_in_scope: HashMap::default(),
             session_macros: false,
             names: NameRecords::default(),
             diagnostics: Vec::new(), // alloc: empty, a view keeps no diagnostics

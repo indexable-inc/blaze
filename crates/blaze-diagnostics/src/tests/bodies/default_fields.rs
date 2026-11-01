@@ -20,7 +20,7 @@ fn ui_only(name: &str, source: &str, keep: impl Fn(&Diag) -> bool) -> String {
         .diags
         .iter()
         .filter(|it| keep(it))
-        .map(|it| written(it, &sources, Style { ui_testing: true, ..Style::default() }))
+        .map(|it| written(it, &sources, Style { ui_testing: true, ..Style::default() }).unwrap())
         .collect();
     if stderr.ends_with("\n\n") {
         stderr.pop();

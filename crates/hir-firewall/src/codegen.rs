@@ -11,8 +11,9 @@ use blaze_codegen::{
     settings::{DebugInfo, Panic, Pgo, Sanitize},
 };
 use blaze_ids::ContentId;
-use hir_ty_codegen::v2::{BuildTime, Databases, HashSource, HirFrontend, HirInstance, ItemHashes, Runs};
-use rustc_hash::FxHashMap;
+use hir_ty_codegen::v2::{
+    BuildTime, Databases, HashSource, HirFrontend, HirInstance, ItemHashes, Runs,
+};
 
 /// How the harness compiles: a dev build's policy (opt-level 0, where no function's code
 /// builds in another workspace body), the origin the crate's code is asked as, and the names
@@ -50,18 +51,20 @@ impl Codegen {
 }
 
 /// What an instance's store key is made of: its code hash and its arguments' facts.
-pub(crate) type Keys = FxHashMap<HirInstance, (ContentId, ContentId)>;
+pub(crate) type Keys = blaze_hash::HashMap<HirInstance, (ContentId, ContentId)>;
 
 /// Every instance `krate`'s functions reach, by what its key is made of. A dependency's
 /// instance is listed, and what it reaches is not walked: no edit of the crate reaches into
 /// it ([`Owner::Dependency`]).
 pub(crate) fn instances(db: &Db, krate: Crate, codegen: &Codegen) -> Result<Keys, String> {
     let names = Arc::clone(&codegen.names);
-    let hashes = ItemHashes::new(Box::new(move |file: FileId| { // alloc: tests only, once a pass
+    let hashes = ItemHashes::new(Box::new(move |file: FileId| {
+        // alloc: tests only, once a pass
         Some(names.get(&file).cloned().unwrap_or_else(|| format!("file{}.rs", file.index()))) // alloc: clone: tests only, a file's name
     }));
     let build_time = Arc::new(BuildTime(Default::default())); // alloc: tests only, once a pass
-    let frontend = HirFrontend::new(Databases::new(db), HashSource::Items(hashes), build_time).with_policy(&codegen.policy);
+    let frontend = HirFrontend::new(Databases::new(db), HashSource::Items(hashes), build_time)
+        .with_policy(&codegen.policy);
     let mut queue = frontend.every_function(krate);
     let mut keys = Keys::default();
     while let Some(instance) = queue.pop() {

@@ -609,3 +609,35 @@ fn every_program_has_its_expected_output() {
     }
     assert!(programs >= 9, "{programs} programs");
 }
+
+/// The share of `f::<u32>` in a crate whose `fn f<T>(x: T)` calls `f((x,))`, under the crate
+/// attributes `attrs`.
+fn growing_chain(attrs: &str) -> Result<ShareKey, Unshared> {
+    let db: TestDB = fixture::db(&format!(
+        "//- minicore: {MINICORE}\n{attrs}\npub type U32 = u32;\npub fn f<T>(x: T) {{ f((x,)) }}\npub fn main() {{ f(0u32) }}\n"
+    ))
+    .into_db();
+    key_at(&db, RUNTIME, "f", &[Ty("U32")])
+}
+
+/// Arguments that grow with each call never end: past the crate's `recursion_limit` (128, or
+/// what `#![recursion_limit]` says) the share stops with an error naming the crate, the body
+/// and the chain, as rustc's collector does, never a key of the instance's arguments.
+#[test]
+fn a_chain_of_growing_instances_stops_at_the_recursion_limit() {
+    for (attrs, limit) in [("", 128), ("#![recursion_limit = \"16\"]", 16)] {
+        let result = growing_chain(attrs);
+        let Err(why) = &result else { panic!("`f::<u32>` with {attrs:?} has a key: {result:?}") };
+        let Unshared::RecursionLimit { body, depth, limit: found, chain, instance, .. } = why else {
+            panic!("`f::<u32>` with {attrs:?}: {why}")
+        };
+        assert_eq!((body.as_str(), *depth, *found), ("f", limit + 1, limit), "{why}");
+        assert!(chain.first().is_some_and(|it| it.contains("f::<u32>")), "{why}");
+        // The first ten levels, each its callee with its arguments, then how many more, then the last three.
+        assert_eq!(chain.len(), 10 + 1 + 3, "{why}");
+        assert!(chain[1].contains("f::<(u32,)>"), "{why}");
+        assert!(chain[10].ends_with(" more)"), "{why}");
+        assert!(instance.contains("(((u32,),),)"), "{why}");
+        assert!(why.to_string().starts_with("reached the recursion limit while instantiating"), "{why}");
+    }
+}

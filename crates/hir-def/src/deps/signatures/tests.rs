@@ -1,7 +1,7 @@
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use blaze_format::Aligned;
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_hash::{HashMap, HashSet};
 use hir_expand::fixture;
 
 use super::*;
@@ -136,17 +136,17 @@ fn all(db: &TestDB) -> Vec<Crate> {
 /// A store in memory.
 #[derive(Default)]
 struct Memory {
-    images: Mutex<FxHashMap<ContentId, std::sync::Arc<Aligned>>>,
+    images: Mutex<HashMap<ContentId, std::sync::Arc<Aligned>>>,
 }
 
 impl ImageStore for Memory {
     fn get(&self, key: &ContentId) -> Result<Option<crate::deps::ImageBuf>, String> {
-        Ok(self.images.lock().unwrap().get(key).map(|it| it.clone() as crate::deps::ImageBuf))
+        Ok(self.images.lock().get(key).map(|it| it.clone() as crate::deps::ImageBuf))
     }
 
     fn put(&self, key: ContentId, image: Vec<u8>) -> Result<(), String> {
         let image = std::sync::Arc::new(Aligned::copy_from(&image));
-        self.images.lock().unwrap().entry(key).or_insert(image);
+        self.images.lock().entry(key).or_insert(image);
         Ok(())
     }
 
@@ -178,8 +178,8 @@ fn served_db(fixture: &str, memory: &Memory, mode: Mode) -> TestDB {
 
 /// The differences frozen bytes record are the process's: the tests that read them take turns
 /// with the other image tests.
-fn turn() -> std::sync::MutexGuard<'static, ()> {
-    crate::deps::tests::TURN.lock().unwrap_or_else(|it| it.into_inner())
+fn turn() -> parking_lot::MutexGuard<'static, ()> {
+    crate::deps::tests::TURN.lock()
 }
 
 /// Asserts that `item`'s signature as `db` reads it from its image is the one `db` lowers from
@@ -254,7 +254,7 @@ fn every_served_signature_is_the_lowered_one() {
         let krate = crate_named(&db, name);
         let items = items(&db, krate);
         if name == "lib" {
-            let kinds: FxHashSet<u8> = items.iter().map(|it| it.what()).collect();
+            let kinds: HashSet<u8> = items.iter().map(|it| it.what()).collect();
             assert_eq!(kinds.len(), 11, "the fixture asks every query: {kinds:?}");
         }
         for item in items {
@@ -544,10 +544,10 @@ fn with_signatures(fixture: &str, memory: &Memory, part: &[u8]) {
     let db = fixture::db(fixture).into_db();
     let lib = crate_named(&db, "lib");
     let key = keys(&db, &[lib], BUILD)[&lib];
-    let image = memory.images.lock().unwrap()[&key].clone();
+    let image = memory.images.lock()[&key].clone();
     let image = ImageRef::open(&image, key).unwrap();
     let bytes = write_image(key, [image.part(Part::DefMap), image.part(Part::LangItems), part]);
-    memory.images.lock().unwrap().insert(key, std::sync::Arc::new(Aligned::copy_from(&bytes)));
+    memory.images.lock().insert(key, std::sync::Arc::new(Aligned::copy_from(&bytes)));
 }
 
 /// The signatures part of `lib` in a fresh database of `fixture`.
@@ -618,9 +618,9 @@ fn a_record_of_another_query_is_refused() {
 
 #[test]
 fn a_key_names_one_item_and_is_the_same_in_every_database() {
-    let keys_of = |db: &TestDB| -> (FxHashSet<ContentId>, usize) {
+    let keys_of = |db: &TestDB| -> (HashSet<ContentId>, usize) {
         let items = items(db, crate_named(db, "lib"));
-        let distinct: FxHashSet<Item> = items.iter().copied().collect();
+        let distinct: HashSet<Item> = items.iter().copied().collect();
         let keys = items.iter().map(|&item| key::of(db, item).unwrap().1).collect();
         (keys, distinct.len())
     };

@@ -9,10 +9,10 @@
 
 use std::rc::Rc;
 
+use blaze_hash::HashMap;
 use blaze_items::{Fact, ItemId};
 use either::Either;
 use hir::{FieldSourceView, InFile, PathResolution};
-use rustc_hash::FxHashMap;
 use syntax::{
     TextRange,
     view::{self as ast, AstNode as _, HasGenericArgs as _, HasGenericParams as _, HasName as _},
@@ -49,10 +49,10 @@ enum Frame<'db> {
 /// What the ADTs of the crate are found to be, across the checks of each.
 #[derive(Default)]
 pub(super) struct Cycles<'db> {
-    state: FxHashMap<hir::Adt, State>,
+    state: HashMap<hir::Adt, State>,
     /// rustc's `params_in_repr`: for each type parameter of an ADT in order, whether a value
     /// of the ADT holds one by value.
-    params: FxHashMap<hir::Adt, Rc<[bool]>>,
+    params: HashMap<hir::Adt, Rc<[bool]>>,
     /// The query stack, empty between checks and reused for each.
     stack: Vec<Frame<'db>>,
 }
@@ -362,7 +362,7 @@ fn type_params(cx: &Cx<'_, '_>, adt: hir::Adt) -> Vec<hir::TypeParam> {
 /// rustc's `params_in_repr`, of the type parameters only.
 fn params_in_repr(
     cx: &Cx<'_, '_>,
-    memo: &mut FxHashMap<hir::Adt, Rc<[bool]>>,
+    memo: &mut HashMap<hir::Adt, Rc<[bool]>>,
     adt: hir::Adt,
 ) -> Rc<[bool]> {
     if let Some(it) = memo.get(&adt) {
@@ -386,7 +386,7 @@ fn params_in_repr(
 /// rustc's `params_in_repr_ty`.
 fn params_in_repr_ty(
     cx: &Cx<'_, '_>,
-    memo: &mut FxHashMap<hir::Adt, Rc<[bool]>>,
+    memo: &mut HashMap<hir::Adt, Rc<[bool]>>,
     ty: &hir::Type<'_>,
     params: &[hir::TypeParam],
     in_repr: &mut [bool],
@@ -415,7 +415,7 @@ fn params_in_repr_ty(
 /// (lifetimes first), for the arguments as written.
 fn all_params_in_repr(
     cx: &Cx<'_, '_>,
-    memo: &mut FxHashMap<hir::Adt, Rc<[bool]>>,
+    memo: &mut HashMap<hir::Adt, Rc<[bool]>>,
     adt: hir::Adt,
 ) -> Vec<bool> {
     let def = hir::GenericDef::from(adt);

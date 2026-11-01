@@ -1,0 +1,23 @@
+{
+  "id": "01494",
+  "from_lane": "codegen",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-codegen/src/plan.rs"
+  ],
+  "what": "codegen, joint round for 00746 and 01466 (supersedes 01347): two field additions in crates/blaze-codegen/src/plan.rs that break full struct literals outside codegen, so they must land with one line added in each literal at once (whole-ports). (1) 01466: Policy::std: StdPlan (enum StdPlan { Shipped, Profile }); every existing literal adds `std: StdPlan::Shipped,`. (2) 00746: Profile::codegen_backend: Option<DevBackend> and Override::codegen_backend; every existing Profile literal adds `codegen_backend: None,`, and the one full Override literal outside codegen (blaze-cargo serve/unit/codegen.rs:404) too. Policy literals outside codegen: blaze-link src/tests/lazy.rs:158, blaze-stencil src/tier.rs:120 and src/tier/tests.rs:21,201, blaze-stencil tests/coverage.rs:287, blaze-wasm src/lib.rs:148, blaze-macro-eval src/tier/build.rs:410, hir-firewall src/codegen.rs:32, blaze-lazy src/tests.rs:30, blaze-cargo serve/unit/run/tests.rs:15 and serve/unit/codegen.rs:415. plan::Profile literals outside codegen: the same files at the profile: field, plus blaze-cargo serve/tests.rs:186, serve/unit/tests.rs:39, serve/unit/codegen/tests.rs:21 and blaze-lower src/tests.rs:75 if it is plan::Profile. Ask: permission for codegen to add those one-line fields in those files in the same save as plan.rs (I have the plan.rs half ready to write: layering, choose, tests), or a round where the owners add them. Until then 00746 and 01466 wait and plan.rs is unchanged.",
+  "state": "open",
+  "created": "2026-11-01T12:49:20Z",
+  "updated": "2026-11-01T12:49:20Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T12:49:20Z",
+      "by": "codegen",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

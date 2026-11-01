@@ -1,6 +1,7 @@
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
+use blaze_hash::{HashMap, HashSet};
 use blaze_manifest::Config;
 use blaze_manifest::files::Disk;
 use blaze_manifest::manifest::{Context, EitherManifest, Manifest, read_manifest};
@@ -8,7 +9,6 @@ use blaze_manifest::profiles::{Profile as BaseProfile, ProfileRoot};
 use blaze_manifest::targets::{CrateType, TargetKind};
 use blaze_resolve::{InternedString, PackageId, SourceId};
 use cargo_util_schemas::manifest::TomlManifest;
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::hash::{self, StableHasher};
 use super::outputs::{self, CompileFiles, Layout};
@@ -658,11 +658,11 @@ fn plan_app(target: Option<&str>) -> (PathBuf, Vec<UnitPlan>, String) {
             false,
         ),
     ];
-    let packages: FxHashMap<String, (PackageId, Package<'_>)> = ids
+    let packages: HashMap<String, (PackageId, Package<'_>)> = ids
         .iter()
         .map(|(key, id, manifest, _, is_member)| ((*key).to_owned(), (*id, Package { manifest: *manifest, is_member: *is_member })))
         .collect();
-    let manifests: FxHashMap<PackageId, (&Path, &Manifest)> =
+    let manifests: HashMap<PackageId, (&Path, &Manifest)> =
         ids.iter().map(|(_, id, manifest, path, _)| (*id, (*path, *manifest))).collect();
 
     let units = app_units(target);
@@ -676,7 +676,7 @@ fn plan_app(target: Option<&str>) -> (PathBuf, Vec<UnitPlan>, String) {
         ..BaseProfile::default()
     };
     let target_dir = ws.join("target");
-    let unsandboxed: FxHashSet<&str> = ["app"].into_iter().collect();
+    let unsandboxed: HashSet<&str> = ["app"].into_iter().collect();
     let ws_metadata = Some(toml::Value::Table(toml::from_str("[blaze.lints]\nhot_alloc = \"warn\"\n").unwrap()));
     let input = PlanInput {
         units: &units,

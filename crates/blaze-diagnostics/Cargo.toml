@@ -17,13 +17,13 @@ doctest = false
 # The version rustc renders its diagnostics with (`rustc_errors`'s
 # `annotate_snippet_emitter_writer.rs`), so that ours read byte for byte as rustc's do.
 annotate-snippets.workspace = true
+blaze-hash.workspace = true
 either.workspace = true
 hashbrown.workspace = true
 memchr.workspace = true
 rustc_lexer.workspace = true
 rustc_parse_format.workspace = true
 rustc_apfloat.workspace = true
-rustc-hash.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 smallvec.workspace = true
@@ -58,6 +58,7 @@ syntax.workspace = true
 blaze-alloc-count.workspace = true
 hegeltest.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
+parking_lot.workspace = true
 
 [lints]
 workspace = true

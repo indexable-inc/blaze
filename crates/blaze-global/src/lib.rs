@@ -51,7 +51,7 @@ use std::fmt;
 
 use blaze_cas::Key;
 pub(crate) use blaze_core::Tags;
-pub(crate) use blaze_ids::prehashed::ByHash;
+pub(crate) use blaze_hash::ByHash;
 
 pub use crate::{
     bundle::{BundleId, BundleSpec, Download, Downloaded, Locked, Manifest},

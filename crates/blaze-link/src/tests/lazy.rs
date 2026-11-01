@@ -10,7 +10,7 @@
 //! image links.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use blaze_codegen::plan::{Mode, OptLevel, Override, Policy, Profile};
 use blaze_codegen::settings::{DebugInfo, Panic, Pgo, Relocation as Pic, Sanitize, Toolchain};
@@ -23,6 +23,7 @@ use blaze_lazy::runner::Placer as _;
 use blaze_lazy::stub::{Abi, Isa, Stubs, X86Save};
 use blaze_lazy::{Plan, Purpose, Session, hook};
 use blaze_live::patch::Message;
+use parking_lot::Mutex;
 
 use super::{Change, Disk, GROWTH, Image, Output, OutputKind, TO, function, id, key, name, output};
 use crate::model::{Class, Reserve};
@@ -241,7 +242,7 @@ fn called(arch: Arch, addr: u64, code: &[u8], count: usize) -> Vec<u64> {
 /// the arena that AArch64 placed code reaches a target in the image past a `bl`'s reach by.
 fn past_veneer(placed: &Placed, arch: Arch, to: u64) -> u64 {
     let in_arena = {
-        let memory = placed.memory.lock().unwrap();
+        let memory = placed.memory.lock();
         memory.offset_of(to).is_some_and(|it| it >= memory.image_len())
     };
     if arch == Arch::X86_64 || !in_arena {
@@ -365,13 +366,13 @@ impl Recorder {
     }
 
     fn published(&self) -> Vec<(Slot, u64)> {
-        self.0.lock().unwrap().clone()
+        self.0.lock().clone()
     }
 }
 
 impl Slots for Recorder {
     fn publish(&mut self, slot: Slot, target: u64) -> Result<(), String> {
-        self.0.lock().unwrap().push((slot, target));
+        self.0.lock().push((slot, target));
         Ok(())
     }
 }
@@ -444,13 +445,13 @@ fn placed(case: Case, output: Output, label: &str) -> Option<Placed> {
 impl Placed {
     /// The code the memory holds at `target`, `len` bytes.
     fn code(&self, target: u64, len: usize) -> Vec<u8> {
-        let memory = self.memory.lock().unwrap();
+        let memory = self.memory.lock();
         let offset = memory.offset_of(target).expect("in the code memory");
         memory.bytes(CodeRange { offset, len: len as u64 }).unwrap().to_vec()
     }
 
     fn slot(&self, n: u8) -> Slot {
-        self.image.lock().unwrap().slot(&key(n)).expect("a slot")
+        self.image.lock().slot(&key(n)).expect("a slot")
     }
 }
 
@@ -551,8 +552,8 @@ fn a_later_link_keeps_its_hands_off_lazy_slots() {
 fn the_placer_stores_the_hook_in_the_cell() {
     for case in CASES {
         let Some(placed) = placed(case, case.lazy(), "cell") else { continue };
-        let image = placed.image.lock().unwrap();
-        let memory = placed.memory.lock().unwrap();
+        let image = placed.image.lock();
+        let memory = placed.memory.lock();
         let region = image.lazy_stubs().unwrap();
         let at = memory.offset_of(region + u64::from(blaze_lazy::stub::CELL)).expect("in the code");
         assert!(at < memory.image_len(), "{case:?}: the region is in the image part");
@@ -572,14 +573,14 @@ fn place_writes_code_that_resolves_publishes_it_and_stores_its_slot() {
         let target = placed.placer.place(&l0).unwrap();
         assert_eq!(placed.recorder.published(), vec![(placed.slot(L0), target)], "{case:?}: published in its slot");
         {
-            let memory = placed.memory.lock().unwrap();
+            let memory = placed.memory.lock();
             let offset = memory.offset_of(target).expect("in the code memory");
             assert!(offset >= memory.image_len(), "{case:?}: in the arena, at {offset:#x}");
             assert!(target.is_multiple_of(u64::from(l0.align)), "{case:?}: {target:#x}");
         }
         let code = placed.code(target, l0.code.len());
         let slot = placed.slot(L0);
-        let image = placed.image.lock().unwrap();
+        let image = placed.image.lock();
         let expected = vec![slot_stub(&image, L1), slot_stub(&image, L1), body_addr(&image, CALLER), target];
         let mut went = called(arch, target, &code, 4);
         went[2] = past_veneer(&placed, arch, went[2]);
@@ -594,10 +595,10 @@ fn replace_stores_the_new_code_and_retires_the_old_behind_the_fence() {
     for case in CASES {
         let arch = case.arch();
         let Some(mut placed) = placed(case, case.lazy(), "replace") else { continue };
-        placed.memory.lock().unwrap().attach_forking(std::process::id());
+        placed.memory.lock().attach_forking(std::process::id());
         let tier0 = calls(L0, arch, &[Target::Function(key(L1))]);
         let old = placed.placer.place(&tier0).unwrap();
-        assert_eq!(placed.memory.lock().unwrap().held(), 0, "{case:?}: nothing retired");
+        assert_eq!(placed.memory.lock().held(), 0, "{case:?}: nothing retired");
 
         let tier1 = calls(T0, arch, &[Target::Direct(key(L1)), Target::Function(key(L2))]);
         let new = placed.placer.replace(key(L0), &tier1).unwrap();
@@ -605,10 +606,10 @@ fn replace_stores_the_new_code_and_retires_the_old_behind_the_fence() {
         let slot = placed.slot(L0);
         assert_eq!(placed.recorder.published(), vec![(slot, old), (slot, new)], "{case:?}: the tier-up in the lazy slot");
         let code = placed.code(new, tier1.code.len());
-        let image = placed.image.lock().unwrap();
+        let image = placed.image.lock();
         assert_eq!(called(arch, new, &code, 2), vec![slot_stub(&image, L1), slot_stub(&image, L2)], "{case:?}");
         drop(image);
-        let held = placed.memory.lock().unwrap().held();
+        let held = placed.memory.lock().held();
         assert!(held >= tier0.code.len() as u64, "{case:?}: the tier-0 code waits behind the fence, {held} bytes");
 
         let error = placed.placer.replace(key(NOWHERE), &tier1).unwrap_err();
@@ -622,7 +623,7 @@ fn a_placed_function_counts_in_its_own_pair_and_a_linked_one_in_the_stage_s() {
         let arch = case.arch();
         let Some(mut placed) = placed(case, case.lazy(), "counters") else { continue };
         let (cells, stage_pair) = {
-            let image = placed.image.lock().unwrap();
+            let image = placed.image.lock();
             let (addr, code) = code_of(&image, F);
             (cells_at(&image), reached(arch, addr, &code)[0])
         };
@@ -638,19 +639,19 @@ fn a_placed_function_counts_in_its_own_pair_and_a_linked_one_in_the_stage_s() {
         assert_eq!(reached(arch, at, &placed.code(at, lazy.code.len())), expected(arch, top), "{case:?}: a new pair, from the top");
         let offset = placed.placer.cells(&key(L1)).expect("a pair");
         {
-            let image = placed.image.lock().unwrap();
-            let memory = placed.memory.lock().unwrap();
+            let image = placed.image.lock();
+            let memory = placed.memory.lock();
             assert_eq!(Some(offset), image.counter(&key(L1)), "{case:?}");
             assert_eq!(memory.offset_of(top), Some(offset), "{case:?}: the offset of the pair the code reaches");
         }
         assert_eq!(placed.placer.cells(&key(NOWHERE)), None);
 
         let g = counting(G, arch);
-        let staged = placed.image.lock().unwrap().stage(Change { added: vec![&g], ..Change::default() }).unwrap();
+        let staged = placed.image.lock().stage(Change { added: vec![&g], ..Change::default() }).unwrap();
         let l2 = counting(L2, arch);
         placed.placer.place(&l2).unwrap();
-        let mut image = placed.image.lock().unwrap();
-        let mut memory = placed.memory.lock().unwrap();
+        let mut image = placed.image.lock();
+        let mut memory = placed.memory.lock();
         assert!(image.commit_into(staged, &mut memory).is_ok(), "{case:?}: a stage from before the placement commits");
         let pair = |n: u8| image.counter(&key(n)).map(|it| (it - memory.cells().offset) / 16);
         assert_eq!((pair(F), pair(G), pair(L1), pair(L2)), (Some(0), Some(1), Some(3), Some(2)), "{case:?}: kept and carried");
@@ -665,7 +666,7 @@ fn the_placer_never_stores_a_slot_of_an_armed_execution_log() {
         // The runtime finds the log through the live descriptor.
         let Some(mut placed) = placed(case, Output { exec_log: true, live: Some(Live), ..case.lazy() }, "log") else { continue };
         let snapshot = |placed: &Placed| {
-            let memory = placed.memory.lock().unwrap();
+            let memory = placed.memory.lock();
             memory.bytes(CodeRange { offset: 0, len: memory.image_len() }).unwrap().to_vec()
         };
         let before = snapshot(&placed);
@@ -689,8 +690,8 @@ fn a_commit_and_a_rollback_never_name_a_lazy_slot() {
         let lazy: Vec<Slot> = LAZY.iter().map(|n| placed.slot(*n)).collect();
 
         let caller2 = calls(CALLER2, arch, &[Target::Function(key(L0)), Target::Direct(key(L1))]);
-        let mut image = placed.image.lock().unwrap();
-        let mut memory = placed.memory.lock().unwrap();
+        let mut image = placed.image.lock();
+        let mut memory = placed.memory.lock();
         let cells_before: Vec<u64> = lazy.iter().map(|slot| cell(&image, *slot)).collect();
         let tier_up = Change { added: vec![&caller2], slots: vec![(key(CALLER), key(CALLER2))], ..Change::default() };
         let staged = image.stage(tier_up).unwrap();
@@ -728,7 +729,7 @@ fn placing_what_the_image_cannot_reach_is_an_error_naming_the_function() {
             theirs.relocs = other.relocs.clone();
             assert!(placed.placer.place(&theirs).unwrap_err().contains("another function's code"), "{case:?}");
             assert_eq!(placed.recorder.published(), Vec::new(), "{case:?}: nothing published");
-            assert_eq!(placed.memory.lock().unwrap().held(), 0, "{case:?}: nothing left reserved behind the fence");
+            assert_eq!(placed.memory.lock().held(), 0, "{case:?}: nothing left reserved behind the fence");
 
             let mut refused = LazyPlacer::new(placed.image.clone(), placed.memory.clone(), Refusing, 0).unwrap();
             let error = refused.place(&calls(L0, arch, &[])).unwrap_err();

@@ -28,13 +28,13 @@
 //! weak_lang_items.rs` and `compiler/rustc_abi/src/extern_abi.rs` (`is_rustic_abi`) (MIT or
 //! Apache-2.0).
 
+use blaze_hash::HashMap;
 use hir::{InFile, LangItem};
-use rustc_hash::FxHashMap;
 use syntax::{
     SyntaxKind, TextRange, WalkEvent,
     view::{
-        self as ast, AstNode, AstToken as _, HasAttrs as _, HasGenericArgs as _, HasGenericParams as _, HasName as _,
-        HasTypeBounds as _, IsString as _,
+        self as ast, AstNode, AstToken as _, HasAttrs as _, HasGenericArgs as _,
+        HasGenericParams as _, HasName as _, HasTypeBounds as _, IsString as _,
     },
 };
 
@@ -44,7 +44,10 @@ use super::{
     parsers::{Finalize, doc},
 };
 use crate::{
-    cx::{Cx, def_range_view as def_range, item_range_view as item_range, signature_range_view as signature_range},
+    cx::{
+        Cx, def_range_view as def_range, item_range_view as item_range,
+        signature_range_view as signature_range,
+    },
     lints::syntax::attrs::{
         Owner, Target,
         target::{GenericParamKind, MethodKind},
@@ -482,7 +485,7 @@ fn must_implement_one_of(fx: &mut Finalize<'_, '_, '_>, attr: usize, names: &[(S
             }
         }
     }
-    let mut seen: FxHashMap<&str, TextRange> = FxHashMap::default();
+    let mut seen: HashMap<&str, TextRange> = HashMap::default();
     for (name, range) in names {
         if let Some(dup) = seen.insert(name.as_str(), *range) {
             let mut diag = Diag::error(None, "functions names are duplicated", fx.span(attr, dup));

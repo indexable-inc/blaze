@@ -15,7 +15,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use blaze_hash::{FixedState, HashMap};
 
 use crate::{
     Error,
@@ -121,7 +121,7 @@ const SCAN: usize = 16;
 enum Seen {
     Scan,
     /// Each hash met, with the index of the first value kept that has it.
-    Hashed(FxHashMap<u64, u32>),
+    Hashed(HashMap<u64, u32>),
 }
 
 impl Seen {
@@ -129,7 +129,7 @@ impl Seen {
         if len <= SCAN {
             Seen::Scan
         } else {
-            Seen::Hashed(FxHashMap::with_capacity_and_hasher(len, FxBuildHasher))
+            Seen::Hashed(HashMap::with_capacity_and_hasher(len, FixedState))
         }
     }
 
@@ -138,7 +138,7 @@ impl Seen {
         let unseen = |kept: &[K]| !kept.iter().any(|it| it.borrow() == value);
         match self {
             Seen::Scan => unseen(kept),
-            Seen::Hashed(hashes) => match hashes.entry(FxBuildHasher.hash_one(value)) {
+            Seen::Hashed(hashes) => match hashes.entry(FixedState.hash_one(value)) {
                 Entry::Vacant(entry) => {
                     entry.insert(kept.len() as u32);
                     true

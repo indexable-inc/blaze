@@ -14,8 +14,9 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-hash.workspace = true
 blaze-rng.workspace = true
-rustc-hash.workspace = true
+parking_lot.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

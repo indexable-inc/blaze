@@ -185,6 +185,7 @@ pub fn capture_reads<D: Database, T>(db: &D, f: impl FnOnce() -> T) -> (T, Optio
         if unshareable {
             return None;
         }
+        local.dedup_from(capture.edges_start as usize);
         let edges = &local.edges[capture.edges_start as usize..];
         let span = storage.push_edges(edges);
         let durability = u32::from(durability.min(2));

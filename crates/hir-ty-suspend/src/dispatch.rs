@@ -10,9 +10,12 @@
 //! is checked (`crate::check`).
 
 use base_db::Db;
+use blaze_hash::{HashMap, HashSet};
+use blaze_query::db::{AsId, FromId};
 use either::Either;
 use hir_def::{
-    AdtId, AssocItemId, CallableDefId, FieldId, FunctionId, GenericParamId, ItemContainerId, VariantId,
+    AdtId, AssocItemId, CallableDefId, FieldId, FunctionId, GenericParamId, ItemContainerId,
+    VariantId,
     attrs::AttrFlags,
     lang_item::{LangItems, lang_items},
     signatures::FunctionSignature,
@@ -26,20 +29,18 @@ use hir_ty::{
     intrinsic::{Intrinsic, intrinsic_of},
     method_resolution::is_dyn_method,
     next_solver::{
-        DbInterner, GenericArg, GenericArgs, Region, RegionExt as _, StoredGenericArgs, TraitRef, Ty,
-        TyKind, TypingMode,
+        DbInterner, GenericArg, GenericArgs, Region, RegionExt as _, StoredGenericArgs, TraitRef,
+        Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt as _, InferCtxt},
     },
     traits::StoredParamEnvAndCrate,
 };
 use hir_ty_mir::mir::{
-    BasicBlockId, CastKind, LocalId, MirBody, MirLowerError, MirSpan, Operand, OperandKind, PlaceTy,
-    ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind, is_by_move_coroutine,
-    normalize_or_keep,
+    BasicBlockId, CastKind, LocalId, MirBody, MirLowerError, MirSpan, Operand, OperandKind,
+    PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
+    is_by_move_coroutine, normalize_or_keep,
 };
-use blaze_query::db::{AsId, FromId};
 use intern::sym;
-use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     Interner as _,
     inherent::{BoundExistentialPredicates as _, Clause as _, GenericArgs as _, IntoKind as _},
@@ -218,7 +219,7 @@ pub(crate) fn sites<'db>(cx: &Cx<'db>, body: &MirBody<'db>) -> Sites<'db> {
         cx,
         body,
         out: Sites { calls: Vec::new(), slots: Vec::new(), reified: Vec::new(), unseen: None },
-        loads: FxHashMap::default(),
+        loads: HashMap::default(),
         derive_depth: 0,
     };
     scan.loads();
@@ -236,7 +237,7 @@ pub(crate) fn sites<'db>(cx: &Cx<'db>, body: &MirBody<'db>) -> Sites<'db> {
             }
             TerminatorKind::Drop { place, .. } | TerminatorKind::DropAndReplace { place, .. } => {
                 let ty = scan.place_ty(place);
-                scan.drop_glue(ty, &mut FxHashSet::default(), &mut targets);
+                scan.drop_glue(ty, &mut HashSet::default(), &mut targets);
             }
             _ => continue,
         }
@@ -253,7 +254,7 @@ struct Scan<'a, 'db> {
     out: Sites<'db>,
     /// Each local assigned a copy or move of a place, as a whole: where a function pointer
     /// called through it was loaded from.
-    loads: FxHashMap<LocalId, &'a StoredPlace>,
+    loads: HashMap<LocalId, &'a StoredPlace>,
     derive_depth: u32,
 }
 
@@ -342,7 +343,7 @@ impl<'a, 'db> Scan<'a, 'db> {
             return self.unseen(Unseen::TooLong);
         }
         if Some(f) == lang.DropInPlace || Some(f) == lang.DropGlue {
-            return self.drop_glue(args.type_at(0), &mut FxHashSet::default(), out);
+            return self.drop_glue(args.type_at(0), &mut HashSet::default(), out);
         }
         match intrinsic_of(db, f) {
             Ok(Some(Intrinsic::ConstEvalSelect)) => {
@@ -488,7 +489,7 @@ impl<'a, 'db> Scan<'a, 'db> {
     }
 
     /// Drop glue of `ty`: its `Drop` impl's `drop`, then its fields'.
-    fn drop_glue(&mut self, ty: Ty<'db>, seen: &mut FxHashSet<Ty<'db>>, out: &mut SmallVec<[Target; 2]>) {
+    fn drop_glue(&mut self, ty: Ty<'db>, seen: &mut HashSet<Ty<'db>>, out: &mut SmallVec<[Target; 2]>) {
         let cx = self.cx;
         let db = cx.db;
         let ty = cx.normalize(ty);
@@ -618,7 +619,7 @@ impl<'a, 'db> Scan<'a, 'db> {
     fn vtable(&mut self, concrete: Ty<'db>, dyn_ty: Ty<'db>, span: MirSpan) {
         let cx = self.cx;
         let mut drop = SmallVec::new();
-        self.drop_glue(concrete, &mut FxHashSet::default(), &mut drop);
+        self.drop_glue(concrete, &mut HashSet::default(), &mut drop);
         if !drop.is_empty() {
             self.out.slots.push(Slot { span, concrete, method: None, targets: drop.into_iter().collect() });
         }
@@ -626,7 +627,7 @@ impl<'a, 'db> Scan<'a, 'db> {
         let Some(principal) = bounds.principal() else { return };
         let trait_ref =
             cx.interner.instantiate_bound_regions_with_erased(principal.with_self_ty(cx.interner, concrete));
-        let mut seen = FxHashSet::default();
+        let mut seen = HashSet::default();
         self.trait_methods(trait_ref, concrete, span, &mut seen);
     }
 
@@ -635,7 +636,7 @@ impl<'a, 'db> Scan<'a, 'db> {
         trait_ref: TraitRef<'db>,
         concrete: Ty<'db>,
         span: MirSpan,
-        seen: &mut FxHashSet<TraitRef<'db>>,
+        seen: &mut HashSet<TraitRef<'db>>,
     ) {
         if !seen.insert(trait_ref) {
             return;

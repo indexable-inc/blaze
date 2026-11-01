@@ -4,15 +4,15 @@
 //! root as often again after reconnecting. A root the daemon no longer has then is reported to
 //! the service ([`Input::Unpinned`]).
 
-use std::{path::PathBuf, sync::mpsc};
+use std::path::PathBuf;
 
 use blaze_api::{
     Request, Response, ViewRef,
     client::{Client, ClientError},
 };
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_vfs::View;
-use rustc_hash::FxHashMap;
 
 use super::{api_error, log, said_or};
 use crate::service::Input;
@@ -20,7 +20,7 @@ use crate::service::Input;
 pub(crate) enum Command {
     /// Opens `view` and holds its root; the root, or why not, goes to `reply` (for the
     /// service's own pins, `None`: a failure is [`Input::Unpinned`]).
-    Open { view: ViewRef, reply: Option<mpsc::Sender<Result<ContentId, String>>> },
+    Open { view: ViewRef, reply: Option<crossbeam_channel::Sender<Result<ContentId, String>>> },
     /// Lets go of one hold of `root`; one this does not hold (lost when the daemon restarted) is
     /// already reported.
     Close { root: ContentId },
@@ -30,12 +30,12 @@ struct Pins {
     socket: PathBuf,
     client: Option<Client>,
     /// Sorted by root where it is walked, so roots are held again in that order.
-    held: FxHashMap<ContentId, u32>,
-    service: mpsc::Sender<Input>,
+    held: HashMap<ContentId, u32>,
+    service: crossbeam_channel::Sender<Input>,
 }
 
-pub(crate) fn run(socket: PathBuf, commands: mpsc::Receiver<Command>, service: mpsc::Sender<Input>) {
-    let mut pins = Pins { socket, client: None, held: FxHashMap::default(), service };
+pub(crate) fn run(socket: PathBuf, commands: crossbeam_channel::Receiver<Command>, service: crossbeam_channel::Sender<Input>) {
+    let mut pins = Pins { socket, client: None, held: HashMap::default(), service };
     for command in commands {
         match command {
             Command::Open { view, reply } => {

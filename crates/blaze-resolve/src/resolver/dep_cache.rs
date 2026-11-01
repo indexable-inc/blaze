@@ -216,7 +216,7 @@ pub(super) fn registry_queryer<'a, T: Registry>(
 ) -> RegistryQueryer<'a, T, impl Query> {
     let inner = Rc::new(RegistryQueryerAsync::new(registry, replacements, version_prefs));
     RegistryQueryer {
-        inner: inner.clone(),
+        inner: Rc::clone(&inner),
         poller: LocalPollAdapter::new(inner, start_query::<T>),
         summary_cache: HashMap::default(),
     }
@@ -275,7 +275,7 @@ impl<'a, T: Registry, Q: Query> RegistryQueryer<'a, T, Q> {
         // if we have calculated a result before, then we can just return it,
         // as it is a "pure" query of its arguments.
         if let Some(out) = self.summary_cache.get(&(parent, candidate.clone(), opts.clone())) {
-            return Ok(out.0.clone());
+            return Ok(Rc::clone(&out.0));
         }
         // First, figure out our set of dependencies based on the requested set
         // of features. This also calculates what features we're going to enable
@@ -316,7 +316,7 @@ impl<'a, T: Registry, Q: Query> RegistryQueryer<'a, T, Q> {
         // If we succeed we add the result to the cache so we can use it again next time.
         // We don't cache the failure cases as they don't impl Clone.
         self.summary_cache
-            .insert((parent, candidate.clone(), opts.clone()), (out.clone(), all_ready));
+            .insert((parent, candidate.clone(), opts.clone()), (Rc::clone(&out), all_ready));
 
         Ok(out)
     }

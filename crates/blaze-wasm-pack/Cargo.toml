@@ -13,7 +13,8 @@ repository.workspace = true
 # No codegen here: `blaze serve` depends on this, and `blaze-wasm`'s `hir-ty-codegen` feature
 # must not reach the native build.
 [dependencies]
-rustc-hash.workspace = true
+blaze-hash.workspace = true
+parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 triomphe.workspace = true
 

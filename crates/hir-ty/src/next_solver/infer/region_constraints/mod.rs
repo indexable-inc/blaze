@@ -3,7 +3,7 @@
 use std::ops::Range;
 use std::{cmp, fmt, mem};
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use rustc_index::IndexVec;
 use rustc_type_ir::solve::VisibleForLeakCheck;
 use rustc_type_ir::{IsRigid, RegionKind, RegionVid, TypeVisitableExt, UniverseIndex};
@@ -553,7 +553,7 @@ pub(crate) enum CombineMapType {
     Glb,
 }
 
-type CombineMap<'db> = FxHashMap<TwoRegions<'db>, RegionVid>;
+type CombineMap<'db> = HashMap<TwoRegions<'db>, RegionVid>;
 
 #[derive(Debug, Clone)]
 pub struct RegionVariableInfo {

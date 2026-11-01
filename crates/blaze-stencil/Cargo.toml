@@ -20,6 +20,7 @@ blaze-codegen.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
 cranelift-codegen.workspace = true
+parking_lot.workspace = true
 smallvec.workspace = true
 
 [build-dependencies]
@@ -33,6 +34,7 @@ blaze-bytes.workspace = true
 blaze-ids.workspace = true
 
 [dev-dependencies]
+blaze-spin.workspace = true
 cranelift-codegen = { workspace = true, features = ["x86", "arm64"] }
 cranelift-frontend.workspace = true
 # The reference each stencil is checked against, and the reader of the CLIF corpus.

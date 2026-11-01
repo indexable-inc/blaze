@@ -543,7 +543,7 @@ impl Checkout {
     /// may be in a submodule. A manifest that does not parse is skipped, as cargo skips it.
     pub fn packages(&self) -> anyhow::Result<Vec<Found>> {
         let mut found = Vec::new();
-        let mut visited = rustc_hash::FxHashSet::default();
+        let mut visited = blaze_hash::HashSet::default();
         walk(&self.root, &self.root, &mut found, &mut visited)?;
         Ok(found)
     }
@@ -574,7 +574,7 @@ fn walk(
     root: &Path,
     dir: &Path,
     found: &mut Vec<Found>,
-    visited: &mut rustc_hash::FxHashSet<PathBuf>,
+    visited: &mut blaze_hash::HashSet<PathBuf>,
 ) -> anyhow::Result<()> {
     if dir != root {
         if dir.file_name().and_then(|it| it.to_str()).is_some_and(|it| it.starts_with('.')) {
@@ -609,7 +609,7 @@ fn walk(
     Ok(())
 }
 
-fn read_nested(dir: &Path, found: &mut Vec<Found>, visited: &mut rustc_hash::FxHashSet<PathBuf>) {
+fn read_nested(dir: &Path, found: &mut Vec<Found>, visited: &mut blaze_hash::HashSet<PathBuf>) {
     if !visited.insert(dir.to_owned()) {
         return;
     }

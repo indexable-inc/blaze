@@ -63,7 +63,7 @@ fn while_busy<T>(mut start: impl FnMut() -> io::Result<T>) -> io::Result<T> {
                 ),
             ));
         };
-        std::thread::sleep(std::time::Duration::from_nanos(wait));
+        busy::wait(wait);
         tried += 1;
         waited += wait;
     }

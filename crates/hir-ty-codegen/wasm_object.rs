@@ -16,11 +16,11 @@
 
 use std::borrow::Cow;
 
+use blaze_hash::HashMap;
 use cranelift_object::object::{
     self, Object, ObjectSection, ObjectSymbol, RelocationTarget, SectionIndex, SectionKind,
     SymbolIndex, SymbolKind,
 };
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use wasm_encoder::{
     CustomSection, Encode, EntityType, FunctionSection, GlobalType, ImportSection, MemoryType,
@@ -101,7 +101,7 @@ struct Defined {
 #[derive(Default)]
 struct Writer {
     types: Vec<WasmSignature>,
-    type_of: FxHashMap<WasmSignature, u32>,
+    type_of: HashMap<WasmSignature, u32>,
     symbols: Vec<u8>,
     symbol_count: u32,
     code: Vec<u8>,
@@ -136,7 +136,7 @@ fn import_of(symbol: &str) -> Option<(&str, &str)> {
 /// joins the ones of every object.
 pub(super) fn from_elf(
     elf: &[u8],
-    signatures: &FxHashMap<String, WasmSignature>,
+    signatures: &HashMap<String, WasmSignature>,
     custom: &[(String, Vec<u8>)],
 ) -> Result<Vec<u8>, String> {
     // alloc: the error's message
@@ -178,7 +178,7 @@ pub(super) fn from_elf(
     // An undefined symbol of an ELF object has no kind: it is a function when the code
     // generator declared one of its name. The ones nothing refers to are left out, as the
     // linker would ask for them.
-    let referred: rustc_hash::FxHashSet<SymbolIndex> = file
+    let referred: blaze_hash::HashSet<SymbolIndex> = file
         .sections()
         .flat_map(|section| section.relocations())
         .filter_map(|(_, reloc)| match reloc.target() {
@@ -187,7 +187,7 @@ pub(super) fn from_elf(
         })
         // alloc: once per object, the set of the symbols relocations name
         .collect();
-    let mut symbol_of: FxHashMap<SymbolIndex, (u32, bool)> = FxHashMap::default();
+    let mut symbol_of: HashMap<SymbolIndex, (u32, bool)> = HashMap::default();
     let mut imported = 0u32;
     // alloc: once per object, its functions
     let mut functions = Vec::new();

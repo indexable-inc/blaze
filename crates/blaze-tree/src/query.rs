@@ -3,16 +3,20 @@
 //! blaze-metadata's.
 
 use blaze_format::SchemaHash;
+use blaze_hash::HashSet;
 use blaze_ids::ContentId;
 use blaze_manifest::files::Files;
 use blaze_query::{Cancelled, Cx, Database, Query, QueryKind};
-use blaze_units::load::{ResolveAsk, Resolving, ViewResolved, key_id, load_error, platform_cfg, resolve_view};
+use blaze_units::load::{
+    ResolveAsk, Resolving, ViewResolved, key_id, load_error, platform_cfg, resolve_view,
+};
 use blaze_units::query::{Cbor, Fetch, LoadError, Versioned, producer};
-use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::packages::Reads;
-use crate::{DepKind, DisplayDepth, EdgeKind, Input, Kinds, Options, Packages, Platformed, Prefix, Target};
+use crate::{
+    DepKind, DisplayDepth, EdgeKind, Input, Kinds, Options, Packages, Platformed, Prefix, Target,
+};
 
 /// `cargo tree`'s command line, as cargo reads it: everything of [`Options`] and the
 /// platforms. The rest of the invocation (`--manifest-path`, `--config`, `--locked`,
@@ -77,7 +81,7 @@ impl Versioned for Printed {
 impl TreeAsk {
     /// The options of `cargo tree`, made once per query from its key, which it outlives.
     fn options(&self) -> Options {
-        let edge_kinds: FxHashSet<EdgeKind> = self
+        let edge_kinds: HashSet<EdgeKind> = self
             .edges
             .iter()
             .map(|it| match it {

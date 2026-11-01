@@ -249,13 +249,13 @@ fn only_fully_promoted_slots_release_their_storage() {
 
 #[cfg(test)]
 mod tests {
+    use blaze_hash::{HashMap, HashSet};
     use blaze_ids::rng::SplitMix64;
     use cranelift_codegen::ir::{
         AbiParam, InstBuilder, StackSlotData, StackSlotKind,
         types::{F64, I32, I64},
     };
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-    use rustc_hash::{FxHashMap, FxHashSet};
 
     use super::*;
 
@@ -267,10 +267,9 @@ mod tests {
             stores: Vec<ir::Inst>,
             loads: Vec<ir::Inst>,
         }
-        let mut escaped: FxHashSet<StackSlot> = kept.collect();
-        let mut slot_of: FxHashMap<Value, StackSlot> = FxHashMap::default();
-        let mut parts: FxHashMap<StackSlot, FxHashMap<(i32, ir::Type), Part>> =
-            FxHashMap::default();
+        let mut escaped: HashSet<StackSlot> = kept.collect();
+        let mut slot_of: HashMap<Value, StackSlot> = HashMap::default();
+        let mut parts: HashMap<StackSlot, HashMap<(i32, ir::Type), Part>> = HashMap::default();
         for block in func.layout.blocks() {
             for inst in func.layout.block_insts(block) {
                 if let InstructionData::StackAddr { stack_slot, offset, .. } = func.dfg.insts[inst]

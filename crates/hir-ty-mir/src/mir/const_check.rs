@@ -24,7 +24,7 @@ use blaze_mem::{Frame, Tag, frame};
 use hir_def::{
     CallableDefId, DefWithBodyId, FunctionId, HasModule, ImplId, ItemContainerId, Lookup,
     ModuleIdLt, TraitId,
-    expr_store::Body,
+    expr_store::{ExpressionStore, ExpressionStoreSourceMap},
     hir::{ClosureKind, CoroutineKind, CoroutineSource, generics::GenericParams},
     lang_item::LangItems,
     signatures::{
@@ -38,7 +38,7 @@ use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
 
 use hir_ty::{
     InferBodyId, InferenceResult,
-    db::HirDatabase,
+    db::{AnonConstId, HirDatabase},
     display::{DisplayTarget, HirDisplay},
     next_solver::{DbInterner, GenericArg, GenericArgs, StoredGenericArgs, StoredTy, Ty, TyKind},
 };
@@ -371,14 +371,27 @@ pub fn const_check<'db>(db: &'db Db, def: DefWithBodyId) -> ConstCheck {
     {
         return ConstCheck::default();
     }
-    let infer = InferenceResult::of(db, def);
+    check(db, InferBodyId::DefWithBodyId(def), context)
+}
+
+/// What rustc's const checker reports in an anonymous constant: an array length or repeat
+/// count, a const generic argument or default, an enum discriminant's or a `const { .. }`
+/// block. rustc checks each as a body of its own, a `const` (`ConstContext::Const`), whatever
+/// the body it is written in is.
+#[blaze_query::tracked(returns(ref))]
+pub fn anon_const_check<'db>(db: &'db Db, konst: AnonConstId<'db>) -> ConstCheck {
+    check(db, InferBodyId::AnonConstId(konst), ConstContext::Const)
+}
+
+fn check<'db>(db: &'db Db, owner: InferBodyId<'db>, context: ConstContext) -> ConstCheck {
+    let infer = InferenceResult::of(db, owner);
     if infer.has_type_mismatches() || infer.is_erroneous() || !infer.diagnostics().is_empty() {
         return ConstCheck::default();
     }
-    let Ok(body) = db.mir_body(InferBodyId::DefWithBodyId(def)) else {
+    let Ok(body) = db.mir_body(owner) else {
         return ConstCheck::default();
     };
-    let mut checker = Checker::new(db, def, body, infer, context);
+    let mut checker = Checker::new(db, owner, body, infer, context);
     frame::task(Tag::Mir, |frame| {
         let order = reachable(body, frame);
         for &block in order.iter() {
@@ -399,7 +412,7 @@ pub fn const_check<'db>(db: &'db Db, def: DefWithBodyId) -> ConstCheck {
                 _ => {}
             }
         }
-        qualifs::check_qualifs(db, def, body, context, &order, frame, &mut |kind, span| {
+        qualifs::check_qualifs(db, owner, body, context, &order, frame, &mut |kind, span| {
             let status = Status::of_qualif(&kind);
             checker.check_op(kind, status, span)
         });
@@ -484,9 +497,9 @@ fn coroutine_op(kind: ClosureKind) -> Option<(ConstCheckKind, Status)> {
 /// rustc's `Checker` of one body.
 struct Checker<'a, 'db> {
     db: &'db Db,
-    def: DefWithBodyId,
+    owner: InferBodyId<'db>,
     body: &'a MirBody<'db>,
-    store: &'db Body,
+    store: &'db ExpressionStore,
     infer: &'a InferenceResult<'db>,
     context: ConstContext,
     krate: Crate,
@@ -504,26 +517,26 @@ struct Checker<'a, 'db> {
 impl<'a, 'db> Checker<'a, 'db> {
     fn new(
         db: &'db Db,
-        def: DefWithBodyId,
+        owner: InferBodyId<'db>,
         body: &'a MirBody<'db>,
         infer: &'a InferenceResult<'db>,
         context: ConstContext,
     ) -> Self {
-        let krate = def.module(db).krate(db);
+        let krate = owner.module(db).krate(db);
         let features = UnstableFeatures::query(db, krate);
-        let recursive = match def {
-            DefWithBodyId::FunctionId(func) => {
+        let recursive = match owner.as_function() {
+            Some(func) => {
                 context == ConstContext::ConstFn
                     && features.staged_api
                     && stability::safe_to_expose(db, stability::Item::Fn(func), krate)
             }
-            _ => false,
+            None => false,
         };
         Checker {
             db,
-            def,
+            owner,
             body,
-            store: Body::of(db, def),
+            store: ExpressionStore::of(db, owner.expression_store_owner(db)),
             infer,
             context,
             krate,
@@ -592,7 +605,7 @@ impl<'a, 'db> Checker<'a, 'db> {
         {
             if !safe_to_expose
                 && self.recursive
-                && let DefWithBodyId::FunctionId(func) = self.def
+                && let Some(func) = self.owner.as_function()
                 && !stability::allows_const_fn_unstable(self.db, func, &gate)
             {
                 let already_unstable = stability::written_const_unstable(self.db, func);
@@ -632,13 +645,19 @@ impl<'a, 'db> Checker<'a, 'db> {
     /// last, of what would be reported: a body with nothing to report is checked without
     /// building its source map.
     fn written(&self, span: MirSpan) -> bool {
-        let source_map = || &Body::with_source_map(self.db, self.def).1;
+        let source_map = || self.source_map();
         match span {
             MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => source_map().expr_syntax(expr).is_ok(),
             MirSpan::PatId(pat) => source_map().pat_syntax(pat).is_ok(),
             MirSpan::BindingId(_) | MirSpan::SelfParam => true,
             MirSpan::Unknown | MirSpan::Inlined(_) => false,
         }
+    }
+
+    /// The source map of the store the body's expressions are in: the body's own, or for an
+    /// anonymous constant the store of the body or signature it is written in.
+    fn source_map(&self) -> &'db ExpressionStoreSourceMap {
+        ExpressionStore::with_source_map(self.db, self.owner.expression_store_owner(self.db)).1
     }
 }
 

@@ -10,8 +10,8 @@
 use std::{
     fmt, fs, io,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -140,14 +140,17 @@ impl Drop for Scratch {
     }
 }
 
+/// What stops a query under way: a message on it, or every sender of it gone.
+pub type Stop = crossbeam_channel::Receiver<()>;
+
 /// Runs `query` over the history; its answer as Arrow record batches.
 pub fn run(query: &Query<'_>) -> Result<Vec<RecordBatch>, SqlError> {
-    run_with(query, &AtomicBool::new(false))
+    run_with(query, &crossbeam_channel::never())
 }
 
-/// [`run`], killing DuckDB and answering [`SqlError::Stopped`] once `stop` is set: what the
+/// [`run`], killing DuckDB and answering [`SqlError::Stopped`] once `stop` says to: what the
 /// explorer does when the page cancels a query.
-pub fn run_with(query: &Query<'_>, stop: &AtomicBool) -> Result<Vec<RecordBatch>, SqlError> {
+pub fn run_with(query: &Query<'_>, stop: &Stop) -> Result<Vec<RecordBatch>, SqlError> {
     let mut scratch = Scratch::new()?;
     let answer = run_in(&scratch.dir, query, &[query.history], stop);
     scratch.keep = answer.as_ref().is_err_and(|it| !matches!(it, SqlError::Stopped));
@@ -157,14 +160,14 @@ pub fn run_with(query: &Query<'_>, stop: &AtomicBool) -> Result<Vec<RecordBatch>
 /// Runs `query` over the history and the last `window` of this process's flight recorder:
 /// what the daemon answers `blaze debug sql --live`.
 pub fn run_live(query: &Query<'_>, window: Duration) -> Result<Vec<RecordBatch>, SqlError> {
-    run_live_with(query, window, &AtomicBool::new(false))
+    run_live_with(query, window, &crossbeam_channel::never())
 }
 
 /// [`run_live`], stopped as [`run_with`] is.
 pub fn run_live_with(
     query: &Query<'_>,
     window: Duration,
-    stop: &AtomicBool,
+    stop: &Stop,
 ) -> Result<Vec<RecordBatch>, SqlError> {
     let mut scratch = Scratch::new()?;
     let live = scratch.dir.join("live");
@@ -175,8 +178,67 @@ pub fn run_live_with(
     answer
 }
 
-/// How often a running query looks at its `stop`.
-const STOP_POLL: Duration = Duration::from_millis(5);
+/// Waits for `child` to end, or for `stop`: its exit status, or `None` once it is killed for
+/// `stop`. A thread of its own hears the exit without reaping the child, so the child's
+/// number stays its own until `child` reaps it here, and a kill can reach no other process.
+fn ended_or_stopped(child: &mut Child, stop: &Stop) -> io::Result<Option<ExitStatus>> {
+    #[cfg(unix)]
+    let watched = child.id();
+    #[cfg(windows)]
+    let watched = std::os::windows::io::AsRawHandle::as_raw_handle(child) as usize;
+    let (exited, heard) = crossbeam_channel::bounded::<io::Result<()>>(1);
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            // alloc: a thread's name, once a query
+            .name("duckdb exit".to_owned())
+            .spawn_scoped(scope, move || _ = exited.send(exit_heard(watched)))?;
+        crossbeam_channel::select! {
+            recv(heard) -> seen => {
+                seen.map_err(|_| io::Error::other("the thread that waits for DuckDB's exit ended saying nothing"))??;
+                child.wait().map(Some)
+            }
+            recv(stop) -> _ => {
+                // One already gone is fine: either way it is reaped by the wait.
+                _ = child.kill();
+                child.wait().map(|_| None)
+            }
+        }
+    })
+}
+
+/// Waits until the child `pid` has ended, leaving it to be reaped by its `Child`.
+#[cfg(unix)]
+fn exit_heard(pid: u32) -> io::Result<()> {
+    let pid = libc::id_t::try_from(pid).map_err(io::Error::other)?;
+    loop {
+        // SAFETY: all zeros is a `siginfo_t` of nothing, for the call to write over.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is live for the call to write. `WNOWAIT` leaves the child unreaped, so
+        // its number names it alone until its `Child` waits for it.
+        if unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// Waits until the process of `handle` has ended.
+#[cfg(windows)]
+fn exit_heard(handle: usize) -> io::Result<()> {
+    use windows_sys::Win32::{
+        Foundation::WAIT_OBJECT_0,
+        System::Threading::{INFINITE, WaitForSingleObject},
+    };
+    // SAFETY: the process handle of a `Child` that outlives this call: `ended_or_stopped` waits
+    // on a scoped thread, and its `Child` is borrowed for the whole scope.
+    match unsafe { WaitForSingleObject(handle as windows_sys::Win32::Foundation::HANDLE, INFINITE) } {
+        WAIT_OBJECT_0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
 
 /// The DuckDB script of `sql` over `dirs`: no extension installed, the views, then the query
 /// copied to `answer` as Parquet.
@@ -205,7 +267,7 @@ fn run_in(
     scratch: &Path,
     query: &Query<'_>,
     dirs: &[&Path],
-    stop: &AtomicBool,
+    stop: &Stop,
 ) -> Result<Vec<RecordBatch>, SqlError> {
     let duckdb = query.duckdb;
     let no_duckdb = |why: &str| SqlError::NoDuckdb {
@@ -230,7 +292,7 @@ fn run_in(
     // An empty init file, so the user's ~/.duckdbrc does not change what the query means.
     fs::write(&init, b"").map_err(io_error(&init, "writing"))?;
     let stdin = fs::File::open(&script_path).map_err(io_error(&script_path, "opening"))?;
-    // To a file, not a pipe: the query is polled for `stop`, so nothing drains a pipe meanwhile.
+    // To a file, not a pipe: the wait is for the exit or `stop`, so nothing drains a pipe meanwhile.
     let stderr_path = scratch.join("stderr");
     let stderr_file = fs::File::create(&stderr_path).map_err(io_error(&stderr_path, "making"))?;
     let mut child = Command::new(duckdb)
@@ -243,17 +305,8 @@ fn run_in(
         .stderr(Stdio::from(stderr_file))
         .spawn()
         .map_err(io_error(duckdb, "running"))?;
-    let status = loop {
-        if stop.load(Ordering::Relaxed) {
-            // A child already gone is fine: either way it is reaped by the wait.
-            _ = child.kill();
-            _ = child.wait();
-            return Err(SqlError::Stopped);
-        }
-        match child.try_wait().map_err(io_error(duckdb, "waiting for"))? {
-            Some(status) => break status,
-            None => std::thread::sleep(STOP_POLL),
-        }
+    let Some(status) = ended_or_stopped(&mut child, stop).map_err(io_error(duckdb, "waiting for"))? else {
+        return Err(SqlError::Stopped);
     };
     let stderr = fs::read(&stderr_path).map_err(io_error(&stderr_path, "reading"))?;
     let refused = |message: String| SqlError::Duckdb {
@@ -301,6 +354,7 @@ mod tests {
     use crate::{
         flight,
         history::{BuildRow, CAP_BYTES, History, Outcome},
+        schema,
     };
 
     #[test]
@@ -323,22 +377,35 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let stop = std::sync::Arc::new(AtomicBool::new(false));
-        let stopper = {
-            let stop = stop.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
-                stop.store(true, Ordering::Relaxed);
-            })
-        };
+        let (stopper, stop) = crossbeam_channel::bounded(1);
         let started = std::time::Instant::now();
         let query = Query { duckdb: &fake, history: &dir, sql: "SELECT 1" };
-        let error = run_with(&query, &stop).unwrap_err();
-        stopper.join().unwrap();
+        let error = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                blaze_graph::spin::busy(Duration::from_millis(50));
+                stopper.send(()).unwrap();
+            });
+            run_with(&query, &stop).unwrap_err()
+        });
         assert!(matches!(error, SqlError::Stopped), "{error}");
         assert_eq!(error.kind(), "cancelled");
-        assert!(started.elapsed() < Duration::from_secs(5), "stopped within a few polls");
+        assert!(started.elapsed() < Duration::from_secs(5), "stopped at its stop, not a limit");
         _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_query_that_ends_is_heard_at_its_exit_and_a_dropped_stop_stops() {
+        let started = std::time::Instant::now();
+        let mut child = Command::new("/bin/sh").args(["-c", "exit 3"]).spawn().unwrap();
+        let status = ended_or_stopped(&mut child, &crossbeam_channel::never()).unwrap().unwrap();
+        assert_eq!(status.code(), Some(3));
+        assert!(started.elapsed() < Duration::from_secs(5), "heard after {:?}", started.elapsed());
+        let mut child = Command::new("/bin/sh").args(["-c", "exec sleep 600"]).spawn().unwrap();
+        let (stopper, stop) = crossbeam_channel::bounded::<()>(1);
+        drop(stopper);
+        assert!(ended_or_stopped(&mut child, &stop).unwrap().is_none());
+        assert!(started.elapsed() < Duration::from_secs(5), "stopped after {:?}", started.elapsed());
     }
 
     #[test]
@@ -390,6 +457,8 @@ mod tests {
             hits: Some(1),
             misses: Some(1),
             joined: Some(0),
+            tree: None,
+            blaze: None,
         });
         history.flush(Some(77)).unwrap();
 
@@ -441,6 +510,82 @@ mod tests {
                 assert!(script.exists(), "a failed query's script is kept");
             }
             _ => panic!("{error}"),
+        }
+    }
+
+    /// A build of two jobs: job 2 (slot 2) runs `unit b` from 10 to 100 ns and waits from 20 to 60
+    /// for a key job 1 (slot 1, owner 2) runs in `compile a` from 0 to 60. Its critical path is
+    /// job 1's run, then job 2's after its wait: the wait's owner is followed across lanes.
+    #[test]
+    #[ignore = "needs the pinned DuckDB: BLAZE_DUCKDB=$(nix build --print-out-paths .#duckdb)/bin/duckdb"]
+    fn the_critical_path_crosses_from_a_wait_to_the_job_that_ran_what_it_waited_on() {
+        let duckdb = PathBuf::from(std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"));
+        let dir = std::env::temp_dir().join(format!("blaze-sql-critical-{}", std::process::id()));
+        _ = fs::remove_dir_all(&dir);
+        History::open(&dir, CAP_BYTES).unwrap();
+        let fixture = format!(
+            "COPY (SELECT * FROM (VALUES (1::UBIGINT, 0::BIGINT, 100::BIGINT, 'ok', '/work', 'build')) \
+                AS t(build_id, started_ns, dur_ns, outcome, workspace, command)) TO '{d}/1-00000001.builds.parquet';\n\
+             COPY (SELECT * FROM (VALUES \
+                (1::UBIGINT, 7::UINTEGER, 10::UINTEGER, 1::UBIGINT, 0::USMALLINT, 'compile a', 'a', NULL::VARCHAR, NULL::UBIGINT, 0::BIGINT, 60::BIGINT), \
+                (1, 7, 11, 2, 0, 'unit b', 'b', NULL, NULL, 10, 90), \
+                (1, 7, 11, 3, 1, 'wait', NULL, 'key a', 2, 20, 40)) \
+                AS t(build_id, process, thread, span_id, depth, name, crate, awaits, owner, start_ns, dur_ns)) TO '{d}/1-00000001.spans.parquet';\n\
+             COPY (SELECT * FROM (VALUES \
+                (1::UBIGINT, 7::UINTEGER, 10::UINTEGER, 0::BIGINT, 'started', 1::UBIGINT), \
+                (1, 7, 11, 10, 'started', 2), (1, 7, 11, 21, 'parked', 2), (1, 7, 10, 60, 'ended', 1), \
+                (1, 7, 11, 60, 'resumed', 2), (1, 7, 11, 100, 'ended', 2)) \
+                AS t(build_id, process, thread, t_ns, event, job)) TO '{d}/1-00000001.switches.parquet';\n",
+            d = dir.display()
+        );
+        let written = Command::new(&duckdb)
+            .args(["-batch", "-bail", "-init", "/dev/null", "-c", &fixture])
+            .output()
+            .unwrap();
+        assert!(written.status.success(), "{}", String::from_utf8_lossy(&written.stderr));
+
+        let mut args = Map::new();
+        args.insert("build".into(), Value::from(1));
+        let path = views::render(views::find("critical_path").unwrap(), &args).unwrap();
+        let sql = format!(
+            "SELECT CAST(step AS BIGINT) AS step, CAST(lane AS VARCHAR) AS lane, CAST(what AS VARCHAR) AS what, \
+             CAST(from_ns AS BIGINT) AS from_ns, CAST(to_ns AS BIGINT) AS to_ns, CAST(path_pct AS DOUBLE) AS pct FROM ({path})"
+        );
+        let batches = run(&Query { duckdb: &duckdb, history: &dir, sql: &sql }).unwrap_or_else(|error| panic!("{error}"));
+        let mut steps = Vec::new();
+        for batch in &batches {
+            let int = |at: usize| batch.column(at).as_primitive::<arrow_array::types::Int64Type>().clone();
+            let text = |at: usize| batch.column(at).as_string::<i32>().clone();
+            let (step, lane, what, from, to) = (int(0), text(1), text(2), int(3), int(4));
+            let pct = batch.column(5).as_primitive::<arrow_array::types::Float64Type>().clone();
+            for i in 0..batch.num_rows() {
+                steps.push((step.value(i), lane.value(i).to_owned(), what.value(i).to_owned(), from.value(i), to.value(i)));
+                assert!((pct.value(i) - 100.0).abs() < 0.01, "the path is the whole build");
+            }
+        }
+        assert_eq!(
+            steps,
+            [
+                (1, "job 1".to_owned(), "compile a".to_owned(), 0, 60),
+                (0, "job 2".to_owned(), "unit b".to_owned(), 60, 100),
+            ]
+        );
+        _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_critical_path_fixture_names_only_columns_of_the_schema() {
+        for (table, columns) in [
+            (&schema::BUILDS, &["build_id", "started_ns", "dur_ns", "outcome", "workspace", "command"][..]),
+            (
+                &schema::SPANS,
+                &["build_id", "process", "thread", "span_id", "depth", "name", "crate", "awaits", "owner", "start_ns", "dur_ns"],
+            ),
+            (&schema::SWITCHES, &["build_id", "process", "thread", "t_ns", "event", "job"]),
+        ] {
+            for column in columns {
+                assert!(table.column(column).is_some(), "{}.{column}", table.name);
+            }
         }
     }
 }

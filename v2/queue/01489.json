@@ -1,0 +1,24 @@
+{
+  "id": "01489",
+  "from_lane": "observe",
+  "owner": "db",
+  "paths": [
+    "crates/blaze-query/src/db/function.rs",
+    "crates/blaze-query/src/db/storage.rs"
+  ],
+  "what": "observe (Andrew, 2026-11-01 03:31, item 5: re-execution counters per query kind, so repeated work like 78k item-tree parses for 16k files shows directly). Please count per ingredient, in blaze-query: executed (in function.rs `run`, beside the WillExecute event), verified (in `mark`, beside DidValidateMemoizedValue) and reran (an execution of a key its ingredient already executed in the current revision; e.g. a bit per row set at run, cleared at a new revision). Keep the counts per thread (a small [u64; 3] array per ingredient in the thread-local, no shared atomic on these paths, none on the warm hit), and add `Storage::take_counts(&self, each: impl FnMut(&str, u64, u64, u64))` that sums and resets them, naming each kind as its span names it (`file_item_tree_query`, the spans `query_kind`). blaze-profile side is in: `blaze_profile::query_counts(QueryCounts { build, kind, executed, verified, reran })`, counters `query executed/verified/reran` with a `query_kind` column, and the view `reexecution_per_query_kind`. The daemon call is queued to cargo separately.",
+  "state": "open",
+  "created": "2026-11-01T11:53:10Z",
+  "updated": "2026-11-01T11:53:10Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T11:53:10Z",
+      "by": "observe",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

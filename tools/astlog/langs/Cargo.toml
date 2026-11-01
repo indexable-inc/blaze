@@ -1,0 +1,20 @@
+[package]
+name = "ast-merge-langs"
+description = "The tree-sitter grammars astlog parses (Rust, TOML and Python) and a profile of each"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+tree-sitter.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-toml-ng.workspace = true
+
+[lints]
+workspace = true

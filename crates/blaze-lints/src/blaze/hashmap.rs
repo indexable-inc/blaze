@@ -6,7 +6,7 @@
 //! type, a turbofish). An expression that makes one: a call whose value is such a map and whose
 //! callee is the map's own constructor or a trait's method (`HashMap::new()`,
 //! `HashSet::with_capacity(n)`, `Default::default()`, `.collect()`), with no turbofish on the
-//! call, as that is a written type of its own. A map hashing with anything else (`FxHashMap`,
+//! call, as that is a written type of its own. A map hashing with anything else (`HashMap`,
 //! a hasher parameter `S`) is not flagged.
 
 use hir_def::{AdtId, FunctionId, ItemContainerId};

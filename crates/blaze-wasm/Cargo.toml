@@ -17,10 +17,11 @@ crate-type = ["rlib", "cdylib"]
 blaze-cas = { path = "../blaze-cas" }
 blaze-codegen = { path = "../blaze-codegen" }
 blaze-format = { path = "../blaze-format" }
+blaze-hash = { path = "../blaze-hash" }
 blaze-ids = { path = "../blaze-ids" }
 blaze-items = { path = "../blaze-items" }
 blaze-wasm-pack = { path = "../blaze-wasm-pack", version = "0.0.0" }
-rustc-hash = "2.1.1"
+parking_lot = "0.12.5"
 wasm-encoder = { version = "0.263", default-features = false, features = ["std"] }
 triomphe = { version = "0.1.14", default-features = false, features = ["std"] }
 
@@ -48,4 +49,9 @@ wasmparser = "0.263"
 debug = 0
 
 [patch.crates-io]
+# The root workspace's patches, which an excluded crate does not see.
+# Links the pinned LLVM statically, with a static libstdc++ on Linux (vendor/llvm-sys/SOURCE.md).
+llvm-sys = { path = "../../vendor/llvm-sys" }
 cranelift-object = { path = "../../vendor/cranelift-object" }
+# The unwind instructions hir-ty-codegen makes `.eh_frame` rows from (vendor/cranelift-codegen/SOURCE.md).
+cranelift-codegen = { path = "../../vendor/cranelift-codegen" }

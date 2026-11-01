@@ -481,7 +481,7 @@ fn walk(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
 /// takes it rather than prepare it again.
 pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
     let Some(slot) = job.starts.get(unit) else { return false };
-    let mut slot = slot.lock().unwrap_or_else(|it| it.into_inner());
+    let mut slot = slot.lock();
     if slot.is_none() {
         let Ok(Some(start)) = prepare(job, unit) else { return false };
         *slot = Some(Box::new(start));
@@ -639,7 +639,7 @@ pub(crate) fn start(job: &Arc<Job>, unit: usize, tags: u64) -> Result<ScriptRun,
     if !matches!(u.mode, Mode::RunCustomBuild) {
         return Err(ApiError::new(format!("unit {unit} (`{}`) is no build script's run", u.target.name), None));
     }
-    let kept = job.starts.get(unit).and_then(|it| it.lock().unwrap_or_else(|it| it.into_inner()).take());
+    let kept = job.starts.get(unit).and_then(|it| it.lock().take());
     let start = match kept {
         Some(it) => *it,
         None => match prepare(job, unit)? {

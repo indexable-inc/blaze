@@ -22,14 +22,15 @@ use std::{hash::BuildHasher, ops::Range};
 use crate::next_solver::StoredGenericArgs;
 use blaze_ids::bits::{BitMatrix, Ones, words_for};
 use blaze_mem::Frame;
+use blaze_query::db::AsId;
 use either::Either;
 use hir_expand::name::Name;
 use intern::{Symbol, sym};
-use blaze_query::db::AsId;
 use span::Edition;
 use tracing::{debug, instrument};
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
+use blaze_hash::FixedState;
 use hir_def::{
     AssocItemId, BlockIdLt, BuiltinDeriveImplId, ConstId, DefWithBodyId, FunctionId,
     GenericParamId, HasModule, ImplId, ItemContainerId, MacroId, ModuleDefId, ModuleId, TraitId,
@@ -44,7 +45,6 @@ use hir_def::{
     signatures::{ConstSignature, FunctionSignature},
     unstable_features::UnstableFeatures,
 };
-use rustc_hash::FxBuildHasher;
 use rustc_type_ir::{
     TypeFoldable, TypeVisitableExt, VisitorResult,
     fast_reject::{TreatParams, simplify_type},
@@ -1319,7 +1319,7 @@ fn macro_resolution(db: &Db, krate: Crate, name: &Symbol) -> String {
         return "unknown".to_owned();
     }
     let mut found = Vec::new();
-    let mut seen = rustc_hash::FxHashSet::default();
+    let mut seen = blaze_hash::HashSet::default();
     // alloc: as above
     let mut stack = vec![krate];
     while let Some(at) = stack.pop() {
@@ -1345,7 +1345,7 @@ fn macro_resolution(db: &Db, krate: Crate, name: &Symbol) -> String {
         if !writes[i].1 {
             continue;
         }
-        let mut files = rustc_hash::FxHashSet::default();
+        let mut files = blaze_hash::HashSet::default();
         for (_, module) in def_map.modules(db) {
             let Some(file) = module.origin.file_id() else { continue };
             // alloc: as above
@@ -1795,7 +1795,7 @@ fn order_by_trait_id<'f>(frame: &'f Frame, trait_ids: &[TraitId]) -> &'f mut [u3
 }
 
 fn hash_self_ty(self_ty: &SimplifiedType<'_>) -> u64 {
-    FxBuildHasher.hash_one(self_ty)
+    FixedState.hash_one(self_ty)
 }
 
 /// Simplified self types as two columns: the hashes, searched, and the types, compared only

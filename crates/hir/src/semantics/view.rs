@@ -17,13 +17,13 @@ mod tests;
 use std::{cell::RefCell, fmt, ptr, sync::Arc};
 
 use base_db::{Db, toolchain_channel};
+use blaze_hash::{HashMap, HashSet};
 use hir_def::{
     expr_store::ExprOrPatSource,
-    nameres::{ModuleOrigin, crate_def_map},
+        nameres::ModuleOrigin,
 };
 use hir_expand::{AstId, EditionedFileId, ExpandResult, HirFileId, MacroCallId};
 use hir_ty::next_solver::AnyImplId;
-use rustc_hash::{FxHashMap, FxHashSet};
 use span::FileId;
 use syntax::{
     AstPtr, FlatTree, SyntaxNodePtr,
@@ -42,7 +42,7 @@ pub struct Semantics<'db> {
     pub db: &'db Db,
     pub(super) imp: SemanticsImpl<'db>,
     /// The file of each tree this handed out, by the address of the file's tree.
-    roots: RefCell<FxHashMap<usize, HirFileId>>,
+    roots: RefCell<HashMap<usize, HirFileId>>,
 }
 
 impl fmt::Debug for Semantics<'_> {
@@ -62,7 +62,7 @@ fn tree_key(node: Node<'_>) -> usize {
 thread_local! {
     /// The `roots` of the last `Semantics` dropped on this thread, emptied: the next one takes
     /// its allocation, as the source-to-def tables are carried (`SourceToDefCache::take`).
-    static ROOTS: RefCell<FxHashMap<usize, HirFileId>> = RefCell::default();
+    static ROOTS: RefCell<HashMap<usize, HirFileId>> = RefCell::default();
 }
 
 impl Drop for Semantics<'_> {
@@ -80,7 +80,7 @@ impl<'db> Semantics<'db> {
 
     /// Like `new`, with a file taken as a module of only those of `crates` it is in, when it
     /// is in any.
-    pub fn new_within(db: &'db Db, crates: Arc<FxHashSet<base_db::Crate>>) -> Semantics<'db> {
+    pub fn new_within(db: &'db Db, crates: Arc<HashSet<base_db::Crate>>) -> Semantics<'db> {
         let mut imp = SemanticsImpl::new(db);
         imp.s2d_cache.get_mut().within = Some(crates);
         Semantics { db, imp, roots: RefCell::new(ROOTS.take()) }
@@ -177,9 +177,8 @@ impl<'db> Semantics<'db> {
     pub fn find_parent_file(&self, file_id: HirFileId) -> Option<InFile<Node<'db>>> {
         match file_id {
             HirFileId::FileId(file_id) => {
-                let module = self.imp.file_to_module_defs(file_id.file_id(self.db)).next()?;
-                let def_map = crate_def_map(self.db, module.krate(self.db).id);
-                match def_map.module(self.db, module.id).origin {
+                let module = self.file_modules(file_id.file_id(self.db)).next()?;
+                match module.id.def_map(self.db).module(self.db, module.id).origin {
                     ModuleOrigin::CrateRoot { .. } => None,
                     ModuleOrigin::File { declaration, declaration_tree_id, .. } => {
                         let file_id = declaration_tree_id.file_id();
@@ -207,22 +206,23 @@ impl<'db> Semantics<'db> {
     }
 
     pub fn file_to_module_def(&self, file: impl Into<FileId>) -> Option<Module> {
-        self.imp.file_to_module_defs(file.into()).next()
+        self.file_modules(file.into()).next()
     }
 
     pub fn file_to_module_defs(&self, file: impl Into<FileId>) -> impl Iterator<Item = Module> {
-        self.imp.file_to_module_defs(file.into())
+        self.file_modules(file.into())
     }
 
     pub fn hir_file_to_module_def(&self, file: impl Into<HirFileId>) -> Option<Module> {
-        self.imp.hir_file_to_module_defs(file.into()).next()
+        self.hir_file_to_module_defs(file).next()
     }
 
     pub fn hir_file_to_module_defs(
         &self,
         file: impl Into<HirFileId>,
     ) -> impl Iterator<Item = Module> {
-        self.imp.hir_file_to_module_defs(file.into())
+        let file = file.into().original_file_respecting_includes(self.db).file_id(self.db);
+        self.file_modules(file)
     }
 
     pub fn is_nightly(&self, krate: Crate) -> bool {
@@ -248,7 +248,7 @@ impl<'db> Semantics<'db> {
         self.imp.adjust_edition(file_id)
     }
 
-    pub fn get_unsafe_ops(&self, def: ExpressionStoreOwner) -> FxHashSet<ExprOrPatSource> {
+    pub fn get_unsafe_ops(&self, def: ExpressionStoreOwner) -> HashSet<ExprOrPatSource> {
         self.imp.get_unsafe_ops(def)
     }
 

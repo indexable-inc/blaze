@@ -5,8 +5,9 @@
 use base_db::{Crate, Db, all_crates};
 use hir_def::{AdtId, FunctionId, expr_store::Body, signatures::FunctionSignature};
 use hir_expand::fixture;
+use hir_ty_mir::mir::MirSpan;
 
-use crate::{Found, Held, Promise, Why, root::roots, suspend_check};
+use crate::{Found, Held, Promise, Site, Why, may_suspend_at, on_fiber, root::roots, suspend_check, suspend_points};
 
 /// minicore, `corosensei` and the engine. A test appends `//- /x.rs crate:x deps:engine`.
 const ENGINE: &str = r#"
@@ -509,4 +510,64 @@ pub fn f() -> u32 {
         assert!(roots(db, krate).is_empty(), "no root without `corosensei`");
         nothing(suspend_check(db, krate));
     });
+}
+
+#[test]
+fn points_list_every_value_held_and_say_why_only_for_the_rejected() {
+    check(
+        r#"
+//- /x.rs crate:x deps:engine
+use engine::{Db, Plain};
+
+pub fn mixed(db: &Db) -> u32 {
+    let mut guard = engine::lock();
+    let plain = Plain { n: 1 };
+    let v = db.variance(1);
+    guard.push(v);
+    plain.n
+}
+"#,
+        |db, found| {
+            let krate = crate_named(db, "x");
+            let owner = one_held(found).call.owner;
+            let [point] = &**suspend_points(db, krate, owner) else { panic!("one point in `mixed`") };
+            let mut held: Vec<(String, Option<Why>)> = point
+                .held
+                .iter()
+                .filter_map(|it| it.binding.map(|binding| (Body::of(db, owner)[binding].name.as_str().to_owned(), it.why)))
+                .collect();
+            held.sort_by(|a, b| a.0.cmp(&b.0));
+            assert!(matches!(&*held, [(guard, Some(Why::MustNotSuspend(_))), (plain, None)] if guard == "guard" && plain == "plain"), "{held:?}");
+            assert_eq!(
+                may_suspend_at(db, krate, point.call).as_deref(),
+                Some("`variance` → `fetch` → `get_or_run` → `suspend`"),
+            );
+            assert_eq!(may_suspend_at(db, krate, Site { owner, span: MirSpan::Unknown }), None);
+        },
+    );
+}
+
+#[test]
+fn what_may_suspend_runs_on_a_fiber_and_what_does_not_is_not_said_to() {
+    check(
+        r#"
+//- /x.rs crate:x deps:engine
+use engine::Db;
+
+pub fn waits(db: &Db) -> u32 {
+    db.variance(1)
+}
+
+pub fn calm() -> u32 {
+    1
+}
+"#,
+        |db, _| {
+            let names: Vec<String> = on_fiber(db, crate_named(db, "x")).iter().map(|&it| fn_named(db, it)).collect();
+            for name in ["waits", "variance", "fetch", "get_or_run"] {
+                assert!(names.iter().any(|it| it == name), "`{name}` runs on a fiber: {names:?}");
+            }
+            assert!(!names.iter().any(|it| it == "calm"), "`calm` is not said to run on a fiber: {names:?}");
+        },
+    );
 }

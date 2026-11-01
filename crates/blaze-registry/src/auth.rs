@@ -10,15 +10,15 @@ mod protocol;
 
 use std::{
     fmt,
-    sync::{Mutex, PoisonError},
     time::{Duration, SystemTime},
 };
 
 use anyhow::bail;
+use blaze_hash::HashMap;
 use blaze_manifest::config::{Config, OptValue, PathAndArgs, Value, env_key};
 use blaze_manifest::files::Disk;
 use blaze_source::SourceId;
-use rustc_hash::FxHashMap;
+use parking_lot::Mutex;
 use serde_derive::Serialize;
 
 use crate::{api::check_token, registry_source};
@@ -296,21 +296,20 @@ pub struct Auth {
 struct State {
     config: Config<Disk>,
     /// By the registry's canonical URL.
-    tokens: FxHashMap<String, Cached>,
+    tokens: HashMap<String, Cached>,
     /// By the registry's canonical URL, cargo's `registry_config` cache.
-    registries: FxHashMap<String, Option<Credentials>>,
+    registries: HashMap<String, Option<Credentials>>,
 }
 
 impl Auth {
     // dyn: the CLI's output, as on `Auth::shell`.
     pub fn new(config: Config<Disk>, shell: Box<dyn Shell>) -> Auth {
-        let state =
-            State { config, tokens: FxHashMap::default(), registries: FxHashMap::default() };
+        let state = State { config, tokens: HashMap::default(), registries: HashMap::default() };
         Auth { state: Mutex::new(state), shell }
     }
 
-    fn state(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    fn state(&self) -> parking_lot::MutexGuard<'_, State> {
+        self.state.lock()
     }
 
     /// The name a registry is configured by, found by its index URL as cargo finds it for

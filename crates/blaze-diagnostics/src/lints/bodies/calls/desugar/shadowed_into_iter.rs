@@ -8,6 +8,7 @@
 //! `compiler/rustc_lint/src/lints.rs` (`ShadowedIntoIterDiag`, `ShadowedIntoIterDiagSub`) and
 //! `compiler/rustc_span/src/lib.rs` (`Span::find_ancestor_in_same_ctxt`) (MIT or Apache-2.0).
 
+use blaze_hash::HashSet;
 use blaze_items::{Fact, ItemId};
 use hir_def::{
     FunctionId, HasModule as _, ModuleDefId,
@@ -15,13 +16,12 @@ use hir_def::{
     lang_item::lang_items,
 };
 use hir_ty::next_solver::{Ty, TyKind};
-use rustc_hash::FxHashSet;
 use rustc_type_ir::inherent::IntoKind as _;
 use syntax::view::{self as ast, AstNode};
 
 use super::for_loop;
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprKind, Hooks, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKind, ExprKinds, Hooks, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
@@ -33,7 +33,7 @@ pub(crate) struct ShadowedIntoIter {
     /// The iterated expressions of the body's `for` loops visited so far: the argument of the
     /// `IntoIterator::into_iter` call each is desugared to (rustc's parent of the parent of a
     /// method call that is one).
-    for_heads: FxHashSet<ExprId>,
+    for_heads: HashSet<ExprId>,
 }
 
 impl LatePass for ShadowedIntoIter {

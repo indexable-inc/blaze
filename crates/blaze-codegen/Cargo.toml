@@ -17,18 +17,20 @@ doctest = false
 blaze-cas.workspace = true
 blaze-format.workspace = true
 blaze-graph.workspace = true
+blaze-hash.workspace = true
 blaze-hashcons.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
 blaze-mem.workspace = true
 blaze-query.workspace = true
 hashbrown.workspace = true
-rustc-hash.workspace = true
+parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+crossbeam-channel.workspace = true
 
 [target.'cfg(blaze_check)'.dependencies]
 blaze-check.workspace = true

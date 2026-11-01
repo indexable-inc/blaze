@@ -11,8 +11,8 @@ authors.workspace = true
 
 
 [dependencies]
+blaze-hash.workspace = true
 blaze-query = { workspace = true, optional = true }
-rustc-hash.workspace = true
 text-size.workspace = true
 unicode-width.workspace = true
 
