@@ -357,8 +357,10 @@ def resolved_build_deps(label: str, ws: Path, env: dict[str, str]) -> dict[tuple
     meta: dict[str, Any] = json.loads(ran.checked(f"{label}: cargo metadata").stdout)
     names = {p["id"]: (p["name"], p["version"]) for p in meta["packages"]}
     out: dict[tuple[str, str], tuple[str, ...]] = {}
-    resolve: dict[str, Any] = meta.get("resolve") or {}
-    nodes: list[dict[str, Any]] = resolve.get("nodes", [])
+    resolve = cast("dict[str, Any] | None", meta.get("resolve"))
+    if resolve is None:
+        raise engine.Failed(f"{label}: cargo metadata has no `resolve`")
+    nodes: list[dict[str, Any]] = resolve["nodes"]
     for node in nodes:
         deps = {names[dep["pkg"]][0] for dep in node["deps"] if any(k["kind"] == "build" for k in dep["dep_kinds"])}
         out[names[node["id"]]] = tuple(sorted(deps))

@@ -359,7 +359,7 @@ class Round:
         found: dict[str, Any] = json.loads(ran.stdout)
         stale = [f"the trace: {s['what']} {s['query']}: {s['detail']}" for s in found["stale"]]
         case: dict[str, Any] = found.get("nameres") or {}
-        findings: list[dict[str, Any]] = case.get("findings", [])
+        findings: list[dict[str, Any]] = case["findings"] if case else []
         for f in findings:
             line = f"the {case['slot']} case ({case['claim']}): {f['side'].lower()}: {f['detail']}"
             if f["side"] != "Unmeasured":
