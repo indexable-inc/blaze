@@ -355,7 +355,7 @@ pub(super) fn activation_error(
             );
         }
     } else if let Some(packages) = alt_paths(dep, settings) {
-        let path = dep.source_id().url().to_file_path().unwrap();
+        let path = blaze_source::url_file(dep.source_id().url()).unwrap();
         let _ = writeln!(&mut msg, "no matching package named `{}` found", dep.package_name());
 
         let mut exact_match: Option<PathBuf> = None;
@@ -518,7 +518,7 @@ fn alt_paths(
     if !dep.source_id().is_path() {
         return None;
     }
-    let path = dep.source_id().url().to_file_path().ok()?;
+    let path = blaze_source::url_file(dep.source_id().url()).ok()?;
     if !path.is_dir() {
         return None;
     }

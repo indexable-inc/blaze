@@ -243,7 +243,7 @@ pub(crate) fn units(
                 };
                 // Named by its key alone, never by the workspace: every workspace on the daemon
                 // asking for the same std names the same outputs, and builds it once.
-                if !Path::new(&spec.std).is_absolute() {
+                if !Path::new(&spec.std).has_root() {
                     return Ok(fail(anyhow::anyhow!(
                         "the daemon names `{}`, no absolute directory, for the standard library's builds",
                         spec.std

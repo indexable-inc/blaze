@@ -51,7 +51,7 @@ impl PackageIdSpec {
         } else if spec.contains('/') || spec.contains('\\') {
             let abs = std::env::current_dir().unwrap_or_default().join(spec);
             if abs.exists() {
-                let maybe_url = Url::from_file_path(abs)
+                let maybe_url = blaze_source::file_url(abs)
                     .map_or_else(|_| "a file:// URL".to_owned(), |url| url.to_string());
                 bail!(
                     "package ID specification `{spec}` looks like a file path, maybe try {maybe_url}"

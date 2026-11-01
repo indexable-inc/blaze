@@ -118,7 +118,8 @@ impl<'c, F: Files> Workspace<'c, F> {
             custom_metadata: None,
             warnings: Vec::new(),
         };
-        if manifest_path.is_relative() {
+        // `has_root`: on Windows the daemon names `C:\a` as `/C:/a`, which has no prefix.
+        if !manifest_path.has_root() {
             bail!(
                 "manifest_path:{manifest_path:?} is not an absolute path. Please provide an absolute path."
             )

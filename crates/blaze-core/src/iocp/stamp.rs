@@ -113,6 +113,8 @@ fn unnameable(name: &str) -> bool {
 /// The drive a name starts with, and the rest: Windows has no one root, so a name `S:/wt/x` is on
 /// the drive `S:` (and `S:` alone is that drive's root), whatever the driver's root is.
 fn drive(name: &str) -> Option<(&str, &str)> {
+    // The daemon roots a drive at `/` (`/S:/wt/x`); the name may come with that root or without.
+    let name = name.strip_prefix('/').unwrap_or(name);
     let bytes = name.as_bytes();
     let on = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
     (on && (bytes.len() == 2 || bytes[2] == b'/')).then(|| (&name[..2], name.get(3..).unwrap_or("")))

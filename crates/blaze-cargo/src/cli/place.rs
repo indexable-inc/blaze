@@ -138,11 +138,16 @@ pub fn utf8(path: &Path) -> Result<String, String> {
         .ok_or_else(|| format!("the path {} is not UTF-8, which a request to the daemon can't carry", path.display()))
 }
 
-/// A path as the daemon names it: with `/` between its parts, on Windows after its drive
-/// (`C:\a` is `C:/a`, which `Path` and `Url` take as absolute too).
+/// A path as the daemon names it: rooted at `/` with `/` between its parts. On Windows the
+/// drive is the first part (`C:\a` is `/C:/a`), so the daemon's one-root path model holds.
 #[cfg(windows)]
 pub fn api_path(text: &str) -> String {
-    text.replace('\\', "/")
+    let text = text.strip_prefix(r"\\?\").unwrap_or(text).replace('\\', "/");
+    let bytes = text.as_bytes();
+    match bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        true => format!("/{}{}", char::from(bytes[0].to_ascii_uppercase()), &text[1..]),
+        false => text,
+    }
 }
 
 #[cfg(not(windows))]
@@ -153,7 +158,9 @@ pub fn api_path(text: &str) -> String {
 /// A path the daemon named, as this system opens it: [`api_path`]'s inverse.
 #[cfg(windows)]
 pub fn host_path(text: &str) -> PathBuf {
-    PathBuf::from(text.replace('/', "\\"))
+    let bytes = text.as_bytes();
+    let drive = bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':';
+    PathBuf::from(text[usize::from(drive)..].replace('/', "\\"))
 }
 
 #[cfg(not(windows))]

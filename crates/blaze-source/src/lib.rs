@@ -15,5 +15,5 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 pub use interning::InternedString;
 pub use source_id::{
     CRATES_IO_DOMAIN, CRATES_IO_HTTP_INDEX, CRATES_IO_INDEX, CRATES_IO_REGISTRY, CanonicalUrl,
-    GitReference, Precise, PrettyRef, SourceId, SourceIdAsUrl, SourceKind, short_hash,
+    GitReference, Precise, PrettyRef, SourceId, SourceIdAsUrl, SourceKind, file_url, short_hash, url_file,
 };

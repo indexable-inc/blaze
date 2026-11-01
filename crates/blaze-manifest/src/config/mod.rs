@@ -973,7 +973,7 @@ impl<F: Files> Config<F> {
     fn resolve_registry_index(&self, index: &Value<String>) -> anyhow::Result<Url> {
         let base = index.definition.root(&self.cwd).join("truncated-by-url_with_base");
         crate::source::into_url(&index.val)?;
-        let base = Url::from_file_path(&base).ok();
+        let base = blaze_source::file_url(&base).ok();
         let url = Url::options()
             .base_url(base.as_ref())
             .parse(&index.val)

@@ -142,6 +142,8 @@ fn std_printed(job: &Job, compile: usize) -> Result<Value, String> {
     let package = package_of(units, u).map_err(|it| it.what)?;
     let failed = |what: String| format!("std's `{}` build script: {what}", package.name);
     let root = u.target.src_path.to_string_lossy();
+    // On Windows a `Path::join` puts a `\` in the daemon's `/`-separated names.
+    let root = if cfg!(windows) { root.replace('\\', "/").into() } else { root };
     let read = |path: &str| match job.mounted.read(path) {
         Ok(Some((_, _, bytes))) => Ok(bytes),
         Ok(None) => Err(format!("{path} is not among the build's files")),
