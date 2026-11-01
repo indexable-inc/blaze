@@ -99,7 +99,7 @@ pub fn nothing_listens(error: &ClientError) -> bool {
 /// Where systemd or launchd is socket-activating the daemon, the connect itself starts it
 /// (the manager listens and the request waits in its backlog); the CLI starts `blaze serve`
 /// only where no unit serves the socket, and says so.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
     let socket = crate::serve::socket()?;
     let refused = match Client::unix(&socket) {
@@ -108,6 +108,7 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
         Err(_) if start == Start::Never => return Ok(None),
         Err(error) => error,
     };
+    #[cfg(unix)]
     match activation(&socket)? {
         Installed::Yes => {
             let place = blaze_api::units::place_here()?;
@@ -129,6 +130,8 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
              start it on demand)"
         ),
     }
+    #[cfg(windows)]
+    eprintln!("blaze: starting the daemon ({refused})");
     let log = started()?;
     let asked = Instant::now();
     let mut tries = 0u32;
@@ -153,15 +156,6 @@ fn activation(socket: &Path) -> anyhow::Result<Installed> {
         return Ok(Installed::No);
     }
     Ok(blaze_api::units::installed(&blaze_api::units::place_here()?, socket)?)
-}
-
-#[cfg(not(unix))]
-pub fn connect(_: Start) -> anyhow::Result<Option<Client>> {
-    anyhow::bail!(
-        "blaze's CLI speaks to its daemon over the Unix socket {}, and blaze_api's client has \
-         Unix sockets on Unix only",
-        crate::serve::socket()?.display()
-    )
 }
 
 /// What a start that never listened says.
@@ -270,7 +264,7 @@ fn listening_pid(line: &str) -> Option<u32> {
 
 /// What came of the daemon that hung up on a request: its log's last start and what it wrote
 /// since, and how its process ended, given [`ENDING`] to.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn died() -> anyhow::Result<Died> {
     use std::io::{Read as _, Seek as _};
 
@@ -293,6 +287,8 @@ pub fn died() -> anyhow::Result<Died> {
     let said = said.into_iter().map(str::to_owned).collect(); // alloc: as above
     let asked = Instant::now();
     let ended = loop {
+        // Only a unix parent hears how its child ended; a Windows one has its exit code only from a handle it kept.
+        #[cfg(unix)]
         if let Some(reaped) = crate::raw::process::reap(pid) {
             break Ended::Reaped(reaped);
         }
@@ -308,14 +304,9 @@ pub fn died() -> anyhow::Result<Died> {
     Ok(Died { log, ended: Some((pid, ended)), said })
 }
 
-#[cfg(not(unix))]
-pub fn died() -> anyhow::Result<Died> {
-    anyhow::bail!("blaze's CLI speaks to its daemon over a Unix socket, which this system lacks")
-}
-
 /// Starts `blaze serve` in a process group of its own, so that what ends this command or its
 /// terminal's foreground does not end it, with its output appended to its log; the log.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn started() -> anyhow::Result<std::path::PathBuf> {
     use anyhow::Context as _;
     let state = crate::serve::state()?;
@@ -327,7 +318,11 @@ fn started() -> anyhow::Result<std::path::PathBuf> {
     let mut daemon = std::process::Command::new(std::env::current_exe().context("finding blaze's own executable")?);
     daemon.arg("serve");
     daemon.stdin(std::process::Stdio::null()).stdout(file.try_clone()?).stderr(file);
+    #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut daemon, 0);
+    // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW: out of this console's Ctrl-C and close.
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut daemon, 0x0000_0008 | 0x0000_0200 | 0x0800_0000);
     daemon.spawn().context("starting the daemon (`blaze serve`)")?;
     Ok(log)
 }
@@ -380,18 +375,13 @@ pub fn stop(err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
 
 /// Whether the daemon still answers at `socket`; a connect that fails for another reason than
 /// that nothing listens is the error.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn answers(socket: &Path) -> Result<bool, DaemonError> {
     match Client::unix(socket) {
         Ok(_) => Ok(true),
         Err(error) if nothing_listens(&error) => Ok(false),
         Err(error) => Err(DaemonError::Connect { socket: socket.to_owned(), error }),
     }
-}
-
-#[cfg(not(unix))]
-fn answers(_: &Path) -> Result<bool, DaemonError> {
-    Ok(false)
 }
 
 /// `blaze status`: what the daemon is doing, on stdout.

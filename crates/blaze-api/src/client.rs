@@ -12,6 +12,10 @@ use std::{
 };
 
 use blaze_protocol::cbor;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(windows)]
+use uds_windows::UnixStream;
 
 use crate::{
     ApiError, Envelope, LONGEST_REQUEST, Request, Response, ResponseRef, SCHEMA,
@@ -110,7 +114,7 @@ pub struct Client {
 impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let over = match &self.link {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Link::Unix(_) => "unix",
             Link::Http(_) => "http",
         };
@@ -119,8 +123,8 @@ impl fmt::Debug for Client {
 }
 
 enum Link {
-    #[cfg(unix)]
-    Unix(std::os::unix::net::UnixStream),
+    #[cfg(any(unix, windows))]
+    Unix(UnixStream),
     Http(HttpLink),
 }
 
@@ -142,9 +146,9 @@ struct HttpLink {
 }
 
 impl Client {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn unix(path: &Path) -> Result<Client, ClientError> {
-        let stream = std::os::unix::net::UnixStream::connect(path)
+        let stream = UnixStream::connect(path)
             // alloc: error path, a connect that failed.
             .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))?;
         Ok(Client::over(Link::Unix(stream)))
@@ -195,7 +199,7 @@ impl Client {
         let envelope = Envelope::new(id, request);
         self.out.clear();
         match &mut self.link {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Link::Unix(stream) => {
                 frames::encode_into(&mut self.writer, &mut self.out, &envelope)
                     .map_err(ClientError::Refused)?;
@@ -316,7 +320,7 @@ impl Client {
     /// come first are kept for [`Client::receive`]. A daemon that stops hangs up every
     /// connection last, once its state is durable: where a service manager keeps its socket
     /// listening, this is how `blaze stop` knows it is gone. Only the Unix socket has it.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn until_hung_up(&mut self, patience: std::time::Duration) -> Result<(), ClientError> {
         let deadline = std::time::Instant::now() + patience;
         let waited = || {
@@ -399,7 +403,7 @@ impl Client {
     /// ended and nothing more is coming until the next request.
     fn more(&mut self) -> Result<bool, ClientError> {
         let link = match &mut self.link {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Link::Unix(stream) => {
                 let most = self.frames.wanted(RECEIVE);
                 if self.frames.fill(stream, most)? == 0 {

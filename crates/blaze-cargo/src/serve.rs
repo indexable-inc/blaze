@@ -121,6 +121,13 @@ fn writer_of(state: &Path) -> anyhow::Result<blaze_ids::ContentId> {
 /// An absolute path as the driver names it: the driver's root is `/`.
 pub fn file_name(path: &Path) -> anyhow::Result<FileName> {
     let text = path.to_str().with_context(|| format!("{} is not UTF-8", path.display()))?;
+    // The driver's root / is joined with the name, and C:/dir joined to it is itself: a drive path is its own name.
+    #[cfg(windows)]
+    let (text, rest) = match (path.is_absolute(), text.replace('\\', "/")) {
+        (true, name) => (text, name),
+        (false, _) => bail!("{text} is not an absolute path"),
+    };
+    #[cfg(not(windows))]
     let Some(rest) = text.strip_prefix('/') else { bail!("{text} is not an absolute path") };
     FileName::new(rest.trim_end_matches('/')).with_context(|| format!("{text} has an empty, `.` or `..` part"))
 }
