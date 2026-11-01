@@ -22,8 +22,8 @@ use windows_sys::Win32::{
         SO_UPDATE_CONNECT_CONTEXT, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0,
         SOCKADDR_STORAGE, SOCKADDR_UN, SOCKET, SOL_SOCKET, TCP_NODELAY, WSA_FLAG_NO_HANDLE_INHERIT,
         WSA_FLAG_OVERLAPPED, WSA_IO_PENDING, WSABUF, WSADATA, WSAENOTCONN, WSAGetLastError, WSAID_CONNECTEX,
-        WSAIoctl, WSARecv, WSASend, WSASocketW, WSAStartup, bind, connect, getsockname, listen,
-        setsockopt, shutdown,
+        WSAIoctl, WSARecv, WSASend, WSASocketW, WSAStartup, bind, connect, getsockname,
+        listen as wsa_listen, setsockopt, shutdown,
     },
     System::IO::OVERLAPPED,
 };
@@ -230,7 +230,7 @@ pub(super) fn listen(root: &Path, at: &Address) -> io::Result<Listener> {
     let listener = Listener { socket, family: address.family, path };
     // The most Winsock takes (`SOMAXCONN` of winsock2.h).
     // SAFETY: a bound socket.
-    if unsafe { listen(raw(&listener.socket), i32::MAX) } != 0 {
+    if unsafe { wsa_listen(raw(&listener.socket), i32::MAX) } != 0 {
         return Err(last());
     }
     Ok(listener)
@@ -411,13 +411,15 @@ type ConnectEx = unsafe extern "system" fn(
 fn connect_ex(socket: &OwnedSocket) -> io::Result<ConnectEx> {
     let mut function: LPFN_CONNECTEX = None;
     let mut got = 0;
+    // A const has no address: the GUID is read from a local.
+    let guid = WSAID_CONNECTEX;
     // SAFETY: an open socket, the GUID to read, and room for the pointer; synchronous.
     let asked = unsafe {
         WSAIoctl(
             raw(socket),
             SIO_GET_EXTENSION_FUNCTION_POINTER,
-            (&raw const WSAID_CONNECTEX).cast(),
-            size_of_val(&WSAID_CONNECTEX) as u32,
+            (&raw const guid).cast(),
+            size_of_val(&guid) as u32,
             (&raw mut function).cast(),
             size_of::<LPFN_CONNECTEX>() as u32,
             &mut got,
